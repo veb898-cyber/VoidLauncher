@@ -38,6 +38,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          projectPath: src-tauri
           tagName: ${{ github.ref_name }}
           releaseName: "VoidLauncher ${{ github.ref_name }}"
           releaseBody: "See the assets below for the installer and update file."

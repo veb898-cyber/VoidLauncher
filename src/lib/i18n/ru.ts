@@ -401,6 +401,7 @@ export const ru: Record<string, string> = {
   'updater.btn_update':                 'Обновить',
   'updater.btn_later':                  'Позже',
   'updater.checking':                   'Проверка обновлений...',
+  'updater.check_failed':               'Не удалось проверить обновления: {error}',
 
   // ── Offline account username validation ─────────────────────
   'accounts.offline_username_cyrillic': 'Имя не должно содержать кириллицу.',

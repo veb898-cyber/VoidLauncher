@@ -45,8 +45,10 @@ export function useUpdater() {
         setState((s) => ({ ...s, checking: false }));
       }
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       console.error('Update check failed:', err);
-      setState((s) => ({ ...s, checking: false }));
+      addToast(t('updater.check_failed', { error: msg }), 'error');
+      setState((s) => ({ ...s, checking: false, error: msg }));
     }
   }, []);
 

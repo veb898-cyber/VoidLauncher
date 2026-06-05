@@ -397,6 +397,7 @@ export const en = {
   'updater.btn_update':                 'Update Now',
   'updater.btn_later':                  'Later',
   'updater.checking':                   'Checking for updates...',
+  'updater.check_failed':               'Update check failed: {error}',
 
   // ── Offline account username validation ─────────────────────
   'accounts.offline_username_cyrillic': 'Username must not contain Cyrillic characters.',
