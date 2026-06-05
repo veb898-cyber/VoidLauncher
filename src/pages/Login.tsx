@@ -1,0 +1,192 @@
+import { useEffect, useRef, useState } from 'react';
+import { LogIn, Copy, Check, ExternalLink } from 'lucide-react';
+import { openUrl } from '@tauri-apps/plugin-opener';
+import { useAuthStore } from '../stores/authStore';
+import { t } from '../lib/i18n';
+import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { Button } from '../components/ui/Button';
+
+interface LoginProps {
+  onNavigate: (page: string) => void;
+}
+
+export function Login({ onNavigate }: LoginProps) {
+  const {
+    isLoggedIn,
+    isLoading,
+    error,
+    userCode,
+    verificationUri,
+    startLogin,
+    pollLogin,
+    clearError,
+  } = useAuthStore();
+  const pollInterval = useRef<number | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (isLoggedIn) {
+      onNavigate('home');
+    }
+  }, [isLoggedIn, onNavigate]);
+
+  useEffect(() => {
+    if (userCode && !isLoggedIn) {
+      pollInterval.current = window.setInterval(() => {
+        pollLogin();
+      }, 5000);
+    }
+
+    return () => {
+      if (pollInterval.current) {
+        clearInterval(pollInterval.current);
+      }
+    };
+  }, [userCode, isLoggedIn]);
+
+  const handleCopyCode = () => {
+    if (userCode) {
+      navigator.clipboard.writeText(userCode);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleOpenLink = async () => {
+    if (verificationUri) {
+      await openUrl(verificationUri);
+    }
+  };
+
+  return (
+    <div className="login-page animate-fade-in">
+      <div className="glass-card login-card">
+        <div className="login-card__icon">
+          <LogIn size={40} color="white" />
+        </div>
+
+        <h1 className="login-card__title">{t('login.title')}</h1>
+        <p className="login-card__desc">
+          {t('login.desc')}
+        </p>
+
+        {error && (
+          <div style={{
+            background: 'hsla(0, 85%, 60%, 0.1)',
+            border: '1px solid hsla(0, 85%, 60%, 0.3)',
+            borderRadius: 'var(--radius-md)',
+            padding: 'var(--space-md)',
+            marginBottom: 'var(--space-lg)',
+            color: 'var(--error)',
+            fontSize: 'var(--font-size-sm)',
+          }}>
+            {error}
+            <button
+              onClick={clearError}
+              style={{
+                marginLeft: 'var(--space-sm)',
+                background: 'none',
+                border: 'none',
+                color: 'var(--error)',
+                cursor: 'pointer',
+                textDecoration: 'underline',
+              }}
+            >
+              {t('common.dismiss')}
+            </button>
+          </div>
+        )}
+
+        {!userCode ? (
+          <Button
+            size="lg"
+            onClick={startLogin}
+            disabled={isLoading}
+            style={{ width: '100%' }}
+            loading={isLoading}
+            id="login-button"
+          >
+            <MicrosoftIcon /> {t('login.sign_in_btn')}
+          </Button>
+        ) : (
+          <div className="animate-slide-up">
+            <div style={{
+              background: 'var(--surface-glass)',
+              border: '1px solid var(--surface-border)',
+              borderRadius: 'var(--radius-lg)',
+              padding: 'var(--space-xl)',
+              marginBottom: 'var(--space-lg)',
+            }}>
+              <p style={{
+                fontSize: 'var(--font-size-sm)',
+                color: 'var(--text-secondary)',
+                marginBottom: 'var(--space-md)',
+              }}>
+                {t('login.instruction')}
+              </p>
+
+              <div
+                onClick={handleCopyCode}
+                style={{
+                  fontSize: 'var(--font-size-3xl)',
+                  fontWeight: 800,
+                  letterSpacing: '4px',
+                  fontFamily: 'monospace',
+                  background: 'var(--gradient-primary)',
+                  WebkitBackgroundClip: 'text',
+                  WebkitTextFillColor: 'transparent',
+                  cursor: 'pointer',
+                  marginBottom: 'var(--space-sm)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 'var(--space-sm)',
+                }}
+                title={t('login.click_to_copy')}
+              >
+                {userCode}
+                {copied ? <Check size={24} color="var(--success)" /> : <Copy size={24} />}
+              </div>
+
+              <p style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                {copied ? t('login.copied') : t('login.click_to_copy')}
+              </p>
+            </div>
+
+            <Button
+              variant="secondary"
+              size="lg"
+              onClick={handleOpenLink}
+              style={{ width: '100%', marginBottom: 'var(--space-md)' }}
+            >
+              <ExternalLink size={16} /> {t('login.open_browser')}
+            </Button>
+
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 'var(--space-sm)',
+              color: 'var(--text-tertiary)',
+              fontSize: 'var(--font-size-sm)',
+            }}>
+              <LoadingSpinner />
+              {t('login.waiting')}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MicrosoftIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 21 21" fill="none">
+      <rect x="1" y="1" width="9" height="9" fill="#F25022" />
+      <rect x="11" y="1" width="9" height="9" fill="#7FBA00" />
+      <rect x="1" y="11" width="9" height="9" fill="#00A4EF" />
+      <rect x="11" y="11" width="9" height="9" fill="#FFB900" />
+    </svg>
+  );
+}

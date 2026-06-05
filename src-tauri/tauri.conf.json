@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VoidLauncher",
+  "version": "0.1.0",
+  "identifier": "com.voidlauncher.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "VoidLauncher",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "decorations": false,
+        "transparent": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' https://crafatar.com https://mc-heads.net https://piston-meta.mojang.com https://cdn.modrinth.com https://modrinth.com https://mediafilez.forgecdn.net https://edge.forgecdn.net https://media.forgecdn.net data: blob:; connect-src 'self' https://piston-meta.mojang.com https://piston-data.mojang.com https://launchermeta.mojang.com https://resources.download.minecraft.net https://libraries.minecraft.net https://login.microsoftonline.com https://user.auth.xboxlive.com https://xsts.auth.xboxlive.com https://api.minecraftservices.com https://meta.fabricmc.net https://meta.quiltmc.org https://maven.minecraftforge.net https://maven.neoforged.net https://api.modrinth.com https://api.curseforge.com https://authserver.ely.by; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
+}
