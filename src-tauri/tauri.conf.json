@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' https://crafatar.com https://mc-heads.net https://piston-meta.mojang.com https://cdn.modrinth.com https://modrinth.com https://mediafilez.forgecdn.net https://edge.forgecdn.net https://media.forgecdn.net data: blob:; connect-src 'self' https://piston-meta.mojang.com https://piston-data.mojang.com https://launchermeta.mojang.com https://resources.download.minecraft.net https://libraries.minecraft.net https://login.microsoftonline.com https://user.auth.xboxlive.com https://xsts.auth.xboxlive.com https://api.minecraftservices.com https://meta.fabricmc.net https://meta.quiltmc.org https://maven.minecraftforge.net https://maven.neoforged.net https://api.modrinth.com https://api.curseforge.com https://authserver.ely.by; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
+      "csp": "default-src 'self'; img-src 'self' https://crafatar.com https://mc-heads.net https://piston-meta.mojang.com https://cdn.modrinth.com https://modrinth.com https://mediafilez.forgecdn.net https://edge.forgecdn.net https://media.forgecdn.net data: blob:; connect-src 'self' https://piston-meta.mojang.com https://piston-data.mojang.com https://launchermeta.mojang.com https://resources.download.minecraft.net https://libraries.minecraft.net https://login.microsoftonline.com https://user.auth.xboxlive.com https://xsts.auth.xboxlive.com https://api.minecraftservices.com https://meta.fabricmc.net https://meta.quiltmc.org https://maven.minecraftforge.net https://maven.neoforged.net https://api.modrinth.com https://api.curseforge.com https://authserver.ely.by https://github.*/**; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
     }
   },
   "bundle": {
@@ -35,11 +35,22 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   },
   "plugins": {
     "shell": {
       "open": true
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZDNzg3REUwOTlCN0UyRUEKUldUcTRyZVo0SDE0Ykt3NXVlTllIb0R6WTkzQWxxbWRYWGlwN1FlUmZGRUlQSFZ6aDcxWkFsTXMK",
+      "endpoints": [
+        "https://github.com/veb898-cyber/VoidLauncher/releases/latest/download/latest.json"
+      ]
     }
   }
 }

@@ -3,12 +3,14 @@ import { Titlebar } from './components/Titlebar';
 import { Sidebar } from './components/Sidebar';
 import { ToastContainer } from './components/ui/Toast';
 import { InstallOverlay } from './components/install/InstallOverlay';
+import { UpdaterModal } from './components/UpdaterModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useAuthStore } from './stores/authStore';
 import { useSettingsStore } from './stores/settingsStore';
 import { useGameEvents } from './hooks/useGameEvents';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useFocusStore } from './stores/focusStore';
+import { useUpdater } from './hooks/useUpdater';
 
 const Home = lazy(() => import('./pages/Home').then(m => ({ default: m.Home })));
 const Login = lazy(() => import('./pages/Login').then(m => ({ default: m.Login })));
@@ -20,6 +22,7 @@ const HomeLayout = lazy(() => import('./components/layout/HomeLayout').then(m =>
 function App() {
   useGameEvents();
   useKeyboardShortcuts();
+  const updater = useUpdater();
   const [activePage, setActivePage] = useState('home');
   const { checkAuth } = useAuthStore();
   const { loadConfig } = useSettingsStore();
@@ -78,6 +81,16 @@ function App() {
         </main>
       </div>
       <InstallOverlay />
+      <UpdaterModal
+        updateAvailable={updater.updateAvailable}
+        updateInfo={updater.updateInfo}
+        downloading={updater.downloading}
+        downloadProgress={updater.downloadProgress}
+        installing={updater.installing}
+        error={updater.error}
+        onUpdate={updater.downloadAndInstall}
+        onDismiss={updater.dismissUpdate}
+      />
       <ToastContainer />
     </>
   );

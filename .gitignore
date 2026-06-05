@@ -35,3 +35,6 @@ Desktop.ini
 # Environment
 .env
 .env.*
+
+# Signing keys
+*.key

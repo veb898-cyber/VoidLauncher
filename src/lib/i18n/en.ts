@@ -384,6 +384,18 @@ export const en = {
   'install.stage_complete':            'Complete!',
   'install.progress':                  '{downloaded} MB / {total} MB',
 
+  // ── App updater ─────────────────────────────────────────────
+  'updater.title':                      'Update Available',
+  'updater.description':                'A new version of VoidLauncher is available. Do you want to update?',
+  'updater.version':                    'Version: {version}',
+  'updater.downloading':                'Downloading update...',
+  'updater.installing':                 'Installing update...',
+  'updater.complete':                   'Update complete! Restarting...',
+  'updater.error':                      'Update failed: {error}',
+  'updater.btn_update':                 'Update Now',
+  'updater.btn_later':                  'Later',
+  'updater.checking':                   'Checking for updates...',
+
   // ── Offline account username validation ─────────────────────
   'accounts.offline_username_cyrillic': 'Username must not contain Cyrillic characters.',
   'accounts.offline_username_invalid':  'Username must be 3\u201316 characters: letters, digits, and underscores only.',

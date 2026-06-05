@@ -388,6 +388,18 @@ export const ru: Record<string, string> = {
   'install.stage_complete':            'Готово!',
   'install.progress':                  '{downloaded} MB / {total} MB',
 
+  // ── App updater ─────────────────────────────────────────────
+  'updater.title':                      'Доступно обновление',
+  'updater.description':                'Доступна новая версия VoidLauncher. Хотите обновиться?',
+  'updater.version':                    'Версия: {version}',
+  'updater.downloading':                'Загрузка обновления...',
+  'updater.installing':                 'Установка обновления...',
+  'updater.complete':                   'Обновление завершено! Перезапуск...',
+  'updater.error':                      'Ошибка обновления: {error}',
+  'updater.btn_update':                 'Обновить',
+  'updater.btn_later':                  'Позже',
+  'updater.checking':                   'Проверка обновлений...',
+
   // ── Offline account username validation ─────────────────────
   'accounts.offline_username_cyrillic': 'Имя не должно содержать кириллицу.',
   'accounts.offline_username_invalid':  'Имя: 3\u201316 символов, только латиница, цифры и подчёркивание.',

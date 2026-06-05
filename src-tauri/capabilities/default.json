@@ -28,6 +28,7 @@
     "fs:allow-read-dir",
     "fs:allow-read-file",
     "fs:allow-write-file",
+    "updater:default",
     {
       "identifier": "fs:scope",
       "allow": [
