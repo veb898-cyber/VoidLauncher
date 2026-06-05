@@ -1,6 +1,12 @@
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// Supported GC preset strategies. Serialized as lowercase strings
 /// in the Instance config: "standard" | "g1gc" | "zgc".
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,10 +35,12 @@ impl GcPreset {
 /// Run `java -version` against the given path and return the major version
 /// (e.g. 8, 17, 21). Returns None if the path is invalid or unparseable.
 pub fn detect_java_major(java_path: &Path) -> Option<u32> {
-    let output = Command::new(java_path)
-        .arg("-version")
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(java_path);
+    cmd.arg("-version");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd.output().ok()?;
     // `java -version` writes to stderr
     let combined = if !output.stderr.is_empty() {
         String::from_utf8_lossy(&output.stderr).to_string()

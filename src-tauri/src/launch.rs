@@ -7,6 +7,12 @@ use crate::jvm::{build_jvm_args, detect_java_major, strip_gc_selection_flags, Gc
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// Launch Minecraft for a given instance
 pub fn launch_minecraft(
     config: &AppConfig,
@@ -212,16 +218,15 @@ pub fn launch_minecraft(
     }
     eprintln!("[LAUNCH] Spawning Java process...");
 
-    let child = Command::new(&java_path)
-        .args(&args)
+    let mut cmd = Command::new(&java_path);
+    cmd.args(&args)
         .current_dir(&game_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // NOTE: std::process::Command::kill_on_drop is unstable on stable Rust
-        // (tracking issue rust-lang/rust#85397). The launcher stores the child
-        // in AppState and explicitly calls `child.kill()` on window close
-        // and launch failure. If the launcher crashes, the Java process
-        // becomes a brief orphan until the OS reaps it on shutdown.
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let child = cmd
         .spawn()
         .map_err(|e| {
             eprintln!("[LAUNCH] FAILED to spawn Java: {}", e);

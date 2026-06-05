@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+/// Windows creation flag to hide console windows
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// Detected Java installation
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JavaInstallation {
@@ -93,10 +100,12 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
 
 /// Probe a Java executable to get version info
 fn probe_java(path: &PathBuf) -> Option<JavaInstallation> {
-    let output = Command::new(path)
-        .arg("-version")
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(path);
+    cmd.arg("-version");
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd.output().ok()?;
 
     // Java prints version to stderr
     let stderr = String::from_utf8_lossy(&output.stderr);
