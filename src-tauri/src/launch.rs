@@ -7,6 +7,8 @@ use crate::jvm::{build_jvm_args, detect_java_major, strip_gc_selection_flags, Gc
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
@@ -107,7 +109,7 @@ pub fn launch_minecraft(
             let processed = loader_arg
                 .replace("${natives_directory}", &natives_dir.to_string_lossy())
                 .replace("${launcher_name}", "VoidLauncher")
-                .replace("${launcher_version}", "0.1.0");
+                .replace("${launcher_version}", LAUNCHER_VERSION);
             args.push(processed);
         }
     }
@@ -133,7 +135,7 @@ pub fn launch_minecraft(
         let processed = arg
             .replace("${natives_directory}", &natives_dir.to_string_lossy())
             .replace("${launcher_name}", "VoidLauncher")
-            .replace("${launcher_version}", "0.1.0");
+            .replace("${launcher_version}", LAUNCHER_VERSION);
         args.push(processed);
     }
 
