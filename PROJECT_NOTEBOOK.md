@@ -11,7 +11,7 @@
 | **Название** | VoidLauncher |
 | **Описание** | Кастомный лаунчер Minecraft для Windows |
 | **Для кого** | Для друзей разработчика (персональное использование) |
-| **Версия** | 0.1.0 (активная разработка) |
+| **Версия** | 0.1.1 (активная разработка) |
 | **Репозиторий** | https://github.com/veb898-cyber/VoidLauncher |
 | **Платформа** | Windows 10/11 (x86_64) |
 | **Язык UI** | English (по умолчанию) + Русский (переключаемый) |
@@ -474,15 +474,19 @@ git push origin v0.1.1
 | SSRF protection | ✅ |
 | Path traversal protection | ✅ |
 | Токен рефреш перед запуском | ✅ |
+| Консольные окна Java (CREATE_NO_WINDOW) | ✅ |
+| Play time отображение на Home | ✅ |
+| Очистка кэша (assets/libraries) | ✅ |
 
 ### Известные баги / TODO
 
-| Проблема | Описание |
+| Проблема | Статус |
 |---|---|
-| `cmd_get_instance_dir` → `instance.dir()` | Должен возвращать `.minecraft_dir()` (уже исправлено) |
-| Двойное открытие ссылок в описаниях | Исправлено: `onClick` + `openUrl()` вместо `target="_blank"` |
-| Иконки обрезались при длинном тексте | Исправлено: `overflow: hidden` только на `.btn--play` |
-| CurseForge API key молча ломал сохранение | Исправлено: `#[serde(default)]` на `curseforge_api_key` |
+| `cmd_get_instance_dir` → `instance.dir()` | ✅ Исправлено → `instance.minecraft_dir()` |
+| Двойное открытие ссылок в описаниях | ✅ Исправлено: `onClick` + `openUrl()` |
+| Иконки обрезались при длинном тексте | ✅ Исправлено: `overflow: hidden` только на `.btn--play` |
+| CurseForge API key молча ломал сохранение | ✅ Исправлено: `#[serde(default)]` |
+| Чёрные консольные окна Java | ✅ Исправлено: `CREATE_NO_WINDOW` |
 
 ### Планы на будущее
 
@@ -536,5 +540,5 @@ git tag v0.1.1 && git push origin v0.1.1
 
 ---
 
-*Последнее обновление: v0.1.0 — 05.06.2026*
+*Последнее обновление: v0.1.1 — 05.06.2026*
 *Автор: veb898-cyber*

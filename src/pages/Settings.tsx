@@ -4,6 +4,7 @@ import { useAuthStore } from '../stores/authStore';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '../components/ui/Button';
+import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { addToast } from '../components/ui/Toast';
 import { CustomSelect } from '../components/ui/CustomSelect';
 import { getRecommendedMemoryMb, snapToMemoryStep } from '../lib/memory';
@@ -22,6 +23,7 @@ export function Settings() {
   const { profile, isLoggedIn, logout } = useAuthStore();
   const [localConfig, setLocalConfig] = useState(config);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [clearingCache, setClearingCache] = useState(false);
 
   useEffect(() => {
     loadConfig();
@@ -362,9 +364,25 @@ export function Settings() {
             </div>
           </div>
           <div className="settings-row__control">
-            <Button size="sm" variant="ghost" onClick={() => {
-              addToast(t('settings.clear_cache_not_impl'), 'info');
-            }}>{t('settings.clear_cache_btn')}</Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={clearingCache}
+              onClick={async () => {
+                setClearingCache(true);
+                try {
+                  const freed = await invoke<number>('cmd_clear_cache');
+                  const mb = Math.round(freed / 1024 / 1024);
+                  addToast(t('settings.clear_cache_success', { mb: mb.toString() }), 'success');
+                } catch (e) {
+                  addToast(t('settings.clear_cache_error', { error: String(e) }), 'error');
+                } finally {
+                  setClearingCache(false);
+                }
+              }}
+            >
+              {clearingCache ? <LoadingSpinner size={14} /> : t('settings.clear_cache_btn')}
+            </Button>
           </div>
         </div>
       </section>

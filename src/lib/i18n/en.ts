@@ -239,6 +239,8 @@ export const en = {
   'settings.clear_cache_desc':         'Delete cached downloads and assets (will be re-downloaded as needed)',
   'settings.clear_cache_not_impl':     'Cache clearing not yet implemented. Manually delete the assets/libraries folders.',
   'settings.clear_cache_btn':          'Clear Cache',
+  'settings.clear_cache_success':      'Cache cleared, freed {mb} MB',
+  'settings.clear_cache_error':        'Failed to clear cache: {error}',
 
   'settings.section_about':            'About',
   'settings.about_name':               'VoidLauncher',

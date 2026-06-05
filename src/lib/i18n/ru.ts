@@ -243,6 +243,8 @@ export const ru: Record<string, string> = {
   'settings.clear_cache_desc':         'Удалить загруженные файлы и ассеты (будут загружены заново при необходимости)',
   'settings.clear_cache_not_impl':     'Очистка кэша пока не реализована. Удалите папки assets/libraries вручную.',
   'settings.clear_cache_btn':          'Очистить кэш',
+  'settings.clear_cache_success':      'Кэш очищен, освобождено {mb} МБ',
+  'settings.clear_cache_error':        'Не удалось очистить кэш: {error}',
 
   'settings.section_about':            'О программе',
   'settings.about_name':               'VoidLauncher',

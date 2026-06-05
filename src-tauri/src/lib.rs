@@ -2270,6 +2270,46 @@ fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Option<String>, St
     Ok(running.clone())
 }
 
+// ==================== Cache Commands ====================
+
+#[tauri::command]
+fn cmd_clear_cache(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let data_dir = config.data_dir.clone();
+    drop(config);
+
+    let mut freed: u64 = 0;
+    for subdir in &["assets", "libraries"] {
+        let dir = data_dir.join(subdir);
+        if dir.exists() {
+            let size = dir_size(&dir).unwrap_or(0);
+            std::fs::remove_dir_all(&dir).map_err(|e| {
+                let msg = format!("Failed to remove {:?}: {}", dir, e);
+                events::emit_log(&app, "error", "cache", &msg);
+                msg
+            })?;
+            freed += size;
+            events::emit_log(&app, "info", "cache", &format!("Removed {:?} ({} MB)", dir, size / 1024 / 1024));
+        }
+    }
+
+    Ok(freed)
+}
+
+fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total += dir_size(&entry.path()).unwrap_or(0);
+        } else {
+            total += meta.len();
+        }
+    }
+    Ok(total)
+}
+
 // ==================== Playtime Commands ====================
 
 #[tauri::command]
@@ -2436,6 +2476,7 @@ pub fn run() {
             cmd_get_playtime,
             cmd_format_playtime,
             cmd_flush_playtime,
+            cmd_clear_cache,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {
