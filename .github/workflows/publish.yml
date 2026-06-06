@@ -186,10 +186,29 @@ jobs:
 
       - name: Commit latest.json to main
         run: |
+          set -eu
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout main
-          git pull origin main --rebase --autostash
+
+          # Fetch + reset ONLY `latest.json` to whatever is on origin/main
+          # (not a full rebase) so a previous run's leftover never
+          # produces a merge conflict — and the file never ends up with
+          # `<<<<<<<` / `=======` / `>>>>>>>` markers in `main`.
+          # The freshly generated `latest.json` from the earlier step
+          # is then re-added on top and committed.
+          git fetch origin main
+          git checkout FETCH_HEAD -- latest.json
           git add latest.json
+
+          # Sanity guard: if the file ever does contain a conflict
+          # marker (e.g. someone manually committed a half-resolved
+          # file), fail loudly instead of shipping a broken updater
+          # manifest.
+          if grep -E '^(<{7}|={7}|>{7})' latest.json >/dev/null 2>&1; then
+            echo "::error::latest.json contains merge conflict markers after stage. Aborting."
+            exit 1
+          fi
+
           git commit -m "chore: update latest.json for ${{ github.ref_name }}" || echo "No changes to commit"
           git push origin HEAD:main
