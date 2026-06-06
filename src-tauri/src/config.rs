@@ -76,8 +76,9 @@ impl Default for AppConfig {
         // Auto-pick a sensible memory default based on system RAM on first launch.
         let total_ram = detect_total_ram_mb();
         let recommended = recommended_memory_mb(total_ram);
-        eprintln!(
-            "[config] First launch: detected {} MB RAM, defaulting to {} MB",
+        tracing::info!(
+            target: "config",
+            "First launch: detected {} MB RAM, defaulting to {} MB",
             total_ram, recommended
         );
 
@@ -124,23 +125,76 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Load config from disk or create default
+    /// Load config from disk or create default.
+    ///
+    /// **Never panics.** Any of the following are handled gracefully by
+    /// falling back to `Default::default()` and (re)writing a fresh
+    /// config file:
+    ///   * file does not exist  → first launch
+    ///   * file is empty        → corruption / interrupted write
+    ///   * file is unreadable   → permission error / disk error
+    ///   * JSON parse error     → manual edit, partial write, BOM, etc.
+    ///   * serde flatten error  → unknown / wrong-type fields
+    ///
+    /// Every fallback path is logged via `tracing::warn!` so the
+    /// `launcher.log` file shows exactly what went wrong, even if the
+    /// user just deletes `config.json` and the issue never recurs.
     pub fn load(data_dir: &std::path::Path) -> Self {
         let config_path = data_dir.join("config.json");
         if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
-                Ok(contents) => match serde_json::from_str(&contents) {
-                    Ok(config) => return config,
-                    Err(e) => eprintln!("Failed to parse config: {}", e),
-                },
-                Err(e) => eprintln!("Failed to read config: {}", e),
+                Ok(contents) => {
+                    if contents.trim().is_empty() {
+                        tracing::warn!(
+                            target: "config",
+                            "Config file at {} is empty; rewriting with defaults",
+                            config_path.display()
+                        );
+                    } else {
+                        match serde_json::from_str::<Self>(&contents) {
+                            Ok(config) => {
+                                tracing::info!(
+                                    target: "config",
+                                    "Loaded config from {}",
+                                    config_path.display()
+                                );
+                                return config;
+                            }
+                            Err(e) => tracing::warn!(
+                                target: "config",
+                                "Failed to parse config at {}: {}; rewriting with defaults",
+                                config_path.display(),
+                                e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "config",
+                    "Failed to read config at {}: {}; rewriting with defaults",
+                    config_path.display(),
+                    e
+                ),
             }
+        } else {
+            tracing::info!(
+                target: "config",
+                "No config at {}; creating with defaults",
+                config_path.display()
+            );
         }
         let config = Self {
             data_dir: data_dir.to_path_buf(),
             ..Default::default()
         };
-        let _ = config.save();
+        if let Err(e) = config.save() {
+            tracing::warn!(
+                target: "config",
+                "Failed to write fresh config at {}: {}",
+                config_path.display(),
+                e
+            );
+        }
         config
     }
 

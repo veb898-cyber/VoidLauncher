@@ -47,8 +47,19 @@ impl ProgressSender {
     }
 }
 
-/// Emit a log message event to the frontend
+/// Emit a log message event to the frontend AND write it to the
+/// file-based tracing logger (see `logger::init`).
 pub fn emit_log(app: &AppHandle, level: &str, source: &str, message: &str) {
+    // Mirror to the file logger. We do this BEFORE the IPC emit so a
+    // crash inside the renderer (e.g. an exception in the Logs page)
+    // doesn't lose the log line.
+    match level {
+        "error" => tracing::error!(target: "launcher", source = %source, "{}", message),
+        "warn"  => tracing::warn!(target: "launcher", source = %source, "{}", message),
+        "debug" => tracing::debug!(target: "launcher", source = %source, "{}", message),
+        _       => tracing::info!(target: "launcher", source = %source, "{}", message),
+    }
+
     let _ = app.emit(
         "log_message",
         LogPayload {

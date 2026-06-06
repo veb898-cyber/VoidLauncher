@@ -9,6 +9,7 @@ mod instances;
 mod java;
 mod jvm;
 mod launch;
+mod logger;
 mod modloaders;
 mod modrinth;
 mod playtime;
@@ -2380,12 +2381,22 @@ pub fn run() {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("VoidLauncher");
 
+    // File logger MUST be initialized first, before any other code path
+    // that might emit a tracing event or call eprintln! (e.g. AppConfig::load
+    // when the on-disk config is corrupt).
+    logger::init(&data_dir);
+
     let config = AppConfig::load(&data_dir);
     let auth_state = auth::load_auth_state(&config.auth_file()).unwrap_or_default();
     let icon_cache = load_icon_cache_from_disk(&config);
 
+    tracing::info!(target: "launcher", "Data dir: {}", data_dir.display());
+    tracing::info!(target: "launcher", "Config: data_dir={}, default_memory_mb={}, gc={}",
+        config.data_dir.display(), config.default_memory_mb, config.default_gc_preset);
+
     // If there's a cached Microsoft session, ensure it's in accounts.json
     if let Some(ref profile) = auth_state.profile {
+        tracing::info!(target: "launcher", "Restoring cached Microsoft session for {}", profile.name);
         let _ = accounts::upsert_microsoft_account(&data_dir, &profile.name, &profile.id);
     }
 
