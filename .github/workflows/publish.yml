@@ -190,7 +190,12 @@ jobs:
           set -eu
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout main
+
+          # actions/checkout on a tag push leaves the runner in a detached
+          # HEAD at the tag commit, with no local `main` branch. We don't
+          # need to be on `main` for what follows — we just need to make
+          # a new commit on top of the current HEAD and push it to
+          # origin/main (the very last line).
 
           # Fetch + reset ONLY `latest.json` to whatever is on origin/main
           # (not a full rebase) so a previous run's leftover never
