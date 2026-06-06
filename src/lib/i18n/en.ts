@@ -71,6 +71,8 @@ export const en = {
   'home.empty_title':                  'No instances',
   'home.empty_desc':                   'Create your first instance to get started playing Minecraft',
   'home.empty_cta':                    'Create Instance',
+  'home.instance_play_btn':            'PLAY',
+  'home.instance_never_played':        'Never played',
 
   // ── Accounts ────────────────────────────────────────────────
   'accounts.title':                    'Accounts',
@@ -203,6 +205,11 @@ export const en = {
   'settings.sign_out':                 'Sign Out',
   'settings.not_signed_in':            'Not signed in',
   'settings.sign_in_subtitle':         'Sign in to play Minecraft',
+  'settings.account_type_microsoft':   'Microsoft',
+  'settings.account_type_elyby':       'Ely.by',
+  'settings.account_type_offline':     'Offline',
+  'settings.account_subtitle_default': 'Default account \u2022 {type}',
+  'settings.account_manage_btn':       'Manage Accounts',
 
   'settings.java_path_title':          'Java Path',
   'settings.java_path_desc':           'Custom Java executable path (leave empty for auto-detect)',

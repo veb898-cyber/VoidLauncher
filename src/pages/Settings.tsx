@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useSettingsStore } from '../stores/settingsStore';
 import { useAuthStore } from '../stores/authStore';
+import { useAccountsStore } from '../stores/accountsStore';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { invoke } from '@tauri-apps/api/core';
@@ -27,6 +28,8 @@ export function Settings() {
   const detectJava = useSettingsStore((s) => s.detectJava);
   const detectSystemRam = useSettingsStore((s) => s.detectSystemRam);
   const { profile, isLoggedIn, logout } = useAuthStore();
+  const accounts = useAccountsStore((s) => s.accounts);
+  const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const [localConfig, setLocalConfig] = useState(config);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [clearingCache, setClearingCache] = useState(false);
@@ -34,6 +37,8 @@ export function Settings() {
   useEffect(() => {
     loadConfig();
     detectJava();
+    loadAccounts();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -82,45 +87,14 @@ export function Settings() {
       {/* Account Section */}
       <section className="settings-section">
         <h2 className="settings-section__title">{t('settings.section_account')}</h2>
-        <div className="glass-card" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xl)', padding: 'var(--space-xl)' }}>
-          {isLoggedIn && profile ? (
-            <>
-              <img
-                src={`https://mc-heads.net/avatar/${profile.id}/48`}
-                referrerPolicy="no-referrer"
-                alt={profile.name}
-                style={{ width: 48, height: 48, borderRadius: 'var(--radius-md)' }}
-              />
-              <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 600, fontSize: 'var(--font-size-lg)' }}>{profile.name}</div>
-                <div style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
-                  {t('settings.signed_in_as', { id: profile.id.substring(0, 8) })}
-                </div>
-              </div>
-              <button className="btn btn--danger" onClick={logout}>
-                {t('settings.sign_out')}
-              </button>
-            </>
-          ) : (
-            <>
-              <div style={{
-                width: 48, height: 48,
-                borderRadius: 'var(--radius-md)',
-                background: 'var(--surface-glass)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                color: 'var(--text-tertiary)',
-              }}>
-                ?
-              </div>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontWeight: 600 }}>{t('settings.not_signed_in')}</div>
-                <div style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
-                  {t('settings.sign_in_subtitle')}
-                </div>
-              </div>
-            </>
-          )}
-        </div>
+        <AccountCard
+          defaultAccountName={accounts.find((a) => a.default)?.name ?? null}
+          defaultAccountUuid={accounts.find((a) => a.default)?.uuid ?? null}
+          defaultAccountType={accounts.find((a) => a.default)?.account_type ?? null}
+          microsoftName={isLoggedIn && profile ? profile.name : null}
+          microsoftUuid={isLoggedIn && profile ? profile.id : null}
+          onSignOut={logout}
+        />
       </section>
 
       {/* Java Section */}
@@ -417,6 +391,99 @@ export function Settings() {
       </section>
 
       <LatestVersionSection />
+    </div>
+  );
+}
+
+interface AccountCardProps {
+  /** The user's default account, if any (any type). */
+  defaultAccountName: string | null;
+  defaultAccountUuid: string | null;
+  defaultAccountType: 'Microsoft' | 'Offline' | 'ElyBy' | null;
+  /** Fallback Microsoft profile from the auth store, when no default account
+   *  exists yet but the user is currently signed in to Microsoft. */
+  microsoftName: string | null;
+  microsoftUuid: string | null;
+  onSignOut: () => void;
+}
+
+/**
+ * Resolves which account to show in the Account section.
+ *
+ *   1. Default account from the accounts list (any type: Microsoft, Ely.by, Offline).
+ *   2. Fallback: legacy Microsoft profile from authStore.
+ *   3. No account at all.
+ *
+ * For Microsoft accounts, shows a "Sign Out" button (clears the cached
+ * Microsoft tokens). For Ely.by / Offline, no destructive action is
+ * exposed here — the user manages those in the Accounts tab.
+ */
+function AccountCard({
+  defaultAccountName,
+  defaultAccountUuid,
+  defaultAccountType,
+  microsoftName,
+  microsoftUuid,
+  onSignOut,
+}: AccountCardProps) {
+  const t = useT();
+
+  const typeLabelKey = defaultAccountType
+    ? defaultAccountType === 'Microsoft'
+      ? 'settings.account_type_microsoft'
+      : defaultAccountType === 'ElyBy'
+        ? 'settings.account_type_elyby'
+        : 'settings.account_type_offline'
+    : null;
+
+  const isMicrosoft = defaultAccountType === 'Microsoft';
+  const hasAccount = !!defaultAccountName || !!microsoftName;
+  const activeName = defaultAccountName ?? microsoftName ?? '';
+  const activeUuid = defaultAccountUuid ?? microsoftUuid ?? null;
+  const typeLabel = typeLabelKey ? t(typeLabelKey) : '';
+
+  return (
+    <div className="glass-card" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xl)', padding: 'var(--space-xl)' }}>
+      {hasAccount ? (
+        <>
+          <img
+            src={`https://mc-heads.net/avatar/${activeUuid}/48`}
+            referrerPolicy="no-referrer"
+            alt={activeName}
+            style={{ width: 48, height: 48, borderRadius: 'var(--radius-md)' }}
+          />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600, fontSize: 'var(--font-size-lg)' }}>{activeName}</div>
+            <div style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
+              {t('settings.account_subtitle_default', { type: typeLabel })}
+              {activeUuid ? ` \u2022 ${activeUuid.substring(0, 8)}\u2026` : ''}
+            </div>
+          </div>
+          {isMicrosoft && (
+            <button className="btn btn--danger" onClick={onSignOut}>
+              {t('settings.sign_out')}
+            </button>
+          )}
+        </>
+      ) : (
+        <>
+          <div style={{
+            width: 48, height: 48,
+            borderRadius: 'var(--radius-md)',
+            background: 'var(--surface-glass)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: 'var(--text-tertiary)',
+          }}>
+            ?
+          </div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600 }}>{t('settings.not_signed_in')}</div>
+            <div style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
+              {t('settings.sign_in_subtitle')}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

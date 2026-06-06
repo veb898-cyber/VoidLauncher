@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from 'react';
-import { Play, Plus, Package, Settings } from 'lucide-react';
+import { Play, Plus, Package, Settings, Clock } from 'lucide-react';
 import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore } from '../stores/accountsStore';
 import { useInstanceStore } from '../stores/instanceStore';
@@ -169,7 +169,7 @@ export function Home({ onNavigate }: HomeProps) {
             {instances.map((inst) => (
               <div
                 key={inst.name}
-                className="instance-card glass-card"
+                className="instance-card"
                 onClick={() => {
                   window.location.hash = `#/instances/${encodeURIComponent(inst.name)}`;
                   onNavigate('instances');
@@ -177,25 +177,50 @@ export function Home({ onNavigate }: HomeProps) {
                 role="button"
                 tabIndex={0}
               >
-                <div className="instance-card__icon">
-                  <Package size={32} />
+                <div className="instance-card__banner">
+                  <div className="instance-card__icon">
+                    {inst.icon ? (
+                      <img
+                        src={inst.icon}
+                        alt={inst.name}
+                        style={{ width: '100%', height: '100%', borderRadius: 'var(--radius-md)', objectFit: 'cover' }}
+                      />
+                    ) : (
+                      <Package size={24} />
+                    )}
+                  </div>
                 </div>
                 <div className="instance-card__body">
                   <div className="instance-card__name">{inst.name}</div>
                   <div className="instance-card__meta">
-                    <span>{inst.mc_version}</span>
+                    <span className="instance-card__version">{inst.mc_version}</span>
                     {inst.loader && inst.loader !== 'Vanilla' && (
-                      <span className="instance-card__loader">
+                      <span className={`instance-card__tag instance-card__tag--${inst.loader.toLowerCase()}`}>
                         {inst.loader}
                         {inst.loader_version ? ` ${inst.loader_version}` : ''}
                       </span>
                     )}
                   </div>
-                  {inst.play_time_seconds && inst.play_time_seconds > 0 && (
-                    <div className="instance-card__playtime">
-                      {formatPlayTime(inst.play_time_seconds * 1000)}
-                    </div>
-                  )}
+                </div>
+                <div className="instance-card__actions">
+                  <span className="instance-card__playtime">
+                    <Clock size={12} />
+                    {inst.play_time_seconds && inst.play_time_seconds > 0
+                      ? formatPlayTime(inst.play_time_seconds * 1000)
+                      : t('home.instance_never_played')}
+                  </span>
+                  <button
+                    className="instance-card__play"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      launchGame(inst.name);
+                    }}
+                    title={t('home.instance_play_btn')}
+                    disabled={isLaunching}
+                  >
+                    <Play size={14} fill="currentColor" />
+                    {t('home.instance_play_btn')}
+                  </button>
                 </div>
               </div>
             ))}

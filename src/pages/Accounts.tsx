@@ -206,8 +206,10 @@ export function Accounts() {
         </div>
       </Modal>
 
-      {/* Add Microsoft Modal — reuses the same login card as the main-menu "ВОЙТИ" page */}
-      <Modal open={showMicrosoftLogin} onClose={() => setShowMicrosoftLogin(false)} maxWidth={460}>
+      {/* Add Microsoft Modal — reuses the same login card as the main-menu "ВОЙТИ" page.
+          `bare` removes the dark blurred backdrop so this dialog looks identical
+          to the standalone Sign-In page, not like a "popover over dimmed content". */}
+      <Modal open={showMicrosoftLogin} onClose={() => setShowMicrosoftLogin(false)} maxWidth={460} bare>
         <MicrosoftLoginCard onSuccess={() => setShowMicrosoftLogin(false)} />
       </Modal>
     </div>

@@ -75,6 +75,8 @@ export const ru: Record<string, string> = {
   'home.empty_title':                  'Нет сборок',
   'home.empty_desc':                   'Создайте свою первую сборку, чтобы начать играть в Minecraft',
   'home.empty_cta':                    'Создать сборку',
+  'home.instance_play_btn':            'ИГРАТЬ',
+  'home.instance_never_played':        'Ещё не запускалась',
 
   // ── Accounts ────────────────────────────────────────────────
   'accounts.title':                    'Аккаунты',
@@ -207,6 +209,11 @@ export const ru: Record<string, string> = {
   'settings.sign_out':                 'Выйти',
   'settings.not_signed_in':            'Не вошёл',
   'settings.sign_in_subtitle':         'Войдите, чтобы играть в Minecraft',
+  'settings.account_type_microsoft':   'Microsoft',
+  'settings.account_type_elyby':       'Ely.by',
+  'settings.account_type_offline':     'Оффлайн',
+  'settings.account_subtitle_default': 'Активный аккаунт \u2022 {type}',
+  'settings.account_manage_btn':       'Управление аккаунтами',
 
   'settings.java_path_title':          'Путь к Java',
   'settings.java_path_desc':           'Путь к исполняемому файлу Java (оставьте пустым для автоопределения)',

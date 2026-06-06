@@ -7,9 +7,17 @@ interface ModalProps {
   children: ReactNode;
   footer?: ReactNode;
   maxWidth?: number;
+  /**
+   * `bare` removes the dark, blurred backdrop. The dialog still floats
+   * centered and click-outside / Escape still close it, but the page
+   * behind remains fully visible and interactive-look (no dim, no blur).
+   * Used by the Microsoft login card so the in-page dialog matches the
+   * standalone "ВОЙТИ" page exactly.
+   */
+  bare?: boolean;
 }
 
-export function Modal({ open, onClose, title, children, footer, maxWidth }: ModalProps) {
+export function Modal({ open, onClose, title, children, footer, maxWidth, bare }: ModalProps) {
   useEffect(() => {
     if (!open) return;
     const handler = (e: KeyboardEvent) => {
@@ -22,7 +30,10 @@ export function Modal({ open, onClose, title, children, footer, maxWidth }: Moda
   if (!open) return null;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div
+      className={bare ? 'modal-overlay modal-overlay--bare' : 'modal-overlay'}
+      onClick={onClose}
+    >
       <div
         className="modal animate-slide-up"
         onClick={(e) => e.stopPropagation()}

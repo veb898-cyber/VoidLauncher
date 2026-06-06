@@ -839,6 +839,47 @@ select option {
   justify-content: space-between;
   padding: var(--space-md) var(--space-lg);
   border-top: 1px solid var(--surface-border);
+  gap: var(--space-sm);
+}
+
+.instance-card__playtime {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.instance-card__play {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-xs) var(--space-md);
+  border-radius: var(--radius-full);
+  border: none;
+  background: var(--gradient-primary);
+  color: white;
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  box-shadow: 0 0 0 0 transparent;
+  flex-shrink: 0;
+}
+
+.instance-card__play:hover:not(:disabled) {
+  box-shadow: var(--glow-primary);
+  transform: translateY(-1px);
+}
+
+.instance-card__play:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* ============================
@@ -875,6 +916,18 @@ select option {
   justify-content: center;
   z-index: 1000;
   animation: fadeIn var(--transition-fast) ease-out;
+}
+
+/* Variant for dialogs that should float over the page without
+   dimming or blurring what's behind (e.g. the Microsoft login
+   card, which needs to look identical to the standalone
+   "ВОЙТИ" page). The overlay is still clickable for
+   click-outside-to-close, just invisible. */
+.modal-overlay--bare {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  animation: none;
 }
 
 .modal {
