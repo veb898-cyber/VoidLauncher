@@ -114,6 +114,12 @@ jobs:
           # Prefer the locally-installed CLI (already in node_modules after
           # the `npm ci` in the previous step). Fall back to the network
           # download if the local binary is missing.
+          #
+          # `tauri signer sign` in @tauri-apps/cli v2 takes:
+          #   -k / --key        : secret key file
+          #   -t / --trusted-comment : trusted comment line
+          #       --password    : key password (LONG FORM ONLY — there is no -w)
+          #   <FILE>            : file to sign (POSITIONAL, not -m)
           if [ -x node_modules/.bin/tauri ]; then
             SIGN_CMD=(node_modules/.bin/tauri signer sign)
             echo "Using local tauri CLI at node_modules/.bin/tauri"
@@ -123,9 +129,9 @@ jobs:
           fi
           "${SIGN_CMD[@]}" \
               -k "$KEY_FILE" \
-              -w "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
-              -m installer.exe \
-              -t "VoidLauncher $TAG"
+              --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
+              -t "VoidLauncher $TAG" \
+              installer.exe
 
           # ── 4. Extract the base64 signature (last non-empty line of the .minisig) ──
           if [ ! -f installer.exe.minisig ]; then
