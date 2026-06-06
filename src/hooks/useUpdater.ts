@@ -66,26 +66,37 @@ export function useUpdater() {
         return;
       }
 
-      let downloaded = 0;
-      let contentLength = 0;
+    let downloaded = 0;
+    let contentLength = 0;
+    let lastReportedPct = -1;
 
-      await update.downloadAndInstall((event) => {
-        switch (event.event) {
-          case 'Started':
-            contentLength = event.data.contentLength ?? 0;
-            break;
-          case 'Progress':
-            downloaded += event.data.chunkLength;
-            break;
-          case 'Finished':
-            break;
-        }
-      });
+    await update.downloadAndInstall((event) => {
+      switch (event.event) {
+        case 'Started':
+          contentLength = event.data.contentLength ?? 0;
+          break;
+        case 'Progress':
+          downloaded += event.data.chunkLength;
+          if (contentLength > 0) {
+            const pct = Math.min(99, Math.round((downloaded / contentLength) * 100));
+            // Throttle state updates: only re-render when the rounded percent
+            // changes. Otherwise we get a setState storm on a fast link
+            // (every chunk is one update), which janks the progress bar.
+            if (pct !== lastReportedPct) {
+              lastReportedPct = pct;
+              setState((s) => ({ ...s, downloadProgress: pct }));
+            }
+          }
+          break;
+        case 'Finished':
+          break;
+      }
+    });
 
-      const pct = contentLength > 0 ? Math.round((downloaded / contentLength) * 100) : 100;
-      setState((s) => ({ ...s, downloading: false, installing: true, downloadProgress: pct }));
+    setState((s) => ({ ...s, downloadProgress: 100 }));
+    setState((s) => ({ ...s, downloading: false, installing: true }));
 
-      await relaunch();
+    await relaunch();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('Update failed:', err);

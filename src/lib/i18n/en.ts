@@ -244,9 +244,18 @@ export const en = {
 
   'settings.section_about':            'About',
   'settings.about_name':               'VoidLauncher',
-  'settings.about_version':            'v0.1.0',
+  'settings.about_version':            'v{version}',
   'settings.about_desc':               'A premium Minecraft launcher built with Tauri v2 and React.',
   'settings.about_disclaimer':         'Not affiliated with Mojang Studios or Microsoft Corporation.',
+
+  // Latest version (remote check)
+  'settings.latest_version_label':     'Latest available',
+  'settings.latest_version_current':   'Installed',
+  'settings.latest_version_checking':  'Checking…',
+  'settings.latest_version_up_to_date':'You are on the latest version',
+  'settings.latest_version_available': 'Update available: v{version}',
+  'settings.latest_version_check_btn': 'Check for updates',
+  'settings.latest_version_failed':    'Could not fetch version info',
 
   // Java detection
   'settings.java_detected_heading':    'Detected Java Installations',

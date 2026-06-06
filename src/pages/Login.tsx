@@ -40,6 +40,7 @@ export function Login({ onNavigate }: LoginProps) {
     return () => {
       if (pollInterval.current) {
         clearInterval(pollInterval.current);
+        pollInterval.current = null;
       }
     };
   }, [userCode, isLoggedIn]);

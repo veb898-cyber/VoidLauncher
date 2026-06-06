@@ -248,9 +248,18 @@ export const ru: Record<string, string> = {
 
   'settings.section_about':            'О программе',
   'settings.about_name':               'VoidLauncher',
-  'settings.about_version':            'v0.1.0',
+  'settings.about_version':            'v{version}',
   'settings.about_desc':               'Премиум-лаунчер Minecraft на Tauri v2 и React.',
   'settings.about_disclaimer':         'Не аффилирован с Mojang Studios или Microsoft Corporation.',
+
+  // Latest version (remote check)
+  'settings.latest_version_label':     'Актуальная версия',
+  'settings.latest_version_current':   'Установлена',
+  'settings.latest_version_checking':  'Проверка…',
+  'settings.latest_version_up_to_date':'Установлена последняя версия',
+  'settings.latest_version_available': 'Доступно обновление: v{version}',
+  'settings.latest_version_check_btn': 'Проверить обновления',
+  'settings.latest_version_failed':    'Не удалось получить информацию о версии',
 
   // Java detection
   'settings.java_detected_heading':    'Обнаруженные установки Java',
