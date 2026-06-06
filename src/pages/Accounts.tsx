@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore, type AccountEntry } from '../stores/accountsStore';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Modal } from '../components/ui/Modal';
+import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
 import { addToast } from '../components/ui/Toast';
 import { t } from '../lib/i18n';
 
@@ -39,8 +39,7 @@ function validateOfflineUsername(name: string): string | null {
 
 export function Accounts() {
   const { accounts, loadAccounts, addOfflineAccount, addElybyAccount, removeAccount, setDefaultAccount, changeSkin } = useAccountsStore();
-  const { isLoggedIn, startLogin, pollLogin, userCode, verificationUri } = useAuthStore();
-  const pollInterval = useRef<number | null>(null);
+  const { isLoggedIn } = useAuthStore();
 
   const [showAddOffline, setShowOffline] = useState(false);
   const [offlineName, setOfflineName] = useState('');
@@ -48,30 +47,18 @@ export function Accounts() {
   const [showAddElyby, setShowElyby] = useState(false);
   const [elybyUser, setElybyUser] = useState('');
   const [elybyPass, setElybyPass] = useState('');
+  const [showMicrosoftLogin, setShowMicrosoftLogin] = useState(false);
 
-  useEffect(() => { loadAccounts(); }, []);
+  useEffect(() => { loadAccounts(); }, [loadAccounts]);
 
-  // Poll for Microsoft login completion
-  useEffect(() => {
-    if (userCode && !isLoggedIn) {
-      pollInterval.current = window.setInterval(() => {
-        pollLogin();
-      }, 5000);
-    }
-    return () => {
-      if (pollInterval.current) {
-        clearInterval(pollInterval.current);
-        pollInterval.current = null;
-      }
-    };
-  }, [userCode, isLoggedIn]);
-
-  // Reload accounts when login state changes
+  // Reload accounts when Microsoft login completes so the new
+  // Microsoft entry shows up in the list and the modal closes.
   useEffect(() => {
     if (isLoggedIn) {
       loadAccounts();
+      setShowMicrosoftLogin(false);
     }
-  }, [isLoggedIn]);
+  }, [isLoggedIn, loadAccounts]);
 
   const handleAddOffline = async () => {
     if (offlineNameError) {
@@ -134,34 +121,12 @@ export function Accounts() {
           <Button onClick={() => setShowOffline(true)}>{t('accounts.btn_add_offline')}</Button>
           <Button onClick={() => setShowElyby(true)} variant="secondary">{t('accounts.btn_add_elyby')}</Button>
           {!isLoggedIn && (
-            <Button onClick={startLogin} variant="primary">
+            <Button onClick={() => setShowMicrosoftLogin(true)} variant="primary">
               {t('accounts.btn_add_microsoft')}
             </Button>
           )}
         </div>
       </div>
-
-      {/* Microsoft login in progress */}
-      {userCode && (
-        <div className="glass-card" style={{ padding: 'var(--space-xl)', marginBottom: 'var(--space-lg)', textAlign: 'center' }}>
-          <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-md)' }}>
-            {t('accounts.login_status')}
-          </p>
-          <div style={{
-            fontSize: 'var(--font-size-3xl)', fontWeight: 800, letterSpacing: '4px',
-            fontFamily: 'monospace',
-            background: 'var(--gradient-primary)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
-            marginBottom: 'var(--space-sm)',
-          }}>
-            {userCode}
-          </div>
-          <div style={{ display: 'flex', gap: 'var(--space-sm)', justifyContent: 'center' }}>
-              <Button onClick={async () => { if (verificationUri) await openUrl(verificationUri); }}>
-                {t('accounts.btn_open_login')}
-              </Button>
-          </div>
-        </div>
-      )}
 
       {/* Accounts list */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
@@ -239,6 +204,11 @@ export function Accounts() {
           <Button variant="ghost" onClick={() => setShowElyby(false)}>{t('common.cancel')}</Button>
           <Button onClick={handleAddElyby} disabled={!elybyUser.trim() || !elybyPass.trim()}>{t('common.add')}</Button>
         </div>
+      </Modal>
+
+      {/* Add Microsoft Modal — reuses the same login card as the main-menu "ВОЙТИ" page */}
+      <Modal open={showMicrosoftLogin} onClose={() => setShowMicrosoftLogin(false)} maxWidth={460}>
+        <MicrosoftLoginCard onSuccess={() => setShowMicrosoftLogin(false)} />
       </Modal>
     </div>
   );

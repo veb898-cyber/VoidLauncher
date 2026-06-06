@@ -7,6 +7,7 @@ import { UpdaterModal } from './components/UpdaterModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useAuthStore } from './stores/authStore';
 import { useSettingsStore } from './stores/settingsStore';
+import { useAccountsStore } from './stores/accountsStore';
 import { useGameEvents } from './hooks/useGameEvents';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useFocusStore } from './stores/focusStore';
@@ -26,11 +27,13 @@ function App() {
   const [activePage, setActivePage] = useState('home');
   const { checkAuth } = useAuthStore();
   const { loadConfig } = useSettingsStore();
+  const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const isFrozen = useFocusStore((s) => s.isFrozen);
 
   useEffect(() => {
     checkAuth();
     loadConfig();
+    loadAccounts();
     const splash = document.getElementById('splash');
     if (splash) {
       splash.classList.add('fade-out');
