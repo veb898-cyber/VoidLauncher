@@ -191,30 +191,26 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # actions/checkout on a tag push leaves the runner in a detached
-          # HEAD at the tag commit, with no local `main` branch. We don't
-          # need to be on `main` for what follows — we just need to make
-          # a new commit on top of the current HEAD and push it to
-          # origin/main (the very last line).
+          # The previous step (Sign installer and generate latest.json)
+          # already wrote a freshly built, conflict-free latest.json into
+          # the working tree. We just need to sanity-check, commit, and
+          # push.
 
-          # Fetch + reset ONLY `latest.json` to whatever is on origin/main
-          # (not a full rebase) so a previous run's leftover never
-          # produces a merge conflict — and the file never ends up with
-          # `<<<<<<<` / `=======` / `>>>>>>>` markers in `main`.
-          # The freshly generated `latest.json` from the earlier step
-          # is then re-added on top and committed.
-          git fetch origin main
-          git checkout FETCH_HEAD -- latest.json
-          git add latest.json
+          # actions/checkout on a tag push leaves the runner in a
+          # detached HEAD at the tag commit, with no local `main`
+          # branch. We don't need to be on `main` for this step —
+          # the very last line already pushes HEAD (the new commit
+          # on top of the current tag) to origin:main.
 
           # Sanity guard: if the file ever does contain a conflict
           # marker (e.g. someone manually committed a half-resolved
           # file), fail loudly instead of shipping a broken updater
           # manifest.
           if grep -E '^(<{7}|={7}|>{7})' latest.json >/dev/null 2>&1; then
-            echo "::error::latest.json contains merge conflict markers after stage. Aborting."
+            echo "::error::latest.json contains merge conflict markers. Aborting."
             exit 1
           fi
 
+          git add latest.json
           git commit -m "chore: update latest.json for ${{ github.ref_name }}" || echo "No changes to commit"
           git push origin HEAD:main
