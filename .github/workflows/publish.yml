@@ -58,64 +58,84 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAG: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
+          # -x: print every command before it runs (CI log will show exactly
+          #     where the script died, which is what we need to debug).
+          set -euxo pipefail
 
           TAG_NO_V="${TAG#v}"
           INSTALLER="VoidLauncher_${TAG_NO_V}_x64-setup.exe"
           KEY_FILE="secret.key"
 
-          echo "Tag: $TAG"
-          echo "Installer: $INSTALLER"
+          echo "Tag:           $TAG"
+          echo "Installer:     $INSTALLER"
+          echo "OS:            $(uname -a)"
+          echo "Secret length: ${#TAURI_SIGNING_PRIVATE_KEY}"
+          echo "Secret first 4 chars (hex): $(printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | head -c 4 | od -An -tx1 | tr -d ' \n')"
 
           # ── 1. Fetch the freshly-uploaded installer from the release ──
-          echo "::group::Downloading installer"
           gh release download "$TAG" --pattern "$INSTALLER" --output installer.exe
           ls -la installer.exe
-          echo "::endgroup::"
 
           # ── 2. Materialize the minisign key file from the secret ──
           # The secret can be in one of two shapes:
-          #   (a) the raw minisign key text (starts with "untrusted comment:") — what tauri-action expects
-          #   (b) base64-encoded text of the key file (i.e. the contents of a file that
-          #       was created by piping `tauri signer generate` through `base64`)
-          # Try (b) first; fall back to (a). The file we write must look like a
-          # normal minisign key file, or `tauri signer sign` will reject it
-          # with a confusing error.
-          echo "::group::Materializing key"
-          KEY_SOURCE="unknown"
-          # Write the secret as raw bytes to a temp file (so CRLF / trailing
-          # newlines are preserved exactly), then try base64-decoding that.
+          #   (a) the raw minisign key text (starts with "untrusted comment:")
+          #   (b) base64-encoded text of the key file
+          # Try (b) first; fall back to (a).
+          # `set -e` is suspended for the candidate blocks because each of them
+          # is allowed to "fail" (returns non-zero) when the candidate isn't the
+          # right format.
           printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > raw.txt
-          if base64 -d < raw.txt > "$KEY_FILE" 2>/dev/null && head -1 "$KEY_FILE" | grep -q "^untrusted comment:"; then
-            KEY_SOURCE="base64-decoded"
-          elif head -1 raw.txt | grep -q "^untrusted comment:"; then
-            cp raw.txt "$KEY_FILE"
-            KEY_SOURCE="raw minisign text"
-          else
-            echo "::error::TAURI_SIGNING_PRIVATE_KEY is neither a base64-encoded minisign key nor a raw minisign key file (no 'untrusted comment:' header in either form). Update the secret and re-run."
-            head -3 raw.txt || true
+          KEY_SOURCE="unknown"
+          set +e
+            base64 -d < raw.txt > "$KEY_FILE" 2>/dev/null
+            base64_rc=$?
+            if [ $base64_rc -eq 0 ] && head -1 "$KEY_FILE" | grep -q "^untrusted comment:"; then
+              KEY_SOURCE="base64-decoded"
+            elif head -1 raw.txt | grep -q "^untrusted comment:"; then
+              cp raw.txt "$KEY_FILE"
+              KEY_SOURCE="raw minisign text"
+            fi
+          set -e
+          rm -f raw.txt
+
+          if [ "$KEY_SOURCE" = "unknown" ]; then
+            {
+              echo "::error::TAURI_SIGNING_PRIVATE_KEY is neither a base64-encoded minisign key nor a raw minisign key file."
+              echo "::error::The first 3 lines of the secret as it appears in the env var:"
+              printf '%s\n' "$TAURI_SIGNING_PRIVATE_KEY" | head -3 | sed 's/^/::error::  /'
+            } >&2
             exit 1
           fi
-          rm -f raw.txt
           echo "Key source: $KEY_SOURCE"
           ls -la "$KEY_FILE"
-          echo "::endgroup::"
+          head -2 "$KEY_FILE" | sed 's/^/key> /'
 
           # ── 3. Sign the installer ──
-          echo "::group::Signing installer"
-          npx --yes @tauri-apps/cli@latest signer sign \
+          # Prefer the locally-installed CLI (already in node_modules after
+          # the `npm ci` in the previous step). Fall back to the network
+          # download if the local binary is missing.
+          if [ -x node_modules/.bin/tauri ]; then
+            SIGN_CMD=(node_modules/.bin/tauri signer sign)
+            echo "Using local tauri CLI at node_modules/.bin/tauri"
+          else
+            SIGN_CMD=(npx --yes @tauri-apps/cli signer sign)
+            echo "Local tauri CLI not found, will use npx"
+          fi
+          "${SIGN_CMD[@]}" \
               -k "$KEY_FILE" \
               -w "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
               -m installer.exe \
               -t "VoidLauncher $TAG"
-          echo "::endgroup::"
 
           # ── 4. Extract the base64 signature (last non-empty line of the .minisig) ──
           if [ ! -f installer.exe.minisig ]; then
             echo "::error::Signing produced no .minisig file"
+            ls -la
             exit 1
           fi
+          echo "::group::.minisig contents"
           cat installer.exe.minisig
+          echo "::endgroup::"
           SIGNATURE=$(grep -v '^[[:space:]]*$' installer.exe.minisig | tail -1 | tr -d '\r\n')
           echo "Signature length: ${#SIGNATURE}"
           if [ ${#SIGNATURE} -lt 80 ]; then
