@@ -31,49 +31,114 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Build the installer. We deliberately do NOT pass
+      # `includeUpdaterJson: true` here: when that step's internal signing
+      # fails (wrong TAURI_SIGNING_PRIVATE_KEY secret, etc.) tauri-action
+      # silently skips attaching latest.json, and the auto-updater ends up
+      # with a half-broken release. We do the signing ourselves in the next
+      # step so any failure is loud and visible in the CI log.
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: src-tauri
           tagName: ${{ github.ref_name }}
           releaseName: "VoidLauncher ${{ github.ref_name }}"
-          releaseBody: "See the assets below for the installer and update file."
+          releaseBody: "See the assets below for the installer."
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
 
-      - name: Download latest.json from release
-        id: download_json
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download "${{ github.ref_name }}" --pattern "latest.json" --output latest.json
-        continue-on-error: true
-
-      - name: Generate latest.json manually if download failed
-        if: steps.download_json.outcome == 'failure' || !hashFiles('latest.json')
+      - name: Sign installer and generate latest.json
         shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $version = $tag -replace '^v', ''
-          $installerName = "VoidLauncher_${version}_x64-setup.exe"
-          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$installerName"
-          $json = @{
-            version     = $version
-            notes       = "Release $tag"
-            pub_date    = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
-            platforms   = @{
+          $ErrorActionPreference = "Stop"
+
+          $tag        = "${{ github.ref_name }}"
+          $version    = $tag -replace '^v', ''
+          $installer  = "VoidLauncher_${version}_x64-setup.exe"
+
+          # ── 1. Fetch the freshly-uploaded installer from the release ──
+          Write-Host "Downloading $installer from release $tag"
+          gh release download $tag --pattern $installer --output installer.exe
+
+          # ── 2. Materialize the minisign key file from the secret ──
+          # The secret can be in one of two shapes:
+          #   (a) the raw minisign key text (starts with "untrusted comment:") — what tauri-action expects
+          #   (b) base64-encoded text of the key file (i.e. the contents of a file that
+          #       was created by piping `tauri signer generate` through `base64`)
+          # Try (b) first; fall back to (a). Either way, the file we write must
+          # look like a normal minisign key file, or `tauri signer sign` will
+          # reject it with a confusing error.
+          $raw = $env:TAURI_SIGNING_PRIVATE_KEY
+          $keyText = $null
+          try {
+            $bytes = [System.Convert]::FromBase64String($raw.Trim())
+            $decoded = [System.Text.Encoding]::UTF8.GetString($bytes)
+            if ($decoded -match '(?m)^untrusted comment:') {
+              $keyText = $decoded
+              Write-Host "Secret decoded as base64 → looks like a minisign key"
+            }
+          } catch {
+            # Not valid base64 — that's fine, try treating it as raw key text.
+          }
+          if ($null -eq $keyText) {
+            if ($raw -match '(?m)^untrusted comment:') {
+              $keyText = $raw
+              Write-Host "Secret used as raw minisign key text"
+            } else {
+              Write-Error "TAURI_SIGNING_PRIVATE_KEY is neither a base64-encoded minisign key nor a raw minisign key (no 'untrusted comment:' header). Fix the secret and re-run."
+              exit 1
+            }
+          }
+          [System.IO.File]::WriteAllText("tauri.key", $keyText)
+          [System.IO.File]::WriteAllText("tauri.key.password", $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
+
+          # ── 3. Sign the installer ──
+          Write-Host "Signing installer..."
+          npx --yes @tauri-apps/cli signer sign `
+              -k tauri.key `
+              -W tauri.key.password `
+              -m installer.exe `
+              -t "VoidLauncher $tag"
+
+          # ── 4. Extract the base64 signature (3rd line of the .minisig file) ──
+          $sigLines = Get-Content "installer.exe.minisig"
+          $signature = ($sigLines | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 1).Trim()
+          if ($signature.Length -lt 80) {
+            Write-Error "Signature looks too short / invalid: '$signature'"
+            exit 1
+          }
+          if ($signature -notmatch '^[A-Za-z0-9+/=]+$') {
+            Write-Error "Signature is not valid base64: '$signature'"
+            exit 1
+          }
+          Write-Host "Got signature (length=$($signature.Length))"
+
+          # ── 5. Generate latest.json ──
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$installer"
+          $latestJson = @{
+            version   = $version
+            notes     = "Release $tag"
+            pub_date  = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
+            platforms = @{
               "windows-x86_64" = @{
-                signature = "PLACEHOLDER_SIGNATURE"
+                signature = $signature
                 url       = $url
               }
             }
           } | ConvertTo-Json -Depth 10
-          $json | Out-File -FilePath latest.json -Encoding UTF8
-          Write-Host "Generated latest.json with placeholder signature"
+          [System.IO.File]::WriteAllText("latest.json", $latestJson)
+
+          Write-Host "::group::latest.json"
+          Get-Content "latest.json"
+          Write-Host "::endgroup::"
+
+          # ── 6. Cleanup secrets & intermediates ──
+          Remove-Item "tauri.key", "tauri.key.password", "installer.exe", "installer.exe.minisig" -ErrorAction SilentlyContinue
 
       - name: Commit latest.json to main
         run: |
