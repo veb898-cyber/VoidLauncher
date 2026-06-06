@@ -1045,9 +1045,12 @@ async fn cmd_launch_game(
 
             let version_path = config.versions_dir().join(&instance.mc_version).join(format!("{}.json", instance.mc_version));
             events::emit_log(&app, "info", "launch", &format!("Loading version info from {:?}", version_path));
-            let version_info = versions::fetch_version_info(&version_path.to_string_lossy())
-                .await
-                .map_err(|e| e.to_string())?;
+            let version_info = versions::version_info_from_file(&version_path)
+                .map_err(|e| {
+                    let msg = format!("Failed to load version info from {:?}: {}", version_path, e);
+                    events::emit_log(&app, "error", "launch", &msg);
+                    msg
+                })?;
 
             events::emit_log(&app, "info", "launch", "Building classpath and launching Java...");
             launch::launch_minecraft(
@@ -1104,9 +1107,12 @@ async fn cmd_launch_game(
 
             let version_path = config.versions_dir().join(&instance.mc_version).join(format!("{}.json", instance.mc_version));
             events::emit_log(&app, "info", "launch", &format!("Loading version info from {:?}", version_path));
-            let version_info = versions::fetch_version_info(&version_path.to_string_lossy())
-                .await
-                .map_err(|e| e.to_string())?;
+            let version_info = versions::version_info_from_file(&version_path)
+                .map_err(|e| {
+                    let msg = format!("Failed to load version info from {:?}: {}", version_path, e);
+                    events::emit_log(&app, "error", "launch", &msg);
+                    msg
+                })?;
 
             events::emit_log(&app, "info", "launch", "Building classpath and launching Java (offline)...");
             launch::launch_minecraft(

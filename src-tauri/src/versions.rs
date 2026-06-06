@@ -344,7 +344,6 @@ pub fn collect_downloads(
 }
 
 /// Load version info from file
-#[allow(dead_code)]
 pub fn version_info_from_file(path: &PathBuf) -> Result<VersionInfo> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| LauncherError::Version(format!("Failed to read version file: {}", e)))?;
