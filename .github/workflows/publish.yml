@@ -185,6 +185,7 @@ jobs:
           rm -f raw_secret.txt decoded.txt installer.exe installer.exe.sig
 
       - name: Commit latest.json to main
+        shell: bash
         run: |
           set -eu
           git config user.name "github-actions[bot]"
