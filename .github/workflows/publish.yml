@@ -52,6 +52,8 @@ jobs:
       - name: Sign installer and generate latest.json
         shell: pwsh
         env:
+          # Required for `gh release download` inside Actions.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
@@ -95,17 +97,22 @@ jobs:
             }
           }
           [System.IO.File]::WriteAllText("tauri.key", $keyText)
-          [System.IO.File]::WriteAllText("tauri.key.password", $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)
 
           # ── 3. Sign the installer ──
+          # `tauri signer sign` takes the password inline via `-w` (not `-W`).
+          # There is no `--password-file` flag, so the password is passed as a
+          # command-line argument. The user's password is a simple ASCII string
+          # so this is safe; if it ever changes, the quoting here will need to
+          # match.
+          $password = $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
           Write-Host "Signing installer..."
           npx --yes @tauri-apps/cli signer sign `
               -k tauri.key `
-              -W tauri.key.password `
+              -w $password `
               -m installer.exe `
               -t "VoidLauncher $tag"
 
-          # ── 4. Extract the base64 signature (3rd line of the .minisig file) ──
+          # ── 4. Extract the base64 signature (last non-empty line of the .minisig) ──
           $sigLines = Get-Content "installer.exe.minisig"
           $signature = ($sigLines | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 1).Trim()
           if ($signature.Length -lt 80) {
@@ -138,7 +145,7 @@ jobs:
           Write-Host "::endgroup::"
 
           # ── 6. Cleanup secrets & intermediates ──
-          Remove-Item "tauri.key", "tauri.key.password", "installer.exe", "installer.exe.minisig" -ErrorAction SilentlyContinue
+          Remove-Item "tauri.key", "installer.exe", "installer.exe.minisig" -ErrorAction SilentlyContinue
 
       - name: Commit latest.json to main
         run: |
