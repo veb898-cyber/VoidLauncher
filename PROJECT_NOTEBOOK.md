@@ -1,544 +1,386 @@
 # PROJECT_NOTEBOOK.md — VoidLauncher
 
-> **Единый "Живой Блокнот Проекта"** — создан для того, чтобы любой ИИ (включая тебя же в будущем) мгновенно понимал весь контекст проекта без дополнительного анализа кода. Обновляй при каждом значимом изменении.
+> **Единый "Живой Блокнот Проекта"** — мгновенный контекст для любого ИИ, который подключится к проекту. Только то, что **есть в коде прямо сейчас**. Никаких планов, гипотез и wishlist'ов.
 
 ---
 
-## 1. Общая информация и глобальная цель
+## ⚠️ PRODUCTION STATUS — ВАЖНО ДЛЯ ЛЮБОГО ИИ
+
+**VoidLauncher v0.1.0 — это СТАБИЛЬНЫЙ РЕЛИЗ, который прямо сейчас используют реальные люди** (личный лаунчер автора для друзей).
+
+**Правила для любых изменений:**
+
+1. **main = production.** Ветка `main` находится в активной эксплуатации. Не делай в ней breaking changes «по приколу».
+2. **Любое изменение протокола подписи/апдейтера, capabilities, CSP, auth-flow или структуры данных на диске — потенциально ломает установленные у пользователей копии.** Если такое изменение необходимо, опиши риск пользователю и согласуй перед коммитом.
+3. **Секреты репозитория (`TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) — это production-криптография.** Потеря приватного ключа = невозможность подписать следующий релиз = пользователи не получат автообновления. Не трогай workflow подписи без подтверждения от пользователя.
+4. **Версия в `package.json`, `src-tauri/tauri.conf.json` и `src-tauri/Cargo.toml` должна совпадать.** Рассинхрон → пользователи увидят `latest.json` с одной версией, а бинарь — с другой.
+5. **Локализация.** Все user-facing строки — через `t()` / `useT()`. Хардкод EN-текста в JSX = регрессия.
+6. **CSP / capabilities / allowlist хостов** — это защита от SSRF, path traversal, mixed-content. Не ослабляй, не добавляй wildcard'ы.
+7. **Перед тегами `v*`:** подпись релиза работает только при наличии обоих секретов и корректного `latest.json` в `main`. CI стартует автоматически — `git push --delete` + `git push` нового тега = новый релиз. Не делай «случайных» тегов.
+
+---
+
+## 1. Общая информация
 
 | Поле | Значение |
 |---|---|
 | **Название** | VoidLauncher |
-| **Описание** | Кастомный лаунчер Minecraft для Windows |
-| **Для кого** | Для друзей разработчика (персональное использование) |
-| **Версия** | 0.1.2 (активная разработка) |
-| **Репозиторий** | https://github.com/veb898-cyber/VoidLauncher |
-| **Платформа** | Windows 10/11 (x86_64) |
-| **Язык UI** | English (по умолчанию) + Русский (переключаемый) |
+| **Тип** | Кастомный лаунчер Minecraft для Windows |
+| **Версия** | `0.1.0` (см. `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`) |
+| **Репозиторий** | https://github.com/veb898-cyber/VoidLauncher (public, ветка `main`) |
+| **Платформа** | Windows 10/11 (x86_64), NSIS-установщик, per-user install |
+| **UI языки** | English (по умолчанию) + Русский (переключаемый в Settings) |
 
-### Глобальная цель
-Создать удобный, быстрый и красивый лаунчер Minecraft с:
-- Поддержкой Microsoft, Ely.by и оффлайн аккаунтов
-- Модами (Fabric, Quilt, Forge, NeoForge) и их установкой из Modrinth/CurseForge
-- Автообновлениями (без прав админа)
-- Полной локализацией EN/RU
-- Автоматической сборкой и релизами через CI/CD
+**Глобальная цель:** удобный, быстрый лаунчер Minecraft с модами (Fabric/Quilt/Forge/NeoForge), мод-браузером Modrinth, аккаунтами Microsoft / Ely.by / Offline, автообновлениями без UAC и тихим CI/CD.
 
 ---
 
 ## 2. Технологический стек
 
 ### Backend (Tauri / Rust)
-| Компонент | Версия |
-|---|---|
-| **Tauri** | 2.x (`tauri = "2"`) |
-| **Rust edition** | 2021 |
-| **tauri-build** | 2.x |
-| **serde / serde_json** | 1.x |
-| **reqwest** | 0.12 (json, stream) |
-| **tokio** | 1.x (full) |
-| **zip** | 2.x |
-| **chrono** | 0.4 (serde) |
-| **sysinfo** | 0.33 |
-| **notify** | 6.x (file watcher) |
-| **thiserror** | 2.x |
-| **sha1** | 0.10 |
-| **uuid** | 1.x (v4) |
+
+| Компонент | Версия | Назначение |
+|---|---|---|
+| `tauri` | `2` | Главный фреймворк |
+| `tauri-build` | `2` | Build-time кодогенерация |
+| `tauri-plugin-opener` | `2` | Открытие URL в системном браузере |
+| `tauri-plugin-shell` | `2` | Запуск внешних команд |
+| `tauri-plugin-dialog` | `2` | Нативные диалоги выбора файлов |
+| `tauri-plugin-process` | `2` | `relaunch()` для автообновления |
+| `tauri-plugin-fs` | `2` | Чтение/запись файловой системы (scoped) |
+| `tauri-plugin-updater` | `2` | Автообновления + проверка подписи minisign |
+| `serde` / `serde_json` | `1` | Сериализация |
+| `reqwest` | `0.12` (`json`, `stream`) | HTTP-клиент (Mojang, Modrinth, CurseForge, Ely.by) |
+| `tokio` | `1` (`full`) | Async runtime |
+| `zip` | `2` | Распаковка jar/zip |
+| `chrono` | `0.4` (`serde`) | Дата/время |
+| `sysinfo` | `0.33` | RAM detection |
+| `notify` + `notify-debouncer-mini` | `6` / `0.4` | Watcher для `mods/`, `resourcepacks/`, `shaderpacks/` |
+| `thiserror` | `2` | Кастомные ошибки |
+| `sha1` | `0.10` | Хеширование |
+| `uuid` | `1` (`v4`) | Offline-UUID |
+| `dirs` | `6` | Кросс-платформенные пути |
+| `hex` | `0.4` | hex-кодирование |
+| `urlencoding` | `2` | URL-кодирование |
+| `futures` | `0.3` | Async helpers |
+
+Rust edition `2021`. Release-профиль: `strip = true`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `opt-level = "s"`.
 
 ### Frontend (React / TypeScript)
+
 | Компонент | Версия |
 |---|---|
-| **React** | 19.x |
-| **TypeScript** | 5.8.x |
-| **Vite** | 7.x |
-| **Zustand** | 5.x (state management) |
-| **lucide-react** | 1.16+ (иконки) |
-| **marked** | 18.x (Markdown рендеринг) |
-| **DOMPurify** | 3.x (санитайзинг HTML) |
-| **react-router-dom** | 7.x |
-
-### Tauri плагины (Rust side)
-| Плагин | Версия | Назначение |
-|---|---|---|
-| `tauri-plugin-opener` | 2.x | Открытие ссылок в системном браузере |
-| `tauri-plugin-shell` | 2.x | Запуск внешних команд |
-| `tauri-plugin-dialog` | 2.x | Нативные диалоги (выбор файлов) |
-| `tauri-plugin-process` | 2.x | `relaunch()` для автообновления |
-| `tauri-plugin-fs` | 2.x | Чтение/запись файловой системы |
-| `tauri-plugin-updater` | 2.x | Автоматические обновления + подпись |
-
-### Tauri плагины (Frontend side)
-| Пакет | Версия |
-|---|---|
-| `@tauri-apps/api` | ^2 |
-| `@tauri-apps/plugin-dialog` | ^2.7.1 |
-| `@tauri-apps/plugin-fs` | ^2.5.1 |
-| `@tauri-apps/plugin-opener` | ^2 |
-| `@tauri-apps/plugin-process` | ^2.3.1 |
-| `@tauri-apps/plugin-shell` | ^2.3.5 |
-| `@tauri-apps/plugin-updater` | ^2.10.1 |
-
-### Сборка и dev体验
-| Инструмент | Назначение |
-|---|---|
-| **Vite** | Bundler для фронтенда |
-| **npm** | Менеджер пакетов |
-| **cargo** | Rust toolchain |
-| **@tauri-apps/cli** | ^2 (CLI для `npm run tauri`) |
-
-### Release profile (Cargo)
-```toml
-[profile.release]
-strip = true      # Удаление символов
-lto = true        # Link-Time Optimization
-codegen-units = 1 # Максимальная оптимизация
-panic = "abort"   # Нет unwinding
-opt-level = "s"   # Оптимизация по размеру
-```
+| `react` / `react-dom` | `^19.1.0` |
+| `typescript` | `~5.8.3` |
+| `vite` | `^7.0.4` |
+| `@vitejs/plugin-react` | `^4.6.0` |
+| `zustand` | `^5.0.13` (state management) |
+| `react-router-dom` | `^7.15.1` |
+| `lucide-react` | `^1.16.0` (иконки) |
+| `marked` | `^18.0.4` (Markdown в описаниях) |
+| `dompurify` | `^3.4.7` (санитайзинг HTML) |
+| `@tauri-apps/api` | `^2` |
+| `@tauri-apps/plugin-dialog` | `^2.7.1` |
+| `@tauri-apps/plugin-fs` | `^2.5.1` |
+| `@tauri-apps/plugin-opener` | `^2` |
+| `@tauri-apps/plugin-process` | `^2.3.1` |
+| `@tauri-apps/plugin-shell` | `^2.3.5` |
+| `@tauri-apps/plugin-updater` | `^2.10.1` |
+| `@tauri-apps/cli` | `^2` (devDep) |
 
 ---
 
-## 3. Архитектура бэкенда (Tauri / Rust)
-
-### Структура файлов `src-tauri/src/`
+## 3. Архитектура бэкенда (`src-tauri/src/`)
 
 ```
 src-tauri/src/
 ├── main.rs              # Точка входа (вызывает lib::run)
-├── lib.rs               # Основной модуль: AppState, все Tauri commands, Builder
-├── config.rs            # AppConfig (JSON конфиг), recommended_memory_mb, detect_total_ram_mb
-├── auth.rs              # Microsoft OAuth2 Device Code Flow, Ely.by, токены
-├── accounts.rs          # Управление аккаунтами (Microsoft, Offline, Ely.by) в accounts.json
-├── instances.rs         # CRUD инстансов (instance.json), моды, скриншоты, миры
-├── launch.rs            # Сборка JVM аргументов, classpath, запуск Java процесса
-├── jvm.rs               # GC presets (Standard/G1GC/ZGC), strip_gc_selection_flags
-├── java.rs              # Детекция Java установок, выбор оптимальной версии
-├── download.rs          # Параллельная загрузка файлов с прогрессом
-├── versions.rs          # Version manifest (Mojang), сборка classpath, game args
-├── playtime.rs          # Трекинг наигранного времени (playtime.json)
-├── events.rs            # Tauri event system (логи, прогресс установки, launch events)
-├── error.rs             # LauncherError enum (thiserror)
-├── curseforge.rs        # CurseForge API клиент
-├── modrinth.rs          # Modrinth API клиент
+├── lib.rs               # AppState, все #[tauri::command], Builder, is_allowed_download_host
+├── config.rs            # AppConfig (JSON-конфиг), пути к data/instances/libraries/versions/assets
+├── auth.rs              # Microsoft OAuth2 Device Code, Ely.by login, refresh-токен, offline creds
+├── accounts.rs          # CRUD аккаунтов (Microsoft / Offline / Ely.by) в accounts.json
+├── instances.rs         # CRUD инстансов, моды, скриншоты, миры, паки
+├── launch.rs            # Сборка JVM args, classpath, запуск Java-процесса
+├── jvm.rs               # GC presets (standard / G1GC / ZGC), strip_gc_selection_flags
+├── java.rs              # Детекция Java-установок
+├── download.rs          # Параллельная загрузка с прогрессом
+├── versions.rs          # Version manifest Mojang, classpath, asset index
+├── playtime.rs          # ActiveSession, минутные тики, save в playtime.json
+├── events.rs            # Tauri events (logs, install progress, game_started/game_exited)
+├── error.rs             # LauncherError (thiserror)
+├── curseforge.rs        # CurseForge API клиент (backend-модуль готов, UI не подключён)
+├── modrinth.rs          # Modrinth API клиент (моды, паки)
 └── modloaders/
     ├── mod.rs           # LoaderProfile, LoaderType
-    ├── fabric.rs        # Fabric loader installation
-    ├── quilt.rs         # Quilt loader installation
-    ├── forge.rs         # Forge loader installation
-    └── neoforge.rs      # NeoForge loader installation
+    ├── fabric.rs        # Fabric loader
+    ├── quilt.rs         # Quilt loader
+    ├── forge.rs         # Forge loader
+    └── neoforge.rs      # NeoForge loader
 ```
 
-### Ключевые структуры данных
+### Ключевые структуры
 
-#### `AppState` (lib.rs)
+#### `AppState` (`lib.rs`)
 ```rust
 pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub auth_state: Mutex<auth::AuthState>,
     pub running_instance_id: Mutex<Option<String>>,
     pub pack_watcher: Mutex<Option<PackWatcherHandle>>,
-    pub icon_cache: Mutex<HashMap<String, String>>,
+    pub icon_cache: Mutex<HashMap<String, String>>,  // persist в icon_cache.json
     pub active_session: Mutex<Option<playtime::ActiveSession>>,
 }
 ```
 
-#### `AppConfig` (config.rs)
-```rust
-pub struct AppConfig {
-    pub data_dir: PathBuf,
-    pub client_id: String,                    // Microsoft OAuth
-    pub default_memory_mb: u32,
-    pub max_memory_mb: u32,
-    pub default_gc_preset: String,            // "standard" | "g1gc" | "zgc"
-    pub default_jvm_args: Vec<String>,
-    pub java_path: Option<PathBuf>,
-    pub close_on_launch: bool,
-    pub show_snapshots: bool,
-    pub show_old_versions: bool,
-    pub curseforge_api_key: String,           // #[serde(default)]
-}
-```
+#### `AppConfig` (`config.rs`)
+- `data_dir`, `client_id` (Microsoft OAuth), `default_memory_mb`, `max_memory_mb`
+- `default_gc_preset: String` (стандартный/G1GC/ZGC), `default_jvm_args: Vec<String>`
+- `java_path: Option<PathBuf>`, `close_on_launch: bool`, `show_snapshots`, `show_old_versions`
+- `curseforge_api_key: String` — поле `#[serde(default)]`, отсутствие ключа в конфиге не ломает сохранение
 
-#### `Instance` (instances.rs)
-```rust
-pub struct Instance {
-    pub name: String,
-    pub mc_version: String,
-    pub loader: LoaderType,                   // Vanilla/Fabric/Quilt/Forge/NeoForge
-    pub loader_version: Option<String>,
-    pub loader_profile: Option<LoaderProfile>,
-    pub memory_mb: Option<u32>,
-    pub jvm_args: Option<Vec<String>>,
-    pub gc_preset: Option<String>,
-    pub java_path: Option<PathBuf>,
-    pub resolution: Option<Resolution>,
-    pub icon: Option<String>,
-    pub created_at: String,
-    pub last_played: Option<String>,
-    pub play_time_seconds: u64,               // Мержится из playtime.json при list/get
-    pub notes: String,
-}
-```
+#### `Instance` (`instances.rs`)
+Поля: `name`, `mc_version`, `loader` (Vanilla/Fabric/Quilt/Forge/NeoForge), `loader_version`, `loader_profile`, `memory_mb`, `jvm_args`, `gc_preset`, `java_path`, `resolution`, `icon`, `created_at`, `last_played`, `play_time_seconds` (мержится из `playtime.json`), `notes`.
 
-### NSIS-установщик (CurrentUser)
+### NSIS-установщик (`tauri.conf.json` → `bundle.windows.nsis`)
 ```json
-// tauri.conf.json → bundle.windows.nsis
-{
-  "installMode": "currentUser"
-}
+{ "installMode": "currentUser" }
 ```
-- Устанавливает в `%LOCALAPPDATA%\VoidLauncher\`
-- **Без UAC**, без прав админа
-- Автообновления работают тихо
+Установка в `%LOCALAPPDATA%\VoidLauncher\`, без UAC, автообновления работают тихо.
 
-### Tauri Capabilities (permissions)
-Файл: `src-tauri/capabilities/default.json`
+### Capabilities (`src-tauri/capabilities/default.json`)
+- `core:default` + window controls (min/max/unmax/close/is-maximized/set-size/set-position/center)
+- `opener:default`, `shell:default` + `shell:allow-open`, `dialog:default`
+- `process:default` (для `relaunch()`)
+- `fs:default` + узкие `fs:allow-*` (read/write/exists/mkdir/remove/rename/read-dir/read-file/write-file)
+- `updater:default`
+- `fs:scope`: `$APPDATA/**`, `$HOME/**`, `$RESOURCE/**`
+
+### Updater (`tauri.conf.json` → `plugins.updater`)
 ```json
 {
-  "permissions": [
-    "core:default",
-    "core:window:allow-minimize",
-    "core:window:allow-maximize",
-    "core:window:allow-unmaximize",
-    "core:window:allow-close",
-    "core:window:allow-is-maximized",
-    "core:window:allow-set-size",
-    "core:window:allow-set-position",
-    "core:window:allow-center",
-    "opener:default",
-    "shell:default",
-    "shell:allow-open",
-    "dialog:default",
-    "process:default",
-    "fs:default",
-    "fs:allow-read",
-    "fs:allow-write",
-    "fs:allow-exists",
-    "fs:allow-mkdir",
-    "fs:allow-remove",
-    "fs:allow-rename",
-    "fs:allow-read-dir",
-    "fs:allow-read-file",
-    "fs:allow-write-file",
-    "updater:default",
-    { "identifier": "fs:scope", "allow": ["$APPDATA/**", "$HOME/**", "$RESOURCE/**"] }
-  ]
-}
-```
-
-### Updater конфигурация
-```json
-// tauri.conf.json → plugins.updater
-{
-  "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZDNzg3REUwOTlCN0UyRUEK...",
+  "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZDNzg3REUwOTlCN0UyRUEKUldUcTRyZVo0SDE0Ykt3NXVlTllIb0R6WTkzQWxxbWRYWGlwN1FlUmZGRUlQSFZ6aDcxWkFsTXMK",
   "endpoints": [
-    "https://github.com/veb898-cyber/VoidLauncher/releases/latest/download/latest.json"
+    "https://raw.githubusercontent.com/veb898-cyber/VoidLauncher/main/latest.json"
   ]
 }
 ```
-- Приватный ключ: `~/.voidlauncher-update.key` (пароль: `voidlauncher`)
-- НЕ в репозитории (в .gitignore через `*.key`)
+Приватный ключ: `~/.voidlauncher-update.key` (пароль `voidlauncher`), **не в репо** (`*.key` в `.gitignore`).
 
-### Безопасность
-- **CSP**: Ограничены источники (img-src, connect-src, style-src, font-src)
-- **SSRF protection**: `is_allowed_download_host()` проверяет хосты перед загрузкой
-- **Path traversal**: `validate_instance_name()` блокирует `..`, `/`, `\`, спецсимволы
-- **Token-free bridge**: Приватный ключ не пересекает IPC мост (остаётся в Rust)
-- **HTTPS enforcement**: Все URL должны начинаться с `https://`
-- **Username validation**: Запрет кириллицы, контроль длины (3-16), ASCII-only
+### Защита
+- **CSP** в `tauri.conf.json`: точный allowlist `default-src`, `img-src`, `connect-src`, `style-src`, `font-src`. Не ослаблять.
+- **SSRF guard** (`lib.rs` → `is_allowed_download_host`): белый список хостов (Modrinth, CurseForge CDN, Mojang, Fabric/Quilt/Forge/NeoForge Maven). Любой `http://` / `file://` / незнакомый хост → отказ.
+- **Path traversal** (`validate_instance_name`): 3-64 символа, запрет `..`, `/`, `\`, `\0`, Windows reserved (`CON`/`PRN`/`COM1`...), `< > : " | ? *`, control-chars; разрешены Unicode (Cyrillic, CJK, emoji). 17 unit-тестов в `lib.rs`.
+- **Offline-username validator** (`validate_offline_username`): 3-16 ASCII (буквы/цифры/`_`), кириллица запрещена. Unit-тесты.
+- **Token-free IPC bridge**: токены авторизации (`access_token`, `elby_token`) **никогда** не покидают Rust — `cmd_list_accounts` возвращает `PublicAccountEntry` со стрипнутыми секретами.
+- **HTTPS-only**: все download-URL.
 
 ---
 
-## 4. Архитектура фронтенда (React / TypeScript)
-
-### Структура файлов `src/`
+## 4. Архитектура фронтенда (`src/`)
 
 ```
 src/
-├── main.tsx                          # Точка входа React
-├── App.tsx                           # Корневой компонент (роутинг, updater)
-├── index.css                         # Глобальные стили (glass-design)
-├── vite-env.d.ts                     # Vite type declarations
+├── main.tsx                          # React entry
+├── App.tsx                           # Router + useUpdater() + <UpdaterModal />
+├── index.css                         # Glass design tokens
+├── vite-env.d.ts                     # Vite types + declare __APP_VERSION__
 │
 ├── pages/
-│   ├── Home.tsx                      # Главная (quick play, список инстансов)
-│   ├── Login.tsx                     # Microsoft/Ely.by/Offline авторизация
-│   ├── Settings.tsx                  # Настройки (Java, память, GC, язык)
-│   ├── Logs.tsx                      # Просмотр логов
-│   ├── Accounts.tsx                  # Управление аккаунтами
-│   ├── Instances.tsx                 # Список инстансов + создание
+│   ├── Home.tsx                      # Quick play + список инстансов + play time
+│   ├── Login.tsx                     # Microsoft / Ely.by / Offline login
+│   ├── Settings.tsx                  # Java, память, GC, язык, latest version, очистка кэша
+│   ├── Logs.tsx                      # Live-логи (info / warn / error)
+│   ├── Accounts.tsx                  # Управление аккаунтами, set default
+│   ├── Instances.tsx                 # Список + создание
 │   └── CreateInstanceWizard.tsx      # Мастер создания инстанса
 │
 ├── components/
-│   ├── Titlebar.tsx                  # Кастомный заголовок окна
-│   ├── Sidebar.tsx                   # Навигация (Home/Instances/Accounts/Logs/Settings)
-│   ├── ErrorBoundary.tsx             # Обработка ошибок React
-│   ├── UpdaterModal.tsx              # Модалка обновления лаунчера
+│   ├── Titlebar.tsx                  # Кастомный titlebar (min/max/close)
+│   ├── Sidebar.tsx                   # Home / Instances / Accounts / Logs / Settings
+│   ├── ErrorBoundary.tsx             # React error boundary
+│   ├── UpdaterModal.tsx              # Модалка обновления (progress bar, error, relaunch)
 │   ├── layout/
 │   │   └── HomeLayout.tsx            # Layout для страницы инстансов
 │   ├── instances/
 │   │   ├── InstanceList.tsx          # Список инстансов в сайдбаре
-│   │   ├── InstanceDetail.tsx        # Детали инстанса (вкладки: Settings/Content/Worlds/Screenshots)
+│   │   ├── InstanceDetail.tsx        # Вкладки Settings / Content / Worlds / Screenshots
 │   │   ├── InstanceEditor.tsx        # Редактирование инстанса
-│   │   ├── ContentManager.tsx        # Управление модами/ресурспаками/шейдерпаками
-│   │   ├── ContentBrowser.tsx        # Браузер контента (установленные файлы)
-│   │   ├── PackBrowser.tsx           # Браузер паков (Minecraft/Modrinth)
-│   │   ├── ModBrowser.tsx            # Браузер модов (Modrinth)
-│   │   ├── PacksManager.tsx          # Управление паками (Minecraft/Modrinth)
-│   │   ├── WorldsManager.tsx         # Управление мирами (saves)
-│   │   └── ScreenshotsGallery.tsx    # Галерея скриншотов
+│   │   ├── ContentManager.tsx        # Управление модами / паками / шейдерами
+│   │   ├── ContentBrowser.tsx        # Браузер установленного контента
+│   │   ├── PackBrowser.tsx           # Браузер паков (Modrinth)
+│   │   ├── PacksManager.tsx          # Управление resourcepacks / shaderpacks
+│   │   ├── WorldsManager.tsx         # Управление saves/
+│   │   ├── ScreenshotsGallery.tsx    # Галерея скриншотов
+│   │   └── ModBrowser.tsx            # Поиск и установка модов из Modrinth
 │   ├── install/
-│   │   └── InstallOverlay.tsx        # Оверлей прогресса установки
+│   │   └── InstallOverlay.tsx        # Прогресс установки поверх UI
 │   ├── launch/
 │   │   └── GameRunningBadge.tsx      # Бейдж запущенной игры
 │   ├── mods/
-│   │   └── ModBrowser.tsx            # Поиск и установка модов
+│   │   └── ModBrowser.tsx            # То же что instances/ModBrowser.tsx (alias)
 │   └── ui/
-│       ├── Button.tsx                # Кнопки (primary/ghost/play)
-│       ├── Modal.tsx                 # Модальные окна
-│       ├── Toast.tsx                 # Уведомления (глобальные)
-│       ├── Input.tsx                 # Поля ввода
-│       ├── ProgressBar.tsx           # Прогресс-бар
-│       ├── CustomSelect.tsx          # Кастомный select
-│       ├── LoadingSpinner.tsx        # Спиннер загрузки
-│       ├── Skeleton.tsx              # Скелетон загрузки
+│       ├── Button.tsx                # primary / ghost / play
+│       ├── Modal.tsx                 # Модалки
+│       ├── Toast.tsx                 # Глобальные уведомления
+│       ├── Input.tsx
+│       ├── ProgressBar.tsx
+│       ├── CustomSelect.tsx
+│       ├── LoadingSpinner.tsx
+│       ├── Skeleton.tsx
 │       └── index.ts                  # Barrel export
 │
-├── stores/
-│   ├── authStore.ts                  # Авторизация (Microsoft/Ely.by/Offline)
-│   ├── accountsStore.ts              # Управление списком аккаунтов
-│   ├── settingsStore.ts              # Конфигурация (AppConfig)
-│   ├── instanceStore.ts              # Инстансы (список, запуск, установка)
-│   ├── logStore.ts                   # Логи (массив сообщений)
-│   ├── languageStore.ts              # Язык (persist в localStorage)
-│   └── focusStore.ts                 # Фокус окна (freeze при запущенной игре)
+├── stores/                           # Zustand, ВСЕ через индивидуальные селекторы
+│   ├── authStore.ts
+│   ├── accountsStore.ts
+│   ├── settingsStore.ts
+│   ├── instanceStore.ts
+│   ├── logStore.ts
+│   ├── languageStore.ts              # Persist в localStorage
+│   └── focusStore.ts                 # Freeze UI когда игра запущена
 │
 ├── hooks/
-│   ├── useGameEvents.ts              # Tauri events (launch, install, log)
-│   ├── useKeyboardShortcuts.ts       # Горячие клавиши
-│   └── useUpdater.ts                 # Проверка/скачивание обновлений
+│   ├── useGameEvents.ts              # Подписка на Tauri events
+│   ├── useKeyboardShortcuts.ts
+│   ├── useUpdater.ts                 # check() + downloadAndInstall() + progress throttling
+│   └── useLatestVersion.ts           # Fetch latest.json, semver compare, refresh
 │
-├── lib/
-│   ├── i18n/
-│   │   ├── en.ts                     # Английские переводы (~350 ключей)
-│   │   ├── ru.ts                     # Русские переводы (~350 ключей)
-│   │   └── index.ts                  # t(), useT(), formatPlayTime(), getLanguage()
-│   └── memory.ts                     # Форматирование памяти (MB/GB)
+└── lib/
+    ├── i18n/
+    │   ├── en.ts                     # 341 ключ (default)
+    │   ├── ru.ts                     # 341 ключ
+    │   └── index.ts                  # t() / useT() / formatPlayTime() / getLanguage()
+    └── memory.ts                     # Форматирование MB/GB
 ```
 
-### Zustand Stores — паттерны
+### Паттерны
 
-Все store используют **индивидуальные селекторы** для оптимизации рендеров:
-```tsx
-// Правильно (стабильные ссылки):
+**Zustand — только индивидуальные селекторы** (стабильные ссылки, минимум ре-рендеров):
+```ts
 const instances = useInstanceStore((s) => s.instances);
 const launchGame = useInstanceStore((s) => s.launchGame);
-
-// Неправильно (вызывает ре-рендер при любом изменении store):
-const { instances, launchGame } = useInstanceStore();
 ```
 
-### useUpdater.ts — логика обновлений
+**i18n** (`src/lib/i18n/index.ts`):
+- `t(key, vars?)` — bare-функция, читает язык через `useLanguageStore.getState().language`
+- `useT()` — React-хук, пере-рендерит при смене языка
+- `MessageKey = keyof typeof en` — TypeScript проверяет все ключи в `en.ts` / `ru.ts`
+- `formatPlayTime(seconds)` — локализованные «1 час 5 минут» / «1 hour 5 minutes»
+- **Не переводятся** (технические термины): Minecraft, Java, RAM, Xmx, Xms, G1GC, ZGC, JVM, Modrinth, CurseForge, Fabric, Quilt, Forge, NeoForge, Vanilla, LWJGL, Microsoft, Windows, NVIDIA, OpenGL, VoidLauncher
+- **Переменные** (`{name}`, `{count}`, `{error}`) сохраняются в переводах verbatim
 
-```typescript
-// 1. Через 3 сек после монтирования → check() из @tauri-apps/plugin-updater
-// 2. Если update найден → setState({ updateAvailable: true, updateInfo: { version, body } })
-// 3. Пользователь нажимает "Update Now" → downloadAndInstall()
-// 4. downloadAndInstall(callback) — скачивает с прогрессом
-// 5. relaunch() из @tauri-apps/plugin-process — перезапуск
-```
+**Updater flow** (`useUpdater.ts`):
+1. Через 3 сек после маунта → `check()` из `@tauri-apps/plugin-updater`
+2. Если update найден → state `{ updateAvailable: true, updateInfo: { version, body } }`
+3. `downloadAndInstall(callback)` — `Started` → `contentLength`, `Progress` → `chunkLength` с троттлингом (setState только при смене rounded %)
+4. `relaunch()` из `@tauri-apps/plugin-process` — перезапуск лаунчера
+5. Ошибки: toast через `addToast(t('updater.error', { error }))`
 
-### UpdaterModal.tsx — UI обновлений
+**Latest version check** (`useLatestVersion.ts`):
+- `APP_VERSION` инжектится Vite-define'ом из `package.json` (`__APP_VERSION__`)
+- `useLatestVersion()` fetches `latest.json` с `raw.githubusercontent.com/.../main/latest.json` (cache: no-store)
+- `compareVersions(a, b)` — MAJOR.MINOR.PATCH, пре-релиз-теги стрипаются (`"0.1.7-rc1" == "0.1.7"`)
+- `getVersionComparison(current, latest)` → `{ status: -1|0|1|null, updateAvailable }`
+- Используется в `Settings.tsx` (блок «Latest version» + кнопка «Check for updates»)
 
-- Модальное окно с описанием версии
-- ProgressBar при скачивании
-- Текст "Installing..." при установке
-- Красный текст ошибки при сбое
-- Кнопки: "Обновить" / "Позже"
-- Нельзя закрыть во время скачивания/установки
+**Java subprocess safety**:
+- В `cmd_launch_game` Java-процесс запускается с `Command::new(...).creation_flags(0x08000000)` (`CREATE_NO_WINDOW`) в `launch.rs` / `java.rs` / `jvm.rs` — иначе при запуске игры на секунду вылезает чёрное консольное окно
+- `stdout` / `stderr` Java-процесса читаются в фоновых потоках с `String::from_utf8_lossy` (важно для не-UTF-8 кодировок типа CP1251 на русской Windows)
+- Логи `stderr` помечаются уровнем `error` для подсветки в UI
 
-### Локализация (i18n)
+**Playtime** (`playtime.rs` + `cmd_launch_game`):
+- При старте игры создаётся `ActiveSession { started_at, last_flush, child }` (Arc<Mutex<Option<Child>>>)
+- Каждые 60 сек тик — `add_minutes_and_save` в `playtime.json` (поминутно, не на каждом тике — вычитаем `unpaid_minutes`)
+- При exit (try_wait → Some) — финальный флаш через `take_session`
+- На чтение (`cmd_list_instances`, `cmd_get_instance`) — мерж из `playtime.json` в `instance.play_time_seconds`
 
-- **Два файла**: `en.ts` (по умолчанию) и `ru.ts`
-- **Типизированные ключи**: `MessageKey = keyof typeof en` — TypeScript проверяет все ключи
-- **`t()` — bare function**: Читает язык из `useLanguageStore.getState().language`
-- **`useT()` — React hook**: Подписывается на store, перерендеривает при смене языка
-- **`formatPlayTime()`**: Локализованное время (RU: "1 час 5 минут", EN: "1 hour 5 minutes")
-- **Не переводятся**: Minecraft, Java, RAM, Xmx, Xms, G1GC, ZGC, JVM, Modrinth, CurseFabric, Fabric, Quilt, Forge, NeoForge, Vanilla, LWJGL, Microsoft, Windows, NVIDIA, OpenGL
-- **Переменные**: `{name}`, `{count}`, `{error}` и т.д. — сохраняются в переводе как есть
+**File watcher** (`cmd_watch_instance`):
+- `notify-debouncer-mini` (300ms debounce) на `mods/`, `resourcepacks/`, `shaderpacks/`
+- Эмитит `instance_dir_changed` event с `subfolder` — фронт перечитывает список
+
+**Cache clear** (`cmd_clear_cache` в `lib.rs`):
+- Удаляет `assets/` и `libraries/` (полностью перекачаются при следующем запуске)
+- Вызывается из `Settings.tsx`
+
+**Latest.json signing** (CI):
+- `tauri-action@v0` **не** подписывает (нет `includeUpdaterJson: true`)
+- Отдельный bash-шаг: `node_modules/.bin/tauri signer sign installer.exe` через env-переменные `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+- Сигнатура пишется в `installer.exe.sig` (base64 SignatureBox, **не** `.minisig`!)
+- Из `.sig` собирается `latest.json`, который коммитится в `main` тем же workflow
 
 ---
 
-## 5. Инфраструктура и Релизы (CI/CD)
+## 5. CI/CD
 
-### GitHub Actions Workflow
+**Файл:** `.github/workflows/publish.yml`, имя `Release`, триггер `push tags: ['v*']`.
 
-Файл: `.github/workflows/publish.yml`
+**Шаги:**
+1. `actions/checkout@v4`
+2. `actions/setup-node@v4` (Node 20)
+3. `dtolnay/rust-toolchain@stable`
+4. `swatinem/rust-cache@v2` (workspaces: `src-tauri -> target`)
+5. `npm ci`
+6. `tauri-apps/tauri-action@v0` — сборка Windows-установщика + создание GitHub Release с ассетами. **Без** `includeUpdaterJson: true` (подпись делаем сами, чтобы ошибка была громкой)
+7. **Sign installer and generate latest.json** (bash, `set -euxo pipefail`):
+   - Нормализует secret (поддерживает `base64-of-minisign-text` и сырой minisign-текст) → `KEY_FOR_CLI`
+   - `gh release download $TAG --pattern VoidLauncher_X.Y.Z_x64-setup.exe --output installer.exe`
+   - `TAURI_SIGNING_PRIVATE_KEY=$KEY_FOR_CLI TAURI_SIGNING_PRIVATE_KEY_PASSWORD=... node_modules/.bin/tauri signer sign installer.exe`
+   - Читает `installer.exe.sig` (base64), собирает `latest.json` с `platforms.windows-x86_64.{signature,url}`
+8. **Commit latest.json to main** — `github-actions[bot]` коммитит `latest.json` в main
 
-```yaml
-name: "Release"
-on:
-  push:
-    tags: ["v*"]       # Срабатывает при пуше тегов v0.1.0, v0.2.0 и т.д.
+**Секреты репозитория:**
 
-permissions:
-  contents: write       # Разрешение на создание релизов
-
-jobs:
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - Checkout
-      - Node.js 20
-      - Rust stable
-      - Rust cache (swatinem/rust-cache@v2)
-      - npm ci
-      - tauri-apps/tauri-action@v0
-```
-
-### Что делает tauri-action
-
-1. Собирает frontend (`npm run build`)
-2. Собирает Rust backend (`cargo build --release`)
-3. Создаёт NSIS-установщик (`.exe`) + портативный `.exe`
-4. Подписывает бинарники приватным ключом
-5. Генерирует `latest.json` (для автообновлений)
-6. Создаёт GitHub Release и прикрепляет все артефакты
-
-### Секреты репозитория
-
-| Secret | Значение | Описание |
+| Secret | Значение | Назначение |
 |---|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | Содержимое `~/.voidlauncher-update.key` | Приватный ключ подписи обновлений |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | `voidlauncher` | Пароль к приватному ключу |
-| `GITHUB_TOKEN` | (автоматический) | Токен для создания релизов |
+| `TAURI_SIGNING_PRIVATE_KEY` | Содержимое `~/.voidlauncher-update.key` | Приватный ключ minisign |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | `voidlauncher` | Пароль к ключу |
+| `GITHUB_TOKEN` | (auto) | Создание релизов, `gh release download` |
 
-### Процесс релиза
+**Процесс нового релиза:**
+1. Поднять версию в `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` (все три!)
+2. Закоммитить в `main`
+3. `git tag vX.Y.Z && git push origin vX.Y.Z`
+4. Дождаться зелёного CI (≈10–12 мин: 9 мин сборка + 30 сек подпись + коммит)
+5. Проверить, что коммит `chore: update latest.json for vX.Y.Z` появился в `main`
+
+**Updater client:**
+- Endpoint: `https://raw.githubusercontent.com/veb898-cyber/VoidLauncher/main/latest.json` (raw GitHub, не release assets — обходит 404 на draft-релизах)
+- `check()` через 3 сек после старта лаунчера
+- Сигнатура проверяется встроенным `pubkey` (см. `tauri.conf.json`)
+
+---
+
+## 6. Quick Reference
 
 ```bash
-# 1. Обнови версию в tauri.conf.json и package.json
-# 2. Закоммить
-git add -A && git commit -m "v0.1.1"
-
-# 3. Создай и пуши тег
-git tag v0.1.1
-git push origin v0.1.1
-
-# 4. GitHub Actions соберёт и создаст релиз
-# 5. Пользователи увидят обновление при следующем запуске
-```
-
-### Как лаунчер понимает, что вышло обновление
-
-1. При запуске через 3 сек → `check()` → GET `latest.json` с GitHub Releases
-2. `latest.json` содержит: `version`, `notes`, `pub_date`, `platforms.windows.x64.url` + `.signature`
-3. Если `version` > текущей → показывается UpdaterModal
-4. Скачивание → проверка подписи (pubkey) → установка → перезапуск
-
----
-
-## 6. Текущий статус и План расширения
-
-### Что уже реализовано (v0.1.0)
-
-| Функционал | Статус |
-|---|---|
-| Авторизация (Microsoft OAuth2 Device Code) | ✅ |
-| Оффлайн аккаунты | ✅ |
-| Ely.by аккаунты | ✅ |
-| Создание/удаление инстансов | ✅ |
-| Запуск Minecraft (Vanilla + мод loader'ы) | ✅ |
-| Автоматическая установка Java | ✅ |
-| Установка библиотек и ассетов с прогрессом | ✅ |
-| Fabric / Quilt / Forge / NeoForge | ✅ |
-| GC presets (Standard/G1GC/ZGC) с auto-fallback | ✅ |
-| Управление памятью JVM (Xms/Xmx) | ✅ |
-| Кастомные JVM аргументы | ✅ |
-| Установка модов из Modrinth | ✅ |
-| Установка паков из Modrinth (resourcepacks/shaderpacks) | ✅ |
-| Браузер контента (моды/паки/шейдеры) | ✅ |
-| Управление мирами (saves) | ✅ |
-| Галерея скриншотов | ✅ |
-| Трекинг наигранного времени | ✅ |
-| Тёмная тема (glass design) | ✅ |
-| Локализация EN/RU (~350 ключей) | ✅ |
-| Кастомный Titlebar + Sidebar | ✅ |
-| Логи установки/запуска | ✅ |
-| Горячие клавиши | ✅ |
-| Автообновления (Tauri updater) | ✅ |
-| CI/CD (GitHub Actions) | ✅ |
-| NSIS-установщик (Per-User) | ✅ |
-| Подпись релизов (minisign) | ✅ |
-| Оптимизация Zustand селекторов | ✅ |
-| XSS protection (DOMPurify) | ✅ |
-| SSRF protection | ✅ |
-| Path traversal protection | ✅ |
-| Токен рефреш перед запуском | ✅ |
-| Консольные окна Java (CREATE_NO_WINDOW) | ✅ |
-| Play time отображение на Home | ✅ |
-| Очистка кэша (assets/libraries) | ✅ |
-
-### Известные баги / TODO
-
-| Проблема | Статус |
-|---|---|
-| `cmd_get_instance_dir` → `instance.dir()` | ✅ Исправлено → `instance.minecraft_dir()` |
-| Двойное открытие ссылок в описаниях | ✅ Исправлено: `onClick` + `openUrl()` |
-| Иконки обрезались при длинном тексте | ✅ Исправлено: `overflow: hidden` только на `.btn--play` |
-| CurseForge API key молча ломал сохранение | ✅ Исправлено: `#[serde(default)]` |
-| Чёрные консольные окна Java | ✅ Исправлено: `CREATE_NO_WINDOW` |
-
-### Планы на будущее
-
-| Функционал | Приоритет | Описание |
-|---|---|---|
-| CurseForge интеграция | 🔴 Высокий | Установка модов/паков с CurseForge API |
-| Обновление модов | 🔴 Высокий | Проверка обновлений для установленных модов |
-| Профили сборок | 🟡 Средний | Сохранение наборов модов как профилей |
-| Автозапуск Minecraft | 🟡 Средний | Запуск игры двойным кликом по .minecraft |
-| Проверка целостности файлов | 🟡 Средний | Проверка повреждённых/отсутствующих файлов |
-| Кастомные иконки инстансов | 🟡 Средний | Загрузка自己的 иконок |
-| Краши и отчёты | 🟢 Низкий | Автоматический сбор крашей |
-| Multi-platform (Linux/macOS) | 🟢 Низкий | Расширение CI/CD на другие ОС |
-| Обновление модов | 🟡 Средний | Auto-update для модов из Modrinth/CurseForge |
-| Интеграция с模组 launcher'ами | 🟢 Низкий | CurseForge App, Modrinth App |
-| Профили Java | 🟡 Средний | Переключение между JDK 8/17/21 |
-| Статистика | 🟢 Низкий | Графики наигранного времени |
-
----
-
-## Quick Reference — Часто используемые команды
-
-```bash
-# Dev mode (hot reload)
+# Dev (hot reload)
 npm run tauri dev
 
-# Production build (frontend only)
-npm run build
-
-# Production build (full Tauri)
+# Production build (frontend + Tauri bundle)
 npm run tauri build
 
-# Rust type check
-cd src-tauri && cargo check
+# Frontend build only
+npm run build
 
-# Rust tests
-cd src-tauri && cargo test
-
-# TypeScript type check
+# TypeScript check
 npx tsc --noEmit
 
-# Run all 35 Rust tests
+# Rust check
+cd src-tauri && cargo check
+
+# Rust tests (35+ unit tests: instance name / offline username validation, и др.)
 cd src-tauri && cargo test
 
-# Generate signing key
+# Генерация нового signing key (только при утере!)
 npx tauri signer generate --password "voidlauncher"
+# Затем: записать приватный ключ в GitHub Secret, обновить pubkey в src-tauri/tauri.conf.json
 
-# Push release
-git tag v0.1.1 && git push origin v0.1.1
+# Создание нового релиза
+git tag v0.X.Y && git push origin v0.X.Y
 ```
+
+**Путь установки у пользователя:** `%LOCALAPPDATA%\VoidLauncher\` (NSIS `currentUser`).
 
 ---
 
-*Последнее обновление: v0.1.2 — 05.06.2026*
+*Последнее обновление: v0.1.0 (stable, production)*
 *Автор: veb898-cyber*
