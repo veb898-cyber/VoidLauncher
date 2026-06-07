@@ -19,7 +19,7 @@ export interface LoaderProfile {
 export interface Instance {
   name: string;
   mc_version: string;
-  loader: 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge';
+  loader: 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge' | 'LiteLoader';
   loader_version: string | null;
   loader_profile: LoaderProfile | null;
   memory_mb: number | null;

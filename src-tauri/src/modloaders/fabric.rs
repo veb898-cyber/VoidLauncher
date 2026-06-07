@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use crate::error::{LauncherError, Result};
-use crate::modloaders::{LoaderLibrary, LoaderProfile, LoaderVersion};
+use crate::modloaders::{LoaderLibrary, LoaderProfile, LoaderVersionPage};
 use crate::versions::maven_to_path;
 
 /// Fabric Meta API response for loader versions
@@ -48,23 +48,26 @@ struct FabricArguments {
     jvm: Vec<String>,
 }
 
-/// Fetch available Fabric loader versions
-pub async fn get_loader_versions() -> Result<Vec<LoaderVersion>> {
-    let client = crate::download::global_http_client();
-    let versions: Vec<FabricLoaderVersion> = client
-        .get("https://meta.fabricmc.net/v2/versions/loader")
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    Ok(versions
-        .into_iter()
-        .map(|v| LoaderVersion {
-            version: v.version,
-            stable: v.stable,
-        })
-        .collect())
+/// Fetch a page of available Fabric loader versions.
+///
+/// We delegate to the Prism metadata mirror (`prism_meta`) rather than
+/// hitting `meta.fabricmc.net` directly: the mirror is faster, more
+/// reliable, and returns the same data in a uniform shape. Fabric
+/// Loader versions are universal across MC versions (they only pin
+/// `net.fabricmc.intermediary`, not a specific MC), so we pass `None`
+/// for the MC filter.
+///
+/// The wizard drives this with infinite scroll: it asks for
+/// `PAGE_SIZE` items, appends them, and asks for the next page at
+/// `accumulator.length`. The underlying `prism_meta` call caches
+/// the parsed 251-entry index on first request so every page
+/// after the first is instant.
+///
+/// On fetch/parse failure the underlying `prism_meta` call logs the
+/// error and returns an empty page with `total = 0` — see
+/// `prism_meta::fetch_loader_versions` for details.
+pub async fn get_loader_versions(offset: usize, limit: usize) -> Result<LoaderVersionPage> {
+    super::prism_meta::fetch_loader_versions("net.fabricmc.fabric-loader", None, offset, limit).await
 }
 
 /// Fetch game versions supported by Fabric

@@ -4,6 +4,9 @@ pub mod fabric;
 pub mod quilt;
 pub mod forge;
 pub mod neoforge;
+#[allow(dead_code)]
+pub mod liteloader;
+mod prism_meta;
 
 use serde::{Deserialize, Serialize};
 use crate::error::Result;
@@ -14,6 +17,17 @@ use std::path::Path;
 pub struct LoaderVersion {
     pub version: String,
     pub stable: bool,
+}
+
+/// A page of loader versions plus the total count of matching
+/// versions across all pages. The wizard uses this for infinite
+/// scroll: it shows `versions` immediately, then asks for the next
+/// `PAGE_SIZE` items starting at `versions.length` until the
+/// accumulator reaches `total`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LoaderVersionPage {
+    pub versions: Vec<LoaderVersion>,
+    pub total: usize,
 }
 
 /// Profile data that modifies the launch configuration
@@ -50,6 +64,7 @@ pub async fn get_profile(
         "Quilt" => quilt::get_profile(mc_version, loader_version).await,
         "Forge" => forge::get_profile(mc_version, loader_version).await,
         "NeoForge" => neoforge::get_profile(mc_version, loader_version).await,
+        "LiteLoader" => liteloader::get_profile(mc_version, loader_version).await,
         _ => Err(crate::error::LauncherError::ModLoader(format!(
             "Unknown loader: {}",
             loader
@@ -70,6 +85,7 @@ pub async fn install_loader(
         "Quilt" => quilt::install(mc_version, loader_version, libraries_dir).await,
         "Forge" => forge::install(mc_version, loader_version, libraries_dir).await,
         "NeoForge" => neoforge::install(mc_version, loader_version, libraries_dir).await,
+        "LiteLoader" => liteloader::install(mc_version, loader_version, libraries_dir).await,
         _ => Err(crate::error::LauncherError::ModLoader(format!(
             "Unknown loader: {}",
             loader

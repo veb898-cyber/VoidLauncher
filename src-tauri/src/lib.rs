@@ -1335,16 +1335,37 @@ async fn cmd_launch_game(
 
 // ==================== Mod Loader Commands ====================
 
+/// All five `cmd_get_*_versions` commands return a `LoaderVersionPage`
+/// — a slice of the full sorted version list plus `total`, the count
+/// of all versions that match the MC filter. The wizard uses this for
+/// infinite scroll: it asks for `PAGE_SIZE` items starting at
+/// `accumulator.length`, appends them, then asks for the next page
+/// at the new length. When `accumulator.length >= total` the wizard
+/// stops. See `CreateInstanceWizard.tsx` for the front-end logic.
+///
+/// The first call per `uid` triggers a network fetch (60s timeout,
+/// fail-soft → empty page with `total = 0` on error); subsequent
+/// pages come from the in-process cache and are instant.
+const PAGE_SIZE: usize = 20;
+
 #[tauri::command]
-async fn cmd_get_fabric_versions() -> Result<Vec<modloaders::LoaderVersion>, String> {
-    modloaders::fabric::get_loader_versions()
+async fn cmd_get_fabric_versions(
+    offset: usize,
+    limit: usize,
+) -> Result<modloaders::LoaderVersionPage, String> {
+    let limit = if limit == 0 { PAGE_SIZE } else { limit };
+    modloaders::fabric::get_loader_versions(offset, limit)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn cmd_get_quilt_versions() -> Result<Vec<modloaders::LoaderVersion>, String> {
-    modloaders::quilt::get_loader_versions()
+async fn cmd_get_quilt_versions(
+    offset: usize,
+    limit: usize,
+) -> Result<modloaders::LoaderVersionPage, String> {
+    let limit = if limit == 0 { PAGE_SIZE } else { limit };
+    modloaders::quilt::get_loader_versions(offset, limit)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1400,15 +1421,37 @@ async fn cmd_install_quilt(
 }
 
 #[tauri::command]
-async fn cmd_get_forge_versions(mc_version: String) -> Result<Vec<modloaders::LoaderVersion>, String> {
-    modloaders::forge::get_loader_versions(&mc_version)
+async fn cmd_get_forge_versions(
+    mc_version: String,
+    offset: usize,
+    limit: usize,
+) -> Result<modloaders::LoaderVersionPage, String> {
+    let limit = if limit == 0 { PAGE_SIZE } else { limit };
+    modloaders::forge::get_loader_versions(&mc_version, offset, limit)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn cmd_get_neoforge_versions(mc_version: String) -> Result<Vec<modloaders::LoaderVersion>, String> {
-    modloaders::neoforge::get_loader_versions(&mc_version)
+async fn cmd_get_neoforge_versions(
+    mc_version: String,
+    offset: usize,
+    limit: usize,
+) -> Result<modloaders::LoaderVersionPage, String> {
+    let limit = if limit == 0 { PAGE_SIZE } else { limit };
+    modloaders::neoforge::get_loader_versions(&mc_version, offset, limit)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_get_liteloader_versions(
+    mc_version: String,
+    offset: usize,
+    limit: usize,
+) -> Result<modloaders::LoaderVersionPage, String> {
+    let limit = if limit == 0 { PAGE_SIZE } else { limit };
+    modloaders::liteloader::get_loader_versions(&mc_version, offset, limit)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1658,6 +1701,28 @@ async fn cmd_install_neoforge(
     instance.loader_profile = Some(profile);
     instances::save_instance(&config.instances_dir(), &instance).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+async fn cmd_install_liteloader(
+    _state: State<'_, AppState>,
+    _mc_version: String,
+    _loader_version: String,
+    _instance_name: String,
+) -> Result<(), String> {
+    // LiteLoader has been abandoned since 2017 — its downloads live at
+    // `dl.liteloader.com/versions/` which is no longer reachable. The
+    // wizard still *lists* LiteLoader versions (for parity with Prism
+    // Launcher), but the install path is a hard error so the user gets
+    // a visible toast instead of a silent half-installed instance.
+    //
+    // The wizard's `cmd_install_liteloader` branch in CreateInstanceWizard
+    // catches this and shows `create_instance.liteloader_unsupported`
+    // with an "OK" button — see `addToast(..., 'warning')` there.
+    Err("LiteLoader is no longer maintained and cannot be installed. \
+         Versions exist only for Minecraft 1.12.1 / 1.12.2 and the \
+         upstream download URLs (dl.liteloader.com) are unreachable."
+        .to_string())
 }
 
 #[tauri::command]
@@ -2442,10 +2507,12 @@ pub fn run() {
             cmd_get_quilt_versions,
             cmd_get_forge_versions,
             cmd_get_neoforge_versions,
+            cmd_get_liteloader_versions,
             cmd_install_fabric,
             cmd_install_quilt,
             cmd_install_forge,
             cmd_install_neoforge,
+            cmd_install_liteloader,
             cmd_get_config,
             cmd_save_config,
             cmd_get_launch_state,

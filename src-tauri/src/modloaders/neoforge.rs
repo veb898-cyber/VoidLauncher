@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use crate::error::{LauncherError, Result};
 use crate::versions::maven_to_path;
-use super::{LoaderVersion, LoaderProfile, LoaderLibrary};
+use super::{LoaderVersionPage, LoaderProfile, LoaderLibrary};
 use std::path::Path;
 
 /// NeoForge install profile (same structure as Minecraft version JSON)
@@ -53,58 +53,34 @@ struct NeoForgeArguments {
     jvm: Vec<serde_json::Value>,
 }
 
-/// Fetch available NeoForge versions for a MC version
-pub async fn get_loader_versions(mc_version: &str) -> Result<Vec<LoaderVersion>> {
-    let client = crate::download::global_http_client();
-    // The NeoForge Maven API can be slow to respond (the global HTTP client
-    // has a 30s timeout, but cold-cache requests from some regions exceed
-    // that). Extend the per-request timeout to 60s so the wizard has a fair
-    // chance of getting data on first try.
-    let url = "https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge";
-    let resp = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(60))
-        .send()
-        .await
-        .map_err(|e| LauncherError::ModLoader(format!("Failed to fetch NeoForge versions: {}", e)))?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| LauncherError::ModLoader(format!("Failed to parse NeoForge versions: {}", e)))?;
-
-    let mut versions = Vec::new();
-    // Be lenient about response shape: the API documents an object like
-    //   { "versions": ["21.1.69", ...] }
-    // but has also historically returned a bare JSON array. Accept both.
-    let version_list: Option<Vec<&serde_json::Value>> = resp
-        .get("versions")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().collect())
-        .or_else(|| resp.as_array().map(|a| a.iter().collect()));
-
-    if let Some(version_list) = version_list {
-        // NeoForge versions map to MC versions differently
-        // MC 1.21 → NeoForge 21.x, MC 1.21.1 → NeoForge 21.1.x, etc.
-        let mc_parts: Vec<&str> = mc_version.split('.').collect();
-        let neo_prefix = if mc_parts.len() >= 2 && mc_parts[0] == "1" {
-            mc_parts[1..].join(".")
-        } else {
-            mc_version.to_string()
-        };
-
-        for ver in version_list {
-            if let Some(v) = ver.as_str() {
-                if v.starts_with(&neo_prefix) && !v.contains('-') {
-                    versions.push(LoaderVersion {
-                        version: v.to_string(),
-                        stable: true,
-                    });
-                }
-            }
-        }
-    }
-
-    versions.sort_by(|a, b| b.version.cmp(&a.version));
-    Ok(versions)
+/// Fetch a page of available NeoForge versions for a MC version.
+///
+/// We delegate to the Prism metadata mirror (`prism_meta`) rather than
+/// hitting `maven.neoforged.net/api/maven/versions/releases/...` directly.
+/// The Maven API endpoint is notoriously slow from many regions
+/// (60s+ on cold cache, frequent outright timeouts) which is what
+/// caused NeoForge to appear to "load forever" in the wizard. The
+/// Prism mirror is a curated JSON file served from a single fast host
+/// and returns in single-digit seconds.
+///
+/// The mirror filters by `requires.net.minecraft` for us, so passing
+/// `Some(mc_version)` is enough — we no longer need the manual
+/// `21.1`-prefix string matching that the old code did.
+///
+/// The wizard drives this with infinite scroll: it asks for
+/// `PAGE_SIZE` items, appends them, and asks for the next page at
+/// `accumulator.length`. The underlying `prism_meta` call caches
+/// the parsed 1633-entry index on first request so every page
+/// after the first is instant.
+///
+/// On fetch/parse failure the underlying `prism_meta` call logs the
+/// error and returns an empty page with `total = 0`.
+pub async fn get_loader_versions(
+    mc_version: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<LoaderVersionPage> {
+    super::prism_meta::fetch_loader_versions("net.neoforged", Some(mc_version), offset, limit).await
 }
 
 /// Get NeoForge launch profile

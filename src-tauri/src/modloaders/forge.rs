@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use crate::error::{LauncherError, Result};
 use crate::versions::maven_to_path;
-use super::{LoaderVersion, LoaderProfile, LoaderLibrary};
+use super::{LoaderVersionPage, LoaderProfile, LoaderLibrary};
 use std::path::Path;
 
 /// Forge installer profile (same structure as a Minecraft version JSON)
@@ -55,39 +55,33 @@ struct ForgeArguments {
     jvm: Vec<serde_json::Value>,
 }
 
-/// Fetch available Forge versions for a MC version
-pub async fn get_loader_versions(mc_version: &str) -> Result<Vec<LoaderVersion>> {
-    let client = crate::download::global_http_client();
-    let url = "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json";
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| LauncherError::ModLoader(format!("Failed to fetch Forge versions: {}", e)))?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| LauncherError::ModLoader(format!("Failed to parse Forge versions: {}", e)))?;
-
-    let mut versions = Vec::new();
-    if let Some(promos) = resp.get("promos").and_then(|p| p.as_object()) {
-        for (key, value) in promos {
-            if key.starts_with(mc_version) {
-                if let Some(ver) = value.as_str() {
-                    let is_recommended = key.ends_with("-recommended");
-                    versions.push(LoaderVersion {
-                        version: format!("{}-{}", mc_version, ver),
-                        stable: is_recommended,
-                    });
-                }
-            }
-        }
-    }
-
-    // Remove duplicates and sort latest first
-    versions.sort_by(|a, b| b.version.cmp(&a.version));
-    versions.dedup_by(|a, b| a.version == b.version);
-
-    Ok(versions)
+/// Fetch a page of available Forge versions for a MC version.
+///
+/// We delegate to the Prism metadata mirror (`prism_meta`) rather than
+/// parsing `files.minecraftforge.net/.../promotions_slim.json`. The
+/// `promotions_slim.json` API only contains the *recommended* and
+/// *latest* Forge builds per MC version — to get the full list of
+/// every Forge release for a given MC version, you'd have to do a
+/// second request to `maven-metadata.xml`. The Prism mirror already
+/// has the complete, curated list in one fetch and includes the
+/// `requires.net.minecraft` constraint we need to filter by MC
+/// version.
+///
+/// The wizard drives this with infinite scroll: it asks for
+/// `PAGE_SIZE` items, appends them, and asks for the next page at
+/// `accumulator.length`. The underlying `prism_meta` call caches
+/// the parsed 4968-entry index on first request so every page
+/// after the first is instant (no re-download of the 1.96 MB
+/// file).
+///
+/// On fetch/parse failure the underlying `prism_meta` call logs the
+/// error and returns an empty page with `total = 0`.
+pub async fn get_loader_versions(
+    mc_version: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<LoaderVersionPage> {
+    super::prism_meta::fetch_loader_versions("net.minecraftforge", Some(mc_version), offset, limit).await
 }
 
 /// Get Forge launch profile

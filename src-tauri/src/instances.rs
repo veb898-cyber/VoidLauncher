@@ -48,6 +48,7 @@ pub enum LoaderType {
     Quilt,
     Forge,
     NeoForge,
+    LiteLoader,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

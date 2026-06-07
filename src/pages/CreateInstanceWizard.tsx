@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { t } from '../lib/i18n';
 import { invoke } from '@tauri-apps/api/core';
 import { Search } from 'lucide-react';
@@ -20,12 +20,33 @@ interface LoaderVersion {
   stable: boolean;
 }
 
+/// Backend pagination shape — see `prism_meta::LoaderVersionPage`
+/// in `modloaders/prism_meta.rs`. The wizard asks for one page at
+/// a time and uses `total` to know when to stop requesting more.
+interface LoaderVersionPage {
+  versions: LoaderVersion[];
+  total: number;
+}
+
 interface CreateWizardProps {
   open: boolean;
   onClose: () => void;
 }
 
-type LoaderType = 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge';
+type LoaderType = 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge' | 'LiteLoader';
+
+/// How many loader versions to ask for per page. Must match the
+/// Rust-side `PAGE_SIZE` constant in `lib.rs` (the backend clamps
+/// `limit = 0` to this value, so passing 0 here also works, but
+/// passing the explicit value keeps the intent obvious).
+const LOADER_PAGE_SIZE = 20;
+
+/// Scroll distance from the bottom (in px) at which to trigger
+/// loading the next page. 50px is roughly two list rows at the
+/// current `font-size-sm` + `padding: 6px 10px` — close enough to
+/// "the user reached the end" without firing during a small fling
+/// that doesn't actually need a fetch.
+const SCROLL_LOAD_THRESHOLD_PX = 50;
 
 export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
   const { createInstance, installVersion, saveInstance } = useInstanceStore();
@@ -37,14 +58,33 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
   const [searchQuery, setSearchQuery] = useState('');
 
   const [loaderType, setLoaderType] = useState<LoaderType>('Vanilla');
-  const [fabricVersions, setFabricVersions] = useState<LoaderVersion[]>([]);
-  const [quiltVersions, setQuiltVersions] = useState<LoaderVersion[]>([]);
-  const [forgeVersions, setForgeVersions] = useState<LoaderVersion[]>([]);
-  const [neoforgeVersions, setNeoForgeVersions] = useState<LoaderVersion[]>([]);
+  /// Per-loader version accumulators (the wizard's infinite-scroll
+  /// state). Keyed by loader name so switching back to a loader the
+  /// user has already paginated through doesn't reset their scroll
+  /// position. `Vanilla` is never read (no versions) but we keep it
+  /// in the type for the `Record<LoaderType, ...>` shape.
+  const [loaderVersions, setLoaderVersions] = useState<Record<LoaderType, LoaderVersion[]>>({
+    Vanilla: [], Fabric: [], Quilt: [], Forge: [], NeoForge: [], LiteLoader: [],
+  });
+  /// Per-loader `total` from the most recent successful page. The
+  /// wizard stops requesting more pages when `accumulated.length
+  /// >= total`. `null` means "haven't fetched yet for this loader".
+  const [loaderVersionTotals, setLoaderVersionTotals] = useState<Record<LoaderType, number | null>>({
+    Vanilla: null, Fabric: null, Quilt: null, Forge: null, NeoForge: null, LiteLoader: null,
+  });
+  const [loaderVersionsLoading, setLoaderVersionsLoading] = useState(false);
+  const [loaderVersionsError, setLoaderVersionsError] = useState(false);
   const [selectedLoaderVersion, setSelectedLoaderVersion] = useState('');
 
   const [instanceName, setInstanceName] = useState('');
   const [isCreating, setIsCreating] = useState(false);
+
+  /// Ref to the loader-version scrollable container. We read
+  /// `scrollHeight` / `scrollTop` / `clientHeight` on scroll to
+  /// decide whether to load the next page. Using a ref (rather than
+  /// the React event's `currentTarget`) avoids stale-closure issues
+  /// if the user re-opens the wizard with a different loader.
+  const loaderListRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -59,6 +99,8 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
     setInstanceName('');
     setIsCreating(false);
     setSearchQuery('');
+    setLoaderVersionsLoading(false);
+    setLoaderVersionsError(false);
   };
 
   const fetchVersions = async () => {
@@ -75,29 +117,101 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
     setVersionsLoading(false);
   };
 
-  const fetchLoaderVersions = async (loader: string) => {
+  /// Fetch the next page of loader versions for `loader` and append
+  /// them to its accumulator. If `loader` is omitted, uses the
+  /// currently active loader (used by the scroll handler; the
+  /// button-click path passes the loader explicitly to avoid
+  /// reading a stale `loaderType` between `setLoaderType` and the
+  /// React re-render).
+  const fetchLoaderPage = useCallback(async (loader?: LoaderType) => {
+    const target: LoaderType = loader ?? loaderType;
+    if (target === 'Vanilla') return;
+
+    if (loaderVersionsLoading) return;
+
+    /// Guard: if the MC version list hasn't loaded yet, `selectedVersion`
+    /// is `''` and the Rust filter `requires.equals == ""` would
+    /// return 0 matches for every loader that needs an MC filter
+    /// (Forge / NeoForge / LiteLoader). Bail out with an empty
+    /// accumulator instead of sending a bogus mcVersion.
+    if (target !== 'Fabric' && target !== 'Quilt' && selectedVersion === '') {
+      setLoaderVersions(prev => ({ ...prev, [target]: [] }));
+      setLoaderVersionTotals(prev => ({ ...prev, [target]: 0 }));
+      return;
+    }
+
+    const offset = loaderVersions[target]?.length ?? 0;
+    const totalKnown = loaderVersionTotals[target];
+    if (totalKnown !== null && offset >= totalKnown) return;
+
+    setLoaderVersionsLoading(true);
+    setLoaderVersionsError(false);
+
     try {
-      let v: LoaderVersion[] = [];
-      if (loader === 'Fabric') v = await invoke<LoaderVersion[]>('cmd_get_fabric_versions');
-      else if (loader === 'Quilt') v = await invoke<LoaderVersion[]>('cmd_get_quilt_versions');
-      else if (loader === 'Forge') v = await invoke<LoaderVersion[]>('cmd_get_forge_versions', { mcVersion: selectedVersion });
-      else if (loader === 'NeoForge') v = await invoke<LoaderVersion[]>('cmd_get_neoforge_versions', { mcVersion: selectedVersion });
+      let page: LoaderVersionPage;
+      if (target === 'Fabric') {
+        page = await invoke<LoaderVersionPage>('cmd_get_fabric_versions', { offset, limit: LOADER_PAGE_SIZE });
+      } else if (target === 'Quilt') {
+        page = await invoke<LoaderVersionPage>('cmd_get_quilt_versions', { offset, limit: LOADER_PAGE_SIZE });
+      } else if (target === 'Forge') {
+        page = await invoke<LoaderVersionPage>('cmd_get_forge_versions', { mcVersion: selectedVersion, offset, limit: LOADER_PAGE_SIZE });
+      } else if (target === 'NeoForge') {
+        page = await invoke<LoaderVersionPage>('cmd_get_neoforge_versions', { mcVersion: selectedVersion, offset, limit: LOADER_PAGE_SIZE });
+      } else {
+        page = await invoke<LoaderVersionPage>('cmd_get_liteloader_versions', { mcVersion: selectedVersion, offset, limit: LOADER_PAGE_SIZE });
+      }
 
-      if (loader === 'Fabric') setFabricVersions(v);
-      else if (loader === 'Quilt') setQuiltVersions(v);
-      else if (loader === 'Forge') setForgeVersions(v);
-      else if (loader === 'NeoForge') setNeoForgeVersions(v);
+      setLoaderVersions(prev => ({
+        ...prev,
+        [target]: [...(prev[target] ?? []), ...page.versions],
+      }));
+      setLoaderVersionTotals(prev => ({ ...prev, [target]: page.total }));
 
-      if (v.length > 0) setSelectedLoaderVersion(v[0].version);
+      /// If this was the first page (offset was 0) and at least
+      /// one version came back, pre-select the newest one (which
+      /// is `page.versions[0]` — see the `sort_by(b.version.cmp)`
+      /// newest-first in prism_meta). This matches the pre-scroll
+      /// behavior: clicking a loader button should leave the user
+      /// on a sensible default.
+      if (offset === 0 && page.versions.length > 0) {
+        setSelectedLoaderVersion(page.versions[0].version);
+      }
     } catch (e) {
       console.error('Failed to fetch loader versions:', e);
+      setLoaderVersionsError(true);
     }
-  };
+    setLoaderVersionsLoading(false);
+  }, [loaderType, selectedVersion, loaderVersionsLoading, loaderVersions, loaderVersionTotals]);
 
+  /// Called when the user clicks a loader button. Resets the
+  /// accumulator for `loader` and starts the infinite scroll at
+  /// page 0.
   const handleLoaderChange = (loader: LoaderType) => {
     setLoaderType(loader);
     setSelectedLoaderVersion('');
-    if (loader !== 'Vanilla') fetchLoaderVersions(loader);
+    setLoaderVersionsError(false);
+    if (loader === 'Vanilla') {
+      setLoaderVersionsLoading(false);
+      return;
+    }
+    /// Reset the accumulator for the freshly-clicked loader so we
+    /// start from page 0 (not from whatever the previous loader
+    /// had accumulated).
+    setLoaderVersions(prev => ({ ...prev, [loader]: [] }));
+    setLoaderVersionTotals(prev => ({ ...prev, [loader]: null }));
+    fetchLoaderPage(loader);
+  };
+
+  /// Scroll handler: when the user is within 50px of the bottom of
+  /// the loader-version list, load the next page. No-op while a
+  /// fetch is already in flight or when we've already loaded the
+  /// full list.
+  const handleLoaderScroll = () => {
+    const el = loaderListRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom > SCROLL_LOAD_THRESHOLD_PX) return;
+    fetchLoaderPage();
   };
 
   const filteredVersions = versions.filter((v) => {
@@ -107,11 +221,10 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
     return true;
   });
 
-  const currentLoaderVersions = loaderType === 'Fabric' ? fabricVersions
-    : loaderType === 'Quilt' ? quiltVersions
-    : loaderType === 'Forge' ? forgeVersions
-    : loaderType === 'NeoForge' ? neoforgeVersions
-    : [];
+  const currentLoaderVersions = loaderVersions[loaderType] ?? [];
+  const currentLoaderTotal = loaderVersionTotals[loaderType];
+  const hasMoreLoaderVersions = currentLoaderTotal === null
+    || currentLoaderVersions.length < currentLoaderTotal;
 
   const canCreate = instanceName.trim() !== '' && selectedVersion !== '' && !isCreating
     && (loaderType === 'Vanilla' || selectedLoaderVersion !== '');
@@ -138,11 +251,19 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
         const cmd = loaderType === 'Fabric' ? 'cmd_install_fabric'
           : loaderType === 'Quilt' ? 'cmd_install_quilt'
           : loaderType === 'Forge' ? 'cmd_install_forge'
+          : loaderType === 'LiteLoader' ? 'cmd_install_liteloader'
           : 'cmd_install_neoforge';
         try {
           await invoke(cmd, { mcVersion: selectedVersion, loaderVersion: selectedLoaderVersion, instanceName: instanceName.trim() });
-        } catch (e) {
-          addToast(t('create_instance.loader_failed', { loader: loaderType }), 'warning');
+        } catch (e: any) {
+          // LiteLoader's install is intentionally a hard error (the
+          // upstream download URLs are dead) — surface the backend's
+          // message verbatim rather than the generic "loader_failed".
+          if (loaderType === 'LiteLoader') {
+            addToast(t('create_instance.liteloader_unsupported', { error: String(e) }), 'warning');
+          } else {
+            addToast(t('create_instance.loader_failed', { loader: loaderType }), 'warning');
+          }
         }
       }
 
@@ -184,7 +305,9 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
 
       {/* MC Version + Loader in two columns */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-xl)' }}>
-        {/* Left: Version Selection */}
+        {/* Left: Version Selection — show ALL versions, no pagination.
+            The container is `maxHeight: 200, overflowY: auto` so the
+            user can scroll through the full list (no slice cap). */}
         <div>
           <label className="input-group__label" style={{ display: 'block', marginBottom: 'var(--space-sm)', fontWeight: 600, fontSize: 'var(--font-size-sm)' }}>
             {t('create_instance.version_label')}
@@ -211,7 +334,7 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
             {versionsLoading ? (
               Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} height={32} style={{ marginBottom: 2 }} />)
             ) : (
-              filteredVersions.slice(0, 30).map((v) => (
+              filteredVersions.map((v) => (
                 <div
                   key={v.id}
                   onClick={() => setSelectedVersion(v.id)}
@@ -231,13 +354,16 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
           </div>
         </div>
 
-        {/* Right: Loader Selection */}
+        {/* Right: Loader Selection — infinite scroll, 20 items per
+            page. The container is `maxHeight: 168, overflowY: auto`
+            and we load the next page when the user is within
+            50px of the bottom (see `handleLoaderScroll`). */}
         <div>
           <label className="input-group__label" style={{ display: 'block', marginBottom: 'var(--space-sm)', fontWeight: 600, fontSize: 'var(--font-size-sm)' }}>
             {t('create_instance.loader_label')}
           </label>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 'var(--space-sm)' }}>
-            {(['Vanilla', 'Fabric', 'Quilt', 'Forge', 'NeoForge'] as const).map((l) => (
+            {(['Vanilla', 'Fabric', 'Quilt', 'Forge', 'NeoForge', 'LiteLoader'] as const).map((l) => (
               <Button
                 key={l}
                 size="sm"
@@ -245,32 +371,57 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
                 onClick={() => handleLoaderChange(l)}
                 style={{ fontSize: '11px' }}
               >
-                {l === 'Vanilla' ? t('create_instance.loader_vanilla') : l === 'Fabric' ? t('create_instance.loader_fabric') : l === 'Quilt' ? t('create_instance.loader_quilt') : l === 'Forge' ? t('create_instance.loader_forge') : t('create_instance.loader_neoforge')}
+                {l === 'Vanilla' ? t('create_instance.loader_vanilla') : l === 'Fabric' ? t('create_instance.loader_fabric') : l === 'Quilt' ? t('create_instance.loader_quilt') : l === 'Forge' ? t('create_instance.loader_forge') : l === 'LiteLoader' ? t('create_instance.loader_liteloader') : t('create_instance.loader_neoforge')}
               </Button>
             ))}
           </div>
 
           {loaderType !== 'Vanilla' && (
-            <div style={{ maxHeight: 168, overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
-              {currentLoaderVersions.length === 0 ? (
-                <Skeleton height={32} />
+            <div
+              ref={loaderListRef}
+              onScroll={handleLoaderScroll}
+              style={{ maxHeight: 168, overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}
+            >
+              {loaderVersionsError ? (
+                <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                  {t('create_instance.loader_versions_failed', { loader: loaderType })}
+                </div>
+              ) : currentLoaderVersions.length === 0 && !loaderVersionsLoading ? (
+                <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                  {loaderType === 'LiteLoader'
+                    ? t('create_instance.liteloader_empty')
+                    : t('create_instance.loader_no_versions')}
+                </div>
               ) : (
-                currentLoaderVersions.slice(0, 20).map((lv) => (
-                  <div
-                    key={lv.version}
-                    onClick={() => setSelectedLoaderVersion(lv.version)}
-                    style={{
-                      padding: '6px 10px', cursor: 'pointer', fontSize: 'var(--font-size-sm)',
-                      background: selectedLoaderVersion === lv.version ? 'var(--primary)' : 'transparent',
-                      color: selectedLoaderVersion === lv.version ? 'white' : 'var(--text-primary)',
-                      borderRadius: 'var(--radius-sm)',
-                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                    }}
-                  >
-                    <span>{lv.version}</span>
-                    {lv.stable && <span style={{ fontSize: 10, opacity: 0.6 }}>{t('create_instance.stable_badge')}</span>}
-                  </div>
-                ))
+                <>
+                  {currentLoaderVersions.map((lv) => (
+                    <div
+                      key={lv.version}
+                      onClick={() => setSelectedLoaderVersion(lv.version)}
+                      style={{
+                        padding: '6px 10px', cursor: 'pointer', fontSize: 'var(--font-size-sm)',
+                        background: selectedLoaderVersion === lv.version ? 'var(--primary)' : 'transparent',
+                        color: selectedLoaderVersion === lv.version ? 'white' : 'var(--text-primary)',
+                        borderRadius: 'var(--radius-sm)',
+                        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                      }}
+                    >
+                      <span>{lv.version}</span>
+                      {lv.stable && <span style={{ fontSize: 10, opacity: 0.6 }}>{t('create_instance.stable_badge')}</span>}
+                    </div>
+                  ))}
+                  {loaderVersionsLoading && (
+                    <Skeleton height={32} style={{ margin: '4px 8px' }} />
+                  )}
+                  {!loaderVersionsLoading && !hasMoreLoaderVersions && currentLoaderTotal !== null && currentLoaderTotal > 0 && (
+                    <div style={{ padding: '8px', textAlign: 'center', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                      {t('create_instance.loader_end', { loaded: currentLoaderVersions.length, total: currentLoaderTotal })}
+                    </div>
+                  )}
+                </>
+              )}
+              {currentLoaderVersions.length === 0 && loaderVersionsLoading && (
+                <Skeleton height={32} style={{ margin: '4px 8px' }} />
               )}
             </div>
           )}
