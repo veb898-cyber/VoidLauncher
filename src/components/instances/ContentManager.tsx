@@ -321,8 +321,27 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         if (cancelled) break;
         checkedRef.current.add(item.filename);
         try {
-          const vers = await invoke<any[]>('cmd_get_modrinth_versions', { projectId: item.slug, mcVersion: mcVersion ?? null, loader: loader ?? null });
+          // Strict query: instance's MC version + loader.
+          let vers = await invoke<any[]>('cmd_get_modrinth_versions', {
+            projectId: item.slug,
+            mcVersion: mcVersion ?? null,
+            loader: loader ?? null,
+          });
           if (cancelled) break;
+          // Fallback: if the strict query returned nothing, the mod may still
+          // be compatible — the Modrinth project just lacks a version tagged
+          // for the exact MC version (e.g. instance is on 1.21.11 and the
+          // mod's tagged versions only cover 1.21.1). Re-query with just the
+          // loader; if the mod has *any* Fabric/Forge/… version we treat it
+          // as compatible, since the loader is the harder constraint.
+          if (vers.length === 0 && loader && loader !== 'Vanilla') {
+            vers = await invoke<any[]>('cmd_get_modrinth_versions', {
+              projectId: item.slug,
+              mcVersion: null,
+              loader,
+            });
+            if (cancelled) break;
+          }
           if (vers.length === 0) {
             setCompatibility((prev) => ({ ...prev, [item.filename]: true }));
           }
@@ -633,18 +652,27 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
                     {contentType === 'mod' ? item.provider : ''}
                   </div>
                   <div>
-                    {contentType === 'mod' && compatibility[item.filename] && (
-                      <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }}
-                        title={
-                          !item.version && !item.provider ? 'Cannot determine mod version or loader' :
-                          mcVersion && !item.version ? `This mod may not support Minecraft ${mcVersion}` :
-                          `This mod is not compatible with ${mcVersion ? `MC ${mcVersion}` : ''}${mcVersion && loader && loader !== 'Vanilla' ? ` / ` : ''}${loader && loader !== 'Vanilla' ? loader : ''}`
-                        }>
-                        <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
-                          <AlertTriangle size={12} />
+                    {contentType === 'mod' && compatibility[item.filename] && (() => {
+                      // Build a localized warning string. The yellow
+                      // "this mod may be incompatible" tooltip used to be
+                      // hardcoded English, which broke the Russian UI.
+                      const versionPart = mcVersion ? `MC ${mcVersion}` : '';
+                      const loaderPart = loader && loader !== 'Vanilla' ? loader : '';
+                      const target = [versionPart, loaderPart].filter(Boolean).join(' / ');
+                      const title =
+                        !item.version && !item.provider
+                          ? t('manager.compat_unknown')
+                          : mcVersion && !item.version
+                            ? t('manager.compat_maybe', { version: mcVersion })
+                            : t('manager.compat_no', { target });
+                      return (
+                        <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }} title={title}>
+                          <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
+                            <AlertTriangle size={12} />
+                          </div>
                         </div>
-                      </div>
-                    )}
+                      );
+                    })()}
                   </div>
                 </div>
               );

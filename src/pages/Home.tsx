@@ -206,7 +206,7 @@ export function Home({ onNavigate }: HomeProps) {
                   <span className="instance-card__playtime">
                     <Clock size={12} />
                     {inst.play_time_seconds && inst.play_time_seconds > 0
-                      ? formatPlayTime(inst.play_time_seconds * 1000)
+                      ? formatPlayTime(inst.play_time_seconds)
                       : t('home.instance_never_played')}
                   </span>
                   <button

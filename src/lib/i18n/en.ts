@@ -326,7 +326,7 @@ export const en = {
   'manager.update_error':              'Failed to update {name}: {error}',
   'manager.compat_unknown':            'Cannot determine mod version or loader',
   'manager.compat_maybe':              'This mod may not support Minecraft {version}',
-  'manager.compat_no':                 'This mod is not compatible with {version} / {loader}',
+  'manager.compat_no':                 'This mod is not compatible with {target}',
 
   // ── Pack Browser ────────────────────────────────────────────
   'pack.browse_heading':               'Browse {label}',

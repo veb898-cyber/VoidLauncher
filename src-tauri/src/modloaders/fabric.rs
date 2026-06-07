@@ -11,6 +11,9 @@ pub struct FabricLoaderVersion {
     pub build: u32,
     pub maven: String,
     pub version: String,
+    /// Defensive default: if Fabric's API ever drops the `stable` field
+    /// we still want the whole array to deserialize.
+    #[serde(default)]
     pub stable: bool,
 }
 

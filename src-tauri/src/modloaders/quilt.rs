@@ -10,6 +10,12 @@ struct QuiltLoaderVersion {
     build: u32,
     maven: String,
     version: String,
+    /// Quilt's loader-versions endpoint does NOT include a `stable` field
+    /// (unlike Fabric's). Without `#[serde(default)]` the entire array
+    /// fails to deserialize and `cmd_get_quilt_versions` returns an error,
+    /// which the wizard silently swallows — leaving the Quilt version list
+    /// empty. We treat every Quilt release as stable by default.
+    #[serde(default)]
     stable: bool,
 }
 

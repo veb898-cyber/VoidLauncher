@@ -330,7 +330,7 @@ export const ru: Record<string, string> = {
   'manager.update_error':              'Не удалось обновить {name}: {error}',
   'manager.compat_unknown':            'Не удалось определить версию мода или лоудер',
   'manager.compat_maybe':              'Этот мод может не поддерживать Minecraft {version}',
-  'manager.compat_no':                 'Этот мод несовместим с {version} / {loader}',
+  'manager.compat_no':                 'Этот мод несовместим с {target}',
 
   // ── Pack Browser ────────────────────────────────────────────
   'pack.browse_heading':               'Обзор: {label}',

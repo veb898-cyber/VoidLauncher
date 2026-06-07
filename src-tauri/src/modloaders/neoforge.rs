@@ -56,9 +56,14 @@ struct NeoForgeArguments {
 /// Fetch available NeoForge versions for a MC version
 pub async fn get_loader_versions(mc_version: &str) -> Result<Vec<LoaderVersion>> {
     let client = crate::download::global_http_client();
+    // The NeoForge Maven API can be slow to respond (the global HTTP client
+    // has a 30s timeout, but cold-cache requests from some regions exceed
+    // that). Extend the per-request timeout to 60s so the wizard has a fair
+    // chance of getting data on first try.
     let url = "https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge";
     let resp = client
         .get(url)
+        .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
         .map_err(|e| LauncherError::ModLoader(format!("Failed to fetch NeoForge versions: {}", e)))?
@@ -67,7 +72,16 @@ pub async fn get_loader_versions(mc_version: &str) -> Result<Vec<LoaderVersion>>
         .map_err(|e| LauncherError::ModLoader(format!("Failed to parse NeoForge versions: {}", e)))?;
 
     let mut versions = Vec::new();
-    if let Some(version_list) = resp.get("versions").and_then(|v| v.as_array()) {
+    // Be lenient about response shape: the API documents an object like
+    //   { "versions": ["21.1.69", ...] }
+    // but has also historically returned a bare JSON array. Accept both.
+    let version_list: Option<Vec<&serde_json::Value>> = resp
+        .get("versions")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .or_else(|| resp.as_array().map(|a| a.iter().collect()));
+
+    if let Some(version_list) = version_list {
         // NeoForge versions map to MC versions differently
         // MC 1.21 → NeoForge 21.x, MC 1.21.1 → NeoForge 21.1.x, etc.
         let mc_parts: Vec<&str> = mc_version.split('.').collect();
