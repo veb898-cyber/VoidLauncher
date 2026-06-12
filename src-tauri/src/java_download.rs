@@ -143,12 +143,12 @@ pub async fn download_java_runtime(
         LauncherError::Download(format!("No Java {} release found", major_version))
     })?;
 
-    // Find the Windows x64 JDK installer (prefer MSI/installer, fallback to zip)
+    // Find the Windows x64 JDK package (always prefer zip for extraction)
     let pkg = version_entry
         .binaries
         .iter()
         .find(|b| b.os_name == "windows" && b.architecture == "x64" && b.image_type == "jdk")
-        .and_then(|b| b.installer.as_ref().or(b.package.as_ref()))
+        .and_then(|b| b.package.as_ref().or(b.installer.as_ref()))
         .ok_or_else(|| {
             LauncherError::Download(format!(
                 "No Windows x64 JDK package for Java {}",
