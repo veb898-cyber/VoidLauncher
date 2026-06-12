@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore } from '../stores/accountsStore';
 import { useInstanceStore } from '../stores/instanceStore';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
-import { useT, formatPlayTime } from '../lib/i18n';
+import { useT, formatPlayTime, formatRelativeTime } from '../lib/i18n';
 
 interface HomeProps {
   onNavigate: (page: string) => void;
@@ -178,28 +178,49 @@ export function Home({ onNavigate }: HomeProps) {
                 tabIndex={0}
               >
                 <div className="instance-card__banner">
+                  <div className="instance-card__banner-overlay"></div>
+                  {inst.icon ? (
+                    <img
+                      className="instance-card__banner-img"
+                      src={inst.icon}
+                      alt={inst.name}
+                    />
+                  ) : (
+                    <div className="instance-card__banner-fallback">
+                      <Package size={32} />
+                    </div>
+                  )}
+                  {inst.last_played && (
+                    <div className="instance-card__last-played">
+                      <Clock size={12} />
+                      <span>{formatRelativeTime(inst.last_played)}</span>
+                    </div>
+                  )}
+                </div>
+                <div className="instance-card__body instance-card__body--horizontal">
                   <div className="instance-card__icon">
                     {inst.icon ? (
                       <img
                         src={inst.icon}
                         alt={inst.name}
-                        style={{ width: '100%', height: '100%', borderRadius: 'var(--radius-md)', objectFit: 'cover' }}
                       />
                     ) : (
-                      <Package size={24} />
+                      <div className="instance-card__icon-fallback">
+                        <Package size={20} />
+                      </div>
                     )}
                   </div>
-                </div>
-                <div className="instance-card__body">
-                  <div className="instance-card__name">{inst.name}</div>
-                  <div className="instance-card__meta">
-                    <span className="instance-card__version">{inst.mc_version}</span>
-                    {inst.loader && inst.loader !== 'Vanilla' && (
-                      <span className={`instance-card__tag instance-card__tag--${inst.loader.toLowerCase()}`}>
-                        {inst.loader}
-                        {inst.loader_version ? ` ${inst.loader_version}` : ''}
-                      </span>
-                    )}
+                  <div className="instance-card__info">
+                    <div className="instance-card__name">{inst.name}</div>
+                    <div className="instance-card__meta">
+                      <span className="instance-card__version">{inst.mc_version}</span>
+                      {inst.loader && inst.loader !== 'Vanilla' && (
+                        <span className={`instance-card__tag instance-card__tag--${inst.loader.toLowerCase()}`}>
+                          {inst.loader}
+                          {inst.loader_version ? ` ${inst.loader_version}` : ''}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div className="instance-card__actions">
@@ -219,7 +240,7 @@ export function Home({ onNavigate }: HomeProps) {
                     disabled={isLaunching}
                   >
                     <Play size={14} fill="currentColor" />
-                    {t('home.instance_play_btn')}
+                    <span>{t('home.instance_play_btn')}</span>
                   </button>
                 </div>
               </div>

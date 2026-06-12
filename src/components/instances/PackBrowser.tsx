@@ -94,6 +94,7 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
         fileName: file.filename,
         subfolder: packType,
         projectId: selected?.project_id || null,
+        projectName: selected?.title || null,
         versionId: version.id || null,
         versionNumber: version.version_number || version.name || null,
         provider: 'modrinth',

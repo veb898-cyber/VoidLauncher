@@ -59,7 +59,7 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
                     };
 
                     if !checked_paths.contains(&actual) {
-                        if let Some(install) = probe_java(&actual) {
+                        if let Some(install) = probe_java_by_path(&actual) {
                             checked_paths.push(actual);
                             installations.push(install);
                         }
@@ -73,7 +73,7 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
     if let Ok(java_home) = std::env::var("JAVA_HOME") {
         let java_exe = PathBuf::from(&java_home).join("bin").join("java.exe");
         if java_exe.exists() && !checked_paths.contains(&java_exe) {
-            if let Some(install) = probe_java(&java_exe) {
+            if let Some(install) = probe_java_by_path(&java_exe) {
                 checked_paths.push(java_exe);
                 installations.push(install);
             }
@@ -85,7 +85,7 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
         for dir in path.split(';') {
             let java_exe = PathBuf::from(dir).join("java.exe");
             if java_exe.exists() && !checked_paths.contains(&java_exe) {
-                if let Some(install) = probe_java(&java_exe) {
+                if let Some(install) = probe_java_by_path(&java_exe) {
                     checked_paths.push(java_exe);
                     installations.push(install);
                 }
@@ -99,7 +99,7 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
 }
 
 /// Probe a Java executable to get version info
-fn probe_java(path: &PathBuf) -> Option<JavaInstallation> {
+pub fn probe_java_by_path(path: &PathBuf) -> Option<JavaInstallation> {
     let mut cmd = Command::new(path);
     cmd.arg("-version");
     #[cfg(target_os = "windows")]

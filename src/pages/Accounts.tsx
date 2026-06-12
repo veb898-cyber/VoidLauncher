@@ -135,9 +135,24 @@ export function Accounts() {
             padding: 'var(--space-lg)', display: 'flex', alignItems: 'center', gap: 'var(--space-lg)',
             border: acc.default ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
           }}>
+            {acc.uuid ? (
+              <img
+                src={`https://mc-heads.net/avatar/${acc.uuid}/40`}
+                referrerPolicy="no-referrer"
+                alt={acc.name}
+                style={{ width: 40, height: 40, borderRadius: 'var(--radius-md)' }}
+                onError={(e) => {
+                  const img = e.currentTarget;
+                  img.style.display = 'none';
+                  const fb = img.nextElementSibling as HTMLElement | null;
+                  if (fb) fb.style.display = 'flex';
+                }}
+              />
+            ) : null}
             <div style={{
               width: 40, height: 40, borderRadius: 'var(--radius-md)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              display: acc.uuid ? 'none' : 'flex',
+              alignItems: 'center', justifyContent: 'center',
               background: 'var(--surface-glass)', fontWeight: 700, fontSize: 'var(--font-size-lg)',
               color: getTypeColor(acc.account_type),
             }}>

@@ -5,8 +5,10 @@ mod curseforge;
 mod download;
 mod error;
 mod events;
+mod game_logs;
 mod instances;
 mod java;
+mod java_download;
 mod jvm;
 mod launch;
 mod logger;
@@ -215,11 +217,14 @@ fn cmd_list_accounts(state: State<'_, AppState>) -> Result<Vec<accounts::PublicA
 fn cmd_add_offline_account(
     state: State<'_, AppState>,
     username: String,
-) -> Result<Vec<accounts::AccountEntry>, String> {
+) -> Result<Vec<accounts::PublicAccountEntry>, String> {
     validate_offline_username(&username)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let entry = accounts::AccountEntry::new_offline(&username);
-    accounts::add_account(&config.data_dir, entry)
+    Ok(accounts::add_account(&config.data_dir, entry)?
+        .into_iter()
+        .map(accounts::PublicAccountEntry::from)
+        .collect())
 }
 
 /// Validate an offline-account username.
@@ -437,7 +442,7 @@ async fn cmd_add_elyby_account(
     state: State<'_, AppState>,
     username: String,
     password: String,
-) -> Result<Vec<accounts::AccountEntry>, String> {
+) -> Result<Vec<accounts::PublicAccountEntry>, String> {
     let data_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.data_dir.clone()
@@ -446,25 +451,32 @@ async fn cmd_add_elyby_account(
         .await
         .map_err(|e| e.to_string())?;
     let entry = accounts::AccountEntry::new_elyby(&name, &uuid, &access_token);
-    accounts::add_account(&data_dir, entry)
+    let accounts = accounts::add_account(&data_dir, entry)?;
+    Ok(accounts.into_iter().map(accounts::PublicAccountEntry::from).collect())
 }
 
 #[tauri::command]
 fn cmd_remove_account(
     state: State<'_, AppState>,
     id: String,
-) -> Result<Vec<accounts::AccountEntry>, String> {
+) -> Result<Vec<accounts::PublicAccountEntry>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    accounts::remove_account(&config.data_dir, &id)
+    Ok(accounts::remove_account(&config.data_dir, &id)?
+        .into_iter()
+        .map(accounts::PublicAccountEntry::from)
+        .collect())
 }
 
 #[tauri::command]
 fn cmd_set_default_account(
     state: State<'_, AppState>,
     id: String,
-) -> Result<Vec<accounts::AccountEntry>, String> {
+) -> Result<Vec<accounts::PublicAccountEntry>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    accounts::set_default_account(&config.data_dir, &id)
+    Ok(accounts::set_default_account(&config.data_dir, &id)?
+        .into_iter()
+        .map(accounts::PublicAccountEntry::from)
+        .collect())
 }
 
 #[tauri::command]
@@ -532,6 +544,9 @@ async fn cmd_get_versions() -> Result<versions::VersionManifest, String> {
 
 #[tauri::command]
 async fn cmd_get_version_info(url: String) -> Result<versions::VersionInfo, String> {
+    if !is_allowed_download_host(&url) {
+        return Err("Access denied: download host not allowed".to_string());
+    }
     versions::fetch_version_info(&url)
         .await
         .map_err(|e| e.to_string())
@@ -573,6 +588,7 @@ fn cmd_create_instance(
 
 #[tauri::command]
 fn cmd_delete_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    validate_instance_name(&name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
     instances::delete_instance(&config.instances_dir(), &name).map_err(|e| e.to_string())
 }
@@ -612,6 +628,15 @@ fn cmd_duplicate_instance(
 }
 
 #[tauri::command]
+fn cmd_import_prism_instance(
+    state: State<'_, AppState>,
+    zip_path: String,
+) -> Result<instances::Instance, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    instances::import_prism_pack(&config.instances_dir(), &zip_path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn cmd_set_instance_icon(
     state: State<'_, AppState>,
     instance_name: String,
@@ -623,6 +648,15 @@ fn cmd_set_instance_icon(
 }
 
 #[tauri::command]
+fn cmd_log_toast(level: String, message: String) {
+    match level.as_str() {
+        "error" => tracing::error!(target: "frontend", "{message}"),
+        "warning" => tracing::warn!(target: "frontend", "{message}"),
+        _ => tracing::info!(target: "frontend", "{message}"),
+    }
+}
+
+#[tauri::command]
 fn cmd_list_saves(
     state: State<'_, AppState>,
     instance_name: String,
@@ -630,6 +664,46 @@ fn cmd_list_saves(
     validate_instance_name(&instance_name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
     instances::list_saves(&config.instances_dir(), &instance_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_rename_world(
+    state: State<'_, AppState>,
+    instance_name: String,
+    old_name: String,
+    new_name: String,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    validate_instance_name(&old_name)?;
+    validate_instance_name(&new_name)?;
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    instances::rename_world(&config.instances_dir(), &instance_name, &old_name, &new_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_copy_world(
+    state: State<'_, AppState>,
+    instance_name: String,
+    world_name: String,
+    new_name: String,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    validate_instance_name(&world_name)?;
+    validate_instance_name(&new_name)?;
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    instances::copy_world(&config.instances_dir(), &instance_name, &world_name, &new_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_delete_world(
+    state: State<'_, AppState>,
+    instance_name: String,
+    world_name: String,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    validate_instance_name(&world_name)?;
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    instances::delete_world(&config.instances_dir(), &instance_name, &world_name).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -649,6 +723,9 @@ fn cmd_list_packs(
     pack_type: String,
 ) -> Result<Vec<instances::PackEntry>, String> {
     validate_instance_name(&instance_name)?;
+    if !["mods", "resourcepacks", "shaderpacks", "config"].contains(&pack_type.as_str()) {
+        return Err("Invalid pack_type".to_string());
+    }
     let config = state.config.lock().map_err(|e| e.to_string())?;
     instances::list_packs(&config.instances_dir(), &instance_name, &pack_type).map_err(|e| e.to_string())
 }
@@ -660,6 +737,10 @@ fn cmd_get_pack_icon(
     pack_type: String,
     filename: String,
 ) -> Result<Option<String>, String> {
+    validate_instance_name(&instance_name)?;
+    if !["mods", "resourcepacks", "shaderpacks", "config"].contains(&pack_type.as_str()) {
+        return Err("Invalid pack_type".to_string());
+    }
     let safe_filename = std::path::Path::new(&filename)
         .file_name()
         .and_then(|n| n.to_str())
@@ -769,6 +850,51 @@ fn cmd_detect_java() -> Vec<java::JavaInstallation> {
     java::detect_java_installations()
 }
 
+#[tauri::command]
+async fn cmd_list_available_java() -> Result<Vec<java_download::AvailableJavaVersion>, String> {
+    java_download::list_available_java_versions()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cmd_download_java(
+    state: State<'_, AppState>,
+    major_version: u32,
+) -> Result<java_download::ManagedJavaRuntime, String> {
+    let data_dir = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.data_dir.clone()
+    };
+    java_download::download_java_runtime(major_version, &data_dir)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_list_managed_java(state: State<'_, AppState>) -> Vec<java_download::ManagedJavaRuntime> {
+    let data_dir = {
+        let c = state.config.lock().map_err(|e| e.to_string());
+        match c {
+            Ok(cfg) => cfg.data_dir.clone(),
+            Err(_) => return Vec::new(),
+        }
+    };
+    java_download::list_managed_java(&data_dir)
+}
+
+#[tauri::command]
+fn cmd_remove_managed_java(
+    state: State<'_, AppState>,
+    major_version: u32,
+) -> Result<(), String> {
+    let data_dir = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.data_dir.clone()
+    };
+    java_download::remove_managed_java(major_version, &data_dir).map_err(|e| e.to_string())
+}
+
 // ==================== Launch Commands ====================
 
 #[tauri::command]
@@ -848,6 +974,9 @@ async fn cmd_install_version(
     send_progress(75.0, "assets", "Downloading asset index...");
 
     // Download and save asset index
+    if !is_allowed_download_host(&version_info.asset_index.url) {
+        return Err("Access denied: asset index host not allowed".to_string());
+    }
     let asset_index = versions::fetch_asset_index(&version_info.asset_index.url)
         .await
         .map_err(|e| e.to_string())?;
@@ -1153,8 +1282,8 @@ async fn cmd_launch_game(
     // Take stdout and stderr out of the child WITHOUT moving the child itself
     // (so the timer + wait tasks can still call try_wait on it).
     let (stdout_opt, stderr_opt) = {
-        let mut guard = child_handle.lock().expect("child_handle lock poisoned");
-        let c = guard.as_mut().expect("child just inserted");
+        let mut guard = child_handle.lock().map_err(|e| e.to_string())?;
+        let c = guard.as_mut().ok_or_else(|| "Child not found".to_string())?;
         (c.stdout.take(), c.stderr.take())
     };
 
@@ -1179,8 +1308,15 @@ async fn cmd_launch_game(
     // Russian Windows) and `lines().flatten()` silently drops every non-UTF-8
     // line — which is exactly when a crash is most likely to print a useful
     // message. Replacing invalid UTF-8 with U+FFFD keeps the log intact.
+
+    // Create a game log file for this session
+    let game_log_path = game_logs::create_game_log_file(&data_dir, &instance_name).ok();
+    if let Some(ref path) = game_log_path {
+        events::emit_log(&app, "info", "launch", &format!("Game log: {}", path));
+    }
+
     if let Some(stdout) = stdout_opt {
-        let app_clone = app.clone();
+        let log_path = game_log_path.clone();
         std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = [0u8; 4096];
@@ -1195,7 +1331,9 @@ async fn cmd_launch_game(
                             let line: String = pending.drain(..=idx).collect();
                             let line = line.trim_end_matches(&['\r', '\n'][..]).to_string();
                             if !line.is_empty() {
-                                events::emit_log(&app_clone, "info", "minecraft", &line);
+                                if let Some(ref lp) = log_path {
+                                    game_logs::append_game_log_line(lp, &line);
+                                }
                             }
                         }
                     }
@@ -1203,12 +1341,14 @@ async fn cmd_launch_game(
                 }
             }
             if !pending.is_empty() {
-                events::emit_log(&app_clone, "info", "minecraft", pending.trim_end());
+                if let Some(ref lp) = log_path {
+                    game_logs::append_game_log_line(lp, pending.trim_end());
+                }
             }
         });
     }
     if let Some(stderr) = stderr_opt {
-        let app_clone = app.clone();
+        let log_path = game_log_path.clone();
         std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = [0u8; 4096];
@@ -1223,9 +1363,9 @@ async fn cmd_launch_game(
                             let line: String = pending.drain(..=idx).collect();
                             let line = line.trim_end_matches(&['\r', '\n'][..]).to_string();
                             if !line.is_empty() {
-                                // Use `error` for stderr so the UI highlights
-                                // Java exceptions visibly in the log panel.
-                                events::emit_log(&app_clone, "error", "minecraft", &line);
+                                if let Some(ref lp) = log_path {
+                                    game_logs::append_game_log_line(lp, &line);
+                                }
                             }
                         }
                     }
@@ -1233,7 +1373,9 @@ async fn cmd_launch_game(
                 }
             }
             if !pending.is_empty() {
-                events::emit_log(&app_clone, "error", "minecraft", pending.trim_end());
+                if let Some(ref lp) = log_path {
+                    game_logs::append_game_log_line(lp, pending.trim_end());
+                }
             }
         });
     }
@@ -1317,6 +1459,7 @@ async fn cmd_launch_game(
         };
 
         events::emit_log(&app_clone, "info", "launch", &format!("Game exited with code {}", exit_code));
+        game_logs::clear_current_log_path();
         let _ = app_clone.emit(
             "launch_complete",
             events::LaunchEventPayload {
@@ -1734,6 +1877,7 @@ async fn cmd_install_mod(
     file_name: String,
     download_url: String,
     project_id: Option<String>,
+    project_name: Option<String>,
     version_number: Option<String>,
     provider: String,
 ) -> Result<String, String> {
@@ -1771,6 +1915,7 @@ async fn cmd_install_mod(
         let sidecar = serde_json::json!({
             "provider": provider,
             "project_id": pid,
+            "project_name": project_name,
             "version_id": modrinth_version_id,
             "version_number": version_number,
         });
@@ -1789,6 +1934,7 @@ async fn cmd_download_to_folder(
     download_url: String,
     file_name: String,
     project_id: Option<String>,
+    project_name: Option<String>,
     version_id: Option<String>,
     version_number: Option<String>,
     provider: String,
@@ -1839,6 +1985,7 @@ async fn cmd_download_to_folder(
         let sidecar = serde_json::json!({
             "provider": provider,
             "project_id": pid,
+            "project_name": project_name,
             "version_id": version_id,
             "version_number": version_number,
         });
@@ -1924,6 +2071,9 @@ fn cmd_list_instance_mods(
             let enabled = is_jar && !is_disabled;
             let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             let meta = read_mod_meta_from_jar(&path);
+            let (slug, slug_verified) = read_mod_sidecar_slug(&mods_dir, &filename)
+                .map(|s| (Some(s), true))
+                .unwrap_or_else(|| (meta.slug, false));
             mods.push(ModMetadata {
                 filename,
                 name: meta.name,
@@ -1932,7 +2082,8 @@ fn cmd_list_instance_mods(
                 enabled,
                 file_size,
                 icon: meta.icon,
-                slug: meta.slug,
+                slug,
+                slug_verified,
             });
         }
     }
@@ -1993,6 +2144,33 @@ fn cmd_emit_log(
 }
 
 #[tauri::command]
+fn cmd_list_game_logs(state: State<'_, AppState>) -> Vec<game_logs::GameLogSession> {
+    let data_dir = {
+        let c = state.config.lock().map_err(|e| e.to_string());
+        match c {
+            Ok(cfg) => cfg.data_dir.clone(),
+            Err(_) => return Vec::new(),
+        }
+    };
+    game_logs::list_game_log_sessions(&data_dir)
+}
+
+#[tauri::command]
+fn cmd_read_game_log(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    let data_dir = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.data_dir.clone()
+    };
+    let safe_path = game_logs::validate_log_path(&data_dir, &path)?;
+    game_logs::read_game_log(&safe_path, None)
+}
+
+#[tauri::command]
+fn cmd_get_current_game_log() -> Option<String> {
+    game_logs::get_current_log_path()
+}
+
+#[tauri::command]
 fn cmd_rename_file(
     state: State<'_, AppState>,
     from: String,
@@ -2004,19 +2182,16 @@ fn cmd_rename_file(
     let to_path = std::path::Path::new(&to);
     // Open the source first to fail fast on missing/unreadable files.
     let _ = std::fs::File::open(from_path).map_err(|e| e.to_string())?;
-    if let Ok(canon) = from_path.canonicalize() {
-        let base_canon = instances_dir.canonicalize().map_err(|_| "Invalid base".to_string())?;
-        if !canon.starts_with(&base_canon) {
-            return Err("Access denied: path is outside instances directory".to_string());
-        }
+    let from_canon = from_path.canonicalize().map_err(|_| "Access denied: invalid source path".to_string())?;
+    let base_canon = instances_dir.canonicalize().map_err(|_| "Invalid base".to_string())?;
+    if !from_canon.starts_with(&base_canon) {
+        return Err("Access denied: path is outside instances directory".to_string());
     }
     // Target may not exist yet; check parent
     if let Some(parent) = to_path.parent() {
-        if let Ok(parent_canon) = parent.canonicalize() {
-            let base_canon = instances_dir.canonicalize().map_err(|_| "Invalid base".to_string())?;
-            if !parent_canon.starts_with(&base_canon) {
-                return Err("Access denied: target is outside instances directory".to_string());
-            }
+        let parent_canon = parent.canonicalize().map_err(|_| "Access denied: invalid target path".to_string())?;
+        if !parent_canon.starts_with(&base_canon) {
+            return Err("Access denied: target is outside instances directory".to_string());
         }
     }
     std::fs::rename(&from, &to).map_err(|e| e.to_string())
@@ -2026,11 +2201,10 @@ fn cmd_rename_file(
 fn cmd_delete_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let instances_dir = config.instances_dir();
-    if let Ok(canon) = std::path::Path::new(&path).canonicalize() {
-        let base_canon = instances_dir.canonicalize().map_err(|_| "Invalid base".to_string())?;
-        if !canon.starts_with(&base_canon) {
-            return Err("Access denied: path is outside instances directory".to_string());
-        }
+    let canon = std::path::Path::new(&path).canonicalize().map_err(|_| "Access denied: invalid path".to_string())?;
+    let base_canon = instances_dir.canonicalize().map_err(|_| "Invalid base".to_string())?;
+    if !canon.starts_with(&base_canon) {
+        return Err("Access denied: path is outside instances directory".to_string());
     }
     std::fs::remove_file(&path).map_err(|e| e.to_string())
 }
@@ -2045,6 +2219,15 @@ pub struct ModMetadata {
     pub file_size: u64,
     pub icon: Option<String>,
     pub slug: Option<String>,
+    /// `true` when the slug came from the `.voidlauncher.json` sidecar
+    /// (i.e. the mod was installed via the launcher and the slug is the
+    /// verified Modrinth/CurseForge project ID). `false` when the slug is
+    /// derived from the jar's internal metadata (e.g. `fabric.mod.json`
+    /// `id`), which is the mod's *internal* identifier and may NOT match
+    /// the Modrinth project slug — causing false-positive "incompatible"
+    /// warnings in the compatibility check.
+    #[serde(default)]
+    pub slug_verified: bool,
 }
 
 #[tauri::command]
@@ -2070,6 +2253,10 @@ fn cmd_get_mod_metadata(
                 let enabled = is_jar && !is_disabled;
                 let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let meta = read_mod_meta_from_jar(&path);
+                // Check sidecar for verified Modrinth/CurseForge project slug.
+                let (slug, slug_verified) = read_mod_sidecar_slug(&mods_dir, &filename)
+                    .map(|s| (Some(s), true))
+                    .unwrap_or_else(|| (meta.slug, false));
                 mods.push(ModMetadata {
                     filename,
                     name: meta.name,
@@ -2078,13 +2265,24 @@ fn cmd_get_mod_metadata(
                     enabled,
                     file_size,
                     icon: meta.icon,
-                    slug: meta.slug,
+                    slug,
+                    slug_verified,
                 });
             }
         }
     }
     mods.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(mods)
+}
+
+/// Read the Modrinth/CurseForge project slug from the `.voidlauncher.json`
+/// sidecar file that `cmd_install_mod` writes at download time.
+fn read_mod_sidecar_slug(mods_dir: &std::path::Path, filename: &str) -> Option<String> {
+    let stem = filename.trim_end_matches(".jar").trim_end_matches(".disabled");
+    let sidecar_path = mods_dir.join(format!("{}.voidlauncher.json", stem));
+    let contents = std::fs::read_to_string(sidecar_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    json["project_id"].as_str().map(|s| s.to_string())
 }
 
 struct ModMetaResult {
@@ -2501,6 +2699,10 @@ pub fn run() {
             cmd_get_instance,
             cmd_save_instance,
             cmd_detect_java,
+            cmd_list_available_java,
+            cmd_download_java,
+            cmd_list_managed_java,
+            cmd_remove_managed_java,
             cmd_install_version,
             cmd_launch_game,
             cmd_get_fabric_versions,
@@ -2543,11 +2745,19 @@ pub fn run() {
             cmd_get_mod_metadata,
             cmd_get_mod_icon,
             cmd_emit_log,
+            cmd_list_game_logs,
+            cmd_read_game_log,
+            cmd_get_current_game_log,
             cmd_rename_file,
             cmd_delete_file,
             cmd_duplicate_instance,
+            cmd_import_prism_instance,
             cmd_set_instance_icon,
+            cmd_log_toast,
             cmd_list_saves,
+            cmd_rename_world,
+            cmd_copy_world,
+            cmd_delete_world,
             cmd_list_screenshots,
             cmd_list_packs,
             cmd_get_pack_icon,

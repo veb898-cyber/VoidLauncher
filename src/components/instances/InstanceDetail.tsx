@@ -71,16 +71,16 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
     });
     if (!selected) return;
     try {
-      const resp = await fetch(`file://${selected}`);
-      const blob = await resp.blob();
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const dataUrl = reader.result as string;
-        await invoke('cmd_set_instance_icon', { instanceName: instance.name, iconData: dataUrl });
-        addToast(t('instance_detail.icon_updated'), 'success');
-        useInstanceStore.getState().loadInstances();
-      };
-      reader.readAsDataURL(blob);
+      const { readFile } = await import('@tauri-apps/plugin-fs');
+      const bytes = await readFile(selected);
+      const ext = selected.split('.').pop()?.toLowerCase() || 'png';
+      const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'ico' ? 'image/x-icon' : 'image/png';
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      const dataUrl = `data:${mime};base64,${btoa(binary)}`;
+      await invoke('cmd_set_instance_icon', { instanceName: instance.name, iconData: dataUrl });
+      addToast(t('instance_detail.icon_updated'), 'success');
+      useInstanceStore.getState().loadInstances();
     } catch (e: any) { addToast(t('instance_detail.icon_error', { error: e.toString() }), 'error'); }
   };
 
@@ -127,19 +127,19 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
 
       {/* Tab bar */}
       <div style={{ display: 'flex', borderBottom: '1px solid var(--surface-border)', flexShrink: 0, padding: '0 var(--space-xl)' }}>
-        {TABS.map((t) => (
+        {TABS.map((tabEntry) => (
           <button
-            key={t.id}
-            onClick={() => setTab(t.id)}
+            key={tabEntry.id}
+            onClick={() => setTab(tabEntry.id)}
             style={{
               padding: '10px 16px', border: 'none', background: 'none', cursor: 'pointer',
-              color: tab === t.id ? 'var(--primary)' : 'var(--text-secondary)',
-              borderBottom: tab === t.id ? '2px solid var(--primary)' : '2px solid transparent',
-              fontWeight: tab === t.id ? 600 : 400, fontSize: 'var(--font-size-sm)',
+              color: tab === tabEntry.id ? 'var(--primary)' : 'var(--text-secondary)',
+              borderBottom: tab === tabEntry.id ? '2px solid var(--primary)' : '2px solid transparent',
+              fontWeight: tab === tabEntry.id ? 600 : 400, fontSize: 'var(--font-size-sm)',
               transition: 'all 0.15s',
             }}
           >
-            {t.label}
+            {tabEntry.label}
           </button>
         ))}
       </div>

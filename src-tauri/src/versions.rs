@@ -139,27 +139,56 @@ pub struct AssetObject {
 
 /// Fetch version manifest from Mojang
 pub async fn fetch_version_manifest() -> Result<VersionManifest> {
+    tracing::info!(target: "launcher", "Fetching version manifest from Mojang");
     let client = crate::download::global_http_client();
     let manifest = client
         .get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
         .send()
-        .await?
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "launcher", "Failed to fetch version manifest: {}", e);
+            e
+        })?
         .json::<VersionManifest>()
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "launcher", "Failed to parse version manifest: {}", e);
+            e
+        })?;
     Ok(manifest)
 }
 
 /// Fetch detailed version info
 pub async fn fetch_version_info(url: &str) -> Result<VersionInfo> {
+    tracing::info!(target: "launcher", "Fetching version info from {}", url);
     let client = crate::download::global_http_client();
-    let info = client.get(url).send().await?.json::<VersionInfo>().await?;
+    let info = client.get(url).send().await
+        .map_err(|e| {
+            tracing::error!(target: "launcher", "Failed to fetch version info: {}", e);
+            e
+        })?
+        .json::<VersionInfo>().await
+        .map_err(|e| {
+            tracing::error!(target: "launcher", "Failed to parse version info: {}", e);
+            e
+        })?;
     Ok(info)
 }
 
 /// Fetch asset index
 pub async fn fetch_asset_index(url: &str) -> Result<AssetIndexData> {
+    tracing::info!(target: "launcher", "Fetching asset index from {}", url);
     let client = crate::download::global_http_client();
-    let index = client.get(url).send().await?.json::<AssetIndexData>().await?;
+    let index = client.get(url).send().await
+        .map_err(|e| {
+            tracing::error!(target: "launcher", "Failed to fetch asset index: {}", e);
+            e
+        })?
+        .json::<AssetIndexData>().await
+        .map_err(|e| {
+            tracing::error!(target: "launcher", "Failed to parse asset index: {}", e);
+            e
+        })?;
     Ok(index)
 }
 

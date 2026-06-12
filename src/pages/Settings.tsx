@@ -18,6 +18,19 @@ import {
   getVersionComparison,
 } from '../hooks/useLatestVersion';
 
+interface AvailableJavaVersion {
+  major_version: number;
+  label: string;
+}
+
+interface ManagedJavaRuntime {
+  major_version: number;
+  path: string;
+  version: string;
+  vendor: string;
+  is_64bit: boolean;
+}
+
 export function Settings() {
   const t = useT();
   const language = useLanguageStore((s) => s.language);
@@ -33,6 +46,11 @@ export function Settings() {
   const [localConfig, setLocalConfig] = useState(config);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [clearingCache, setClearingCache] = useState(false);
+  const [availableJava, setAvailableJava] = useState<AvailableJavaVersion[]>([]);
+  const [managedJava, setManagedJava] = useState<ManagedJavaRuntime[]>([]);
+  const [checkingJava, setCheckingJava] = useState(false);
+  const [downloadingJava, setDownloadingJava] = useState<number | null>(null);
+  const [javaError, setJavaError] = useState(false);
 
   useEffect(() => {
     loadConfig();
@@ -44,6 +62,30 @@ export function Settings() {
   useEffect(() => {
     setLocalConfig(config);
   }, [config]);
+
+  const loadJavaVersions = useCallback(async () => {
+    setCheckingJava(true);
+    setJavaError(false);
+    try {
+      const [available, managed] = await Promise.all([
+        invoke<AvailableJavaVersion[]>('cmd_list_available_java'),
+        invoke<ManagedJavaRuntime[]>('cmd_list_managed_java'),
+      ]);
+      setAvailableJava(available);
+      setManagedJava(managed);
+      if (available.length === 0) {
+        setJavaError(true);
+      }
+    } catch {
+      setJavaError(true);
+    } finally {
+      setCheckingJava(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadJavaVersions();
+  }, [loadJavaVersions]);
 
   const handleSave = useCallback(async () => {
     if (!localConfig) return;
@@ -236,6 +278,114 @@ export function Settings() {
             </div>
           )}
         </div>
+      </section>
+
+      {/* Managed Java Runtimes */}
+      <section className="settings-section">
+        <h2 className="settings-section__title">{t('settings.java_download_heading')}</h2>
+        <p className="settings-section__desc" style={{ marginTop: 'var(--space-xs)', marginBottom: 'var(--space-md)', color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
+          {t('settings.java_download_desc')}
+        </p>
+
+        {/* Available for download */}
+        {checkingJava ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: 'var(--space-md)' }}>
+            <LoadingSpinner size={16} />
+            <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>{t('settings.java_checking')}</span>
+          </div>
+        ) : javaError && availableJava.length === 0 ? (
+          <div className="glass-card" style={{ padding: 'var(--space-lg)', textAlign: 'center' }}>
+            <div style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-sm)', fontSize: 'var(--font-size-sm)' }}>
+              {t('settings.java_fetch_error')}
+            </div>
+            <Button size="sm" variant="secondary" onClick={loadJavaVersions}>
+              {t('settings.java_retry')}
+            </Button>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)', marginBottom: 'var(--space-lg)' }}>
+            {availableJava.map((jv) => {
+              const isDownloading = downloadingJava === jv.major_version;
+              const isInstalled = managedJava.some((m) => m.major_version === jv.major_version);
+              return (
+                <div key={jv.major_version} className="glass-card" style={{
+                  padding: 'var(--space-md) var(--space-lg)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                }}>
+                  <div>
+                    <div style={{ fontWeight: 500, fontSize: 'var(--font-size-md)' }}>{jv.label}</div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant={isInstalled ? 'secondary' : 'primary'}
+                    disabled={isDownloading}
+                    onClick={async () => {
+                      if (isInstalled) return;
+                      setDownloadingJava(jv.major_version);
+                      try {
+                        await invoke('cmd_download_java', { majorVersion: jv.major_version });
+                        addToast(t('settings.java_install_success', { version: jv.major_version.toString() }), 'success');
+                        const managed = await invoke<ManagedJavaRuntime[]>('cmd_list_managed_java');
+                        setManagedJava(managed);
+                      } catch (e) {
+                        addToast(t('settings.java_install_error', { error: String(e) }), 'error');
+                      } finally {
+                        setDownloadingJava(null);
+                      }
+                    }}
+                  >
+                    {isDownloading ? <LoadingSpinner size={14} /> : isInstalled ? `✓ ${t('settings.java_downloaded')}` : t('settings.java_download_btn')}
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Already downloaded */}
+        <div style={{ fontWeight: 500, marginBottom: 'var(--space-md)' }}>{t('settings.java_downloaded')}</div>
+        {managedJava.length === 0 ? (
+          <div className="glass-card" style={{ padding: 'var(--space-lg)', textAlign: 'center', color: 'var(--text-secondary)' }}>
+            {t('settings.java_no_managed')}
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)' }}>
+            {managedJava.map((m) => (
+              <div key={m.major_version} className="glass-card" style={{
+                padding: 'var(--space-md) var(--space-lg)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+              }}>
+                <div>
+                  <div style={{ fontWeight: 500, fontSize: 'var(--font-size-md)' }}>
+                    Java {m.major_version}
+                    <span style={{ marginLeft: 'var(--space-sm)', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                      {m.version}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
+                    {m.vendor} &bull; {m.is_64bit ? t('settings.java_64bit') : t('settings.java_32bit')}
+                  </div>
+                </div>
+                <Button size="sm" variant="ghost" onClick={async () => {
+                  try {
+                    await invoke('cmd_remove_managed_java', { majorVersion: m.major_version });
+                    addToast(t('settings.java_remove_success', { version: m.major_version.toString() }), 'success');
+                    const managed = await invoke<ManagedJavaRuntime[]>('cmd_list_managed_java');
+                    setManagedJava(managed);
+                  } catch (e) {
+                    addToast(t('settings.java_remove_error', { error: String(e) }), 'error');
+                  }
+                }}>
+                  {t('settings.java_remove_btn')}
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
       {/* Appearance Section */}

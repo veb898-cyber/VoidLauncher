@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing;
 use crate::error::{LauncherError, Result};
 
 /// Microsoft OAuth2 token response
@@ -47,6 +48,7 @@ pub struct AuthState {
 /// Authenticate with Microsoft OAuth2 Device Code Flow
 /// This flow is simpler and doesn't require a redirect server
 pub async fn start_device_code_flow(client_id: &str) -> Result<serde_json::Value> {
+    tracing::info!(target: "launcher", "Starting device code flow");
     let client = crate::download::global_http_client();
     let resp = client
         .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
@@ -60,12 +62,11 @@ pub async fn start_device_code_flow(client_id: &str) -> Result<serde_json::Value
         .await?;
 
     if resp.get("error").is_some() {
-        return Err(LauncherError::Auth(
-            resp["error_description"]
-                .as_str()
-                .unwrap_or("Unknown error")
-                .to_string(),
-        ));
+        let msg = resp["error_description"]
+            .as_str()
+            .unwrap_or("Unknown error");
+        tracing::error!(target: "launcher", "Device code flow failed: {}", msg);
+        return Err(LauncherError::Auth(msg.to_string()));
     }
 
     Ok(resp)
@@ -94,14 +95,14 @@ pub async fn poll_device_code(
         if error_str == "authorization_pending" {
             return Err(LauncherError::Auth("authorization_pending".into()));
         }
-        return Err(LauncherError::Auth(
-            resp["error_description"]
-                .as_str()
-                .unwrap_or("Unknown error")
-                .to_string(),
-        ));
+        let msg = resp["error_description"]
+            .as_str()
+            .unwrap_or("Unknown error");
+        tracing::error!(target: "launcher", "Device code poll failed: {}", msg);
+        return Err(LauncherError::Auth(msg.to_string()));
     }
 
+    tracing::info!(target: "launcher", "Device code poll succeeded");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -124,6 +125,7 @@ pub async fn refresh_microsoft_token(
     client_id: &str,
     refresh_token: &str,
 ) -> Result<MicrosoftToken> {
+    tracing::info!(target: "launcher", "Refreshing Microsoft token");
     let client = crate::download::global_http_client();
     let resp = client
         .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
@@ -139,9 +141,11 @@ pub async fn refresh_microsoft_token(
         .await?;
 
     if resp.get("error").is_some() {
+        tracing::error!(target: "launcher", "Token refresh failed");
         return Err(LauncherError::Auth("Token refresh failed".into()));
     }
 
+    tracing::info!(target: "launcher", "Microsoft token refreshed successfully");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -179,11 +183,17 @@ pub async fn get_xbox_token(ms_token: &str) -> Result<XboxToken> {
 
     let token = resp["Token"]
         .as_str()
-        .ok_or_else(|| LauncherError::Auth("Missing Xbox token".into()))?
+        .ok_or_else(|| {
+            tracing::error!(target: "launcher", "Missing Xbox token in response");
+            LauncherError::Auth("Missing Xbox token".into())
+        })?
         .to_string();
     let user_hash = resp["DisplayClaims"]["xui"][0]["uhs"]
         .as_str()
-        .ok_or_else(|| LauncherError::Auth("Missing user hash".into()))?
+        .ok_or_else(|| {
+            tracing::error!(target: "launcher", "Missing user hash in Xbox response");
+            LauncherError::Auth("Missing user hash".into())
+        })?
         .to_string();
 
     Ok(XboxToken { token, user_hash })
@@ -221,16 +231,23 @@ pub async fn get_xsts_token(xbox_token: &str) -> Result<XboxToken> {
             2148916238 => "Child account. Add to a Family.",
             _ => "Unknown XSTS error",
         };
+        tracing::error!(target: "launcher", "XSTS token request failed with code {}: {}", code, msg);
         return Err(LauncherError::Auth(msg.into()));
     }
 
     let token = resp["Token"]
         .as_str()
-        .ok_or_else(|| LauncherError::Auth("Missing XSTS token".into()))?
+        .ok_or_else(|| {
+            tracing::error!(target: "launcher", "Missing XSTS token in response");
+            LauncherError::Auth("Missing XSTS token".into())
+        })?
         .to_string();
     let user_hash = resp["DisplayClaims"]["xui"][0]["uhs"]
         .as_str()
-        .ok_or_else(|| LauncherError::Auth("Missing user hash".into()))?
+        .ok_or_else(|| {
+            tracing::error!(target: "launcher", "Missing user hash in XSTS response");
+            LauncherError::Auth("Missing user hash".into())
+        })?
         .to_string();
 
     Ok(XboxToken { token, user_hash })
@@ -260,7 +277,10 @@ pub async fn get_minecraft_token(xsts_token: &str, user_hash: &str) -> Result<Mi
     Ok(MinecraftToken {
         access_token: resp["access_token"]
             .as_str()
-            .ok_or_else(|| LauncherError::Auth("Missing MC token".into()))?
+            .ok_or_else(|| {
+                tracing::error!(target: "launcher", "Missing MC token in response");
+                LauncherError::Auth("Missing MC token".into())
+            })?
             .to_string(),
         expires_in: now + resp["expires_in"].as_u64().unwrap_or(86400),
     })
@@ -306,18 +326,21 @@ pub async fn get_profile(mc_token: &str) -> Result<MinecraftProfile> {
 
 /// Full authentication flow: Microsoft → Xbox → XSTS → Minecraft
 pub async fn full_auth_flow(ms_token: &MicrosoftToken) -> Result<(MinecraftToken, MinecraftProfile)> {
+    tracing::info!(target: "launcher", "Starting full auth flow");
     let xbox = get_xbox_token(&ms_token.access_token).await?;
     let xsts = get_xsts_token(&xbox.token).await?;
     let mc_token = get_minecraft_token(&xsts.token, &xsts.user_hash).await?;
 
     let owns_game = check_ownership(&mc_token.access_token).await?;
     if !owns_game {
+        tracing::warn!(target: "launcher", "User does not own Minecraft");
         return Err(LauncherError::Auth(
             "You don't own Minecraft. Please purchase the game.".into(),
         ));
     }
 
     let profile = get_profile(&mc_token.access_token).await?;
+    tracing::info!(target: "launcher", "Full auth flow completed successfully");
     Ok((mc_token, profile))
 }
 
@@ -382,6 +405,7 @@ pub fn load_auth_state(path: &std::path::Path) -> Option<AuthState> {
 
 /// Ely.by authentication
 pub async fn elyby_login(username: &str, password: &str) -> Result<(String, String, String)> {
+    tracing::info!(target: "launcher", "Starting Ely.by login");
     let client = crate::download::global_http_client();
     let body = serde_json::json!({
         "username": username,
@@ -403,27 +427,36 @@ pub async fn elyby_login(username: &str, password: &str) -> Result<(String, Stri
         .await?;
 
     if resp.get("error").is_some() {
-        return Err(LauncherError::Auth(
-            resp["errorMessage"]
-                .as_str()
-                .unwrap_or("Ely.by authentication failed")
-                .to_string()
-        ));
+        let msg = resp["errorMessage"]
+            .as_str()
+            .unwrap_or("Ely.by authentication failed");
+        tracing::error!(target: "launcher", "Ely.by login failed: {}", msg);
+        return Err(LauncherError::Auth(msg.to_string()));
     }
 
     let access_token = resp["accessToken"]
         .as_str()
-        .ok_or_else(|| LauncherError::Auth("Missing accessToken".into()))?
+        .ok_or_else(|| {
+            tracing::error!(target: "launcher", "Missing accessToken in Ely.by response");
+            LauncherError::Auth("Missing accessToken".into())
+        })?
         .to_string();
     let uuid = resp["selectedProfile"]["id"]
         .as_str()
-        .ok_or_else(|| LauncherError::Auth("Missing profile id".into()))?
+        .ok_or_else(|| {
+            tracing::error!(target: "launcher", "Missing profile id in Ely.by response");
+            LauncherError::Auth("Missing profile id".into())
+        })?
         .to_string();
     let name = resp["selectedProfile"]["name"]
         .as_str()
-        .ok_or_else(|| LauncherError::Auth("Missing profile name".into()))?
+        .ok_or_else(|| {
+            tracing::error!(target: "launcher", "Missing profile name in Ely.by response");
+            LauncherError::Auth("Missing profile name".into())
+        })?
         .to_string();
 
+    tracing::info!(target: "launcher", "Ely.by login successful for {}", name);
     Ok((name, uuid, access_token))
 }
 

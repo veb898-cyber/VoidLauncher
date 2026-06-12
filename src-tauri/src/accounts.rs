@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracing;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum AccountType {
@@ -100,13 +101,23 @@ pub fn list_accounts(accounts_dir: &std::path::Path) -> Vec<AccountEntry> {
 
 pub fn save_accounts(accounts_dir: &std::path::Path, accounts: &[AccountEntry]) -> Result<(), String> {
     let path = accounts_dir.join("accounts.json");
-    std::fs::create_dir_all(accounts_dir).map_err(|e| e.to_string())?;
-    let json = serde_json::to_string_pretty(accounts).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())?;
+    if let Err(e) = std::fs::create_dir_all(accounts_dir) {
+        tracing::warn!(target: "launcher", "Failed to create accounts directory: {}", e);
+        return Err(e.to_string());
+    }
+    let json = serde_json::to_string_pretty(accounts).map_err(|e| {
+        tracing::warn!(target: "launcher", "Failed to serialize accounts: {}", e);
+        e.to_string()
+    })?;
+    std::fs::write(path, json).map_err(|e| {
+        tracing::warn!(target: "launcher", "Failed to write accounts file: {}", e);
+        e.to_string()
+    })?;
     Ok(())
 }
 
 pub fn add_account(accounts_dir: &std::path::Path, entry: AccountEntry) -> Result<Vec<AccountEntry>, String> {
+    tracing::info!(target: "launcher", "Adding {:?} account: {}", entry.account_type, entry.name);
     let mut accounts = list_accounts(accounts_dir);
     accounts.push(entry);
     save_accounts(accounts_dir, &accounts)?;
@@ -114,6 +125,7 @@ pub fn add_account(accounts_dir: &std::path::Path, entry: AccountEntry) -> Resul
 }
 
 pub fn remove_account(accounts_dir: &std::path::Path, id: &str) -> Result<Vec<AccountEntry>, String> {
+    tracing::info!(target: "launcher", "Removing account with id: {}", id);
     let mut accounts = list_accounts(accounts_dir);
     accounts.retain(|a| a.id != id);
     save_accounts(accounts_dir, &accounts)?;
@@ -151,6 +163,7 @@ pub fn remove_microsoft_account(accounts_dir: &std::path::Path, uuid: &str) -> R
 }
 
 pub fn set_default_account(accounts_dir: &std::path::Path, id: &str) -> Result<Vec<AccountEntry>, String> {
+    tracing::info!(target: "launcher", "Setting default account to id: {}", id);
     let mut accounts = list_accounts(accounts_dir);
     for a in &mut accounts {
         a.default = a.id == id;

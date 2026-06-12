@@ -166,15 +166,19 @@ pub async fn install(
     loader_version: &str,
     libraries_dir: &Path,
 ) -> Result<LoaderProfile> {
+    tracing::info!(target: "launcher", "Installing Forge for MC {} (loader {})", mc_version, loader_version);
     let profile = get_profile(mc_version, loader_version).await?;
 
-    // Download all Forge libraries
     for lib in &profile.libraries {
         let lib_path = libraries_dir.join(&lib.path);
         if !lib_path.exists() {
-            crate::download::download_file(&lib.url, &lib_path, "").await?;
+            if let Err(e) = crate::download::download_file(&lib.url, &lib_path, "").await {
+                tracing::warn!(target: "launcher", "Failed to download Forge library {}: {}", lib.name, e);
+                return Err(e);
+            }
         }
     }
 
+    tracing::info!(target: "launcher", "Forge install completed for MC {}", mc_version);
     Ok(profile)
 }

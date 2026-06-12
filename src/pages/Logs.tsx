@@ -5,10 +5,11 @@ import { t } from '../lib/i18n';
 export function Logs() {
   const { logs, clearLogs } = useLogStore();
   const bottomRef = useRef<HTMLDivElement>(null);
+  const launcherLogs = logs.filter((l) => l.source !== 'minecraft');
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logs.length]);
+  }, [launcherLogs.length]);
 
   const getLevelClass = (level: string) => {
     switch (level) {
@@ -28,7 +29,7 @@ export function Logs() {
         </div>
         <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
           <button className="btn btn--ghost btn--sm" onClick={() => {
-            const text = logs.map(l => `[${l.timestamp}] [${l.source}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
+            const text = launcherLogs.map(l => `[${l.timestamp}] [${l.source}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
             navigator.clipboard.writeText(text);
           }}>
             {t('common.copy_all')}
@@ -49,12 +50,12 @@ export function Logs() {
         fontSize: 'var(--font-size-xs)',
         lineHeight: 1.6,
       }}>
-        {logs.length === 0 ? (
+        {launcherLogs.length === 0 ? (
           <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-2xl)' }}>
             {t('logs.empty')}
           </div>
         ) : (
-          logs.map((log) => (
+          launcherLogs.map((log) => (
             <div key={log.id} className={`log-line ${getLevelClass(log.level)}`} style={{
               display: 'flex',
               gap: 'var(--space-sm)',

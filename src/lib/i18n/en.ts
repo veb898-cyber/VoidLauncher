@@ -15,6 +15,7 @@ export const en = {
 
   // ── Sidebar ─────────────────────────────────────────────────
   'sidebar.home':                      'Home',
+  'sidebar.game_logs':                 'Game Logs',
   'sidebar.instances':                 'Instances',
   'sidebar.accounts':                  'Accounts',
   'sidebar.logs':                      'Logs',
@@ -250,7 +251,6 @@ export const en = {
 
   'settings.clear_cache_title':        'Clear Cache',
   'settings.clear_cache_desc':         'Delete cached downloads and assets (will be re-downloaded as needed)',
-  'settings.clear_cache_not_impl':     'Cache clearing not yet implemented. Manually delete the assets/libraries folders.',
   'settings.clear_cache_btn':          'Clear Cache',
   'settings.clear_cache_success':      'Cache cleared, freed {mb} MB',
   'settings.clear_cache_error':        'Failed to clear cache: {error}',
@@ -276,6 +276,20 @@ export const en = {
   'settings.java_none_detected':       'No Java installations detected',
   'settings.java_64bit':               '64-bit',
   'settings.java_32bit':               '32-bit',
+  'settings.java_download_heading':     'Download Java Runtime',
+  'settings.java_download_desc':        'Download and manage Java runtimes for instances that require a specific version',
+  'settings.java_download_btn':         'Download',
+  'settings.java_downloading':          'Downloading Java {version}...',
+  'settings.java_downloaded':           'Downloaded Java Runtimes',
+  'settings.java_remove_btn':           'Remove',
+  'settings.java_checking':             'Checking available versions...',
+  'settings.java_no_managed':           'No managed Java runtimes downloaded',
+  'settings.java_install_success':      'Java {version} installed successfully',
+  'settings.java_install_error':        'Failed to install Java: {error}',
+  'settings.java_remove_success':       'Java {version} removed',
+  'settings.java_remove_error':         'Failed to remove Java: {error}',
+  'settings.java_fetch_error':          'Could not fetch available versions. Check your internet connection.',
+  'settings.java_retry':                'Retry',
 
   // ── Content Browser ─────────────────────────────────────────
   'content.type_mod':                  'Mods',
@@ -292,6 +306,7 @@ export const en = {
   'content.download_count':            '{n} downloads',
   'content.add_btn':                   'Add',
   'content.added_btn':                 'Added',
+  'content.already_installed':         'Installed',
   'content.versions_label':            'Versions',
   'content.versions_available':        '{n} available',
   'content.no_compatible_version':     'No compatible version found',
@@ -370,6 +385,25 @@ export const en = {
   'worlds.hint':                       'Launch the game and create a world to see it here.',
   'worlds.last_played':                'Last played: {date}',
   'worlds.open_folder':                'Open Saves Folder',
+  'worlds.rename':                     'Rename',
+  'worlds.copy':                       'Copy',
+  'worlds.delete':                     'Delete',
+  'worlds.copy_seed':                  'Copy Seed',
+  'worlds.rename_title':               'Rename World',
+  'worlds.rename_label':               'New name',
+  'worlds.copy_title':                 'Copy World',
+  'worlds.copy_label':                 'Copy name',
+  'worlds.delete_title':               'Delete World',
+  'worlds.delete_confirm':             'Are you sure you want to delete "{name}"? This cannot be undone.',
+  'worlds.rename_toast':               'World renamed to {name}',
+  'worlds.copy_toast':                 'World copied as {name}',
+  'worlds.delete_toast':               'World deleted',
+  'worlds.seed_toast':                 'Seed copied to clipboard',
+  'worlds.game_survival':              'Survival',
+  'worlds.game_creative':              'Creative',
+  'worlds.game_adventure':             'Adventure',
+  'worlds.game_hardcore':              'Hardcore',
+  'worlds.game_unknown':               'Unknown',
 
   // ── Mod Browser ─────────────────────────────────────────────
   'mod.source_modrinth':               'Modrinth',
@@ -397,8 +431,16 @@ export const en = {
 
   // ── Logs ────────────────────────────────────────────────────
   'logs.title':                        'Logs',
-  'logs.subtitle':                     'Installation and launch logs',
+  'logs.subtitle':                     'Launcher and system logs',
   'logs.empty':                        'No logs yet',
+
+  // ── Game Logs ────────────────────────────────────────────────
+  'game_logs.title':                   'Game Logs',
+  'game_logs.subtitle':                'Minecraft game output from recent sessions',
+  'game_logs.empty':                   'No game logs yet. Launch a game to see its output here.',
+  'game_logs.no_content':              'No output in this session',
+  'game_logs.live_session':            'Live Session',
+  'game_logs.active':                  'Active',
 
   // ── Install Overlay ─────────────────────────────────────────
   'install.stage_fetching':            'Fetching version info',

@@ -24,33 +24,33 @@ pub fn launch_minecraft(
     uuid: &str,
     username: &str,
 ) -> Result<std::process::Child> {
-    eprintln!("[LAUNCH] Starting launch for instance: {}", instance.name);
-    eprintln!("[LAUNCH] MC version: {}", instance.mc_version);
-    eprintln!("[LAUNCH] Username: {}", username);
+    tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
+    tracing::info!(target: "launcher", "MC version: {}", instance.mc_version);
+    tracing::info!(target: "launcher", "Username: {}", username);
 
     // 1. Determine Java path
-    eprintln!("[LAUNCH] Detecting Java installation...");
+    tracing::info!(target: "launcher", "Detecting Java installation...");
     let java_path = get_java_path(config, instance, version_info)?;
-    eprintln!("[LAUNCH] Using Java: {:?}", java_path);
+    tracing::info!(target: "launcher", "Using Java: {:?}", java_path);
 
     // 2. Probe the selected Java's major version BEFORE composing the command.
     //    This is what lets us safely fall back from ZGC to G1GC for older JDKs.
     let java_major = detect_java_major(&java_path).unwrap_or(0);
-    eprintln!("[LAUNCH] Detected Java major version: {}", java_major);
+    tracing::info!(target: "launcher", "Detected Java major version: {}", java_major);
 
     // 3. Build classpath
     let client_jar = config
         .versions_dir()
         .join(&version_info.id)
         .join(format!("{}.jar", version_info.id));
-    eprintln!("[LAUNCH] Client JAR: {:?}", client_jar);
-    eprintln!("[LAUNCH] Client JAR exists: {}", client_jar.exists());
+    tracing::debug!(target: "launcher", "Client JAR: {:?}", client_jar);
+    tracing::debug!(target: "launcher", "Client JAR exists: {}", client_jar.exists());
 
     let mut classpath = build_classpath(version_info, &config.libraries_dir(), &client_jar);
 
     // Add mod loader libraries to classpath
     if let Some(profile) = &instance.loader_profile {
-        eprintln!("[LAUNCH] Mod loader: main_class={}", profile.main_class);
+        tracing::info!(target: "launcher", "Mod loader: main_class={}", profile.main_class);
         for lib in &profile.libraries {
             let lib_path = config.libraries_dir().join(&lib.path);
             if lib_path.exists() {
@@ -59,7 +59,7 @@ pub fn launch_minecraft(
                 }
                 classpath.push_str(&lib_path.to_string_lossy());
             } else {
-                eprintln!("[LAUNCH] WARNING: Mod library not found: {:?}", lib_path);
+                tracing::warn!(target: "launcher", "Mod library not found: {:?}", lib_path);
             }
         }
     }
@@ -72,7 +72,7 @@ pub fn launch_minecraft(
     let preset_str = instance.gc_preset.as_deref().unwrap_or("g1gc");
     let requested_preset = GcPreset::from_str(preset_str);
     let (mut args, effective_preset) = build_jvm_args(requested_preset, memory_mb, java_major);
-    eprintln!("[LAUNCH] Memory: Xms=Xmx={}M, preset={:?} (requested {:?})",
+    tracing::info!(target: "launcher", "Memory: Xms=Xmx={}M, preset={:?} (requested {:?})",
               memory_mb, effective_preset, requested_preset);
 
     // Append user-provided custom args (for power users). These go AFTER the
@@ -123,11 +123,11 @@ pub fn launch_minecraft(
     // "multiple garbage collectors selected" before the game can start.
     // See `jvm::strip_gc_selection_flags` for the full list.
     let version_jvm_args = get_jvm_arguments(version_info);
-    eprintln!("[LAUNCH] Version manifest JVM args ({} total):", version_jvm_args.len());
-    for a in &version_jvm_args { eprintln!("[LAUNCH]   raw: {}", a); }
+    tracing::debug!(target: "launcher", "Version manifest JVM args ({} total):", version_jvm_args.len());
+    for a in &version_jvm_args { tracing::debug!(target: "launcher", "  raw: {}", a); }
     let version_jvm_args = strip_gc_selection_flags(&version_jvm_args);
-    eprintln!("[LAUNCH] After GC-strip ({} remaining):", version_jvm_args.len());
-    for a in &version_jvm_args { eprintln!("[LAUNCH]   kept: {}", a); }
+    tracing::debug!(target: "launcher", "After GC-strip ({} remaining):", version_jvm_args.len());
+    for a in &version_jvm_args { tracing::debug!(target: "launcher", "  kept: {}", a); }
     for arg in &version_jvm_args {
         if arg == "-cp" || arg == "${classpath}" {
             continue;
@@ -150,7 +150,7 @@ pub fn launch_minecraft(
         .map(|p| p.main_class.clone())
         .unwrap_or_else(|| version_info.main_class.clone());
     args.push(main_class.clone());
-    eprintln!("[LAUNCH] Main class: {}", main_class);
+    tracing::info!(target: "launcher", "Main class: {}", main_class);
 
     // 5. Build game arguments
     let game_dir = instance.minecraft_dir(&config.instances_dir());
@@ -210,15 +210,24 @@ pub fn launch_minecraft(
     }
 
     // 6. Launch
-    eprintln!("[LAUNCH] Final args count: {}", args.len());
-    eprintln!("[LAUNCH] Game dir: {:?}", game_dir);
-    // Print the actual argv to help diagnose "multiple garbage collectors
-    // selected" and similar JVM errors. Truncated to keep the dev log tidy.
-    eprintln!("[LAUNCH] argv:");
-    for (i, a) in args.iter().enumerate() {
-        eprintln!("[LAUNCH]   [{}] {}", i, a);
+    tracing::info!(target: "launcher", "Final args count: {}", args.len());
+    tracing::debug!(target: "launcher", "Game dir: {:?}", game_dir);
+    tracing::debug!(target: "launcher", "argv:");
+    let sanitized: Vec<String> = args.iter().enumerate().map(|(i, a)| {
+        if a == "--accessToken" || a == "--authAccessToken" {
+            args.get(i + 1).map(|_| {
+                format!("{} ***", a)
+            }).unwrap_or_else(|| a.clone())
+        } else if i > 0 && (args[i - 1] == "--accessToken" || args[i - 1] == "--authAccessToken") {
+            "***".to_string()
+        } else {
+            a.clone()
+        }
+    }).collect::<Vec<_>>();
+    for (i, a) in sanitized.iter().enumerate() {
+        tracing::debug!(target: "launcher", "  [{}] {}", i, a);
     }
-    eprintln!("[LAUNCH] Spawning Java process...");
+    tracing::info!(target: "launcher", "Spawning Java process...");
 
     let mut cmd = Command::new(&java_path);
     cmd.args(&args)
@@ -231,11 +240,11 @@ pub fn launch_minecraft(
     let child = cmd
         .spawn()
         .map_err(|e| {
-            eprintln!("[LAUNCH] FAILED to spawn Java: {}", e);
+            tracing::error!(target: "launcher", "FAILED to spawn Java: {}", e);
             LauncherError::Launch(format!("Failed to launch: {}", e))
         })?;
 
-    eprintln!("[LAUNCH] Java process spawned with PID: {}", child.id());
+    tracing::info!(target: "launcher", "Java process spawned with PID: {}", child.id());
     Ok(child)
 }
 
@@ -248,26 +257,26 @@ fn get_java_path(
     // Priority: instance java > config java > auto-detect
     if let Some(path) = &instance.java_path {
         if path.exists() {
-            eprintln!("[LAUNCH] Using instance Java: {:?}", path);
+            tracing::info!(target: "launcher", "Using instance Java: {:?}", path);
             return Ok(path.clone());
         }
-        eprintln!("[LAUNCH] Instance Java not found: {:?}", path);
+        tracing::debug!(target: "launcher", "Instance Java not found: {:?}", path);
     }
 
     if let Some(path) = &config.java_path {
         if path.exists() {
-            eprintln!("[LAUNCH] Using config Java: {:?}", path);
+            tracing::info!(target: "launcher", "Using config Java: {:?}", path);
             return Ok(path.clone());
         }
-        eprintln!("[LAUNCH] Config Java not found: {:?}", path);
+        tracing::debug!(target: "launcher", "Config Java not found: {:?}", path);
     }
 
     // Auto-detect
-    eprintln!("[LAUNCH] Auto-detecting Java installations...");
+    tracing::info!(target: "launcher", "Auto-detecting Java installations...");
     let installations = detect_java_installations();
-    eprintln!("[LAUNCH] Found {} Java installations", installations.len());
+    tracing::info!(target: "launcher", "Found {} Java installations", installations.len());
     for (i, inst) in installations.iter().enumerate() {
-        eprintln!("[LAUNCH]   [{}] {} v{} ({})", i, inst.vendor, inst.version, inst.path.display());
+        tracing::debug!(target: "launcher", "  [{}] {} v{} ({})", i, inst.vendor, inst.version, inst.path.display());
     }
 
     if installations.is_empty() {
@@ -280,11 +289,11 @@ fn get_java_path(
         .java_version
         .as_ref()
         .map(|v| v.major_version);
-    eprintln!("[LAUNCH] Required Java version: {}+", required_java.unwrap_or(21));
+    tracing::info!(target: "launcher", "Required Java version: {}+", required_java.unwrap_or(21));
 
     match get_recommended_java(required_java, &installations) {
         Some(java) => {
-            eprintln!("[LAUNCH] Selected Java: {} v{} at {:?}", java.vendor, java.version, java.path);
+            tracing::info!(target: "launcher", "Selected Java: {} v{} at {:?}", java.vendor, java.version, java.path);
             Ok(java.path)
         }
         None => Err(LauncherError::Java(format!(
