@@ -168,6 +168,20 @@ pub async fn download_java_runtime(
             LauncherError::Download(format!("Failed to download Java: {}", e))
         })?;
 
+    let status = response.status();
+    let content_type = response.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    tracing::info!(target: "launcher", "Java {} download response: status={}, content_type={}", major_version, status, content_type);
+
+    if !status.is_success() {
+        let msg = format!("Java {} download failed with HTTP {}", major_version, status);
+        tracing::error!(target: "launcher", "{}", msg);
+        return Err(LauncherError::Download(msg));
+    }
+
     let bytes = response.bytes().await.map_err(|e| {
         tracing::error!(target: "launcher", "Failed to read Java download bytes: {}", e);
         LauncherError::Download(format!("Failed to read Java download: {}", e))

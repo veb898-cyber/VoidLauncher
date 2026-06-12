@@ -20,6 +20,8 @@ fn http_client() -> &'static reqwest::Client {
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(15))
             .user_agent("VoidLauncher/0.1.0")
+            .brotli(true)
+            .deflate(true)
             .build()
             .expect("Failed to create HTTP client")
     })

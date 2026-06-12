@@ -1428,7 +1428,6 @@ async fn cmd_launch_game(
             if delta > 0 {
                 playtime::add_minutes_and_save(&data_dir_for_timer, &instance_for_timer, delta);
                 playtime::touch_session(&app_state.active_session, now);
-                events::emit_log(&app_for_timer, "debug", "playtime", &format!("+{} min for {}", delta, instance_for_timer));
             }
         }
     });
