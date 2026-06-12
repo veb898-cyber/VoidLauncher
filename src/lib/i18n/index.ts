@@ -81,6 +81,52 @@ export function formatPlayTime(seconds: number): string {
 }
 
 /**
+ * Format a timestamp as a relative time string (e.g., "2 hours ago", "вчера", "3 дня назад").
+ */
+export function formatRelativeTime(isoString: string): string {
+  const lang = useLanguageStore.getState().language;
+  const date = new Date(isoString);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffSec = Math.floor(diffMs / 1000);
+  const diffMin = Math.floor(diffSec / 60);
+  const diffHour = Math.floor(diffMin / 60);
+  const diffDay = Math.floor(diffHour / 24);
+
+  if (diffSec < 60) {
+    return lang === 'ru' ? 'только что' : 'just now';
+  }
+  if (diffMin < 60) {
+    return lang === 'ru'
+      ? `${diffMin} ${pluralRu(diffMin, 'минута', 'минуты', 'минут')} назад`
+      : `${diffMin} ${diffMin === 1 ? 'minute' : 'minutes'} ago`;
+  }
+  if (diffHour < 24) {
+    return lang === 'ru'
+      ? `${diffHour} ${pluralRu(diffHour, 'час', 'часа', 'часов')} назад`
+      : `${diffHour} ${diffHour === 1 ? 'hour' : 'hours'} ago`;
+  }
+  if (diffDay < 7) {
+    return lang === 'ru'
+      ? `${diffDay} ${pluralRu(diffDay, 'день', 'дня', 'дней')} назад`
+      : `${diffDay} ${diffDay === 1 ? 'day' : 'days'} ago`;
+  }
+  // Older than a week: show date
+  return date.toLocaleDateString(lang === 'ru' ? 'ru-RU' : 'en-US', {
+    day: 'numeric',
+    month: 'short',
+    year: diffDay < 365 ? undefined : 'numeric',
+  });
+}
+
+function pluralRu(n: number, one: string, few: string, many: string): string {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && !(m100 >= 12 && m100 <= 14)) return few;
+  return many;
+}
+
+/**
  * React hook: subscribes to the active language and returns a `t` function
  * that reads the *current* language at call time. The returned function
  * reference is stable across renders that don't change the language.

@@ -151,7 +151,7 @@ export function Instances() {
               onClick={() => selectInstance(instance.name)}
             >
               <div className="instance-card__banner" />
-              <div className="instance-card__icon">
+              <div className="instance-card__icon instance-card--banner-icon">
                 <Package size={24} />
               </div>
               <div className="instance-card__body">

@@ -17,6 +17,7 @@ const Home = lazy(() => import('./pages/Home').then(m => ({ default: m.Home })))
 const Login = lazy(() => import('./pages/Login').then(m => ({ default: m.Login })));
 const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.Settings })));
 const Logs = lazy(() => import('./pages/Logs').then(m => ({ default: m.Logs })));
+const GameLogs = lazy(() => import('./pages/GameLogs').then(m => ({ default: m.GameLogs })));
 const Accounts = lazy(() => import('./pages/Accounts').then(m => ({ default: m.Accounts })));
 const HomeLayout = lazy(() => import('./components/layout/HomeLayout').then(m => ({ default: m.HomeLayout })));
 
@@ -42,6 +43,13 @@ function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Disable browser context menu (right-click)
+  useEffect(() => {
+    const handler = (e: MouseEvent) => { e.preventDefault(); };
+    window.addEventListener('contextmenu', handler);
+    return () => window.removeEventListener('contextmenu', handler);
+  }, []);
+
   // Toggle a global class that pauses animations and disables transitions
   // when the launcher is frozen (window unfocused + game running).
   useEffect(() => {
@@ -55,6 +63,8 @@ function App() {
     switch (activePage) {
       case 'home':
         return <Home onNavigate={setActivePage} />;
+      case 'game_logs':
+        return <GameLogs />;
       case 'login':
         return <Login onNavigate={setActivePage} />;
       case 'instances':

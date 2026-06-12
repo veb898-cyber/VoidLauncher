@@ -12,6 +12,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
 
   const navItems = [
     { id: 'home', icon: <HomeIcon />, label: t('sidebar.home') },
+    { id: 'game_logs', icon: <GameLogsIcon />, label: t('sidebar.game_logs') },
     { id: 'instances', icon: <InstancesIcon />, label: t('sidebar.instances') },
     { id: 'accounts', icon: <AccountsIcon />, label: t('sidebar.accounts') },
     { id: 'logs', icon: <LogsIcon />, label: t('sidebar.logs') },
@@ -93,6 +94,15 @@ function AccountsIcon() {
       <circle cx="9" cy="7" r="4" />
       <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
       <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  );
+}
+
+function GameLogsIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="4 17 10 11 4 5" />
+      <line x1="12" y1="19" x2="20" y2="19" />
     </svg>
   );
 }

@@ -63,9 +63,11 @@ pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Re
             host
         )));
     }
+    tracing::info!(target: "launcher", url = %url, "Downloading {}", path.display());
     // Check if file exists with correct hash
     if path.exists() && !expected_sha1.is_empty() {
         if verify_sha1(path, expected_sha1)? {
+            tracing::debug!(target: "launcher", "SHA1 verified: {}", path.display());
             return Ok(());
         }
     }
@@ -123,6 +125,7 @@ async fn attempt_download(
 
     let status = response.status();
     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        tracing::warn!(target: "launcher", status = %status, url = %url, "Download returned non-success status");
         return Err(LauncherError::Download(format!(
             "HTTP {} for {}",
             status, url
@@ -148,6 +151,11 @@ async fn attempt_download(
 
     if !expected_sha1.is_empty() {
         if !verify_sha1(path, expected_sha1)? {
+            let bytes = std::fs::read(path)?;
+            let mut hasher = Sha1::new();
+            hasher.update(&bytes);
+            let got = hex::encode(hasher.finalize());
+            tracing::warn!(target: "launcher", expected = %expected_sha1, got = %got, "SHA1 mismatch for {}", path.display());
             std::fs::remove_file(path)?;
             return Err(LauncherError::Download(format!(
                 "SHA1 mismatch for {}",
@@ -225,6 +233,7 @@ pub async fn download_assets(
 ) -> Result<()> {
     let objects_dir = assets_dir.join("objects");
     std::fs::create_dir_all(&objects_dir)?;
+    tracing::info!(target: "launcher", count = asset_index.objects.len(), "Downloading game assets");
 
     let mut files: Vec<(String, PathBuf, String, u64)> = Vec::new();
 
@@ -242,10 +251,13 @@ pub async fn download_assets(
     }
 
     if files.is_empty() {
+        tracing::info!(target: "launcher", "Game assets download complete");
         return Ok(());
     }
 
-    download_files(files, on_progress).await
+    download_files(files, on_progress).await?;
+    tracing::info!(target: "launcher", "Game assets download complete");
+    Ok(())
 }
 
 /// Verify file SHA1 hash

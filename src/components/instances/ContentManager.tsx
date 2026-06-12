@@ -39,6 +39,7 @@ interface ContentItem {
   icon: string | null;
   size?: number;
   slug?: string | null;
+  slug_verified?: boolean;
   project_id?: string;
 }
 
@@ -207,6 +208,8 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
           enabled: m.enabled,
           icon: m.icon,
           slug: m.slug,
+          slug_verified: m.slug_verified,
+          project_id: m.slug_verified ? m.slug : undefined,
         }));
         setItems(mapped);
         const cache = iconCacheRef.current;
@@ -233,6 +236,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
           version: p.version || '',
           provider: p.provider || '',
           project_id: p.project_id || '',
+          slug: p.project_id || undefined,
           enabled: !p.filename.endsWith('.disabled'),
           icon: null,
           size: p.file_size,
@@ -313,7 +317,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
     if (isFrozen) return;
     if (loading || contentType !== 'mod') return;
     const visible = items.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()) || p.filename.toLowerCase().includes(search.toLowerCase()));
-    const toCheck = visible.filter((it) => it.slug && !checkedRef.current.has(it.filename));
+    const toCheck = visible.filter((it) => it.slug && it.slug_verified && !checkedRef.current.has(it.filename));
     if (toCheck.length === 0) return;
     let cancelled = false;
     (async () => {
@@ -453,8 +457,8 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
 
   const handleCheckUpdates = async () => {
     const toCheck = selectedFilenames.size > 0
-      ? getSelectedItems().filter((m) => (m.provider === 'Modrinth' || m.provider === 'CurseForge') && m.project_id)
-      : items.filter((m) => m.enabled && (m.provider === 'Modrinth' || m.provider === 'CurseForge') && m.project_id);
+      ? getSelectedItems().filter((m) => (m.provider === 'Modrinth' || m.provider === 'CurseForge') && (m.project_id || m.slug))
+      : items.filter((m) => m.enabled && (m.provider === 'Modrinth' || m.provider === 'CurseForge') && (m.project_id || m.slug));
 
     if (toCheck.length === 0) { addToast(t('manager.no_updates'), 'info'); return; }
 
@@ -463,8 +467,9 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
     const found: UpdateInfo[] = [];
 
     for (const m of toCheck) {
+      const pid = m.project_id || m.slug || '';
       try {
-        const vers = await invoke<any[]>('cmd_get_modrinth_versions', { projectId: m.project_id, mcVersion: mcVersion ?? null, loader: contentType === 'mod' ? (loader ?? null) : null });
+        const vers = await invoke<any[]>('cmd_get_modrinth_versions', { projectId: pid, mcVersion: mcVersion ?? null, loader: contentType === 'mod' ? (loader ?? null) : null });
         if (vers.length > 0) {
           const latest = vers[0];
           const latestVersion = latest.version_number || latest.name || '';
@@ -496,7 +501,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
 
   const handleApplyUpdate = async (update: UpdateInfo) => {
     try {
-      await invoke('cmd_download_to_folder', { instanceName, downloadUrl: update.downloadUrl, fileName: update.filename, subfolder, projectId: null, versionId: null, versionNumber: null, provider: 'modrinth' });
+      await invoke('cmd_download_to_folder', { instanceName, downloadUrl: update.downloadUrl, fileName: update.filename, subfolder, projectId: null, projectName: update.name || null, versionId: null, versionNumber: null, provider: 'modrinth' });
       addToast(t('manager.updated_toast', { name: update.name, version: update.newVersion }), 'success');
       setUpdates((prev) => prev ? prev.filter((u) => u.name !== update.name) : null);
       loadItems();
@@ -550,6 +555,31 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
   const hasSelection = selectedFilenames.size > 0;
 
   if (showBrowser) {
+    // Normalize: lowercase + underscore→dash so fabric mod ids (e.g. "My_Cool_Mod")
+    // match Modrinth slugs ("my-cool-mod"). Both original and normalized are stored
+    // so the set works either way.
+    const normalizeSlug = (s: string) => s.toLowerCase().replace(/_/g, '-');
+    // For name matching, also treat dashes as spaces so a filename-derived name
+    // like "3d-skin-layers" matches the Modrinth title "3D Skin Layers".
+    const normalizeName = (s: string) => s.toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+    const installedIds = new Set(
+      items.flatMap((it) => {
+        const ids: string[] = [];
+        if (it.slug) {
+          const n = normalizeSlug(it.slug);
+          ids.push(it.slug);
+          if (n !== it.slug) ids.push(n);
+        }
+        if (it.name) {
+          ids.push(`name:${normalizeName(it.name)}`);
+          // Also add narrower variants: just slug-normalized name helps when
+          // Modrinth slug and item slug happen to match space-for-dash.
+          const slugForm = normalizeSlug(it.name);
+          if (slugForm !== normalizeName(it.name)) ids.push(`name:${slugForm}`);
+        }
+        return ids;
+      })
+    );
     return (
       <ContentBrowser
         instanceName={instanceName}
@@ -558,6 +588,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         loader={loader}
         onClose={() => setShowBrowser(false)}
         onInstalled={() => { loadItems(); }}
+        installedProjectIds={installedIds}
       />
     );
   }

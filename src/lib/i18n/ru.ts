@@ -19,6 +19,7 @@ export const ru: Record<string, string> = {
 
   // ── Sidebar ─────────────────────────────────────────────────
   'sidebar.home':                      'Главная',
+  'sidebar.game_logs':                 'Логи игры',
   'sidebar.instances':                 'Сборки',
   'sidebar.accounts':                  'Аккаунты',
   'sidebar.logs':                      'Логи',
@@ -254,7 +255,6 @@ export const ru: Record<string, string> = {
 
   'settings.clear_cache_title':        'Очистить кэш',
   'settings.clear_cache_desc':         'Удалить загруженные файлы и ассеты (будут загружены заново при необходимости)',
-  'settings.clear_cache_not_impl':     'Очистка кэша пока не реализована. Удалите папки assets/libraries вручную.',
   'settings.clear_cache_btn':          'Очистить кэш',
   'settings.clear_cache_success':      'Кэш очищен, освобождено {mb} МБ',
   'settings.clear_cache_error':        'Не удалось очистить кэш: {error}',
@@ -280,6 +280,20 @@ export const ru: Record<string, string> = {
   'settings.java_none_detected':       'Установки Java не найдены',
   'settings.java_64bit':               '64-битная',
   'settings.java_32bit':               '32-битная',
+  'settings.java_download_heading':     'Установить Java',
+  'settings.java_download_desc':        'Загрузите и управляйте средами Java для сборок, требующих определенную версию',
+  'settings.java_download_btn':         'Установить',
+  'settings.java_downloading':          'Загрузка Java {version}...',
+  'settings.java_downloaded':           'Загруженные среды Java',
+  'settings.java_remove_btn':           'Удалить',
+  'settings.java_checking':             'Проверка доступных версий...',
+  'settings.java_no_managed':           'Нет загруженных сред Java',
+  'settings.java_install_success':      'Java {version} успешно установлена',
+  'settings.java_install_error':        'Ошибка установки Java: {error}',
+  'settings.java_remove_success':       'Java {version} удалена',
+  'settings.java_remove_error':         'Ошибка удаления Java: {error}',
+  'settings.java_fetch_error':          'Не удалось загрузить список версий. Проверьте подключение к интернету.',
+  'settings.java_retry':                'Повторить',
 
   // ── Content Browser ─────────────────────────────────────────
   'content.type_mod':                  'Моды',
@@ -296,6 +310,7 @@ export const ru: Record<string, string> = {
   'content.download_count':            '{n} скачиваний',
   'content.add_btn':                   'Добавить',
   'content.added_btn':                 'Добавлено',
+  'content.already_installed':         'Установлен',
   'content.versions_label':            'Версии',
   'content.versions_available':        '{n} доступно',
   'content.no_compatible_version':     'Совместимая версия не найдена',
@@ -374,6 +389,25 @@ export const ru: Record<string, string> = {
   'worlds.hint':                       'Запустите игру и создайте мир.',
   'worlds.last_played':                'Последний раз: {date}',
   'worlds.open_folder':                'Открыть папку сохранений',
+  'worlds.rename':                     'Переименовать',
+  'worlds.copy':                       'Копировать',
+  'worlds.delete':                     'Удалить',
+  'worlds.copy_seed':                  'Копировать сид',
+  'worlds.rename_title':               'Переименовать мир',
+  'worlds.rename_label':               'Новое имя',
+  'worlds.copy_title':                 'Копировать мир',
+  'worlds.copy_label':                 'Имя копии',
+  'worlds.delete_title':               'Удалить мир',
+  'worlds.delete_confirm':             'Вы уверены, что хотите удалить «{name}»? Это действие необратимо.',
+  'worlds.rename_toast':               'Мир переименован в {name}',
+  'worlds.copy_toast':                 'Мир скопирован как {name}',
+  'worlds.delete_toast':               'Мир удалён',
+  'worlds.seed_toast':                 'Сид скопирован в буфер обмена',
+  'worlds.game_survival':              'Выживание',
+  'worlds.game_creative':              'Творчество',
+  'worlds.game_adventure':             'Приключение',
+  'worlds.game_hardcore':              'Хардкор',
+  'worlds.game_unknown':               'Неизвестно',
 
   // ── Mod Browser ─────────────────────────────────────────────
   'mod.source_modrinth':               'Modrinth',
@@ -401,8 +435,16 @@ export const ru: Record<string, string> = {
 
   // ── Logs ────────────────────────────────────────────────────
   'logs.title':                        'Логи',
-  'logs.subtitle':                     'Логи установки и запуска',
+  'logs.subtitle':                     'Системные логи и логи лаунчера',
   'logs.empty':                        'Логов пока нет',
+
+  // ── Game Logs ────────────────────────────────────────────────
+  'game_logs.title':                   'Логи игры',
+  'game_logs.subtitle':                'Вывод игры Minecraft из последних сессий',
+  'game_logs.empty':                   'Логов игры пока нет. Запустите игру, чтобы увидеть её вывод здесь.',
+  'game_logs.no_content':              'В этой сессии нет вывода',
+  'game_logs.live_session':            'Текущая сессия',
+  'game_logs.active':                  'Активна',
 
   // ── Install Overlay ─────────────────────────────────────────
   'install.stage_fetching':            'Получение информации о версии',

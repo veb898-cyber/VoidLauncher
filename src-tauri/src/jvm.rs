@@ -104,14 +104,16 @@ pub fn build_jvm_args(
         GcPreset::G1gcAikar => GcPreset::G1gcAikar,
         GcPreset::ModernZgc => {
             if java_major < 17 {
-                eprintln!(
-                    "[JVM] ZGC requires Java 17+ (detected: {}). Falling back to G1GC.",
+                tracing::warn!(
+                    target: "launcher",
+                    "ZGC requires Java 17+ (detected: {}). Falling back to G1GC.",
                     java_major
                 );
                 GcPreset::G1gcAikar
             } else if memory_mb < 6144 {
-                eprintln!(
-                    "[JVM] ZGC requires at least 6 GB of heap (allocated: {} MB). Falling back to G1GC.",
+                tracing::warn!(
+                    target: "launcher",
+                    "ZGC requires at least 6 GB of heap (allocated: {} MB). Falling back to G1GC.",
                     memory_mb
                 );
                 GcPreset::G1gcAikar

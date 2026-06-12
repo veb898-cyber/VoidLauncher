@@ -4,6 +4,7 @@ use crate::modloaders::LoaderProfile;
 use std::path::{Path, PathBuf};
 use std::io::Read;
 use chrono::Utc;
+use flate2::read::GzDecoder;
 
 /// Instance configuration
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -105,13 +106,23 @@ impl Instance {
         self.minecraft_dir(instances_dir).join("mods")
     }
 
-    /// Get config file path
-    pub fn config_file(&self, instances_dir: &PathBuf) -> PathBuf {
-        self.dir(instances_dir).join("instance.json")
-    }
+/// Get config file path
+pub fn config_file(&self, instances_dir: &PathBuf) -> PathBuf {
+    self.dir(instances_dir).join("instance.json")
 }
 
-/// List all instances
+/// Get Prism-compatible instance.cfg path
+pub fn prism_cfg_file(&self, instances_dir: &PathBuf) -> PathBuf {
+    self.dir(instances_dir).join("instance.cfg")
+}
+
+/// Get Prism-compatible pack.png icon path
+pub fn pack_icon_file(&self, instances_dir: &PathBuf) -> PathBuf {
+    self.dir(instances_dir).join("pack.png")
+}
+}
+
+/// List all instances (supports both instance.json and instance.cfg)
 pub fn list_instances(instances_dir: &PathBuf) -> Result<Vec<Instance>> {
     let mut instances = Vec::new();
 
@@ -121,16 +132,28 @@ pub fn list_instances(instances_dir: &PathBuf) -> Result<Vec<Instance>> {
 
     for entry in std::fs::read_dir(instances_dir)? {
         let entry = entry?;
-        let config_path = entry.path().join("instance.json");
-        if config_path.exists() {
-            match std::fs::read_to_string(&config_path) {
+        let dir_path = entry.path();
+        if !dir_path.is_dir() { continue; }
+        let json_path = dir_path.join("instance.json");
+        let cfg_path = dir_path.join("instance.cfg");
+
+        if json_path.exists() {
+            match std::fs::read_to_string(&json_path) {
                 Ok(contents) => match serde_json::from_str::<Instance>(&contents) {
                     Ok(instance) => instances.push(instance),
-                    Err(e) => {
-                        eprintln!("Failed to parse instance at {:?}: {}", config_path, e)
-                    }
+                    Err(e) => tracing::warn!(target: "launcher", "Failed to parse instance at {:?}: {}", json_path, e),
                 },
-                Err(e) => eprintln!("Failed to read instance at {:?}: {}", config_path, e),
+                Err(e) => tracing::warn!(target: "launcher", "Failed to read instance at {:?}: {}", json_path, e),
+            }
+        } else if cfg_path.exists() {
+            // Import Prism/MultiMC format on the fly
+            if let Some(instance) = parse_prism_cfg(&cfg_path) {
+                // Save as instance.json for future fast loading
+                let json_path = dir_path.join("instance.json");
+                if let Ok(json) = serde_json::to_string_pretty(&instance) {
+                    let _ = std::fs::write(&json_path, &json);
+                }
+                instances.push(instance);
             }
         }
     }
@@ -175,11 +198,20 @@ pub fn create_instance(instances_dir: &PathBuf, instance: &Instance) -> Result<(
     Ok(())
 }
 
-/// Save instance config to disk
+/// Save instance config to disk, plus Prism-compatible instance.cfg and pack.png
 pub fn save_instance(instances_dir: &PathBuf, instance: &Instance) -> Result<()> {
     let config_path = instance.config_file(instances_dir);
     let json = serde_json::to_string_pretty(instance)?;
-    std::fs::write(config_path, json)?;
+    std::fs::write(&config_path, json)?;
+
+    // Write Prism-compatible instance.cfg
+    write_prism_cfg(instance, instances_dir)?;
+
+    // Write pack.png if instance has an icon
+    if let Some(ref icon) = instance.icon {
+        write_pack_png(instances_dir, &instance.name, icon);
+    }
+
     Ok(())
 }
 
@@ -196,18 +228,32 @@ pub fn delete_instance(instances_dir: &PathBuf, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Get an instance by name
+/// Get an instance by name (supports both instance.json and instance.cfg)
 pub fn get_instance(instances_dir: &PathBuf, name: &str) -> Result<Instance> {
-    let config_path = instances_dir.join(name).join("instance.json");
-    if !config_path.exists() {
-        return Err(LauncherError::Instance(format!(
-            "Instance '{}' not found",
-            name
-        )));
+    let dir = instances_dir.join(name);
+    let json_path = dir.join("instance.json");
+    let cfg_path = dir.join("instance.cfg");
+
+    if json_path.exists() {
+        let contents = std::fs::read_to_string(&json_path)?;
+        let instance = serde_json::from_str(&contents)?;
+        return Ok(instance);
     }
-    let contents = std::fs::read_to_string(&config_path)?;
-    let instance = serde_json::from_str(&contents)?;
-    Ok(instance)
+
+    if cfg_path.exists() {
+        if let Some(instance) = parse_prism_cfg(&cfg_path) {
+            // Save as instance.json for future fast loading
+            if let Ok(json) = serde_json::to_string_pretty(&instance) {
+                let _ = std::fs::write(&json_path, &json);
+            }
+            return Ok(instance);
+        }
+    }
+
+    Err(LauncherError::Instance(format!(
+        "Instance '{}' not found",
+        name
+    )))
 }
 
 /// Duplicate an instance
@@ -265,11 +311,25 @@ pub fn list_saves(instances_dir: &PathBuf, name: &str) -> Result<Vec<SaveEntry>>
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             let path = entry.path();
+            let world_name = entry.file_name().to_string_lossy().to_string();
+            let last_modified = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok())
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+            let level = parse_level_dat(&path.join("level.dat"));
+            let game_mode = level.game_type.map(|gt| match gt {
+                0 => "Survival".to_string(),
+                1 => "Creative".to_string(),
+                2 => "Adventure".to_string(),
+                3 => "Hardcore".to_string(),
+                _ => format!("Type {gt}"),
+            });
+            let icon_data = read_world_icon(instances_dir, name, &world_name);
             saves.push(SaveEntry {
-                name: entry.file_name().to_string_lossy().to_string(),
-                last_modified: std::fs::metadata(&path).ok().and_then(|m| m.modified().ok())
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64),
+                name: world_name,
+                last_modified,
                 size_bytes: dir_size(&path),
+                game_mode,
+                seed: level.seed,
+                icon_data,
             });
         }
     }
@@ -282,6 +342,12 @@ pub struct SaveEntry {
     pub name: String,
     pub last_modified: Option<i64>,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub game_mode: Option<String>,
+    #[serde(default)]
+    pub seed: Option<i64>,
+    #[serde(default)]
+    pub icon_data: Option<String>,
 }
 
 /// List screenshots
@@ -329,14 +395,18 @@ pub fn list_packs(instances_dir: &PathBuf, name: &str, pack_type: &str) -> Resul
         if filename.starts_with('.') || filename.ends_with(".voidlauncher.json") { continue; }
         let is_dir = path.is_dir();
         let meta = std::fs::metadata(&path)?;
-        let name = if is_dir { read_pack_name_from_dir(&path) } else { read_pack_name_from_zip(&path) }
-            .unwrap_or_else(|| {
-                let stem = Path::new(&filename).file_stem().and_then(|s| s.to_str()).unwrap_or(&filename);
-                let stem = stem.strip_suffix(".disabled").unwrap_or(stem);
-                strip_minecraft_color_codes(stem)
-            });
-        // Read sidecar metadata
-        let (provider, version, project_id) = read_pack_sidecar(&path).unwrap_or_default();
+        // Read sidecar metadata (project_name is the Modrinth/CurseForge display name)
+        let (provider, version, project_id, project_name) = read_pack_sidecar(&path).unwrap_or_default();
+        // Name resolution: sidecar project_name > pack.mcmeta pack.name/description > filename
+        let name = if !project_name.is_empty() {
+            Some(project_name)
+        } else {
+            if is_dir { read_pack_name_from_dir(&path) } else { read_pack_name_from_zip(&path) }
+        }.unwrap_or_else(|| {
+            let stem = Path::new(&filename).file_stem().and_then(|s| s.to_str()).unwrap_or(&filename);
+            let stem = stem.strip_suffix(".disabled").unwrap_or(stem);
+            strip_minecraft_color_codes(stem)
+        });
         packs.push(PackEntry {
             filename,
             name,
@@ -363,7 +433,7 @@ pub fn read_pack_icon(instances_dir: &PathBuf, instance_name: &str, pack_type: &
     }
 }
 
-fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, String)> {
+fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, String, String)> {
     let filename = pack_path.file_name()?.to_string_lossy().to_string();
     let meta_filename = format!("{}.voidlauncher.json", filename);
     let meta_path = pack_path.parent()?.join(&meta_filename);
@@ -372,7 +442,8 @@ fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, Str
     let provider = val["provider"].as_str().unwrap_or("").to_string();
     let version = val["version_number"].as_str().unwrap_or("").to_string();
     let project_id = val["project_id"].as_str().unwrap_or("").to_string();
-    Some((provider, version, project_id))
+    let project_name = val["project_name"].as_str().unwrap_or("").to_string();
+    Some((provider, version, project_id, project_name))
 }
 
 /// Strip Minecraft color/formatting codes (§a, §l, §r, etc.) and any underscores used as spaces
@@ -466,12 +537,24 @@ fn try_read_zip_image<R: std::io::Read + std::io::Seek>(archive: &mut zip::ZipAr
 }
 
 fn extract_pack_name_from_json(json: &serde_json::Value) -> Option<String> {
-    let desc = &json["pack"]["description"];
-    let raw = if let Some(s) = desc.as_str() {
+    // Prefer pack.name (human-readable) over pack.description (often an internal identifier).
+    let raw = extract_text_field(&json["pack"]["name"])
+        .or_else(|| extract_text_field(&json["pack"]["description"]))?;
+
+    let stripped = strip_minecraft_color_codes(&raw);
+    // Strip common HTML tags used in descriptions
+    let clean = stripped.replace("<br>", " ").replace("<br/>", " ").replace("</br>", " ");
+    let clean = clean.trim().to_string();
+    if clean.is_empty() { None } else { Some(clean) }
+}
+
+/// Extract text from a Minecraft JSON text component (string, object with "text", or array).
+fn extract_text_field(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
         Some(s.to_string())
-    } else if let Some(obj) = desc.as_object() {
+    } else if let Some(obj) = value.as_object() {
         obj.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
-    } else if let Some(arr) = desc.as_array() {
+    } else if let Some(arr) = value.as_array() {
         let mut result = String::new();
         for item in arr {
             if let Some(obj) = item.as_object() {
@@ -485,13 +568,7 @@ fn extract_pack_name_from_json(json: &serde_json::Value) -> Option<String> {
         if result.is_empty() { None } else { Some(result) }
     } else {
         None
-    }?;
-
-    let stripped = strip_minecraft_color_codes(&raw);
-    // Strip common HTML tags used in descriptions
-    let clean = stripped.replace("<br>", " ").replace("<br/>", " ").replace("</br>", " ");
-    let clean = clean.trim().to_string();
-    if clean.is_empty() { None } else { Some(clean) }
+    }
 }
 
 fn read_pack_name_from_dir(path: &std::path::Path) -> Option<String> {
@@ -546,10 +623,401 @@ fn base64_encode(data: &[u8]) -> String {
     result
 }
 
+/// Minimal base64 decode (decodes standard base64 with padding)
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    const DECODE: [i8; 256] = {
+        let mut table = [-1i8; 256];
+        let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut i = 0;
+        while i < 64 {
+            table[chars[i] as usize] = i as i8;
+            i += 1;
+        }
+        table[b'=' as usize] = 0;
+        table
+    };
+
+    let clean: Vec<u8> = input.bytes().filter(|&b| b != b'\r' && b != b'\n' && b != b' ').collect();
+    if clean.is_empty() || clean.len() % 4 != 0 { return None; }
+
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    for chunk in clean.chunks(4) {
+        if chunk.len() != 4 { return None; }
+        let mut vals = [0u8; 4];
+        for (i, &b) in chunk.iter().enumerate() {
+            let v = DECODE.get(b as usize)?;
+            if *v == -1 { return None; }
+            vals[i] = *v as u8;
+        }
+        out.push((vals[0] << 2) | (vals[1] >> 4));
+        if chunk[2] != b'=' {
+            out.push((vals[1] << 4) | (vals[2] >> 2));
+        }
+        if chunk[3] != b'=' {
+            out.push((vals[2] << 6) | vals[3]);
+        }
+    }
+    Some(out)
+}
+
 /// Update instance's last played timestamp
 pub fn update_last_played(instances_dir: &PathBuf, name: &str) -> Result<()> {
     let mut instance = get_instance(instances_dir, name)?;
     instance.last_played = Some(Utc::now().to_rfc3339());
     save_instance(instances_dir, &instance)?;
     Ok(())
+}
+
+// ── Prism compatibility helpers ─────────────────────────────────
+
+/// Write a Prism/MultiMC-compatible instance.cfg from our Instance
+fn write_prism_cfg(instance: &Instance, instances_dir: &PathBuf) -> Result<()> {
+    let cfg_path = instance.prism_cfg_file(instances_dir);
+    let last_launch = instance.last_played.as_ref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0);
+
+    let mut lines = Vec::new();
+    lines.push("[General]".to_string());
+    lines.push(format!("name={}", instance.name));
+    lines.push(format!("iconKey={}", instance.name));
+    lines.push("notes=".to_string());
+    lines.push(format!("lastLaunchTime={}", last_launch));
+    lines.push(format!("totalTimePlayed={}", instance.play_time_seconds));
+    lines.push(String::new());
+    lines.push("[MultiMC]".to_string());
+    lines.push("autoCloseMinecraft=false".to_string());
+
+    std::fs::write(&cfg_path, lines.join("\n"))?;
+    Ok(())
+}
+
+/// Write instance icon as pack.png in the instance root directory
+pub fn write_pack_png(instances_dir: &PathBuf, instance_name: &str, icon_data: &str) {
+    let instance = match get_instance(instances_dir, instance_name) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+    let png_path = instance.dir(instances_dir).join("pack.png");
+
+    // Decode base64 data URL (data:image/png;base64,...)
+    if let Some(b64) = icon_data.split(";base64,").nth(1) {
+        if let Some(bytes) = base64_decode(b64) {
+            let _ = std::fs::write(&png_path, &bytes);
+        }
+    }
+}
+
+/// Read instance icon from pack.png, return as base64 data URL
+pub fn read_pack_png_as_icon(instances_dir: &PathBuf, instance_name: &str) -> Option<String> {
+    let instance = get_instance(instances_dir, instance_name).ok()?;
+    let png_path = instance.dir(instances_dir).join("pack.png");
+    if !png_path.exists() { return None; }
+    let mut file = std::fs::File::open(&png_path).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    if buf.is_empty() { return None; }
+    Some(format!("data:image/png;base64,{}", base64_encode(&buf)))
+}
+
+/// Try to parse a Prism instance.cfg into our Instance format
+pub fn parse_prism_cfg(cfg_path: &std::path::Path) -> Option<Instance> {
+    let content = std::fs::read_to_string(cfg_path).ok()?;
+    let dir = cfg_path.parent()?;
+    let dir_name = dir.file_name()?.to_string_lossy().to_string();
+
+    let mut name = dir_name.clone();
+    let mut icon_data = None;
+
+    // Read pack.png
+    let png_path = dir.join("pack.png");
+    if png_path.exists() {
+        icon_data = read_image_as_base64(&png_path);
+    }
+
+    // Parse INI lines
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') || line.starts_with('#') || line.is_empty() { continue; }
+        if let Some(eq) = line.find('=') {
+            let key = line[..eq].trim();
+            let val = line[eq + 1..].trim();
+            match key {
+                "name" => name = val.to_string(),
+                _ => {}
+            }
+        }
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    Some(Instance {
+        name,
+        mc_version: String::new(),
+        loader: LoaderType::Vanilla,
+        loader_version: None,
+        loader_profile: None,
+        memory_mb: None,
+        jvm_args: None,
+        gc_preset: None,
+        java_path: None,
+        resolution: None,
+        icon: icon_data,
+        created_at: now.clone(),
+        last_played: None,
+        play_time_seconds: 0,
+        notes: String::new(),
+    })
+}
+
+/// Import a Prism Launcher instance.zip into VoidLauncher instances dir
+pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Instance> {
+    let zip_path = std::path::Path::new(zip_path);
+    if !zip_path.exists() {
+        return Err(LauncherError::Instance(format!(
+            "ZIP file not found: {}",
+            zip_path.display()
+        )));
+    }
+
+    // Read the ZIP in one pass: detect instance.cfg, read name, then extract
+    let zip_bytes = std::fs::read(zip_path)?;
+    let name = {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))
+            .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
+
+        let mut found = false;
+        let mut cfg_content = String::new();
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+            if entry.name() == "instance.cfg" {
+                found = true;
+                entry.read_to_string(&mut cfg_content).ok();
+                break;
+            }
+        }
+
+        if !found {
+            return Err(LauncherError::Instance(
+                "Not a valid Prism instance pack: missing instance.cfg".to_string(),
+            ));
+        }
+
+        cfg_content.lines()
+            .find_map(|line| {
+                let line = line.trim();
+                if line.starts_with("name=") { Some(line[5..].to_string()) } else { None }
+            })
+            .unwrap_or_else(|| {
+                zip_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("imported")
+                    .to_string()
+            })
+    };
+
+    // Create target directory
+    let target_dir = instances_dir.join(&name);
+    std::fs::create_dir_all(&target_dir)?;
+
+    // Extract all files from the ZIP to the target directory
+    {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+            .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)
+                .map_err(|e| LauncherError::Instance(e.to_string()))?;
+            if entry.is_dir() { continue; }
+
+            let entry_name = entry.name().to_string();
+            // Skip entries outside root or path traversal
+            if entry_name.contains("..") || entry_name.starts_with('/') {
+                continue;
+            }
+
+            let out_path = target_dir.join(&entry_name);
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out_file = std::fs::File::create(&out_path)?;
+            std::io::copy(&mut entry, &mut out_file)?;
+        }
+    }
+
+    // Parse the extracted instance.cfg and save as instance.json
+    let extracted_cfg = target_dir.join("instance.cfg");
+    let instance = parse_prism_cfg(&extracted_cfg).ok_or_else(|| {
+        LauncherError::Instance("Failed to parse imported instance.cfg".to_string())
+    })?;
+
+    // Write instance.json
+    let json_path = target_dir.join("instance.json");
+    let json = serde_json::to_string_pretty(&instance)?;
+    std::fs::write(&json_path, json)?;
+
+    tracing::info!(target: "launcher", "Imported Prism pack '{}' from {:?}", name, zip_path);
+    Ok(instance)
+}
+
+// ── World operations ──────────────────────────────────────────────
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct LevelDatData {
+    pub game_type: Option<i32>,
+    pub seed: Option<i64>,
+    pub level_name: Option<String>,
+    pub last_played: Option<i64>,
+}
+
+fn nbt_read_string(r: &mut impl Read) -> Result<String> {
+    let mut len_buf = [0u8; 2];
+    r.read_exact(&mut len_buf).map_err(|e| LauncherError::Instance(e.to_string()))?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).map_err(|e| LauncherError::Instance(e.to_string()))?;
+    String::from_utf8(buf).map_err(|e| LauncherError::Instance(format!("Invalid UTF-8 in NBT: {e}")))
+}
+
+fn nbt_skip(r: &mut impl Read, tag: u8) -> Result<()> {
+    match tag {
+        0 => Ok(()),
+        1 => { let mut b = [0u8; 1]; r.read_exact(&mut b).map_err(|e| LauncherError::Instance(e.to_string()))?; Ok(()) }
+        2 => { let mut b = [0u8; 2]; r.read_exact(&mut b).map_err(|e| LauncherError::Instance(e.to_string()))?; Ok(()) }
+        3 => { let mut b = [0u8; 4]; r.read_exact(&mut b).map_err(|e| LauncherError::Instance(e.to_string()))?; Ok(()) }
+        4 => { let mut b = [0u8; 8]; r.read_exact(&mut b).map_err(|e| LauncherError::Instance(e.to_string()))?; Ok(()) }
+        5 => { let mut b = [0u8; 4]; r.read_exact(&mut b).map_err(|e| LauncherError::Instance(e.to_string()))?; Ok(()) }
+        6 => { let mut b = [0u8; 8]; r.read_exact(&mut b).map_err(|e| LauncherError::Instance(e.to_string()))?; Ok(()) }
+        7 | 11 | 12 => {
+            let mut len_buf = [0u8; 4];
+            r.read_exact(&mut len_buf).map_err(|e| LauncherError::Instance(e.to_string()))?;
+            let elem_size: usize = match tag { 7 => 1, 11 => 4, 12 => 8, _ => 1 };
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut skip = vec![0u8; len * elem_size];
+            r.read_exact(&mut skip).map_err(|e| LauncherError::Instance(e.to_string()))?;
+            Ok(())
+        }
+        8 => { nbt_read_string(r)?; Ok(()) }
+        9 => {
+            let mut elem_type = [0u8; 1];
+            r.read_exact(&mut elem_type).map_err(|e| LauncherError::Instance(e.to_string()))?;
+            let mut len_buf = [0u8; 4];
+            r.read_exact(&mut len_buf).map_err(|e| LauncherError::Instance(e.to_string()))?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            for _ in 0..len { nbt_skip(r, elem_type[0])?; }
+            Ok(())
+        }
+        10 => {
+            loop {
+                let mut t = [0u8; 1];
+                r.read_exact(&mut t).map_err(|e| LauncherError::Instance(e.to_string()))?;
+                if t[0] == 0 { break; }
+                nbt_read_string(r)?;
+                nbt_skip(r, t[0])?;
+            }
+            Ok(())
+        }
+        _ => Err(LauncherError::Instance(format!("Unknown NBT tag type: {tag}"))),
+    }
+}
+
+fn nbt_parse_compound_fields(r: &mut impl Read, data: &mut LevelDatData) -> Result<()> {
+    loop {
+        let mut tag = [0u8; 1];
+        r.read_exact(&mut tag).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        if tag[0] == 0 { break; }
+        let name = nbt_read_string(r)?;
+        match tag[0] {
+            3 => {
+                let mut buf = [0u8; 4];
+                r.read_exact(&mut buf).map_err(|e| LauncherError::Instance(e.to_string()))?;
+                let val = i32::from_be_bytes(buf);
+                if name == "GameType" { data.game_type = Some(val); }
+            }
+            4 => {
+                let mut buf = [0u8; 8];
+                r.read_exact(&mut buf).map_err(|e| LauncherError::Instance(e.to_string()))?;
+                let val = i64::from_be_bytes(buf);
+                match name.as_str() {
+                    "Seed" => data.seed = Some(val),
+                    "LastPlayed" => data.last_played = Some(val),
+                    _ => {}
+                }
+            }
+            8 => {
+                let val = nbt_read_string(r)?;
+                if name == "LevelName" { data.level_name = Some(val); }
+            }
+            10 => {
+                if name == "Data" {
+                    nbt_parse_compound_fields(r, data)?;
+                } else {
+                    nbt_skip(r, 10)?;
+                }
+            }
+            _ => { nbt_skip(r, tag[0])?; }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a GZip-compressed Minecraft level.dat and extract key fields.
+pub fn parse_level_dat(path: &std::path::Path) -> LevelDatData {
+    let Ok(file) = std::fs::File::open(path) else { return LevelDatData::default() };
+    let mut decoder = GzDecoder::new(file);
+    let mut tag = [0u8; 1];
+    if decoder.read_exact(&mut tag).is_err() || tag[0] != 10 {
+        return LevelDatData::default();
+    }
+    let _ = nbt_read_string(&mut decoder);
+    let mut data = LevelDatData::default();
+    let _ = nbt_parse_compound_fields(&mut decoder, &mut data);
+    data
+}
+
+pub fn rename_world(instances_dir: &PathBuf, instance_name: &str, old_name: &str, new_name: &str) -> Result<()> {
+    let instance = get_instance(instances_dir, instance_name)?;
+    let saves_dir = instance.minecraft_dir(instances_dir).join("saves");
+    let from = saves_dir.join(old_name);
+    let to = saves_dir.join(new_name);
+    if !from.exists() {
+        return Err(LauncherError::Instance(format!("World '{}' not found", old_name)));
+    }
+    if to.exists() {
+        return Err(LauncherError::Instance(format!("A world named '{}' already exists", new_name)));
+    }
+    std::fs::rename(&from, &to).map_err(|e| LauncherError::Instance(e.to_string()))
+}
+
+pub fn copy_world(instances_dir: &PathBuf, instance_name: &str, world_name: &str, new_name: &str) -> Result<()> {
+    let instance = get_instance(instances_dir, instance_name)?;
+    let saves_dir = instance.minecraft_dir(instances_dir).join("saves");
+    let src = saves_dir.join(world_name);
+    let dst = saves_dir.join(new_name);
+    if !src.exists() {
+        return Err(LauncherError::Instance(format!("World '{}' not found", world_name)));
+    }
+    if dst.exists() {
+        return Err(LauncherError::Instance(format!("A world named '{}' already exists", new_name)));
+    }
+    copy_dir_recursive(&src, &dst)
+}
+
+pub fn delete_world(instances_dir: &PathBuf, instance_name: &str, world_name: &str) -> Result<()> {
+    let instance = get_instance(instances_dir, instance_name)?;
+    let saves_dir = instance.minecraft_dir(instances_dir).join("saves");
+    let world_dir = saves_dir.join(world_name);
+    if !world_dir.exists() {
+        return Err(LauncherError::Instance(format!("World '{}' not found", world_name)));
+    }
+    std::fs::remove_dir_all(&world_dir).map_err(|e| LauncherError::Instance(e.to_string()))
+}
+
+pub fn read_world_icon(instances_dir: &PathBuf, instance_name: &str, world_name: &str) -> Option<String> {
+    let instance = get_instance(instances_dir, instance_name).ok()?;
+    let icon_path = instance.minecraft_dir(instances_dir)
+        .join("saves").join(world_name).join("icon.png");
+    if !icon_path.exists() { return None; }
+    read_image_as_base64(&icon_path)
 }

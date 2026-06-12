@@ -139,15 +139,20 @@ pub async fn install(
     loader_version: &str,
     libraries_dir: &std::path::Path,
 ) -> Result<LoaderProfile> {
+    tracing::info!(target: "launcher", "Installing Fabric for MC {} (loader {})", mc_version, loader_version);
     let profile = get_profile(mc_version, loader_version).await?;
 
     for lib in &profile.libraries {
         let lib_path = libraries_dir.join(&lib.path);
         if !lib_path.exists() {
             let url = format!("{}{}", lib.url, lib.path);
-            crate::download::download_file(&url, &lib_path, "").await?;
+            if let Err(e) = crate::download::download_file(&url, &lib_path, "").await {
+                tracing::warn!(target: "launcher", "Failed to download Fabric library {}: {}", lib.name, e);
+                return Err(e);
+            }
         }
     }
 
+    tracing::info!(target: "launcher", "Fabric install completed for MC {}", mc_version);
     Ok(profile)
 }

@@ -40,6 +40,8 @@ interface Props {
   loader?: string | null;
   onClose: () => void;
   onInstalled: () => void;
+  /** Project IDs of mods/packs already installed on disk (verified slugs only). */
+  installedProjectIds?: Set<string>;
 }
 
 type SortMode = 'downloads' | 'newest' | 'oldest';
@@ -50,7 +52,10 @@ const SUBFOLDER: Record<ContentType, string> = {
   shader: 'shaderpacks',
 };
 
-export function ContentBrowser({ instanceName, contentType, mcVersion, loader, onClose, onInstalled }: Props) {
+const normalizeSlug = (s: string) => s.toLowerCase().replace(/_/g, '-');
+const normalizeName = (s: string) => s.toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+export function ContentBrowser({ instanceName, contentType, mcVersion, loader, onClose, onInstalled, installedProjectIds }: Props) {
   const t = useT();
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Hit[]>([]);
@@ -71,7 +76,9 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const [hasMorePopular, setHasMorePopular] = useState(true);
   const [hasMoreResults, setHasMoreResults] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [versionLimit, setVersionLimit] = useState(20);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const versionSentinelRef = useRef<HTMLDivElement | null>(null);
   const PAGE_SIZE = 50;
 
   const TYPE_LABELS: Record<ContentType, string> = {
@@ -177,11 +184,25 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     return () => obs.disconnect();
   }, [loading, loadingMore, query, loadMoreResults, loadMorePopular]);
 
+  // Version infinite scroll: load 20 more when reaching the bottom of the version list
+  useEffect(() => {
+    const el = versionSentinelRef.current;
+    if (!el || !selected || versions.length <= versionLimit) return;
+    const obs = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        setVersionLimit((prev) => Math.min(prev + 20, versions.length));
+      }
+    }, { rootMargin: '100px' });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [selected, versions, versionLimit]);
+
   const handleSelect = async (hit: Hit) => {
     setSelected(hit);
     setLoadingDetail(true);
     setModDetail(null);
     setVersions([]);
+    setVersionLimit(20);
     try {
       const [detail, vers] = await Promise.all([
         invoke<any>('cmd_get_modrinth_project', { id: hit.project_id }),
@@ -193,8 +214,18 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setLoadingDetail(false);
   };
 
+  const isAdded = (id: string, slug?: string, title?: string) =>
+    selectedItems.some((m) => m.projectId === id)
+    || (installedProjectIds?.has(normalizeSlug(id)) ?? false)
+    || (slug ? (installedProjectIds?.has(normalizeSlug(slug)) ?? false) : false)
+    || (title ? (installedProjectIds?.has(`name:${normalizeName(title)}`) ?? false) : false);
+  const isInstalled = (id: string, slug?: string, title?: string) =>
+    (installedProjectIds?.has(normalizeSlug(id)) ?? false)
+    || (slug ? (installedProjectIds?.has(normalizeSlug(slug)) ?? false) : false)
+    || (title ? (installedProjectIds?.has(`name:${normalizeName(title)}`) ?? false) : false);
+
   const addLatest = async (hit: Hit) => {
-    if (selectedItems.some((m) => m.projectId === hit.project_id)) {
+    if (selectedItems.some((m) => m.projectId === hit.project_id) || isInstalled(hit.project_id, hit.slug, hit.title)) {
       return;
     }
     setAddingId(hit.project_id);
@@ -231,8 +262,11 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       const depId = dep.project_id;
       if (!depId) continue;
       if (selectedItems.some((m) => m.projectId === depId)) continue;
+      if (installedProjectIds?.has(depId)) continue;
       try {
         const depProject = await invoke<any>('cmd_get_modrinth_project', { id: depId });
+        // Also check by slug (matches fabric mod id for mods without sidecar)
+        if (depProject?.slug && installedProjectIds?.has(depProject.slug)) continue;
         const depVers = await invoke<any[]>('cmd_get_modrinth_versions', { projectId: depId, mcVersion: mcVersion ?? null, loader: versionLoader });
         if (depVers.length > 0) {
           const f = depVers[0].files?.find((f: any) => f.primary) || depVers[0].files?.[0];
@@ -271,6 +305,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           fileName: item.filename,
           subfolder,
           projectId: item.projectId || null,
+          projectName: item.name || null,
           versionId: null,
           versionNumber: item.versionName || null,
           provider: item.source || 'modrinth',
@@ -297,7 +332,6 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   };
 
   const displayHits = results.length > 0 ? results : popular;
-  const isAdded = (id: string) => selectedItems.some((m) => m.projectId === id);
 
   const renderMarkdown = (text: string): string => {
     if (!text) return '';
@@ -437,7 +471,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             </div>
           )}
           {sortHits(displayHits).map((hit) => {
-            const added = isAdded(hit.project_id);
+            const added = isAdded(hit.project_id, hit.slug, hit.title);
             return (
               <div key={hit.project_id}
                 onClick={() => handleSelect(hit)}
@@ -468,8 +502,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                     {hit.downloads != null && t('content.download_count', { n: formatDownloads(hit.downloads) })}
                   </div>
                 </div>
-                <Button size="sm" variant={added ? 'ghost' : 'primary'} onClick={(e) => { e.stopPropagation(); added ? removeByProjectId(hit.project_id) : addLatest(hit); }} disabled={addingId === hit.project_id} style={{ flexShrink: 0, alignSelf: 'center', color: added ? 'var(--color-danger)' : undefined }}>
-                  {addingId === hit.project_id ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : added ? <X size={12} /> : t('content.add_btn')}
+                <Button size="sm" variant={isInstalled(hit.project_id, hit.slug, hit.title) ? 'ghost' : added ? 'ghost' : 'primary'} onClick={(e) => { e.stopPropagation(); isInstalled(hit.project_id, hit.slug, hit.title) ? undefined : added ? removeByProjectId(hit.project_id) : addLatest(hit); }} disabled={isInstalled(hit.project_id, hit.slug, hit.title) || addingId === hit.project_id} style={{ flexShrink: 0, alignSelf: 'center', color: isInstalled(hit.project_id, hit.slug, hit.title) ? 'var(--text-tertiary)' : added ? 'var(--color-danger)' : undefined }}>
+                  {addingId === hit.project_id ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : isInstalled(hit.project_id, hit.slug, hit.title) ? <><Check size={12} /> {t('content.already_installed')}</> : added ? <X size={12} /> : t('content.add_btn')}
                 </Button>
               </div>
             );
@@ -498,11 +532,11 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                       <p style={{ margin: '4px 0 0', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{formatDownloads(selected.downloads)} downloads</p>
                     )}
                   </div>
-                  <Button size="sm" variant={isAdded(selected.project_id) ? 'ghost' : 'primary'}
+                  <Button size="sm" variant={isInstalled(selected.project_id, selected.slug, selected.title) ? 'ghost' : isAdded(selected.project_id, selected.slug, selected.title) ? 'ghost' : 'primary'}
                     onClick={() => addLatest(selected)}
-                    disabled={isAdded(selected.project_id) || addingId === selected.project_id}
+                    disabled={isInstalled(selected.project_id, selected.slug, selected.title) || isAdded(selected.project_id, selected.slug, selected.title) || addingId === selected.project_id}
                     style={{ flexShrink: 0, alignSelf: 'flex-start' }}>
-                    {addingId === selected.project_id ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : isAdded(selected.project_id) ? <><Check size={12} /> {t('content.added_btn')}</> : t('content.add_btn')}
+                    {addingId === selected.project_id ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : isInstalled(selected.project_id, selected.slug, selected.title) ? <><Check size={12} /> {t('content.already_installed')}</> : isAdded(selected.project_id, selected.slug, selected.title) ? <><Check size={12} /> {t('content.added_btn')}</> : t('content.add_btn')}
                   </Button>
                   <X size={16} style={{ cursor: 'pointer', color: 'var(--text-tertiary)', flexShrink: 0 }} onClick={() => setSelected(null)} />
                 </div>
@@ -530,7 +564,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                       <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('content.versions_available', { n: versions.length.toString() })}</span>
                     </div>
                     <div style={{ maxHeight: 240, overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
-                      {versions.slice(0, 20).map((v: any) => {
+                      {versions.slice(0, versionLimit).map((v: any) => {
                         const file = v.files?.[0];
                         const alreadyAdded = selectedItems.some((m) => m.filename === file?.filename);
                         return (
@@ -563,6 +597,9 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                           </div>
                         );
                       })}
+                      {versionLimit < versions.length && (
+                        <div ref={versionSentinelRef} style={{ height: 1 }} />
+                      )}
                     </div>
                   </div>
                 )}
