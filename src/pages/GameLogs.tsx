@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useT } from '../lib/i18n';
+import { useGameLogStore } from '../stores/gameLogStore';
 
 interface GameLogSession {
   path: string;
@@ -13,29 +14,16 @@ interface GameLogSession {
 export function GameLogs() {
   const t = useT();
   const [sessions, setSessions] = useState<GameLogSession[]>([]);
-  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const selectedPath = useGameLogStore((s) => s.selectedPath);
+  const setSelectedPath = useGameLogStore((s) => s.setSelectedPath);
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(true);
   const [loadingContent, setLoadingContent] = useState(false);
   const [currentGameLog, setCurrentGameLog] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
-  const prevCurrentLogRef = useRef<string | null>(null);
-
-  const loadSessions = useCallback(async () => {
-    try {
-      const [list, current] = await Promise.all([
-        invoke<GameLogSession[]>('cmd_list_game_logs'),
-        invoke<string | null>('cmd_get_current_game_log'),
-      ]);
-      setSessions(list);
-      setCurrentGameLog(current);
-    } catch {
-      // ignore
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const contentRef = useRef('');
+  contentRef.current = content;
 
   const loadContent = useCallback(async (path: string) => {
     setLoadingContent(true);
@@ -49,54 +37,95 @@ export function GameLogs() {
     }
   }, []);
 
+  const loadSessions = useCallback(async () => {
+    try {
+      const [list, current] = await Promise.all([
+        invoke<GameLogSession[]>('cmd_list_game_logs'),
+        invoke<string | null>('cmd_get_current_game_log'),
+      ]);
+      setSessions(list);
+      setCurrentGameLog(current);
+      // Auto-select: prefer current game log, then most recent session
+      if (current && !useGameLogStore.getState().selectedPath) {
+        setSelectedPath(current);
+      } else if (list.length > 0 && !useGameLogStore.getState().selectedPath) {
+        setSelectedPath(list[0].path);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+    }
+  }, [setSelectedPath]);
+
+  // Load sessions on mount + every 5s
   useEffect(() => {
     loadSessions();
     const interval = setInterval(loadSessions, 5000);
     return () => clearInterval(interval);
   }, [loadSessions]);
 
-  // When a new MC session starts (currentGameLog changes to a new path), auto-select it
+  // Auto-select current game log when it changes (new game starts)
   useEffect(() => {
-    if (currentGameLog && currentGameLog !== prevCurrentLogRef.current) {
+    if (currentGameLog && currentGameLog !== selectedPath) {
       setSelectedPath(currentGameLog);
-      prevCurrentLogRef.current = currentGameLog;
     }
-  }, [currentGameLog]);
+  }, [currentGameLog, selectedPath, setSelectedPath]);
 
-  // When selected path changes, load content
+  // When selected path changes, load content from disk
   useEffect(() => {
     if (selectedPath) {
       loadContent(selectedPath);
     }
   }, [selectedPath, loadContent]);
 
-  // Listen for live log updates when viewing the CURRENT (live) game log
+  // Periodically re-read the selected log file from disk
   useEffect(() => {
-    if (!currentGameLog || selectedPath !== currentGameLog) return;
+    if (!selectedPath) return;
+    const interval = setInterval(() => {
+      invoke<string>('cmd_read_game_log', { path: selectedPath }).then((text) => {
+        setContent(text);
+      }).catch(() => {});
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [selectedPath]);
 
-    const unlisten = listen<{ level: string; source: string; message: string }>('log_message', (event) => {
-      if (event.payload.source === 'minecraft') {
-        setContent((prev) => {
-          const line = event.payload.message;
-          const updated = prev ? prev + '\n' + line : line;
-          const lines = updated.split('\n');
-          if (lines.length > 5000) {
-            return lines.slice(lines.length - 5000).join('\n');
-          }
-          return updated;
-        });
-      }
+  // Listen for game log events
+  useEffect(() => {
+    let unlistenFn: (() => void) | undefined;
+    let cancelled = false;
+
+    const p = listen<{ level: string; source: string; message: string }>('log_message', (event) => {
+      if (cancelled) return;
+      if (event.payload.source !== 'minecraft' && event.payload.source !== 'launch') return;
+      const line = event.payload.message;
+      setContent((prev) => {
+        const updated = prev ? prev + '\n' + line : line;
+        const lines = updated.split('\n');
+        if (lines.length > 5000) {
+          return lines.slice(lines.length - 5000).join('\n');
+        }
+        return updated;
+      });
     });
 
-    return () => { unlisten.then((f) => f()); };
-  }, [currentGameLog, selectedPath]);
+    p.then((fn) => {
+      if (cancelled) { try { fn(); } catch {} return; }
+      unlistenFn = fn;
+    });
 
-  // Listen for launch_complete to refresh sessions and current log state
+    return () => {
+      cancelled = true;
+      try { unlistenFn?.(); } catch {}
+    };
+  }, []);
+
+  // Listen for launch_complete to refresh sessions
   useEffect(() => {
     const unlisten = listen<{ status: string }>('launch_complete', () => {
       loadSessions();
     });
-    return () => { unlisten.then((f) => f()); };
+    return () => { unlisten.then((f) => f()).catch(() => {}); };
   }, [loadSessions]);
 
   // Auto-scroll
@@ -119,6 +148,29 @@ export function GameLogs() {
 
   const lines = content ? content.split('\n') : [];
 
+  const getLineLevel = (line: string): string => {
+    const upper = line.toUpperCase();
+    // Check for explicit level markers (launcher format: [ERROR], Minecraft format: /ERROR])
+    if (/\[ERROR\]|\/ERROR\]/.test(line)) return 'error';
+    if (/\[WARN\]|\/WARN\]/.test(line)) return 'warn';
+    if (/\[DEBUG\]|\/DEBUG\]/.test(line)) return 'debug';
+    // Detect error-like conditions without explicit ERROR tag
+    if (/\bEXCEPTION\b/.test(upper) || /\bFATAL\b/.test(upper)) return 'error';
+    if (/exit code [1-9]/.test(line) || /exit code \d{2,}/.test(line)) return 'error';
+    if (/FAILED/i.test(line) || /\bERROR\b/i.test(line)) return 'error';
+    if (/WARNING/i.test(line)) return 'warn';
+    return '';
+  };
+
+  const getLineColor = (level: string): string => {
+    switch (level) {
+      case 'error': return 'var(--color-danger)';
+      case 'warn': return 'var(--color-warning)';
+      case 'debug': return 'var(--text-tertiary)';
+      default: return 'var(--text-primary)';
+    }
+  };
+
   return (
     <div className="page animate-fade-in" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <div className="page__header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 }}>
@@ -127,7 +179,6 @@ export function GameLogs() {
           <p className="page__subtitle">{t('game_logs.subtitle')}</p>
         </div>
         <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'center' }}>
-          {/* Session selector */}
           {sessions.length > 0 && (
             <div className="game-logs-select-wrapper">
               <select
@@ -180,7 +231,7 @@ export function GameLogs() {
           fontSize: 'var(--font-size-xs)',
           lineHeight: 1.6,
         }} onScroll={handleScroll}>
-          {loadingContent ? (
+          {loadingContent || (selectedPath && lines.length === 0 && !loading) ? (
             <div style={{ color: 'var(--text-secondary)', textAlign: 'center', paddingTop: 'var(--space-2xl)' }}>
               {t('common.loading')}
             </div>
@@ -190,18 +241,22 @@ export function GameLogs() {
             </div>
           ) : (
             <>
-              {lines.map((line, i) => (
+              {lines.map((line, i) => {
+                const level = getLineLevel(line);
+                return (
                 <div key={i} className="log-line" style={{
                   padding: '1px var(--space-sm)',
                   whiteSpace: 'pre-wrap',
                   wordBreak: 'break-all',
-                  color: 'var(--text-primary)',
+                  color: getLineColor(level),
                   borderRadius: 'var(--radius-sm)',
                   userSelect: 'text',
+                  background: level === 'error' ? 'rgba(255, 60, 60, 0.06)' : level === 'warn' ? 'rgba(255, 180, 40, 0.06)' : 'transparent',
                 }}>
                   {line}
                 </div>
-              ))}
+                );
+              })}
               <div ref={bottomRef} />
             </>
           )}

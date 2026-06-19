@@ -114,6 +114,8 @@ export const ru: Record<string, string> = {
   'instances.empty_desc':              'Создайте свою первую сборку Minecraft.',
   'instances.empty_cta':               'Создать сборку',
   'instances.play':                    'Играть',
+  'instances.import_btn':              'Импорт',
+  'instances.export_btn':              'Экспорт',
   'instances.hours_played':            '{h} ч',
   'instances.mins_played':             '{m} мин',
   'instances.never_played':            'Не играл',
@@ -143,6 +145,15 @@ export const ru: Record<string, string> = {
   'create_instance.liteloader_empty': 'LiteLoader заброшен (последний релиз 2017, MC 1.12.2). Для современных версий Minecraft версий нет.',
   'create_instance.loader_end':       'Все {total} версий загружены',
   'create_instance.liteloader_unsupported': 'LiteLoader больше не поддерживается. Релизы были только для MC 1.12.1 / 1.12.2, и upstream-ссылки на скачивание не работают: {error}',
+  'create_instance.mode_new':          'Новая',
+  'create_instance.mode_import':       'Импорт',
+  'create_instance.import_desc':       'Импортируйте существующую сборку из .zip или .mrpack файла',
+  'create_instance.import_change_file':'Сменить файл',
+  'create_instance.import_select_file':'Выбрать файл сборки',
+  'create_instance.import_analyzing':  'Анализ сборки...',
+  'create_instance.import_starting':   'Импорт начат...',
+  'create_instance.import_action':     'Импортировать',
+  'create_instance.imported':          'Сборка "{name}" импортирована!',
   'create_instance.created':           'Сборка "{name}" создана!',
   'create_instance.failed':            'Не удалось создать сборку: {error}',
 
@@ -241,6 +252,11 @@ export const ru: Record<string, string> = {
   'settings.section_appearance':       'Внешний вид',
   'settings.language_title':           'Язык',
   'settings.language_desc':            'Язык интерфейса. Изменения применяются сразу.',
+  'settings.theme_title':              'Тема',
+  'settings.theme_desc':               'Оформление лаунчера',
+  'settings.theme_standard':           'Neon',
+  'settings.theme_dark':               'OLED Dark',
+  'settings.theme_light':              'OLED Light',
 
   'settings.section_launcher':         'Лаунчер',
   'settings.close_on_launch_title':    'Закрывать при запуске',
@@ -435,7 +451,7 @@ export const ru: Record<string, string> = {
 
   // ── Logs ────────────────────────────────────────────────────
   'logs.title':                        'Логи',
-  'logs.subtitle':                     'Системные логи и логи лаунчера',
+  'logs.subtitle':                     'Логи лаунчера и системы (вывод игры — во вкладке «Логи игры»)',
   'logs.empty':                        'Логов пока нет',
 
   // ── Game Logs ────────────────────────────────────────────────
@@ -445,6 +461,14 @@ export const ru: Record<string, string> = {
   'game_logs.no_content':              'В этой сессии нет вывода',
   'game_logs.live_session':            'Текущая сессия',
   'game_logs.active':                  'Активна',
+
+  // ── Loader Install ───────────────────────────────────────────
+  'loader_install.title':              '{loader} не установлен',
+  'loader_install.description':        'Для этой сборки требуется {loader} {version} для Minecraft {mc}. Установить сейчас?',
+  'loader_install.install_btn':        'Установить {loader}',
+  'loader_install.installing':         'Установка {loader}...',
+  'loader_install.retry':              'Повторить',
+  'loader_install.done':               '{loader} успешно установлен!',
 
   // ── Install Overlay ─────────────────────────────────────────
   'install.stage_fetching':            'Получение информации о версии',

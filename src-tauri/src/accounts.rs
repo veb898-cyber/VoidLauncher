@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tracing;
+use hex;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum AccountType {
@@ -93,10 +94,21 @@ pub fn list_accounts(accounts_dir: &std::path::Path) -> Vec<AccountEntry> {
     if !path.exists() {
         return Vec::new();
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    // Try plain JSON first (backward compat with old plaintext files)
+    if let Ok(accounts) = serde_json::from_str(&content) {
+        return accounts;
+    }
+    // Try hex-encoded JSON
+    if let Ok(bytes) = hex::decode(content.trim()) {
+        if let Ok(accounts) = serde_json::from_slice(&bytes) {
+            return accounts;
+        }
+    }
+    Vec::new()
 }
 
 pub fn save_accounts(accounts_dir: &std::path::Path, accounts: &[AccountEntry]) -> Result<(), String> {
@@ -105,12 +117,18 @@ pub fn save_accounts(accounts_dir: &std::path::Path, accounts: &[AccountEntry]) 
         tracing::warn!(target: "launcher", "Failed to create accounts directory: {}", e);
         return Err(e.to_string());
     }
-    let json = serde_json::to_string_pretty(accounts).map_err(|e| {
+    let json = serde_json::to_string(accounts).map_err(|e| {
         tracing::warn!(target: "launcher", "Failed to serialize accounts: {}", e);
         e.to_string()
     })?;
-    std::fs::write(path, json).map_err(|e| {
-        tracing::warn!(target: "launcher", "Failed to write accounts file: {}", e);
+    let encoded = hex::encode(json.as_bytes());
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &encoded).map_err(|e| {
+        tracing::warn!(target: "launcher", "Failed to write accounts temp file: {}", e);
+        e.to_string()
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        tracing::warn!(target: "launcher", "Failed to rename accounts file: {}", e);
         e.to_string()
     })?;
     Ok(())

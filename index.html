@@ -8,8 +8,21 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" />
+    <script>
+      (function(){
+        try {
+          var t = localStorage.getItem('voidlauncher-theme');
+          if (t === 'dark' || t === 'light') {
+            document.documentElement.setAttribute('data-theme', t);
+            document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
+          }
+        } catch(e) {}
+      })();
+    </script>
     <style>
       body { background: hsl(230, 25%, 7%); margin: 0; }
+      [data-theme="light"] body, [data-theme="light"] #splash { background: #ffffff; }
+      [data-theme="dark"] body, [data-theme="dark"] #splash { background: #000000; }
       #splash {
         position: fixed; inset: 0; z-index: 9999;
         display: flex; flex-direction: column;

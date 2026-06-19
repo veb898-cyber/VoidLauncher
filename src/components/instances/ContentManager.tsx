@@ -7,6 +7,7 @@ import { addToast } from '../ui/Toast';
 import { ContentBrowser, type ContentType } from './ContentBrowser';
 import { useFocusStore } from '../../stores/focusStore';
 import { useT } from '../../lib/i18n';
+import { useIconCacheStore } from '../../stores/iconCacheStore';
 
 /// Strip a trailing version like "_v1.2.3", "-1.0", " v3.2" from a name
 function strip_version_suffix(name: string): string {
@@ -68,7 +69,6 @@ const SUBFOLDER: Record<ContentType, string> = {
 export function ContentManager({ instanceName, contentType, mcVersion, loader, onOpenFolder }: Props) {
   const t = useT();
   const [items, setItems] = useState<ContentItem[]>([]);
-  const [itemIcons, setItemIcons] = useState<Record<string, string>>({});
   const [failedIcons, setFailedIcons] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
@@ -86,12 +86,10 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
   // remain mounted; only the network/CPU work is suspended.
   const isFrozen = useFocusStore((s) => s.isFrozen);
 
-  // Persistent in-memory mirror of the Rust icon cache.
-  // Keyed by `modrinth:<project_id>` (packs) or `file:<filename>` (mods / packs without project_id).
-  // Hydrated from disk on mount, written to disk when new icons are resolved.
-  const iconCacheRef = useRef<Map<string, string>>(new Map());
-  const [, setIconCacheVersion] = useState(0);
+  // Global icon cache (persists across remounts)
+  const { cache: iconCache, getIcon, setIcon, setCache, hydrated } = useIconCacheStore();
   const projectNameCache = useRef<Map<string, string>>(new Map());
+  const loadGen = useRef(0);
 
   const TYPE_LABELS: Record<ContentType, string> = {
     mod: t('content.type_mod'),
@@ -104,19 +102,17 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
 
   const cacheIcon = useCallback((key: string, value: string) => {
     if (!key) return;
-    if (iconCacheRef.current.get(key) === value) return;
-    iconCacheRef.current.set(key, value);
-    setItemIcons((prev) => prev[key] === value ? prev : { ...prev, [key]: value });
-    setIconCacheVersion((v) => v + 1);
+    if (getIcon(key) === value) return;
+    setIcon(key, value);
     invoke('cmd_set_icon_cache_entry', { key, value }).catch(() => {});
-  }, []);
+  }, [getIcon, setIcon]);
 
   const fetchPackIcons = useCallback(async (rawPacks: any[]) => {
     // Use the same source as PackBrowser: Modrinth CDN icons. For packs with project_id,
     // do a direct lookup. For others, search Modrinth by name to find the project.
     // Local pack.png is a fallback if Modrinth icon is missing.
     const projectType = contentType === 'resourcepack' ? 'resourcepack' : contentType === 'shader' ? 'shader' : 'mod';
-    const cache = iconCacheRef.current;
+    const cache = iconCache;
 
     // Build per-pack plans: track which keys are settled and which need a fetch.
     type Plan = { filename: string; name: string; projectId: string | null; modrinthKey: string; localKey: string; hasModrinth: boolean; hasLocal: boolean; resolved: boolean };
@@ -196,10 +192,12 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
   }, [instanceName, subfolder, contentType, cacheIcon]);
 
   const loadItems = useCallback(async () => {
+    const gen = ++loadGen.current;
     setLoading(true);
     try {
       if (contentType === 'mod') {
         const raw = await invoke<any[]>('cmd_get_mod_metadata', { instanceName });
+        if (gen !== loadGen.current) return;
         const mapped = raw.map((m) => ({
           filename: m.filename,
           name: m.name,
@@ -212,24 +210,29 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
           project_id: m.slug_verified ? m.slug : undefined,
         }));
         setItems(mapped);
-        const cache = iconCacheRef.current;
-        for (const m of raw) {
-          const key = `file:${m.filename}`;
-          const cached = cache.get(key);
-          if (cached) {
-            // Already cached - apply immediately
-            cacheIcon(key, cached);
-            continue;
-          }
-          // Not in cache: only fetch from jar if no remote icon
-          if (m.icon && m.icon.startsWith('data:')) continue;
-          try {
-            const icon = await invoke<string | null>('cmd_get_mod_icon', { instanceName, filename: m.filename });
-            if (icon) cacheIcon(key, icon);
-          } catch { }
+        setLoading(false);
+
+        const cache = iconCache;
+        const uncached = raw.filter((m) => {
+          if (m.icon && m.icon.startsWith('data:')) return false;
+          return !cache.get(`file:${m.filename}`);
+        });
+
+        const CONCURRENCY = 5;
+        for (let i = 0; i < uncached.length; i += CONCURRENCY) {
+          if (gen !== loadGen.current) return;
+          const batch = uncached.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(batch.map(async (m) => {
+            const key = `file:${m.filename}`;
+            try {
+              const icon = await invoke<string | null>('cmd_get_mod_icon', { instanceName, filename: m.filename });
+              if (icon && gen === loadGen.current) cacheIcon(key, icon);
+            } catch { }
+          }));
         }
       } else {
         const raw = await invoke<any[]>('cmd_list_packs', { instanceName, packType: subfolder });
+        if (gen !== loadGen.current) return;
         setItems(raw.map((p) => ({
           filename: p.filename,
           name: p.name,
@@ -241,13 +244,15 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
           icon: null,
           size: p.file_size,
         })));
-        // Pack icons are resolved by fetchPackIcons (uses persistent cache internally)
-        fetchPackIcons(raw);
+        setLoading(false);
+        fetchPackIcons(raw).catch((e) => console.error('fetchPackIcons error:', e));
       }
     } catch (e: any) {
-      addToast(t('manager.load_error', { label, error: e.toString() }), 'error');
+      if (gen === loadGen.current) {
+        addToast(t('manager.load_error', { label, error: e.toString() }), 'error');
+        setLoading(false);
+      }
     }
-    setLoading(false);
   }, [instanceName, contentType, subfolder, fetchPackIcons, label, cacheIcon]);
 
   useEffect(() => {
@@ -257,26 +262,22 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
     setCompatibility({});
     setFailedIcons(new Set());
     checkedRef.current = new Set();
-  }, [loadItems]);
+  }, [loadItems, mcVersion, loader]);
 
-  // Hydrate the icon cache from disk on mount and seed itemIcons for instant display.
-  // Runs once on app start; cache is then kept in sync by `cacheIcon` calls.
+  // Hydrate the global icon cache from disk on mount (runs once).
+  // Subsequent remounts skip disk read since cache persists in store.
   useEffect(() => {
+    if (hydrated) return;
     let cancelled = false;
     (async () => {
       try {
         const cache = await invoke<Record<string, string>>('cmd_get_icon_cache');
         if (cancelled) return;
-        const map = new Map(Object.entries(cache));
-        iconCacheRef.current = map;
-        const seeded: Record<string, string> = {};
-        for (const [k, v] of map) seeded[k] = v;
-        setItemIcons(seeded);
-        setIconCacheVersion((v) => v + 1);
+        setCache(cache);
       } catch { }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [hydrated, setCache]);
 
   // Watch the instance directory for external file changes; reload list on event
   useEffect(() => {
@@ -396,13 +397,11 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         await invoke('cmd_rename_file', { from: `${itemDir}/${item.filename}.voidlauncher.json`, to: `${itemDir}/${newName}.voidlauncher.json` });
       } catch { }
       setItems((prev) => prev.map((it) => it.filename === item.filename ? { ...it, filename: newName, enabled: newEnabled } : it));
-      if (itemIcons[item.filename]) {
-        setItemIcons((prev) => {
-          const copy = { ...prev };
-          copy[newName] = copy[item.filename];
-          delete copy[item.filename];
-          return copy;
-        });
+      const oldIconKey = `file:${item.filename}`;
+      const cachedIcon = getIcon(oldIconKey);
+      if (cachedIcon) {
+        setIcon(`file:${newName}`, cachedIcon);
+        invoke('cmd_set_icon_cache_entry', { key: `file:${newName}`, value: cachedIcon }).catch(() => {});
       }
     } catch (e: any) { addToast(t('manager.toggle_error', { error: e.toString() }), 'error'); }
   };
@@ -520,13 +519,12 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
     if (item.icon && item.icon.startsWith('data:')) return item.icon;
     // Look up the persistent icon cache: prefer project_id key, fall back to filename
     if (item.project_id) {
-      const v = itemIcons[`modrinth:${item.project_id}`] ?? iconCacheRef.current.get(`modrinth:${item.project_id}`);
+      const v = getIcon(`modrinth:${item.project_id}`);
       if (v) return v;
     }
     const fileKey = `file:${item.filename}`;
-    const v2 = itemIcons[fileKey] ?? iconCacheRef.current.get(fileKey);
+    const v2 = getIcon(fileKey);
     if (v2) return v2;
-    if (itemIcons[item.filename]) return itemIcons[item.filename];
     if (item.icon && !item.icon.startsWith('data:') && item.icon.includes('/')) {
       return `https://cdn.modrinth.com/data/${item.icon}`;
     }

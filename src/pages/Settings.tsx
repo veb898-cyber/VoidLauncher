@@ -5,6 +5,7 @@ import { useAccountsStore } from '../stores/accountsStore';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { Button } from '../components/ui/Button';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { addToast } from '../components/ui/Toast';
@@ -12,6 +13,7 @@ import { CustomSelect } from '../components/ui/CustomSelect';
 import { getRecommendedMemoryMb, snapToMemoryStep } from '../lib/memory';
 import { useT, Language } from '../lib/i18n';
 import { useLanguageStore } from '../stores/languageStore';
+import { useThemeStore, Theme } from '../stores/themeStore';
 import {
   APP_VERSION,
   useLatestVersion,
@@ -34,6 +36,8 @@ interface ManagedJavaRuntime {
 export function Settings() {
   const t = useT();
   const language = useLanguageStore((s) => s.language);
+  const theme = useThemeStore((s) => s.theme);
+  const setTheme = useThemeStore((s) => s.setTheme);
   const config = useSettingsStore((s) => s.config);
   const javaInstallations = useSettingsStore((s) => s.javaInstallations);
   const loadConfig = useSettingsStore((s) => s.loadConfig);
@@ -50,6 +54,7 @@ export function Settings() {
   const [managedJava, setManagedJava] = useState<ManagedJavaRuntime[]>([]);
   const [checkingJava, setCheckingJava] = useState(false);
   const [downloadingJava, setDownloadingJava] = useState<number | null>(null);
+  const [javaProgress, setJavaProgress] = useState<{ percent: number; message: string } | null>(null);
   const [javaError, setJavaError] = useState(false);
 
   useEffect(() => {
@@ -62,6 +67,20 @@ export function Settings() {
   useEffect(() => {
     setLocalConfig(config);
   }, [config]);
+
+  useEffect(() => {
+    const unlisten = listen<{ major_version: number; percent: number; stage: string; message: string }>(
+      'java_download_progress',
+      (event) => {
+        if (event.payload.stage === 'done') {
+          setJavaProgress(null);
+        } else {
+          setJavaProgress({ percent: event.payload.percent, message: event.payload.message });
+        }
+      }
+    );
+    return () => { unlisten.then((fn) => fn()).catch(() => {}); };
+  }, []);
 
   const loadJavaVersions = useCallback(async () => {
     setCheckingJava(true);
@@ -314,8 +333,13 @@ export function Settings() {
                   alignItems: 'center',
                   justifyContent: 'space-between',
                 }}>
-                  <div>
+                   <div>
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-md)' }}>{jv.label}</div>
+                    {isDownloading && javaProgress && (
+                      <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                        {javaProgress.message}
+                      </div>
+                    )}
                   </div>
                   <Button
                     size="sm"
@@ -324,6 +348,7 @@ export function Settings() {
                     onClick={async () => {
                       if (isInstalled) return;
                       setDownloadingJava(jv.major_version);
+                      setJavaProgress({ percent: 0, message: 'Starting...' });
                       try {
                         await invoke('cmd_download_java', { majorVersion: jv.major_version });
                         addToast(t('settings.java_install_success', { version: jv.major_version.toString() }), 'success');
@@ -333,10 +358,11 @@ export function Settings() {
                         addToast(t('settings.java_install_error', { error: String(e) }), 'error');
                       } finally {
                         setDownloadingJava(null);
+                        setJavaProgress(null);
                       }
                     }}
                   >
-                    {isDownloading ? <LoadingSpinner size={14} /> : isInstalled ? `✓ ${t('settings.java_downloaded')}` : t('settings.java_download_btn')}
+                    {isDownloading ? <><LoadingSpinner size={14} /> {javaProgress ? `${Math.round(javaProgress.percent)}%` : ''}</> : isInstalled ? `✓ ${t('settings.java_downloaded')}` : t('settings.java_download_btn')}
                   </Button>
                 </div>
               );
@@ -406,6 +432,25 @@ export function Settings() {
                 { value: 'ru', label: 'Русский' },
               ]}
               onChange={(v) => useLanguageStore.getState().setLanguage(v as Language)}
+            />
+          </div>
+        </div>
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.theme_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.theme_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control" style={{ width: 220 }}>
+            <CustomSelect
+              value={theme}
+              options={[
+                { value: 'standard', label: t('settings.theme_standard') },
+                { value: 'dark', label: t('settings.theme_dark') },
+                { value: 'light', label: t('settings.theme_light') },
+              ]}
+              onChange={(v) => setTheme(v as Theme)}
             />
           </div>
         </div>

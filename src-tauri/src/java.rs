@@ -98,14 +98,36 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
     installations
 }
 
-/// Probe a Java executable to get version info
+/// Probe a Java executable to get version info.
+/// Skips files smaller than 10KB (MSI stubs / broken installations).
 pub fn probe_java_by_path(path: &PathBuf) -> Option<JavaInstallation> {
+    // Skip tiny executables — real java.exe is 30KB+, MSI stubs are ~10-50KB
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() < 10_000 {
+        tracing::debug!(target: "launcher", "Skipping small java.exe ({} bytes): {:?}", meta.len(), path);
+        return None;
+    }
+
     let mut cmd = Command::new(path);
     cmd.arg("-version");
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let output = cmd.output().ok()?;
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(target: "launcher", "Failed to run java -version at {:?}: {}", path, e);
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        tracing::warn!(target: "launcher", "java -version failed at {:?}: status={}, stderr={}, stdout={}",
+            path, output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout));
+        return None;
+    }
 
     // Java prints version to stderr
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -116,9 +138,13 @@ pub fn probe_java_by_path(path: &PathBuf) -> Option<JavaInstallation> {
         stdout.to_string()
     };
 
-    let version = parse_java_version(&version_output)?;
+    let version = parse_java_version(&version_output).unwrap_or_default();
+    if version.is_empty() {
+        tracing::warn!(target: "launcher", "Could not parse java version from {:?}: stderr={}", path, stderr);
+        return None;
+    }
     let major = parse_major_version(&version);
-    let is_64bit = version_output.contains("64-Bit");
+    let is_64bit = version_output.contains("64-Bit") || version_output.contains("64-bit");
     let vendor = parse_vendor(&version_output);
 
     Some(JavaInstallation {

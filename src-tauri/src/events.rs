@@ -49,6 +49,8 @@ impl ProgressSender {
 
 /// Emit a log message event to the frontend AND write it to the
 /// file-based tracing logger (see `logger::init`).
+/// If the source is "launch", also append to the current game log file
+/// so the Game Logs page captures launch messages.
 pub fn emit_log(app: &AppHandle, level: &str, source: &str, message: &str) {
     // Mirror to the file logger. We do this BEFORE the IPC emit so a
     // crash inside the renderer (e.g. an exception in the Logs page)
@@ -68,6 +70,17 @@ pub fn emit_log(app: &AppHandle, level: &str, source: &str, message: &str) {
             message: message.to_string(),
         },
     );
+
+    // Also write launch logs to the current game log file so
+    // the Game Logs tab can show them even after the fact.
+    if source == "launch" {
+        if let Some(path) = crate::game_logs::get_current_log_path() {
+            crate::game_logs::append_game_log_line(
+                &path,
+                &format!("[{}] [{}] {}", level.to_uppercase(), source, message),
+            );
+        }
+    }
 }
 
 /// Spawn a background task that bridges broadcast channel → Tauri events

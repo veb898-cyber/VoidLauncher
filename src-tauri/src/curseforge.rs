@@ -222,6 +222,12 @@ pub async fn get_mod_files(
     api_get(&url, api_key).await
 }
 
+pub async fn get_mod_file(mod_id: u64, file_id: u64, api_key: &str) -> Result<CfFile> {
+    let url = format!("{}/v1/mods/{}/files/{}", BASE_URL, mod_id, file_id);
+    let resp: CfDataResponse<CfFile> = api_get(&url, api_key).await?;
+    Ok(resp.data)
+}
+
 pub async fn popular_mods(
     mc_version: Option<&str>,
     loader: Option<&str>,

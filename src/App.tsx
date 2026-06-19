@@ -1,13 +1,15 @@
-import { Suspense, lazy, useEffect, useState } from 'react';
+import { Suspense, lazy, useEffect, useState, useCallback } from 'react';
 import { Titlebar } from './components/Titlebar';
 import { Sidebar } from './components/Sidebar';
 import { ToastContainer } from './components/ui/Toast';
 import { InstallOverlay } from './components/install/InstallOverlay';
 import { UpdaterModal } from './components/UpdaterModal';
+import { LoaderInstallModal } from './components/launch/LoaderInstallModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useAuthStore } from './stores/authStore';
 import { useSettingsStore } from './stores/settingsStore';
 import { useAccountsStore } from './stores/accountsStore';
+import { useInstanceStore } from './stores/instanceStore';
 import { useGameEvents } from './hooks/useGameEvents';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useFocusStore } from './stores/focusStore';
@@ -30,6 +32,16 @@ function App() {
   const { loadConfig } = useSettingsStore();
   const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const isFrozen = useFocusStore((s) => s.isFrozen);
+  const pendingLoaderInstall = useInstanceStore((s) => s.pendingLoaderInstall);
+  const dismissLoaderInstall = useInstanceStore((s) => s.dismissLoaderInstall);
+  const launchGame = useInstanceStore((s) => s.launchGame);
+
+  const handleLoaderInstalled = useCallback(() => {
+    if (!pendingLoaderInstall) return;
+    const name = pendingLoaderInstall.instanceName;
+    dismissLoaderInstall();
+    launchGame(name);
+  }, [pendingLoaderInstall, dismissLoaderInstall, launchGame]);
 
   useEffect(() => {
     checkAuth();
@@ -105,6 +117,14 @@ function App() {
         onDismiss={updater.dismissUpdate}
       />
       <ToastContainer />
+      {pendingLoaderInstall && (
+        <LoaderInstallModal
+          open={true}
+          onClose={dismissLoaderInstall}
+          onInstalled={handleLoaderInstalled}
+          instanceName={pendingLoaderInstall.instanceName}
+        />
+      )}
     </>
   );
 }

@@ -5,7 +5,7 @@ import { t } from '../lib/i18n';
 export function Logs() {
   const { logs, clearLogs } = useLogStore();
   const bottomRef = useRef<HTMLDivElement>(null);
-  const launcherLogs = logs.filter((l) => l.source !== 'minecraft');
+  const launcherLogs = logs.filter((l) => l.source !== 'minecraft' && l.source !== 'launch');
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });

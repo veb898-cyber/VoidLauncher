@@ -48,16 +48,28 @@ pub fn launch_minecraft(
 
     let mut classpath = build_classpath(version_info, &config.libraries_dir(), &client_jar);
 
-    // Add mod loader libraries to classpath
+    // Track already added library paths to avoid duplicates (e.g., gson in both vanilla and NeoForge)
+    let mut added_libs: std::collections::HashSet<String> = classpath
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    // Add mod loader libraries to classpath (deduplicated)
     if let Some(profile) = &instance.loader_profile {
         tracing::info!(target: "launcher", "Mod loader: main_class={}", profile.main_class);
         for lib in &profile.libraries {
             let lib_path = config.libraries_dir().join(&lib.path);
             if lib_path.exists() {
-                if !classpath.is_empty() {
-                    classpath.push(';');
+                let lib_path_str = lib_path.to_string_lossy().to_string();
+                if added_libs.insert(lib_path_str.clone()) {
+                    if !classpath.is_empty() {
+                        classpath.push(';');
+                    }
+                    classpath.push_str(&lib_path_str);
+                } else {
+                    tracing::debug!(target: "launcher", "Skipping duplicate library on classpath: {}", lib.name);
                 }
-                classpath.push_str(&lib_path.to_string_lossy());
             } else {
                 tracing::warn!(target: "launcher", "Mod library not found: {:?}", lib_path);
             }
@@ -100,6 +112,9 @@ pub fn launch_minecraft(
     // Add mod loader JVM args (skip -cp and ${classpath}, we add them explicitly below).
     // Loader profiles (Forge/NeoForge in particular) sometimes include their own
     // GC selector, so we strip those here too — the user's chosen preset wins.
+    let library_dir = config.libraries_dir();
+    let classpath_sep = ";";
+    let version_name = &version_info.id;
     if let Some(profile) = &instance.loader_profile {
         let loader_args = strip_gc_selection_flags(&profile.jvm_args);
         for loader_arg in &loader_args {
@@ -108,6 +123,9 @@ pub fn launch_minecraft(
             }
             let processed = loader_arg
                 .replace("${natives_directory}", &natives_dir.to_string_lossy())
+                .replace("${library_directory}", &library_dir.to_string_lossy())
+                .replace("${classpath_separator}", classpath_sep)
+                .replace("${version_name}", version_name)
                 .replace("${launcher_name}", "VoidLauncher")
                 .replace("${launcher_version}", LAUNCHER_VERSION);
             args.push(processed);
@@ -134,6 +152,9 @@ pub fn launch_minecraft(
         }
         let processed = arg
             .replace("${natives_directory}", &natives_dir.to_string_lossy())
+            .replace("${library_directory}", &library_dir.to_string_lossy())
+            .replace("${classpath_separator}", classpath_sep)
+            .replace("${version_name}", version_name)
             .replace("${launcher_name}", "VoidLauncher")
             .replace("${launcher_version}", LAUNCHER_VERSION);
         args.push(processed);
@@ -142,6 +163,39 @@ pub fn launch_minecraft(
     // Add classpath
     args.push("-cp".to_string());
     args.push(classpath.clone());
+
+    // NeoForge's -p module path only includes NeoForge-specific jars, but
+    // JiJ dependencies (e.g. endec from owo-lib) may require other modules
+    // like fastutil that are on the classpath but not the module path.
+    // Fix: append all classpath entries (except native JARs) to the -p value
+    // so the module system can resolve all module dependencies.
+    if instance.loader != crate::instances::LoaderType::Vanilla {
+        if let Some(p_idx) = args.iter().position(|a| a == "-p") {
+            let cp_entries: Vec<&str> = classpath.split(';').collect();
+            if let Some(module_path) = args.get_mut(p_idx + 1) {
+                for entry in &cp_entries {
+                    if entry.is_empty() || module_path.contains(entry) {
+                        continue;
+                    }
+                    // Skip native JARs (e.g. lwjgl-freetype-3.3.3-natives-linux.jar)
+                    // which would cause "Module named X was already on the JVMs module path"
+                    let fname = std::path::Path::new(entry)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    let is_native = fname.contains("-natives-linux")
+                        || fname.contains("-natives-macos")
+                        || fname.contains("-natives-windows")
+                        || fname.contains("-natives-");
+                    if is_native {
+                        continue;
+                    }
+                    module_path.push_str(classpath_sep);
+                    module_path.push_str(entry);
+                }
+            }
+        }
+    }
 
     // Main class (use loader profile if available)
     let main_class = instance
@@ -240,8 +294,13 @@ pub fn launch_minecraft(
     let child = cmd
         .spawn()
         .map_err(|e| {
-            tracing::error!(target: "launcher", "FAILED to spawn Java: {}", e);
-            LauncherError::Launch(format!("Failed to launch: {}", e))
+            let msg = if e.raw_os_error() == Some(740) {
+                format!("Java requires administrator privileges. Right-click java.exe → Properties → Compatibility → disable 'Run as admin'. Java path: {}", java_path.display())
+            } else {
+                format!("Failed to launch: {}", e)
+            };
+            tracing::error!(target: "launcher", "FAILED to spawn Java: {}", msg);
+            LauncherError::Launch(msg)
         })?;
 
     tracing::info!(target: "launcher", "Java process spawned with PID: {}", child.id());

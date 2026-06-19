@@ -79,12 +79,13 @@ pub async fn install_loader(
     mc_version: &str,
     loader_version: &str,
     libraries_dir: &Path,
+    app: Option<&tauri::AppHandle>,
 ) -> Result<LoaderProfile> {
     match loader {
         "Fabric" => fabric::install(mc_version, loader_version, libraries_dir).await,
         "Quilt" => quilt::install(mc_version, loader_version, libraries_dir).await,
         "Forge" => forge::install(mc_version, loader_version, libraries_dir).await,
-        "NeoForge" => neoforge::install(mc_version, loader_version, libraries_dir).await,
+        "NeoForge" => neoforge::install(mc_version, loader_version, libraries_dir, app).await,
         "LiteLoader" => liteloader::install(mc_version, loader_version, libraries_dir).await,
         _ => Err(crate::error::LauncherError::ModLoader(format!(
             "Unknown loader: {}",

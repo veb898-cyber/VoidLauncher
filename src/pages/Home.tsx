@@ -19,6 +19,7 @@ export function Home({ onNavigate }: HomeProps) {
   const isLaunching = useInstanceStore((s) => s.isLaunching);
   const launchGame = useInstanceStore((s) => s.launchGame);
   const loadInstances = useInstanceStore((s) => s.loadInstances);
+  const selectInstance = useInstanceStore((s) => s.selectInstance);
 
   useEffect(() => {
     loadInstances();
@@ -70,12 +71,12 @@ export function Home({ onNavigate }: HomeProps) {
             src={`https://mc-heads.net/avatar/${activeId}/56`}
             referrerPolicy="no-referrer"
             alt={activeName ?? ''}
-            style={{ width: 56, height: 56, borderRadius: 'var(--radius-lg)' }}
+            style={{ width: 56, height: 56, borderRadius: 'var(--radius-md)' }}
           />
         ) : (
           <div style={{
             width: 56, height: 56,
-            borderRadius: 'var(--radius-lg)',
+            borderRadius: 'var(--radius-md)',
             background: 'var(--surface-glass)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             fontSize: 24, color: 'var(--text-tertiary)',
@@ -171,7 +172,7 @@ export function Home({ onNavigate }: HomeProps) {
                 key={inst.name}
                 className="instance-card"
                 onClick={() => {
-                  window.location.hash = `#/instances/${encodeURIComponent(inst.name)}`;
+                  selectInstance(inst.name);
                   onNavigate('instances');
                 }}
                 role="button"

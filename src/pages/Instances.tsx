@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Plus, Play, Trash2, Package, X } from 'lucide-react';
+import { Plus, Play, Trash2, Package, X, Download, Upload } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import { useInstanceStore } from '../stores/instanceStore';
 import { t, formatPlayTime } from '../lib/i18n';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
@@ -60,6 +61,33 @@ export function Instances() {
     fetchVersions();
   };
 
+  const handleImport = async () => {
+    try {
+      const selected = await openFileDialog({
+        multiple: false,
+        filters: [{ name: 'Instance Archive', extensions: ['zip'] }],
+      });
+      if (!selected) return;
+      await invoke('cmd_import_prism_instance', { zipPath: selected });
+      loadInstances();
+    } catch (e) {
+      console.error('Failed to import instance:', e);
+    }
+  };
+
+  const handleExport = async (name: string) => {
+    try {
+      const path = await saveFileDialog({
+        defaultPath: `${name}.zip`,
+        filters: [{ name: 'Instance Archive', extensions: ['zip'] }],
+      });
+      if (!path) return;
+      await invoke('cmd_export_instance', { name, outputPath: path });
+    } catch (e) {
+      console.error('Failed to export instance:', e);
+    }
+  };
+
   const handleCreate = async () => {
     if (!newName.trim() || !selectedVersion) return;
     setIsCreating(true);
@@ -106,10 +134,16 @@ export function Instances() {
           <h1 className="page__title">{t('instances.page_title')}</h1>
           <p className="page__subtitle">{t('instances.count', { n: instances.length.toString() })}</p>
         </div>
-        <Button onClick={handleOpenCreate} id="create-instance-btn">
-          <Plus size={16} />
-          {t('instances.new_btn')}
-        </Button>
+        <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
+          <Button variant="secondary" onClick={handleImport}>
+            <Download size={16} />
+            {t('instances.import_btn')}
+          </Button>
+          <Button onClick={handleOpenCreate} id="create-instance-btn">
+            <Plus size={16} />
+            {t('instances.new_btn')}
+          </Button>
+        </div>
       </div>
 
       {error && (
@@ -216,6 +250,10 @@ export function Instances() {
           <Button variant="ghost" style={{ width: '100%', justifyContent: 'flex-start' }}
             onClick={() => { launchGame(contextMenu.name); setContextMenu(null); }}>
               <Play size={14} fill="currentColor" /> {t('instances.play')}
+            </Button>
+            <Button variant="ghost" style={{ width: '100%', justifyContent: 'flex-start' }}
+              onClick={() => { handleExport(contextMenu.name); setContextMenu(null); }}>
+              <Upload size={14} /> {t('instances.export_btn')}
             </Button>
             <Button variant="ghost" style={{ width: '100%', justifyContent: 'flex-start' }}
               onClick={() => { deleteInstance(contextMenu.name); setContextMenu(null); }}>

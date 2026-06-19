@@ -116,10 +116,6 @@ pub fn prism_cfg_file(&self, instances_dir: &PathBuf) -> PathBuf {
     self.dir(instances_dir).join("instance.cfg")
 }
 
-/// Get Prism-compatible pack.png icon path
-pub fn pack_icon_file(&self, instances_dir: &PathBuf) -> PathBuf {
-    self.dir(instances_dir).join("pack.png")
-}
 }
 
 /// List all instances (supports both instance.json and instance.cfg)
@@ -395,6 +391,15 @@ pub fn list_packs(instances_dir: &PathBuf, name: &str, pack_type: &str) -> Resul
         if filename.starts_with('.') || filename.ends_with(".voidlauncher.json") { continue; }
         let is_dir = path.is_dir();
         let meta = std::fs::metadata(&path)?;
+
+        // Skip tiny non-zip config presets in shaderpacks (e.g. "Better MC - High.json" at 373 bytes)
+        if pack_type == "shaderpacks" && !is_dir && meta.len() < 1024 {
+            let lower = filename.to_lowercase();
+            if lower.ends_with(".json") || lower.ends_with(".txt") || lower.ends_with(".cfg") || lower.ends_with(".properties") {
+                continue;
+            }
+        }
+
         // Read sidecar metadata (project_name is the Modrinth/CurseForge display name)
         let (provider, version, project_id, project_name) = read_pack_sidecar(&path).unwrap_or_default();
         // Name resolution: sidecar project_name > pack.mcmeta pack.name/description > filename
@@ -435,7 +440,16 @@ pub fn read_pack_icon(instances_dir: &PathBuf, instance_name: &str, pack_type: &
 
 fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, String, String)> {
     let filename = pack_path.file_name()?.to_string_lossy().to_string();
-    let meta_filename = format!("{}.voidlauncher.json", filename);
+    // Handle .disabled suffix: if file is foo.jar.disabled, look for both
+    // foo.jar.disabled.voidlauncher.json and foo.jar.voidlauncher.json
+    let meta_disabled = format!("{}.voidlauncher.json", filename);
+    let meta_filename = if let Some(stripped) = filename.strip_suffix(".disabled") {
+        let meta_original = format!("{}.voidlauncher.json", stripped);
+        let meta_path = pack_path.parent()?.join(&meta_original);
+        if meta_path.exists() { meta_original } else { meta_disabled }
+    } else {
+        meta_disabled
+    };
     let meta_path = pack_path.parent()?.join(&meta_filename);
     let contents = std::fs::read_to_string(&meta_path).ok()?;
     let val: serde_json::Value = serde_json::from_str(&contents).ok()?;
@@ -475,53 +489,81 @@ pub struct PackEntry {
 }
 
 fn read_pack_icon_from_dir(path: &std::path::Path) -> Option<String> {
+    // Check root pack.png first
     let icon_path = path.join("pack.png");
-    if icon_path.exists() { read_image_as_base64(&icon_path) } else { None }
+    if icon_path.exists() { return read_image_as_base64(&icon_path); }
+
+    // Recursively scan for any image file (shader packs often have screenshots/ in subdirs)
+    let exts = [".png", ".jpg", ".jpeg"];
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(img) = read_pack_icon_from_dir(&path) {
+                return Some(img);
+            }
+        } else {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if exts.iter().any(|e| name.ends_with(e)) {
+                if let Some(img) = read_image_as_base64(&path) {
+                    return Some(img);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn read_pack_icon_from_zip(path: &std::path::Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut archive = zip::ZipArchive::new(reader).ok()?;
+    let total = archive.len();
 
-    // Try common icon filenames first (in root)
-    let candidates_root = ["pack.png", "pack.jpg", "pack.jpeg", "preview.png", "thumb.png", "icon.png", "logo.png"];
-    for name in &candidates_root {
-        if let Some(img) = try_read_zip_image(&mut archive, name) {
-            return Some(img);
-        }
-    }
-    // Try "pack.png" in any subdir
-    let pack_candidates: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
-        .filter(|n| n.to_lowercase().ends_with("pack.png"))
-        .collect();
-    for name in &pack_candidates {
-        if let Some(img) = try_read_zip_image(&mut archive, name) {
-            return Some(img);
-        }
-    }
-
-    // Fallback: find any image in the zip
-    let exts = [".png", ".jpg", ".jpeg"];
-    let image_candidates: Vec<String> = (0..archive.len())
+    // Build a list of entry names first (avoids borrow conflicts)
+    let entries: Vec<(String, bool)> = (0..total)
         .filter_map(|i| {
-            archive.by_index(i).ok().and_then(|e| {
-                if !e.is_dir() {
-                    let n = e.name();
-                    let lower = n.to_lowercase();
-                    if exts.iter().any(|e| lower.ends_with(e)) {
-                        Some(n.to_string())
-                    } else { None }
-                } else { None }
-            })
+            let e = archive.by_index(i).ok()?;
+            let is_dir = e.is_dir();
+            let name = e.name().to_string();
+            Some((name, is_dir))
         })
         .collect();
-    for name in &image_candidates {
+
+    let exts_img = [".png", ".jpg", ".jpeg"];
+    let root_preferred = ["pack.png", "pack.jpg", "pack.jpeg", "preview.png", "thumb.png", "icon.png", "logo.png"];
+
+    // Pass 1: root-level preferred names
+    for (name, is_dir) in &entries {
+        if *is_dir { continue; }
+        let lower = name.to_lowercase();
+        if root_preferred.iter().any(|p| lower == *p) {
+            if let Some(img) = try_read_zip_image(&mut archive, name) {
+                return Some(img);
+            }
+        }
+    }
+
+    // Pass 2: pack.png in any subdir, then fallback to first image
+    let mut fallback_name: Option<String> = None;
+    for (name, is_dir) in &entries {
+        if *is_dir { continue; }
+        let lower = name.to_lowercase();
+
+        if lower.ends_with("pack.png") {
+            if let Some(img) = try_read_zip_image(&mut archive, name) {
+                return Some(img);
+            }
+        } else if fallback_name.is_none() && exts_img.iter().any(|e| lower.ends_with(e)) {
+            fallback_name = Some(name.clone());
+        }
+    }
+
+    if let Some(ref name) = fallback_name {
         if let Some(img) = try_read_zip_image(&mut archive, name) {
             return Some(img);
         }
     }
+
     None
 }
 
@@ -709,18 +751,6 @@ pub fn write_pack_png(instances_dir: &PathBuf, instance_name: &str, icon_data: &
     }
 }
 
-/// Read instance icon from pack.png, return as base64 data URL
-pub fn read_pack_png_as_icon(instances_dir: &PathBuf, instance_name: &str) -> Option<String> {
-    let instance = get_instance(instances_dir, instance_name).ok()?;
-    let png_path = instance.dir(instances_dir).join("pack.png");
-    if !png_path.exists() { return None; }
-    let mut file = std::fs::File::open(&png_path).ok()?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    if buf.is_empty() { return None; }
-    Some(format!("data:image/png;base64,{}", base64_encode(&buf)))
-}
-
 /// Try to parse a Prism instance.cfg into our Instance format
 pub fn parse_prism_cfg(cfg_path: &std::path::Path) -> Option<Instance> {
     let content = std::fs::read_to_string(cfg_path).ok()?;
@@ -817,6 +847,28 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
             })
     };
 
+    // Validate the extracted name
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.chars().count() < 3 || trimmed.chars().count() > 64
+        || trimmed.contains("..") || trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\0')
+        || trimmed.contains('<') || trimmed.contains('>') || trimmed.contains(':') || trimmed.contains('"')
+        || trimmed.contains('|') || trimmed.contains('?') || trimmed.contains('*')
+        || trimmed.chars().any(|c| c.is_control())
+        || trimmed.starts_with(' ') || trimmed.starts_with('.')
+    {
+        return Err(LauncherError::Instance(
+            format!("Invalid instance name in Prism pack: '{}'", name)
+        ));
+    }
+    let windows_reserved = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+        "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4",
+        "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"];
+    if windows_reserved.iter().any(|r| r.eq_ignore_ascii_case(trimmed)) {
+        return Err(LauncherError::Instance(
+            format!("Invalid instance name in Prism pack: '{}'", name)
+        ));
+    }
+
     // Create target directory
     let target_dir = instances_dir.join(&name);
     std::fs::create_dir_all(&target_dir)?;
@@ -832,8 +884,12 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
             if entry.is_dir() { continue; }
 
             let entry_name = entry.name().to_string();
-            // Skip entries outside root or path traversal
-            if entry_name.contains("..") || entry_name.starts_with('/') {
+            // Refuse path traversal: reject any component equal to ".."
+            let normalised = entry_name.replace('\\', "/");
+            if normalised.contains('\0') || normalised.split('/').any(|c| c == "..") {
+                continue;
+            }
+            if normalised.starts_with('/') {
                 continue;
             }
 
@@ -859,6 +915,59 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
 
     tracing::info!(target: "launcher", "Imported Prism pack '{}' from {:?}", name, zip_path);
     Ok(instance)
+}
+
+/// Export an instance as a .zip archive (compatible with Prism/MultiMC format)
+pub fn export_instance(instances_dir: &PathBuf, name: &str, output_path: &str) -> Result<()> {
+    use zip::write::SimpleFileOptions;
+
+    let instance = get_instance(instances_dir, name)?;
+    let instance_dir = instance.dir(instances_dir);
+    if !instance_dir.exists() {
+        return Err(LauncherError::Instance(format!("Instance '{}' not found", name)));
+    }
+
+    let out_path = std::path::Path::new(output_path);
+    let file = std::fs::File::create(out_path)?;
+    let mut zip_w = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    fn add_dir_to_zip(
+        zip: &mut zip::ZipWriter<std::fs::File>,
+        dir: &std::path::Path,
+        base_prefix: &str,
+        options: SimpleFileOptions,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let zip_path = if base_prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", base_prefix, name)
+            };
+
+            if path.is_dir() {
+                zip.add_directory(&zip_path, options)?;
+                add_dir_to_zip(zip, &path, &zip_path, options)?;
+            } else {
+                let mut file = std::fs::File::open(&path)?;
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf)?;
+                zip.start_file(&zip_path, options)?;
+                std::io::Write::write_all(zip, &buf)?;
+            }
+        }
+        Ok(())
+    }
+
+    add_dir_to_zip(&mut zip_w, &instance_dir, "", options)?;
+    zip_w.finish()?;
+
+    tracing::info!(target: "launcher", "Exported instance '{}' to {:?}", name, out_path);
+    Ok(())
 }
 
 // ── World operations ──────────────────────────────────────────────

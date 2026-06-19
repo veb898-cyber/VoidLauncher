@@ -39,7 +39,7 @@
 //! is O(N log N), both trivially fast for N ≤ ~5000 (Forge is the
 //! biggest).
 
-use crate::error::Result;
+use crate::error::{LauncherError, Result};
 use crate::modloaders::{LoaderVersion, LoaderVersionPage};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -147,8 +147,13 @@ fn is_prerelease(version: &str) -> bool {
 /// mirror JSON on first call. Subsequent calls return the cached
 /// `Arc` clone (O(1)).
 async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
-    if let Some(cached) = index_cache().lock().unwrap().get(uid).cloned() {
-        return Ok(cached);
+    {
+        let cache = index_cache().lock().map_err(|e| {
+            LauncherError::ModLoader(format!("Prism meta cache lock: {}", e))
+        })?;
+        if let Some(cached) = cache.get(uid).cloned() {
+            return Ok(cached);
+        }
     }
     let client = crate::download::global_http_client();
     let url = format!("{}/{}/index.json", META_BASE, uid);
@@ -188,10 +193,9 @@ async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
         e
     })?;
     let entries = Arc::new(index.versions);
-    index_cache()
-        .lock()
-        .unwrap()
-        .insert(uid.to_string(), entries.clone());
+    index_cache().lock().map_err(|e| {
+        LauncherError::ModLoader(format!("Prism meta cache lock: {}", e))
+    })?.insert(uid.to_string(), entries.clone());
     Ok(entries)
 }
 

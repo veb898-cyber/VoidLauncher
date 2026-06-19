@@ -110,6 +110,8 @@ export const en = {
   'instances.empty_desc':              'Create your first Minecraft instance to get started.',
   'instances.empty_cta':               'Create Instance',
   'instances.play':                    'Play',
+  'instances.import_btn':              'Import',
+  'instances.export_btn':              'Export',
   'instances.hours_played':            '{h}h played',
   'instances.mins_played':             '{m}m played',
   'instances.never_played':            'Never played',
@@ -139,6 +141,15 @@ export const en = {
   'create_instance.liteloader_empty': 'LiteLoader is abandoned (last release 2017, MC 1.12.2). No versions exist for modern Minecraft.',
   'create_instance.loader_end':       'All {total} versions loaded',
   'create_instance.liteloader_unsupported': 'LiteLoader is no longer maintained. Only MC 1.12.1 / 1.12.2 had releases, and the upstream download URLs are unreachable: {error}',
+  'create_instance.mode_new':          'New',
+  'create_instance.mode_import':       'Import',
+  'create_instance.import_desc':       'Import an existing modpack from a .zip or .mrpack file',
+  'create_instance.import_change_file':'Change File',
+  'create_instance.import_select_file':'Select Modpack File',
+  'create_instance.import_analyzing':  'Analyzing modpack...',
+  'create_instance.import_starting':   'Starting import...',
+  'create_instance.import_action':     'Import',
+  'create_instance.imported':          'Instance "{name}" imported!',
   'create_instance.created':           'Instance "{name}" created!',
   'create_instance.failed':            'Failed to create instance: {error}',
 
@@ -237,6 +248,11 @@ export const en = {
   'settings.section_appearance':       'Appearance',
   'settings.language_title':           'Language',
   'settings.language_desc':            'Interface language. Changes apply immediately.',
+  'settings.theme_title':              'Theme',
+  'settings.theme_desc':               'Launcher appearance',
+  'settings.theme_standard':           'Neon',
+  'settings.theme_dark':               'OLED Dark',
+  'settings.theme_light':              'OLED Light',
 
   'settings.section_launcher':         'Launcher',
   'settings.close_on_launch_title':    'Close on Launch',
@@ -431,7 +447,7 @@ export const en = {
 
   // ── Logs ────────────────────────────────────────────────────
   'logs.title':                        'Logs',
-  'logs.subtitle':                     'Launcher and system logs',
+  'logs.subtitle':                     'Launcher and system logs (game output is in Game Logs tab)',
   'logs.empty':                        'No logs yet',
 
   // ── Game Logs ────────────────────────────────────────────────
@@ -441,6 +457,14 @@ export const en = {
   'game_logs.no_content':              'No output in this session',
   'game_logs.live_session':            'Live Session',
   'game_logs.active':                  'Active',
+
+  // ── Loader Install ───────────────────────────────────────────
+  'loader_install.title':              '{loader} Not Installed',
+  'loader_install.description':        'This instance requires {loader} {version} for Minecraft {mc}. Would you like to install it now?',
+  'loader_install.install_btn':        'Install {loader}',
+  'loader_install.installing':         'Installing {loader}...',
+  'loader_install.retry':              'Retry',
+  'loader_install.done':               '{loader} installed successfully!',
 
   // ── Install Overlay ─────────────────────────────────────────
   'install.stage_fetching':            'Fetching version info',

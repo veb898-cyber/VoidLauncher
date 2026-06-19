@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import type { LoaderCheckResult } from '../components/launch/LoaderInstallModal';
 
 export interface LoaderLibrary {
   name: string;
@@ -42,12 +43,15 @@ interface InstanceState {
   error: string | null;
   isLaunching: boolean;
   launchStatus: string | null;
+  /** Pending loader install: instance name + check result */
+  pendingLoaderInstall: { instanceName: string; check: LoaderCheckResult } | null;
 
   loadInstances: () => Promise<void>;
   createInstance: (name: string, mcVersion: string) => Promise<void>;
   deleteInstance: (name: string) => Promise<void>;
   selectInstance: (name: string | null) => void;
   launchGame: (instanceName: string) => Promise<void>;
+  dismissLoaderInstall: () => void;
   installVersion: (versionUrl: string, instanceId?: string) => Promise<string>;
   checkInstalled: (instanceName: string) => Promise<boolean>;
   saveInstance: (instance: Instance) => Promise<void>;
@@ -61,6 +65,7 @@ export const useInstanceStore = create<InstanceState>((set) => ({
   error: null,
   isLaunching: false,
   launchStatus: null,
+  pendingLoaderInstall: null,
 
   loadInstances: async () => {
     set({ isLoading: true });
@@ -98,7 +103,20 @@ export const useInstanceStore = create<InstanceState>((set) => ({
   },
 
   launchGame: async (instanceName: string) => {
-    set({ isLaunching: true, launchStatus: 'Launching...' });
+    set({ isLaunching: true, launchStatus: 'Checking instance...' });
+
+    try {
+      // Check if loader needs to be installed
+      const check = await invoke<LoaderCheckResult>('cmd_check_instance_loader', { instanceName });
+      if (check.needs_install) {
+        set({ isLaunching: false, launchStatus: null, pendingLoaderInstall: { instanceName, check } });
+        return;
+      }
+    } catch {
+      // If check fails, try launching anyway (will get an error from backend if truly missing)
+    }
+
+    set({ launchStatus: 'Launching...' });
     // Minimize the window immediately on click, as requested.
     // If launch fails OR the game crashes shortly after, the
     // `launch_complete` handler in useGameEvents restores the window
@@ -119,6 +137,10 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       }
       set({ isLaunching: false, launchStatus: null, error: e.toString() });
     }
+  },
+
+  dismissLoaderInstall: () => {
+    set({ pendingLoaderInstall: null });
   },
 
   installVersion: async (versionUrl: string, instanceId?: string) => {

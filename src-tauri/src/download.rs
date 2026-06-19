@@ -9,6 +9,34 @@ const MAX_RETRIES: u32 = 3;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 const CONCURRENT_LIMIT: usize = 32;
 
+/// Shared allowlist of trusted download mirrors.
+pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
+    "cdn.modrinth.com",
+    "assets.modrinth.com",
+    "api.modrinth.com",
+    "github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "edge.forgecdn.net",
+    "mediafilez.forgecdn.net",
+    "piston-data.mojang.com",
+    "piston-meta.mojang.com",
+    "launchermeta.mojang.com",
+    "libraries.minecraft.net",
+    "resources.download.minecraft.net",
+    "maven.fabricmc.net",
+    "maven.quiltmc.org",
+    "files.minecraftforge.net",
+    "maven.minecraftforge.net",
+    "maven.neoforged.net",
+    "api.adoptium.net",
+];
+
+/// Check whether `host` is in the allowlist (exact or subdomain match).
+pub fn is_host_allowed(host: &str) -> bool {
+    ALLOWED_DOWNLOAD_HOSTS.iter().any(|h| host == *h || host.ends_with(&format!(".{}", h)))
+}
+
 /// Global HTTP client with connection pooling
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -19,11 +47,9 @@ fn http_client() -> &'static reqwest::Client {
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(15))
-            .user_agent("VoidLauncher/0.1.0")
-            .brotli(true)
-            .deflate(true)
+            .user_agent("VoidLauncher/0.1.3")
             .build()
-            .expect("Failed to create HTTP client")
+            .expect("Failed to create HTTP client (check TLS libraries)")
     })
 }
 
@@ -42,24 +68,7 @@ pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Re
         .find(|c: char| c == '/' || c == ':' || c == '?' || c == '#')
         .unwrap_or(after_scheme.len());
     let host = after_scheme[..host_end].to_ascii_lowercase();
-    const ALLOWED: &[&str] = &[
-        "cdn.modrinth.com",
-        "github.com",
-        "raw.githubusercontent.com",
-        "edge.forgecdn.net",
-        "mediafilez.forgecdn.net",
-        "piston-data.mojang.com",
-        "piston-meta.mojang.com",
-        "launchermeta.mojang.com",
-        "libraries.minecraft.net",
-        "resources.download.minecraft.net",
-        "maven.fabricmc.net",
-        "maven.quiltmc.org",
-        "files.minecraftforge.net",
-        "maven.minecraftforge.net",
-        "maven.neoforged.net",
-    ];
-    if !ALLOWED.iter().any(|h| host == *h || host.ends_with(&format!(".{}", h))) {
+    if !is_host_allowed(&host) {
         return Err(crate::error::LauncherError::Download(format!(
             "Download host '{}' is not in the allowlist",
             host
@@ -113,10 +122,13 @@ async fn attempt_download(
     expected_sha1: &str,
     existing_len: u64,
 ) -> Result<()> {
+    use std::io::Write;
+    use futures::StreamExt;
+
     let mut req = client.get(url);
 
-    // Resume if we have a partial file and no SHA1 to verify
-    if existing_len > 0 && expected_sha1.is_empty() {
+    // Resume if we have a partial file
+    if existing_len > 0 {
         req = req.header("Range", format!("bytes={}-", existing_len));
     }
 
@@ -134,21 +146,26 @@ async fn attempt_download(
         )));
     }
 
-    let bytes = response.bytes().await.map_err(|e| {
-        LauncherError::Download(format!("Failed to read response from {}: {}", url, e))
-    })?;
-
     if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        // Append to existing file
-        use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(path)
             .map_err(|e| LauncherError::Download(format!("Failed to open {}: {}", path.display(), e)))?;
-        file.write_all(&bytes)
-            .map_err(|e| LauncherError::Download(format!("Failed to write {}: {}", path.display(), e)))?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| LauncherError::Download(format!("Stream error: {}", e)))?;
+            file.write_all(&chunk)
+                .map_err(|e| LauncherError::Download(format!("Failed to write {}: {}", path.display(), e)))?;
+        }
     } else {
-        std::fs::write(path, &bytes)?;
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| LauncherError::Download(format!("Failed to create {}: {}", path.display(), e)))?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| LauncherError::Download(format!("Stream error: {}", e)))?;
+            file.write_all(&chunk)
+                .map_err(|e| LauncherError::Download(format!("Failed to write {}: {}", path.display(), e)))?;
+        }
     }
 
     if !expected_sha1.is_empty() {

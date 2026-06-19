@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tracing;
+use hex;
 use crate::error::{LauncherError, Result};
 
 /// Microsoft OAuth2 token response
@@ -344,10 +345,16 @@ pub async fn full_auth_flow(ms_token: &MicrosoftToken) -> Result<(MinecraftToken
     Ok((mc_token, profile))
 }
 
-/// Save auth state to disk
+/// Save auth state to disk (hex-encoded to avoid plaintext tokens; atomic write)
 pub fn save_auth_state(path: &std::path::Path, state: &AuthState) -> Result<()> {
-    let json = serde_json::to_string_pretty(state)?;
-    std::fs::write(path, json)?;
+    let json = serde_json::to_string(state)?;
+    let encoded = hex::encode(json.as_bytes());
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &encoded)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -397,10 +404,16 @@ pub fn get_offline_credentials(path: &std::path::Path) -> Option<(String, String
     None
 }
 
-/// Load auth state from disk
+/// Load auth state from disk (supports both hex-encoded and plain JSON)
 pub fn load_auth_state(path: &std::path::Path) -> Option<AuthState> {
     let contents = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    // Try plain JSON first (backward compat)
+    if let Ok(state) = serde_json::from_str(&contents) {
+        return Some(state);
+    }
+    // Try hex-encoded JSON
+    let bytes = hex::decode(contents.trim()).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Ely.by authentication
