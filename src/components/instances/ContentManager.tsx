@@ -54,6 +54,7 @@ interface UpdateInfo {
   oldFilename: string;
   projectId: string;
   versionId: string;
+  expectedSha1: string;
 }
 
 interface Props {
@@ -512,6 +513,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         oldFilename: r.filename,
         projectId: r.project_id,
         versionId: r.version_id,
+        expectedSha1: r.expected_sha1 || '',
       }));
       setCheckingUpdates(false);
       if (found.length > 0) {
@@ -539,6 +541,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         versionNumber: update.newVersion,
         provider: 'modrinth',
         oldFilename: update.oldFilename,
+        expectedSha1: update.expectedSha1 || '',
       });
       if (!silent) addToast(t('manager.updated_toast', { name: update.name, version: update.newVersion }), 'success');
       setUpdates((prev) => prev ? prev.filter((u) => u.name !== update.name) : null);
@@ -567,6 +570,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
           versionNumber: u.newVersion,
           provider: 'modrinth',
           oldFilename: u.oldFilename,
+          expectedSha1: u.expectedSha1 || '',
         });
         successes.push(u.name);
       } catch (e: any) { errors.push({ name: u.name, error: e.toString() }); }

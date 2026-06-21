@@ -2063,6 +2063,7 @@ struct ModUpdateResult {
     new_filename: String,
     project_id: String,
     version_id: String,
+    expected_sha1: String,
 }
 
 #[tauri::command]
@@ -2171,6 +2172,7 @@ async fn cmd_check_mod_updates(
             new_filename: primary_file.filename.clone(),
             project_id: version.project_id.clone(),
             version_id: version.id.clone(),
+            expected_sha1: file_hash.to_string(),
         });
     }
 
@@ -2620,6 +2622,7 @@ async fn cmd_download_to_folder(
     version_number: Option<String>,
     provider: String,
     old_filename: Option<String>,
+    expected_sha1: String,
 ) -> Result<String, String> {
     validate_instance_name(&instance_name)?;
     if !download_url.starts_with("https://") {
@@ -2669,7 +2672,7 @@ async fn cmd_download_to_folder(
         let old_sidecar = dest_dir.join(format!("{}.voidlauncher.json", old.trim_end_matches(".jar")));
         let _ = std::fs::remove_file(old_sidecar);
     }
-    download::download_file(&download_url, &dest, "")
+    download::download_file(&download_url, &dest, &expected_sha1)
         .await
         .map_err(|e| e.to_string())?;
     let final_name = safe_name.clone();

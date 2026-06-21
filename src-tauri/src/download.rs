@@ -199,6 +199,17 @@ async fn attempt_download_timed(
         return Err(LauncherError::Download(format!("HTTP {} for {}", status, url)));
     }
 
+    // Reject HTML/text responses to prevent writing error pages as binaries
+    if let Some(ct) = response.headers().get("content-type") {
+        let ct_str = ct.to_str().unwrap_or("");
+        if ct_str.starts_with("text/html") || ct_str.starts_with("text/plain") {
+            return Err(LauncherError::Download(format!(
+                "Server returned unexpected content-type '{}' for {}",
+                ct_str, url
+            )));
+        }
+    }
+
     if status == reqwest::StatusCode::PARTIAL_CONTENT {
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -261,6 +272,17 @@ async fn attempt_download(
             "HTTP {} for {}",
             status, url
         )));
+    }
+
+    // Reject HTML/text responses to prevent writing error pages as binaries
+    if let Some(ct) = response.headers().get("content-type") {
+        let ct_str = ct.to_str().unwrap_or("");
+        if ct_str.starts_with("text/html") || ct_str.starts_with("text/plain") {
+            return Err(LauncherError::Download(format!(
+                "Server returned unexpected content-type '{}' for {}",
+                ct_str, url
+            )));
+        }
     }
 
     if status == reqwest::StatusCode::PARTIAL_CONTENT {

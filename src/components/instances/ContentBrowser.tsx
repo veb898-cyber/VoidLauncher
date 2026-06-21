@@ -29,6 +29,7 @@ export interface SelectedItem {
   versionName?: string;
   isDependency?: boolean;
   parentMod?: string;
+  sha1?: string;
 }
 
 export type ContentType = 'mod' | 'resourcepack' | 'shader';
@@ -247,6 +248,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           source: 'modrinth',
           projectId: hit.project_id,
           versionName: v.name || v.version_number,
+          sha1: file.hashes?.sha1,
         };
         setSelectedItems((prev) => [...prev, item]);
         if (contentType === 'mod') await resolveDependencies(hit, v);
@@ -276,6 +278,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
               downloadUrl: f.url, filename: f.filename,
               source: 'modrinth', projectId: depId, versionName: depVers[0].name,
               isDependency: true, parentMod: mod.title,
+              sha1: f.hashes?.sha1,
             }]);
           }
         }
@@ -309,6 +312,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           versionId: null,
           versionNumber: item.versionName || null,
           provider: item.source || 'modrinth',
+          expectedSha1: item.sha1 || '',
         });
         success++;
       } catch (e: any) { failed++; addToast(t('content.install_error', { name: item.name, error: e.toString() }), 'error'); }
@@ -575,6 +579,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                                 downloadUrl: file.url, filename: file.filename,
                                 source: 'modrinth', projectId: selected.project_id,
                                 versionName: v.name || v.version_number,
+                                sha1: file.hashes?.sha1,
                               };
                               setSelectedItems((prev) => [...prev, item]);
                               addToast(t('content.added_toast', { name: selected.title }), 'success');

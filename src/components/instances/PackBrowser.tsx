@@ -98,6 +98,7 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
         versionId: version.id || null,
         versionNumber: version.version_number || version.name || null,
         provider: 'modrinth',
+        expectedSha1: file.hashes?.sha1 || '',
       });
       addToast(t('pack.installed_toast', { title: selected?.title || '', version: version.name || version.version_number }), 'success');
       setInstalledVersion(version.version_number || version.name);
