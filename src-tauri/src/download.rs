@@ -19,6 +19,7 @@ pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
     "objects.githubusercontent.com",
     "edge.forgecdn.net",
     "mediafilez.forgecdn.net",
+    "media.forgecdn.net",
     "piston-data.mojang.com",
     "piston-meta.mojang.com",
     "launchermeta.mojang.com",
@@ -47,7 +48,7 @@ fn http_client() -> &'static reqwest::Client {
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(15))
-            .user_agent("VoidLauncher/0.1.3")
+            .user_agent("VoidLauncher/0.1.4")
             .build()
             .expect("Failed to create HTTP client (check TLS libraries)")
     })
@@ -113,6 +114,122 @@ pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Re
     Err(last_err.unwrap_or_else(|| {
         LauncherError::Download(format!("Failed to download {}", url))
     }))
+}
+
+/// Compute a reasonable download timeout from file size (~512 KB/s minimum + buffer).
+pub fn timeout_for_size(size_bytes: u64) -> Duration {
+    let secs = size_bytes / 512_000 + 60;
+    Duration::from_secs(secs.clamp(120, 900))
+}
+
+/// Download a file with streaming, retries, and a timeout scaled to expected size.
+pub async fn download_file_sized(
+    url: &str,
+    path: &PathBuf,
+    expected_sha1: &str,
+    size_bytes: u64,
+) -> Result<()> {
+    let url_lower = url.to_ascii_lowercase();
+    if !url_lower.starts_with("https://") {
+        return Err(LauncherError::Download(
+            "Download URL must use HTTPS".to_string(),
+        ));
+    }
+    let after_scheme = &url[url.find("://").map(|i| i + 3).unwrap_or(8)..];
+    let host_end = after_scheme
+        .find(|c: char| c == '/' || c == ':' || c == '?' || c == '#')
+        .unwrap_or(after_scheme.len());
+    let host = after_scheme[..host_end].to_ascii_lowercase();
+    if !is_host_allowed(&host) {
+        return Err(LauncherError::Download(format!(
+            "Download host '{}' is not in the allowlist",
+            host
+        )));
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let timeout = timeout_for_size(size_bytes);
+    let client = http_client();
+    let mut last_err = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        match attempt_download_timed(client, url, path, expected_sha1, 0, timeout).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < MAX_RETRIES {
+                    sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        LauncherError::Download(format!("Failed to download {}", url))
+    }))
+}
+
+async fn attempt_download_timed(
+    client: &reqwest::Client,
+    url: &str,
+    path: &PathBuf,
+    expected_sha1: &str,
+    existing_len: u64,
+    timeout: Duration,
+) -> Result<()> {
+    use std::io::Write;
+    use futures::StreamExt;
+
+    let mut req = client.get(url).timeout(timeout);
+
+    if existing_len > 0 {
+        req = req.header("Range", format!("bytes={}-", existing_len));
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| LauncherError::Download(format!("Failed to download {}: {}", url, e)))?;
+
+    let status = response.status();
+    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(LauncherError::Download(format!("HTTP {} for {}", status, url)));
+    }
+
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|e| LauncherError::Download(format!("Failed to open {}: {}", path.display(), e)))?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| LauncherError::Download(format!("Stream error: {}", e)))?;
+            file.write_all(&chunk)
+                .map_err(|e| LauncherError::Download(format!("Failed to write {}: {}", path.display(), e)))?;
+        }
+    } else {
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| LauncherError::Download(format!("Failed to create {}: {}", path.display(), e)))?;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| LauncherError::Download(format!("Stream error: {}", e)))?;
+            file.write_all(&chunk)
+                .map_err(|e| LauncherError::Download(format!("Failed to write {}: {}", path.display(), e)))?;
+        }
+    }
+
+    if !expected_sha1.is_empty() && !verify_sha1(path, expected_sha1)? {
+        std::fs::remove_file(path)?;
+        return Err(LauncherError::Download(format!(
+            "SHA1 mismatch for {}",
+            path.display()
+        )));
+    }
+
+    Ok(())
 }
 
 async fn attempt_download(
@@ -286,6 +403,20 @@ pub fn verify_sha1(path: &PathBuf, expected: &str) -> Result<bool> {
     hasher.update(&bytes);
     let result = hex::encode(hasher.finalize());
     Ok(result == expected)
+}
+
+/// Compute SHA1 hash of a file and return hex string
+pub fn hash_file_sha1(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha1::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Expose global client for use by other modules (versions, modloaders)

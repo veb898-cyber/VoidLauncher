@@ -1,10 +1,13 @@
-import { useEffect, useMemo } from 'react';
-import { Play, Plus, Package, Settings, Clock } from 'lucide-react';
+import { useEffect, useMemo, useState, useRef } from 'react';
+import { Play, Plus, Package, Settings, Clock, Image, Upload } from 'lucide-react';
 import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore } from '../stores/accountsStore';
 import { useInstanceStore } from '../stores/instanceStore';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { useT, formatPlayTime, formatRelativeTime } from '../lib/i18n';
+import { addToast } from '../components/ui/Toast';
+import { invoke } from '@tauri-apps/api/core';
+import { BANNER_PRESETS, isGradientBanner, getGradientValue } from '../lib/bannerPresets';
 
 interface HomeProps {
   onNavigate: (page: string) => void;
@@ -21,11 +24,77 @@ export function Home({ onNavigate }: HomeProps) {
   const loadInstances = useInstanceStore((s) => s.loadInstances);
   const selectInstance = useInstanceStore((s) => s.selectInstance);
 
+  const [menuInstance, setMenuInstance] = useState<string | null>(null);
+  const [bannerPickerFor, setBannerPickerFor] = useState<string | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const pickerRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     loadInstances();
     loadAccounts();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Close icon menu on outside click
+  useEffect(() => {
+    if (!menuInstance) return;
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuInstance(null);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [menuInstance]);
+
+  // Close banner picker on outside click
+  useEffect(() => {
+    if (!bannerPickerFor) return;
+    const handler = (e: MouseEvent) => {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
+        setBannerPickerFor(null);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [bannerPickerFor]);
+
+  const setBanner = async (instanceName: string, value: string) => {
+    try {
+      await invoke('cmd_set_instance_banner', { instanceName, bannerData: value });
+      setBannerPickerFor(null);
+      setMenuInstance(null);
+      loadInstances();
+    } catch (e: any) {
+      addToast(e?.message || 'Failed to set banner', 'error');
+    }
+  };
+
+  const handlePickImage = async (instanceName: string, type: 'icon' | 'banner') => {
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({
+        title: type === 'icon' ? 'Choose Icon' : 'Choose Banner',
+        filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg'] }],
+        multiple: false,
+      });
+      if (!selected) return;
+      const { readFile } = await import('@tauri-apps/plugin-fs');
+      const bytes = await readFile(selected);
+      const ext = selected.split('.').pop()?.toLowerCase() || 'png';
+      const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png';
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      const dataUrl = `data:${mime};base64,${btoa(binary)}`;
+      const cmd = type === 'icon' ? 'cmd_set_instance_icon' : 'cmd_set_instance_banner';
+      await invoke(cmd, { instanceName, [`${type}Data`]: dataUrl });
+      setBannerPickerFor(null);
+      setMenuInstance(null);
+      loadInstances();
+    } catch (e: any) {
+      addToast(e?.message || `Failed to set ${type}`, 'error');
+    }
+  };
 
   const lastInstance = useMemo(() => {
     if (instances.length === 0) return null;
@@ -37,10 +106,6 @@ export function Home({ onNavigate }: HomeProps) {
     return sorted[0];
   }, [instances]);
 
-  // Resolve the "active player" for the home greeting:
-  //   1. Default account from the accounts list (any type: Microsoft / ElyBy / Offline)
-  //   2. Fall back to the legacy Microsoft profile from authStore
-  //   3. Otherwise: guest
   const defaultAccount = useMemo(
     () => accounts.find((a) => a.default) ?? null,
     [accounts]
@@ -178,9 +243,18 @@ export function Home({ onNavigate }: HomeProps) {
                 role="button"
                 tabIndex={0}
               >
-                <div className="instance-card__banner">
+                <div className="instance-card__banner" style={isGradientBanner(inst.banner) ? {
+                  background: getGradientValue(inst.banner),
+                  opacity: 1,
+                } : undefined}>
                   <div className="instance-card__banner-overlay"></div>
-                  {inst.icon ? (
+                  {inst.banner && !isGradientBanner(inst.banner) ? (
+                    <img
+                      className="instance-card__banner-img"
+                      src={inst.banner}
+                      alt={inst.name}
+                    />
+                  ) : inst.icon && !inst.banner ? (
                     <img
                       className="instance-card__banner-img"
                       src={inst.icon}
@@ -199,12 +273,14 @@ export function Home({ onNavigate }: HomeProps) {
                   )}
                 </div>
                 <div className="instance-card__body instance-card__body--horizontal">
-                  <div className="instance-card__icon">
+                  <div className="instance-card__icon" style={{ position: 'relative', cursor: 'pointer' }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setMenuInstance(menuInstance === inst.name ? null : inst.name);
+                      setBannerPickerFor(null);
+                    }}>
                     {inst.icon ? (
-                      <img
-                        src={inst.icon}
-                        alt={inst.name}
-                      />
+                      <img src={inst.icon} alt={inst.name} />
                     ) : (
                       <div className="instance-card__icon-fallback">
                         <Package size={20} />
@@ -244,6 +320,105 @@ export function Home({ onNavigate }: HomeProps) {
                     <span>{t('home.instance_play_btn')}</span>
                   </button>
                 </div>
+
+                {/* Icon context menu */}
+                {menuInstance === inst.name && !bannerPickerFor && (
+                  <div
+                    ref={menuRef}
+                    style={{
+                      position: 'absolute',
+                      top: 148,
+                      left: 16,
+                      zIndex: 100,
+                      background: 'var(--bg-elevated)',
+                      border: '1px solid var(--surface-border)',
+                      borderRadius: 'var(--radius-md)',
+                      boxShadow: 'var(--shadow-lg)',
+                      padding: 'var(--space-xs)',
+                      minWidth: 180,
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <button
+                      className="btn btn--ghost btn--sm"
+                      style={{ width: '100%', justifyContent: 'flex-start', gap: 'var(--space-sm)' }}
+                      onClick={() => setBannerPickerFor(inst.name)}
+                    >
+                      <Image size={16} />
+                      {t('home.change_banner')}
+                    </button>
+                    <button
+                      className="btn btn--ghost btn--sm"
+                      style={{ width: '100%', justifyContent: 'flex-start', gap: 'var(--space-sm)' }}
+                      onClick={() => handlePickImage(inst.name, 'icon')}
+                    >
+                      <Upload size={16} />
+                      {t('home.change_icon')}
+                    </button>
+                  </div>
+                )}
+
+                {/* Banner preset picker */}
+                {bannerPickerFor === inst.name && (
+                  <div
+                    ref={pickerRef}
+                    style={{
+                      position: 'absolute',
+                      top: 148,
+                      left: 16,
+                      zIndex: 110,
+                      background: 'var(--bg-elevated)',
+                      border: '1px solid var(--surface-border)',
+                      borderRadius: 'var(--radius-md)',
+                      boxShadow: 'var(--shadow-lg)',
+                      padding: 'var(--space-md)',
+                      width: 240,
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600, marginBottom: 'var(--space-sm)' }}>
+                      {t('home.banner_presets')}
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 'var(--space-xs)', marginBottom: 'var(--space-sm)' }}>
+                      {BANNER_PRESETS.map((p) => (
+                        <div
+                          key={p.id}
+                          title={p.label}
+                          onClick={() => setBanner(inst.name, `gradient:${p.id}`)}
+                          style={{
+                            width: '100%',
+                            aspectRatio: '16/9',
+                            borderRadius: 'var(--radius-sm)',
+                            background: p.gradient,
+                            cursor: 'pointer',
+                            border: inst.banner === `gradient:${p.id}` ? '2px solid var(--primary)' : '2px solid transparent',
+                            transition: 'border-color 0.15s',
+                          }}
+                        />
+                      ))}
+                    </div>
+                    <div style={{ display: 'flex', gap: 'var(--space-xs)' }}>
+                      <button
+                        className="btn btn--ghost btn--sm"
+                        style={{ flex: 1, justifyContent: 'center', gap: 'var(--space-xs)' }}
+                        onClick={() => handlePickImage(inst.name, 'banner')}
+                      >
+                        <Upload size={14} />
+                        {t('home.upload_image')}
+                      </button>
+                      {inst.banner && (
+                        <button
+                          className="btn btn--ghost btn--sm"
+                          style={{ justifyContent: 'center', color: 'var(--color-danger)' }}
+                          onClick={() => setBanner(inst.name, '')}
+                          title={t('home.remove_banner')}
+                        >
+                          x
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             ))}
           </div>

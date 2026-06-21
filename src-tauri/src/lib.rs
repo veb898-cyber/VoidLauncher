@@ -21,8 +21,8 @@ mod versions;
 use config::AppConfig;
 use events::{InstallProgressPayload, ProgressSender};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
 use std::io::Read as _;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
@@ -41,7 +41,9 @@ pub struct AppState {
 /// Load the icon cache from disk; returns empty map on any error
 fn load_icon_cache_from_disk(config: &AppConfig) -> HashMap<String, String> {
     let path = config.icon_cache_file();
-    let Ok(contents) = std::fs::read_to_string(&path) else { return HashMap::new(); };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
     serde_json::from_str(&contents).unwrap_or_default()
 }
 
@@ -86,7 +88,10 @@ fn is_allowed_download_host(url: &str) -> bool {
 // ==================== Auth Commands ====================
 
 #[tauri::command]
-async fn cmd_start_login(app: AppHandle, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn cmd_start_login(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     events::emit_log(&app, "info", "auth", "Starting Microsoft login flow...");
     let client_id = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -145,7 +150,12 @@ async fn cmd_poll_login(
         let _ = accounts::upsert_microsoft_account(&config.data_dir, &profile.name, &profile.id);
     }
 
-    events::emit_log(&app, "info", "auth", &format!("Login successful: {}", profile.name));
+    events::emit_log(
+        &app,
+        "info",
+        "auth",
+        &format!("Login successful: {}", profile.name),
+    );
     Ok(profile)
 }
 
@@ -168,7 +178,9 @@ fn cmd_can_launch_offline(state: State<'_, AppState>) -> Result<bool, String> {
 
 /// Get offline mode credentials (username and UUID) from cached auth state
 #[tauri::command]
-fn cmd_get_offline_credentials(state: State<'_, AppState>) -> Result<Option<(String, String)>, String> {
+fn cmd_get_offline_credentials(
+    state: State<'_, AppState>,
+) -> Result<Option<(String, String)>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     Ok(auth::get_offline_credentials(&config.auth_file()))
 }
@@ -191,7 +203,9 @@ fn cmd_logout(state: State<'_, AppState>) -> Result<(), String> {
 // ==================== Account Management Commands ====================
 
 #[tauri::command]
-fn cmd_list_accounts(state: State<'_, AppState>) -> Result<Vec<accounts::PublicAccountEntry>, String> {
+fn cmd_list_accounts(
+    state: State<'_, AppState>,
+) -> Result<Vec<accounts::PublicAccountEntry>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     // Strip access_token / elby_token before crossing the bridge so secrets
     // never enter the renderer process. The launch flow reads tokens from
@@ -277,9 +291,8 @@ fn validate_instance_name(name: &str) -> Result<(), String> {
     // Reject Windows reserved device names (CON, PRN, AUX, NUL, COM1..9, LPT1..9)
     let upper = trimmed.to_ascii_uppercase();
     const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL",
-        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if RESERVED.iter().any(|r| *r == upper.as_str()) {
         return Err(format!("'{}' is a reserved name.", trimmed));
@@ -329,7 +342,7 @@ mod offline_username_tests {
 
     #[test]
     fn rejects_invalid_length() {
-        assert!(validate_offline_username("ab").is_err());       // too short
+        assert!(validate_offline_username("ab").is_err()); // too short
         assert!(validate_offline_username("a".repeat(17).as_str()).is_err()); // too long
     }
 
@@ -441,7 +454,10 @@ async fn cmd_add_elyby_account(
         .map_err(|e| e.to_string())?;
     let entry = accounts::AccountEntry::new_elyby(&name, &uuid, &access_token);
     let accounts = accounts::add_account(&data_dir, entry)?;
-    Ok(accounts.into_iter().map(accounts::PublicAccountEntry::from).collect())
+    Ok(accounts
+        .into_iter()
+        .map(accounts::PublicAccountEntry::from)
+        .collect())
 }
 
 #[tauri::command]
@@ -480,18 +496,28 @@ async fn cmd_change_skin(
     if !skin.exists() || !skin.is_file() {
         return Err("Invalid skin file path".to_string());
     }
-    let ext = skin.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let ext = skin
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     if !["png", "jpg", "jpeg"].contains(&ext.as_str()) {
         return Err("Skin file must be a PNG or JPG image".to_string());
     }
     let (data_dir, account_type, mc_token) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let accounts_list = accounts::list_accounts(&config.data_dir);
-        let account = accounts_list.iter().find(|a| a.id == account_id)
-            .ok_or("Account not found")?.clone();
+        let account = accounts_list
+            .iter()
+            .find(|a| a.id == account_id)
+            .ok_or("Account not found")?
+            .clone();
         let mc_token = if account.account_type == accounts::AccountType::Microsoft {
             let auth_state = state.auth_state.lock().map_err(|e| e.to_string())?;
-            auth_state.minecraft_token.as_ref().map(|t| t.access_token.clone())
+            auth_state
+                .minecraft_token
+                .as_ref()
+                .map(|t| t.access_token.clone())
         } else {
             None
         };
@@ -516,14 +542,22 @@ async fn cmd_change_skin(
 }
 
 #[tauri::command]
-fn cmd_get_skin_path(state: State<'_, AppState>, account_id: String) -> Result<Option<String>, String> {
+fn cmd_get_skin_path(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Option<String>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let accounts_list = accounts::list_accounts(&config.data_dir);
-    let account = accounts_list.iter().find(|a| a.id == account_id)
+    let account = accounts_list
+        .iter()
+        .find(|a| a.id == account_id)
         .ok_or("Account not found")?;
 
     // Check if there's a skin file for this account
-    let skin_path = config.data_dir.join("skins").join(format!("{}.png", account.id));
+    let skin_path = config
+        .data_dir
+        .join("skins")
+        .join(format!("{}.png", account.id));
     if skin_path.exists() {
         Ok(Some(skin_path.to_string_lossy().to_string()))
     } else {
@@ -555,7 +589,8 @@ async fn cmd_get_version_info(url: String) -> Result<versions::VersionInfo, Stri
 #[tauri::command]
 fn cmd_list_instances(state: State<'_, AppState>) -> Result<Vec<instances::Instance>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut insts = instances::list_instances(&config.instances_dir()).map_err(|e| e.to_string())?;
+    let mut insts =
+        instances::list_instances(&config.instances_dir()).map_err(|e| e.to_string())?;
     // Merge playtime from playtime.json into each instance
     let playtime_map = crate::playtime::load_playtime(&config.data_dir);
     for inst in &mut insts {
@@ -598,7 +633,8 @@ fn cmd_get_instance(
 ) -> Result<instances::Instance, String> {
     validate_instance_name(&name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut inst = instances::get_instance(&config.instances_dir(), &name).map_err(|e| e.to_string())?;
+    let mut inst =
+        instances::get_instance(&config.instances_dir(), &name).map_err(|e| e.to_string())?;
     // Merge playtime from playtime.json
     let playtime_map = crate::playtime::load_playtime(&config.data_dir);
     if let Some(entry) = playtime_map.get(&inst.name) {
@@ -626,7 +662,8 @@ fn cmd_duplicate_instance(
     validate_instance_name(&name)?;
     validate_instance_name(&new_name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::duplicate_instance(&config.instances_dir(), &name, &new_name).map_err(|e| e.to_string())
+    instances::duplicate_instance(&config.instances_dir(), &name, &new_name)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -653,7 +690,8 @@ fn cmd_export_instance(
 ) -> Result<(), String> {
     validate_instance_name(&name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::export_instance(&config.instances_dir(), &name, &output_path).map_err(|e| e.to_string())
+    instances::export_instance(&config.instances_dir(), &name, &output_path)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -677,10 +715,28 @@ async fn cmd_import_modpack(
     }
     let (instances_dir, curseforge_api_key, libraries_dir) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        (config.instances_dir().clone(), config.curseforge_api_key.clone(), config.libraries_dir())
+        (
+            config.instances_dir().clone(),
+            config.curseforge_api_key.clone(),
+            config.libraries_dir(),
+        )
     };
-    import::import_modpack(&instances_dir, &path, &instance_name, &curseforge_api_key, &libraries_dir, Some(&app)).await.map_err(|e| e.to_string())
+    import::import_modpack(
+        &instances_dir,
+        &path,
+        &instance_name,
+        &curseforge_api_key,
+        &libraries_dir,
+        Some(&app),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
+
+/// Maximum size for a Base64-encoded instance icon.
+/// 3 MB of Base64 ≈ 2.2 MB decoded — enough for any reasonable image.
+const MAX_ICON_DATA_BYTES: usize = 9 * 1024 * 1024;
+const MAX_BANNER_DATA_BYTES: usize = 18 * 1024 * 1024;
 
 #[tauri::command]
 fn cmd_set_instance_icon(
@@ -689,17 +745,43 @@ fn cmd_set_instance_icon(
     icon_data: String,
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
+    if icon_data.len() > MAX_ICON_DATA_BYTES {
+        return Err(format!(
+            "Icon is too large ({} KB). Maximum allowed size is 2 MB.",
+            icon_data.len() / 1024
+        ));
+    }
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::save_instance_icon(&config.instances_dir(), &instance_name, &icon_data).map_err(|e| e.to_string())
+    instances::save_instance_icon(&config.instances_dir(), &instance_name, &icon_data)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn cmd_log_toast(level: String, message: String) {
-    match level.as_str() {
-        "error" => tracing::error!(target: "frontend", "{message}"),
-        "warning" => tracing::warn!(target: "frontend", "{message}"),
-        _ => tracing::info!(target: "frontend", "{message}"),
+fn cmd_set_instance_banner(
+    state: State<'_, AppState>,
+    instance_name: String,
+    banner_data: String,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    if banner_data.len() > MAX_BANNER_DATA_BYTES {
+        return Err(format!(
+            "Banner is too large ({} KB). Maximum allowed size is 4 MB.",
+            banner_data.len() / 1024
+        ));
     }
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    instances::save_instance_banner(&config.instances_dir(), &instance_name, &banner_data)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cmd_log_toast(app: AppHandle, level: String, message: String) {
+    let log_level = match level.as_str() {
+        "error" => "error",
+        "warning" => "warn",
+        _ => "info",
+    };
+    events::emit_log(&app, log_level, "toast", &message);
 }
 
 #[tauri::command]
@@ -723,7 +805,13 @@ fn cmd_rename_world(
     validate_instance_name(&old_name)?;
     validate_instance_name(&new_name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::rename_world(&config.instances_dir(), &instance_name, &old_name, &new_name).map_err(|e| e.to_string())
+    instances::rename_world(
+        &config.instances_dir(),
+        &instance_name,
+        &old_name,
+        &new_name,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -737,7 +825,13 @@ fn cmd_copy_world(
     validate_instance_name(&world_name)?;
     validate_instance_name(&new_name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::copy_world(&config.instances_dir(), &instance_name, &world_name, &new_name).map_err(|e| e.to_string())
+    instances::copy_world(
+        &config.instances_dir(),
+        &instance_name,
+        &world_name,
+        &new_name,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -749,7 +843,8 @@ fn cmd_delete_world(
     validate_instance_name(&instance_name)?;
     validate_instance_name(&world_name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::delete_world(&config.instances_dir(), &instance_name, &world_name).map_err(|e| e.to_string())
+    instances::delete_world(&config.instances_dir(), &instance_name, &world_name)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -773,7 +868,8 @@ fn cmd_list_packs(
         return Err("Invalid pack_type".to_string());
     }
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::list_packs(&config.instances_dir(), &instance_name, &pack_type).map_err(|e| e.to_string())
+    instances::list_packs(&config.instances_dir(), &instance_name, &pack_type)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -793,8 +889,13 @@ fn cmd_get_pack_icon(
         .ok_or("Invalid filename")?
         .to_string();
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::read_pack_icon(&config.instances_dir(), &instance_name, &pack_type, &safe_filename)
-        .map_err(|e| e.to_string())
+    instances::read_pack_icon(
+        &config.instances_dir(),
+        &instance_name,
+        &pack_type,
+        &safe_filename,
+    )
+    .map_err(|e| e.to_string())
 }
 
 // ==================== Icon Cache ====================
@@ -847,28 +948,40 @@ fn cmd_watch_instance(
         std::time::Duration::from_millis(300),
         move |res: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             if let Ok(events) = res {
-                if events.is_empty() { return; }
+                if events.is_empty() {
+                    return;
+                }
                 let mut changed: Vec<String> = Vec::new();
                 for ev in events {
                     let path_str = ev.path.to_string_lossy().to_string();
-                    if path_str.contains("resourcepacks") { changed.push("resourcepacks".to_string()); }
-                    else if path_str.contains("shaderpacks") { changed.push("shaderpacks".to_string()); }
-                    else if path_str.contains("mods") { changed.push("mods".to_string()); }
+                    if path_str.contains("resourcepacks") {
+                        changed.push("resourcepacks".to_string());
+                    } else if path_str.contains("shaderpacks") {
+                        changed.push("shaderpacks".to_string());
+                    } else if path_str.contains("mods") {
+                        changed.push("mods".to_string());
+                    }
                 }
                 changed.sort();
                 changed.dedup();
                 for sub in changed {
-                    let _ = app_clone.emit("instance_dir_changed", serde_json::json!({
-                        "instance": instance_for_closure.clone(),
-                        "subfolder": sub,
-                    }));
+                    let _ = app_clone.emit(
+                        "instance_dir_changed",
+                        serde_json::json!({
+                            "instance": instance_for_closure.clone(),
+                            "subfolder": sub,
+                        }),
+                    );
                 }
             }
         },
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     for path in &watch_paths {
-        debouncer.watcher().watch(path, RecursiveMode::NonRecursive)
+        debouncer
+            .watcher()
+            .watch(path, RecursiveMode::NonRecursive)
             .map_err(|e| e.to_string())?;
     }
 
@@ -897,13 +1010,17 @@ fn cmd_detect_java(state: State<'_, AppState>) -> Result<Vec<java::JavaInstallat
     let data_dir = c.data_dir.clone();
     drop(c);
     let mut installations = java::detect_java_installations();
-    installations.extend(java_download::list_managed_java(&data_dir).into_iter().map(|m| java::JavaInstallation {
-        path: m.path,
-        version: m.version,
-        major_version: m.major_version,
-        is_64bit: m.is_64bit,
-        vendor: m.vendor,
-    }));
+    installations.extend(
+        java_download::list_managed_java(&data_dir)
+            .into_iter()
+            .map(|m| java::JavaInstallation {
+                path: m.path,
+                version: m.version,
+                major_version: m.major_version,
+                is_64bit: m.is_64bit,
+                vendor: m.vendor,
+            }),
+    );
     Ok(installations)
 }
 
@@ -942,10 +1059,7 @@ fn cmd_list_managed_java(state: State<'_, AppState>) -> Vec<java_download::Manag
 }
 
 #[tauri::command]
-fn cmd_remove_managed_java(
-    state: State<'_, AppState>,
-    major_version: u32,
-) -> Result<(), String> {
+fn cmd_remove_managed_java(state: State<'_, AppState>, major_version: u32) -> Result<(), String> {
     let data_dir = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.data_dir.clone()
@@ -995,7 +1109,12 @@ async fn cmd_install_version(
         .await
         .map_err(|e| e.to_string())?;
 
-    events::emit_log(&app, "info", "install", &format!("Version {} fetched", version_info.id));
+    events::emit_log(
+        &app,
+        "info",
+        "install",
+        &format!("Version {} fetched", version_info.id),
+    );
     send_progress(5.0, "manifest", "Collecting files to download...");
 
     // Collect files to download
@@ -1009,7 +1128,12 @@ async fn cmd_install_version(
     let instance_id_clone = instance_id.clone();
 
     // Download all files with real progress
-    events::emit_log(&app, "info", "install", &format!("Downloading {} libraries...", files.len()));
+    events::emit_log(
+        &app,
+        "info",
+        "install",
+        &format!("Downloading {} libraries...", files.len()),
+    );
     send_progress(10.0, "libraries", "Downloading libraries...");
     download::download_files(files, move |completed, total, _msg| {
         let pct = 10.0 + (completed as f64 / total as f64) * 60.0;
@@ -1050,23 +1174,32 @@ async fn cmd_install_version(
     let index_json = serde_json::to_string_pretty(&asset_index).map_err(|e| e.to_string())?;
     std::fs::write(index_path, index_json).map_err(|e| e.to_string())?;
 
-    events::emit_log(&app, "info", "install", &format!("Downloading assets for {}...", version_info.assets));
+    events::emit_log(
+        &app,
+        "info",
+        "install",
+        &format!("Downloading assets for {}...", version_info.assets),
+    );
     send_progress(78.0, "assets", "Downloading assets...");
 
     // Download assets with progress
     let progress_tx_assets = progress_tx.clone();
     let instance_id_assets = instance_id.clone();
-    download::download_assets(&asset_index, &config.assets_dir(), move |completed, total, _msg| {
-        let pct = 78.0 + (completed as f64 / total as f64) * 20.0;
-        progress_tx_assets.send(InstallProgressPayload {
-            instance_id: instance_id_assets.clone(),
-            percent: pct,
-            downloaded_bytes: completed as u64,
-            total_bytes: total as u64,
-            stage: "assets".to_string(),
-            message: format!("Downloading assets ({}/{})", completed, total),
-        });
-    })
+    download::download_assets(
+        &asset_index,
+        &config.assets_dir(),
+        move |completed, total, _msg| {
+            let pct = 78.0 + (completed as f64 / total as f64) * 20.0;
+            progress_tx_assets.send(InstallProgressPayload {
+                instance_id: instance_id_assets.clone(),
+                percent: pct,
+                downloaded_bytes: completed as u64,
+                total_bytes: total as u64,
+                stage: "assets".to_string(),
+                message: format!("Downloading assets ({}/{})", completed, total),
+            });
+        },
+    )
     .await
     .map_err(|e| e.to_string())?;
 
@@ -1093,7 +1226,12 @@ async fn cmd_launch_game(
     // Create game log file early so all launch messages are captured in it
     let _ = game_logs::create_game_log_file(&data_dir, &instance_name);
 
-    events::emit_log(&app, "info", "launch", &format!("Preparing to launch: {}", instance_name));
+    events::emit_log(
+        &app,
+        "info",
+        "launch",
+        &format!("Preparing to launch: {}", instance_name),
+    );
 
     // Try Microsoft account first, then check accounts list for offline/Ely.by
     //
@@ -1110,45 +1248,74 @@ async fn cmd_launch_game(
     if let Some(ref mc_token) = auth.minecraft_token {
         if let Some(ref ms_token) = auth.microsoft_token {
             if auth::is_token_expired(mc_token) && !ms_token.refresh_token.is_empty() {
-                events::emit_log(&app, "info", "launch", "Minecraft token expired; re-authenticating via Microsoft OAuth...");
+                events::emit_log(
+                    &app,
+                    "info",
+                    "launch",
+                    "Minecraft token expired; re-authenticating via Microsoft OAuth...",
+                );
                 let client_id = config.client_id.clone();
                 let refresh_tok = ms_token.refresh_token.clone();
                 match auth::refresh_microsoft_token(&client_id, &refresh_tok).await {
                     Ok(new_ms) => {
                         match auth::full_auth_flow(&new_ms).await {
                             Ok((new_mc, new_profile)) => {
-                                events::emit_log(&app, "info", "launch", &format!("Token refreshed for user: {}", new_profile.name));
+                                events::emit_log(
+                                    &app,
+                                    "info",
+                                    "launch",
+                                    &format!("Token refreshed for user: {}", new_profile.name),
+                                );
                                 let fresh_state = auth::AuthState {
                                     microsoft_token: Some(new_ms),
                                     minecraft_token: Some(new_mc),
                                     profile: Some(new_profile),
                                     timestamp: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default().as_secs(),
+                                        .unwrap_or_default()
+                                        .as_secs(),
                                     offline_mode: false,
                                 };
                                 let _ = auth::save_auth_state(&config.auth_file(), &fresh_state);
                                 {
-                                    let mut as_guard = state.auth_state.lock().map_err(|e| e.to_string())?;
+                                    let mut as_guard =
+                                        state.auth_state.lock().map_err(|e| e.to_string())?;
                                     *as_guard = fresh_state.clone();
                                 }
                                 auth = fresh_state; // <-- the if-let below will see the fresh token
                             }
                             Err(e) => {
-                                events::emit_log(&app, "warn", "launch", &format!("Full re-auth failed: {}", e));
+                                events::emit_log(
+                                    &app,
+                                    "warn",
+                                    "launch",
+                                    &format!("Full re-auth failed: {}", e),
+                                );
                             }
                         }
                     }
                     Err(e) => {
-                        events::emit_log(&app, "warn", "launch", &format!("Microsoft token refresh failed: {}", e));
+                        events::emit_log(
+                            &app,
+                            "warn",
+                            "launch",
+                            &format!("Microsoft token refresh failed: {}", e),
+                        );
                     }
                 }
             }
         }
     }
 
-    let child = if let (Some(ref mc_token), Some(ref profile)) = (&auth.minecraft_token, &auth.profile) {
-        events::emit_log(&app, "info", "launch", "Online mode: using Microsoft account");
+    let child = if let (Some(ref mc_token), Some(ref profile)) =
+        (&auth.minecraft_token, &auth.profile)
+    {
+        events::emit_log(
+            &app,
+            "info",
+            "launch",
+            "Online mode: using Microsoft account",
+        );
         let instance = instances::get_instance(&config.instances_dir(), &instance_name)
             .map_err(|e| e.to_string())?;
 
@@ -1162,7 +1329,10 @@ async fn cmd_launch_game(
                 instances::LoaderType::LiteLoader => "LiteLoader",
                 _ => "Vanilla",
             };
-            return Err(format!("{} loader is not installed. Please install it before launching.", loader_str));
+            return Err(format!(
+                "{} loader is not installed. Please install it before launching.",
+                loader_str
+            ));
         }
 
         events::emit_log(&app, "info", "launch", "Fetching version manifest...");
@@ -1170,21 +1340,34 @@ async fn cmd_launch_game(
             .await
             .map_err(|e| e.to_string())?;
 
-        let version_url = manifest.versions.iter()
+        let version_url = manifest
+            .versions
+            .iter()
             .find(|v| v.id == instance.mc_version)
             .ok_or_else(|| {
                 let msg = format!("Version {} not found in manifest", instance.mc_version);
                 events::emit_log(&app, "error", "launch", &msg);
                 msg
             })?
-            .url.clone();
+            .url
+            .clone();
 
-        events::emit_log(&app, "info", "launch", &format!("Fetching version info for {}...", instance.mc_version));
+        events::emit_log(
+            &app,
+            "info",
+            "launch",
+            &format!("Fetching version info for {}...", instance.mc_version),
+        );
         let version_info = versions::fetch_version_info(&version_url)
             .await
             .map_err(|e| e.to_string())?;
 
-        events::emit_log(&app, "info", "launch", "Building classpath and launching Java...");
+        events::emit_log(
+            &app,
+            "info",
+            "launch",
+            "Building classpath and launching Java...",
+        );
         launch::launch_minecraft(
             &config,
             &instance,
@@ -1192,19 +1375,26 @@ async fn cmd_launch_game(
             &mc_token.access_token,
             &profile.id,
             &profile.name,
-        ).map_err(|e| {
+        )
+        .map_err(|e| {
             events::emit_log(&app, "error", "launch", &format!("Launch failed: {}", e));
             e.to_string()
         })?
     } else {
         // Try accounts from accounts.json (offline / Ely.by)
         let accounts_list = accounts::list_accounts(&data_dir);
-        let default_account = accounts_list.iter().find(|a| a.default).or_else(|| accounts_list.first());
+        let default_account = accounts_list
+            .iter()
+            .find(|a| a.default)
+            .or_else(|| accounts_list.first());
 
         if let Some(account) = default_account {
             let (uuid, username) = match account.account_type {
                 accounts::AccountType::Offline => {
-                    let uuid_val = account.uuid.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    let uuid_val = account
+                        .uuid
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                     (uuid_val, account.name.clone())
                 }
                 accounts::AccountType::ElyBy => {
@@ -1217,10 +1407,16 @@ async fn cmd_launch_game(
                     if let Some(auth_state) = auth::load_auth_state(&auth_path) {
                         if let Some(ref ms_token) = auth_state.microsoft_token {
                             if !ms_token.refresh_token.is_empty() {
-                                events::emit_log(&app, "info", "launch", "Refreshing Microsoft token...");
+                                events::emit_log(
+                                    &app,
+                                    "info",
+                                    "launch",
+                                    "Refreshing Microsoft token...",
+                                );
                                 let client_id = config.client_id.clone();
                                 let refresh_tok = ms_token.refresh_token.clone();
-                                match auth::refresh_microsoft_token(&client_id, &refresh_tok).await {
+                                match auth::refresh_microsoft_token(&client_id, &refresh_tok).await
+                                {
                                     Ok(new_token) => {
                                         let fresh_state = auth::AuthState {
                                             microsoft_token: Some(new_token),
@@ -1229,7 +1425,12 @@ async fn cmd_launch_game(
                                         let _ = auth::save_auth_state(&auth_path, &fresh_state);
                                     }
                                     Err(e) => {
-                                        events::emit_log(&app, "warn", "launch", &format!("Token refresh failed: {}, using cached", e));
+                                        events::emit_log(
+                                            &app,
+                                            "warn",
+                                            "launch",
+                                            &format!("Token refresh failed: {}, using cached", e),
+                                        );
                                     }
                                 }
                             }
@@ -1237,7 +1438,8 @@ async fn cmd_launch_game(
                     }
                     // Fall through to cached credentials
                     if !auth::can_launch_offline(&auth_path) {
-                        let msg = "Cannot launch offline: no valid cached credentials found.".to_string();
+                        let msg =
+                            "Cannot launch offline: no valid cached credentials found.".to_string();
                         events::emit_log(&app, "error", "launch", &msg);
                         return Err(msg);
                     }
@@ -1247,12 +1449,19 @@ async fn cmd_launch_game(
                 }
             };
 
-            events::emit_log(&app, "info", "launch", &format!("Using account: {} ({})", username, uuid));
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                &format!("Using account: {} ({})", username, uuid),
+            );
 
             let instance = instances::get_instance(&config.instances_dir(), &instance_name)
                 .map_err(|e| e.to_string())?;
 
-            if instance.loader != instances::LoaderType::Vanilla && instance.loader_profile.is_none() {
+            if instance.loader != instances::LoaderType::Vanilla
+                && instance.loader_profile.is_none()
+            {
                 let loader_str = match instance.loader {
                     instances::LoaderType::Fabric => "Fabric",
                     instances::LoaderType::Quilt => "Quilt",
@@ -1261,19 +1470,34 @@ async fn cmd_launch_game(
                     instances::LoaderType::LiteLoader => "LiteLoader",
                     _ => "Vanilla",
                 };
-                return Err(format!("{} loader is not installed. Please install it before launching.", loader_str));
+                return Err(format!(
+                    "{} loader is not installed. Please install it before launching.",
+                    loader_str
+                ));
             }
 
-            let version_path = config.versions_dir().join(&instance.mc_version).join(format!("{}.json", instance.mc_version));
-            events::emit_log(&app, "info", "launch", &format!("Loading version info from {:?}", version_path));
-            let version_info = versions::version_info_from_file(&version_path)
-                .map_err(|e| {
-                    let msg = format!("Failed to load version info from {:?}: {}", version_path, e);
-                    events::emit_log(&app, "error", "launch", &msg);
-                    msg
-                })?;
+            let version_path = config
+                .versions_dir()
+                .join(&instance.mc_version)
+                .join(format!("{}.json", instance.mc_version));
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                &format!("Loading version info from {:?}", version_path),
+            );
+            let version_info = versions::version_info_from_file(&version_path).map_err(|e| {
+                let msg = format!("Failed to load version info from {:?}: {}", version_path, e);
+                events::emit_log(&app, "error", "launch", &msg);
+                msg
+            })?;
 
-            events::emit_log(&app, "info", "launch", "Building classpath and launching Java...");
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                "Building classpath and launching Java...",
+            );
             launch::launch_minecraft(
                 &config,
                 &instance,
@@ -1281,13 +1505,19 @@ async fn cmd_launch_game(
                 "offline_token",
                 &uuid,
                 &username,
-            ).map_err(|e| {
+            )
+            .map_err(|e| {
                 events::emit_log(&app, "error", "launch", &format!("Launch failed: {}", e));
                 e.to_string()
             })?
         } else {
             // Fall back to cached Microsoft credentials
-            events::emit_log(&app, "info", "launch", "No accounts found, trying cached credentials");
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                "No accounts found, trying cached credentials",
+            );
 
             // Try to refresh token
             let auth_path = config.auth_file();
@@ -1306,7 +1536,12 @@ async fn cmd_launch_game(
                                 let _ = auth::save_auth_state(&auth_path, &fresh_state);
                             }
                             Err(e) => {
-                                events::emit_log(&app, "warn", "launch", &format!("Token refresh failed: {}, using cached", e));
+                                events::emit_log(
+                                    &app,
+                                    "warn",
+                                    "launch",
+                                    &format!("Token refresh failed: {}, using cached", e),
+                                );
                             }
                         }
                     }
@@ -1321,12 +1556,19 @@ async fn cmd_launch_game(
 
             let (username, uuid) = auth::get_offline_credentials(&config.auth_file())
                 .ok_or("Failed to get offline credentials")?;
-            events::emit_log(&app, "info", "launch", &format!("Offline user: {} ({})", username, uuid));
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                &format!("Offline user: {} ({})", username, uuid),
+            );
 
             let instance = instances::get_instance(&config.instances_dir(), &instance_name)
                 .map_err(|e| e.to_string())?;
 
-            if instance.loader != instances::LoaderType::Vanilla && instance.loader_profile.is_none() {
+            if instance.loader != instances::LoaderType::Vanilla
+                && instance.loader_profile.is_none()
+            {
                 let loader_str = match instance.loader {
                     instances::LoaderType::Fabric => "Fabric",
                     instances::LoaderType::Quilt => "Quilt",
@@ -1335,19 +1577,34 @@ async fn cmd_launch_game(
                     instances::LoaderType::LiteLoader => "LiteLoader",
                     _ => "Vanilla",
                 };
-                return Err(format!("{} loader is not installed. Please install it before launching.", loader_str));
+                return Err(format!(
+                    "{} loader is not installed. Please install it before launching.",
+                    loader_str
+                ));
             }
 
-            let version_path = config.versions_dir().join(&instance.mc_version).join(format!("{}.json", instance.mc_version));
-            events::emit_log(&app, "info", "launch", &format!("Loading version info from {:?}", version_path));
-            let version_info = versions::version_info_from_file(&version_path)
-                .map_err(|e| {
-                    let msg = format!("Failed to load version info from {:?}: {}", version_path, e);
-                    events::emit_log(&app, "error", "launch", &msg);
-                    msg
-                })?;
+            let version_path = config
+                .versions_dir()
+                .join(&instance.mc_version)
+                .join(format!("{}.json", instance.mc_version));
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                &format!("Loading version info from {:?}", version_path),
+            );
+            let version_info = versions::version_info_from_file(&version_path).map_err(|e| {
+                let msg = format!("Failed to load version info from {:?}: {}", version_path, e);
+                events::emit_log(&app, "error", "launch", &msg);
+                msg
+            })?;
 
-            events::emit_log(&app, "info", "launch", "Building classpath and launching Java (offline)...");
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                "Building classpath and launching Java (offline)...",
+            );
             launch::launch_minecraft(
                 &config,
                 &instance,
@@ -1355,7 +1612,8 @@ async fn cmd_launch_game(
                 "offline_token",
                 &uuid,
                 &username,
-            ).map_err(|e| {
+            )
+            .map_err(|e| {
                 events::emit_log(&app, "error", "launch", &format!("Launch failed: {}", e));
                 e.to_string()
             })?
@@ -1363,7 +1621,12 @@ async fn cmd_launch_game(
     };
 
     let pid = child.id();
-    events::emit_log(&app, "info", "launch", &format!("Java process started (PID: {})", pid));
+    events::emit_log(
+        &app,
+        "info",
+        "launch",
+        &format!("Java process started (PID: {})", pid),
+    );
 
     // Update last played
     let _ = instances::update_last_played(&config.instances_dir(), &instance_name);
@@ -1387,7 +1650,9 @@ async fn cmd_launch_game(
     // (so the timer + wait tasks can still call try_wait on it).
     let (stdout_opt, stderr_opt) = {
         let mut guard = child_handle.lock().map_err(|e| e.to_string())?;
-        let c = guard.as_mut().ok_or_else(|| "Child not found".to_string())?;
+        let c = guard
+            .as_mut()
+            .ok_or_else(|| "Child not found".to_string())?;
         (c.stdout.take(), c.stderr.take())
     };
 
@@ -1511,19 +1776,29 @@ async fn cmd_launch_game(
                 if let Ok(mut guard) = child_for_timer.lock() {
                     if let Some(child) = guard.as_mut() {
                         matches!(child.try_wait(), Ok(None))
-                    } else { false }
-                } else { false }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
             };
             if !alive {
                 // Process exited — commit any final sub-minute tail via the helper
                 let now = Instant::now();
                 let app_state = app_for_timer.state::<AppState>();
-                if let Some((name, delta)) = playtime::take_session(&app_state.active_session, now) {
+                if let Some((name, delta)) = playtime::take_session(&app_state.active_session, now)
+                {
                     if delta > 0 {
                         playtime::add_minutes_and_save(&data_dir_for_timer, &name, delta);
                     }
                 }
-                events::emit_log(&app_for_timer, "info", "launch", &format!("Playtime session ended for: {}", instance_for_timer));
+                events::emit_log(
+                    &app_for_timer,
+                    "info",
+                    "launch",
+                    &format!("Playtime session ended for: {}", instance_for_timer),
+                );
                 break;
             }
             // Commit the actual unpaid minutes since the last flush. The timer
@@ -1571,7 +1846,12 @@ async fn cmd_launch_game(
             }
         };
 
-        events::emit_log(&app_clone, "info", "launch", &format!("Game exited with code {}", exit_code));
+        events::emit_log(
+            &app_clone,
+            "info",
+            "launch",
+            &format!("Game exited with code {}", exit_code),
+        );
         game_logs::clear_current_log_path();
         let _ = app_clone.emit(
             "launch_complete",
@@ -1584,7 +1864,12 @@ async fn cmd_launch_game(
         );
     });
 
-    events::emit_log(&app, "info", "launch", &format!("Game launched: {} (PID: {})", instance_name, pid));
+    events::emit_log(
+        &app,
+        "info",
+        "launch",
+        &format!("Game launched: {} (PID: {})", instance_name, pid),
+    );
 
     Ok(())
 }
@@ -1762,8 +2047,134 @@ async fn cmd_get_modrinth_version_by_id(
 
 #[tauri::command]
 async fn cmd_get_modrinth_project_body(id: String) -> Result<String, String> {
-    let project = modrinth::get_project(&id).await.map_err(|e| e.to_string())?;
+    let project = modrinth::get_project(&id)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(project.body.unwrap_or_default())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ModUpdateResult {
+    filename: String,
+    name: String,
+    old_version: String,
+    new_version: String,
+    download_url: String,
+    new_filename: String,
+    project_id: String,
+    version_id: String,
+}
+
+#[tauri::command]
+async fn cmd_check_mod_updates(
+    state: State<'_, AppState>,
+    instance_name: String,
+    mc_version: Option<String>,
+    loader: Option<String>,
+) -> Result<Vec<ModUpdateResult>, String> {
+    validate_instance_name(&instance_name)?;
+
+    // Collect mod files with metadata (config lock dropped before await)
+    struct ModFile {
+        filename: String,
+        name: String,
+        version: String,
+        hash: Option<String>,
+    }
+
+    let mods_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
+            .map_err(|e| e.to_string())?;
+        instance.minecraft_dir(&config.instances_dir()).join("mods")
+    };
+
+    if !mods_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut mod_files: Vec<ModFile> = Vec::new();
+    let mut hash_to_mod: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut all_hashes: Vec<String> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&mods_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let filename = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let is_jar = filename.ends_with(".jar") || filename.ends_with(".jar.disabled");
+            if !is_jar { continue; }
+
+            let meta = read_mod_meta_from_jar(&path);
+            let hash = download::hash_file_sha1(&path).ok();
+
+            if let Some(ref h) = hash {
+                let idx = mod_files.len();
+                hash_to_mod.insert(h.clone(), idx);
+                all_hashes.push(h.clone());
+            }
+
+            mod_files.push(ModFile {
+                filename,
+                name: meta.name,
+                version: meta.version,
+                hash,
+            });
+        }
+    }
+
+    if all_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Query Modrinth update API
+    let loaders = loader.map(|l| vec![l.to_lowercase()]);
+    let game_versions = mc_version.map(|v| vec![v]);
+
+    let response = modrinth::check_version_updates(
+        all_hashes,
+        "sha1",
+        loaders,
+        game_versions,
+    ).await.map_err(|e| e.to_string())?;
+
+    let mut results = Vec::new();
+
+    for (hash_str, maybe_version) in &response {
+        let Some(version) = maybe_version else { continue; };
+        let Some(&idx) = hash_to_mod.get(hash_str) else { continue; };
+        let mod_file = &mod_files[idx];
+
+        let file = version.files.iter()
+            .find(|f| f.primary)
+            .or_else(|| version.files.first());
+        let Some(primary_file) = file else { continue; };
+
+        let installed_hash = mod_file.hash.as_deref().unwrap_or("");
+        let file_hash = primary_file.hashes.get("sha1")
+            .or_else(|| primary_file.hashes.get("sha512"))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        if installed_hash == file_hash {
+            continue;
+        }
+
+        results.push(ModUpdateResult {
+            filename: mod_file.filename.clone(),
+            name: mod_file.name.clone(),
+            old_version: mod_file.version.clone(),
+            new_version: version.version_number.clone(),
+            download_url: primary_file.url.clone(),
+            new_filename: primary_file.filename.clone(),
+            project_id: version.project_id.clone(),
+            version_id: version.id.clone(),
+        });
+    }
+
+    Ok(results)
 }
 
 #[tauri::command]
@@ -1874,8 +2285,8 @@ fn cmd_open_folder(
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let base = if let Some(name) = instance_name.as_deref() {
         validate_instance_name(name)?;
-        let instance = instances::get_instance(&config.instances_dir(), name)
-            .map_err(|e| e.to_string())?;
+        let instance =
+            instances::get_instance(&config.instances_dir(), name).map_err(|e| e.to_string())?;
         instance.minecraft_dir(&config.instances_dir())
     } else {
         config.data_dir.clone()
@@ -1887,11 +2298,23 @@ fn cmd_open_folder(
             base
         } else {
             const ALLOWED: &[&str] = &[
-                "mods", "resourcepacks", "shaderpacks", "config", "screenshots",
-                "saves", "logs", "datapacks", "crash-reports", "versions",
+                "mods",
+                "resourcepacks",
+                "shaderpacks",
+                "config",
+                "screenshots",
+                "saves",
+                "logs",
+                "datapacks",
+                "crash-reports",
+                "versions",
             ];
-            if !ALLOWED.contains(&sub) || sub.contains("..") || sub.contains('/')
-                || sub.contains('\\') || sub.contains(':') || sub.contains('\0')
+            if !ALLOWED.contains(&sub)
+                || sub.contains("..")
+                || sub.contains('/')
+                || sub.contains('\\')
+                || sub.contains(':')
+                || sub.contains('\0')
             {
                 return Err(format!("Subfolder '{}' is not allowed", sub));
             }
@@ -1975,10 +2398,12 @@ async fn cmd_install_liteloader(
     // The wizard's `cmd_install_liteloader` branch in CreateInstanceWizard
     // catches this and shows `create_instance.liteloader_unsupported`
     // with an "OK" button — see `addToast(..., 'warning')` there.
-    Err("LiteLoader is no longer maintained and cannot be installed. \
+    Err(
+        "LiteLoader is no longer maintained and cannot be installed. \
          Versions exist only for Minecraft 1.12.1 / 1.12.2 and the \
          upstream download URLs (dl.liteloader.com) are unreachable."
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// Result of checking whether a loader needs to be installed
@@ -2001,8 +2426,13 @@ async fn cmd_check_instance_loader(
         .map_err(|e| e.to_string())?;
 
     // Check if loader needs install: loader is set AND (profile is None OR profile.main_class is empty)
-    let needs = instance.loader != instances::LoaderType::Vanilla 
-        && (instance.loader_profile.is_none() || instance.loader_profile.as_ref().map(|p| p.main_class.is_empty()).unwrap_or(true));
+    let needs = instance.loader != instances::LoaderType::Vanilla
+        && (instance.loader_profile.is_none()
+            || instance
+                .loader_profile
+                .as_ref()
+                .map(|p| p.main_class.is_empty())
+                .unwrap_or(true));
     let loader_type = match instance.loader {
         instances::LoaderType::Fabric => "Fabric",
         instances::LoaderType::Quilt => "Quilt",
@@ -2043,28 +2473,50 @@ async fn cmd_install_instance_loader(
             instances::LoaderType::LiteLoader => "LiteLoader",
             _ => return Err("Instance has no mod loader".into()),
         };
-        let lv = instance.loader_version.clone()
+        let lv = instance
+            .loader_version
+            .clone()
             .ok_or("Instance has no loader version set")?;
         let mc = instance.mc_version.clone();
         (config.libraries_dir(), loader_str.to_string(), lv, mc)
     };
-    events::emit_log(&app, "info", "loader", &format!("Installing {} {} for {}...", loader_type, loader_version, mc_version));
+    events::emit_log(
+        &app,
+        "info",
+        "loader",
+        &format!(
+            "Installing {} {} for {}...",
+            loader_type, loader_version, mc_version
+        ),
+    );
 
     // Emit progress: downloading
-    let _ = app.emit("loader-install-progress", serde_json::json!({
-        "stage": "downloading",
-        "message": format!("Downloading {} libraries...", loader_type),
-    }));
+    let _ = app.emit(
+        "loader-install-progress",
+        serde_json::json!({
+            "stage": "downloading",
+            "message": format!("Downloading {} libraries...", loader_type),
+        }),
+    );
 
-    let profile = modloaders::install_loader(&loader_type, &mc_version, &loader_version, &libraries_dir, Some(&app))
-        .await
-        .map_err(|e| {
-            let _ = app.emit("loader-install-progress", serde_json::json!({
+    let profile = modloaders::install_loader(
+        &loader_type,
+        &mc_version,
+        &loader_version,
+        &libraries_dir,
+        Some(&app),
+    )
+    .await
+    .map_err(|e| {
+        let _ = app.emit(
+            "loader-install-progress",
+            serde_json::json!({
                 "stage": "error",
                 "message": format!("Failed to install {} loader: {}", loader_type, e),
-            }));
-            e.to_string()
-        })?;
+            }),
+        );
+        e.to_string()
+    })?;
 
     // Save profile to instance
     let config2 = state.config.lock().map_err(|e| e.to_string())?;
@@ -2074,12 +2526,23 @@ async fn cmd_install_instance_loader(
     instances::save_instance(&config2.instances_dir(), &instance).map_err(|e| e.to_string())?;
 
     // Emit progress: done
-    let _ = app.emit("loader-install-progress", serde_json::json!({
-        "stage": "done",
-        "message": format!("{} loader installed successfully", loader_type),
-    }));
+    let _ = app.emit(
+        "loader-install-progress",
+        serde_json::json!({
+            "stage": "done",
+            "message": format!("{} loader installed successfully", loader_type),
+        }),
+    );
 
-    events::emit_log(&app, "info", "loader", &format!("{} {} installed for {}", loader_type, loader_version, instance_name));
+    events::emit_log(
+        &app,
+        "info",
+        "loader",
+        &format!(
+            "{} {} installed for {}",
+            loader_type, loader_version, instance_name
+        ),
+    );
     Ok(())
 }
 
@@ -2134,7 +2597,10 @@ async fn cmd_install_mod(
             "version_id": modrinth_version_id,
             "version_number": version_number,
         });
-        let sidecar_path = mods_dir.join(format!("{}.voidlauncher.json", safe_name.trim_end_matches(".jar")));
+        let sidecar_path = mods_dir.join(format!(
+            "{}.voidlauncher.json",
+            safe_name.trim_end_matches(".jar")
+        ));
         let _ = std::fs::write(sidecar_path, sidecar.to_string());
     }
 
@@ -2153,6 +2619,7 @@ async fn cmd_download_to_folder(
     version_id: Option<String>,
     version_number: Option<String>,
     provider: String,
+    old_filename: Option<String>,
 ) -> Result<String, String> {
     validate_instance_name(&instance_name)?;
     if !download_url.starts_with("https://") {
@@ -2165,11 +2632,12 @@ async fn cmd_download_to_folder(
         ));
     }
     // Whitelist allowed subfolders under the instance .minecraft dir.
-    const ALLOWED: &[&str] = &[
-        "mods", "resourcepacks", "shaderpacks", "config",
-    ];
+    const ALLOWED: &[&str] = &["mods", "resourcepacks", "shaderpacks", "config"];
     let safe_subfolder = subfolder.trim_matches('/').trim_matches('\\');
-    if !ALLOWED.iter().any(|s| s.eq_ignore_ascii_case(safe_subfolder)) {
+    if !ALLOWED
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(safe_subfolder))
+    {
         return Err(format!("Subfolder '{}' is not allowed.", subfolder));
     }
     if safe_subfolder.contains("..")
@@ -2182,7 +2650,9 @@ async fn cmd_download_to_folder(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let instance = instances::get_instance(&config.instances_dir(), &instance_name)
             .map_err(|e| e.to_string())?;
-        let dest_dir = instance.minecraft_dir(&config.instances_dir()).join(safe_subfolder);
+        let dest_dir = instance
+            .minecraft_dir(&config.instances_dir())
+            .join(safe_subfolder);
         let _ = std::fs::create_dir_all(&dest_dir);
         let safe_name = std::path::Path::new(&file_name)
             .file_name()
@@ -2192,6 +2662,13 @@ async fn cmd_download_to_folder(
         let dest = dest_dir.join(&safe_name);
         (dest_dir, safe_name, dest)
     };
+    // If replacing an old file, delete it first so we don't end up with duplicates
+    if let Some(ref old) = old_filename {
+        let old_path = dest_dir.join(old.trim_end_matches(".jar").to_string() + ".jar");
+        let _ = std::fs::remove_file(&old_path);
+        let old_sidecar = dest_dir.join(format!("{}.voidlauncher.json", old.trim_end_matches(".jar")));
+        let _ = std::fs::remove_file(old_sidecar);
+    }
     download::download_file(&download_url, &dest, "")
         .await
         .map_err(|e| e.to_string())?;
@@ -2219,9 +2696,20 @@ fn cmd_open_instance_folder(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
     const ALLOWED: &[&str] = &[
-        "mods", "resourcepacks", "shaderpacks", "config", "screenshots", "saves", "logs", "",
+        "mods",
+        "resourcepacks",
+        "shaderpacks",
+        "config",
+        "screenshots",
+        "saves",
+        "logs",
+        "",
     ];
-    let sub = subfolder.as_deref().unwrap_or("").trim_matches('/').trim_matches('\\');
+    let sub = subfolder
+        .as_deref()
+        .unwrap_or("")
+        .trim_matches('/')
+        .trim_matches('\\');
     if !ALLOWED.iter().any(|s| s.eq_ignore_ascii_case(sub)) {
         return Err(format!("Subfolder '{}' is not allowed.", sub));
     }
@@ -2253,7 +2741,10 @@ fn cmd_get_instance_dir(
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let instance = instances::get_instance(&config.instances_dir(), &instance_name)
         .map_err(|e| e.to_string())?;
-    Ok(instance.minecraft_dir(&config.instances_dir()).to_string_lossy().to_string())
+    Ok(instance
+        .minecraft_dir(&config.instances_dir())
+        .to_string_lossy()
+        .to_string())
 }
 
 #[tauri::command]
@@ -2273,7 +2764,11 @@ fn cmd_list_instance_mods(
     if let Ok(entries) = std::fs::read_dir(&mods_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             // Skip the voidlauncher sidecar files
             if filename.ends_with(".voidlauncher.json") {
                 continue;
@@ -2286,8 +2781,9 @@ fn cmd_list_instance_mods(
             let enabled = is_jar && !is_disabled;
             let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             let meta = read_mod_meta_from_jar(&path);
-            let (slug, slug_verified) = read_mod_sidecar_slug(&mods_dir, &filename)
-                .map(|s| (Some(s), true))
+            let sidecar_project_id = read_mod_sidecar_slug(&mods_dir, &filename);
+            let (slug, slug_verified) = sidecar_project_id.as_ref()
+                .map(|s| (Some(s.clone()), true))
                 .unwrap_or_else(|| (meta.slug, false));
             mods.push(ModMetadata {
                 filename,
@@ -2298,6 +2794,7 @@ fn cmd_list_instance_mods(
                 file_size,
                 icon: meta.icon,
                 slug,
+                project_id: sidecar_project_id,
                 slug_verified,
             });
         }
@@ -2327,8 +2824,12 @@ fn cmd_remove_instance_mod(
         std::fs::remove_file(&mod_path).map_err(|e| e.to_string())?;
     }
     // Also remove any sidecar
-    let sidecar = mods_dir.join(format!("{}.voidlauncher.json",
-        safe_name.trim_end_matches(".jar").trim_end_matches(".disabled")));
+    let sidecar = mods_dir.join(format!(
+        "{}.voidlauncher.json",
+        safe_name
+            .trim_end_matches(".jar")
+            .trim_end_matches(".disabled")
+    ));
     let _ = std::fs::remove_file(sidecar);
     Ok(())
 }
@@ -2386,25 +2887,36 @@ fn cmd_get_current_game_log() -> Option<String> {
 }
 
 #[tauri::command]
-fn cmd_rename_file(
-    state: State<'_, AppState>,
-    from: String,
-    to: String,
-) -> Result<(), String> {
+fn cmd_delete_game_log(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let data_dir = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.data_dir.clone()
+    };
+    game_logs::delete_game_log(&data_dir, &path)
+}
+
+#[tauri::command]
+fn cmd_rename_file(state: State<'_, AppState>, from: String, to: String) -> Result<(), String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let instances_dir = config.instances_dir();
     let from_path = std::path::Path::new(&from);
     let to_path = std::path::Path::new(&to);
     // Open the source first to fail fast on missing/unreadable files.
     let _ = std::fs::File::open(from_path).map_err(|e| e.to_string())?;
-    let from_canon = from_path.canonicalize().map_err(|_| "Access denied: invalid source path".to_string())?;
-    let base_canon = instances_dir.canonicalize().map_err(|_| "Invalid base".to_string())?;
+    let from_canon = from_path
+        .canonicalize()
+        .map_err(|_| "Access denied: invalid source path".to_string())?;
+    let base_canon = instances_dir
+        .canonicalize()
+        .map_err(|_| "Invalid base".to_string())?;
     if !from_canon.starts_with(&base_canon) {
         return Err("Access denied: path is outside instances directory".to_string());
     }
     // Target may not exist yet; check parent
     if let Some(parent) = to_path.parent() {
-        let parent_canon = parent.canonicalize().map_err(|_| "Access denied: invalid target path".to_string())?;
+        let parent_canon = parent
+            .canonicalize()
+            .map_err(|_| "Access denied: invalid target path".to_string())?;
         if !parent_canon.starts_with(&base_canon) {
             return Err("Access denied: target is outside instances directory".to_string());
         }
@@ -2416,8 +2928,12 @@ fn cmd_rename_file(
 fn cmd_delete_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let instances_dir = config.instances_dir();
-    let canon = std::path::Path::new(&path).canonicalize().map_err(|_| "Access denied: invalid path".to_string())?;
-    let base_canon = instances_dir.canonicalize().map_err(|_| "Invalid base".to_string())?;
+    let canon = std::path::Path::new(&path)
+        .canonicalize()
+        .map_err(|_| "Access denied: invalid path".to_string())?;
+    let base_canon = instances_dir
+        .canonicalize()
+        .map_err(|_| "Invalid base".to_string())?;
     if !canon.starts_with(&base_canon) {
         return Err("Access denied: path is outside instances directory".to_string());
     }
@@ -2434,6 +2950,7 @@ pub struct ModMetadata {
     pub file_size: u64,
     pub icon: Option<String>,
     pub slug: Option<String>,
+    pub project_id: Option<String>,
     /// `true` when the slug came from the `.voidlauncher.json` sidecar
     /// (i.e. the mod was installed via the launcher and the slug is the
     /// verified Modrinth/CurseForge project ID). `false` when the slug is
@@ -2461,7 +2978,11 @@ fn cmd_get_mod_metadata(
     if let Ok(entries) = std::fs::read_dir(&mods_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             let is_jar = filename.ends_with(".jar");
             let is_disabled = filename.ends_with(".jar.disabled");
             if is_jar || is_disabled {
@@ -2469,18 +2990,31 @@ fn cmd_get_mod_metadata(
                 let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let meta = read_mod_meta_from_jar(&path);
                 // Check sidecar for verified Modrinth/CurseForge project slug.
-                let (slug, slug_verified) = read_mod_sidecar_slug(&mods_dir, &filename)
-                    .map(|s| (Some(s), true))
+                let sidecar_project_id = read_mod_sidecar_slug(&mods_dir, &filename);
+                let (slug, slug_verified) = sidecar_project_id.as_ref()
+                    .map(|s| (Some(s.clone()), true))
                     .unwrap_or_else(|| (meta.slug, false));
+                // Prefer the sidecar provider (modrinth/curseforge/local) over the JAR metadata loader name
+                let sidecar_provider = read_mod_sidecar_provider(&mods_dir, &filename);
+                let provider = match sidecar_provider.as_deref() {
+                    Some(s) => match s.to_lowercase().as_str() {
+                        "modrinth" => "Modrinth".to_string(),
+                        "curseforge" => "CurseForge".to_string(),
+                        "local" => "Local".to_string(),
+                        other => other.to_string(),
+                    },
+                    None => meta.provider.clone(),
+                };
                 mods.push(ModMetadata {
                     filename,
                     name: meta.name,
                     version: meta.version,
-                    provider: meta.provider,
+                    provider,
                     enabled,
                     file_size,
                     icon: meta.icon,
                     slug,
+                    project_id: sidecar_project_id,
                     slug_verified,
                 });
             }
@@ -2493,11 +3027,24 @@ fn cmd_get_mod_metadata(
 /// Read the Modrinth/CurseForge project slug from the `.voidlauncher.json`
 /// sidecar file that `cmd_install_mod` writes at download time.
 fn read_mod_sidecar_slug(mods_dir: &std::path::Path, filename: &str) -> Option<String> {
-    let stem = filename.trim_end_matches(".jar").trim_end_matches(".disabled");
+    let stem = filename
+        .trim_end_matches(".jar")
+        .trim_end_matches(".disabled");
     let sidecar_path = mods_dir.join(format!("{}.voidlauncher.json", stem));
     let contents = std::fs::read_to_string(sidecar_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
     json["project_id"].as_str().map(|s| s.to_string())
+}
+
+/// Read the provider (modrinth/curseforge/local) from the `.voidlauncher.json` sidecar.
+fn read_mod_sidecar_provider(mods_dir: &std::path::Path, filename: &str) -> Option<String> {
+    let stem = filename
+        .trim_end_matches(".jar")
+        .trim_end_matches(".disabled");
+    let sidecar_path = mods_dir.join(format!("{}.voidlauncher.json", stem));
+    let contents = std::fs::read_to_string(sidecar_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    json["provider"].as_str().map(|s| s.to_string())
 }
 
 struct ModMetaResult {
@@ -2509,10 +3056,18 @@ struct ModMetaResult {
 }
 
 fn fallback_meta_from_filename(path: &std::path::Path) -> ModMetaResult {
-    let fallback_name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("Unknown").to_string();
+    let fallback_name = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Unknown")
+        .to_string();
     let clean_name = if let Some(dash_pos) = fallback_name.rfind('-') {
-        let potential_version = &fallback_name[dash_pos+1..];
-        if potential_version.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        let potential_version = &fallback_name[dash_pos + 1..];
+        if potential_version
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_digit())
+        {
             fallback_name[..dash_pos].to_string()
         } else {
             fallback_name.clone()
@@ -2520,7 +3075,13 @@ fn fallback_meta_from_filename(path: &std::path::Path) -> ModMetaResult {
     } else {
         fallback_name.clone()
     };
-    ModMetaResult { name: clean_name, version: "Unknown".into(), provider: "Local".into(), icon: None, slug: None }
+    ModMetaResult {
+        name: clean_name,
+        version: "Unknown".into(),
+        provider: "Local".into(),
+        icon: None,
+        slug: None,
+    }
 }
 
 fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
@@ -2539,14 +3100,27 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                let name = json["name"].as_str().or_else(|| json["id"].as_str()).unwrap_or("Unknown").to_string();
+                let name = json["name"]
+                    .as_str()
+                    .or_else(|| json["id"].as_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
                 let version = json["version"].as_str().unwrap_or("Unknown").to_string();
                 let slug = json["id"].as_str().map(|s| s.to_string());
                 let icon = json["icon"].as_str().map(|s| {
-                    let clean = s.trim_start_matches("/").trim_start_matches("assets/").to_string();
+                    let clean = s
+                        .trim_start_matches("/")
+                        .trim_start_matches("assets/")
+                        .to_string();
                     clean
                 });
-                return ModMetaResult { name, version, provider: "Fabric".into(), icon, slug };
+                return ModMetaResult {
+                    name,
+                    version,
+                    provider: "Fabric".into(),
+                    icon,
+                    slug,
+                };
             }
         }
     }
@@ -2559,33 +3133,96 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                 if let Ok(toml_val) = contents.parse::<toml::Value>() {
                     if let Some(mods_arr) = toml_val.get("mods").and_then(|v| v.as_array()) {
                         if let Some(first_mod) = mods_arr.first() {
-                            let mod_id = first_mod.get("modId").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
-                            let display_name = first_mod.get("displayName").and_then(|v| v.as_str()).unwrap_or(&mod_id).to_string();
-                            let version = first_mod.get("version").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
-                            let logo = first_mod.get("logoFile").and_then(|v| v.as_str()).map(|s| s.to_string());
-                            let provider = if toml_name.contains("neoforge") { "NeoForge" } else { "Forge" };
-                            return ModMetaResult { name: display_name, version, provider: provider.into(), icon: logo, slug: Some(mod_id) };
+                            let mod_id = first_mod
+                                .get("modId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+                            let display_name = first_mod
+                                .get("displayName")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&mod_id)
+                                .to_string();
+                            let version = first_mod
+                                .get("version")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+                            let logo = first_mod
+                                .get("logoFile")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let provider = if toml_name.contains("neoforge") {
+                                "NeoForge"
+                            } else {
+                                "Forge"
+                            };
+                            return ModMetaResult {
+                                name: display_name,
+                                version,
+                                provider: provider.into(),
+                                icon: logo,
+                                slug: Some(mod_id),
+                            };
                         }
                     }
                     // Inline format: mods = [{modId = "x", ...}]
                     if let Some(mods_arr) = toml_val.get("mods").and_then(|v| v.as_array()) {
                         if let Some(first_mod) = mods_arr.first() {
-                            let mod_id = first_mod.get("modId").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
-                            let display_name = first_mod.get("displayName").and_then(|v| v.as_str()).unwrap_or(&mod_id).to_string();
-                            let version = first_mod.get("version").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
-                            let logo = first_mod.get("logoFile").and_then(|v| v.as_str()).map(|s| s.to_string());
-                            let provider = if toml_name.contains("neoforge") { "NeoForge" } else { "Forge" };
-                            return ModMetaResult { name: display_name, version, provider: provider.into(), icon: logo, slug: Some(mod_id) };
+                            let mod_id = first_mod
+                                .get("modId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+                            let display_name = first_mod
+                                .get("displayName")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&mod_id)
+                                .to_string();
+                            let version = first_mod
+                                .get("version")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+                            let logo = first_mod
+                                .get("logoFile")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let provider = if toml_name.contains("neoforge") {
+                                "NeoForge"
+                            } else {
+                                "Forge"
+                            };
+                            return ModMetaResult {
+                                name: display_name,
+                                version,
+                                provider: provider.into(),
+                                icon: logo,
+                                slug: Some(mod_id),
+                            };
                         }
                     }
                 }
                 // Fallback to line-based parser for malformed TOML
-                let mod_id = extract_toml_field(&contents, "modId").unwrap_or("Unknown".to_string());
-                let display_name = extract_toml_field(&contents, "displayName").unwrap_or_else(|| mod_id.clone());
-                let version = extract_toml_field(&contents, "version").unwrap_or("Unknown".to_string());
+                let mod_id =
+                    extract_toml_field(&contents, "modId").unwrap_or("Unknown".to_string());
+                let display_name =
+                    extract_toml_field(&contents, "displayName").unwrap_or_else(|| mod_id.clone());
+                let version =
+                    extract_toml_field(&contents, "version").unwrap_or("Unknown".to_string());
                 let logo = extract_toml_field(&contents, "logoFile");
-                let provider = if toml_name.contains("neoforge") { "NeoForge" } else { "Forge" };
-                return ModMetaResult { name: display_name, version, provider: provider.into(), icon: logo, slug: Some(mod_id) };
+                let provider = if toml_name.contains("neoforge") {
+                    "NeoForge"
+                } else {
+                    "Forge"
+                };
+                return ModMetaResult {
+                    name: display_name,
+                    version,
+                    provider: provider.into(),
+                    icon: logo,
+                    slug: Some(mod_id),
+                };
             }
         }
     }
@@ -2598,11 +3235,25 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                 let name = json["quilt_loader"]["metadata"]["name"]
                     .as_str()
                     .or_else(|| json["quilt_loader"]["id"].as_str())
-                    .unwrap_or("Unknown").to_string();
-                let version = json["quilt_loader"]["version"].as_str().unwrap_or("Unknown").to_string();
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let version = json["quilt_loader"]["version"]
+                    .as_str()
+                    .unwrap_or("Unknown")
+                    .to_string();
                 let slug = json["quilt_loader"]["id"].as_str().map(|s| s.to_string());
-                let icon = json["quilt_loader"]["metadata"]["icon"].as_str().map(|s| s.trim_start_matches("/").trim_start_matches("assets/").to_string());
-                return ModMetaResult { name, version, provider: "Quilt".into(), icon, slug };
+                let icon = json["quilt_loader"]["metadata"]["icon"].as_str().map(|s| {
+                    s.trim_start_matches("/")
+                        .trim_start_matches("assets/")
+                        .to_string()
+                });
+                return ModMetaResult {
+                    name,
+                    version,
+                    provider: "Quilt".into(),
+                    icon,
+                    slug,
+                };
             }
         }
     }
@@ -2615,12 +3266,20 @@ fn extract_toml_field(content: &str, field: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with(field) && trimmed.contains('=') {
-            let val = trimmed.splitn(2, '=').nth(1)?.trim().trim_matches('"').trim_matches('\'');
+            let val = trimmed
+                .splitn(2, '=')
+                .nth(1)?
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
             if val.starts_with('{') {
                 if let Some(start) = val.find(field) {
                     let after = &val[start..];
                     if let Some(eq_pos) = after.find('=') {
-                        let v = after[eq_pos+1..].trim().trim_matches('"').trim_matches('\'');
+                        let v = after[eq_pos + 1..]
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'');
                         let v = v.trim_end_matches(',').trim_end_matches('}').trim();
                         return Some(v.to_string());
                     }
@@ -2666,8 +3325,10 @@ async fn cmd_get_mod_icon(
 
     // Fallback: try CurseForge API by project_id from sidecar (only if API key is configured)
     if !curseforge_api_key.is_empty() {
-        let sidecar_name = format!("{}.voidlauncher.json",
-            safe_filename.trim_end_matches(".jar"));
+        let sidecar_name = format!(
+            "{}.voidlauncher.json",
+            safe_filename.trim_end_matches(".jar")
+        );
         if let Some(sidecar_path) = jar_path.parent() {
             let sidecar_path = sidecar_path.join(&sidecar_name);
             if let Ok(contents) = std::fs::read_to_string(&sidecar_path) {
@@ -2675,8 +3336,31 @@ async fn cmd_get_mod_icon(
                     if val["provider"].as_str() == Some("curseforge") {
                         if let Some(pid_str) = val["project_id"].as_str() {
                             if let Ok(pid) = pid_str.parse::<u64>() {
-                                if let Ok(Some(icon)) = fetch_curseforge_mod_icon(pid, &curseforge_api_key).await {
+                                if let Ok(Some(icon)) =
+                                    fetch_curseforge_mod_icon(pid, &curseforge_api_key).await
+                                {
                                     return Ok(Some(icon));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: try Modrinth project API for icon_url
+    let sidecar_name = format!("{}.voidlauncher.json", safe_filename.trim_end_matches(".jar"));
+    if let Some(mods_dir) = jar_path.parent() {
+        let sidecar_path = mods_dir.join(&sidecar_name);
+        if let Ok(contents) = std::fs::read_to_string(&sidecar_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if val["provider"].as_str() == Some("modrinth") {
+                    if let Some(pid) = val["project_id"].as_str().map(|s| s.to_string()) {
+                        if let Ok(project) = modrinth::get_project(&pid).await {
+                            if let Some(icon_url) = project.icon_url {
+                                if let Some(icon_data) = fetch_remote_icon(&icon_url).await {
+                                    return Ok(Some(icon_data));
                                 }
                             }
                         }
@@ -2690,8 +3374,12 @@ async fn cmd_get_mod_icon(
 }
 
 /// Fetch a mod's logo icon from CurseForge API and return as base64 data URL
-async fn fetch_curseforge_mod_icon(project_id: u64, api_key: &str) -> crate::error::Result<Option<String>> {
-    let detail = crate::curseforge::get_mod(project_id, api_key).await
+async fn fetch_curseforge_mod_icon(
+    project_id: u64,
+    api_key: &str,
+) -> crate::error::Result<Option<String>> {
+    let detail = crate::curseforge::get_mod(project_id, api_key)
+        .await
         .map_err(|e| crate::error::LauncherError::Download(format!("CF API error: {}", e)))?;
 
     let thumbnail_url = match detail.logo {
@@ -2700,15 +3388,17 @@ async fn fetch_curseforge_mod_icon(project_id: u64, api_key: &str) -> crate::err
     };
 
     let client = crate::download::global_http_client();
-    let resp = client.get(&thumbnail_url).send().await
-        .map_err(|e| crate::error::LauncherError::Download(format!("Failed to fetch CF logo: {}", e)))?;
+    let resp = client.get(&thumbnail_url).send().await.map_err(|e| {
+        crate::error::LauncherError::Download(format!("Failed to fetch CF logo: {}", e))
+    })?;
 
     if !resp.status().is_success() {
         return Ok(None);
     }
 
-    let bytes = resp.bytes().await
-        .map_err(|e| crate::error::LauncherError::Download(format!("Failed to read CF logo: {}", e)))?;
+    let bytes = resp.bytes().await.map_err(|e| {
+        crate::error::LauncherError::Download(format!("Failed to read CF logo: {}", e))
+    })?;
 
     let b64 = base64_encode(&bytes);
     let mime = if thumbnail_url.ends_with(".jpg") || thumbnail_url.ends_with(".jpeg") {
@@ -2720,7 +3410,20 @@ async fn fetch_curseforge_mod_icon(project_id: u64, api_key: &str) -> crate::err
     Ok(Some(format!("data:{};base64,{}", mime, b64)))
 }
 
-fn extract_icon_from_jar(path: &std::path::Path) -> Result<Option<String>, Box<dyn std::error::Error>> {
+/// Download an image from a URL and return as base64 data URL.
+async fn fetch_remote_icon(url: &str) -> Option<String> {
+    let client = crate::download::global_http_client();
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    let bytes = resp.bytes().await.ok()?;
+    let b64 = base64_encode(&bytes);
+    let mime = if url.ends_with(".jpg") || url.ends_with(".jpeg") { "image/jpeg" } else { "image/png" };
+    Some(format!("data:{};base64,{}", mime, b64))
+}
+
+fn extract_icon_from_jar(
+    path: &std::path::Path,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     let mut archive = zip::ZipArchive::new(reader)?;
@@ -2775,7 +3478,9 @@ fn extract_icon_from_jar(path: &std::path::Path) -> Result<Option<String>, Box<d
                         }
                     }
                 }
-                if found_icon_name.is_some() { break; }
+                if found_icon_name.is_some() {
+                    break;
+                }
             }
         }
     }
@@ -2786,7 +3491,13 @@ fn extract_icon_from_jar(path: &std::path::Path) -> Result<Option<String>, Box<d
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
             let b64 = base64_encode(&buf);
-            let mime = if icon_name.ends_with(".png") { "image/png" } else if icon_name.ends_with(".jpg") || icon_name.ends_with(".jpeg") { "image/jpeg" } else { "image/png" };
+            let mime = if icon_name.ends_with(".png") {
+                "image/png"
+            } else if icon_name.ends_with(".jpg") || icon_name.ends_with(".jpeg") {
+                "image/jpeg"
+            } else {
+                "image/png"
+            };
             return Ok(Some(format!("data:{};base64,{}", mime, b64)));
         }
     }
@@ -2806,7 +3517,9 @@ fn extract_icon_from_jar(path: &std::path::Path) -> Result<Option<String>, Box<d
         if let Ok(entry) = archive.by_index(i) {
             let name = entry.name().to_string();
             let lower = name.to_lowercase();
-            if (lower.ends_with("icon.png") || lower.ends_with("logo.png")) && !lower.contains("META-INF") {
+            if (lower.ends_with("icon.png") || lower.ends_with("logo.png"))
+                && !lower.contains("META-INF")
+            {
                 let mut buf = Vec::new();
                 let mut file = entry;
                 file.read_to_end(&mut buf)?;
@@ -2829,8 +3542,16 @@ fn base64_encode(data: &[u8]) -> String {
         let triple = (b0 << 16) | (b1 << 8) | b2;
         result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
         result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 { result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char); } else { result.push('='); }
-        if chunk.len() > 2 { result.push(CHARS[(triple & 0x3F) as usize] as char); } else { result.push('='); }
+        if chunk.len() > 1 {
+            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
     }
     result
 }
@@ -2864,7 +3585,10 @@ fn cmd_check_instance_installed(
 
 #[tauri::command]
 fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let running = state.running_instance_id.lock().map_err(|e| e.to_string())?;
+    let running = state
+        .running_instance_id
+        .lock()
+        .map_err(|e| e.to_string())?;
     Ok(running.clone())
 }
 
@@ -2887,7 +3611,12 @@ fn cmd_clear_cache(app: AppHandle, state: State<'_, AppState>) -> Result<u64, St
                 msg
             })?;
             freed += size;
-            events::emit_log(&app, "info", "cache", &format!("Removed {:?} ({} MB)", dir, size / 1024 / 1024));
+            events::emit_log(
+                &app,
+                "info",
+                "cache",
+                &format!("Removed {:?} ({} MB)", dir, size / 1024 / 1024),
+            );
         }
     }
 
@@ -2913,7 +3642,8 @@ fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
 #[tauri::command]
 fn cmd_get_playtime(state: State<'_, AppState>, instance_name: String) -> Result<u64, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    Ok(playtime::get_playtime(&config.data_dir, &instance_name))
+    // Return seconds for consistency with play_time_seconds
+    Ok(playtime::get_playtime(&config.data_dir, &instance_name) * 60)
 }
 
 #[tauri::command]
@@ -2961,7 +3691,11 @@ fn cmd_get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
-fn cmd_save_config(app: AppHandle, state: State<'_, AppState>, new_config: AppConfig) -> Result<(), String> {
+fn cmd_save_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    new_config: AppConfig,
+) -> Result<(), String> {
     events::emit_log(&app, "info", "config", "Saving configuration...");
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     *config = new_config;
@@ -3061,6 +3795,7 @@ pub fn run() {
             cmd_popular_curseforge,
             cmd_get_curseforge_mod_detail,
             cmd_get_modrinth_project_body,
+            cmd_check_mod_updates,
             cmd_list_accounts,
             cmd_add_offline_account,
             cmd_add_elyby_account,
@@ -3078,6 +3813,7 @@ pub fn run() {
             cmd_list_game_logs,
             cmd_read_game_log,
             cmd_get_current_game_log,
+            cmd_delete_game_log,
             cmd_rename_file,
             cmd_delete_file,
             cmd_duplicate_instance,
@@ -3086,6 +3822,7 @@ pub fn run() {
             cmd_probe_modpack,
             cmd_import_modpack,
             cmd_set_instance_icon,
+            cmd_set_instance_banner,
             cmd_log_toast,
             cmd_list_saves,
             cmd_rename_world,

@@ -47,7 +47,8 @@ pub fn create_game_log_file(data_dir: &PathBuf, instance_name: &str) -> Result<S
 
     let now = chrono::Local::now();
     let timestamp = now.format("%Y%m%d_%H%M%S");
-    let safe_name = instance_name.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
+    let safe_name =
+        instance_name.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
     let filename = format!("{}_{}.log", safe_name, timestamp);
     let path = game_logs_dir.join(&filename);
 
@@ -98,14 +99,17 @@ pub fn list_game_log_sessions(data_dir: &PathBuf) -> Vec<GameLogSession> {
             }
             if let Ok(meta) = path.metadata() {
                 if meta.is_file() {
-                    let file_name = path.file_stem()
+                    let file_name = path
+                        .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("unknown")
                         .to_string();
 
-                    // Parse instance name from filename (everything before the timestamp)
+                    // Parse instance name from filename.
+                    // Format: {safe_name}_{YYYYMMDD}_{HHMMSS} — strip the
+                    // two trailing timestamp segments to recover the name.
                     let instance_name = file_name
-                        .rsplitn(2, '_')
+                        .rsplitn(3, '_')
                         .last()
                         .unwrap_or(&file_name)
                         .to_string();
@@ -166,11 +170,23 @@ fn rotate_game_logs(data_dir: &PathBuf) {
     }
 }
 
+pub fn delete_game_log(data_dir: &PathBuf, path: &str) -> Result<(), String> {
+    let safe_path = validate_log_path(data_dir, path)?;
+    if safe_path == get_current_log_path().unwrap_or_default() {
+        return Err("Cannot delete the currently active game log".to_string());
+    }
+    std::fs::remove_file(&safe_path).map_err(|e| format!("Failed to delete log: {}", e))
+}
+
 pub fn validate_log_path(data_dir: &PathBuf, path: &str) -> Result<String, String> {
     let logs_dir = data_dir.join("logs").join("game");
-    let logs_canon = logs_dir.canonicalize().map_err(|e| format!("Invalid logs directory: {}", e))?;
+    let logs_canon = logs_dir
+        .canonicalize()
+        .map_err(|e| format!("Invalid logs directory: {}", e))?;
     let file_path = std::path::Path::new(path);
-    let file_canon = file_path.canonicalize().map_err(|e| format!("Invalid log file path: {}", e))?;
+    let file_canon = file_path
+        .canonicalize()
+        .map_err(|e| format!("Invalid log file path: {}", e))?;
     if !file_canon.starts_with(&logs_canon) {
         return Err("Access denied: log file is outside the game logs directory".to_string());
     }

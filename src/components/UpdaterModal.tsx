@@ -1,6 +1,7 @@
 import { useT } from '../lib/i18n';
 import { Modal } from './ui/Modal';
 import { ProgressBar } from './ui/ProgressBar';
+import { useLogPlaque } from '../lib/uiLog';
 import type { UpdaterState } from '../hooks/useUpdater';
 
 interface UpdaterModalProps extends Omit<UpdaterState, 'checking'> {
@@ -10,6 +11,7 @@ interface UpdaterModalProps extends Omit<UpdaterState, 'checking'> {
 
 export function UpdaterModal({ updateAvailable, updateInfo, downloading, downloadProgress, installing, error, onUpdate, onDismiss }: UpdaterModalProps) {
   const t = useT();
+  useLogPlaque(error ? t('updater.error', { error }) : null, 'error', 'updater');
 
   if (!updateAvailable && !downloading && !installing) return null;
 

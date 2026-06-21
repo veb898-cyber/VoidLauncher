@@ -3,6 +3,7 @@ import { LogIn, Copy, Check, ExternalLink } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAuthStore } from '../stores/authStore';
 import { t } from '../lib/i18n';
+import { useLogPlaque } from '../lib/uiLog';
 import { LoadingSpinner } from './ui/LoadingSpinner';
 import { Button } from './ui/Button';
 
@@ -38,6 +39,8 @@ export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
   } = useAuthStore();
   const pollInterval = useRef<number | null>(null);
   const [copied, setCopied] = useState(false);
+
+  useLogPlaque(error, 'error', 'auth');
 
   useEffect(() => {
     if (isLoggedIn) {
@@ -87,8 +90,8 @@ export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
 
       {error && (
         <div style={{
-          background: 'hsla(0, 85%, 60%, 0.1)',
-          border: '1px solid hsla(0, 85%, 60%, 0.3)',
+          background: 'var(--banner-error-bg)',
+          border: '1px solid var(--banner-error-border)',
           borderRadius: 'var(--radius-md)',
           padding: 'var(--space-md)',
           marginBottom: 'var(--space-lg)',

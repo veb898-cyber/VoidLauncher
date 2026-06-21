@@ -89,6 +89,12 @@ pub struct CfLinks {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CfHash {
+    pub value: String,
+    pub algo: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CfFile {
     pub id: u64,
     #[serde(rename = "displayName")]
@@ -106,6 +112,17 @@ pub struct CfFile {
     pub dependencies: Vec<CfDependency>,
     #[serde(rename = "releaseType")]
     pub release_type: u32,
+    #[serde(default)]
+    pub hashes: Vec<CfHash>,
+}
+
+impl CfFile {
+    pub fn sha1_hash(&self) -> Option<&str> {
+        self.hashes
+            .iter()
+            .find(|h| h.algo == 1)
+            .map(|h| h.value.as_str())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -226,6 +243,92 @@ pub async fn get_mod_file(mod_id: u64, file_id: u64, api_key: &str) -> Result<Cf
     let url = format!("{}/v1/mods/{}/files/{}", BASE_URL, mod_id, file_id);
     let resp: CfDataResponse<CfFile> = api_get(&url, api_key).await?;
     Ok(resp.data)
+}
+
+/// Official signed download URL from the CurseForge API (most reliable).
+pub async fn get_mod_file_download_url(mod_id: u64, file_id: u64, api_key: &str) -> Result<String> {
+    let url = format!("{}/v1/mods/{}/files/{}/download-url", BASE_URL, mod_id, file_id);
+    let resp: CfDataResponse<String> = api_get(&url, api_key).await?;
+    Ok(resp.data)
+}
+
+fn cf_cdn_urls(file_id: u64, file_name: &str) -> Vec<String> {
+    let prefix = file_id / 1000;
+    let suffix = file_id % 1000;
+    let encoded = urlencoding::encode(file_name);
+    let mut urls = Vec::new();
+    for host in ["edge.forgecdn.net", "mediafilez.forgecdn.net", "media.forgecdn.net"] {
+        urls.push(format!(
+            "https://{}/files/{}/{}/{}",
+            host, prefix, suffix, file_name
+        ));
+        if encoded != file_name {
+            urls.push(format!(
+                "https://{}/files/{}/{}/{}",
+                host, prefix, suffix, encoded
+            ));
+        }
+    }
+    urls
+}
+
+/// Download a CurseForge mod file, trying the signed API URL then CDN fallbacks.
+pub async fn download_mod_file(
+    mod_id: u64,
+    file_id: u64,
+    cf_file: &CfFile,
+    api_key: &str,
+    dest_path: &std::path::Path,
+) -> Result<()> {
+    let mut urls: Vec<String> = Vec::new();
+
+    if let Ok(signed) = get_mod_file_download_url(mod_id, file_id, api_key).await {
+        if !signed.is_empty() {
+            urls.push(signed);
+        }
+    }
+
+    if let Some(u) = cf_file.download_url.as_ref().filter(|u| !u.is_empty()) {
+        if !urls.iter().any(|x| x == u) {
+            urls.push(u.clone());
+        }
+    }
+
+    for cdn in cf_cdn_urls(file_id, &cf_file.file_name) {
+        if !urls.iter().any(|x| x == &cdn) {
+            urls.push(cdn);
+        }
+    }
+
+    if urls.is_empty() {
+        return Err(crate::error::LauncherError::Download(format!(
+            "No download URL for {} ({})",
+            cf_file.display_name, cf_file.file_name
+        )));
+    }
+
+    let dest_buf = dest_path.to_path_buf();
+    let expected_sha1 = cf_file.sha1_hash().unwrap_or("");
+    let mut last_err = String::new();
+
+    for url in urls {
+        match crate::download::download_file_sized(
+            &url,
+            &dest_buf,
+            expected_sha1,
+            cf_file.file_length,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+
+    Err(crate::error::LauncherError::Download(format!(
+        "Failed to download {} ({}): {}",
+        cf_file.display_name, cf_file.file_name, last_err
+    )))
 }
 
 pub async fn popular_mods(

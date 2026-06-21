@@ -32,6 +32,9 @@ pub struct Instance {
     pub resolution: Option<Resolution>,
     /// Instance icon (base64 or path)
     pub icon: Option<String>,
+    /// Instance banner for the home page card (base64 data URL)
+    #[serde(default)]
+    pub banner: Option<String>,
     /// When the instance was created
     pub created_at: String,
     /// When the instance was last played
@@ -84,6 +87,7 @@ impl Instance {
             java_path: None,
             resolution: None,
             icon: None,
+            banner: None,
             created_at: Utc::now().to_rfc3339(),
             last_played: None,
             play_time_seconds: 0,
@@ -293,6 +297,14 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 pub fn save_instance_icon(instances_dir: &PathBuf, name: &str, icon_data: &str) -> Result<()> {
     let mut instance = get_instance(instances_dir, name)?;
     instance.icon = Some(icon_data.to_string());
+    save_instance(instances_dir, &instance)?;
+    Ok(())
+}
+
+/// Save instance banner (base64 data URL or gradient:name, empty to remove)
+pub fn save_instance_banner(instances_dir: &PathBuf, name: &str, banner_data: &str) -> Result<()> {
+    let mut instance = get_instance(instances_dir, name)?;
+    instance.banner = if banner_data.is_empty() { None } else { Some(banner_data.to_string()) };
     save_instance(instances_dir, &instance)?;
     Ok(())
 }
@@ -793,6 +805,7 @@ pub fn parse_prism_cfg(cfg_path: &std::path::Path) -> Option<Instance> {
         java_path: None,
         resolution: None,
         icon: icon_data,
+        banner: None,
         created_at: now.clone(),
         last_played: None,
         play_time_seconds: 0,

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, X, AlertTriangle } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { addToast } from '../ui/Toast';
@@ -50,6 +51,9 @@ interface UpdateInfo {
   newVersion: string;
   downloadUrl: string;
   filename: string;
+  oldFilename: string;
+  projectId: string;
+  versionId: string;
 }
 
 interface Props {
@@ -81,6 +85,9 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updates, setUpdates] = useState<UpdateInfo[] | null>(null);
   const [showBrowser, setShowBrowser] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [downloadingMods, setDownloadingMods] = useState<Set<string>>(new Set());
+  const [updateProgress, setUpdateProgress] = useState<{ current: number; total: number } | null>(null);
   // Heavy effects (file watcher, compatibility checks) are skipped while the window
   // is unfocused AND a game is running — this is the "frozen" state. State and UI
   // remain mounted; only the network/CPU work is suspended.
@@ -371,6 +378,39 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
     }
   }, [isFrozen, loadItems]);
 
+  // Drag-and-drop .jar/.zip files onto the mods/packs list
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const w = getCurrentWindow();
+        unlisten = await w.onDragDropEvent((event) => {
+          const e = event.payload;
+          if (e.type === 'drop') {
+            setDragOver(false);
+            if (!e.paths || e.paths.length === 0) return;
+            const validExt = contentType === 'mod' ? '.jar' : '.zip';
+            for (const filePath of e.paths) {
+              const filename = filePath.split(/[/\\]/).pop() || '';
+              if (!filename.toLowerCase().endsWith(validExt)) continue;
+              (async () => {
+                try {
+                  await invoke('cmd_install_mod', { instanceName, downloadUrl: `file://${filePath}`, fileName: filename, provider: 'local' });
+                  loadItems();
+                } catch (e: any) { addToast(t('manager.dragdrop_error', { name: filename, error: e.toString() }), 'error'); }
+              })();
+            }
+          } else if (e.type === 'over') {
+            setDragOver(true);
+          } else if (e.type === 'leave') {
+            setDragOver(false);
+          }
+        });
+      } catch { }
+    })();
+    return () => { if (unlisten) unlisten(); };
+  }, [instanceName, contentType, loadItems]);
+
   useEffect(() => {
     const handler = () => setContextMenu(null);
     window.addEventListener('click', handler);
@@ -455,64 +495,92 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
   };
 
   const handleCheckUpdates = async () => {
-    const toCheck = selectedFilenames.size > 0
-      ? getSelectedItems().filter((m) => (m.provider === 'Modrinth' || m.provider === 'CurseForge') && (m.project_id || m.slug))
-      : items.filter((m) => m.enabled && (m.provider === 'Modrinth' || m.provider === 'CurseForge') && (m.project_id || m.slug));
-
-    if (toCheck.length === 0) { addToast(t('manager.no_updates'), 'info'); return; }
-
     setCheckingUpdates(true);
-    addToast(t('manager.checking_updates', { count: toCheck.length.toString() }), 'info');
-    const found: UpdateInfo[] = [];
-
-    for (const m of toCheck) {
-      const pid = m.project_id || m.slug || '';
-      try {
-        const vers = await invoke<any[]>('cmd_get_modrinth_versions', { projectId: pid, mcVersion: mcVersion ?? null, loader: contentType === 'mod' ? (loader ?? null) : null });
-        if (vers.length > 0) {
-          const latest = vers[0];
-          const latestVersion = latest.version_number || latest.name || '';
-          // For packs (no version) always consider as update; for mods only if version differs
-          const isUpdate = contentType !== 'mod' || (latestVersion && latestVersion !== m.version);
-          if (isUpdate) {
-            const file = latest.files?.find((f: any) => f.primary) || latest.files?.[0];
-            if (file) {
-              found.push({
-                name: m.name,
-                oldVersion: m.version || '(installed)',
-                newVersion: latestVersion,
-                downloadUrl: file.url,
-                filename: file.filename,
-              });
-            }
-          }
-        }
-      } catch { }
-    }
-
-    setCheckingUpdates(false);
-    if (found.length > 0) {
-      setUpdates(found);
-    } else {
-      addToast(t('common.up_to_date'), 'success');
+    addToast(t('manager.checking_updates', { count: items.length.toString() }), 'info');
+    try {
+      const results = await invoke<any[]>('cmd_check_mod_updates', {
+        instanceName,
+        mcVersion: mcVersion ?? null,
+        loader: contentType === 'mod' ? (loader ?? null) : null,
+      });
+      const found: UpdateInfo[] = (results || []).map((r: any) => ({
+        name: r.name,
+        oldVersion: r.old_version,
+        newVersion: r.new_version,
+        downloadUrl: r.download_url,
+        filename: r.new_filename,
+        oldFilename: r.filename,
+        projectId: r.project_id,
+        versionId: r.version_id,
+      }));
+      setCheckingUpdates(false);
+      if (found.length > 0) {
+        setUpdates(found);
+      } else {
+        addToast(t('common.up_to_date'), 'success');
+      }
+    } catch (e: any) {
+      setCheckingUpdates(false);
+      addToast(t('manager.update_error', { name: '', error: e.toString() }), 'error');
     }
   };
 
-  const handleApplyUpdate = async (update: UpdateInfo) => {
+  const handleApplyUpdate = async (update: UpdateInfo, silent = false) => {
+    setDownloadingMods((prev) => new Set(prev).add(update.filename));
     try {
-      await invoke('cmd_download_to_folder', { instanceName, downloadUrl: update.downloadUrl, fileName: update.filename, subfolder, projectId: null, projectName: update.name || null, versionId: null, versionNumber: null, provider: 'modrinth' });
-      addToast(t('manager.updated_toast', { name: update.name, version: update.newVersion }), 'success');
+      await invoke('cmd_download_to_folder', {
+        instanceName,
+        downloadUrl: update.downloadUrl,
+        fileName: update.filename,
+        subfolder,
+        projectId: update.projectId,
+        projectName: update.name || null,
+        versionId: update.versionId,
+        versionNumber: update.newVersion,
+        provider: 'modrinth',
+        oldFilename: update.oldFilename,
+      });
+      if (!silent) addToast(t('manager.updated_toast', { name: update.name, version: update.newVersion }), 'success');
       setUpdates((prev) => prev ? prev.filter((u) => u.name !== update.name) : null);
       loadItems();
-    } catch (e: any) { addToast(t('manager.update_error', { name: update.name, error: e.toString() }), 'error'); }
+    } catch (e: any) { if (!silent) addToast(t('manager.update_error', { name: update.name, error: e.toString() }), 'error'); }
+    setDownloadingMods((prev) => { const next = new Set(prev); next.delete(update.filename); return next; });
+    return { name: update.name, success: true };
   };
 
   const handleApplyAllUpdates = async () => {
     if (!updates) return;
+    const total = updates.length;
+    setUpdateProgress({ current: 0, total });
+    const successes: string[] = [];
+    const errors: { name: string; error: string }[] = [];
     for (const u of updates) {
-      await handleApplyUpdate(u);
+      try {
+        await invoke('cmd_download_to_folder', {
+          instanceName,
+          downloadUrl: u.downloadUrl,
+          fileName: u.filename,
+          subfolder,
+          projectId: u.projectId,
+          projectName: u.name || null,
+          versionId: u.versionId,
+          versionNumber: u.newVersion,
+          provider: 'modrinth',
+          oldFilename: u.oldFilename,
+        });
+        successes.push(u.name);
+      } catch (e: any) { errors.push({ name: u.name, error: e.toString() }); }
+      setUpdateProgress((prev) => prev ? { ...prev, current: prev.current + 1 } : null);
     }
+    setUpdateProgress(null);
     setUpdates(null);
+    loadItems();
+    if (errors.length === 0) {
+      addToast(t('manager.updated_all_success', { count: successes.length.toString() }), 'success');
+    } else {
+      const errorMsg = errors.map((e) => `${e.name}: ${e.error}`).join('; ');
+      addToast((errors.length === total ? t('manager.updated_all_failed') : t('manager.updated_all_partial', { success: successes.length.toString(), failed: errors.length.toString() })) + ': ' + errorMsg, 'error');
+    }
   };
 
   const getItemIcon = (item: ContentItem): string | null => {
@@ -607,7 +675,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
                     display: 'grid', gridTemplateColumns: '28px 36px 1fr 1fr 80px 28px',
           padding: '6px var(--space-2xl)', borderBottom: '1px solid var(--surface-border)',
           fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--text-tertiary)',
-          background: 'var(--surface-elevated)', flexShrink: 0,
+          background: 'var(--bg-primary)', flexShrink: 0,
         }}>
           <div style={{ textAlign: 'center' }}>{t('manager.column_on')}</div>
           <div></div>
@@ -618,7 +686,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         </div>
 
         {/* Table body */}
-        <div style={{ flex: 1, overflowY: 'auto' }}>
+        <div style={{ flex: 1, overflowY: 'auto', ...(dragOver ? { background: 'var(--primary-dim)', border: '2px dashed var(--primary)' } : {}) }}>
           {loading ? (
             <div style={{ padding: 'var(--space-md) var(--space-2xl)' }}>
               {[1, 2, 3, 4, 5].map((i) => (
@@ -710,7 +778,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         </div>
 
         {/* Bottom bar */}
-        <div style={{ padding: '6px var(--space-2xl)', borderTop: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0, background: 'var(--surface-elevated)' }}>
+        <div style={{ padding: '6px var(--space-2xl)', borderTop: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
           <div style={{ position: 'relative', flex: 1, maxWidth: 300 }}>
             <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
             <input className="input" type="text" placeholder={t('manager.search_placeholder', { label: label.toLowerCase() })} value={search} onChange={(e) => setSearch(e.target.value)} style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
@@ -728,7 +796,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
       </div>
 
       {/* Right actions panel */}
-      <div style={{ width: 200, flexShrink: 0, borderLeft: '1px solid var(--surface-border)', padding: 'var(--space-md)', display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)', background: 'var(--surface-elevated)' }}>
+      <div style={{ width: 200, flexShrink: 0, borderLeft: '1px solid var(--surface-border)', padding: 'var(--space-md)', display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
         <Button size="sm" variant="secondary" onClick={() => setShowBrowser(true)} style={{ width: '100%' }}>
           <Download size={14} /> {t('common.download')} {label}
         </Button>
@@ -793,7 +861,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
       {/* Update Dialog */}
       {updates && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
-          <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 600, width: '90%', maxHeight: '70vh', display: 'flex', flexDirection: 'column' }}>
+          <div style={{ padding: 'var(--space-xl)', maxWidth: 600, width: '90%', maxHeight: '70vh', display: 'flex', flexDirection: 'column', background: 'var(--bg-primary)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-lg)', boxShadow: '0 8px 32px rgba(0,0,0,0.4)' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-md)' }}>
               <h3 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700 }}>{t('manager.updates_title', { count: updates.length.toString() })}</h3>
               <X size={16} style={{ cursor: 'pointer', color: 'var(--text-tertiary)' }} onClick={() => setUpdates(null)} />
@@ -809,16 +877,27 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
                       <span style={{ color: 'var(--success)', fontWeight: 500 }}>{u.newVersion}</span>
                     </div>
                   </div>
-                  <Button size="sm" onClick={() => handleApplyUpdate(u)} style={{ flexShrink: 0 }}>
-                    {t('common.update')}
+                  <Button size="sm" onClick={() => handleApplyUpdate(u)} disabled={downloadingMods.has(u.filename)} style={{ flexShrink: 0 }}>
+                    {downloadingMods.has(u.filename) ? '...' : t('common.update')}
                   </Button>
                 </div>
               ))}
             </div>
+            {updateProgress && (
+              <div style={{ marginBottom: 'var(--space-md)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 4 }}>
+                  <span>{t('manager.updating_progress', { current: updateProgress.current.toString(), total: updateProgress.total.toString() })}</span>
+                  <span>{Math.round((updateProgress.current / updateProgress.total) * 100)}%</span>
+                </div>
+                <div style={{ height: 6, background: 'var(--bg-secondary)', borderRadius: 3, overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${(updateProgress.current / updateProgress.total) * 100}%`, background: 'var(--primary)', borderRadius: 3, transition: 'width 0.3s ease' }} />
+                </div>
+              </div>
+            )}
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-              <Button variant="ghost" onClick={() => setUpdates(null)}>{t('common.cancel')}</Button>
-              <Button onClick={handleApplyAllUpdates}>
-                {t('manager.update_all', { count: updates.length.toString() })}
+              <Button variant="ghost" onClick={() => setUpdates(null)} disabled={!!updateProgress} style={{ opacity: updateProgress ? 0.5 : 1 }}>{t('common.cancel')}</Button>
+              <Button onClick={handleApplyAllUpdates} disabled={!!updateProgress}>
+                {updateProgress ? '...' : t('manager.update_all', { count: updates.length.toString() })}
               </Button>
             </div>
           </div>

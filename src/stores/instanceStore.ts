@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { logUiMessage } from '../lib/uiLog';
 import type { LoaderCheckResult } from '../components/launch/LoaderInstallModal';
 
 export interface LoaderLibrary {
@@ -20,7 +21,7 @@ export interface LoaderProfile {
 export interface Instance {
   name: string;
   mc_version: string;
-  loader: 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge' | 'LiteLoader';
+  loader: 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge';
   loader_version: string | null;
   loader_profile: LoaderProfile | null;
   memory_mb: number | null;
@@ -30,6 +31,7 @@ export interface Instance {
   java_path: string | null;
   resolution: { width: number; height: number } | null;
   icon: string | null;
+  banner: string | null;
   created_at: string;
   last_played: string | null;
   play_time_seconds: number;
@@ -58,6 +60,14 @@ interface InstanceState {
   clearError: () => void;
 }
 
+function reportInstanceError(message: string) {
+  logUiMessage(message, 'error', 'instance');
+}
+
+function reportLaunchStatus(message: string | null) {
+  if (message) logUiMessage(message, 'info', 'launch');
+}
+
 export const useInstanceStore = create<InstanceState>((set) => ({
   instances: [],
   selectedInstance: null,
@@ -73,7 +83,9 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       const instances = await invoke<Instance[]>('cmd_list_instances');
       set({ instances, isLoading: false });
     } catch (e: any) {
-      set({ error: e.toString(), isLoading: false });
+      const msg = e.toString();
+      reportInstanceError(msg);
+      set({ error: msg, isLoading: false });
     }
   },
 
@@ -84,7 +96,9 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       const instances = await invoke<Instance[]>('cmd_list_instances');
       set({ instances, isLoading: false });
     } catch (e: any) {
-      set({ error: e.toString(), isLoading: false });
+      const msg = e.toString();
+      reportInstanceError(msg);
+      set({ error: msg, isLoading: false });
     }
   },
 
@@ -94,7 +108,9 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       const instances = await invoke<Instance[]>('cmd_list_instances');
       set({ instances, selectedInstance: null });
     } catch (e: any) {
-      set({ error: e.toString() });
+      const msg = e.toString();
+      reportInstanceError(msg);
+      set({ error: msg });
     }
   },
 
@@ -104,6 +120,7 @@ export const useInstanceStore = create<InstanceState>((set) => ({
 
   launchGame: async (instanceName: string) => {
     set({ isLaunching: true, launchStatus: 'Checking instance...' });
+    reportLaunchStatus('Checking instance...');
 
     try {
       // Check if loader needs to be installed
@@ -117,6 +134,7 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     }
 
     set({ launchStatus: 'Launching...' });
+    reportLaunchStatus('Launching...');
     // Minimize the window immediately on click, as requested.
     // If launch fails OR the game crashes shortly after, the
     // `launch_complete` handler in useGameEvents restores the window
@@ -130,12 +148,15 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     } catch { /* window control may be unavailable */ }
     try {
       const result = await invoke<string>('cmd_launch_game', { instanceName });
+      reportLaunchStatus(result);
       set({ isLaunching: false, launchStatus: result });
     } catch (e: any) {
       if (minimized) {
         try { await win.unminimize(); } catch { /* best-effort */ }
       }
-      set({ isLaunching: false, launchStatus: null, error: e.toString() });
+      const msg = e.toString();
+      reportInstanceError(msg);
+      set({ isLaunching: false, launchStatus: null, error: msg });
     }
   },
 
@@ -145,6 +166,7 @@ export const useInstanceStore = create<InstanceState>((set) => ({
 
   installVersion: async (versionUrl: string, instanceId?: string) => {
     set({ isLoading: true, launchStatus: 'Downloading version...' });
+    reportLaunchStatus('Downloading version...');
     try {
       const versionId = await invoke<string>('cmd_install_version', {
         versionUrl,
@@ -153,7 +175,9 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       set({ isLoading: false, launchStatus: null });
       return versionId;
     } catch (e: any) {
-      set({ error: e.toString(), isLoading: false, launchStatus: null });
+      const msg = e.toString();
+      reportInstanceError(msg);
+      set({ error: msg, isLoading: false, launchStatus: null });
       throw e;
     }
   },
@@ -164,7 +188,9 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       const instances = await invoke<Instance[]>('cmd_list_instances');
       set({ instances });
     } catch (e: any) {
-      set({ error: e.toString() });
+      const msg = e.toString();
+      reportInstanceError(msg);
+      set({ error: msg });
     }
   },
 

@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { Modal } from '../ui/Modal';
 import { ProgressBar } from '../ui/ProgressBar';
 import { useT } from '../../lib/i18n';
+import { useLogPlaque } from '../../lib/uiLog';
 
 export interface LoaderCheckResult {
   needs_install: boolean;
@@ -36,6 +37,9 @@ export function LoaderInstallModal({ open, onClose, onInstalled, instanceName }:
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [checkResult, setCheckResult] = useState<LoaderCheckResult | null>(null);
+
+  useLogPlaque(error, 'error', 'loader');
+  useLogPlaque(stage === 'installing' || stage === 'done' ? message : null, 'info', 'loader');
 
   useEffect(() => {
     if (!open) return;

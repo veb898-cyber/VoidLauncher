@@ -36,7 +36,7 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
       const s = await invoke<SaveEntry[]>('cmd_list_saves', { instanceName });
       setSaves(s);
     } catch (e: any) {
-      addToast(`Failed to load worlds: ${e.toString()}`, 'error');
+      addToast(t('worlds.load_error', { error: e.toString() }), 'error');
     }
     setLoading(false);
   }, [instanceName]);
@@ -75,7 +75,7 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
       setRenameTarget(null);
       loadSaves();
     } catch (e: any) {
-      addToast(e.toString(), 'error');
+      addToast(t('worlds.action_error', { error: e.toString() }), 'error');
     }
   };
 
@@ -87,7 +87,7 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
       setCopyTarget(null);
       loadSaves();
     } catch (e: any) {
-      addToast(e.toString(), 'error');
+      addToast(t('worlds.action_error', { error: e.toString() }), 'error');
     }
   };
 
@@ -99,7 +99,7 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
       setDeleteTarget(null);
       loadSaves();
     } catch (e: any) {
-      addToast(e.toString(), 'error');
+      addToast(t('worlds.action_error', { error: e.toString() }), 'error');
     }
   };
 
@@ -108,7 +108,7 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
       await navigator.clipboard.writeText(seed.toString());
       addToast(t('worlds.seed_toast'), 'success');
     } catch (e: any) {
-      addToast(e.toString(), 'error');
+      addToast(t('worlds.action_error', { error: e.toString() }), 'error');
     }
   };
 

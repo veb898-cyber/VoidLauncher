@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useT } from '../lib/i18n';
 import { useGameLogStore } from '../stores/gameLogStore';
+import { addToast } from '../components/ui/Toast';
 
 interface GameLogSession {
   path: string;
@@ -20,6 +21,8 @@ export function GameLogs() {
   const [loading, setLoading] = useState(true);
   const [loadingContent, setLoadingContent] = useState(false);
   const [currentGameLog, setCurrentGameLog] = useState<string | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const contentRef = useRef('');
@@ -140,6 +143,23 @@ export function GameLogs() {
     autoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
   };
 
+  const handleDelete = async () => {
+    if (!selectedPath) return;
+    setDeleting(true);
+    try {
+      await invoke('cmd_delete_game_log', { path: selectedPath });
+      addToast(t('game_logs.delete_success'), 'success');
+      setSelectedPath(null);
+      setContent('');
+      setShowDeleteConfirm(false);
+      await loadSessions();
+    } catch (e: any) {
+      addToast(t('game_logs.delete_error', { error: e.toString() }), 'error');
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const formatSize = (bytes: number): string => {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -150,11 +170,9 @@ export function GameLogs() {
 
   const getLineLevel = (line: string): string => {
     const upper = line.toUpperCase();
-    // Check for explicit level markers (launcher format: [ERROR], Minecraft format: /ERROR])
     if (/\[ERROR\]|\/ERROR\]/.test(line)) return 'error';
     if (/\[WARN\]|\/WARN\]/.test(line)) return 'warn';
     if (/\[DEBUG\]|\/DEBUG\]/.test(line)) return 'debug';
-    // Detect error-like conditions without explicit ERROR tag
     if (/\bEXCEPTION\b/.test(upper) || /\bFATAL\b/.test(upper)) return 'error';
     if (/exit code [1-9]/.test(line) || /exit code \d{2,}/.test(line)) return 'error';
     if (/FAILED/i.test(line) || /\bERROR\b/i.test(line)) return 'error';
@@ -206,11 +224,26 @@ export function GameLogs() {
           }}>
             {t('common.copy_all')}
           </button>
-          <button className="btn btn--ghost btn--sm" onClick={() => setContent('')}>
-            {t('common.clear')}
-          </button>
+          {selectedPath && currentGameLog !== selectedPath && (
+            <button className="btn btn--ghost btn--sm" onClick={() => setShowDeleteConfirm(true)}>
+              {t('common.delete')}
+            </button>
+          )}
         </div>
       </div>
+
+      {showDeleteConfirm && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 10000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.6)' }} onClick={() => !deleting && setShowDeleteConfirm(false)}>
+          <div style={{ background: 'var(--bg-elevated)', border: '1px solid var(--surface-border)', borderRadius: 'var(--radius-lg)', padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 var(--space-sm)', fontSize: 'var(--font-size-lg)', fontWeight: 700 }}>{t('game_logs.delete_title')}</h3>
+            <p style={{ margin: '0 0 var(--space-xl)', fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>{t('game_logs.delete_confirm')}</p>
+            <div style={{ display: 'flex', gap: 'var(--space-sm)', justifyContent: 'flex-end' }}>
+              <button className="btn btn--ghost btn--sm" onClick={() => setShowDeleteConfirm(false)} disabled={deleting}>{t('common.cancel')}</button>
+              <button className="btn btn--danger btn--sm" onClick={handleDelete} disabled={deleting}>{deleting ? t('common.loading') : t('common.confirm')}</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {loading ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: 'var(--space-lg)', color: 'var(--text-secondary)' }}>
@@ -224,7 +257,7 @@ export function GameLogs() {
         <div className="log-container" style={{
           flex: 1,
           overflowY: 'auto',
-          background: 'var(--surface-elevated)',
+          background: 'var(--bg-primary)',
           borderRadius: 'var(--radius-lg)',
           padding: 'var(--space-md)',
           fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace",

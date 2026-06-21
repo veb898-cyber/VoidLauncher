@@ -81,7 +81,7 @@ export function Accounts() {
 
   const handleSkinChange = async (account: AccountEntry) => {
     const selected = await openFileDialog({
-      title: 'Select skin file',
+      title: t('accounts.skin_file_title'),
       filters: [{ name: 'PNG Image', extensions: ['png'] }],
       multiple: false,
     });

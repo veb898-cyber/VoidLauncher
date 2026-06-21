@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { create } from 'zustand';
 import { useLogStore } from '../stores/logStore';
+import type { LogEntry } from '../stores/logStore';
 import { useFocusStore } from '../stores/focusStore';
 
 interface InstallProgress {
@@ -116,7 +117,8 @@ export function useGameEvents() {
 
     register(listen<LogPayload>('log_message', (event) => {
       const p = event.payload;
-      addLog({ level: p.level as any, source: p.source, message: p.message });
+      const level = (p.level === 'warning' ? 'warn' : p.level) as LogEntry['level'];
+      addLog({ level, source: p.source, message: p.message });
     }));
 
     // Window focus tracking via Tauri events.

@@ -96,7 +96,14 @@
   --slider-shadow: 0 0 6px hsla(265, 100%, 65%, 0.4);
   --slider-shadow-hover: 0 0 10px hsla(265, 100%, 65%, 0.6);
 
-    /* Sidebar */
+  /* Surface alias (used in inline styles across components) */
+  --surface-elevated: var(--bg-elevated);
+  --banner-error-bg: hsla(0, 85%, 60%, 0.1);
+  --banner-error-border: hsla(0, 85%, 60%, 0.25);
+  --log-error-bg: rgba(255, 70, 70, 0.06);
+  --log-warn-bg: rgba(255, 200, 50, 0.06);
+
+  /* Sidebar */
   --sidebar-width: 72px;
   --sidebar-expanded: 240px;
   --titlebar-height: 40px;
@@ -146,6 +153,20 @@
 
   --slider-shadow: 0 0 6px hsla(210, 80%, 60%, 0.4);
   --slider-shadow-hover: 0 0 10px hsla(210, 80%, 60%, 0.6);
+
+  --success: hsl(150, 60%, 48%);
+  --warning: hsl(40, 90%, 55%);
+  --error: hsl(0, 75%, 55%);
+  --color-danger: var(--error);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+  --color-info: hsl(210, 80%, 60%);
+  --info: var(--color-info);
+
+  --banner-error-bg: hsla(0, 75%, 55%, 0.12);
+  --banner-error-border: hsla(0, 75%, 55%, 0.28);
+  --log-error-bg: rgba(255, 80, 80, 0.08);
+  --log-warn-bg: rgba(255, 190, 60, 0.08);
 }
 
 /* ============================
@@ -201,6 +222,11 @@
 
   --slider-shadow: 0 0 6px hsla(210, 80%, 45%, 0.3);
   --slider-shadow-hover: 0 0 10px hsla(210, 80%, 45%, 0.5);
+
+  --banner-error-bg: hsla(0, 75%, 45%, 0.08);
+  --banner-error-border: hsla(0, 75%, 45%, 0.22);
+  --log-error-bg: hsla(0, 75%, 45%, 0.07);
+  --log-warn-bg: hsla(35, 90%, 45%, 0.08);
 }
 
 [data-theme="light"] .custom-select__list {
@@ -549,7 +575,7 @@ a {
 }
 
 .glass-card:hover {
-  background: var(--surface-glass-hover);
+  background: var(--bg-tertiary);
   border-color: var(--surface-border-hover);
   box-shadow: var(--shadow-md);
 }
@@ -584,6 +610,7 @@ a {
   padding: var(--space-md) var(--space-xl);
   border: none;
   border-radius: var(--radius-md);
+  background: transparent;
   font-family: var(--font-family);
   font-size: var(--font-size-md);
   font-weight: 600;
@@ -1227,6 +1254,7 @@ select option {
   box-shadow: var(--shadow-lg);
   animation: slideInRight var(--transition-normal) ease-out;
   min-width: 300px;
+  color: var(--text-primary);
 }
 
 .toast--success { border-left: 3px solid var(--success); }
@@ -1276,6 +1304,27 @@ select option {
   background: var(--gradient-primary);
   border-radius: var(--radius-full);
   box-shadow: var(--glow-primary);
+}
+
+.btn--tab {
+  background: transparent;
+  color: var(--text-secondary);
+  padding: var(--space-sm) var(--space-lg);
+  border: 1px solid transparent;
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+}
+
+.btn--tab:hover {
+  background: var(--surface-glass);
+  color: var(--text-primary);
+}
+
+.btn--tab-active {
+  background: var(--surface-glass);
+  color: var(--primary);
+  border-color: var(--primary-dim);
 }
 
 /* ============================
@@ -1715,8 +1764,8 @@ select option {
   background: rgba(255, 255, 255, 0.04);
 }
 
-.log-line--error { background: rgba(255, 70, 70, 0.06); }
-.log-line--warn { background: rgba(255, 200, 50, 0.06); }
+.log-line--error { background: var(--log-error-bg); }
+.log-line--warn { background: var(--log-warn-bg); }
 .log-line--debug { opacity: 0.7; }
 
 /* ============================

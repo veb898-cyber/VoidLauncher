@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 const BASE_URL: &str = "https://api.modrinth.com/v2";
-const USER_AGENT: &str = "VoidLauncher/0.1.3 (github.com/voidlauncher)";
+const USER_AGENT: &str = "VoidLauncher/0.1.4 (github.com/voidlauncher)";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModrinthSearchResult {
@@ -179,6 +179,68 @@ pub async fn get_versions(
 pub async fn get_version_by_id(version_id: &str) -> Result<ModrinthVersionResponse> {
     let url = format!("{}/version/{}", BASE_URL, version_id);
     api_get(&url).await
+}
+
+/// Look up a version by file hash using Modrinth's /version_file/{hash} endpoint.
+pub async fn get_version_by_hash(hash: &str, algorithm: &str) -> Result<ModrinthVersionResponse> {
+    let url = format!("{}/version_file/{}?algorithm={}", BASE_URL, hash, algorithm);
+    api_get(&url).await
+}
+
+/// Get all versions for a Modrinth project.
+pub async fn get_project_versions(project_id: &str) -> Result<Vec<ModrinthVersionResponse>> {
+    let url = format!("{}/project/{}/version", BASE_URL, project_id);
+    api_get(&url).await
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VersionFilesUpdateRequest {
+    pub hashes: Vec<String>,
+    pub algorithm: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaders: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_versions: Option<Vec<String>>,
+}
+
+/// Check for updates by sending file hashes to Modrinth's /version_files/update endpoint.
+/// Returns a map from hash to the latest version (or null if already up-to-date).
+pub async fn check_version_updates(
+    hashes: Vec<String>,
+    algorithm: &str,
+    loaders: Option<Vec<String>>,
+    game_versions: Option<Vec<String>>,
+) -> Result<std::collections::HashMap<String, Option<ModrinthVersion>>> {
+    let client = crate::download::global_http_client();
+    let body = VersionFilesUpdateRequest {
+        hashes,
+        algorithm: algorithm.to_string(),
+        loaders,
+        game_versions,
+    };
+    let response = client
+        .post(format!("{}/version_files/update", BASE_URL))
+        .header("User-Agent", USER_AGENT)
+        .json(&body)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(crate::error::LauncherError::Download(
+            format!("Modrinth update API error ({}): {}", status, text)
+        ));
+    }
+    let text = response.text().await.map_err(|e| {
+        crate::error::LauncherError::Download(format!("Failed to read update response: {}", e))
+    })?;
+    serde_json::from_str::<std::collections::HashMap<String, Option<ModrinthVersion>>>(&text).map_err(|e| {
+        crate::error::LauncherError::Download(format!(
+            "Failed to decode update response: {}. Body preview: {}",
+            e,
+            &text.chars().take(500).collect::<String>()
+        ))
+    })
 }
 
 pub async fn popular_mods(

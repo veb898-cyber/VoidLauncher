@@ -251,7 +251,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         setSelectedItems((prev) => [...prev, item]);
         if (contentType === 'mod') await resolveDependencies(hit, v);
       }
-    } catch (e: any) { addToast(`Failed to add: ${e.toString()}`, 'error'); }
+    } catch (e: any) { addToast(t('content.add_error', { error: e.toString() }), 'error'); }
     setAddingId(null);
   };
 

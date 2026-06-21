@@ -11,6 +11,7 @@ import { Skeleton } from '../components/ui/Skeleton';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { useInstanceStore } from '../stores/instanceStore';
 import { addToast } from '../components/ui/Toast';
+import { useLogPlaque } from '../lib/uiLog';
 
 interface VersionEntry {
   id: string;
@@ -42,7 +43,7 @@ interface CreateWizardProps {
   onClose: () => void;
 }
 
-type LoaderType = 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge' | 'LiteLoader';
+type LoaderType = 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge';
 
 const LOADER_PAGE_SIZE = 20;
 const SCROLL_LOAD_THRESHOLD_PX = 50;
@@ -63,10 +64,10 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
 
   const [loaderType, setLoaderType] = useState<LoaderType>('Vanilla');
   const [loaderVersions, setLoaderVersions] = useState<Record<LoaderType, LoaderVersion[]>>({
-    Vanilla: [], Fabric: [], Quilt: [], Forge: [], NeoForge: [], LiteLoader: [],
+    Vanilla: [], Fabric: [], Quilt: [], Forge: [], NeoForge: [],
   });
   const [loaderVersionTotals, setLoaderVersionTotals] = useState<Record<LoaderType, number | null>>({
-    Vanilla: null, Fabric: null, Quilt: null, Forge: null, NeoForge: null, LiteLoader: null,
+    Vanilla: null, Fabric: null, Quilt: null, Forge: null, NeoForge: null,
   });
   const [loaderVersionsLoading, setLoaderVersionsLoading] = useState(false);
   const [loaderVersionsError, setLoaderVersionsError] = useState(false);
@@ -81,6 +82,9 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
   const [importLoading, setImportLoading] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [importProgress, setImportProgress] = useState<{ current: number; total: number; stage: string; message: string } | null>(null);
+
+  useLogPlaque(importError, 'error', 'import');
+  useLogPlaque(importProgress?.message ?? null, 'info', 'import');
 
   const loaderListRef = useRef<HTMLDivElement>(null);
 
@@ -146,7 +150,7 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
       } else if (target === 'NeoForge') {
         page = await invoke<LoaderVersionPage>('cmd_get_neoforge_versions', { mcVersion: selectedVersion, offset, limit: LOADER_PAGE_SIZE });
       } else {
-        page = await invoke<LoaderVersionPage>('cmd_get_liteloader_versions', { mcVersion: selectedVersion, offset, limit: LOADER_PAGE_SIZE });
+        page = { versions: [], total: 0 };
       }
       setLoaderVersions(prev => ({ ...prev, [target]: [...(prev[target] ?? []), ...page.versions] }));
       setLoaderVersionTotals(prev => ({ ...prev, [target]: page.total }));
@@ -217,16 +221,11 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
         const cmd = loaderType === 'Fabric' ? 'cmd_install_fabric'
           : loaderType === 'Quilt' ? 'cmd_install_quilt'
           : loaderType === 'Forge' ? 'cmd_install_forge'
-          : loaderType === 'LiteLoader' ? 'cmd_install_liteloader'
           : 'cmd_install_neoforge';
         try {
           await invoke(cmd, { mcVersion: selectedVersion, loaderVersion: selectedLoaderVersion, instanceName: instanceName.trim() });
         } catch (e: any) {
-          if (loaderType === 'LiteLoader') {
-            addToast(t('create_instance.liteloader_unsupported', { error: String(e) }), 'warning');
-          } else {
-            addToast(t('create_instance.loader_failed', { loader: loaderType }), 'warning');
-          }
+          addToast(t('create_instance.loader_failed', { loader: loaderType }), 'warning');
         }
       }
       addToast(t('create_instance.created', { name: instanceName }), 'success');
@@ -286,10 +285,10 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
 
   const formatLabel = (fmt: string) => {
     switch (fmt) {
-      case 'Prism': return 'Prism / MultiMC';
-      case 'Modrinth': return 'Modrinth';
-      case 'CurseForge': return 'CurseForge / FTB';
-      case 'ATLauncher': return 'ATLauncher';
+      case 'Prism': return t('create_instance.format_prism');
+      case 'Modrinth': return t('create_instance.format_modrinth');
+      case 'CurseForge': return t('create_instance.format_curseforge');
+      case 'ATLauncher': return t('create_instance.format_atlauncher');
       default: return fmt;
     }
   };
@@ -419,10 +418,10 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
                     {t('create_instance.loader_label')}
                   </label>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 'var(--space-sm)' }}>
-                    {(['Vanilla', 'Fabric', 'Quilt', 'Forge', 'NeoForge', 'LiteLoader'] as const).map((l) => (
+                    {(['Vanilla', 'Fabric', 'Quilt', 'Forge', 'NeoForge'] as const).map((l) => (
                       <Button key={l} size="sm" variant={loaderType === l ? 'primary' : 'ghost'}
                         onClick={() => handleLoaderChange(l)} style={{ fontSize: '11px' }}>
-                        {l === 'Vanilla' ? t('create_instance.loader_vanilla') : l === 'Fabric' ? t('create_instance.loader_fabric') : l === 'Quilt' ? t('create_instance.loader_quilt') : l === 'Forge' ? t('create_instance.loader_forge') : l === 'LiteLoader' ? t('create_instance.loader_liteloader') : t('create_instance.loader_neoforge')}
+                        {l === 'Vanilla' ? t('create_instance.loader_vanilla') : l === 'Fabric' ? t('create_instance.loader_fabric') : l === 'Quilt' ? t('create_instance.loader_quilt') : l === 'Forge' ? t('create_instance.loader_forge') : t('create_instance.loader_neoforge')}
                       </Button>
                     ))}
                   </div>
@@ -435,7 +434,7 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
                         </div>
                       ) : currentLoaderVersions.length === 0 && !loaderVersionsLoading ? (
                         <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
-                          {loaderType === 'LiteLoader' ? t('create_instance.liteloader_empty') : t('create_instance.loader_no_versions')}
+                          {t('create_instance.loader_no_versions')}
                         </div>
                       ) : (
                         <>
@@ -507,7 +506,7 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
               {importError && (
                 <div style={{
                   marginTop: 'var(--space-lg)', padding: 'var(--space-md)',
-                  background: 'hsla(0, 85%, 60%, 0.1)', border: '1px solid hsla(0, 85%, 60%, 0.2)',
+                  background: 'var(--banner-error-bg)', border: '1px solid var(--banner-error-border)',
                   borderRadius: 'var(--radius-md)', fontSize: 'var(--font-size-sm)',
                   color: 'var(--error)',
                 }}>
@@ -568,19 +567,19 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-sm)', fontSize: 'var(--font-size-sm)' }}>
                     {importMeta.mc_version && (
                       <>
-                        <span style={{ color: 'var(--text-tertiary)' }}>Minecraft</span>
+                        <span style={{ color: 'var(--text-tertiary)' }}>{t('create_instance.meta_mc')}</span>
                         <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{importMeta.mc_version}</span>
                       </>
                     )}
                     {importMeta.loader && (
                       <>
-                        <span style={{ color: 'var(--text-tertiary)' }}>Mod Loader</span>
+                        <span style={{ color: 'var(--text-tertiary)' }}>{t('create_instance.meta_loader')}</span>
                         <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>
                           {importMeta.loader}{importMeta.loader_version ? ` ${importMeta.loader_version}` : ''}
                         </span>
                       </>
                     )}
-                    <span style={{ color: 'var(--text-tertiary)' }}>Format</span>
+                    <span style={{ color: 'var(--text-tertiary)' }}>{t('create_instance.meta_format')}</span>
                     <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{formatLabel(importMeta.format)}</span>
                   </div>
 

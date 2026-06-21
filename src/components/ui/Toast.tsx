@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { X, CheckCircle, AlertCircle, AlertTriangle, Info } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { logUiMessage, toastTypeToLogLevel } from '../../lib/uiLog';
 
 type ToastType = 'success' | 'error' | 'warning' | 'info';
 
@@ -62,7 +63,9 @@ export function addToast(message: string, type: ToastType = 'info') {
   const id = `toast-${++idCounter}`;
   toasts = [...toasts, { id, message, type }];
   toastListeners.forEach((l) => l(toasts));
-  invoke('cmd_log_toast', { level: type, message }).catch(() => {});
+  invoke('cmd_log_toast', { level: type, message }).catch(() => {
+    logUiMessage(message, toastTypeToLogLevel(type), 'toast');
+  });
 }
 
 export function dismissToast(id: string) {
