@@ -51,7 +51,7 @@ const SCROLL_LOAD_THRESHOLD_PX = 50;
 type WizardMode = 'new' | 'import';
 
 export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
-  const { createInstance, installVersion, saveInstance, loadInstances } = useInstanceStore();
+  const { createInstance, installVersion, loadInstances } = useInstanceStore();
 
   const [mode, setMode] = useState<WizardMode>('new');
 
@@ -210,23 +210,16 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
       const versionEntry = versions.find((v) => v.id === selectedVersion);
       if (!versionEntry) throw new Error('Version not found');
       addToast(t('create_instance.downloading'), 'info');
-      await createInstance(instanceName.trim(), selectedVersion);
+      const ldr = loaderType === 'Vanilla' ? undefined : loaderType;
+      const ldrVer = loaderType === 'Vanilla' ? undefined : selectedLoaderVersion;
+      await createInstance(instanceName.trim(), selectedVersion, ldr, ldrVer);
       await installVersion(versionEntry.url, instanceName.trim());
       if (loaderType !== 'Vanilla' && selectedLoaderVersion) {
-        const instances = useInstanceStore.getState().instances;
-        const created = instances.find((i) => i.name === instanceName.trim());
-        if (created) {
-          await saveInstance({ ...created, loader: loaderType, loader_version: selectedLoaderVersion });
-        }
         const cmd = loaderType === 'Fabric' ? 'cmd_install_fabric'
           : loaderType === 'Quilt' ? 'cmd_install_quilt'
           : loaderType === 'Forge' ? 'cmd_install_forge'
           : 'cmd_install_neoforge';
-        try {
-          await invoke(cmd, { mcVersion: selectedVersion, loaderVersion: selectedLoaderVersion, instanceName: instanceName.trim() });
-        } catch (e: any) {
-          addToast(t('create_instance.loader_failed', { loader: loaderType }), 'warning');
-        }
+        await invoke(cmd, { mcVersion: selectedVersion, loaderVersion: selectedLoaderVersion, instanceName: instanceName.trim() });
       }
       addToast(t('create_instance.created', { name: instanceName }), 'success');
       onClose();

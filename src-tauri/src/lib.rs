@@ -606,14 +606,19 @@ fn cmd_create_instance(
     state: State<'_, AppState>,
     name: String,
     mc_version: String,
+    loader: Option<instances::LoaderType>,
+    loader_version: Option<String>,
 ) -> Result<instances::Instance, String> {
     validate_instance_name(&name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
+    let loader = loader.unwrap_or(instances::LoaderType::Vanilla);
     let instance = instances::Instance::new(
         &name,
         &mc_version,
         config.default_memory_mb,
         &config.default_gc_preset,
+        loader.clone(),
+        if loader == instances::LoaderType::Vanilla { None } else { loader_version },
     );
     instances::create_instance(&config.instances_dir(), &instance).map_err(|e| e.to_string())?;
     Ok(instance)
@@ -1931,6 +1936,8 @@ async fn cmd_install_fabric(
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
         .map_err(|e| e.to_string())?;
+    instance.loader = instances::LoaderType::Fabric;
+    instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
     instances::save_instance(&config.instances_dir(), &instance).map_err(|e| e.to_string())?;
     Ok(())
@@ -1956,6 +1963,8 @@ async fn cmd_install_quilt(
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
         .map_err(|e| e.to_string())?;
+    instance.loader = instances::LoaderType::Quilt;
+    instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
     instances::save_instance(&config.instances_dir(), &instance).map_err(|e| e.to_string())?;
     Ok(())
@@ -2355,6 +2364,8 @@ async fn cmd_install_forge(
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
         .map_err(|e| e.to_string())?;
+    instance.loader = instances::LoaderType::Forge;
+    instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
     instances::save_instance(&config.instances_dir(), &instance).map_err(|e| e.to_string())?;
     Ok(())
@@ -2379,6 +2390,8 @@ async fn cmd_install_neoforge(
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
         .map_err(|e| e.to_string())?;
+    instance.loader = instances::LoaderType::NeoForge;
+    instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
     instances::save_instance(&config.instances_dir(), &instance).map_err(|e| e.to_string())?;
     Ok(())
@@ -3265,24 +3278,34 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
     fallback_meta_from_filename(path)
 }
 
+fn strip_toml_comment(val: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = val.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double => return &val[..i],
+            _ => {}
+        }
+    }
+    val
+}
+
 fn extract_toml_field(content: &str, field: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with(field) && trimmed.contains('=') {
-            let val = trimmed
-                .splitn(2, '=')
-                .nth(1)?
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'');
+            let raw = trimmed.splitn(2, '=').nth(1)?.trim();
+            let raw = strip_toml_comment(raw);
+            let val = raw.trim().trim_matches('"').trim_matches('\'');
             if val.starts_with('{') {
                 if let Some(start) = val.find(field) {
                     let after = &val[start..];
                     if let Some(eq_pos) = after.find('=') {
-                        let v = after[eq_pos + 1..]
-                            .trim()
-                            .trim_matches('"')
-                            .trim_matches('\'');
+                        let v_raw = strip_toml_comment(&after[eq_pos + 1..]);
+                        let v = v_raw.trim().trim_matches('"').trim_matches('\'');
                         let v = v.trim_end_matches(',').trim_end_matches('}').trim();
                         return Some(v.to_string());
                     }

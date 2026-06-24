@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 const BASE_URL: &str = "https://api.modrinth.com/v2";
-const USER_AGENT: &str = "VoidLauncher/0.1.4 (github.com/voidlauncher)";
+const USER_AGENT: &str = "VoidLauncher/0.1.5 (github.com/voidlauncher)";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModrinthSearchResult {

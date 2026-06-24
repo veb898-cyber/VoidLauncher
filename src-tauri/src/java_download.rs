@@ -67,7 +67,7 @@ fn download_client() -> &'static reqwest::Client {
             .timeout(Duration::from_secs(1800))
             .connect_timeout(Duration::from_secs(30))
             .no_gzip()
-            .user_agent("VoidLauncher/0.1.4")
+            .user_agent("VoidLauncher/0.1.5")
             .build()
             .expect("Failed to create Java download client (check TLS libraries)")
     })

@@ -76,6 +76,9 @@ export function PacksManager({ instanceName, packType, onOpenFolder }: Props) {
       const dir = await invoke<string>('cmd_get_instance_dir', { instanceName });
       const packPath = `${dir}/${packType}/${filename}`;
       await invoke('cmd_delete_file', { path: packPath });
+      // Also remove sidecar metadata file
+      const sidecarPath = `${dir}/${packType}/${filename}.voidlauncher.json`;
+      try { await invoke('cmd_delete_file', { path: sidecarPath }); } catch { }
       addToast(t('packs.deleted_toast', { name: filename }), 'success');
       loadPacks();
     } catch (e: any) { addToast(t('packs.delete_error', { error: e.toString() }), 'error'); }

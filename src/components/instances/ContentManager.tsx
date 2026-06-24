@@ -433,9 +433,11 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
       const newEnabled = !item.enabled;
       const newName = newEnabled ? item.filename.replace(/\.disabled$/, '') : `${item.filename}.disabled`;
       await invoke('cmd_rename_file', { from: `${itemDir}/${item.filename}`, to: `${itemDir}/${newName}` });
-      // Rename sidecar too
+      // Rename sidecar too (sidecar filename omits .jar)
       try {
-        await invoke('cmd_rename_file', { from: `${itemDir}/${item.filename}.voidlauncher.json`, to: `${itemDir}/${newName}.voidlauncher.json` });
+        const oldStem = item.filename.replace(/\.jar(\.disabled)?$/, '').replace(/\.disabled$/, '');
+        const newStem = newName.replace(/\.jar(\.disabled)?$/, '').replace(/\.disabled$/, '');
+        await invoke('cmd_rename_file', { from: `${itemDir}/${oldStem}.voidlauncher.json`, to: `${itemDir}/${newStem}.voidlauncher.json` });
       } catch { }
       setItems((prev) => prev.map((it) => it.filename === item.filename ? { ...it, filename: newName, enabled: newEnabled } : it));
       const oldIconKey = `file:${item.filename}`;
@@ -471,8 +473,9 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
       const dir = await invoke<string>('cmd_get_instance_dir', { instanceName });
       const itemPath = `${dir}/${subfolder}/${filename}`;
       await invoke('cmd_delete_file', { path: itemPath });
-      // Also remove sidecar metadata file (pack tracking)
-      const sidecarPath = `${dir}/${subfolder}/${filename}.voidlauncher.json`;
+      // Also remove sidecar metadata file (sidecar filename omits .jar)
+      const sidecarStem = filename.replace(/\.jar(\.disabled)?$/, '').replace(/\.disabled$/, '');
+      const sidecarPath = `${dir}/${subfolder}/${sidecarStem}.voidlauncher.json`;
       try { await invoke('cmd_delete_file', { path: sidecarPath }); } catch { }
     } catch (e: any) { addToast(t('manager.remove_error', { name: filename, error: e.toString() }), 'error'); }
   };

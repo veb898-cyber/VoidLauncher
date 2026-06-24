@@ -49,7 +49,7 @@ interface InstanceState {
   pendingLoaderInstall: { instanceName: string; check: LoaderCheckResult } | null;
 
   loadInstances: () => Promise<void>;
-  createInstance: (name: string, mcVersion: string) => Promise<void>;
+  createInstance: (name: string, mcVersion: string, loader?: string, loaderVersion?: string) => Promise<void>;
   deleteInstance: (name: string) => Promise<void>;
   selectInstance: (name: string | null) => void;
   launchGame: (instanceName: string) => Promise<void>;
@@ -89,10 +89,10 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     }
   },
 
-  createInstance: async (name: string, mcVersion: string) => {
+  createInstance: async (name: string, mcVersion: string, loader?: string, loaderVersion?: string) => {
     set({ isLoading: true, error: null });
     try {
-      await invoke('cmd_create_instance', { name, mcVersion });
+      await invoke('cmd_create_instance', { name, mcVersion, loader, loaderVersion });
       const instances = await invoke<Instance[]>('cmd_list_instances');
       set({ instances, isLoading: false });
     } catch (e: any) {

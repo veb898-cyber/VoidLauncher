@@ -71,12 +71,14 @@ impl Instance {
         mc_version: &str,
         default_memory_mb: u32,
         default_gc_preset: &str,
+        loader: LoaderType,
+        loader_version: Option<String>,
     ) -> Self {
         Self {
             name: name.to_string(),
             mc_version: mc_version.to_string(),
-            loader: LoaderType::Vanilla,
-            loader_version: None,
+            loader,
+            loader_version,
             loader_profile: None,
             // Pre-fill with the recommended default so the slider sits at the
             // optimal position the moment the instance is created, even if the

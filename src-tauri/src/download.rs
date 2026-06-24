@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::sleep;
 
-const MAX_RETRIES: u32 = 3;
-const REQUEST_TIMEOUT_SECS: u64 = 30;
+const MAX_RETRIES: u32 = 5;
+const REQUEST_TIMEOUT_SECS: u64 = 120;
 const CONCURRENT_LIMIT: usize = 32;
 
 /// Shared allowlist of trusted download mirrors.
@@ -48,86 +48,51 @@ fn http_client() -> &'static reqwest::Client {
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(15))
-            .user_agent("VoidLauncher/0.1.4")
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .user_agent("VoidLauncher/0.1.5")
             .build()
             .expect("Failed to create HTTP client (check TLS libraries)")
     })
 }
 
-/// Download a single file with SHA1 verification, resume, timeout, and retry.
-/// Enforces HTTPS + an allowlist of trusted hosts to prevent SSRF / file://
-/// attacks when the URL originates from a third-party API.
-pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Result<()> {
-    let url_lower = url.to_ascii_lowercase();
-    if !url_lower.starts_with("https://") {
-        return Err(crate::error::LauncherError::Download(
-            "Download URL must use HTTPS".to_string(),
-        ));
-    }
-    let after_scheme = &url[url.find("://").map(|i| i + 3).unwrap_or(8)..];
-    let host_end = after_scheme
-        .find(|c: char| c == '/' || c == ':' || c == '?' || c == '#')
-        .unwrap_or(after_scheme.len());
-    let host = after_scheme[..host_end].to_ascii_lowercase();
-    if !is_host_allowed(&host) {
-        return Err(crate::error::LauncherError::Download(format!(
-            "Download host '{}' is not in the allowlist",
-            host
-        )));
-    }
-    tracing::info!(target: "launcher", url = %url, "Downloading {}", path.display());
-    // Check if file exists with correct hash
-    if path.exists() && !expected_sha1.is_empty() {
-        if verify_sha1(path, expected_sha1)? {
-            tracing::debug!(target: "launcher", "SHA1 verified: {}", path.display());
-            return Ok(());
+/// Validate a completed download file: SHA1 check or JSON-content rejection.
+fn validate_download(path: &std::path::Path, expected_sha1: &str) -> Result<()> {
+    if !expected_sha1.is_empty() {
+        if !verify_sha1(path, expected_sha1)? {
+            return Err(LauncherError::Download(format!(
+                "SHA1 mismatch for {}",
+                path.display()
+            )));
         }
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Check for partial file (for resume)
-    let existing_len = if path.exists() {
-        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
     } else {
-        0
-    };
-
-    let client = http_client();
-    let mut last_err = None;
-
-    for attempt in 1..=MAX_RETRIES {
-        match attempt_download(client, url, path, expected_sha1, existing_len).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < MAX_RETRIES {
-                    let delay = Duration::from_secs(2u64.pow(attempt));
-                    sleep(delay).await;
-                }
+        // basic sanity: reject if looks like JSON
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > 0 {
+            use std::io::Read;
+            let mut buf = [0u8; 1];
+            let mut f = std::fs::File::open(path)?;
+            let _ = f.read(&mut buf);
+            if buf[0] == b'{' || buf[0] == b'[' {
+                return Err(LauncherError::Download(format!(
+                    "Downloaded content looks like JSON, not a binary file: {}",
+                    path.display()
+                )));
             }
         }
     }
-
-    Err(last_err.unwrap_or_else(|| {
-        LauncherError::Download(format!("Failed to download {}", url))
-    }))
+    Ok(())
 }
 
-/// Compute a reasonable download timeout from file size (~512 KB/s minimum + buffer).
-pub fn timeout_for_size(size_bytes: u64) -> Duration {
-    let secs = size_bytes / 512_000 + 60;
-    Duration::from_secs(secs.clamp(120, 900))
-}
-
-/// Download a file with streaming, retries, and a timeout scaled to expected size.
-pub async fn download_file_sized(
+/// Validate URL + host, then download to a .part temp file, validate,
+/// and atomically rename to `path` on success. On ANY error the .part file
+/// is cleaned up and `path` is never touched.
+async fn download_to_part(
     url: &str,
-    path: &PathBuf,
+    path: &std::path::Path,
     expected_sha1: &str,
-    size_bytes: u64,
+    timeout: Option<Duration>,
 ) -> Result<()> {
     let url_lower = url.to_ascii_lowercase();
     if !url_lower.starts_with("https://") {
@@ -151,12 +116,90 @@ pub async fn download_file_sized(
         std::fs::create_dir_all(parent)?;
     }
 
-    let timeout = timeout_for_size(size_bytes);
+    let part_path = {
+        let mut p = path.as_os_str().to_os_string();
+        p.push(".part");
+        std::path::PathBuf::from(p)
+    };
+
+    // Always remove any stale .part from a previous attempt
+    let _ = std::fs::remove_file(&part_path);
+
     let client = http_client();
+    let mut req = client.get(url);
+    if let Some(t) = timeout {
+        req = req.timeout(t);
+    }
+    let response = req
+        .send()
+        .await
+        .map_err(|e| LauncherError::Download(format!("Failed to download {}: {}", url, e)))?;
+
+    let status = response.status();
+    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(LauncherError::Download(format!("HTTP {} for {}", status, url)));
+    }
+
+    // Reject non-binary responses
+    if let Some(ct) = response.headers().get("content-type") {
+        let ct_str = ct.to_str().unwrap_or("");
+        if is_rejected_content_type(ct_str) {
+            return Err(LauncherError::Download(format!(
+                "Server returned unexpected content-type '{}' for {}",
+                ct_str, url
+            )));
+        }
+    }
+
+    // Download entire body into memory first, then write to .part file.
+    // Using bytes() instead of bytes_stream() avoids potential chunked-encoding
+    // or HTTP framing issues in the streaming decoder.
+    let write_result = {
+        use std::io::Write;
+
+        let bytes = response.bytes().await.map_err(|e| {
+            LauncherError::Download(format!("Failed to read response body: {}", e))
+        })?;
+        let mut file = std::fs::File::create(&part_path)
+            .map_err(|e| LauncherError::Download(format!("Failed to create .part: {}", e)))?;
+        file.write_all(&bytes)
+            .map_err(|e| LauncherError::Download(format!("Failed to write .part: {}", e)))
+    };
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(e);
+    }
+
+    // Validate the .part file content
+    if let Err(e) = validate_download(&part_path, expected_sha1) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(e);
+    }
+
+    // Atomically replace the destination: rename .part → final path
+    std::fs::rename(&part_path, path)?;
+
+    Ok(())
+}
+
+/// Download a single file with SHA1 verification and retry.
+/// Writes to a .part temp file, validates, then atomically renames.
+pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Result<()> {
+    tracing::info!(target: "launcher", url = %url, "Downloading {}", path.display());
+
+    // Check if file exists with correct hash
+    if path.exists() && !expected_sha1.is_empty() {
+        if verify_sha1(path, expected_sha1)? {
+            tracing::debug!(target: "launcher", "SHA1 verified: {}", path.display());
+            return Ok(());
+        }
+    }
+
     let mut last_err = None;
 
     for attempt in 1..=MAX_RETRIES {
-        match attempt_download_timed(client, url, path, expected_sha1, 0, timeout).await {
+        match download_to_part(url, path, expected_sha1, None).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = Some(e);
@@ -172,157 +215,49 @@ pub async fn download_file_sized(
     }))
 }
 
-async fn attempt_download_timed(
-    client: &reqwest::Client,
-    url: &str,
-    path: &PathBuf,
-    expected_sha1: &str,
-    existing_len: u64,
-    timeout: Duration,
-) -> Result<()> {
-    use std::io::Write;
-    use futures::StreamExt;
-
-    let mut req = client.get(url).timeout(timeout);
-
-    if existing_len > 0 {
-        req = req.header("Range", format!("bytes={}-", existing_len));
-    }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LauncherError::Download(format!("Failed to download {}: {}", url, e)))?;
-
-    let status = response.status();
-    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(LauncherError::Download(format!("HTTP {} for {}", status, url)));
-    }
-
-    // Reject HTML/text responses to prevent writing error pages as binaries
-    if let Some(ct) = response.headers().get("content-type") {
-        let ct_str = ct.to_str().unwrap_or("");
-        if ct_str.starts_with("text/html") || ct_str.starts_with("text/plain") {
-            return Err(LauncherError::Download(format!(
-                "Server returned unexpected content-type '{}' for {}",
-                ct_str, url
-            )));
-        }
-    }
-
-    if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .map_err(|e| LauncherError::Download(format!("Failed to open {}: {}", path.display(), e)))?;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| LauncherError::Download(format!("Stream error: {}", e)))?;
-            file.write_all(&chunk)
-                .map_err(|e| LauncherError::Download(format!("Failed to write {}: {}", path.display(), e)))?;
-        }
-    } else {
-        let mut file = std::fs::File::create(path)
-            .map_err(|e| LauncherError::Download(format!("Failed to create {}: {}", path.display(), e)))?;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| LauncherError::Download(format!("Stream error: {}", e)))?;
-            file.write_all(&chunk)
-                .map_err(|e| LauncherError::Download(format!("Failed to write {}: {}", path.display(), e)))?;
-        }
-    }
-
-    if !expected_sha1.is_empty() && !verify_sha1(path, expected_sha1)? {
-        std::fs::remove_file(path)?;
-        return Err(LauncherError::Download(format!(
-            "SHA1 mismatch for {}",
-            path.display()
-        )));
-    }
-
-    Ok(())
+/// Compute a reasonable download timeout from file size (~512 KB/s minimum + buffer).
+pub fn timeout_for_size(size_bytes: u64) -> Duration {
+    let secs = size_bytes / 512_000 + 60;
+    Duration::from_secs(secs.clamp(120, 900))
 }
 
-async fn attempt_download(
-    client: &reqwest::Client,
+/// Download a file with streaming, retries, and a timeout scaled to expected size.
+pub async fn download_file_sized(
     url: &str,
     path: &PathBuf,
     expected_sha1: &str,
-    existing_len: u64,
+    size_bytes: u64,
 ) -> Result<()> {
-    use std::io::Write;
-    use futures::StreamExt;
+    tracing::info!(target: "launcher", url = %url, size = size_bytes, "Downloading {} (sized)", path.display());
 
-    let mut req = client.get(url);
+    let timeout = timeout_for_size(size_bytes);
+    let mut last_err = None;
 
-    // Resume if we have a partial file
-    if existing_len > 0 {
-        req = req.header("Range", format!("bytes={}-", existing_len));
-    }
-
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LauncherError::Download(format!("Failed to download {}: {}", url, e)))?;
-
-    let status = response.status();
-    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        tracing::warn!(target: "launcher", status = %status, url = %url, "Download returned non-success status");
-        return Err(LauncherError::Download(format!(
-            "HTTP {} for {}",
-            status, url
-        )));
-    }
-
-    // Reject HTML/text responses to prevent writing error pages as binaries
-    if let Some(ct) = response.headers().get("content-type") {
-        let ct_str = ct.to_str().unwrap_or("");
-        if ct_str.starts_with("text/html") || ct_str.starts_with("text/plain") {
-            return Err(LauncherError::Download(format!(
-                "Server returned unexpected content-type '{}' for {}",
-                ct_str, url
-            )));
+    for attempt in 1..=MAX_RETRIES {
+        match download_to_part(url, path, expected_sha1, Some(timeout)).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < MAX_RETRIES {
+                    sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                }
+            }
         }
     }
 
-    if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .map_err(|e| LauncherError::Download(format!("Failed to open {}: {}", path.display(), e)))?;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| LauncherError::Download(format!("Stream error: {}", e)))?;
-            file.write_all(&chunk)
-                .map_err(|e| LauncherError::Download(format!("Failed to write {}: {}", path.display(), e)))?;
-        }
-    } else {
-        let mut file = std::fs::File::create(path)
-            .map_err(|e| LauncherError::Download(format!("Failed to create {}: {}", path.display(), e)))?;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| LauncherError::Download(format!("Stream error: {}", e)))?;
-            file.write_all(&chunk)
-                .map_err(|e| LauncherError::Download(format!("Failed to write {}: {}", path.display(), e)))?;
-        }
-    }
+    Err(last_err.unwrap_or_else(|| {
+        LauncherError::Download(format!("Failed to download {}", url))
+    }))
+}
 
-    if !expected_sha1.is_empty() {
-        if !verify_sha1(path, expected_sha1)? {
-            let bytes = std::fs::read(path)?;
-            let mut hasher = Sha1::new();
-            hasher.update(&bytes);
-            let got = hex::encode(hasher.finalize());
-            tracing::warn!(target: "launcher", expected = %expected_sha1, got = %got, "SHA1 mismatch for {}", path.display());
-            std::fs::remove_file(path)?;
-            return Err(LauncherError::Download(format!(
-                "SHA1 mismatch for {}",
-                path.display()
-            )));
-        }
-    }
-
-    Ok(())
+/// Returns `true` for content-types that indicate an error page or non-binary response.
+fn is_rejected_content_type(ct: &str) -> bool {
+    let ct_lower = ct.to_ascii_lowercase();
+    ct_lower.starts_with("text/")
+        || ct_lower.starts_with("application/json")
+        || ct_lower.starts_with("application/problem+json")
+        || ct_lower.starts_with("application/xml")
+        || ct_lower.starts_with("application/xhtml")
 }
 
 /// Download up to CONCURRENT_LIMIT files in parallel with progress callback
@@ -419,7 +354,7 @@ pub async fn download_assets(
 }
 
 /// Verify file SHA1 hash
-pub fn verify_sha1(path: &PathBuf, expected: &str) -> Result<bool> {
+pub fn verify_sha1(path: &std::path::Path, expected: &str) -> Result<bool> {
     let bytes = std::fs::read(path)?;
     let mut hasher = Sha1::new();
     hasher.update(&bytes);

@@ -1,11 +1,11 @@
 {
-  "version": "0.1.4",
-  "notes": "Release v0.1.4",
-  "pub_date": "2026-06-21T09:21:26Z",
+  "version": "0.1.5",
+  "notes": "Release v0.1.5",
+  "pub_date": "2026-06-25T00:00:00Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUcTRyZVo0SDE0YkptWVplaGJIWThWcytEMkQzODNzWnR5Y2NLS04vYjBRT3JmV3BBNzRZalpwM0JwTHF0VC9OMC9rSTlVWCtPQUQrdTFhbDN5eVBwLzFYaVdjemhSRnd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyMDMzNjg2CWZpbGU6aW5zdGFsbGVyLmV4ZQpOTGtuRzRDbUUvK3dON2tUK09xYjZCV1d4YzBnYU9kRXoyeXA0Wk15VjlwNnp4R1lqUEV1ZGxTZFdrNkNjeUEzUzZETUtVem14YWlSZUpMYTkwTVlCZz09Cg==",
-      "url": "https://github.com/veb898-cyber/VoidLauncher/releases/download/v0.1.4/VoidLauncher_0.1.4_x64-setup.exe"
+      "signature": "",
+      "url": "https://github.com/veb898-cyber/VoidLauncher/releases/download/v0.1.5/VoidLauncher_0.1.5_x64-setup.exe"
     }
   }
 }
