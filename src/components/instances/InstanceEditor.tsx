@@ -4,6 +4,7 @@ import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { Button } from '../ui/Button';
 import { Input } from '../ui/Input';
 import { Modal } from '../ui/Modal';
+import { Slider } from '../ui/Slider';
 import { addToast } from '../ui/Toast';
 import { CustomSelect, type SelectOption } from '../ui/CustomSelect';
 import {
@@ -126,7 +127,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
           return { width: w, height: h };
         })(),
       };
-      await invoke('cmd_save_instance', { instance: updated });
+      await invoke('cmd_save_instance', { instance: updated, oldName: instance.name });
       addToast(t('instance_editor.saved_toast'), 'success');
       onSaved();
       onClose();
@@ -163,14 +164,12 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
               {t('instance_editor.memory_max_info', { maxGb, systemRamGb })}
             </span>
           </label>
-          <input
-            type="range"
+          <Slider
             min={MIN_MEMORY_MB}
             max={maxMemoryMb}
             step={MEMORY_STEP_MB}
             value={memoryMb}
-            onChange={(e) => setMemoryMb(parseInt(e.target.value))}
-            style={{ width: '100%' }}
+            onChange={(v) => setMemoryMb(v)}
           />
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 2 }}>
             <span>{t('instance_editor.memory_min_label', { gb: (MIN_MEMORY_MB / 1024).toFixed(1) })}</span>
@@ -219,22 +218,21 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
           type="text"
           value={jvmArgs}
           onChange={(e) => setJvmArgs(e.target.value)}
-          placeholder={t('instance_editor.jvm_placeholder')}
         />
 
         <div>
           <label className="input__label" style={{ display: 'block', marginBottom: 4 }}>{t('instance_editor.java_path_label')}</label>
           <div style={{ display: 'flex', gap: 'var(--space-xs)' }}>
-            <input className="input" type="text" value={javaPath} onChange={(e) => setJavaPath(e.target.value)} placeholder={t('instance_editor.java_placeholder')} style={{ flex: 1 }} />
+            <input className="input" type="text" value={javaPath} onChange={(e) => setJavaPath(e.target.value)} style={{ flex: 1 }} />
             <Button size="sm" variant="ghost" onClick={pickJavaPath}>{t('instance_editor.browse_btn')}</Button>
           </div>
         </div>
         <div>
           <label className="input__label" style={{ display: 'block', marginBottom: 4 }}>{t('instance_editor.resolution_label')}</label>
           <div style={{ display: 'flex', gap: 'var(--space-xs)', alignItems: 'center' }}>
-            <input className="input" type="number" value={resWidth} onChange={(e) => setResWidth(e.target.value)} placeholder={t('instance_editor.width_placeholder')} style={{ flex: 1 }} />
+            <input className="input" type="number" value={resWidth} onChange={(e) => setResWidth(e.target.value)} style={{ flex: 1 }} />
             <span style={{ color: 'var(--text-tertiary)' }}>×</span>
-            <input className="input" type="number" value={resHeight} onChange={(e) => setResHeight(e.target.value)} placeholder={t('instance_editor.height_placeholder')} style={{ flex: 1 }} />
+            <input className="input" type="number" value={resHeight} onChange={(e) => setResHeight(e.target.value)} style={{ flex: 1 }} />
           </div>
         </div>
       </div>

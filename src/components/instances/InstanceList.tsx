@@ -1,5 +1,6 @@
 import { Plus, Package } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
+import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { t } from '../../lib/i18n';
 import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
@@ -69,7 +70,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
             return (
               <div
                 key={instance.name}
-                onClick={() => selectInstance(instance.name)}
+                onClick={() => useBrowserGuardStore.getState().askLeave(() => selectInstance(instance.name))}
                 style={{
                   display: 'flex',
                   alignItems: 'center',

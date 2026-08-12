@@ -1,7 +1,5 @@
 #[allow(dead_code)]
 pub mod fabric;
-#[allow(dead_code)]
-pub mod quilt;
 pub mod forge;
 pub mod neoforge;
 #[allow(dead_code)]
@@ -41,6 +39,11 @@ pub struct LoaderProfile {
     pub jvm_args: Vec<String>,
     /// Additional game arguments
     pub game_args: Vec<String>,
+    /// True when game_args came from the legacy `minecraftArguments` string
+    /// (MC <= 1.12.2 style) and therefore REPLACE the vanilla game
+    /// arguments instead of being appended to them.
+    #[serde(default)]
+    pub legacy_args: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -61,7 +64,6 @@ pub async fn get_profile(
 ) -> Result<LoaderProfile> {
     match loader {
         "Fabric" => fabric::get_profile(mc_version, loader_version).await,
-        "Quilt" => quilt::get_profile(mc_version, loader_version).await,
         "Forge" => forge::get_profile(mc_version, loader_version).await,
         "NeoForge" => neoforge::get_profile(mc_version, loader_version).await,
         "LiteLoader" => liteloader::get_profile(mc_version, loader_version).await,
@@ -79,13 +81,13 @@ pub async fn install_loader(
     mc_version: &str,
     loader_version: &str,
     libraries_dir: &Path,
+    versions_dir: &Path,
     app: Option<&tauri::AppHandle>,
 ) -> Result<LoaderProfile> {
     match loader {
         "Fabric" => fabric::install(mc_version, loader_version, libraries_dir).await,
-        "Quilt" => quilt::install(mc_version, loader_version, libraries_dir).await,
-        "Forge" => forge::install(mc_version, loader_version, libraries_dir).await,
-        "NeoForge" => neoforge::install(mc_version, loader_version, libraries_dir, app).await,
+        "Forge" => forge::install(mc_version, loader_version, libraries_dir, versions_dir).await,
+        "NeoForge" => neoforge::install(mc_version, loader_version, libraries_dir, versions_dir, app).await,
         "LiteLoader" => liteloader::install(mc_version, loader_version, libraries_dir).await,
         _ => Err(crate::error::LauncherError::ModLoader(format!(
             "Unknown loader: {}",

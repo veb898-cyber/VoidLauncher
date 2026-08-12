@@ -19,6 +19,8 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct LiteLoaderInstallProfile {
+    /// Prism's per-version JSON has no `id` field — only `uid`/`version`.
+    #[serde(default)]
     id: String,
     #[serde(rename = "mainClass")]
     main_class: String,
@@ -121,6 +123,7 @@ pub async fn get_profile(mc_version: &str, lite_version: &str) -> Result<LoaderP
         libraries,
         jvm_args,
         game_args: Vec::new(),
+        legacy_args: false,
     })
 }
 

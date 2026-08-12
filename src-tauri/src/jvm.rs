@@ -99,6 +99,32 @@ pub fn build_jvm_args(
     args.push(format!("-Xms{}M", memory_mb));
     args.push(format!("-Xmx{}M", memory_mb));
 
+    // Java 9+ module system flags: required for Minecraft 1.17+ to access
+    // JDK-internal APIs via reflection. Also prevents JVM from failing when
+    // classpath JARs (notably the obfuscated client.jar) contain classes in
+    // the unnamed default package — modern JDKs scan classpath entries for
+    // automatic module derivation and reject unnamed-package classes.
+    if java_major >= 9 {
+        args.push("--add-opens".into());
+        args.push("java.base/java.lang=ALL-UNNAMED".into());
+        args.push("--add-opens".into());
+        args.push("java.base/java.math=ALL-UNNAMED".into());
+        args.push("--add-opens".into());
+        args.push("java.base/java.util=ALL-UNNAMED".into());
+        args.push("--add-opens".into());
+        args.push("java.base/java.util.concurrent=ALL-UNNAMED".into());
+        args.push("--add-opens".into());
+        args.push("java.base/java.net=ALL-UNNAMED".into());
+        args.push("--add-opens".into());
+        args.push("java.base/java.text=ALL-UNNAMED".into());
+        args.push("--add-opens".into());
+        args.push("java.base/java.lang.reflect=ALL-UNNAMED".into());
+        args.push("--add-opens".into());
+        args.push("java.base/java.io=ALL-UNNAMED".into());
+        args.push("--add-opens".into());
+        args.push("java.desktop/java.awt=ALL-UNNAMED".into());
+    }
+
     let effective = match requested {
         GcPreset::Standard => GcPreset::Standard,
         GcPreset::G1gcAikar => GcPreset::G1gcAikar,
@@ -134,17 +160,22 @@ pub fn build_jvm_args(
             args.push("-XX:+ParallelRefProcEnabled".into());
             args.push("-XX:MaxGCPauseMillis=50".into());
             args.push("-XX:+UnlockExperimentalVMOptions".into());
-            // G1UnlockCommercialFeatures was removed in Java 9+; it only
-            // exists in Java 8. Adding it on newer JDKs would error out.
-            if java_major == 8 {
-                args.push("-XX:+G1UnlockCommercialFeatures".into());
-            }
+            // Note: `-XX:+G1UnlockCommercialFeatures` was never a valid
+            // HotSpot flag. The actual flag was `-XX:+UnlockCommercialFeatures`
+            // (Java 8 only), which we intentionally skip — it had no effect
+            // on G1GC performance and was removed in Java 9+.
         }
         GcPreset::ModernZgc => {
             args.push("-XX:+UseZGC".into());
             args.push("-XX:+UnlockExperimentalVMOptions".into());
         }
     }
+
+    // Remove the never-existent `-XX:+G1UnlockCommercialFeatures` flag that old
+    // Forge profiles wrongly ship (the real flag was `-XX:+UnlockCommercialFeatures`
+    // which itself was removed in Java 9+). Retain unconditionally; there is no
+    // Java version where this flag is valid.
+    args.retain(|a| a != "-XX:+G1UnlockCommercialFeatures");
 
     (args, effective)
 }
@@ -220,15 +251,11 @@ mod tests {
         let (args, eff) = build_jvm_args(GcPreset::G1gcAikar, 4096, 8);
         assert_eq!(eff, GcPreset::G1gcAikar);
         assert!(args.contains(&"-XX:+UseG1GC".to_string()));
-        assert!(args.contains(&"-XX:+G1UnlockCommercialFeatures".to_string())); // Java 8
+        // `-XX:+G1UnlockCommercialFeatures` is never added: it never existed
+        // as a valid HotSpot flag in any Java version.
+        assert!(!args.contains(&"-XX:+G1UnlockCommercialFeatures".to_string()));
         assert!(args.iter().any(|a| a == "-Xms4096M"));
         assert!(args.iter().any(|a| a == "-Xmx4096M"));
-    }
-
-    #[test]
-    fn g1gc_skips_commercial_flag_on_java_17() {
-        let (args, _) = build_jvm_args(GcPreset::G1gcAikar, 4096, 17);
-        assert!(!args.contains(&"-XX:+G1UnlockCommercialFeatures".to_string()));
     }
 
     #[test]

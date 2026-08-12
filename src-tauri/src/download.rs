@@ -23,13 +23,16 @@ pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
     "piston-data.mojang.com",
     "piston-meta.mojang.com",
     "launchermeta.mojang.com",
+    "launcher.mojang.com",
     "libraries.minecraft.net",
     "resources.download.minecraft.net",
     "maven.fabricmc.net",
-    "maven.quiltmc.org",
     "files.minecraftforge.net",
     "maven.minecraftforge.net",
     "maven.neoforged.net",
+    "maven.creeperhost.net",
+    "bmclapi2.bangbang93.com",
+    "mirrors.cernet.edu.cn",
     "api.adoptium.net",
 ];
 
@@ -44,7 +47,7 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(15))
@@ -94,13 +97,20 @@ async fn download_to_part(
     expected_sha1: &str,
     timeout: Option<Duration>,
 ) -> Result<()> {
-    let url_lower = url.to_ascii_lowercase();
-    if !url_lower.starts_with("https://") {
-        return Err(LauncherError::Download(
-            "Download URL must use HTTPS".to_string(),
-        ));
+    // Auto-upgrade http:// to https://
+    let url = if url.to_ascii_lowercase().starts_with("http://") {
+        tracing::debug!(target: "launcher", "Upgrading http:// to https:// for: {}", url);
+        url.replacen("http://", "https://", 1)
+    } else {
+        url.to_string()
+    };
+    if !url.starts_with("https://") {
+        return Err(LauncherError::Download(format!(
+            "Download URL must use HTTPS: {}",
+            url
+        )));
     }
-    let after_scheme = &url[url.find("://").map(|i| i + 3).unwrap_or(8)..];
+    let after_scheme = &url[8..];
     let host_end = after_scheme
         .find(|c: char| c == '/' || c == ':' || c == '?' || c == '#')
         .unwrap_or(after_scheme.len());
@@ -126,7 +136,7 @@ async fn download_to_part(
     let _ = std::fs::remove_file(&part_path);
 
     let client = http_client();
-    let mut req = client.get(url);
+    let mut req = client.get(&url);
     if let Some(t) = timeout {
         req = req.timeout(t);
     }
@@ -137,17 +147,19 @@ async fn download_to_part(
 
     let status = response.status();
     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(LauncherError::Download(format!("HTTP {} for {}", status, url)));
+        return Err(LauncherError::Download(format!("HTTP {} for {}", status, &url)));
     }
 
-    // Reject non-binary responses
-    if let Some(ct) = response.headers().get("content-type") {
-        let ct_str = ct.to_str().unwrap_or("");
-        if is_rejected_content_type(ct_str) {
-            return Err(LauncherError::Download(format!(
-                "Server returned unexpected content-type '{}' for {}",
-                ct_str, url
-            )));
+    // Reject non-binary responses (only when no SHA1 to validate)
+    if expected_sha1.is_empty() {
+        if let Some(ct) = response.headers().get("content-type") {
+            let ct_str = ct.to_str().unwrap_or("");
+            if is_rejected_content_type(ct_str) {
+                return Err(LauncherError::Download(format!(
+                    "Server returned unexpected content-type '{}' for {}",
+                    ct_str, url
+                )));
+            }
         }
     }
 
@@ -183,6 +195,49 @@ async fn download_to_part(
     Ok(())
 }
 
+/// Some Mojang artifacts (e.g. `launchwrapper`) are referenced by old
+/// Forge profiles on `maven.minecraftforge.net` but only exist on
+/// Mojang's own mirror. Attempt the same path on the other host when
+/// the primary one fails (404).
+///
+/// NeoForge's `maven.neoforged.net` is IP-blocked for RU users (connect
+/// timeout), and `maven.creeperhost.net` is DPI-throttled, so we try the
+/// BMCLAPI mirror first (path without `/releases/`), then creeperhost.
+fn mirror_alternates(url: &str) -> Vec<String> {
+    const FORGE_MAVEN: &str = "https://maven.minecraftforge.net/";
+    const MOJANG_LIBRARIES: &str = "https://libraries.minecraft.net/";
+    const NEOFORGE_MAVEN: &str = "https://maven.neoforged.net/releases/";
+    const BMCLAPI_MAVEN: &str = "https://bmclapi2.bangbang93.com/maven/";
+    const CREEPERHOST_MAVEN: &str = "https://maven.creeperhost.net/";
+    if let Some(rest) = url.strip_prefix(NEOFORGE_MAVEN) {
+        vec![
+            format!("{}{}", BMCLAPI_MAVEN, rest),
+            format!("{}{}", CREEPERHOST_MAVEN, rest),
+        ]
+    } else if let Some(rest) = url.strip_prefix("https://maven.neoforged.net/") {
+        vec![
+            format!("{}{}", BMCLAPI_MAVEN, rest),
+            format!("{}{}", CREEPERHOST_MAVEN, rest),
+        ]
+    } else if let Some(rest) = url.strip_prefix(BMCLAPI_MAVEN) {
+        vec![
+            format!("{}{}", NEOFORGE_MAVEN, rest),
+            format!("{}{}", CREEPERHOST_MAVEN, rest),
+        ]
+    } else if let Some(rest) = url.strip_prefix(CREEPERHOST_MAVEN) {
+        vec![
+            format!("{}{}", NEOFORGE_MAVEN, rest),
+            format!("{}{}", BMCLAPI_MAVEN, rest),
+        ]
+    } else if let Some(rest) = url.strip_prefix(FORGE_MAVEN) {
+        vec![format!("{}{}", MOJANG_LIBRARIES, rest)]
+    } else if let Some(rest) = url.strip_prefix(MOJANG_LIBRARIES) {
+        vec![format!("{}{}", FORGE_MAVEN, rest)]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Download a single file with SHA1 verification and retry.
 /// Writes to a .part temp file, validates, then atomically renames.
 pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Result<()> {
@@ -196,17 +251,29 @@ pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Re
         }
     }
 
+    let candidates: Vec<String> = std::iter::once(url.to_string())
+        .chain(mirror_alternates(url))
+        .collect();
     let mut last_err = None;
 
-    for attempt in 1..=MAX_RETRIES {
-        match download_to_part(url, path, expected_sha1, None).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < MAX_RETRIES {
-                    sleep(Duration::from_secs(2u64.pow(attempt))).await;
+    for (ci, candidate) in candidates.iter().enumerate() {
+        // If mirrors exist, the primary host gets only one attempt so a
+        // blocked/dead host fails over to a mirror quickly instead of
+        // burning MAX_RETRIES worth of timeouts per file.
+        let attempts = if candidates.len() > 1 && ci == 0 { 1 } else { MAX_RETRIES };
+        for attempt in 1..=attempts {
+            match download_to_part(candidate, path, expected_sha1, None).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < attempts {
+                        sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                    }
                 }
             }
+        }
+        if ci + 1 < candidates.len() {
+            tracing::warn!(target: "launcher", "Primary host failed for {}, trying mirror", url);
         }
     }
 
@@ -231,17 +298,28 @@ pub async fn download_file_sized(
     tracing::info!(target: "launcher", url = %url, size = size_bytes, "Downloading {} (sized)", path.display());
 
     let timeout = timeout_for_size(size_bytes);
+    let candidates: Vec<String> = std::iter::once(url.to_string())
+        .chain(mirror_alternates(url))
+        .collect();
     let mut last_err = None;
 
-    for attempt in 1..=MAX_RETRIES {
-        match download_to_part(url, path, expected_sha1, Some(timeout)).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt < MAX_RETRIES {
-                    sleep(Duration::from_secs(2u64.pow(attempt))).await;
+    for (ci, candidate) in candidates.iter().enumerate() {
+        // Mirrors get full retries; the primary host gets a single attempt
+        // so it can't stall the whole install with repeated timeouts.
+        let attempts = if candidates.len() > 1 && ci == 0 { 1 } else { MAX_RETRIES };
+        for attempt in 1..=attempts {
+            match download_to_part(candidate, path, expected_sha1, Some(timeout)).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < attempts {
+                        sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                    }
                 }
             }
+        }
+        if ci + 1 < candidates.len() {
+            tracing::warn!(target: "launcher", "Primary host failed for {}, trying mirror", url);
         }
     }
 
@@ -353,6 +431,62 @@ pub async fn download_assets(
     Ok(())
 }
 
+/// Mirror asset objects into `<assets>/virtual/legacy` for versions that read
+/// flat paths from the assets directory instead of the objects store:
+///   - "legacy"/"pre-1.6" index (MC 1.6.x and older): the whole index, the
+///     game is given `--assetsDir <assets>/virtual/legacy`.
+///   - index with `map_to_resources` (MC 1.7.x/1.8.x): whole index, used as a
+///     fallback for legacy resource pack layouts.
+///   - 1.9+ indexes: only objects flagged `virtual: true`.
+/// Modern indexes without virtual objects are skipped entirely.
+pub fn ensure_virtual_assets(
+    index_id: &str,
+    asset_index: &crate::versions::AssetIndexData,
+    assets_dir: &PathBuf,
+) -> Result<()> {
+    let all = index_id == "legacy" || index_id == "pre-1.6" || asset_index.map_to_resources;
+    let any_virtual = asset_index.objects.values().any(|o| o.is_virtual);
+    if !all && !any_virtual {
+        return Ok(());
+    }
+
+    let objects_dir = assets_dir.join("objects");
+    let virtual_dir = assets_dir.join("virtual").join("legacy");
+    std::fs::create_dir_all(&virtual_dir)?;
+
+    let mut copied = 0usize;
+    for (name, obj) in &asset_index.objects {
+        if !all && !obj.is_virtual {
+            continue;
+        }
+        let src = objects_dir.join(&obj.hash[..2]).join(&obj.hash);
+        if !src.exists() {
+            continue;
+        }
+        let dest = virtual_dir.join(name);
+        if dest.exists() {
+            let skip = std::fs::metadata(&dest)
+                .map(|m| m.len() == obj.size)
+                .unwrap_or(false);
+            if skip {
+                continue;
+            }
+            let _ = std::fs::remove_file(&dest);
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Prefer a hard link (instant, deduplicated); fall back to a copy.
+        if std::fs::hard_link(&src, &dest).is_err() {
+            std::fs::copy(&src, &dest)?;
+        }
+        copied += 1;
+    }
+
+    tracing::info!(target: "launcher", count = copied, "Prepared virtual/legacy assets (index {})", index_id);
+    Ok(())
+}
+
 /// Verify file SHA1 hash
 pub fn verify_sha1(path: &std::path::Path, expected: &str) -> Result<bool> {
     let bytes = std::fs::read(path)?;
@@ -360,6 +494,28 @@ pub fn verify_sha1(path: &std::path::Path, expected: &str) -> Result<bool> {
     hasher.update(&bytes);
     let result = hex::encode(hasher.finalize());
     Ok(result == expected)
+}
+
+/// Verify a downloaded file is a valid ZIP/JAR archive by its magic bytes.
+/// Guards against error pages (HTML/JSON) or truncated responses being saved
+/// under a .jar/.zip name when no SHA1 is available to check.
+pub fn verify_zip_magic(path: &std::path::Path) -> Result<()> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| LauncherError::Download(format!("Cannot open downloaded file: {}", e)))?;
+    let mut header = [0u8; 4];
+    if file.read_exact(&mut header).is_err() {
+        return Err(LauncherError::Download(
+            "Downloaded file is too small to be a valid JAR archive".to_string(),
+        ));
+    }
+    // PK\x03\x04 (regular) or PK\x05\x06 (empty archive, EOCD only)
+    if header != [0x50, 0x4b, 0x03, 0x04] && header != [0x50, 0x4b, 0x05, 0x06] {
+        return Err(LauncherError::Download(
+            "Downloaded file is not a valid JAR archive".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Compute SHA1 hash of a file and return hex string
@@ -379,4 +535,52 @@ pub fn hash_file_sha1(path: &std::path::Path) -> Result<String> {
 /// Expose global client for use by other modules (versions, modloaders)
 pub fn global_http_client() -> &'static reqwest::Client {
     http_client()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("voidlauncher_test_{}_{}", std::process::id(), name));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn zip_magic_accepts_regular_zip() {
+        let p = temp_file("ok.zip", b"PK\x03\x04rest");
+        assert!(verify_zip_magic(&p).is_ok());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn zip_magic_accepts_empty_zip() {
+        let p = temp_file("empty.zip", b"PK\x05\x06rest");
+        assert!(verify_zip_magic(&p).is_ok());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn zip_magic_rejects_html() {
+        let p = temp_file("bad.jar", b"<!DOCTYPE html><html>404</html>");
+        assert!(verify_zip_magic(&p).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn zip_magic_rejects_json() {
+        let p = temp_file("bad2.jar", b"{\"error\":\"Not Found\"}");
+        assert!(verify_zip_magic(&p).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn zip_magic_rejects_too_small() {
+        let p = temp_file("tiny.jar", b"PK");
+        assert!(verify_zip_magic(&p).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
 }

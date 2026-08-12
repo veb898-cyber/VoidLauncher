@@ -1,9 +1,12 @@
 use crate::error::{LauncherError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+
+/// Uncomment to always return hardcoded versions (skip API)
+// const FORCE_STATIC_VERSIONS: bool = true;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JavaDownloadProgress {
@@ -33,8 +36,6 @@ pub struct AvailableJavaVersion {
 /// Adoptium API response
 #[derive(Debug, Deserialize)]
 struct AdoptiumVersionData {
-    #[serde(rename = "release_name")]
-    version: String,
     binaries: Vec<AdoptiumBinary>,
 }
 
@@ -67,52 +68,110 @@ fn download_client() -> &'static reqwest::Client {
             .timeout(Duration::from_secs(1800))
             .connect_timeout(Duration::from_secs(30))
             .no_gzip()
+            .no_brotli()
+            .no_deflate()
             .user_agent("VoidLauncher/0.1.5")
             .build()
             .expect("Failed to create Java download client (check TLS libraries)")
     })
 }
 
-/// List Java versions available for download from Adoptium
+/// Adoptium /info/available_releases response (subset of fields)
+#[derive(Debug, Deserialize)]
+struct AdoptiumReleasesInfo {
+    available_releases: Vec<u32>,
+}
+
+/// In-memory cache so reopening settings does not re-hit the API (like Prism Launcher)
+const JAVA_LIST_CACHE_TTL: Duration = Duration::from_secs(600);
+
+static JAVA_LIST_CACHE: OnceLock<Mutex<Option<(Instant, Vec<AvailableJavaVersion>)>>> = OnceLock::new();
+
+fn java_list_cache() -> &'static Mutex<Option<(Instant, Vec<AvailableJavaVersion>)>> {
+    JAVA_LIST_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Java versions actually used by Minecraft Java Edition:
+/// 8  - up to 1.16.5
+/// 16 - 1.17 .. 1.17.1
+/// 17 - 1.18 .. 1.20.4
+/// 21 - 1.20.5 .. 26.1
+/// 25 - 26.2 and newer (per minecraft.wiki system requirements)
+const MC_SUPPORTED_JAVA: [u32; 5] = [8, 16, 17, 21, 25];
+
+/// List Java versions available for download from Adoptium.
+/// Uses ONLY the lightweight /info/available_releases endpoint. The
+/// /v3/assets/... endpoint gets throttled ~30-40s on some networks (RKN/DPI),
+/// so it is deliberately NOT used for listing; exact build labels are
+/// resolved later by the download flow itself.
 pub async fn list_available_java_versions() -> Result<Vec<AvailableJavaVersion>> {
-    let supported = [8u32, 11, 17, 21, 23, 25];
-    let client = download_client();
-    let mut versions = Vec::new();
-
-    for major in &supported {
-        let url = format!(
-            "{}/assets/feature_releases/{}/ga?architecture=x64&image_type=jdk&os=windows&vendor=eclipse&page_size=1",
-            ADOPTIUM_API, major
-        );
-
-        let resp = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        if !resp.status().is_success() {
-            continue;
-        }
-
-        let data: Vec<AdoptiumVersionData> = match resp.json().await {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-
-        if let Some(entry) = data.into_iter().next() {
-            let version_str = entry.version
-                .trim_start_matches("jdk-")
-                .trim_start_matches("jre-")
-                .to_string();
-            let label = format!("Java {} ({})", major, version_str);
-            tracing::debug!(target: "launcher", "Found available Java version: {}", label);
-            versions.push(AvailableJavaVersion {
-                major_version: *major,
-                label,
-            });
+    if let Some((fetched_at, versions)) = java_list_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        if fetched_at.elapsed() < JAVA_LIST_CACHE_TTL {
+            tracing::debug!(target: "launcher", "Returning cached Java version list ({} entries)", versions.len());
+            return Ok(versions.clone());
         }
     }
 
+    let client = download_client();
+
+    let supported: Vec<u32> = {
+        let url = format!("{}/info/available_releases", ADOPTIUM_API);
+        let result = tokio::time::timeout(Duration::from_secs(15), client.get(&url).send()).await;
+        let releases = match result {
+            Ok(Ok(resp)) if resp.status().is_success() => match resp.json::<AdoptiumReleasesInfo>().await {
+                Ok(info) => Some(info.available_releases),
+                Err(e) => {
+                    tracing::warn!(target: "launcher", "Failed to parse Adoptium releases info: {}", e);
+                    None
+                }
+            },
+            Ok(Ok(resp)) => {
+                tracing::warn!(target: "launcher", "Adoptium releases info returned HTTP {}", resp.status());
+                None
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(target: "launcher", "Adoptium releases info error: {}", e);
+                None
+            }
+            Err(_) => {
+                tracing::warn!(target: "launcher", "Timeout fetching Adoptium releases info (15s)");
+                None
+            }
+        };
+        match releases {
+            Some(list) => {
+                let matching: Vec<u32> = MC_SUPPORTED_JAVA
+                    .iter()
+                    .copied()
+                    .filter(|major| list.contains(major))
+                    .collect();
+                tracing::info!(target: "launcher", "Adoptium releases matching Minecraft's Java needs: {:?}", matching);
+                if matching.is_empty() {
+                    tracing::warn!(target: "launcher", "No matching releases from Adoptium, falling back to static list");
+                    MC_SUPPORTED_JAVA.to_vec()
+                } else {
+                    matching
+                }
+            }
+            None => MC_SUPPORTED_JAVA.to_vec(),
+        }
+    };
+
+    let versions: Vec<AvailableJavaVersion> = supported
+        .into_iter()
+        .map(|major| AvailableJavaVersion {
+            major_version: major,
+            label: format!("Java {}", major),
+        })
+        .collect();
+
+    *java_list_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), versions.clone()));
     Ok(versions)
 }
 
@@ -157,7 +216,8 @@ pub async fn download_java_runtime(
 
     let client = download_client();
 
-    // Phase 1: Resolve download URL
+    // Phase 1: Resolve download URL. The /assets endpoint is sometimes
+    // throttled ~30-40s on certain networks, so retry a few times.
     emit_progress(5.0, "resolving", "Querying Adoptium API...");
 
     let url = format!(
@@ -165,9 +225,25 @@ pub async fn download_java_runtime(
         ADOPTIUM_API, major_version
     );
 
-    let resp = client.get(&url).send().await.map_err(|e| {
-        tracing::error!(target: "launcher", "Adoptium API request failed: {}", e);
-        LauncherError::Download(format!("Adoptium API error: {}", e))
+    let mut resolved = None;
+    for attempt in 1..=3 {
+        match tokio::time::timeout(Duration::from_secs(90), client.get(&url).send()).await {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                resolved = Some(resp);
+                break;
+            }
+            Ok(Ok(resp)) => tracing::warn!(target: "launcher", "Adoptium API returned HTTP {} (attempt {}/3)", resp.status(), attempt),
+            Ok(Err(e)) => tracing::warn!(target: "launcher", "Adoptium API request failed (attempt {}/3): {}", attempt, e),
+            Err(_) => tracing::warn!(target: "launcher", "Adoptium API request timed out (attempt {}/3)", attempt),
+        }
+        if attempt < 3 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+
+    let resp = resolved.ok_or_else(|| {
+        tracing::error!(target: "launcher", "Adoptium API unreachable for Java {}", major_version);
+        LauncherError::Download(format!("Adoptium API error for Java {}", major_version))
     })?;
 
     let data: Vec<AdoptiumVersionData> = resp.json().await.map_err(|e| {

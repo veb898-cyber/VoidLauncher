@@ -38,3 +38,8 @@ Desktop.ini
 
 # Signing keys
 *.key
+# AI notebook (internal instructions)
+PROJECT_NOTEBOOK.md
+# Personal AI instructions & changelog (never commit)
+AGENTS.md
+CHANGELOG.md

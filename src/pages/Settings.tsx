@@ -173,7 +173,6 @@ export function Settings() {
             <input
               className="input"
               type="text"
-              placeholder={t('settings.java_placeholder')}
               value={localConfig.java_path || ''}
               onChange={(e) => updateConfig('java_path', e.target.value || null)}
               style={{ width: 250, fontSize: 'var(--font-size-xs)' }}

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useT } from '../lib/i18n';
@@ -23,6 +24,9 @@ export function GameLogs() {
   const [currentGameLog, setCurrentGameLog] = useState<string | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerPos, setPickerPos] = useState<{ top: number; left: number; width: number } | null>(null);
+  const pickerBtnRef = useRef<HTMLButtonElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const contentRef = useRef('');
@@ -143,6 +147,40 @@ export function GameLogs() {
     autoScrollRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
   };
 
+  const togglePicker = () => {
+    if (pickerOpen) {
+      setPickerOpen(false);
+      return;
+    }
+    const el = pickerBtnRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setPickerPos({ top: r.bottom + 6, left: r.left, width: r.width });
+    setPickerOpen(true);
+  };
+
+  const selectSession = (path: string) => {
+    setSelectedPath(path);
+    setPickerOpen(false);
+  };
+
+  // Close the picker dropdown on Escape or window resize
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPickerOpen(false);
+    };
+    const onResize = () => setPickerOpen(false);
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [pickerOpen]);
+
+  const selectedSession = sessions.find((s) => s.path === selectedPath) || null;
+
   const handleDelete = async () => {
     if (!selectedPath) return;
     setDeleting(true);
@@ -198,26 +236,58 @@ export function GameLogs() {
         </div>
         <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'center' }}>
           {sessions.length > 0 && (
-            <div className="game-logs-select-wrapper">
-              <select
-                className="game-logs-select"
-                value={selectedPath || ''}
-                onChange={(e) => setSelectedPath(e.target.value)}
-              >
-                {sessions.map((s) => {
-                  const isCurrent = currentGameLog === s.path;
-                  const label = `${s.instance_name} — ${s.started_at} (${formatSize(s.size_bytes)})`;
-                  return (
-                    <option key={s.path} value={s.path}>
-                      {isCurrent ? '● ' : ''}{label}
-                    </option>
-                  );
-                })}
-              </select>
-              <svg className="game-logs-select-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <button
+              ref={pickerBtnRef}
+              className="game-logs-picker-trigger"
+              onClick={togglePicker}
+              title={selectedSession ? `${selectedSession.instance_name} — ${selectedSession.started_at}` : ''}
+            >
+              <span className={`game-logs-picker-dot${currentGameLog && selectedPath === currentGameLog ? ' game-logs-picker-dot--live' : ''}`} />
+              <span className="game-logs-picker-trigger-instance">
+                {selectedSession ? selectedSession.instance_name : ''}
+              </span>
+              <span className="game-logs-picker-trigger-time">
+                {selectedSession ? selectedSession.started_at.slice(5, 16) : ''}
+              </span>
+              <span className="game-logs-picker-trigger-size">
+                {selectedSession ? formatSize(selectedSession.size_bytes) : ''}
+              </span>
+              <svg className={`game-logs-picker-chevron${pickerOpen ? ' game-logs-picker-chevron--open' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <polyline points="6 9 12 15 18 9" />
               </svg>
-            </div>
+            </button>
+          )}
+
+          {pickerOpen && pickerPos && createPortal(
+            <>
+              <div className="game-logs-picker-overlay" onClick={() => setPickerOpen(false)} />
+              <div className="game-logs-picker-panel" style={{ top: pickerPos.top, left: pickerPos.left, minWidth: pickerPos.width }}>
+                <div className="game-logs-picker-header">
+                  {t('game_logs.recent_sessions')}
+                </div>
+                {sessions.map((s) => {
+                  const isCurrent = currentGameLog === s.path;
+                  const isSelected = selectedPath === s.path;
+                  return (
+                    <div
+                      key={s.path}
+                      className={`game-logs-picker-row${isSelected ? ' game-logs-picker-row--selected' : ''}`}
+                      onClick={() => selectSession(s.path)}
+                    >
+                      <span className={`game-logs-picker-dot${isCurrent ? ' game-logs-picker-dot--live' : ''}`} />
+                      <span className="game-logs-picker-row-instance">{s.instance_name}</span>
+                      {isCurrent && (
+                        <span className="game-logs-picker-badge">{t('game_logs.active')}</span>
+                      )}
+                      <span className="game-logs-picker-row-meta">
+                        {s.started_at} · {formatSize(s.size_bytes)}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </>,
+            document.body,
           )}
           <button className="btn btn--ghost btn--sm" onClick={() => {
             navigator.clipboard.writeText(lines.join('\n'));

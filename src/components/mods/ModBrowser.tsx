@@ -445,7 +445,7 @@ export function ModBrowser({ mcVersion, loader, onConfirm, onCancel }: ModBrowse
         </div>
         <div style={{ position: 'relative', flex: 1 }}>
           <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
-          <input className="input" type="text" placeholder={t('mod.search_placeholder')} value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && search()} style={{ paddingLeft: 32 }} />
+          <input className="input" type="text" value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && search()} style={{ paddingLeft: 32 }} />
         </div>
         <Button onClick={search} loading={searching}>{t('common.search')}</Button>
       </div>

@@ -650,7 +650,6 @@ async fn import_mrpack(
         Some("fabric") => LoaderType::Fabric,
         Some("forge") => LoaderType::Forge,
         Some("neoforge") => LoaderType::NeoForge,
-        Some("quilt") => LoaderType::Quilt,
         _ => LoaderType::Vanilla,
     };
 
@@ -674,7 +673,7 @@ async fn import_mrpack(
         notes: String::new(),
     };
 
-    instances::save_instance(instances_dir, &instance)?;
+    instances::save_instance(instances_dir, &instance, None)?;
     tracing::info!(target: "launcher", "Imported Modrinth pack as '{}' ({} client files, {} mods)", instance_name, total, mod_count);
     Ok(instance)
 }
@@ -908,7 +907,6 @@ async fn import_curseforge_pack(
         Some("fabric") => LoaderType::Fabric,
         Some("forge") => LoaderType::Forge,
         Some("neoforge") => LoaderType::NeoForge,
-        Some("quilt") => LoaderType::Quilt,
         _ => LoaderType::Vanilla,
     };
 
@@ -932,7 +930,7 @@ async fn import_curseforge_pack(
         notes: String::new(),
     };
 
-    instances::save_instance(instances_dir, &instance)?;
+    instances::save_instance(instances_dir, &instance, None)?;
 
     tracing::info!(target: "launcher", "Imported CurseForge pack as '{}' ({} mods) - loader install pending", instance_name, total);
     Ok(instance)
@@ -1001,7 +999,7 @@ fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &s
         notes: String::new(),
     };
 
-    instances::save_instance(instances_dir, &instance)?;
+    instances::save_instance(instances_dir, &instance, None)?;
     tracing::info!(target: "launcher", "Imported ATLauncher pack as '{}'", instance_name);
     Ok(instance)
 }

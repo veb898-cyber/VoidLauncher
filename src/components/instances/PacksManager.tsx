@@ -192,7 +192,7 @@ export function PacksManager({ instanceName, packType, onOpenFolder }: Props) {
       <div style={{ padding: '8px var(--space-2xl)', borderTop: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
         <div style={{ position: 'relative', flex: 1, maxWidth: 300 }}>
           <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
-          <input className="input" type="text" placeholder={t('manager.search_placeholder', { label: label.toLowerCase() })} value={search} onChange={(e) => setSearch(e.target.value)} style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
+          <input className="input" type="text" value={search} onChange={(e) => setSearch(e.target.value)} style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
         </div>
         <Button size="sm" variant="secondary" onClick={() => setShowBrowser(true)}>
           <Download size={14} /> {t('common.download')}

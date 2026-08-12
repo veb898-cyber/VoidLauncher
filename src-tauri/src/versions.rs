@@ -58,6 +58,17 @@ pub struct JavaVersionReq {
     pub major_version: u32,
 }
 
+impl VersionInfo {
+    /// Java major version required by the manifest. Versions without a
+    /// `javaVersion` field (1.6.4 and older) are Java 8-era — default to 8.
+    pub fn required_java_major(&self) -> u32 {
+        self.java_version
+            .as_ref()
+            .map(|v| v.major_version)
+            .unwrap_or(8)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Arguments {
     #[serde(default)]
@@ -129,12 +140,19 @@ pub struct OsRule {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AssetIndexData {
     pub objects: std::collections::HashMap<String, AssetObject>,
+    /// Legacy flag: launcher should mirror the whole index into
+    /// `assets/virtual/legacy` (used by 1.7.x/1.8.x for old resource packs).
+    #[serde(default)]
+    pub map_to_resources: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AssetObject {
     pub hash: String,
     pub size: u64,
+    /// When true (1.9+ indexes), the object is part of the virtual/legacy tree.
+    #[serde(default, rename = "virtual")]
+    pub is_virtual: bool,
 }
 
 /// Fetch version manifest from Mojang
@@ -202,7 +220,10 @@ pub fn should_include_library(lib: &Library) -> bool {
     let current_os = std::env::consts::OS;
     let current_arch = std::env::consts::ARCH;
 
-    let mut dominated_action = "allow";
+    // Per the version.json spec: libraries with rules are included only if
+    // the last matching rule allows them. If no rule matches (e.g. a
+    // macOS-only library on Windows), the library must be excluded.
+    let mut dominated_action = "disallow";
 
     for rule in rules {
         let matches = match &rule.os {
@@ -253,7 +274,23 @@ pub fn maven_to_path(name: &str) -> String {
     }
 }
 
-/// Build classpath from version info libraries
+/// Return the native classifier for the current OS (e.g. "natives-windows")
+/// by reading the library's `natives` map, or None if not applicable.
+fn native_classifier(lib: &Library) -> Option<String> {
+    let natives = lib.natives.as_ref()?;
+    let os_map = natives.as_object()?;
+    let os_key = match std::env::consts::OS {
+        "windows" => "windows",
+        "macos" => "osx",
+        _ => std::env::consts::OS,
+    };
+    let classifier = os_map.get(os_key)?.as_str()?;
+    // Old manifests contain `${arch}` (e.g. "natives-windows-${arch}") —
+    // the launcher always targets 64-bit here.
+    Some(classifier.replace("${arch}", "64"))
+}
+
+/// Build classpath from version info libraries, including native classifier JARs.
 pub fn build_classpath(version_info: &VersionInfo, libraries_dir: &PathBuf, client_jar: &PathBuf) -> String {
     let mut classpath_entries: Vec<String> = Vec::new();
 
@@ -262,19 +299,32 @@ pub fn build_classpath(version_info: &VersionInfo, libraries_dir: &PathBuf, clie
             continue;
         }
 
-        let lib_path = if let Some(downloads) = &lib.downloads {
+        if let Some(downloads) = &lib.downloads {
             if let Some(artifact) = &downloads.artifact {
-                libraries_dir.join(&artifact.path)
-            } else {
-                continue;
+                let lib_path = libraries_dir.join(&artifact.path);
+                if lib_path.exists() {
+                    classpath_entries.push(lib_path.to_string_lossy().to_string());
+                }
+            }
+            // Add native classifier JAR (e.g. lwjgl-3.2.1-natives-windows.jar)
+            if let Some(classifier) = native_classifier(lib) {
+                if let Some(classifiers) = &downloads.classifiers {
+                    if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
+                        if let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) {
+                            let native_path = libraries_dir.join(path);
+                            if native_path.exists() {
+                                classpath_entries.push(native_path.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
             }
         } else {
             let path = maven_to_path(&lib.name);
-            libraries_dir.join(path)
-        };
-
-        if lib_path.exists() {
-            classpath_entries.push(lib_path.to_string_lossy().to_string());
+            let lib_path = libraries_dir.join(&path);
+            if lib_path.exists() {
+                classpath_entries.push(lib_path.to_string_lossy().to_string());
+            }
         }
     }
 
@@ -317,7 +367,8 @@ pub fn get_jvm_arguments(version_info: &VersionInfo) -> Vec<String> {
     }
 }
 
-/// Collect all files that need to be downloaded for a version
+/// Collect all files that need to be downloaded for a version, including native
+/// classifier JARs (e.g. lwjgl natives for the current platform).
 pub fn collect_downloads(
     version_info: &VersionInfo,
     libraries_dir: &PathBuf,
@@ -329,7 +380,7 @@ pub fn collect_downloads(
     // Client JAR
     let client_path = versions_dir
         .join(&version_info.id)
-        .join(format!("{}.jar", version_info.id));
+        .join("client.jar");
     files.push((
         version_info.downloads.client.url.clone(),
         client_path,
@@ -344,6 +395,7 @@ pub fn collect_downloads(
         }
 
         if let Some(downloads) = &lib.downloads {
+            // Main artifact
             if let Some(artifact) = &downloads.artifact {
                 let lib_path = libraries_dir.join(&artifact.path);
                 if !lib_path.exists() {
@@ -353,6 +405,29 @@ pub fn collect_downloads(
                         artifact.sha1.clone(),
                         artifact.size,
                     ));
+                }
+            }
+            // Native classifier artifact for current OS
+            if let Some(classifier) = native_classifier(lib) {
+                if let Some(classifiers) = &downloads.classifiers {
+                    if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
+                        if let (Some(url), Some(path), Some(sha1), Some(size)) = (
+                            native_artifact.get("url").and_then(|u| u.as_str()),
+                            native_artifact.get("path").and_then(|p| p.as_str()),
+                            native_artifact.get("sha1").and_then(|s| s.as_str()),
+                            native_artifact.get("size").and_then(|s| s.as_u64()),
+                        ) {
+                            let native_path = libraries_dir.join(path);
+                            if !native_path.exists() {
+                                files.push((
+                                    url.to_string(),
+                                    native_path,
+                                    sha1.to_string(),
+                                    size,
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         } else if let Some(url_base) = &lib.url {
@@ -381,4 +456,217 @@ pub fn version_info_from_file(path: &PathBuf) -> Result<VersionInfo> {
         .map_err(|e| LauncherError::Version(format!("Failed to parse version JSON: {}", e)))?;
     
     Ok(info)
+}
+
+/// Load a saved asset index (e.g. `indexes/legacy.json`) from disk
+pub fn load_asset_index(path: &PathBuf) -> Result<AssetIndexData> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| LauncherError::Version(format!("Failed to read asset index: {}", e)))?;
+
+    let index: AssetIndexData = serde_json::from_str(&contents)
+        .map_err(|e| LauncherError::Version(format!("Failed to parse asset index: {}", e)))?;
+
+    Ok(index)
+}
+
+/// Download any missing native classifier JARs (e.g. LWJGL natives-windows)
+/// for the current OS. Called at launch to self-heal installs that predate
+/// native-JAR support.
+pub async fn ensure_native_libraries(
+    version_info: &VersionInfo,
+    libraries_dir: &PathBuf,
+) -> Result<()> {
+    let mut missing: Vec<(String, PathBuf, String)> = Vec::new();
+
+    for lib in &version_info.libraries {
+        if !should_include_library(lib) {
+            continue;
+        }
+        if let Some(classifier) = native_classifier(lib) {
+            if let Some(downloads) = &lib.downloads {
+                if let Some(classifiers) = &downloads.classifiers {
+                    if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
+                        if let (Some(url), Some(path), sha1) = (
+                            native_artifact.get("url").and_then(|u| u.as_str()),
+                            native_artifact.get("path").and_then(|p| p.as_str()),
+                            native_artifact.get("sha1").and_then(|s| s.as_str()).unwrap_or(""),
+                        ) {
+                            let native_path = libraries_dir.join(path);
+                            if !native_path.exists() {
+                                missing.push((url.to_string(), native_path, sha1.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(target: "launcher", "Downloading {} missing native libraries...", missing.len());
+    for (url, path, sha1) in &missing {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        crate::download::download_file(url, path, sha1).await.map_err(|e| {
+            LauncherError::Version(format!("Failed to download native library {}: {}", url, e))
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Extract native libraries (DLLs etc.) from the native classifier JARs into
+/// the natives directory so they can be found via -Djava.library.path.
+/// This mirrors the official launcher behavior and also covers old LWJGL
+/// versions that do not load natives from the classpath.
+pub fn extract_natives(version_info: &VersionInfo, libraries_dir: &PathBuf, natives_dir: &PathBuf) {
+    use std::io::Read;
+
+    std::fs::create_dir_all(natives_dir).ok();
+
+    for lib in &version_info.libraries {
+        if !should_include_library(lib) {
+            continue;
+        }
+        if let Some(classifier) = native_classifier(lib) {
+            if let Some(downloads) = &lib.downloads {
+                if let Some(classifiers) = &downloads.classifiers {
+                    if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
+                        if let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) {
+                            let jar_path = libraries_dir.join(path);
+                            if !jar_path.exists() {
+                                continue;
+                            }
+                            let Ok(bytes) = std::fs::read(&jar_path) else { continue };
+                            let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+                            else { continue };
+                            for i in 0..archive.len() {
+                                let Ok(mut entry) = archive.by_index(i) else { continue };
+                                let name = entry.name().replace('\\', "/");
+                                if name.starts_with("META-INF/") || name.ends_with('/') {
+                                    continue;
+                                }
+                                let dest = natives_dir.join(&name);
+                                if dest.exists() {
+                                    continue;
+                                }
+                                if let Some(parent) = dest.parent() {
+                                    std::fs::create_dir_all(parent).ok();
+                                }
+                                if let Ok(mut file) = std::fs::File::create(&dest) {
+                                    use std::io::Write;
+                                    let mut buf = Vec::new();
+                                    if entry.read_to_end(&mut buf).is_ok() {
+                                        let _ = file.write_all(&buf);
+                                        tracing::debug!(target: "launcher", "Extracted native: {}", dest.display());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn library_with_natives(natives: &str) -> Library {
+        Library {
+            name: "org.lwjgl.lwjgl:lwjgl-platform:2.9.4".to_string(),
+            url: None,
+            rules: None,
+            natives: Some(serde_json::json!({ "windows": natives })),
+            downloads: None,
+        }
+    }
+
+    #[test]
+    fn native_classifier_substitutes_arch() {
+        let lib = library_with_natives("natives-windows-${arch}");
+        let classifier = native_classifier(&lib).expect("classifier expected");
+        assert_eq!(classifier, "natives-windows-64");
+    }
+
+    #[test]
+    fn native_classifier_plain_windows() {
+        let lib = library_with_natives("natives-windows");
+        assert_eq!(native_classifier(&lib).as_deref(), Some("natives-windows"));
+    }
+
+    #[test]
+    fn native_classifier_missing_os() {
+        let lib = Library {
+            name: "org.lwjgl.lwjgl:lwjgl-platform:2.9.4".to_string(),
+            url: None,
+            rules: None,
+            natives: Some(serde_json::json!({ "osx": "natives-osx" })),
+            downloads: None,
+        };
+        assert!(native_classifier(&lib).is_none());
+    }
+
+    fn lib_with_rules(rules: Option<Vec<Rule>>) -> Library {
+        Library {
+            name: "org.lwjgl:lwjgl:3.2.1".to_string(),
+            url: None,
+            rules,
+            natives: None,
+            downloads: None,
+        }
+    }
+
+    #[test]
+    fn library_without_rules_is_included() {
+        assert!(should_include_library(&lib_with_rules(None)));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn osx_only_library_is_excluded_on_other_os() {
+        // 1.16.x ships LWJGL twice: 3.2.1 (allow:osx only) and 3.2.2
+        // (allow + disallow:osx). On Windows the macOS variant must be
+        // excluded, otherwise both versions land on the classpath and the
+        // mismatched natives crash with EXCEPTION_ACCESS_VIOLATION.
+        let rules = Some(vec![Rule {
+            action: "allow".to_string(),
+            os: Some(OsRule { name: Some("osx".to_string()), arch: None }),
+        }]);
+        assert!(!should_include_library(&lib_with_rules(rules)));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn cross_platform_library_is_included_on_non_macos() {
+        let rules = Some(vec![
+            Rule { action: "allow".to_string(), os: None },
+            Rule {
+                action: "disallow".to_string(),
+                os: Some(OsRule { name: Some("osx".to_string()), arch: None }),
+            },
+        ]);
+        assert!(should_include_library(&lib_with_rules(rules)));
+    }
+
+    #[test]
+    fn asset_index_parses_virtual_and_map_flags() {
+        let json = r#"{
+            "map_to_resources": true,
+            "objects": {
+                "sound/a.ogg": { "hash": "abc123", "size": 10, "virtual": true },
+                "texts/b.txt": { "hash": "def456", "size": 20 }
+            }
+        }"#;
+        let index: AssetIndexData = serde_json::from_str(json).unwrap();
+        assert!(index.map_to_resources);
+        assert!(index.objects["sound/a.ogg"].is_virtual);
+        assert!(!index.objects["texts/b.txt"].is_virtual);
+    }
 }

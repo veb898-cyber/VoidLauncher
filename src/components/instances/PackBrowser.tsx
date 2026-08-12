@@ -56,7 +56,15 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
   useEffect(() => { loadPopular(); }, [loadPopular]);
 
   const handleSearch = async () => {
-    if (!query.trim()) { loadPopular(); return; }
+    if (!query.trim()) {
+      // Clearing the search must return to the default "popular" list;
+      // otherwise stale results would keep being displayed.
+      setResults([]);
+      setLoaded(true);
+      setSelected(null);
+      loadPopular();
+      return;
+    }
     setLoading(true);
     setSelected(null);
     try {
@@ -239,7 +247,7 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
       <div style={{ padding: 'var(--space-sm) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
         <div style={{ position: 'relative', flex: 1 }}>
           <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
-          <input className="input" type="text" placeholder={t('pack.search_placeholder', { label: label.toLowerCase() })} value={query} onChange={(e) => setQuery(e.target.value)}
+          <input className="input" type="text" value={query} onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
             style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
         </div>

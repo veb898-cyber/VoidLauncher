@@ -3,6 +3,7 @@ import { Plus, Play, Trash2, Package, X, Download, Upload } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import { useInstanceStore } from '../stores/instanceStore';
+import { useBrowserGuardStore } from '../stores/browserGuardStore';
 import { t, formatPlayTime } from '../lib/i18n';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { Button } from '../components/ui/Button';
@@ -182,7 +183,7 @@ export function Instances() {
               key={instance.name}
               className="instance-card"
               onContextMenu={(e) => handleContextMenu(e, instance.name)}
-              onClick={() => selectInstance(instance.name)}
+              onClick={() => useBrowserGuardStore.getState().askLeave(() => selectInstance(instance.name))}
             >
               <div className="instance-card__banner" />
               <div className="instance-card__icon instance-card--banner-icon">
@@ -288,7 +289,6 @@ export function Instances() {
           <input
             className="input"
             type="text"
-            placeholder={t('create_instance.name_placeholder')}
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             autoFocus

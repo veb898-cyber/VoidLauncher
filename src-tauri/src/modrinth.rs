@@ -119,6 +119,7 @@ pub async fn search_mods(
     project_type: &str,
     mc_version: Option<&str>,
     loader: Option<&str>,
+    index: Option<&str>,
     offset: u32,
     limit: u32,
 ) -> Result<ModrinthSearchResponse> {
@@ -136,11 +137,13 @@ pub async fn search_mods(
     }
 
     let facets_str = format!("[{}]", facets.join(","));
+    let index_str = index.unwrap_or("relevance");
     let url = format!(
-        "{}/search?query={}&facets={}&index=relevance&limit={}&offset={}",
+        "{}/search?query={}&facets={}&index={}&limit={}&offset={}",
         BASE_URL,
         urlencoding::encode(query),
         urlencoding::encode(&facets_str),
+        index_str,
         limit,
         offset
     );
@@ -247,6 +250,7 @@ pub async fn popular_mods(
     project_type: &str,
     mc_version: Option<&str>,
     loader: Option<&str>,
+    index: Option<&str>,
     limit: u32,
     offset: u32,
 ) -> Result<ModrinthSearchResponse> {
@@ -264,10 +268,12 @@ pub async fn popular_mods(
     }
 
     let facets_str = format!("[{}]", facets.join(","));
+    let index_str = index.unwrap_or("downloads");
     let url = format!(
-        "{}/search?query=&facets={}&index=downloads&limit={}&offset={}",
+        "{}/search?query=&facets={}&index={}&limit={}&offset={}",
         BASE_URL,
         urlencoding::encode(&facets_str),
+        index_str,
         limit,
         offset,
     );

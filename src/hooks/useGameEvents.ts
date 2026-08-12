@@ -84,11 +84,18 @@ export function useGameEvents() {
       }
     }));
 
-    register(listen<LaunchEvent>('game_started', (event) => {
+    register(listen<LaunchEvent>('game_started', async (event) => {
       const p = event.payload;
       if (p.status === 'running') {
         setRunningGameId(p.instance_id);
         setGameRunning(true);
+        // Minimize the launcher only once the game process is actually
+        // running. If the launch fails before this point, the window stays
+        // visible so the user sees the error.
+        try {
+          const { getCurrentWindow } = await import('@tauri-apps/api/window');
+          await getCurrentWindow().minimize();
+        } catch { /* best-effort */ }
       }
     }));
 
@@ -96,11 +103,11 @@ export function useGameEvents() {
       const p = event.payload;
       setRunningGameId(null);
       setGameRunning(false);
-      // If the launcher minimized itself on Play click (see launchGame
-      // in instanceStore), restore it now so the user actually sees any
-      // crash. A non-zero exit code means the Java process died — surface
-      // it in the launcher log so users can find the cause without having
-      // to dig through Minecraft's own logs.
+      // If the launcher minimized itself when the game started (see the
+      // `game_started` handler), restore it on a crash so the user actually
+      // sees the error. A non-zero exit code means the Java process died —
+      // surface it in the launcher log so users can find the cause without
+      // having to dig through Minecraft's own logs.
       if (p.exit_code !== null && p.exit_code !== undefined && p.exit_code !== 0) {
         try {
           const { getCurrentWindow } = await import('@tauri-apps/api/window');

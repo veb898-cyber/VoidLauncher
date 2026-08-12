@@ -144,7 +144,6 @@ pub fn loader_type_id(loader: &str) -> Option<u32> {
     match loader.to_lowercase().as_str() {
         "forge" => Some(1),
         "fabric" => Some(4),
-        "quilt" => Some(5),
         "neoforge" => Some(6),
         _ => None,
     }

@@ -199,6 +199,25 @@ async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
     Ok(entries)
 }
 
+/// Compare two version strings numerically (semver-style).
+/// Splits by '.' and compares each segment as u32. If one version
+/// has more segments, it is considered greater only if all shared
+/// segments are equal. Falls back to string comparison if parsing
+/// fails (handles pre-release tags like "alpha", "beta").
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_parts: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
+    let b_parts: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+    let len = a_parts.len().max(b_parts.len());
+    for i in 0..len {
+        let a_val = a_parts.get(i).copied().unwrap_or(0);
+        let b_val = b_parts.get(i).copied().unwrap_or(0);
+        if a_val != b_val {
+            return a_val.cmp(&b_val);
+        }
+    }
+    a.cmp(b)
+}
+
 /// Filter `entries` by MC version, sort newest-first, and return
 /// the page starting at `offset` of up to `limit` items plus the
 /// total count. Extracted from `fetch_loader_versions` so the
@@ -219,7 +238,7 @@ fn page_from(
         })
         .collect();
 
-    filtered.sort_by(|a, b| b.version.cmp(&a.version));
+    filtered.sort_by(|a, b| compare_versions(&b.version, &a.version));
 
     let total = filtered.len();
     let page: Vec<LoaderVersion> = filtered

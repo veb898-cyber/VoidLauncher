@@ -21,7 +21,7 @@ export interface LoaderProfile {
 export interface Instance {
   name: string;
   mc_version: string;
-  loader: 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge';
+  loader: 'Vanilla' | 'Fabric' | 'Forge' | 'NeoForge';
   loader_version: string | null;
   loader_profile: LoaderProfile | null;
   memory_mb: number | null;
@@ -95,10 +95,9 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       await invoke('cmd_create_instance', { name, mcVersion, loader, loaderVersion });
       const instances = await invoke<Instance[]>('cmd_list_instances');
       set({ instances, isLoading: false });
-    } catch (e: any) {
-      const msg = e.toString();
-      reportInstanceError(msg);
-      set({ error: msg, isLoading: false });
+    } catch (e) {
+      set({ isLoading: false });
+      throw e;
     }
   },
 
@@ -135,25 +134,14 @@ export const useInstanceStore = create<InstanceState>((set) => ({
 
     set({ launchStatus: 'Launching...' });
     reportLaunchStatus('Launching...');
-    // Minimize the window immediately on click, as requested.
-    // If launch fails OR the game crashes shortly after, the
-    // `launch_complete` handler in useGameEvents restores the window
-    // so the user actually sees the error.
-    const { getCurrentWindow } = await import('@tauri-apps/api/window');
-    const win = getCurrentWindow();
-    let minimized = false;
-    try {
-      await win.minimize();
-      minimized = true;
-    } catch { /* window control may be unavailable */ }
+    // The window is NOT minimized here. It gets minimized only when the
+    // `game_started` event arrives from the backend (see useGameEvents),
+    // i.e. when the Minecraft process is actually running.
     try {
       const result = await invoke<string>('cmd_launch_game', { instanceName });
       reportLaunchStatus(result);
       set({ isLaunching: false, launchStatus: result });
     } catch (e: any) {
-      if (minimized) {
-        try { await win.unminimize(); } catch { /* best-effort */ }
-      }
       const msg = e.toString();
       reportInstanceError(msg);
       set({ isLaunching: false, launchStatus: null, error: msg });

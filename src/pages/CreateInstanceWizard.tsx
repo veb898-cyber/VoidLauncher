@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { t } from '../lib/i18n';
+import { t, getLanguage } from '../lib/i18n';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
@@ -43,7 +43,7 @@ interface CreateWizardProps {
   onClose: () => void;
 }
 
-type LoaderType = 'Vanilla' | 'Fabric' | 'Quilt' | 'Forge' | 'NeoForge';
+type LoaderType = 'Vanilla' | 'Fabric' | 'Forge' | 'NeoForge';
 
 const LOADER_PAGE_SIZE = 20;
 const SCROLL_LOAD_THRESHOLD_PX = 50;
@@ -64,12 +64,13 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
 
   const [loaderType, setLoaderType] = useState<LoaderType>('Vanilla');
   const [loaderVersions, setLoaderVersions] = useState<Record<LoaderType, LoaderVersion[]>>({
-    Vanilla: [], Fabric: [], Quilt: [], Forge: [], NeoForge: [],
+    Vanilla: [], Fabric: [], Forge: [], NeoForge: [],
   });
   const [loaderVersionTotals, setLoaderVersionTotals] = useState<Record<LoaderType, number | null>>({
-    Vanilla: null, Fabric: null, Quilt: null, Forge: null, NeoForge: null,
+    Vanilla: null, Fabric: null, Forge: null, NeoForge: null,
   });
-  const [loaderVersionsLoading, setLoaderVersionsLoading] = useState(false);
+  const [loaderVersionsLoading, _setLoaderVersionsLoading] = useState(false);
+  const setLoaderVersionsLoading = (v: boolean) => { loaderVersionsLoadingRef.current = v; _setLoaderVersionsLoading(v); };
   const [loaderVersionsError, setLoaderVersionsError] = useState(false);
   const [selectedLoaderVersion, setSelectedLoaderVersion] = useState('');
 
@@ -87,6 +88,7 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
   useLogPlaque(importProgress?.message ?? null, 'info', 'import');
 
   const loaderListRef = useRef<HTMLDivElement>(null);
+  const loaderVersionsLoadingRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
@@ -125,26 +127,24 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
     setVersionsLoading(false);
   };
 
-  const fetchLoaderPage = useCallback(async (loader?: LoaderType) => {
+  const fetchLoaderPage = useCallback(async (loader?: LoaderType, resetOffset = false) => {
     const target: LoaderType = loader ?? loaderType;
     if (target === 'Vanilla') return;
-    if (loaderVersionsLoading) return;
-    if (target !== 'Fabric' && target !== 'Quilt' && selectedVersion === '') {
+    if (loaderVersionsLoadingRef.current) return;
+    if (target !== 'Fabric' && selectedVersion === '') {
       setLoaderVersions(prev => ({ ...prev, [target]: [] }));
       setLoaderVersionTotals(prev => ({ ...prev, [target]: 0 }));
       return;
     }
-    const offset = loaderVersions[target]?.length ?? 0;
+    const offset = resetOffset ? 0 : (loaderVersions[target]?.length ?? 0);
     const totalKnown = loaderVersionTotals[target];
-    if (totalKnown !== null && offset >= totalKnown) return;
+    if (!resetOffset && totalKnown !== null && offset >= totalKnown) return;
     setLoaderVersionsLoading(true);
     setLoaderVersionsError(false);
     try {
       let page: LoaderVersionPage;
       if (target === 'Fabric') {
         page = await invoke<LoaderVersionPage>('cmd_get_fabric_versions', { offset, limit: LOADER_PAGE_SIZE });
-      } else if (target === 'Quilt') {
-        page = await invoke<LoaderVersionPage>('cmd_get_quilt_versions', { offset, limit: LOADER_PAGE_SIZE });
       } else if (target === 'Forge') {
         page = await invoke<LoaderVersionPage>('cmd_get_forge_versions', { mcVersion: selectedVersion, offset, limit: LOADER_PAGE_SIZE });
       } else if (target === 'NeoForge') {
@@ -162,19 +162,20 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
       setLoaderVersionsError(true);
     }
     setLoaderVersionsLoading(false);
-  }, [loaderType, selectedVersion, loaderVersionsLoading, loaderVersions, loaderVersionTotals]);
+  }, [loaderType, selectedVersion, loaderVersions, loaderVersionTotals]);
 
   const handleLoaderChange = (loader: LoaderType) => {
     setLoaderType(loader);
     setSelectedLoaderVersion('');
     setLoaderVersionsError(false);
+    loaderVersionsLoadingRef.current = false;
     if (loader === 'Vanilla') {
-      setLoaderVersionsLoading(false);
+      _setLoaderVersionsLoading(false);
       return;
     }
     setLoaderVersions(prev => ({ ...prev, [loader]: [] }));
     setLoaderVersionTotals(prev => ({ ...prev, [loader]: null }));
-    fetchLoaderPage(loader);
+    fetchLoaderPage(loader, true);
   };
 
   const handleLoaderScroll = () => {
@@ -216,12 +217,16 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
       await installVersion(versionEntry.url, instanceName.trim());
       if (loaderType !== 'Vanilla' && selectedLoaderVersion) {
         const cmd = loaderType === 'Fabric' ? 'cmd_install_fabric'
-          : loaderType === 'Quilt' ? 'cmd_install_quilt'
           : loaderType === 'Forge' ? 'cmd_install_forge'
           : 'cmd_install_neoforge';
-        await invoke(cmd, { mcVersion: selectedVersion, loaderVersion: selectedLoaderVersion, instanceName: instanceName.trim() });
+        try {
+          await invoke(cmd, { mcVersion: selectedVersion, loaderVersion: selectedLoaderVersion, instanceName: instanceName.trim(), lang: getLanguage() });
+        } catch (e: any) {
+          addToast(t('create_instance.loader_install_failed', { loader: loaderType, error: e.toString() }), 'warning');
+        }
       }
       addToast(t('create_instance.created', { name: instanceName }), 'success');
+      await loadInstances();
       onClose();
     } catch (e: any) {
       addToast(t('create_instance.failed', { error: e.toString() }), 'error');
@@ -355,8 +360,9 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
             <Input
               label={t('create_instance.name_label')}
               id="wizard-name"
+              name="wizard-instance-name-new"
+              autoComplete="off"
               type="text"
-              placeholder={t('create_instance.name_placeholder')}
               value={instanceName}
               onChange={(e) => setInstanceName(e.target.value)}
               autoFocus={mode === 'new'}
@@ -373,7 +379,7 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
                   </label>
                   <div style={{ position: 'relative', marginBottom: 'var(--space-sm)' }}>
                     <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
-                    <input className="input" type="text" placeholder={t('create_instance.search_placeholder')}
+                    <input className="input" type="text"
                       value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
                       style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
                   </div>
@@ -411,10 +417,10 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
                     {t('create_instance.loader_label')}
                   </label>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 'var(--space-sm)' }}>
-                    {(['Vanilla', 'Fabric', 'Quilt', 'Forge', 'NeoForge'] as const).map((l) => (
+                    {(['Vanilla', 'Fabric', 'Forge', 'NeoForge'] as const).map((l) => (
                       <Button key={l} size="sm" variant={loaderType === l ? 'primary' : 'ghost'}
                         onClick={() => handleLoaderChange(l)} style={{ fontSize: '11px' }}>
-                        {l === 'Vanilla' ? t('create_instance.loader_vanilla') : l === 'Fabric' ? t('create_instance.loader_fabric') : l === 'Quilt' ? t('create_instance.loader_quilt') : l === 'Forge' ? t('create_instance.loader_forge') : t('create_instance.loader_neoforge')}
+                        {l === 'Vanilla' ? t('create_instance.loader_vanilla') : l === 'Fabric' ? t('create_instance.loader_fabric') : l === 'Forge' ? t('create_instance.loader_forge') : t('create_instance.loader_neoforge')}
                       </Button>
                     ))}
                   </div>
@@ -454,11 +460,6 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
                       )}
                       {currentLoaderVersions.length === 0 && loaderVersionsLoading && <Skeleton height={32} style={{ margin: '4px 8px' }} />}
                     </div>
-                  )}
-                  {loaderType === 'Vanilla' && (
-                    <p style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)', marginTop: 'var(--space-sm)' }}>
-                      {t('create_instance.vanilla_hint')}
-                    </p>
                   )}
                 </div>
               </div>

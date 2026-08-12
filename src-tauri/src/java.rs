@@ -209,7 +209,7 @@ pub fn get_recommended_java(
     mc_java_version: Option<u32>,
     installations: &[JavaInstallation],
 ) -> Option<JavaInstallation> {
-    let required_major = mc_java_version.unwrap_or(21);
+    let required_major = mc_java_version.unwrap_or(8);
 
     // Prefer exact match, then closest higher version
     installations

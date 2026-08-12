@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::sync::{Mutex, OnceLock};
 use crate::error::{LauncherError, Result};
 use crate::modloaders::{LoaderLibrary, LoaderProfile, LoaderVersionPage};
 use crate::versions::maven_to_path;
@@ -50,24 +51,86 @@ struct FabricArguments {
 
 /// Fetch a page of available Fabric loader versions.
 ///
-/// We delegate to the Prism metadata mirror (`prism_meta`) rather than
-/// hitting `meta.fabricmc.net` directly: the mirror is faster, more
-/// reliable, and returns the same data in a uniform shape. Fabric
-/// Loader versions are universal across MC versions (they only pin
-/// `net.fabricmc.intermediary`, not a specific MC), so we pass `None`
-/// for the MC filter.
+/// Uses Fabric's official API (`meta.fabricmc.net`) directly rather
+/// than the Prism mirror, because the mirror can be outdated and miss
+/// newer Fabric Loader releases. The official API always returns the
+/// complete, up-to-date list.
 ///
-/// The wizard drives this with infinite scroll: it asks for
-/// `PAGE_SIZE` items, appends them, and asks for the next page at
-/// `accumulator.length`. The underlying `prism_meta` call caches
-/// the parsed 251-entry index on first request so every page
-/// after the first is instant.
-///
-/// On fetch/parse failure the underlying `prism_meta` call logs the
-/// error and returns an empty page with `total = 0` — see
-/// `prism_meta::fetch_loader_versions` for details.
+/// Results are cached in-process after the first fetch so subsequent
+/// pages are instant.
+static FABRIC_VERSIONS_CACHE: OnceLock<Mutex<Option<Vec<FabricLoaderVersion>>>> = OnceLock::new();
+
 pub async fn get_loader_versions(offset: usize, limit: usize) -> Result<LoaderVersionPage> {
-    super::prism_meta::fetch_loader_versions("net.fabricmc.fabric-loader", None, offset, limit).await
+    use std::cmp::Ordering;
+
+    fn compare_versions(a: &str, b: &str) -> Ordering {
+        let a_parts: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
+        let b_parts: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+        let len = a_parts.len().max(b_parts.len());
+        for i in 0..len {
+            let a_val = a_parts.get(i).copied().unwrap_or(0);
+            let b_val = b_parts.get(i).copied().unwrap_or(0);
+            if a_val != b_val {
+                return a_val.cmp(&b_val);
+            }
+        }
+        a.cmp(b)
+    }
+
+    let cache = FABRIC_VERSIONS_CACHE.get_or_init(|| Mutex::new(None));
+
+    // Fetch if not cached
+    {
+        let guard = cache.lock().map_err(|e| LauncherError::ModLoader(e.to_string()))?;
+        if guard.is_some() {
+            let all = guard.as_ref().unwrap();
+            let total = all.len();
+            let page: Vec<_> = all.iter().skip(offset).take(limit).map(|v| {
+                super::LoaderVersion {
+                    version: v.version.clone(),
+                    stable: v.stable,
+                }
+            }).collect();
+            return Ok(LoaderVersionPage { versions: page, total });
+        }
+    }
+
+    // Fetch from Fabric official API
+    let client = crate::download::global_http_client();
+    let versions: Vec<FabricLoaderVersion> = client
+        .get("https://meta.fabricmc.net/v2/versions/loader")
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "launcher", "Failed to fetch Fabric loader versions: {}", e);
+            LauncherError::ModLoader(e.to_string())
+        })?
+        .json()
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "launcher", "Failed to parse Fabric loader versions: {}", e);
+            LauncherError::ModLoader(e.to_string())
+        })?;
+
+    // Sort newest-first by semver
+    let mut sorted = versions;
+    sorted.sort_by(|a, b| compare_versions(&b.version, &a.version));
+
+    let total = sorted.len();
+    let page: Vec<_> = sorted.iter().skip(offset).take(limit).map(|v| {
+        super::LoaderVersion {
+            version: v.version.clone(),
+            stable: v.stable,
+        }
+    }).collect();
+
+    // Cache the full sorted list
+    {
+        let mut guard = cache.lock().map_err(|e| LauncherError::ModLoader(e.to_string()))?;
+        *guard = Some(sorted);
+    }
+
+    Ok(LoaderVersionPage { versions: page, total })
 }
 
 /// Fetch game versions supported by Fabric
@@ -130,6 +193,7 @@ pub async fn get_profile(mc_version: &str, loader_version: &str) -> Result<Loade
         libraries,
         jvm_args,
         game_args,
+        legacy_args: false,
     })
 }
 

@@ -2,11 +2,10 @@ use crate::error::{LauncherError, Result};
 use crate::config::AppConfig;
 use crate::instances::Instance;
 use crate::versions::{VersionInfo, build_classpath, get_game_arguments, get_jvm_arguments};
-use crate::java::{detect_java_installations, get_recommended_java};
+use crate::java::{detect_java_installations, get_recommended_java, JavaInstallation};
 use crate::jvm::{build_jvm_args, detect_java_major, strip_gc_selection_flags, GcPreset};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-
 const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(target_os = "windows")]
@@ -42,39 +41,184 @@ pub fn launch_minecraft(
     let client_jar = config
         .versions_dir()
         .join(&version_info.id)
-        .join(format!("{}.jar", version_info.id));
+        .join("client.jar");
+    // Fallback: migrate old {version}.jar to client.jar
+    if !client_jar.exists() {
+        let old_jar = config
+            .versions_dir()
+            .join(&version_info.id)
+            .join(format!("{}.jar", version_info.id));
+        if old_jar.exists() {
+            std::fs::rename(&old_jar, &client_jar).ok();
+        }
+    }
     tracing::debug!(target: "launcher", "Client JAR: {:?}", client_jar);
     tracing::debug!(target: "launcher", "Client JAR exists: {}", client_jar.exists());
 
-    let mut classpath = build_classpath(version_info, &config.libraries_dir(), &client_jar);
+    // Build vanilla classpath first, then we may reorder below
+    let vanilla_cp = build_classpath(version_info, &config.libraries_dir(), &client_jar);
 
-    // Track already added library paths to avoid duplicates (e.g., gson in both vanilla and NeoForge)
-    let mut added_libs: std::collections::HashSet<String> = classpath
-        .split(';')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-
-    // Add mod loader libraries to classpath (deduplicated)
+    // Collect loader libraries (if any) before inserting into final classpath
+    let mut loader_cp_entries: Vec<String> = Vec::new();
     if let Some(profile) = &instance.loader_profile {
         tracing::info!(target: "launcher", "Mod loader: main_class={}", profile.main_class);
         for lib in &profile.libraries {
             let lib_path = config.libraries_dir().join(&lib.path);
             if lib_path.exists() {
-                let lib_path_str = lib_path.to_string_lossy().to_string();
-                if added_libs.insert(lib_path_str.clone()) {
-                    if !classpath.is_empty() {
-                        classpath.push(';');
-                    }
-                    classpath.push_str(&lib_path_str);
-                } else {
-                    tracing::debug!(target: "launcher", "Skipping duplicate library on classpath: {}", lib.name);
-                }
+                loader_cp_entries.push(lib_path.to_string_lossy().to_string());
             } else {
                 tracing::warn!(target: "launcher", "Mod library not found: {:?}", lib_path);
             }
         }
     }
+
+    // NeoForge/Forge profiles override some vanilla libraries with newer
+    // versions (e.g. NeoForge 21.x ships asm 9.8 while MC 1.21.4 vanilla
+    // carries asm 9.6). Both must not sit on the classpath together: the
+    // module system aborts with "Module ... already on the module path but
+    // class-path contains it" when the loader's -p modules collide with a
+    // different-version JAR on the classpath. Skip any vanilla library
+    // whose artifact (group:artifact) is provided by a loader library that
+    // actually exists on disk (loader wins, as before — dedup by path
+    // couldn't handle the same artifact under different versions).
+    let mut skip_vanilla_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(profile) = &instance.loader_profile {
+        let loader_artifacts: std::collections::HashSet<String> = profile
+            .libraries
+            .iter()
+            .filter(|lib| config.libraries_dir().join(&lib.path).exists())
+            .filter_map(|lib| artifact_key(&lib.name))
+            .collect();
+        if !loader_artifacts.is_empty() {
+            for lib in &version_info.libraries {
+                if !crate::versions::should_include_library(lib) {
+                    continue;
+                }
+                let Some(key) = artifact_key(&lib.name) else { continue };
+                if loader_artifacts.contains(&key) {
+                    if let Some(artifact) = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref()) {
+                        let p = config.libraries_dir().join(&artifact.path);
+                        if p.exists() {
+                            skip_vanilla_paths.insert(p.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // For Forge/NeoForge, loader libraries MUST come first on classpath so
+    // their Log4j version (with the API that ModLauncher expects) takes
+    // priority over the vanilla one. Build a deduplicated classpath string.
+    let mut classpath = String::new();
+    let mut added_libs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Add loader libraries first (highest priority)
+    for entry in &loader_cp_entries {
+        if added_libs.insert(entry.clone()) {
+            if !classpath.is_empty() { classpath.push(';'); }
+            classpath.push_str(entry);
+        }
+    }
+
+    // Add vanilla libraries second (lower priority; duplicates already in set are skipped)
+    for entry in vanilla_cp.split(';').filter(|s| !s.is_empty()) {
+        if skip_vanilla_paths.contains(entry) {
+            tracing::debug!(target: "launcher", "Skipping vanilla library overridden by loader: {}", entry);
+            continue;
+        }
+        if added_libs.insert(entry.to_string()) {
+            if !classpath.is_empty() { classpath.push(';'); }
+            classpath.push_str(entry);
+        }
+    }
+
+    // For Forge/NeoForge instances, remove vanilla client.jar to avoid JPMS
+    // split-package conflict with processor-generated JARs (client-*-srg.jar,
+    // forge-*-client.jar). The processor JARs contain the same packages and
+    // replace client.jar. Since processor JARs are NOT in the loader profile's
+    // library list (they're discovered by MinecraftLocator / the production
+    // client provider at runtime), we check the filesystem for them.
+    if matches!(instance.loader, crate::instances::LoaderType::Forge | crate::instances::LoaderType::NeoForge) {
+        let client_jar_str = client_jar.to_string_lossy().to_string();
+        // Check if THIS version's processor-generated SRG JAR exists
+        // (libraries/net/minecraft/client/<mcp-version>/client-<mcp-version>-srg.jar).
+        // The check MUST be scoped to the instance's MC version: old Forge
+        // (e.g. 1.8.9) has no processor JARs and still needs client.jar on the
+        // classpath, while a global scan would see SRG JARs from other
+        // versions (1.14+/1.19+) and wrongly strip client.jar from old ones.
+        let client_base = config.libraries_dir().join("net").join("minecraft").join("client");
+        let prefix = format!("client-{}-", instance.mc_version);
+        let has_srg = if client_base.is_dir() {
+            std::fs::read_dir(&client_base)
+                .ok()
+                .map(|entries| {
+                    entries.flatten().any(|e| {
+                        let path = e.path();
+                        if path.is_dir() {
+                            // Scan inside version subdirectory
+                            std::fs::read_dir(&path)
+                                .ok()
+                                .map(|inner| {
+                                    inner.flatten().any(|f| {
+                                        let name = f.file_name().to_string_lossy().to_string();
+                                        name.starts_with(&prefix) && name.ends_with("-srg.jar")
+                                    })
+                                })
+                                .unwrap_or(false)
+                        } else {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            name.starts_with(&prefix) && name.ends_with("-srg.jar")
+                        }
+                    })
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if has_srg {
+            // Remove the client.jar entry from classpath
+            let old_len = classpath.len();
+            if classpath.starts_with(&client_jar_str) {
+                let after = classpath.trim_start_matches(&client_jar_str);
+                if after.starts_with(';') {
+                    classpath = after[1..].to_string();
+                } else {
+                    classpath = after.to_string();
+                }
+            } else {
+                classpath = classpath.replace(&format!("{};", client_jar_str), "");
+                classpath = classpath.replace(&format!(";{}", client_jar_str), "");
+                classpath = classpath.trim_end_matches(&client_jar_str).to_string();
+            }
+            if classpath.len() < old_len {
+                added_libs.remove(&client_jar_str);
+                tracing::debug!(target: "launcher", "Removed vanilla client.jar for Forge (replaced by srg/extra JARs)");
+            }
+        }
+    }
+
+    // Write VoidLauncherEntry.jar to a temp dir and prepend it to the
+    // classpath.  The JVM tries to derive an automatic module from the JAR
+    // that contains the main class; by using an entry point that lives
+    // OUTSIDE the obfuscated client.jar we avoid
+    //   java.lang.module.InvalidModuleDescriptorException
+    // caused by Mojang's classes in the unnamed (default) package.
+    let entry_dir = config
+        .versions_dir()
+        .join(&version_info.id)
+        .join("entry");
+    std::fs::create_dir_all(&entry_dir).ok();
+    let entry_jar = entry_dir.join("VoidLauncherEntry.jar");
+    // Always overwrite to ensure embedded bytes match (old JAR from previous
+    // builds may contain a class without the voidlauncher.entry package).
+    let _ = std::fs::write(&entry_jar, crate::entry::JAR_BYTES);
+    // Remove old .class file from previous versions (was in default package,
+    // didn't work with package-based main class name).
+    let _ = std::fs::remove_file(entry_dir.join("VoidLauncherEntry.class"));
+    let entry_path = entry_jar.to_string_lossy().to_string();
+    classpath = format!("{};{}", entry_path, classpath);
 
     // 4. Build JVM arguments.
     //    - Memory: instance override > config default. Xms == Xmx.
@@ -109,6 +253,12 @@ pub fn launch_minecraft(
         .join("natives");
     std::fs::create_dir_all(&natives_dir)?;
 
+    // Extract native libraries (DLLs) from native classifier JARs into the
+    // natives directory, so old LWJGL versions can find them via
+    // -Djava.library.path. The native JARs are also on the classpath (added
+    // by build_classpath), which covers newer LWJGL.
+    crate::versions::extract_natives(version_info, &config.libraries_dir(), &natives_dir);
+
     // Add mod loader JVM args (skip -cp and ${classpath}, we add them explicitly below).
     // Loader profiles (Forge/NeoForge in particular) sometimes include their own
     // GC selector, so we strip those here too — the user's chosen preset wins.
@@ -117,8 +267,11 @@ pub fn launch_minecraft(
     let version_name = &version_info.id;
     if let Some(profile) = &instance.loader_profile {
         let loader_args = strip_gc_selection_flags(&profile.jvm_args);
-        for loader_arg in &loader_args {
+        let mut i = 0;
+        while i < loader_args.len() {
+            let loader_arg = &loader_args[i];
             if loader_arg == "-cp" || loader_arg == "${classpath}" {
+                i += 1;
                 continue;
             }
             let processed = loader_arg
@@ -128,7 +281,26 @@ pub fn launch_minecraft(
                 .replace("${version_name}", version_name)
                 .replace("${launcher_name}", "VoidLauncher")
                 .replace("${launcher_version}", LAUNCHER_VERSION);
+
+            // Diagnostics: log -p value at INFO and check module JARs exist
+            if loader_arg == "-p" && i + 1 < loader_args.len() {
+                let raw_modpath = &loader_args[i + 1];
+                let modpath = raw_modpath
+                    .replace("${library_directory}", &library_dir.to_string_lossy())
+                    .replace("${classpath_separator}", classpath_sep);
+                tracing::info!(target: "launcher", "Module path (-p): {}", modpath);
+                for (j, entry) in modpath.split(';').enumerate() {
+                    let p = std::path::Path::new(entry);
+                    if p.exists() {
+                        tracing::info!(target: "launcher", "  [{}] EXISTS: {}", j, entry);
+                    } else {
+                        tracing::warn!(target: "launcher", "  [{}] MISSING: {}", j, entry);
+                    }
+                }
+            }
+
             args.push(processed);
+            i += 1;
         }
     }
 
@@ -160,98 +332,106 @@ pub fn launch_minecraft(
         args.push(processed);
     }
 
+    // Remove obsolete flag that crashes the JVM (never existed in any Java
+    // version — old Forge profiles shipped it incorrectly).
+    args.retain(|a| a != "-XX:+G1UnlockCommercialFeatures");
+
     // Add classpath
     args.push("-cp".to_string());
     args.push(classpath.clone());
 
-    // NeoForge's -p module path only includes NeoForge-specific jars, but
-    // JiJ dependencies (e.g. endec from owo-lib) may require other modules
-    // like fastutil that are on the classpath but not the module path.
-    // Fix: append all classpath entries (except native JARs) to the -p value
-    // so the module system can resolve all module dependencies.
-    if instance.loader != crate::instances::LoaderType::Vanilla {
-        if let Some(p_idx) = args.iter().position(|a| a == "-p") {
-            let cp_entries: Vec<&str> = classpath.split(';').collect();
-            if let Some(module_path) = args.get_mut(p_idx + 1) {
-                for entry in &cp_entries {
-                    if entry.is_empty() || module_path.contains(entry) {
-                        continue;
-                    }
-                    // Skip native JARs (e.g. lwjgl-freetype-3.3.3-natives-linux.jar)
-                    // which would cause "Module named X was already on the JVMs module path"
-                    let fname = std::path::Path::new(entry)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    let is_native = fname.contains("-natives-linux")
-                        || fname.contains("-natives-macos")
-                        || fname.contains("-natives-windows")
-                        || fname.contains("-natives-");
-                    if is_native {
-                        continue;
-                    }
-                    module_path.push_str(classpath_sep);
-                    module_path.push_str(entry);
-                }
-            }
-        }
-    }
+    // NOTE: PrismLauncher does NOT add classpath entries to -p (module path).
+    // They use -cp for everything.  Adding all classpath entries to -p causes
+    // .zip files (e.g. mcp_config) and obfuscated JARs (client.jar) to fail
+    // with java.lang.module.FindException.  The loader profile's own -p
+    // (if present) already contains the necessary module JARs for Forge/NeoForge.
+    // We intentionally do NOT augment the module path here.
 
-    // Main class (use loader profile if available)
-    let main_class = instance
+    // Main class selection:
+    //   - Vanilla: use VoidLauncherEntry wrapper to avoid module-system
+    //     derivation errors (client.jar has classes in unnamed package).
+    //   - Forge/NeoForge/Fabric/Quilt: use the loader profile's main class
+    //     directly. Its -p (module path) contains the bootstrap JARs and the
+    //     real main class lives there — Class.forName from our entry point
+    //     would NOT find it because it only searches the classpath.
+    let real_main = instance
         .loader_profile
         .as_ref()
         .map(|p| p.main_class.clone())
         .unwrap_or_else(|| version_info.main_class.clone());
-    args.push(main_class.clone());
-    tracing::info!(target: "launcher", "Main class: {}", main_class);
+    if instance.loader_profile.is_some() {
+        // Mod loader — main class is on the module path, use it directly
+        let main_class = real_main.clone();
+        args.push(main_class.clone());
+        tracing::info!(target: "launcher", "Main class: {} (loader)", main_class);
+    } else {
+        // Vanilla — use VoidLauncherEntry wrapper, pass real main as sysprop
+        args.push(format!("-Dvoidlauncher.mainClass={}", real_main));
+        let main_class = "voidlauncher.entry.VoidLauncherEntry".to_string();
+        args.push(main_class.clone());
+        tracing::info!(target: "launcher", "Main class: {} (delegating to {})", main_class, real_main);
+    }
 
     // 5. Build game arguments
     let game_dir = instance.minecraft_dir(&config.instances_dir());
     std::fs::create_dir_all(&game_dir)?;
 
     let assets_dir = config.assets_dir();
-    let game_args = get_game_arguments(version_info);
 
-    for arg in &game_args {
-        let processed = arg
+    // 1.6.x and older read flat files straight from --assetsDir, so the
+    // launcher points them at the mirrored virtual/legacy tree.
+    let game_assets_dir = if version_info.assets == "legacy" {
+        assets_dir.join("virtual").join("legacy")
+    } else {
+        assets_dir.clone()
+    };
+
+    // Old session format (1.6.x): --session <token>:<uuid>:<username>.
+    // "0" is the conventional offline token.
+    let auth_session = format!("0:{}:{}", uuid, username);
+
+    // For legacy loaders (MC <= 1.12.2 Forge/LiteLoader), the loader
+    // profile carries the FULL game argument list in its
+    // `minecraftArguments` string — those REPLACE the vanilla args.
+    let legacy_full_args = instance
+        .loader_profile
+        .as_ref()
+        .map(|p| p.legacy_args && !p.game_args.is_empty())
+        .unwrap_or(false);
+
+    let substitute_args = |arg: &str| -> String {
+        arg
             .replace("${auth_player_name}", username)
             .replace("${version_name}", &version_info.id)
             .replace("${game_directory}", &game_dir.to_string_lossy())
             .replace("${assets_root}", &assets_dir.to_string_lossy())
+            .replace("${game_assets}", &game_assets_dir.to_string_lossy())
             .replace("${assets_index_name}", &version_info.assets)
             .replace("${auth_uuid}", uuid)
             .replace("${auth_access_token}", access_token)
+            .replace("${auth_session}", &auth_session)
             .replace("${user_type}", "msa")
             .replace("${version_type}", &version_info.version_type)
             .replace("${auth_xuid}", "0")
             .replace("${clientid}", "")
             .replace("${user_properties}", "{}")
             .replace("${resolution_width}", "1280")
-            .replace("${resolution_height}", "720");
+            .replace("${resolution_height}", "720")
+    };
 
-        args.push(processed);
+    if !legacy_full_args {
+        let game_args = get_game_arguments(version_info);
+        for arg in &game_args {
+            args.push(substitute_args(arg));
+        }
+    } else {
+        tracing::info!(target: "launcher", "Using legacy loader game arguments (replaces vanilla)");
     }
 
     // Add mod loader game arguments
     if let Some(profile) = &instance.loader_profile {
         for loader_arg in &profile.game_args {
-            let processed = loader_arg
-                .replace("${auth_player_name}", username)
-                .replace("${version_name}", &version_info.id)
-                .replace("${game_directory}", &game_dir.to_string_lossy())
-                .replace("${assets_root}", &assets_dir.to_string_lossy())
-                .replace("${assets_index_name}", &version_info.assets)
-                .replace("${auth_uuid}", uuid)
-                .replace("${auth_access_token}", access_token)
-                .replace("${user_type}", "msa")
-                .replace("${version_type}", &version_info.version_type)
-                .replace("${auth_xuid}", "0")
-                .replace("${clientid}", "")
-                .replace("${user_properties}", "{}")
-                .replace("${resolution_width}", "1280")
-                .replace("${resolution_height}", "720");
-            args.push(processed);
+            args.push(substitute_args(loader_arg));
         }
     }
 
@@ -279,7 +459,7 @@ pub fn launch_minecraft(
         }
     }).collect::<Vec<_>>();
     for (i, a) in sanitized.iter().enumerate() {
-        tracing::debug!(target: "launcher", "  [{}] {}", i, a);
+        tracing::info!(target: "launcher", "  [{}] {}", i, a);
     }
     tracing::info!(target: "launcher", "Spawning Java process...");
 
@@ -307,13 +487,30 @@ pub fn launch_minecraft(
     Ok(child)
 }
 
+/// Find all available Java installations (system + managed)
+pub fn find_all_java_installations(data_dir: &PathBuf) -> Vec<JavaInstallation> {
+    let mut installations = detect_java_installations();
+    installations.extend(
+        crate::java_download::list_managed_java(data_dir)
+            .into_iter()
+            .map(|m| JavaInstallation {
+                path: m.path,
+                version: m.version,
+                major_version: m.major_version,
+                is_64bit: m.is_64bit,
+                vendor: m.vendor,
+            }),
+    );
+    installations
+}
+
 /// Determine which Java executable to use
 fn get_java_path(
     config: &AppConfig,
     instance: &Instance,
     version_info: &VersionInfo,
 ) -> Result<PathBuf> {
-    // Priority: instance java > config java > auto-detect
+    // Priority: instance java > config java > auto-detect (system + managed)
     if let Some(path) = &instance.java_path {
         if path.exists() {
             tracing::info!(target: "launcher", "Using instance Java: {:?}", path);
@@ -330,9 +527,9 @@ fn get_java_path(
         tracing::debug!(target: "launcher", "Config Java not found: {:?}", path);
     }
 
-    // Auto-detect
+    // Auto-detect (system + managed)
     tracing::info!(target: "launcher", "Auto-detecting Java installations...");
-    let installations = detect_java_installations();
+    let installations = find_all_java_installations(&config.data_dir);
     tracing::info!(target: "launcher", "Found {} Java installations", installations.len());
     for (i, inst) in installations.iter().enumerate() {
         tracing::debug!(target: "launcher", "  [{}] {} v{} ({})", i, inst.vendor, inst.version, inst.path.display());
@@ -344,20 +541,35 @@ fn get_java_path(
         ));
     }
 
-    let required_java = version_info
-        .java_version
-        .as_ref()
-        .map(|v| v.major_version);
-    tracing::info!(target: "launcher", "Required Java version: {}+", required_java.unwrap_or(21));
+    let required_java = version_info.required_java_major();
+    tracing::info!(target: "launcher", "Required Java version: {}+", required_java);
 
-    match get_recommended_java(required_java, &installations) {
+    match get_recommended_java(Some(required_java), &installations) {
         Some(java) => {
             tracing::info!(target: "launcher", "Selected Java: {} v{} at {:?}", java.vendor, java.version, java.path);
             Ok(java.path)
         }
         None => Err(LauncherError::Java(format!(
             "No suitable Java found. Required: Java {}+",
-            required_java.unwrap_or(21)
+            required_java
         ))),
     }
+}
+
+/// Check if suitable Java exists, return its major version if found
+pub fn check_java_availability(data_dir: &PathBuf, required_major: u32) -> Option<JavaInstallation> {
+    let installations = find_all_java_installations(data_dir);
+    get_recommended_java(Some(required_major), &installations)
+}
+
+/// Extract "group:artifact" from a Maven coordinate like
+/// "org.ow2.asm:asm:9.8" or "com.google.code.findbugs:jsr305:3.0.2".
+fn artifact_key(name: &str) -> Option<String> {
+    let mut parts = name.split(':');
+    let group = parts.next()?;
+    let artifact = parts.next()?;
+    if group.is_empty() || artifact.is_empty() {
+        return None;
+    }
+    Some(format!("{}:{}", group, artifact))
 }

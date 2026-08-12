@@ -49,7 +49,6 @@ pub struct Instance {
 pub enum LoaderType {
     Vanilla,
     Fabric,
-    Quilt,
     Forge,
     NeoForge,
     LiteLoader,
@@ -195,14 +194,38 @@ pub fn create_instance(instances_dir: &PathBuf, instance: &Instance) -> Result<(
     )?;
 
     // Save instance config
-    save_instance(instances_dir, instance)?;
+    save_instance(instances_dir, instance, None)?;
 
     Ok(())
 }
 
-/// Save instance config to disk, plus Prism-compatible instance.cfg and pack.png
-pub fn save_instance(instances_dir: &PathBuf, instance: &Instance) -> Result<()> {
+/// Save instance config to disk, plus Prism-compatible instance.cfg and pack.png.
+/// If `old_name` differs from `instance.name`, the instance directory is renamed first.
+pub fn save_instance(instances_dir: &PathBuf, instance: &Instance, old_name: Option<&str>) -> Result<()> {
+    // Rename directory if name changed
+    if let Some(prev) = old_name {
+        if prev != instance.name {
+            let old_dir = instances_dir.join(prev);
+            let new_dir = instances_dir.join(&instance.name);
+            if old_dir.exists() && !new_dir.exists() {
+                // Try rename first; on Windows this may fail with Access Denied
+                // if any file handle is still open. Fall back to copy + delete.
+                if let Err(rename_err) = std::fs::rename(&old_dir, &new_dir) {
+                    tracing::warn!(target: "launcher", "fs::rename failed ({}), falling back to copy+delete", rename_err);
+                    copy_dir_recursive(&old_dir, &new_dir)?;
+                    std::fs::remove_dir_all(&old_dir)?;
+                }
+            }
+        }
+    }
+
     let config_path = instance.config_file(instances_dir);
+    let config_dir = config_path.parent().ok_or_else(|| {
+        LauncherError::Instance("Instance config has no parent directory".into())
+    })?;
+    if !config_dir.exists() {
+        std::fs::create_dir_all(config_dir)?;
+    }
     let json = serde_json::to_string_pretty(instance)?;
     std::fs::write(&config_path, json)?;
 
@@ -276,7 +299,7 @@ pub fn duplicate_instance(instances_dir: &PathBuf, name: &str, new_name: &str) -
     instance.last_played = None;
     instance.play_time_seconds = 0;
     instance.created_at = Utc::now().to_rfc3339();
-    save_instance(instances_dir, &instance)?;
+    save_instance(instances_dir, &instance, None)?;
     Ok(instance)
 }
 
@@ -299,7 +322,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 pub fn save_instance_icon(instances_dir: &PathBuf, name: &str, icon_data: &str) -> Result<()> {
     let mut instance = get_instance(instances_dir, name)?;
     instance.icon = Some(icon_data.to_string());
-    save_instance(instances_dir, &instance)?;
+    save_instance(instances_dir, &instance, None)?;
     Ok(())
 }
 
@@ -307,7 +330,7 @@ pub fn save_instance_icon(instances_dir: &PathBuf, name: &str, icon_data: &str) 
 pub fn save_instance_banner(instances_dir: &PathBuf, name: &str, banner_data: &str) -> Result<()> {
     let mut instance = get_instance(instances_dir, name)?;
     instance.banner = if banner_data.is_empty() { None } else { Some(banner_data.to_string()) };
-    save_instance(instances_dir, &instance)?;
+    save_instance(instances_dir, &instance, None)?;
     Ok(())
 }
 
@@ -389,6 +412,27 @@ pub struct ScreenshotEntry {
     pub filename: String,
     pub last_modified: Option<i64>,
     pub size_bytes: u64,
+}
+
+pub fn read_screenshot(instances_dir: &PathBuf, instance_name: &str, filename: &str) -> Result<String> {
+    let instance = get_instance(instances_dir, instance_name)?;
+    let path = instance.minecraft_dir(instances_dir).join("screenshots").join(filename);
+    let buf = std::fs::read(&path)
+        .map_err(|e| LauncherError::Instance(format!("Cannot read {}: {}", path.display(), e)))?;
+    if buf.is_empty() {
+        return Err(LauncherError::Instance(format!("Screenshot is empty: {}", path.display())));
+    }
+    Ok(format!("data:image/png;base64,{}", base64_encode(&buf)))
+}
+
+pub fn delete_screenshot(instances_dir: &PathBuf, instance_name: &str, filename: &str) -> Result<()> {
+    let instance = get_instance(instances_dir, instance_name)?;
+    let path = instance.minecraft_dir(instances_dir).join("screenshots").join(filename);
+    if !path.exists() {
+        return Err(LauncherError::Instance(format!("Screenshot not found: {}", filename)));
+    }
+    std::fs::remove_file(&path)?;
+    Ok(())
 }
 
 /// List resource packs or shader packs (returns entries without icon - fetch via cmd_get_pack_icon)
@@ -475,7 +519,7 @@ fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, Str
 }
 
 /// Strip Minecraft color/formatting codes (§a, §l, §r, etc.) and any underscores used as spaces
-fn strip_minecraft_color_codes(s: &str) -> String {
+pub(crate) fn strip_minecraft_color_codes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -720,7 +764,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 pub fn update_last_played(instances_dir: &PathBuf, name: &str) -> Result<()> {
     let mut instance = get_instance(instances_dir, name)?;
     instance.last_played = Some(Utc::now().to_rfc3339());
-    save_instance(instances_dir, &instance)?;
+    save_instance(instances_dir, &instance, None)?;
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
@@ -7,6 +8,7 @@ import { Button } from '../ui/Button';
 import { addToast } from '../ui/Toast';
 import { useT } from '../../lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 
 interface Hit {
   project_id: string;
@@ -17,6 +19,7 @@ interface Hit {
   downloads: number;
   slug: string;
   author?: string;
+  date_published?: string;
 }
 
 export interface SelectedItem {
@@ -67,6 +70,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [versions, setVersions] = useState<any[]>([]);
   const [sortMode, setSortMode] = useState<SortMode>('downloads');
+  // Modrinth has no "oldest" index; we request newest and page backwards.
+  const sortIndex = sortMode === 'downloads' ? 'downloads' : 'newest';
   const [selectedItems, setSelectedItems] = useState<SelectedItem[]>([]);
   const [addingId, setAddingId] = useState<string | null>(null);
   const [subView, setSubView] = useState<'search' | 'confirm'>('search');
@@ -81,6 +86,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const versionSentinelRef = useRef<HTMLDivElement | null>(null);
   const PAGE_SIZE = 50;
+  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
+  const setPending = useBrowserGuardStore((s) => s.setPending);
 
   const TYPE_LABELS: Record<ContentType, string> = {
     mod: t('content.type_mod'),
@@ -92,20 +99,49 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const subfolder = SUBFOLDER[contentType];
   const versionLoader = contentType === 'mod' ? (loader ?? null) : null;
 
+  // Expose the selection count for the leave-guard (tab switches etc).
+  // Cleanup resets it: any unmount that isn't guarded (e.g. sidebar nav)
+  // or that happened after a confirmed leave must not keep a stale value.
+  useEffect(() => {
+    setPending(selectedItems.length);
+    return () => setPending(0);
+  }, [selectedItems, setPending]);
+
+  const requestLeave = () => {
+    if (selectedItems.length > 0) {
+      setShowLeaveConfirm(true);
+    } else {
+      onClose();
+    }
+  };
+
   const loadPopular = useCallback(async () => {
     setLoading(true);
     setPopular([]);
     setPopularOffset(0);
     setHasMorePopular(true);
     try {
-      const res = await invoke<any>('cmd_popular_modrinth', { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE });
-      const hits: Hit[] = res.hits || [];
-      setPopular(hits);
-      setPopularOffset(hits.length);
-      setHasMorePopular(hits.length >= PAGE_SIZE);
+      const base = { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
+      const res = await invoke<any>('cmd_popular_modrinth', base);
+      if (sortMode === 'oldest') {
+        const total = Math.max(res.total_hits ?? 0, 0);
+        const lastOffset = Math.max(0, total - PAGE_SIZE);
+        const page = lastOffset > 0
+          ? await invoke<any>('cmd_popular_modrinth', { ...base, offset: lastOffset })
+          : res;
+        const hits: Hit[] = [...((page.hits as Hit[]) || [])].reverse();
+        setPopular(hits);
+        setPopularOffset(Math.max(0, lastOffset - PAGE_SIZE));
+        setHasMorePopular(lastOffset > 0);
+      } else {
+        const hits: Hit[] = res.hits || [];
+        setPopular(hits);
+        setPopularOffset(hits.length);
+        setHasMorePopular(hits.length >= PAGE_SIZE);
+      }
     } catch { }
     setLoading(false);
-  }, [contentType, mcVersion, loader]);
+  }, [contentType, mcVersion, loader, sortMode]);
 
   const popularOffsetRef = useRef(0);
   popularOffsetRef.current = popularOffset;
@@ -115,34 +151,63 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setLoadingMore(true);
     const offset = popularOffsetRef.current;
     try {
-      const res = await invoke<any>('cmd_popular_modrinth', { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE });
-      const hits: Hit[] = res.hits || [];
+      const res = await invoke<any>('cmd_popular_modrinth', { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
+      const raw: Hit[] = res.hits || [];
+      const hits: Hit[] = sortMode === 'oldest' ? [...raw].reverse() : raw;
       setPopular((prev) => {
         const seen = new Set(prev.map((h) => h.project_id));
         const fresh = hits.filter((h) => !seen.has(h.project_id));
         return [...prev, ...fresh];
       });
-      setPopularOffset(offset + hits.length);
-      setHasMorePopular(hits.length >= PAGE_SIZE);
+      if (sortMode === 'oldest') {
+        const next = offset - PAGE_SIZE;
+        setPopularOffset(Math.max(0, next));
+        setHasMorePopular(offset > 0);
+      } else {
+        setPopularOffset(offset + hits.length);
+        setHasMorePopular(hits.length >= PAGE_SIZE);
+      }
     } catch { }
     setLoadingMore(false);
-  }, [contentType, mcVersion, loader, hasMorePopular, loadingMore]);
+  }, [contentType, mcVersion, loader, hasMorePopular, loadingMore, sortMode]);
 
   useEffect(() => { loadPopular(); }, [loadPopular]);
 
   const handleSearch = async () => {
-    if (!query.trim()) { loadPopular(); return; }
+    if (!query.trim()) {
+      // Clearing the search must return to the default "popular" list;
+      // otherwise stale results would keep being displayed.
+      setResults([]);
+      setResultsOffset(0);
+      setHasMoreResults(true);
+      setSelected(null);
+      loadPopular();
+      return;
+    }
     setLoading(true);
     setResults([]);
     setResultsOffset(0);
     setHasMoreResults(true);
     setSelected(null);
     try {
-      const res = await invoke<any>('cmd_search_modrinth', { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE });
-      const hits: Hit[] = res.hits || [];
-      setResults(hits);
-      setResultsOffset(hits.length);
-      setHasMoreResults(hits.length >= PAGE_SIZE);
+      const base = { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
+      const res = await invoke<any>('cmd_search_modrinth', base);
+      if (sortMode === 'oldest') {
+        const total = Math.max(res.total_hits ?? 0, 0);
+        const lastOffset = Math.max(0, total - PAGE_SIZE);
+        const page = lastOffset > 0
+          ? await invoke<any>('cmd_search_modrinth', { ...base, offset: lastOffset })
+          : res;
+        const hits: Hit[] = [...((page.hits as Hit[]) || [])].reverse();
+        setResults(hits);
+        setResultsOffset(Math.max(0, lastOffset - PAGE_SIZE));
+        setHasMoreResults(lastOffset > 0);
+      } else {
+        const hits: Hit[] = res.hits || [];
+        setResults(hits);
+        setResultsOffset(hits.length);
+        setHasMoreResults(hits.length >= PAGE_SIZE);
+      }
     } catch (e: any) { addToast(t('content.search_error', { error: e.toString() }), 'error'); }
     setLoading(false);
   };
@@ -155,18 +220,32 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setLoadingMore(true);
     const offset = resultsOffsetRef.current;
     try {
-      const res = await invoke<any>('cmd_search_modrinth', { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE });
-      const hits: Hit[] = res.hits || [];
+      const res = await invoke<any>('cmd_search_modrinth', { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
+      const raw: Hit[] = res.hits || [];
+      const hits: Hit[] = sortMode === 'oldest' ? [...raw].reverse() : raw;
       setResults((prev) => {
         const seen = new Set(prev.map((h) => h.project_id));
         const fresh = hits.filter((h) => !seen.has(h.project_id));
         return [...prev, ...fresh];
       });
-      setResultsOffset(offset + hits.length);
-      setHasMoreResults(hits.length >= PAGE_SIZE);
+      if (sortMode === 'oldest') {
+        const next = offset - PAGE_SIZE;
+        setResultsOffset(Math.max(0, next));
+        setHasMoreResults(offset > 0);
+      } else {
+        setResultsOffset(offset + hits.length);
+        setHasMoreResults(hits.length >= PAGE_SIZE);
+      }
     } catch { }
     setLoadingMore(false);
-  }, [contentType, mcVersion, loader, query, hasMoreResults, loadingMore]);
+  }, [contentType, mcVersion, loader, query, hasMoreResults, loadingMore, sortMode]);
+
+  const prevSortModeRef = useRef(sortMode);
+  useEffect(() => {
+    if (prevSortModeRef.current === sortMode) return;
+    prevSortModeRef.current = sortMode;
+    if (query.trim()) handleSearch(); else loadPopular();
+  }, [sortMode]);
 
   useEffect(() => {
     const el = sentinelRef.current;
@@ -327,12 +406,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   };
 
   const sortHits = (items: Hit[]): Hit[] => {
-    const sorted = [...items];
-    switch (sortMode) {
-      case 'downloads': return sorted.sort((a, b) => (b.downloads || 0) - (a.downloads || 0));
-      case 'newest': return sorted.sort((a, b) => (b.title || '').localeCompare(a.title || ''));
-      case 'oldest': return sorted.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+    if (sortMode === 'oldest') {
+      return [...items].sort((a, b) => {
+        const at = new Date(a.date_published || 0).getTime();
+        const bt = new Date(b.date_published || 0).getTime();
+        return at - bt;
+      });
     }
+    return items;
   };
 
   const displayHits = results.length > 0 ? results : popular;
@@ -432,7 +513,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {/* Header */}
       <div style={{ padding: 'var(--space-md) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', flexShrink: 0 }}>
-        <Button variant="ghost" size="sm" onClick={onClose}><ArrowLeft size={16} /> {t('common.back')}</Button>
+        <Button variant="ghost" size="sm" onClick={requestLeave}><ArrowLeft size={16} /> {t('common.back')}</Button>
         <h2 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700, flex: 1 }}>{t('content.browse_heading', { label })}</h2>
       </div>
 
@@ -440,7 +521,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       <div style={{ padding: 'var(--space-sm) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
         <div style={{ position: 'relative', flex: 1 }}>
           <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
-          <input className="input" type="text" placeholder={t('content.search_placeholder', { label: label.toLowerCase() })} value={query} onChange={(e) => setQuery(e.target.value)}
+          <input className="input" type="text" value={query} onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
             style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
         </div>
@@ -631,6 +712,21 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             {t('common.confirm')}
           </Button>
         </div>
+      )}
+
+      {/* Leave confirmation: back button would discard the selection */}
+      {showLeaveConfirm && createPortal(
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
+          <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }}>
+            <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('content.leave_confirm_title')}</h3>
+            <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('content.leave_confirm_text', { count: selectedItems.length.toString() })}</p>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+              <Button variant="ghost" onClick={() => setShowLeaveConfirm(false)}>{t('common.cancel')}</Button>
+              <Button onClick={() => { setShowLeaveConfirm(false); onClose(); }}>{t('common.leave')}</Button>
+            </div>
+          </div>
+        </div>,
+        document.body
       )}
     </div>
   );

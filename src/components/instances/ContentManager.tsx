@@ -506,6 +506,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         instanceName,
         mcVersion: mcVersion ?? null,
         loader: contentType === 'mod' ? (loader ?? null) : null,
+        packType: subfolder,
       });
       const found: UpdateInfo[] = (results || []).map((r: any) => ({
         name: r.name,
@@ -687,8 +688,8 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
           <div style={{ textAlign: 'center' }}>{t('manager.column_on')}</div>
           <div></div>
           <div>{t('manager.column_name')}</div>
-          <div>{contentType === 'mod' ? t('manager.column_version') : t('manager.column_size')}</div>
-          <div>{contentType === 'mod' ? t('manager.column_provider') : ''}</div>
+          <div>{t('manager.column_version')}</div>
+          <div>{t('manager.column_provider')}</div>
           <div></div>
         </div>
 
@@ -750,10 +751,10 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
                     {item.name}
                   </div>
                   <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {contentType === 'mod' ? item.version : formatSize(item.size ?? 0)}
+                    {item.version}
                   </div>
                   <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
-                    {contentType === 'mod' ? item.provider : ''}
+                    {item.provider || ''}
                   </div>
                   <div>
                     {contentType === 'mod' && compatibility[item.filename] && (() => {
@@ -788,7 +789,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         <div style={{ padding: '6px var(--space-2xl)', borderTop: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
           <div style={{ position: 'relative', flex: 1, maxWidth: 300 }}>
             <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
-            <input className="input" type="text" placeholder={t('manager.search_placeholder', { label: label.toLowerCase() })} value={search} onChange={(e) => setSearch(e.target.value)} style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
+            <input className="input" type="text" value={search} onChange={(e) => setSearch(e.target.value)} style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
           </div>
           {hasSelection && (
             <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('common.items_selected', { n: selectedFilenames.size.toString() })}</span>
@@ -914,8 +915,4 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
   );
 }
 
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+

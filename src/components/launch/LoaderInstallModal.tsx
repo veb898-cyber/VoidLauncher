@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Modal } from '../ui/Modal';
 import { ProgressBar } from '../ui/ProgressBar';
-import { useT } from '../../lib/i18n';
+import { useT, getLanguage } from '../../lib/i18n';
 import { useLogPlaque } from '../../lib/uiLog';
 
 export interface LoaderCheckResult {
@@ -79,7 +79,7 @@ export function LoaderInstallModal({ open, onClose, onInstalled, instanceName }:
     setStage('installing');
     setMessage(t('loader_install.installing', { loader: checkResult?.loader_type || '' }));
     try {
-      await invoke('cmd_install_instance_loader', { instanceName });
+      await invoke('cmd_install_instance_loader', { instanceName, lang: getLanguage() });
     } catch (e: any) {
       setStage('error');
       setError(e.toString());

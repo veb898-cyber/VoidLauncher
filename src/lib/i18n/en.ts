@@ -50,6 +50,7 @@ export const en = {
   'common.items_selected':             '{n} items(s) selected',
   'common.loading':                    'Loading...',
   'common.installing':                 'Installing...',
+  'common.leave':                      'Leave',
 
   // ── Error Boundary ──────────────────────────────────────────
   'error_boundary.heading':            'Something went wrong',
@@ -80,6 +81,18 @@ export const en = {
   'home.upload_image':                  'Upload Image',
   'home.remove_banner':                 'Remove Banner',
   'home.banner_updated':                'Banner updated',
+  'home.banner_neon_purple':            'Neon Purple',
+  'home.banner_cyber_blue':             'Cyber Blue',
+  'home.banner_sunset':                 'Sunset',
+  'home.banner_forest':                 'Forest',
+  'home.banner_ocean':                  'Ocean',
+  'home.banner_midnight':               'Midnight',
+  'home.banner_lava':                   'Lava',
+  'home.banner_arctic':                 'Arctic',
+  'home.banner_royal':                  'Royal',
+  'home.banner_mint':                   'Mint',
+  'home.banner_cherry':                 'Cherry',
+  'home.banner_deep_sea':               'Deep Sea',
 
   // ── Accounts ────────────────────────────────────────────────
   'accounts.title':                    'Accounts',
@@ -134,13 +147,12 @@ export const en = {
   'create_instance.loader_label':      'Mod Loader',
   'create_instance.loader_vanilla':    'Vanilla',
   'create_instance.loader_fabric':     'Fabric',
-  'create_instance.loader_quilt':      'Quilt',
   'create_instance.loader_forge':      'Forge',
   'create_instance.loader_neoforge':   'NeoForge',
   'create_instance.stable_badge':      'stable',
-  'create_instance.vanilla_hint':      'No mod loader. You can add Fabric/Quilt later.',
   'create_instance.downloading':       'Downloading version files...',
   'create_instance.loader_failed':     'Failed to install {loader}, continuing with Vanilla',
+  'create_instance.loader_install_failed': 'Failed to install {loader}: {error}. It will be installed automatically on first launch',
   'create_instance.loader_versions_failed': 'Failed to load {loader} version list',
   'create_instance.loader_no_versions':'No versions available for this Minecraft version',
   'create_instance.loader_end':       'All {total} versions loaded',
@@ -327,6 +339,8 @@ export const en = {
   'content.deps_heading':              'Dependencies ({count})',
   'content.dep_required_by':           'Required by {parent}',
   'content.browse_heading':            'Browse {label}',
+  'content.leave_confirm_title':         'Leave browser?',
+  'content.leave_confirm_text':          'You have {count} item(s) selected. Leaving will discard the selection.',
   'content.search_placeholder':        'Search {label}...',
   'content.empty_results':             'No {label} found',
   'content.download_count':            '{n} downloads',
@@ -409,6 +423,10 @@ export const en = {
   'screenshots.empty':                 'No screenshots yet.',
   'screenshots.hint':                  'Press F2 in-game to take a screenshot.',
   'screenshots.open_folder':           'Open Screenshots Folder',
+  'screenshots.delete_title':          'Delete screenshot',
+  'screenshots.delete_confirm':        'Delete "{name}"?',
+  'screenshots.deleted':               'Screenshot deleted',
+  'screenshots.error':                 'Screenshot error',
 
   // ── Worlds ──────────────────────────────────────────────────
   'worlds.title':                      'Worlds',
@@ -471,6 +489,7 @@ export const en = {
   // ── Game Logs ────────────────────────────────────────────────
   'game_logs.title':                   'Game Logs',
   'game_logs.subtitle':                'Minecraft game output from recent sessions',
+  'game_logs.recent_sessions':         'Recent Sessions',
   'game_logs.empty':                   'No game logs yet. Launch a game to see its output here.',
   'game_logs.no_content':              'No output in this session',
   'game_logs.live_session':            'Live Session',
@@ -508,6 +527,19 @@ export const en = {
   'updater.btn_later':                  'Later',
   'updater.checking':                   'Checking for updates...',
   'updater.check_failed':               'Update check failed: {error}',
+  'updater.check_error_title':          'Update Check Failed',
+  'updater.check_error_description':    'Could not check for updates. The update server may be temporarily unavailable.',
+  'updater.btn_retry':                  'Retry',
+  'updater.btn_cancel':                 'Cancel',
+
+  // ── Launch ───────────────────────────────────────────
+  'launch.java_setup_title':            'Setting up Java',
+  'launch.checking_java':               'Checking Java availability...',
+  'launch.java_stage_resolving':        'Checking for available versions...',
+  'launch.java_stage_downloading':      'Downloading Java...',
+  'launch.java_stage_extracting':       'Extracting Java...',
+  'launch.java_stage_verifying':        'Verifying Java installation...',
+  'launch.java_stage_done':             'Java setup complete!',
 
   // ── Offline account username validation ─────────────────────
   'accounts.offline_username_cyrillic': 'Username must not contain Cyrillic characters.',

@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke, convertFileSrc } from '@tauri-apps/api/core';
-import { Camera, FolderOpen } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { Camera, FolderOpen, RefreshCw, Trash2 } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { Modal } from '../ui/Modal';
+import { addToast } from '../ui/Toast';
 import { t } from '../../lib/i18n';
 
 interface ScreenshotEntry {
@@ -19,6 +21,7 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
   const [screenshots, setScreenshots] = useState<ScreenshotEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
   const loadScreenshots = useCallback(async () => {
     setLoading(true);
@@ -29,24 +32,19 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
     setLoading(false);
   }, [instanceName]);
 
-  // Resolve the screenshot directory once on mount so convertFileSrc can
-  // produce a properly-encoded asset URL per image. Tauri's `convertFileSrc`
-  // handles path separators and special characters (spaces, #, &, +, etc.)
-  // for both Windows and POSIX paths.
-  const [screenshotDir, setScreenshotDir] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    invoke<string>('cmd_get_instance_dir', { instanceName })
-      .then((dir) => { if (!cancelled) setScreenshotDir(`${dir}/screenshots`); })
-      .catch(() => { /* ignore — fall back to nothing */ });
-    return () => { cancelled = true; };
-  }, [instanceName]);
-
   useEffect(() => { loadScreenshots(); }, [loadScreenshots]);
 
-  const formatDate = (ts: number | null) => {
-    if (!ts) return '';
-    return new Date(ts * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    try {
+      await invoke('cmd_delete_screenshot', { instanceName, filename: deleteTarget });
+      addToast(t('screenshots.deleted'), 'success');
+      setDeleteTarget(null);
+      setSelected(null);
+      loadScreenshots();
+    } catch (e: any) {
+      addToast(e.toString(), 'error');
+    }
   };
 
   return (
@@ -58,12 +56,12 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
             {t('screenshots.count', { n: screenshots.length.toString() })}
           </span>
         </h2>
-        <Button size="sm" variant="ghost" onClick={() => { loadScreenshots(); }}>
-          {t('common.refresh')}
+        <Button size="sm" variant="ghost" onClick={loadScreenshots}>
+          <RefreshCw size={14} /> {t('common.refresh')}
         </Button>
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-md)' }}>
+      <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-lg) var(--space-2xl)' }}>
         {loading ? (
           <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>
         ) : screenshots.length === 0 ? (
@@ -73,30 +71,48 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
             <div style={{ fontSize: 'var(--font-size-sm)', marginTop: 4 }}>{t('screenshots.hint')}</div>
           </div>
         ) : (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 'var(--space-sm)' }}>
-            {screenshots.map((s) => (
-              <div
-                key={s.filename}
-                onClick={() => setSelected(selected === s.filename ? null : s.filename)}
-                style={{
-                  borderRadius: 'var(--radius-md)', overflow: 'hidden', cursor: 'pointer',
-                  border: selected === s.filename ? '2px solid var(--primary)' : '2px solid transparent',
-                  background: 'var(--surface-glass)',
-                  transition: 'all 0.15s',
-                }}
-              >
-                <img
-                  src={screenshotDir ? convertFileSrc(`${screenshotDir}/${s.filename}`) : ''}
-                  alt={s.filename}
-                  loading="lazy"
-                  style={{ width: '100%', height: 140, objectFit: 'cover', display: 'block' }}
-                  onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                />
-                <div style={{ padding: '6px 8px', fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)' }}>
-                  {formatDate(s.last_modified)}
+          <div className="instance-grid">
+            {screenshots.map((s) => {
+              const isSelected = selected === s.filename;
+              return (
+                <div
+                  key={s.filename}
+                  className="instance-card"
+                  style={{
+                    borderColor: isSelected ? 'var(--primary)' : undefined,
+                    transform: isSelected ? 'translateY(-4px)' : undefined,
+                    boxShadow: isSelected ? 'var(--shadow-lg), var(--glow-primary)' : undefined,
+                  }}
+                  onClick={() => setSelected(isSelected ? null : s.filename)}
+                  onContextMenu={(e) => { e.preventDefault(); setDeleteTarget(s.filename); }}
+                >
+                  <div className="instance-card__banner" style={{ height: 160, opacity: 1, background: 'var(--bg-tertiary)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Camera size={32} style={{ color: 'var(--text-tertiary)', opacity: 0.4 }} />
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setDeleteTarget(s.filename); }}
+                      className="btn btn--ghost btn--sm"
+                      style={{
+                        position: 'absolute', top: 6, right: 6, zIndex: 2,
+                        background: 'rgba(0,0,0,0.5)', color: 'white',
+                        padding: '4px 6px', borderRadius: 'var(--radius-sm)',
+                        border: 'none', cursor: 'pointer', opacity: 0,
+                        transition: 'opacity 0.15s',
+                      }}
+                      title={t('common.delete')}
+                    ><Trash2 size={14} /></button>
+                    <div className="instance-card__banner-overlay" style={{ background: 'linear-gradient(to bottom, transparent 60%, var(--bg-primary))' }}>
+                    </div>
+                  </div>
+                  <div className="instance-card__body instance-card__body--horizontal" style={{ padding: 'var(--space-sm) var(--space-md)' }}>
+                    <div className="instance-card__info" style={{ minWidth: 0 }}>
+                      <div className="instance-card__name" style={{ fontSize: 'var(--font-size-xs)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {s.filename}
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -105,7 +121,23 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
         <Button size="sm" variant="ghost" onClick={onOpenFolder}>
           <FolderOpen size={14} /> {t('screenshots.open_folder')}
         </Button>
+        <div style={{ flex: 1 }} />
+        {selected && (
+          <Button size="sm" variant="danger" onClick={() => setDeleteTarget(selected)}>
+            <Trash2 size={14} /> {t('common.delete')}
+          </Button>
+        )}
       </div>
+
+      <Modal open={!!deleteTarget} onClose={() => setDeleteTarget(null)} title={t('screenshots.delete_title')}>
+        <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
+          {t('screenshots.delete_confirm', { name: deleteTarget ?? '' })}
+        </p>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
+          <Button variant="ghost" onClick={() => setDeleteTarget(null)}>{t('common.cancel')}</Button>
+          <Button variant="danger" onClick={handleDelete}>{t('common.delete')}</Button>
+        </div>
+      </Modal>
     </div>
   );
 }

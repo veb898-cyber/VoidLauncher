@@ -197,7 +197,7 @@ export function Accounts() {
 
       {/* Add Offline Modal */}
       <Modal open={showAddOffline} onClose={() => setShowOffline(false)} title={t('accounts.modal_offline_title')}>
-        <Input label={t('accounts.username_label')} id="offline-name" type="text" placeholder={t('accounts.username_placeholder')} value={offlineName} onChange={(e) => setOfflineName(e.target.value)} autoFocus />
+        <Input label={t('accounts.username_label')} id="offline-name" type="text" value={offlineName} onChange={(e) => setOfflineName(e.target.value)} autoFocus />
         {offlineNameError && (
           <div style={{ marginTop: 6, fontSize: 'var(--font-size-xs)', color: 'var(--color-error, #ff6b6b)' }}>
             {offlineNameError}
@@ -212,8 +212,8 @@ export function Accounts() {
       {/* Add Ely.by Modal */}
       <Modal open={showAddElyby} onClose={() => setShowElyby(false)} title={t('accounts.modal_elyby_title')}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
-          <Input label={t('accounts.elyby_email_label')} id="elyby-user" type="text" placeholder={t('accounts.elyby_email_placeholder')} value={elybyUser} onChange={(e) => setElybyUser(e.target.value)} autoFocus />
-          <Input label={t('accounts.password_label')} id="elyby-pass" type="password" placeholder={t('accounts.password_placeholder')} value={elybyPass} onChange={(e) => setElybyPass(e.target.value)} />
+          <Input label={t('accounts.elyby_email_label')} id="elyby-user" type="text" value={elybyUser} onChange={(e) => setElybyUser(e.target.value)} autoFocus />
+          <Input label={t('accounts.password_label')} id="elyby-pass" type="password" value={elybyPass} onChange={(e) => setElybyPass(e.target.value)} />
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
           <Button variant="ghost" onClick={() => setShowElyby(false)}>{t('common.cancel')}</Button>

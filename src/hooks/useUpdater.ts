@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { addToast } from '../components/ui/Toast';
@@ -17,6 +17,7 @@ export interface UpdaterState {
   downloadProgress: number;
   installing: boolean;
   error: string | null;
+  checkError: string | null;
 }
 
 export function useUpdater() {
@@ -28,10 +29,14 @@ export function useUpdater() {
     downloadProgress: 0,
     installing: false,
     error: null,
+    checkError: null,
   });
 
+  const skipCheck = useRef(false);
+
   const checkForUpdates = useCallback(async () => {
-    setState((s) => ({ ...s, checking: true, error: null }));
+    if (skipCheck.current) return;
+    setState((s) => ({ ...s, checking: true, checkError: null }));
     try {
       const update = await check();
       if (update) {
@@ -47,9 +52,19 @@ export function useUpdater() {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('Update check failed:', err);
-      addToast(t('updater.check_failed', { error: msg }), 'error');
-      setState((s) => ({ ...s, checking: false, error: msg }));
+      setState((s) => ({ ...s, checking: false, checkError: msg }));
     }
+  }, []);
+
+  const retryCheck = useCallback(async () => {
+    setState((s) => ({ ...s, checkError: null }));
+    skipCheck.current = false;
+    await checkForUpdates();
+  }, [checkForUpdates]);
+
+  const dismissCheckError = useCallback(() => {
+    skipCheck.current = true;
+    setState((s) => ({ ...s, checkError: null }));
   }, []);
 
   const dismissUpdate = useCallback(() => {
@@ -79,9 +94,6 @@ export function useUpdater() {
           downloaded += event.data.chunkLength;
           if (contentLength > 0) {
             const pct = Math.min(99, Math.round((downloaded / contentLength) * 100));
-            // Throttle state updates: only re-render when the rounded percent
-            // changes. Otherwise we get a setState storm on a fast link
-            // (every chunk is one update), which janks the progress bar.
             if (pct !== lastReportedPct) {
               lastReportedPct = pct;
               setState((s) => ({ ...s, downloadProgress: pct }));
@@ -113,6 +125,8 @@ export function useUpdater() {
   return {
     ...state,
     checkForUpdates,
+    retryCheck,
+    dismissCheckError,
     dismissUpdate,
     downloadAndInstall,
   };

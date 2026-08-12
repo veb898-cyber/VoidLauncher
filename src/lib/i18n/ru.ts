@@ -54,6 +54,7 @@ export const ru: Record<string, string> = {
   'common.items_selected':             'Выбрано: {n}',
   'common.loading':                    'Загрузка...',
   'common.installing':                 'Установка...',
+  'common.leave':                      'Выйти',
 
   // ── Error Boundary ──────────────────────────────────────────
   'error_boundary.heading':            'Что-то пошло не так',
@@ -84,6 +85,18 @@ export const ru: Record<string, string> = {
   'home.upload_image':                  'Загрузить изображение',
   'home.remove_banner':                 'Убрать баннер',
   'home.banner_updated':                'Баннер обновлён',
+  'home.banner_neon_purple':            'Неоновый пурпур',
+  'home.banner_cyber_blue':             'Кибер-синий',
+  'home.banner_sunset':                 'Закат',
+  'home.banner_forest':                 'Лес',
+  'home.banner_ocean':                  'Океан',
+  'home.banner_midnight':               'Полночь',
+  'home.banner_lava':                   'Лава',
+  'home.banner_arctic':                 'Арктика',
+  'home.banner_royal':                  'Королевский',
+  'home.banner_mint':                   'Мята',
+  'home.banner_cherry':                 'Вишня',
+  'home.banner_deep_sea':               'Глубокое море',
 
   // ── Accounts ────────────────────────────────────────────────
   'accounts.title':                    'Аккаунты',
@@ -138,13 +151,12 @@ export const ru: Record<string, string> = {
   'create_instance.loader_label':      'Загрузчик модов',
   'create_instance.loader_vanilla':    'Vanilla',
   'create_instance.loader_fabric':     'Fabric',
-  'create_instance.loader_quilt':      'Quilt',
   'create_instance.loader_forge':      'Forge',
   'create_instance.loader_neoforge':   'NeoForge',
   'create_instance.stable_badge':      'стабильная',
-  'create_instance.vanilla_hint':      'Без загрузчика модов. Fabric/Quilt можно добавить позже.',
   'create_instance.downloading':       'Загрузка файлов версии...',
   'create_instance.loader_failed':     'Не удалось установить {loader}, продолжение с Vanilla',
+  'create_instance.loader_install_failed': 'Не удалось установить {loader}: {error}. Он будет установлен автоматически при первом запуске',
   'create_instance.loader_versions_failed': 'Не удалось загрузить список версий {loader}',
   'create_instance.loader_no_versions':'Нет доступных версий для этой версии Minecraft',
   'create_instance.loader_end':       'Все {total} версий загружены',
@@ -331,6 +343,8 @@ export const ru: Record<string, string> = {
   'content.deps_heading':              'Зависимости ({count})',
   'content.dep_required_by':           'Требуется для {parent}',
   'content.browse_heading':            'Обзор: {label}',
+  'content.leave_confirm_title':         'Покинуть просмотр?',
+  'content.leave_confirm_text':          'У вас {count} выбранных элементов. Если вы выйдете, выбор будет потерян.',
   'content.search_placeholder':        'Поиск {label}...',
   'content.empty_results':             '{label} не найдены',
   'content.download_count':            '{n} скачиваний',
@@ -413,6 +427,10 @@ export const ru: Record<string, string> = {
   'screenshots.empty':                 'Скриншотов пока нет.',
   'screenshots.hint':                  'Нажмите F2 в игре, чтобы сделать скриншот.',
   'screenshots.open_folder':           'Открыть папку скриншотов',
+  'screenshots.delete_title':          'Удалить скриншот',
+  'screenshots.delete_confirm':        'Удалить "{name}"?',
+  'screenshots.deleted':               'Скриншот удалён',
+  'screenshots.error':                 'Ошибка скриншота',
 
   // ── Worlds ──────────────────────────────────────────────────
   'worlds.title':                      'Миры',
@@ -475,6 +493,7 @@ export const ru: Record<string, string> = {
   // ── Game Logs ────────────────────────────────────────────────
   'game_logs.title':                   'Логи игры',
   'game_logs.subtitle':                'Вывод игры Minecraft из последних сессий',
+  'game_logs.recent_sessions':         'Последние сессии',
   'game_logs.empty':                   'Логов игры пока нет. Запустите игру, чтобы увидеть её вывод здесь.',
   'game_logs.no_content':              'В этой сессии нет вывода',
   'game_logs.live_session':            'Текущая сессия',
@@ -491,6 +510,15 @@ export const ru: Record<string, string> = {
   'loader_install.installing':         'Установка {loader}...',
   'loader_install.retry':              'Повторить',
   'loader_install.done':               '{loader} успешно установлен!',
+
+  // ── Launch ───────────────────────────────────────────
+  'launch.java_setup_title':            'Настройка Java',
+  'launch.checking_java':               'Проверка Java...',
+  'launch.java_stage_resolving':        'Поиск доступных версий...',
+  'launch.java_stage_downloading':      'Загрузка Java...',
+  'launch.java_stage_extracting':       'Распаковка Java...',
+  'launch.java_stage_verifying':        'Проверка установки Java...',
+  'launch.java_stage_done':             'Java готова!',
 
   // ── Install Overlay ─────────────────────────────────────────
   'install.stage_fetching':            'Получение информации о версии',
@@ -512,6 +540,10 @@ export const ru: Record<string, string> = {
   'updater.btn_later':                  'Позже',
   'updater.checking':                   'Проверка обновлений...',
   'updater.check_failed':               'Не удалось проверить обновления: {error}',
+  'updater.check_error_title':          'Ошибка проверки обновлений',
+  'updater.check_error_description':    'Не удалось проверить наличие обновлений. Сервер обновлений временно недоступен.',
+  'updater.btn_retry':                  'Повторить попытку',
+  'updater.btn_cancel':                 'Отмена',
 
   // ── Offline account username validation ─────────────────────
   'accounts.offline_username_cyrillic': 'Имя не должно содержать кириллицу.',
