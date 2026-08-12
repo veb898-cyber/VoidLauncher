@@ -54,7 +54,7 @@ fn http_client() -> &'static reqwest::Client {
             .no_gzip()
             .no_brotli()
             .no_deflate()
-            .user_agent("VoidLauncher/0.1.5")
+            .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("Failed to create HTTP client (check TLS libraries)")
     })

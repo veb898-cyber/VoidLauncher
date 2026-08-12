@@ -70,7 +70,7 @@ fn download_client() -> &'static reqwest::Client {
             .no_gzip()
             .no_brotli()
             .no_deflate()
-            .user_agent("VoidLauncher/0.1.5")
+            .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("Failed to create Java download client (check TLS libraries)")
     })
