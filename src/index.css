@@ -492,6 +492,8 @@ a {
   align-items: center;
   gap: var(--space-sm);
   padding: 0 var(--space-sm);
+  width: 100%;
+  overflow: hidden;
 }
 
 .sidebar__avatar {

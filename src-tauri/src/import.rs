@@ -186,7 +186,9 @@ fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    let stem = filename.trim_end_matches(".jar").trim_end_matches(".zip");
+    let stem = filename
+        .trim_end_matches(".jar")
+        .trim_end_matches(".zip");
     let sidecar = serde_json::json!({
         "provider": "modrinth",
         "project_id": file_entry["project_id"].as_str(),
@@ -198,8 +200,11 @@ fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) {
         "downloaded_from_mrpack": true,
     });
     if let Some(parent) = dest_path.parent() {
-        let sidecar_name = format!("{}.voidlauncher.json", stem);
-        let _ = std::fs::write(parent.join(sidecar_name), sidecar.to_string());
+        let sidecar_path = parent.join(".index").join(format!("{}.voidlauncher.json", stem));
+        if let Some(index_dir) = sidecar_path.parent() {
+            let _ = std::fs::create_dir_all(index_dir);
+        }
+        let _ = std::fs::write(sidecar_path, sidecar.to_string());
     }
 }
 
@@ -819,7 +824,9 @@ async fn import_curseforge_pack(
                         });
                         let sidecar_name = format!("{}.voidlauncher.json",
                             cf_file.file_name.trim_end_matches(".jar"));
-                        let _ = std::fs::write(mods_dir.join(sidecar_name), sidecar.to_string());
+                        let index_dir = mods_dir.join(".index");
+                        let _ = std::fs::create_dir_all(&index_dir);
+                        let _ = std::fs::write(index_dir.join(sidecar_name), sidecar.to_string());
 
                         Ok(())
                     }.await;

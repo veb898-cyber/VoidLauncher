@@ -1,7 +1,7 @@
 use crate::error::{LauncherError, Result};
 use sha1::{Digest, Sha1};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -31,6 +31,16 @@ pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
     "maven.minecraftforge.net",
     "maven.neoforged.net",
     "maven.creeperhost.net",
+    "repo.maven.apache.org",
+    "meta.fabricmc.net",
+    "meta.prismlauncher.org",
+    "api.curseforge.com",
+    "api.minecraftservices.com",
+    "authserver.ely.by",
+    "login.microsoftonline.com",
+    "login.live.com",
+    "user.auth.xboxlive.com",
+    "xsts.auth.xboxlive.com",
     "bmclapi2.bangbang93.com",
     "mirrors.cernet.edu.cn",
     "api.adoptium.net",
@@ -41,23 +51,77 @@ pub fn is_host_allowed(host: &str) -> bool {
     ALLOWED_DOWNLOAD_HOSTS.iter().any(|h| host == *h || host.ends_with(&format!(".{}", h)))
 }
 
-/// Global HTTP client with connection pooling
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(32)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Duration::from_secs(15))
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("Failed to create HTTP client (check TLS libraries)")
+/// Redirect policy: follow a redirect only if the destination is HTTPS and
+/// its host is allowlisted, otherwise stop. reqwest follows up to 10
+/// redirects by default without re-validating the target, which would let
+/// a 302 from a trusted host escape to an arbitrary host.
+pub fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let url = attempt.url();
+        let host = url.host_str().unwrap_or("");
+        if url.scheme() == "https" && is_host_allowed(host) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
     })
+}
+
+/// Global HTTP client with connection pooling
+fn http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>> = OnceLock::new();
+    let proxy = configured_proxy();
+    let mut slot = CLIENT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap();
+    // Rebuild the client when the proxy setting changes (including disabled).
+    if slot.as_ref().map(|(p, _)| p != &proxy).unwrap_or(true) {
+        *slot = Some((proxy.clone(), build_client(proxy.as_deref())));
+    }
+    slot.as_ref().unwrap().1.clone()
+}
+
+fn build_client(proxy: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(15))
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .redirect(redirect_policy())
+        .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")));
+    if let Some(proxy) = proxy {
+        if let Ok(p) = reqwest::Proxy::all(proxy.to_string()) {
+            builder = builder.proxy(p);
+        }
+    }
+    builder
+        .build()
+        .expect("Failed to create HTTP client (check TLS libraries)")
+}
+
+/// Proxy URL configured in the settings (None = direct connection).
+static PROXY_CFG: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+pub(crate) fn configured_proxy() -> Option<String> {
+    PROXY_CFG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+/// Update the global proxy used by every HTTP request. Called when the
+/// config is loaded and whenever the settings are saved.
+pub fn set_global_proxy(proxy: Option<String>) {
+    *PROXY_CFG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = proxy;
 }
 
 /// Validate a completed download file: SHA1 check or JSON-content rejection.
@@ -532,8 +596,10 @@ pub fn hash_file_sha1(path: &std::path::Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Expose global client for use by other modules (versions, modloaders)
-pub fn global_http_client() -> &'static reqwest::Client {
+/// Expose global client for use by other modules (versions, modloaders).
+/// Returns a cheap clone; the underlying client is rebuilt automatically
+/// when the proxy setting changes.
+pub fn global_http_client() -> reqwest::Client {
     http_client()
 }
 
@@ -582,5 +648,27 @@ mod tests {
         let p = temp_file("tiny.jar", b"PK");
         assert!(verify_zip_magic(&p).is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn host_allowlist_exact_match() {
+        assert!(is_host_allowed("github.com"));
+        assert!(is_host_allowed("objects.githubusercontent.com"));
+        assert!(is_host_allowed("api.modrinth.com"));
+    }
+
+    #[test]
+    fn host_allowlist_subdomain_match() {
+        assert!(is_host_allowed("sub.github.com"));
+        assert!(is_host_allowed("media.forgecdn.net"));
+        assert!(is_host_allowed("x.api.adoptium.net"));
+    }
+
+    #[test]
+    fn host_allowlist_rejects_unknown_and_suffix_spoofing() {
+        assert!(!is_host_allowed("attacker.example"));
+        assert!(!is_host_allowed("github.com.attacker.example"));
+        assert!(!is_host_allowed("notgithub.com"));
+        assert!(!is_host_allowed(""));
     }
 }

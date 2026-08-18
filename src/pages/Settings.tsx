@@ -238,7 +238,7 @@ export function Settings() {
               options={[
                 { value: 'standard', label: 'Standard', description: t('instance_editor.gc_standard_desc') },
                 { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: 'Java 8+' },
-                { value: 'zgc', label: t('instance_editor.gc_zgc'), description: 'Java 17+, \u2265 6 GB' },
+                { value: 'zgc', label: t('instance_editor.gc_zgc'), description: 'Java 17+, \u2265 8 GB' },
               ]}
               onChange={(v) => updateConfig('default_gc_preset', v)}
             />
@@ -480,44 +480,6 @@ export function Settings() {
 
         <div className="settings-row">
           <div className="settings-row__info">
-            <div className="settings-row__title">{t('settings.show_snapshots_title')}</div>
-            <div className="settings-row__desc">
-              {t('settings.show_snapshots_desc')}
-            </div>
-          </div>
-          <div className="settings-row__control">
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={localConfig.show_snapshots}
-                onChange={(e) => updateConfig('show_snapshots', e.target.checked)}
-              />
-              <span className="toggle__slider" />
-            </label>
-          </div>
-        </div>
-
-        <div className="settings-row">
-          <div className="settings-row__info">
-            <div className="settings-row__title">{t('settings.show_old_versions_title')}</div>
-            <div className="settings-row__desc">
-              {t('settings.show_old_versions_desc')}
-            </div>
-          </div>
-          <div className="settings-row__control">
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={localConfig.show_old_versions}
-                onChange={(e) => updateConfig('show_old_versions', e.target.checked)}
-              />
-              <span className="toggle__slider" />
-            </label>
-          </div>
-        </div>
-
-        <div className="settings-row">
-          <div className="settings-row__info">
             <div className="settings-row__title">{t('settings.data_dir_title')}</div>
             <div className="settings-row__desc">
               {localConfig.data_dir}
@@ -527,6 +489,20 @@ export function Settings() {
             <Button size="sm" variant="ghost" onClick={async () => {
               await invoke('cmd_open_folder', { path: localConfig.data_dir });
             }}>{t('settings.data_dir_open')}</Button>
+          </div>
+        </div>
+
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.game_logs_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.game_logs_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control">
+            <Button size="sm" variant="ghost" onClick={async () => {
+              await invoke('cmd_open_folder', { path: `${localConfig.data_dir}/logs/game` });
+            }}>{t('settings.game_logs_open')}</Button>
           </div>
         </div>
 
@@ -557,6 +533,70 @@ export function Settings() {
             >
               {clearingCache ? <LoadingSpinner size={14} /> : t('settings.clear_cache_btn')}
             </Button>
+          </div>
+        </div>
+      </section>
+
+      {/* Network Section */}
+      <section className="settings-section">
+        <h2 className="settings-section__title">{t('settings.section_network')}</h2>
+
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.proxy_enabled_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.proxy_enabled_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control">
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={localConfig.proxy_enabled}
+                onChange={(e) => updateConfig('proxy_enabled', e.target.checked)}
+              />
+              <span className="toggle__slider" />
+            </label>
+          </div>
+        </div>
+
+        <div className="settings-row" style={{ opacity: localConfig.proxy_enabled ? 1 : 0.5 }}>
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.proxy_addr_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.proxy_addr_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control">
+            <input
+              className="input"
+              type="text"
+              value={localConfig.proxy_addr}
+              disabled={!localConfig.proxy_enabled}
+              onChange={(e) => updateConfig('proxy_addr', e.target.value)}
+              style={{ width: 180 }}
+            />
+          </div>
+        </div>
+
+        <div className="settings-row" style={{ opacity: localConfig.proxy_enabled ? 1 : 0.5 }}>
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.proxy_port_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.proxy_port_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control">
+            <input
+              className="input"
+              type="number"
+              min={1}
+              max={65535}
+              value={localConfig.proxy_port || ''}
+              disabled={!localConfig.proxy_enabled}
+              onChange={(e) => updateConfig('proxy_port', Math.max(1, Math.min(65535, Number(e.target.value) || 0)))}
+              style={{ width: 120 }}
+            />
           </div>
         </div>
       </section>

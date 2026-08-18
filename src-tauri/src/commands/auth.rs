@@ -118,7 +118,7 @@ pub fn cmd_logout(state: State<'_, AppState>) -> Result<(), String> {
     drop(auth_state);
     let mut auth_state = state.auth_state.lock().map_err(|e| e.to_string())?;
     *auth_state = auth::AuthState::default();
-    let _ = std::fs::remove_file(config.auth_file());
+    auth::clear_auth_state(&config.auth_file());
     Ok(())
 }
 
@@ -129,9 +129,8 @@ pub fn cmd_list_accounts(
     state: State<'_, AppState>,
 ) -> Result<Vec<accounts::PublicAccountEntry>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    // Strip access_token / elby_token before crossing the bridge so secrets
-    // never enter the renderer process. The launch flow reads tokens from
-    // disk via accounts::list_accounts (which still returns AccountEntry).
+    // Account list carries no secrets — tokens live in the OS credential vault
+    // and are read back by the launch flow via accounts::get_elyby_token.
     Ok(accounts::list_accounts(&config.data_dir)
         .into_iter()
         .map(accounts::PublicAccountEntry::from)
@@ -198,8 +197,10 @@ pub async fn cmd_add_elyby_account(
     let (name, uuid, access_token) = auth::elyby_login(&username, &password)
         .await
         .map_err(|e| e.to_string())?;
-    let entry = accounts::AccountEntry::new_elyby(&name, &uuid, &access_token);
+    let entry = accounts::AccountEntry::new_elyby(&name, &uuid);
     let accounts = accounts::add_account(&data_dir, entry)?;
+    let account_id = accounts.last().map(|a| a.id.clone()).ok_or("Account not saved")?;
+    accounts::store_elyby_token(&account_id, &access_token).map_err(|e| e.to_string())?;
     Ok(accounts
         .into_iter()
         .map(accounts::PublicAccountEntry::from)

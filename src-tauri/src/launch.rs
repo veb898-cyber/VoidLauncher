@@ -14,6 +14,58 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Open (create) files to receive the game process stdout/stderr.
+///
+/// The game writes a LOT to stdout (log4j console appender, warn/error
+/// spam from broken resource packs, mod errors, …). Piping it (Stdio::piped())
+/// without any reader would fill the OS pipe buffer and block the game
+/// forever once the buffer is full — the game then hangs hard on any log
+/// write. Redirecting to files guarantees the game never blocks on logging.
+fn open_game_output_files(
+    data_dir: &std::path::Path,
+    instance_name: &str,
+) -> Result<(std::fs::File, std::fs::File)> {
+    use std::io::Write;
+
+    let game_logs_dir = data_dir.join("logs").join("game");
+    std::fs::create_dir_all(&game_logs_dir).map_err(|e| {
+        LauncherError::Launch(format!("Failed to create game logs dir: {}", e))
+    })?;
+
+    let now = chrono::Local::now();
+    let timestamp = now.format("%Y%m%d_%H%M%S");
+    let safe_name: String = instance_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let base = game_logs_dir.join(format!("{}_{}", safe_name, timestamp));
+    let stdout_path = format!("{}.stdout.log", base.display());
+    let stderr_path = format!("{}.stderr.log", base.display());
+
+    let mut stdout_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_path)
+        .map_err(|e| LauncherError::Launch(format!("Failed to open {}: {}", stdout_path, e)))?;
+    let mut stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)
+        .map_err(|e| LauncherError::Launch(format!("Failed to open {}: {}", stderr_path, e)))?;
+
+    let header = format!(
+        "VoidLauncher game stdout\nInstance: {}\nStarted: {}\n{}\n",
+        instance_name,
+        now.format("%Y-%m-%d %H:%M:%S"),
+        "=".repeat(60),
+    );
+    let _ = writeln!(stdout_file, "{}", header);
+    let _ = writeln!(stderr_file, "{}", header);
+
+    tracing::info!(target: "launcher", "Game stdout -> {}, stderr -> {}", stdout_path, stderr_path);
+    Ok((stdout_file, stderr_file))
+}
+
 /// Launch Minecraft for a given instance
 pub fn launch_minecraft(
     config: &AppConfig,
@@ -222,10 +274,13 @@ pub fn launch_minecraft(
 
     // 4. Build JVM arguments.
     //    - Memory: instance override > config default. Xms == Xmx.
-    //    - Preset: instance override > "g1gc" (safe default).
+    //    - Preset: instance override > config default_gc_preset (safe default).
     //    - Any custom instance.jvm_args are appended AFTER the preset.
     let memory_mb = instance.memory_mb.unwrap_or(config.default_memory_mb);
-    let preset_str = instance.gc_preset.as_deref().unwrap_or("g1gc");
+    let preset_str = instance
+        .gc_preset
+        .as_deref()
+        .unwrap_or(&config.default_gc_preset);
     let requested_preset = GcPreset::from_str(preset_str);
     let (mut args, effective_preset) = build_jvm_args(requested_preset, memory_mb, java_major);
     tracing::info!(target: "launcher", "Memory: Xms=Xmx={}M, preset={:?} (requested {:?})",
@@ -464,10 +519,12 @@ pub fn launch_minecraft(
     tracing::info!(target: "launcher", "Spawning Java process...");
 
     let mut cmd = Command::new(&java_path);
+    let (stdout_file, stderr_file) =
+        open_game_output_files(&config.data_dir, &instance.name)?;
     cmd.args(&args)
         .current_dir(&game_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 

@@ -54,6 +54,35 @@ pub fn cmd_delete_file(state: State<'_, AppState>, path: String) -> Result<(), S
     std::fs::remove_file(&path).map_err(|e| e.to_string())
 }
 
+/// Read an image file picked via the OS file dialog so the renderer never
+/// needs a broad filesystem scope. Restricted to image extensions and a
+/// size limit — an XSS in the renderer cannot exfiltrate arbitrary files.
+#[tauri::command]
+pub fn cmd_read_image_file(path: String) -> Result<Vec<u8>, String> {
+    const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+    // Canonicalize first: resolves symlinks and rejects non-existent paths,
+    // so the extension check below cannot be bypassed by aliasing.
+    let file = std::path::Path::new(&path)
+        .canonicalize()
+        .map_err(|_| "Invalid file path".to_string())?;
+    if !file.is_file() {
+        return Err("Not a file".to_string());
+    }
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !["png", "jpg", "jpeg", "ico"].contains(&ext.as_str()) {
+        return Err("File must be a PNG, JPG or ICO image".to_string());
+    }
+    let meta = std::fs::metadata(&file).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err("Image file is too large (max 10 MB)".to_string());
+    }
+    std::fs::read(&file).map_err(|e| e.to_string())
+}
+
 
 // ==================== Icon Cache ====================
 
@@ -161,6 +190,21 @@ pub fn cmd_save_config(
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     *config = new_config;
     config.save().map_err(|e| e.to_string())?;
+    crate::download::set_global_proxy(config.proxy_url());
     events::emit_log(&app, "info", "config", "Configuration saved");
     Ok(())
+}
+
+/// Open a folder in the system file manager. Used by the settings page
+/// (data folder, game logs). Creates the folder if it does not exist.
+#[tauri::command]
+pub fn cmd_open_folder(app: AppHandle, path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(&path);
+    if !target.exists() {
+        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+    }
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(target.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
 }

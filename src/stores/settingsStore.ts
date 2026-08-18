@@ -11,6 +11,11 @@ interface AppConfig {
   default_jvm_args: string[];
   java_path: string | null;
   close_on_launch: boolean;
+  proxy_enabled: boolean;
+  proxy_addr: string;
+  proxy_port: number;
+  // Kept for config save/load compatibility with the Rust struct
+  // (fields are no longer editable in the UI).
   show_snapshots: boolean;
   show_old_versions: boolean;
   /** CurseForge API key — only used by Rust; not editable in the UI. */

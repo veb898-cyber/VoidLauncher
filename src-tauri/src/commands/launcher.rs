@@ -686,6 +686,14 @@ pub async fn cmd_launch_game(
         },
     );
 
+    // "Close on launch": the window close triggers the playtime flush
+    // (WindowEvent::CloseRequested), then the app exits, leaving only the game.
+    if config.close_on_launch {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.close();
+        }
+    }
+
     // Mark this instance as the running one (the frontend shows a "Running" badge)
     {
         let mut slot = state.running_instance_id.lock().map_err(|e| e.to_string())?;
@@ -823,11 +831,12 @@ pub async fn cmd_launch_game(
 
 #[tauri::command]
 pub async fn cmd_get_fabric_versions(
+    mc_version: String,
     offset: usize,
     limit: usize,
 ) -> Result<modloaders::LoaderVersionPage, String> {
     let limit = if limit == 0 { PAGE_SIZE } else { limit };
-    modloaders::fabric::get_loader_versions(offset, limit)
+    modloaders::fabric::get_loader_versions_for(&mc_version, offset, limit)
         .await
         .map_err(|e| e.to_string())
 }

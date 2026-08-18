@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const MAX_LOG_FILES: usize = 5;
+const MAX_LOG_FILES: usize = 7;
 
 /// Metadata for a game log session
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -82,7 +82,7 @@ pub fn append_game_log_line(log_path: &str, line: &str) {
     }
 }
 
-/// List game log sessions (most recent first, max 5)
+/// List game log sessions (most recent first, max 7)
 pub fn list_game_log_sessions(data_dir: &PathBuf) -> Vec<GameLogSession> {
     let game_logs_dir = data_dir.join("logs").join("game");
     if !game_logs_dir.exists() {

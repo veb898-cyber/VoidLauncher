@@ -122,6 +122,8 @@ pub fn run() {
     let auth_state = auth::load_auth_state(&config.auth_file()).unwrap_or_default();
     let icon_cache = load_icon_cache_from_disk(&config);
 
+    download::set_global_proxy(config.proxy_url());
+
     tracing::info!(target: "launcher", "Data dir: {}", data_dir.display());
     tracing::info!(target: "launcher", "Config: data_dir={}, default_memory_mb={}, gc={}",
         config.data_dir.display(), config.default_memory_mb, config.default_gc_preset);
@@ -138,7 +140,14 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                // GitHub API contents endpoint (fallback to raw.githubusercontent.com)
+                // needs this Accept header to return the raw file content
+                .header("Accept", "application/vnd.github.raw+json")
+                .expect("invalid updater header")
+                .build(),
+        )
         .manage(AppState {
             config: Mutex::new(config),
             auth_state: Mutex::new(auth_state),
@@ -180,6 +189,7 @@ pub fn run() {
             commands::launcher::cmd_install_instance_loader,
             commands::misc::cmd_get_config,
             commands::misc::cmd_save_config,
+            commands::misc::cmd_read_image_file,
             commands::misc::cmd_get_launch_state,
             commands::instances::cmd_check_instance_installed,
             commands::misc::cmd_detect_system_ram,
@@ -241,6 +251,7 @@ pub fn run() {
             commands::launcher::cmd_format_playtime,
             commands::launcher::cmd_flush_playtime,
             commands::misc::cmd_clear_cache,
+            commands::misc::cmd_open_folder,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {

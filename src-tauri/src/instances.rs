@@ -3,6 +3,7 @@ use crate::error::{LauncherError, Result};
 use crate::modloaders::LoaderProfile;
 use std::path::{Path, PathBuf};
 use std::io::Read;
+use std::collections::HashMap;
 use chrono::Utc;
 use flate2::read::GzDecoder;
 
@@ -445,15 +446,23 @@ pub fn list_packs(instances_dir: &PathBuf, name: &str, pack_type: &str) -> Resul
         let entry = entry?;
         let path = entry.path();
         let filename = entry.file_name().to_string_lossy().to_string();
-        // Skip hidden files and sidecar metadata
-        if filename.starts_with('.') || filename.ends_with(".voidlauncher.json") { continue; }
+        // Skip hidden files (incl. Prism `.index/`), sidecar metadata and
+        // Prism/packwiz `.pw.toml` metadata files
+        if filename.starts_with('.')
+            || filename.ends_with(".voidlauncher.json")
+            || filename.ends_with(".pw.toml")
+        {
+            continue;
+        }
         let is_dir = path.is_dir();
         let meta = std::fs::metadata(&path)?;
 
         // Skip tiny non-zip config presets in shaderpacks (e.g. "Better MC - High.json" at 373 bytes)
         if pack_type == "shaderpacks" && !is_dir && meta.len() < 1024 {
             let lower = filename.to_lowercase();
-            if lower.ends_with(".json") || lower.ends_with(".txt") || lower.ends_with(".cfg") || lower.ends_with(".properties") {
+            if lower.ends_with(".json") || lower.ends_with(".txt") || lower.ends_with(".cfg")
+                || lower.ends_with(".properties") || lower.ends_with(".toml")
+            {
                 continue;
             }
         }
@@ -496,26 +505,151 @@ pub fn read_pack_icon(instances_dir: &PathBuf, instance_name: &str, pack_type: &
     }
 }
 
+/// Stem of a content filename: strip `.disabled`, then `.jar`/`.zip`.
+pub(crate) fn content_stem(filename: &str) -> &str {
+    let s = filename.strip_suffix(".disabled").unwrap_or(filename);
+    s.strip_suffix(".jar")
+        .or_else(|| s.strip_suffix(".zip"))
+        .unwrap_or(s)
+}
+
+/// Sidecar metadata path (new layout): a single hidden `.index/` folder
+/// inside the content directory — same layout as Prism Launcher — instead
+/// of a metadata file next to each mod/pack.
+pub(crate) fn sidecar_meta_path(content_dir: &std::path::Path, filename: &str) -> PathBuf {
+    content_dir
+        .join(".index")
+        .join(format!("{}.voidlauncher.json", content_stem(filename)))
+}
+
+/// Legacy sidecar path (old layout): a metadata file next to the content file.
+pub(crate) fn legacy_sidecar_path(content_dir: &std::path::Path, filename: &str) -> PathBuf {
+    content_dir.join(format!("{}.voidlauncher.json", content_stem(filename)))
+}
+
+/// Read sidecar metadata: new `.index/` layout first, legacy layout as fallback.
+pub(crate) fn read_sidecar_meta(content_dir: &std::path::Path, filename: &str) -> Option<serde_json::Value> {
+    for p in [
+        sidecar_meta_path(content_dir, filename),
+        legacy_sidecar_path(content_dir, filename),
+    ] {
+        if let Ok(contents) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str(&contents) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Remove sidecar metadata in both layouts (used when a content file is deleted).
+pub(crate) fn remove_sidecar_meta(content_dir: &std::path::Path, filename: &str) {
+    let _ = std::fs::remove_file(sidecar_meta_path(content_dir, filename));
+    let _ = std::fs::remove_file(legacy_sidecar_path(content_dir, filename));
+}
+
+/// Metadata extracted from a Prism Launcher packwiz `.pw.toml` file.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PackwizMeta {
+    /// Filename the metadata refers to (from `filename = "..."`).
+    pub filename: String,
+    /// Display name (from `name = "..."`).
+    pub name: String,
+    /// Version (from `x-prismlauncher-version-number`, falls back to `version`).
+    pub version: String,
+    /// Provider: "Modrinth", "CurseForge" or "".
+    pub provider: String,
+    /// Project id on the provider (mod-id for Modrinth, project-id for CurseForge).
+    pub project_id: String,
+}
+
+/// Load all packwiz `.pw.toml` metadata from a content dir — scanning both
+/// the `.index/` folder (usual Prism layout) and the content dir root
+/// (Prism exports shader packs' metadata as `<slug>.pw.toml` in the root),
+/// keyed by the declared `filename`.
+///
+/// Prism Launcher stores per-file metadata (name, version, provider, project id)
+/// in `.pw.toml` files next to mods/resourcepacks/shaderpacks. Our own
+/// `.index/*.voidlauncher.json` sidecars take priority everywhere, but imported
+/// Prism instances only have the `.pw.toml` files, so we read them as a fallback.
+pub(crate) fn load_packwiz_index(content_dir: &Path) -> HashMap<String, PackwizMeta> {
+    let mut map = HashMap::new();
+    let mut scan_dirs: Vec<PathBuf> = Vec::with_capacity(2);
+    scan_dirs.push(content_dir.join(".index"));
+    scan_dirs.push(content_dir.to_path_buf());
+    for index_dir in scan_dirs {
+        let Ok(entries) = std::fs::read_dir(&index_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !file_name.ends_with(".pw.toml") {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(v) = contents.parse::<toml::Table>() else {
+                continue;
+            };
+            let Some(filename) = v.get("filename").and_then(|f| f.as_str()) else {
+                continue;
+            };
+            let mut meta = PackwizMeta {
+                filename: filename.to_string(),
+                ..Default::default()
+            };
+            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                meta.name = name.to_string();
+            }
+            if let Some(ver) = v.get("x-prismlauncher-version-number").and_then(|n| n.as_str()) {
+                meta.version = ver.to_string();
+            } else if let Some(ver) = v.get("version").and_then(|n| n.as_str()) {
+                meta.version = ver.to_string();
+            }
+            if let Some(pid) = v
+                .get("update")
+                .and_then(|u| u.get("modrinth"))
+                .and_then(|m| m.get("mod-id"))
+                .and_then(|m| m.as_str())
+            {
+                meta.provider = "Modrinth".to_string();
+                meta.project_id = pid.to_string();
+            } else if let Some(pid) = v
+                .get("update")
+                .and_then(|u| u.get("curseforge"))
+                .and_then(|c| c.get("project-id"))
+                .and_then(|c| c.as_integer())
+            {
+                meta.provider = "CurseForge".to_string();
+                meta.project_id = pid.to_string();
+            }
+            map.insert(meta.filename.clone(), meta);
+        }
+    }
+    map
+}
+
+/// Look up packwiz metadata for a single content file (if any).
+pub(crate) fn read_packwiz_meta(content_dir: &Path, filename: &str) -> Option<PackwizMeta> {
+    load_packwiz_index(content_dir).remove(filename)
+}
+
 fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, String, String)> {
     let filename = pack_path.file_name()?.to_string_lossy().to_string();
-    // Handle .disabled suffix: if file is foo.jar.disabled, look for both
-    // foo.jar.disabled.voidlauncher.json and foo.jar.voidlauncher.json
-    let meta_disabled = format!("{}.voidlauncher.json", filename);
-    let meta_filename = if let Some(stripped) = filename.strip_suffix(".disabled") {
-        let meta_original = format!("{}.voidlauncher.json", stripped);
-        let meta_path = pack_path.parent()?.join(&meta_original);
-        if meta_path.exists() { meta_original } else { meta_disabled }
-    } else {
-        meta_disabled
-    };
-    let meta_path = pack_path.parent()?.join(&meta_filename);
-    let contents = std::fs::read_to_string(&meta_path).ok()?;
-    let val: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    let provider = val["provider"].as_str().unwrap_or("").to_string();
-    let version = val["version_number"].as_str().unwrap_or("").to_string();
-    let project_id = val["project_id"].as_str().unwrap_or("").to_string();
-    let project_name = val["project_name"].as_str().unwrap_or("").to_string();
-    Some((provider, version, project_id, project_name))
+    if let Some(val) = read_sidecar_meta(pack_path.parent()?, &filename) {
+        let provider = val["provider"].as_str().unwrap_or("").to_string();
+        let version = val["version_number"].as_str().unwrap_or("").to_string();
+        let project_id = val["project_id"].as_str().unwrap_or("").to_string();
+        let project_name = val["project_name"].as_str().unwrap_or("").to_string();
+        return Some((provider, version, project_id, project_name));
+    }
+    // Fallback: Prism packwiz metadata (.pw.toml in .index/)
+    let pw = read_packwiz_meta(pack_path.parent()?, &filename)?;
+    Some((pw.provider, pw.version, pw.project_id, pw.name))
 }
 
 /// Strip Minecraft color/formatting codes (§a, §l, §r, etc.) and any underscores used as spaces
@@ -859,7 +993,59 @@ pub fn parse_prism_cfg(cfg_path: &std::path::Path) -> Option<Instance> {
     })
 }
 
-/// Import a Prism Launcher instance.zip into VoidLauncher instances dir
+/// Parse Prism/MultiMC `mmc-pack.json` (components) into our metadata.
+/// Returns (mc_version, loader, loader_version).
+fn parse_prism_mmc_pack(content: &str) -> (String, LoaderType, Option<String>) {
+    let mut mc_version = String::new();
+    let mut loader = LoaderType::Vanilla;
+    let mut loader_version: Option<String> = None;
+
+    let Ok(pack) = serde_json::from_str::<serde_json::Value>(content) else {
+        return (mc_version, loader, loader_version);
+    };
+    let Some(components) = pack["components"].as_array() else {
+        return (mc_version, loader, loader_version);
+    };
+
+    for comp in components {
+        let uid = comp["uid"].as_str().unwrap_or("");
+        let ver = comp["version"].as_str().unwrap_or("");
+        if comp["dependencyOnly"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        match uid {
+            "net.minecraft" | "org.multimc.minecraft" | "org.prismlauncher.minecraft" => {
+                if !ver.is_empty() {
+                    mc_version = ver.to_string();
+                }
+            }
+            "net.fabricmc.fabric-loader" | "org.quiltmc.quilt-loader" => {
+                loader = LoaderType::Fabric;
+                loader_version = Some(ver.to_string());
+            }
+            "net.minecraftforge" => {
+                loader = LoaderType::Forge;
+                loader_version = Some(ver.to_string());
+            }
+            "net.neoforged" => {
+                loader = LoaderType::NeoForge;
+                loader_version = Some(ver.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    (mc_version, loader, loader_version)
+}
+
+/// Import a Prism Launcher instance.zip into VoidLauncher instances dir.
+///
+/// Prism/MultiMC store the game directory as `minecraft/` (no dot) and keep
+/// metadata in `instance.cfg` + `mmc-pack.json`. We map the game directory to
+/// our canonical `.minecraft/` and translate the loader components, so mods,
+/// resourcepacks, shaderpacks, configs and saves land where our launcher
+/// expects them. Per-launch junk (.bobby cache, .mixin.out, crash-reports,
+/// logs) and Prism metadata files are not carried over.
 pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Instance> {
     let zip_path = std::path::Path::new(zip_path);
     if !zip_path.exists() {
@@ -869,21 +1055,27 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
         )));
     }
 
-    // Read the ZIP in one pass: detect instance.cfg, read name, then extract
+    // Read the ZIP in one pass: instance.cfg (name) + mmc-pack.json (version/loader)
     let zip_bytes = std::fs::read(zip_path)?;
-    let name = {
+    let (name, mc_version, loader, loader_version) = {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))
             .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
 
         let mut found = false;
         let mut cfg_content = String::new();
+        let mut pack_content = String::new();
 
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
-            if entry.name() == "instance.cfg" {
-                found = true;
-                entry.read_to_string(&mut cfg_content).ok();
-                break;
+            match entry.name() {
+                "instance.cfg" => {
+                    found = true;
+                    entry.read_to_string(&mut cfg_content).ok();
+                }
+                "mmc-pack.json" => {
+                    entry.read_to_string(&mut pack_content).ok();
+                }
+                _ => {}
             }
         }
 
@@ -893,7 +1085,7 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
             ));
         }
 
-        cfg_content.lines()
+        let name = cfg_content.lines()
             .find_map(|line| {
                 let line = line.trim();
                 if line.starts_with("name=") { Some(line[5..].to_string()) } else { None }
@@ -903,7 +1095,9 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
                     .and_then(|s| s.to_str())
                     .unwrap_or("imported")
                     .to_string()
-            })
+            });
+        let (mc_version, loader, loader_version) = parse_prism_mmc_pack(&pack_content);
+        (name, mc_version, loader, loader_version)
     };
 
     // Validate the extracted name
@@ -932,7 +1126,8 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
     let target_dir = instances_dir.join(&name);
     std::fs::create_dir_all(&target_dir)?;
 
-    // Extract all files from the ZIP to the target directory
+    // Extract with mapping: Prism `minecraft/` (and our own `.minecraft/`
+    // exports) → canonical `.minecraft/`. Skip Prism metadata and launch junk.
     {
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
             .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
@@ -952,7 +1147,30 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
                 continue;
             }
 
-            let out_path = target_dir.join(&entry_name);
+            // Skip per-launch junk we don't need
+            fn is_junk(rel: &str) -> bool {
+                rel.starts_with(".bobby/")
+                    || rel.starts_with(".mixin.out/")
+                    || rel.starts_with("crash-reports/")
+                    || rel.starts_with("logs/")
+            }
+
+            let relative: Option<String> = if let Some(rel) = normalised.strip_prefix("minecraft/") {
+                if is_junk(rel) { None } else { Some(format!(".minecraft/{}", rel)) }
+            } else if let Some(rel) = normalised.strip_prefix(".minecraft/") {
+                if is_junk(rel) { None } else { Some(format!(".minecraft/{}", rel)) }
+            } else {
+                match normalised.as_str() {
+                    "instance.cfg" | "instance.json" | "mmc-pack.json" | ".packignore" => None,
+                    "icon.png" | "pack.png" => Some(normalised),
+                    _ if normalised.starts_with("patches/") => None,
+                    _ => None,
+                }
+            };
+
+            let Some(relative) = relative else { continue };
+
+            let out_path = target_dir.join(&relative);
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -961,18 +1179,48 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
         }
     }
 
-    // Parse the extracted instance.cfg and save as instance.json
-    let extracted_cfg = target_dir.join("instance.cfg");
-    let instance = parse_prism_cfg(&extracted_cfg).ok_or_else(|| {
-        LauncherError::Instance("Failed to parse imported instance.cfg".to_string())
-    })?;
+    // Root icon → instance icon
+    let mut icon = None;
+    for ic in ["icon.png", "pack.png"] {
+        let p = target_dir.join(ic);
+        if p.exists() {
+            icon = read_image_as_base64(&p);
+            let _ = std::fs::remove_file(&p);
+            if icon.is_some() { break; }
+        }
+    }
 
-    // Write instance.json
-    let json_path = target_dir.join("instance.json");
-    let json = serde_json::to_string_pretty(&instance)?;
-    std::fs::write(&json_path, json)?;
+    // Parse metadata and save as instance.json (+ Prism-compatible instance.cfg)
+    let now = chrono::Utc::now().to_rfc3339();
+    let instance = Instance {
+        name,
+        mc_version,
+        loader,
+        loader_version,
+        loader_profile: None,
+        memory_mb: None,
+        jvm_args: None,
+        gc_preset: None,
+        java_path: None,
+        resolution: None,
+        icon,
+        banner: None,
+        created_at: now.clone(),
+        last_played: None,
+        play_time_seconds: 0,
+        notes: String::new(),
+    };
+    save_instance(instances_dir, &instance, None)?;
 
-    tracing::info!(target: "launcher", "Imported Prism pack '{}' from {:?}", name, zip_path);
+    tracing::info!(
+        target: "launcher",
+        "Imported Prism pack '{}' (MC {}, loader {:?} {:?}) from {:?}",
+        instance.name,
+        instance.mc_version,
+        instance.loader,
+        instance.loader_version,
+        zip_path
+    );
     Ok(instance)
 }
 
@@ -1188,4 +1436,307 @@ pub fn read_world_icon(instances_dir: &PathBuf, instance_name: &str, world_name:
         .join("saves").join(world_name).join("icon.png");
     if !icon_path.exists() { return None; }
     read_image_as_base64(&icon_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fn build_prism_zip(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip_w = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+        let cfg = "[General]\nConfigVersion=1.3\nInstanceType=OneSix\nname=Test Pack\n";
+        zip_w.start_file("instance.cfg", opts).unwrap();
+        zip_w.write_all(cfg.as_bytes()).unwrap();
+
+        let pack = r#"{
+            "components": [
+                {"uid": "org.lwjgl3", "version": "3.4.1", "dependencyOnly": true},
+                {"uid": "net.minecraft", "version": "1.20.1", "important": true},
+                {"uid": "net.fabricmc.intermediary", "version": "1.20.1", "dependencyOnly": true},
+                {"uid": "net.fabricmc.fabric-loader", "version": "0.15.11"}
+            ],
+            "formatVersion": 1
+        }"#;
+        zip_w.start_file("mmc-pack.json", opts).unwrap();
+        zip_w.write_all(pack.as_bytes()).unwrap();
+
+        for (name, bytes) in [
+            ("minecraft/mods/testmod.jar", b"PK\x03\x04fakejar".to_vec()),
+            ("minecraft/resourcepacks/rp.zip", b"PK\x03\x04fakerp".to_vec()),
+            ("minecraft/shaderpacks/sh.zip", b"PK\x03\x04fakesh".to_vec()),
+            ("minecraft/config/x.yml", b"key: value".to_vec()),
+            ("minecraft/.bobby/junk.mca", b"junk".to_vec()),
+            ("minecraft/.mixin.out/junk.class", b"junk".to_vec()),
+            ("minecraft/crash-reports/crash.txt", b"junk".to_vec()),
+            ("patches/forge.json", b"{}".to_vec()),
+            ("icon.png", b"\x89PNG\r\n\x1a\nfakepng".to_vec()),
+        ] {
+            zip_w.start_file(name, opts).unwrap();
+            zip_w.write_all(&bytes).unwrap();
+        }
+
+        zip_w.finish().unwrap();
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_prism_import_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn prism_import_maps_game_dir_and_loader() {
+        let dir = temp_dir("map");
+        let zip_path = dir.join("pack.zip");
+        build_prism_zip(&zip_path);
+
+        let instances_dir = dir.join("instances");
+        let instance = import_prism_pack(&instances_dir, zip_path.to_str().unwrap()).unwrap();
+
+        assert_eq!(instance.name, "Test Pack");
+        assert_eq!(instance.mc_version, "1.20.1");
+        assert_eq!(instance.loader, LoaderType::Fabric);
+        assert_eq!(instance.loader_version.as_deref(), Some("0.15.11"));
+        assert!(instance.icon.is_some(), "root icon should be imported");
+
+        let mc_dir = instances_dir.join("Test Pack").join(".minecraft");
+        assert!(mc_dir.join("mods/testmod.jar").exists(), "mods mapped to .minecraft/mods");
+        assert!(mc_dir.join("resourcepacks/rp.zip").exists());
+        assert!(mc_dir.join("shaderpacks/sh.zip").exists());
+        assert!(mc_dir.join("config/x.yml").exists());
+        assert!(!mc_dir.join(".bobby").exists(), "launch junk skipped");
+        assert!(!mc_dir.join(".mixin.out").exists(), "mixin dump skipped");
+        assert!(!mc_dir.join("crash-reports").exists(), "crash reports skipped");
+        assert!(!instances_dir.join("Test Pack").join("patches").exists(), "patches skipped");
+        assert!(instances_dir.join("Test Pack").join("instance.json").exists(), "instance.json written");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn packwiz_index_parses_modrinth_curseforge_and_local_meta() {
+        let dir = temp_dir("pw");
+        let index_dir = dir.join(".index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+
+        std::fs::write(
+            index_dir.join("emf.pw.toml"),
+            r#"filename = "entity_model_features-3.2.6-26.2-fabric.jar"
+name = "Entity Model Features"
+side = "both"
+x-prismlauncher-loaders = ["fabric"]
+x-prismlauncher-mc-versions = ["26.2"]
+x-prismlauncher-version-number = "3.2.6"
+x-prismlauncher-release-type = "release"
+
+[download]
+hash = "abc"
+hash-format = "sha1"
+mode = "metadata:modrinth"
+url = "https://cdn.modrinth.com/data/P7dR8mSH/versions/0/emf.jar"
+
+[update.modrinth]
+mod-id = "P7dR8mSH"
+version = "3.2.6"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            index_dir.join("cf.pw.toml"),
+            r#"filename = "sodium-0.6.0.jar"
+name = "Sodium"
+side = "both"
+
+[download]
+hash = "def"
+hash-format = "sha512"
+mode = "metadata:curseforge"
+url = "https://www.curseforge.com/minecraft/mc-mods/sodium/download/5123456"
+
+[update.curseforge]
+file-id = 5123456
+project-id = 394468
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            index_dir.join("local.pw.toml"),
+            r#"filename = "mymod.jar"
+name = "My Mod"
+side = "both"
+
+[download]
+hash = "123"
+hash-format = "sha1"
+mode = "url"
+url = "https://example.com/mymod.jar"
+"#,
+        )
+        .unwrap();
+
+        // Prism exports shader packs' metadata in the content dir ROOT (not .index/)
+        std::fs::write(
+            dir.join("bsl-shaders.pw.toml"),
+            r#"filename = 'BSL_v10.1.3.zip'
+name = 'BSL Shaders'
+side = 'client'
+x-prismlauncher-version-number = '10.1.3'
+x-prismlauncher-release-type = 'release'
+
+[download]
+hash = 'abc'
+hash-format = 'sha512'
+mode = 'url'
+url = 'https://cdn.modrinth.com/data/Q1vvjJYV/versions/hIibTfxn/BSL_v10.1.3.zip'
+
+[update.modrinth]
+mod-id = 'Q1vvjJYV'
+version = 'hIibTfxn'
+"#,
+        )
+        .unwrap();
+
+        let index = load_packwiz_index(&dir);
+        assert_eq!(index.len(), 4);
+
+        let bsl = index.get("BSL_v10.1.3.zip").unwrap();
+        assert_eq!(bsl.name, "BSL Shaders");
+        assert_eq!(bsl.version, "10.1.3");
+        assert_eq!(bsl.provider, "Modrinth");
+        assert_eq!(bsl.project_id, "Q1vvjJYV");
+
+        let emf = index.get("entity_model_features-3.2.6-26.2-fabric.jar").unwrap();
+        assert_eq!(emf.name, "Entity Model Features");
+        assert_eq!(emf.version, "3.2.6");
+        assert_eq!(emf.provider, "Modrinth");
+        assert_eq!(emf.project_id, "P7dR8mSH");
+
+        let cf = index.get("sodium-0.6.0.jar").unwrap();
+        assert_eq!(cf.name, "Sodium");
+        assert_eq!(cf.provider, "CurseForge");
+        assert_eq!(cf.project_id, "394468");
+
+        let local = index.get("mymod.jar").unwrap();
+        assert_eq!(local.provider, "");
+        assert_eq!(local.project_id, "");
+        assert_eq!(local.version, "");
+
+        // Our own .voidlauncher.json sidecars in the same folder are ignored
+        std::fs::write(index_dir.join("sodium-0.6.0.voidlauncher.json"), "{}").unwrap();
+        let index2 = load_packwiz_index(&dir);
+        assert_eq!(index2.len(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prism_import_handles_packs_without_mmc_pack_json() {
+        let dir = temp_dir("nocfg");
+        let zip_path = dir.join("pack.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_w = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip_w.start_file("instance.cfg", opts).unwrap();
+        zip_w.write_all(b"[General]\nname=Old Pack\n").unwrap();
+        zip_w.start_file("minecraft/mods/old.jar", opts).unwrap();
+        zip_w.write_all(b"PK\x03\x04old").unwrap();
+        zip_w.finish().unwrap();
+
+        let instances_dir = dir.join("instances");
+        let instance = import_prism_pack(&instances_dir, zip_path.to_str().unwrap()).unwrap();
+
+        assert_eq!(instance.name, "Old Pack");
+        assert_eq!(instance.mc_version, "");
+        assert_eq!(instance.loader, LoaderType::Vanilla);
+        assert!(instances_dir.join("Old Pack").join(".minecraft/mods/old.jar").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecar_meta_uses_index_folder_with_legacy_fallback() {
+        let dir = temp_dir("sidecar");
+        let mods = dir.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        // New layout: hidden .index/ folder next to the content dir
+        std::fs::create_dir_all(mods.join(".index")).unwrap();
+        std::fs::write(
+            mods.join(".index").join("foo.voidlauncher.json"),
+            r#"{"provider":"modrinth","project_id":"abc"}"#,
+        )
+        .unwrap();
+        let meta = read_sidecar_meta(&mods, "foo.jar").unwrap();
+        assert_eq!(meta["project_id"], "abc");
+        assert_eq!(sidecar_meta_path(&mods, "foo.jar"), mods.join(".index/foo.voidlauncher.json"));
+
+        // .disabled file resolves to the same stem
+        let meta = read_sidecar_meta(&mods, "foo.jar.disabled").unwrap();
+        assert_eq!(meta["project_id"], "abc");
+
+        // Legacy layout (file next to the content) still works as fallback
+        std::fs::write(mods.join("bar.voidlauncher.json"), r#"{"provider":"curseforge"}"#).unwrap();
+        let meta = read_sidecar_meta(&mods, "bar.zip").unwrap();
+        assert_eq!(meta["provider"], "curseforge");
+
+        // Removal cleans both layouts
+        std::fs::write(mods.join(".index").join("baz.voidlauncher.json"), "{}").unwrap();
+        std::fs::write(mods.join("baz.voidlauncher.json"), "{}").unwrap();
+        remove_sidecar_meta(&mods, "baz.jar");
+        assert!(!mods.join(".index").join("baz.voidlauncher.json").exists());
+        assert!(!mods.join("baz.voidlauncher.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_packs_hides_prism_metadata_and_index_folder() {
+        let dir = temp_dir("packs");
+        let instances_dir = dir.join("instances");
+        let now = chrono::Utc::now().to_rfc3339();
+        let instance = Instance {
+            name: "P".to_string(),
+            mc_version: "1.20.1".to_string(),
+            loader: LoaderType::Vanilla,
+            loader_version: None,
+            loader_profile: None,
+            memory_mb: None,
+            jvm_args: None,
+            gc_preset: None,
+            java_path: None,
+            resolution: None,
+            icon: None,
+            banner: None,
+            created_at: now.clone(),
+            last_played: None,
+            play_time_seconds: 0,
+            notes: String::new(),
+        };
+        save_instance(&instances_dir, &instance, None).unwrap();
+
+        let shaders = instances_dir.join("P").join(".minecraft").join("shaderpacks");
+        std::fs::create_dir_all(&shaders).unwrap();
+        std::fs::write(shaders.join("BSL_v10.zip"), b"PK\x03\x04x").unwrap();
+        std::fs::write(shaders.join("bsl-shaders.pw.toml"), b"meta").unwrap();
+        std::fs::create_dir_all(shaders.join(".index")).unwrap();
+        std::fs::write(shaders.join(".index").join("bsl.voidlauncher.json"), b"{}").unwrap();
+
+        let packs = list_packs(&instances_dir, "P", "shaderpacks").unwrap();
+        assert_eq!(packs.len(), 1, "Prism .pw.toml and .index must be hidden");
+        assert_eq!(packs[0].filename, "BSL_v10.zip");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

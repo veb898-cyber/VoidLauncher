@@ -148,7 +148,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const systemRamGb = (systemRamMb / 1024).toFixed(1);
   const allocatedGb = (memoryMb / 1024).toFixed(1);
   const maxGb = (maxMemoryMb / 1024).toFixed(1);
-  const zgcDisabled = memoryMb < 6144;
+  const zgcDisabled = memoryMb < 8192;
 
   return (
     <Modal open={open} onClose={onClose} title={t('instance_editor.title')}>

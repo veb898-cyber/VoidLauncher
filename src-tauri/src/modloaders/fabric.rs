@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use crate::error::{LauncherError, Result};
 use crate::modloaders::{LoaderLibrary, LoaderProfile, LoaderVersionPage};
 use crate::versions::maven_to_path;
@@ -59,6 +60,56 @@ struct FabricArguments {
 /// Results are cached in-process after the first fetch so subsequent
 /// pages are instant.
 static FABRIC_VERSIONS_CACHE: OnceLock<Mutex<Option<Vec<FabricLoaderVersion>>>> = OnceLock::new();
+
+/// Supported Minecraft versions, cached for 10 minutes.
+static SUPPORTED_VERSIONS_CACHE: OnceLock<Mutex<Option<(Instant, Vec<String>)>>> = OnceLock::new();
+const SUPPORTED_CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// Minecraft versions officially supported by Fabric (`/v2/versions/game`).
+/// Fabric supports 1.14+ only — versions like 1.13 are rejected by the API.
+pub async fn supported_versions() -> Result<Vec<String>> {
+    {
+        let cache = SUPPORTED_VERSIONS_CACHE.get_or_init(|| Mutex::new(None));
+        let guard = cache.lock().map_err(|e| LauncherError::ModLoader(e.to_string()))?;
+        if let Some((fetched_at, versions)) = guard.as_ref() {
+            if fetched_at.elapsed() < SUPPORTED_CACHE_TTL {
+                return Ok(versions.clone());
+            }
+        }
+    }
+    let client = crate::download::global_http_client();
+    let versions: Vec<FabricGameVersion> = client
+        .get("https://meta.fabricmc.net/v2/versions/game")
+        .send()
+        .await
+        .map_err(|e| LauncherError::ModLoader(format!("Failed to fetch Fabric game versions: {}", e)))?
+        .json()
+        .await
+        .map_err(|e| LauncherError::ModLoader(format!("Failed to parse Fabric game versions: {}", e)))?;
+    let list: Vec<String> = versions.into_iter().map(|v| v.version).collect();
+    let cache = SUPPORTED_VERSIONS_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().map_err(|e| LauncherError::ModLoader(e.to_string()))?;
+    *guard = Some((Instant::now(), list.clone()));
+    Ok(list)
+}
+
+/// Whether the given Minecraft version is officially supported by Fabric.
+pub async fn is_supported(mc_version: &str) -> Result<bool> {
+    Ok(supported_versions().await?.iter().any(|v| v == mc_version))
+}
+
+/// Fetch a page of Fabric loader versions for a specific Minecraft version.
+/// Returns an empty page when Fabric does not support the version.
+pub async fn get_loader_versions_for(
+    mc_version: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<LoaderVersionPage> {
+    if !is_supported(mc_version).await? {
+        return Ok(LoaderVersionPage { versions: Vec::new(), total: 0 });
+    }
+    get_loader_versions(offset, limit).await
+}
 
 pub async fn get_loader_versions(offset: usize, limit: usize) -> Result<LoaderVersionPage> {
     use std::cmp::Ordering;
@@ -149,6 +200,12 @@ pub async fn get_game_versions() -> Result<Vec<String>> {
 
 /// Get Fabric profile for a specific MC version + loader version
 pub async fn get_profile(mc_version: &str, loader_version: &str) -> Result<LoaderProfile> {
+    if !is_supported(mc_version).await? {
+        return Err(LauncherError::ModLoader(format!(
+            "Fabric does not support Minecraft {} (supported: 1.14 and newer)",
+            mc_version
+        )));
+    }
     let client = crate::download::global_http_client();
     let url = format!(
         "https://meta.fabricmc.net/v2/versions/loader/{}/{}/profile/json",

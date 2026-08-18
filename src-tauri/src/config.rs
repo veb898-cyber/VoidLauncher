@@ -5,14 +5,14 @@ use std::path::PathBuf;
 ///
 ///   total ≤ 8192   → 4096 (4 GB)
 ///   total ≤ 16384  → 6144 (6 GB)
-///   total ≥ 32768  → 8192 (8 GB, so the ZGC preset is selectable)
+///   total ≥ 24576  → 8192 (8 GB, so the ZGC preset is selectable)
 ///
 /// Falls back to 4096 if RAM is unknown.
 pub fn recommended_memory_mb(total_ram_mb: u64) -> u32 {
     if total_ram_mb == 0 {
         return 4096;
     }
-    if total_ram_mb >= 32 * 1024 {
+    if total_ram_mb >= 24 * 1024 {
         return 8192;
     }
     if total_ram_mb >= 16 * 1024 {
@@ -50,6 +50,15 @@ pub struct AppConfig {
     pub java_path: Option<PathBuf>,
     /// Close launcher when game starts
     pub close_on_launch: bool,
+    /// Route all launcher HTTP traffic through a proxy
+    #[serde(default)]
+    pub proxy_enabled: bool,
+    /// Proxy host (e.g. "127.0.0.1")
+    #[serde(default)]
+    pub proxy_addr: String,
+    /// Proxy port (e.g. 8080)
+    #[serde(default)]
+    pub proxy_port: u16,
     /// Show snapshots in version list
     pub show_snapshots: bool,
     /// Show old versions (alpha/beta)
@@ -76,10 +85,14 @@ impl Default for AppConfig {
         // Auto-pick a sensible memory default based on system RAM on first launch.
         let total_ram = detect_total_ram_mb();
         let recommended = recommended_memory_mb(total_ram);
+        // ZGC is the default on machines with >= 24 GB RAM (heap >= 8 GB):
+        // low pause times win over G1GC there, and `build_jvm_args` still
+        // falls back to G1GC if Java < 17 or the heap is too small.
+        let gc_default = if total_ram >= 24 * 1024 { "zgc" } else { "g1gc" };
         tracing::info!(
             target: "config",
-            "First launch: detected {} MB RAM, defaulting to {} MB",
-            total_ram, recommended
+            "First launch: detected {} MB RAM, defaulting to {} MB, GC preset {}",
+            total_ram, recommended, gc_default
         );
 
         Self {
@@ -88,39 +101,122 @@ impl Default for AppConfig {
             client_id: "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb".into(),
             default_memory_mb: recommended,
             max_memory_mb: recommended,
-            default_gc_preset: "g1gc".into(),
+            default_gc_preset: gc_default.into(),
             // NOTE: This list must NOT contain a GC selector flag
-            // (UseG1GC / UseZGC / UseParallelGC / …). The user's chosen
-            // preset in `default_gc_preset` is the single source of
-            // truth for which GC the JVM starts with — adding
-            // `-XX:+UseG1GC` here would conflict with the ZGC preset
-            // and crash the JVM with "multiple garbage collectors
-            // selected". Only GC-*tuning* flags (region size, pause
-            // target, mixed-GC counts, etc.) belong below.
+            // (UseG1GC / UseZGC / UseParallelGC / …) — the chosen preset
+            // in `default_gc_preset` is the single source of truth for
+            // which GC the JVM starts with. It must also stay free of
+            // GC *tuning* flags: the g1gc preset (Prism-style) already
+            // provides the full client set, and duplicated tuning flags
+            // from here would override it (custom args are appended after
+            // the preset). Only flags that are meaningful for EVERY preset
+            // belong below.
             default_jvm_args: vec![
-                "-XX:+ParallelRefProcEnabled".into(),
-                "-XX:MaxGCPauseMillis=200".into(),
-                "-XX:+UnlockExperimentalVMOptions".into(),
+                // Mods occasionally call System.gc() (often in loops) —
+                // disabling explicit GC prevents surprise Full GC pauses.
                 "-XX:+DisableExplicitGC".into(),
-                "-XX:G1NewSizePercent=30".into(),
-                "-XX:G1MaxNewSizePercent=40".into(),
-                "-XX:G1HeapRegionSize=8M".into(),
-                "-XX:G1ReservePercent=20".into(),
-                "-XX:G1HeapWastePercent=5".into(),
-                "-XX:G1MixedGCCountTarget=4".into(),
-                "-XX:InitiatingHeapOccupancyPercent=15".into(),
-                "-XX:G1MixedGCLiveThresholdPercent=90".into(),
-                "-XX:G1RSetUpdatingPauseTimePercent=5".into(),
-                "-XX:SurvivorRatio=32".into(),
-                "-XX:+PerfDisableSharedMem".into(),
-                "-XX:MaxTenuringThreshold=1".into(),
             ],
             java_path: None,
             close_on_launch: false,
+            proxy_enabled: false,
+            proxy_addr: String::new(),
+            proxy_port: 0,
             show_snapshots: false,
             show_old_versions: false,
             curseforge_api_key: "$2a$10$wuAJuNZuted3NORVmpgUC.m8sI.pv1tOPKZyBgLFGjxFp/br0lZCC".into(),
         }
+    }
+}
+
+impl AppConfig {
+    /// Legacy `default_jvm_args` set shipped before the Prism-style G1GC
+    /// preset existed (server-oriented Aikar tuning that fought the preset
+    /// and meant nothing under ZGC). Configs that still carry this exact
+    /// list are assumed to be untouched defaults and get migrated to the
+    /// slim current set.
+    fn is_legacy_jvm_args(args: &[String]) -> bool {
+        let legacy = [
+            "-XX:+ParallelRefProcEnabled",
+            "-XX:MaxGCPauseMillis=200",
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:+DisableExplicitGC",
+            "-XX:G1NewSizePercent=30",
+            "-XX:G1MaxNewSizePercent=40",
+            "-XX:G1HeapRegionSize=8M",
+            "-XX:G1ReservePercent=20",
+            "-XX:G1HeapWastePercent=5",
+            "-XX:G1MixedGCCountTarget=4",
+            "-XX:InitiatingHeapOccupancyPercent=15",
+            "-XX:G1MixedGCLiveThresholdPercent=90",
+            "-XX:G1RSetUpdatingPauseTimePercent=5",
+            "-XX:SurvivorRatio=32",
+            "-XX:+PerfDisableSharedMem",
+            "-XX:MaxTenuringThreshold=1",
+        ];
+        args.len() == legacy.len() && legacy.iter().zip(args).all(|(l, a)| *l == a)
+    }
+
+    /// Migrate pre-0.1.7 defaults in a freshly loaded config so the new
+    /// Prism-style GC behaviour applies without the user touching settings:
+    ///   * 6 GB default on big-RAM machines → 8 GB (matches the tiered
+    ///     recommendation now that ≥ 24 GB RAM maps to 8 GB);
+    ///   * ZGC preset with less than 8 GB of heap → G1GC (ZGC requires
+    ///     8+ GB; on 6 GB it stalled the client during pack/server loads);
+    ///   * legacy server-style `default_jvm_args` → slim preset-neutral set.
+    /// Returns true when something changed (caller should persist).
+    fn migrate(&mut self) -> bool {
+        let mut changed = false;
+        let total_ram = detect_total_ram_mb();
+
+        if total_ram >= 24 * 1024 && self.default_memory_mb == 6144 && self.max_memory_mb == 6144 {
+            self.default_memory_mb = 8192;
+            self.max_memory_mb = 8192;
+            tracing::info!(
+                target: "config",
+                "Migrated default memory 6144 -> 8192 MB (system has {} MB RAM)",
+                total_ram
+            );
+            changed = true;
+        }
+
+        if self.default_gc_preset.eq_ignore_ascii_case("zgc") && self.default_memory_mb < 8192 {
+            self.default_gc_preset = "g1gc".into();
+            tracing::info!(
+                target: "config",
+                "Migrated default GC preset zgc -> g1gc (ZGC needs >= 8 GB heap, current: {} MB)",
+                self.default_memory_mb
+            );
+            changed = true;
+        }
+
+        // ZGC became the default for machines with >= 24 GB RAM (heaps >= 8 GB).
+        // Only flip untouched-looking configs: heap still at the recommended
+        // 8 GB and the old hard-coded "g1gc" default. A manual choice (any
+        // other memory value or preset) is left alone.
+        if total_ram >= 24 * 1024
+            && self.default_memory_mb >= 8192
+            && self.max_memory_mb >= 8192
+            && self.default_gc_preset.eq_ignore_ascii_case("g1gc")
+        {
+            self.default_gc_preset = "zgc".into();
+            tracing::info!(
+                target: "config",
+                "Migrated default GC preset g1gc -> zgc (system has {} MB RAM, heap {} MB)",
+                total_ram, self.default_memory_mb
+            );
+            changed = true;
+        }
+
+        if Self::is_legacy_jvm_args(&self.default_jvm_args) {
+            self.default_jvm_args = vec!["-XX:+DisableExplicitGC".into()];
+            tracing::info!(
+                target: "config",
+                "Migrated legacy default_jvm_args to slim preset-neutral set"
+            );
+            changed = true;
+        }
+
+        changed
     }
 }
 
@@ -152,12 +248,21 @@ impl AppConfig {
                         );
                     } else {
                         match serde_json::from_str::<Self>(&contents) {
-                            Ok(config) => {
+                            Ok(mut config) => {
                                 tracing::info!(
                                     target: "config",
                                     "Loaded config from {}",
                                     config_path.display()
                                 );
+                                if config.migrate() {
+                                    if let Err(e) = config.save() {
+                                        tracing::warn!(
+                                            target: "config",
+                                            "Failed to persist migrated config: {}",
+                                            e
+                                        );
+                                    }
+                                }
                                 return config;
                             }
                             Err(e) => tracing::warn!(
@@ -235,5 +340,49 @@ impl AppConfig {
     /// Get icon cache file
     pub fn icon_cache_file(&self) -> PathBuf {
         self.data_dir.join("icon_cache.json")
+    }
+
+    /// Proxy URL for reqwest (`None` when disabled). E.g. `http://127.0.0.1:8080`.
+    pub fn proxy_url(&self) -> Option<String> {
+        if self.proxy_enabled && !self.proxy_addr.trim().is_empty() && self.proxy_port > 0 {
+            Some(format!("http://{}:{}", self.proxy_addr.trim(), self.proxy_port))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> AppConfig {
+        AppConfig::default()
+    }
+
+    #[test]
+    fn proxy_url_disabled_by_default() {
+        assert_eq!(base().proxy_url(), None);
+    }
+
+    #[test]
+    fn proxy_url_enabled() {
+        let mut c = base();
+        c.proxy_enabled = true;
+        c.proxy_addr = " 127.0.0.1 ".into();
+        c.proxy_port = 8080;
+        assert_eq!(c.proxy_url(), Some("http://127.0.0.1:8080".to_string()));
+    }
+
+    #[test]
+    fn proxy_url_ignores_missing_addr_or_port() {
+        let mut c = base();
+        c.proxy_enabled = true;
+        assert_eq!(c.proxy_url(), None);
+        c.proxy_addr = "127.0.0.1".into();
+        assert_eq!(c.proxy_url(), None);
+        c.proxy_addr = String::new();
+        c.proxy_port = 8080;
+        assert_eq!(c.proxy_url(), None);
     }
 }

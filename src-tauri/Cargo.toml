@@ -1,6 +1,6 @@
 [package]
 name = "voidlauncher"
-version = "0.1.6"
+version = "0.1.7"
 description = "VoidLauncher — Custom Minecraft Launcher"
 authors = ["VoidLauncher"]
 edition = "2021"
@@ -42,6 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 walkdir = "2.5.0"
 toml = "1.1.2"
+keyring = { version = "3", features = ["windows-native"] }
 
 [profile.release]
 strip = true

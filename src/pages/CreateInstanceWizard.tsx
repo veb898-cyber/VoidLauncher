@@ -127,11 +127,12 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
     setVersionsLoading(false);
   };
 
-  const fetchLoaderPage = useCallback(async (loader?: LoaderType, resetOffset = false) => {
+  const fetchLoaderPage = useCallback(async (loader?: LoaderType, resetOffset = false, mcVersionOverride?: string) => {
     const target: LoaderType = loader ?? loaderType;
     if (target === 'Vanilla') return;
     if (loaderVersionsLoadingRef.current) return;
-    if (target !== 'Fabric' && selectedVersion === '') {
+    const mcVersion = mcVersionOverride ?? selectedVersion;
+    if (target !== 'Fabric' && mcVersion === '') {
       setLoaderVersions(prev => ({ ...prev, [target]: [] }));
       setLoaderVersionTotals(prev => ({ ...prev, [target]: 0 }));
       return;
@@ -144,11 +145,11 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
     try {
       let page: LoaderVersionPage;
       if (target === 'Fabric') {
-        page = await invoke<LoaderVersionPage>('cmd_get_fabric_versions', { offset, limit: LOADER_PAGE_SIZE });
+        page = await invoke<LoaderVersionPage>('cmd_get_fabric_versions', { mcVersion, offset, limit: LOADER_PAGE_SIZE });
       } else if (target === 'Forge') {
-        page = await invoke<LoaderVersionPage>('cmd_get_forge_versions', { mcVersion: selectedVersion, offset, limit: LOADER_PAGE_SIZE });
+        page = await invoke<LoaderVersionPage>('cmd_get_forge_versions', { mcVersion, offset, limit: LOADER_PAGE_SIZE });
       } else if (target === 'NeoForge') {
-        page = await invoke<LoaderVersionPage>('cmd_get_neoforge_versions', { mcVersion: selectedVersion, offset, limit: LOADER_PAGE_SIZE });
+        page = await invoke<LoaderVersionPage>('cmd_get_neoforge_versions', { mcVersion, offset, limit: LOADER_PAGE_SIZE });
       } else {
         page = { versions: [], total: 0 };
       }
@@ -163,6 +164,19 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
     }
     setLoaderVersionsLoading(false);
   }, [loaderType, selectedVersion, loaderVersions, loaderVersionTotals]);
+
+  const handleVersionSelect = (id: string) => {
+    setSelectedVersion(id);
+    setSelectedLoaderVersion('');
+    setLoaderVersionsError(false);
+    // Loader lists are version-specific — reset them all
+    setLoaderVersions({ Vanilla: [], Fabric: [], Forge: [], NeoForge: [] });
+    setLoaderVersionTotals({ Vanilla: null, Fabric: null, Forge: null, NeoForge: null });
+    if (loaderType !== 'Vanilla') {
+      loaderVersionsLoadingRef.current = false;
+      fetchLoaderPage(loaderType, true, id);
+    }
+  };
 
   const handleLoaderChange = (loader: LoaderType) => {
     setLoaderType(loader);
@@ -219,10 +233,13 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
         const cmd = loaderType === 'Fabric' ? 'cmd_install_fabric'
           : loaderType === 'Forge' ? 'cmd_install_forge'
           : 'cmd_install_neoforge';
+        addToast(t('create_instance.loader_installing', { loader: loaderType }), 'info');
         try {
           await invoke(cmd, { mcVersion: selectedVersion, loaderVersion: selectedLoaderVersion, instanceName: instanceName.trim(), lang: getLanguage() });
         } catch (e: any) {
-          addToast(t('create_instance.loader_install_failed', { loader: loaderType, error: e.toString() }), 'warning');
+          addToast(t('create_instance.loader_install_error', { loader: loaderType, error: e.toString() }), 'error');
+          setIsCreating(false);
+          return;
         }
       }
       addToast(t('create_instance.created', { name: instanceName }), 'success');
@@ -396,7 +413,7 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
                       Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} height={32} style={{ marginBottom: 2 }} />)
                     ) : (
                       filteredVersions.map((v) => (
-                        <div key={v.id} onClick={() => setSelectedVersion(v.id)}
+                        <div key={v.id} onClick={() => handleVersionSelect(v.id)}
                           style={{
                             padding: '6px 10px', cursor: 'pointer', fontSize: 'var(--font-size-sm)',
                             background: selectedVersion === v.id ? 'var(--primary)' : 'transparent',
@@ -433,7 +450,8 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
                         </div>
                       ) : currentLoaderVersions.length === 0 && !loaderVersionsLoading ? (
                         <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
-                          {t('create_instance.loader_no_versions')}
+                          {t('create_instance.loader_no_versions', { loader: loaderType, version: selectedVersion })}
+                          <div style={{ marginTop: 4 }}>{t('create_instance.loader_unsupported_hint')}</div>
                         </div>
                       ) : (
                         <>

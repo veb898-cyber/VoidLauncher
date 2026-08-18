@@ -61,19 +61,36 @@ const MANAGED_JAVA_DIR: &str = "java";
 
 /// HTTP client without auto-decompression — prevents "error decoding response body"
 /// when the server sends brotli/deflate despite us not requesting it.
-fn download_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+/// Rebuilt automatically when the proxy setting changes.
+fn download_client() -> reqwest::Client {
+    static CLIENT: OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>> = OnceLock::new();
+    let proxy = crate::download::configured_proxy();
+    let mut slot = CLIENT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap();
+    if slot.as_ref().map(|(p, _)| p != &proxy).unwrap_or(true) {
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(1800))
             .connect_timeout(Duration::from_secs(30))
             .no_gzip()
             .no_brotli()
             .no_deflate()
-            .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("Failed to create Java download client (check TLS libraries)")
-    })
+            .redirect(crate::download::redirect_policy())
+            .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")));
+        if let Some(p) = &proxy {
+            if let Ok(pp) = reqwest::Proxy::all(p.clone()) {
+                builder = builder.proxy(pp);
+            }
+        }
+        *slot = Some((
+            proxy,
+            builder
+                .build()
+                .expect("Failed to create Java download client (check TLS libraries)"),
+        ));
+    }
+    slot.as_ref().unwrap().1.clone()
 }
 
 /// Adoptium /info/available_releases response (subset of fields)

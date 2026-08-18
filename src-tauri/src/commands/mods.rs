@@ -123,7 +123,11 @@ pub async fn cmd_check_mod_updates(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            if filename.starts_with('.') || filename.ends_with(".voidlauncher.json") { continue; }
+            if filename.starts_with('.') || filename.ends_with(".voidlauncher.json")
+                || filename.ends_with(".pw.toml")
+            {
+                continue;
+            }
 
             if is_mods {
                 // Mods: only .jar files, with loader filtering
@@ -255,6 +259,13 @@ fn read_pack_name_and_version(path: &std::path::Path) -> Option<(String, String)
             if !name.is_empty() {
                 return Some((name, version));
             }
+        }
+    }
+
+    // Fallback to Prism packwiz metadata (.pw.toml in .index/)
+    if let Some(pw) = crate::instances::read_packwiz_meta(path.parent()?, &filename) {
+        if !pw.name.is_empty() {
+            return Some((pw.name, pw.version));
         }
     }
 
@@ -445,7 +456,8 @@ pub async fn cmd_install_mod(
     download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
     let final_name = safe_name.clone();
 
-    // Write sidecar so the installed mod can be tracked back to its source.
+    // Write sidecar metadata (`.index/` folder, same layout as Prism) so the
+    // installed mod can be tracked back to its source.
     if let Some(pid) = project_id.as_deref() {
         let sidecar = serde_json::json!({
             "provider": provider,
@@ -454,11 +466,12 @@ pub async fn cmd_install_mod(
             "version_id": modrinth_version_id,
             "version_number": version_number,
         });
-        let sidecar_path = mods_dir.join(format!(
-            "{}.voidlauncher.json",
-            safe_name.trim_end_matches(".jar")
-        ));
+        let sidecar_path = crate::instances::sidecar_meta_path(&mods_dir, &safe_name);
+        if let Some(parent) = sidecar_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = std::fs::write(sidecar_path, sidecar.to_string());
+        let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(&mods_dir, &safe_name));
     }
 
     Ok(final_name)
@@ -553,7 +566,8 @@ pub async fn cmd_download_to_folder(
         download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
     }
 
-    // Write sidecar so the installed file can be tracked back to its source.
+    // Write sidecar metadata (`.index/` folder) so the installed file can be
+    // tracked back to its source.
     if let Some(pid) = project_id.as_deref() {
         let sidecar = serde_json::json!({
             "provider": provider,
@@ -562,11 +576,12 @@ pub async fn cmd_download_to_folder(
             "version_id": version_id,
             "version_number": version_number,
         });
-        let sidecar_path = dest_dir.join(format!(
-            "{}.voidlauncher.json",
-            safe_name.trim_end_matches(".jar")
-        ));
+        let sidecar_path = crate::instances::sidecar_meta_path(&dest_dir, &safe_name);
+        if let Some(parent) = sidecar_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = std::fs::write(sidecar_path, sidecar.to_string());
+        let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(&dest_dir, &safe_name));
     }
 
     Ok(safe_name)
@@ -586,6 +601,7 @@ pub fn cmd_list_instance_mods(
         return Ok(Vec::new());
     }
     let mut mods = Vec::new();
+    let pw_index = crate::instances::load_packwiz_index(&mods_dir);
     if let Ok(entries) = std::fs::read_dir(&mods_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -606,20 +622,36 @@ pub fn cmd_list_instance_mods(
             let enabled = is_jar && !is_disabled;
             let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             let meta = read_mod_meta_from_jar(&path);
+            let pw = pw_index.get(&filename);
             let sidecar_project_id = read_mod_sidecar_slug(&mods_dir, &filename);
-            let (slug, slug_verified) = sidecar_project_id.as_ref()
-                .map(|s| (Some(s.clone()), true))
+            let project_id = sidecar_project_id
+                .clone()
+                .or_else(|| pw.filter(|p| !p.project_id.is_empty()).map(|p| p.project_id.clone()));
+            let (slug, slug_verified) = project_id.as_ref()
+                .map(|s| (Some(s.clone()), sidecar_project_id.is_some()))
                 .unwrap_or_else(|| (meta.slug, false));
+            let provider = read_mod_sidecar_provider(&mods_dir, &filename)
+                .map(|s| normalize_provider(&s))
+                .or_else(|| pw.filter(|p| !p.provider.is_empty()).map(|p| p.provider.clone()))
+                .unwrap_or_else(|| meta.provider.clone());
+            let name = pw
+                .filter(|p| !p.name.is_empty())
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| meta.name.clone());
+            let version = pw
+                .filter(|p| !p.version.is_empty())
+                .map(|p| p.version.clone())
+                .unwrap_or_else(|| meta.version.clone());
             mods.push(ModMetadata {
                 filename,
-                name: meta.name,
-                version: meta.version,
-                provider: meta.provider,
+                name,
+                version,
+                provider,
                 enabled,
                 file_size,
                 icon: meta.icon,
                 slug,
-                project_id: sidecar_project_id,
+                project_id,
                 slug_verified,
             });
         }
@@ -648,14 +680,8 @@ pub fn cmd_remove_instance_mod(
     if mod_path.exists() {
         std::fs::remove_file(&mod_path).map_err(|e| e.to_string())?;
     }
-    // Also remove any sidecar
-    let sidecar = mods_dir.join(format!(
-        "{}.voidlauncher.json",
-        safe_name
-            .trim_end_matches(".jar")
-            .trim_end_matches(".disabled")
-    ));
-    let _ = std::fs::remove_file(sidecar);
+    // Also remove sidecar metadata (both layouts)
+    crate::instances::remove_sidecar_meta(&mods_dir, &safe_name);
     Ok(())
 }
 
@@ -672,6 +698,7 @@ pub fn cmd_get_mod_metadata(
         return Ok(Vec::new());
     }
     let mut mods = Vec::new();
+    let pw_index = crate::instances::load_packwiz_index(&mods_dir);
     if let Ok(entries) = std::fs::read_dir(&mods_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -686,32 +713,42 @@ pub fn cmd_get_mod_metadata(
                 let enabled = is_jar && !is_disabled;
                 let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let meta = read_mod_meta_from_jar(&path);
+                let pw = pw_index.get(&filename);
                 // Check sidecar for verified Modrinth/CurseForge project slug.
                 let sidecar_project_id = read_mod_sidecar_slug(&mods_dir, &filename);
-                let (slug, slug_verified) = sidecar_project_id.as_ref()
-                    .map(|s| (Some(s.clone()), true))
+                let project_id = sidecar_project_id
+                    .clone()
+                    .or_else(|| pw.filter(|p| !p.project_id.is_empty()).map(|p| p.project_id.clone()));
+                let (slug, slug_verified) = project_id.as_ref()
+                    .map(|s| (Some(s.clone()), sidecar_project_id.is_some()))
                     .unwrap_or_else(|| (meta.slug, false));
-                // Prefer the sidecar provider (modrinth/curseforge/local) over the JAR metadata loader name
+                // Provider priority: sidecar (modrinth/curseforge/local) > packwiz > JAR metadata
                 let sidecar_provider = read_mod_sidecar_provider(&mods_dir, &filename);
                 let provider = match sidecar_provider.as_deref() {
-                    Some(s) => match s.to_lowercase().as_str() {
-                        "modrinth" => "Modrinth".to_string(),
-                        "curseforge" => "CurseForge".to_string(),
-                        "local" => "Local".to_string(),
-                        other => other.to_string(),
-                    },
-                    None => meta.provider.clone(),
+                    Some(s) => normalize_provider(s),
+                    None => pw
+                        .filter(|p| !p.provider.is_empty())
+                        .map(|p| p.provider.clone())
+                        .unwrap_or_else(|| meta.provider.clone()),
                 };
+                let name = pw
+                    .filter(|p| !p.name.is_empty())
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| meta.name.clone());
+                let version = pw
+                    .filter(|p| !p.version.is_empty())
+                    .map(|p| p.version.clone())
+                    .unwrap_or_else(|| meta.version.clone());
                 mods.push(ModMetadata {
                     filename,
-                    name: meta.name,
-                    version: meta.version,
+                    name,
+                    version,
                     provider,
                     enabled,
                     file_size,
                     icon: meta.icon,
                     slug,
-                    project_id: sidecar_project_id,
+                    project_id,
                     slug_verified,
                 });
             }
@@ -721,26 +758,27 @@ pub fn cmd_get_mod_metadata(
     Ok(mods)
 }
 
-/// Read the Modrinth/CurseForge project slug from the `.voidlauncher.json`
-/// sidecar file that `cmd_install_mod` writes at download time.
+/// Normalize a raw provider string from sidecar/packwiz metadata.
+fn normalize_provider(raw: &str) -> String {
+    match raw.to_lowercase().as_str() {
+        "modrinth" => "Modrinth".to_string(),
+        "curseforge" => "CurseForge".to_string(),
+        "local" => "Local".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Read the Modrinth/CurseForge project slug from the sidecar metadata
+/// (`.index/` layout, legacy layout as fallback) that `cmd_install_mod`
+/// writes at download time.
 fn read_mod_sidecar_slug(mods_dir: &std::path::Path, filename: &str) -> Option<String> {
-    let stem = filename
-        .trim_end_matches(".jar")
-        .trim_end_matches(".disabled");
-    let sidecar_path = mods_dir.join(format!("{}.voidlauncher.json", stem));
-    let contents = std::fs::read_to_string(sidecar_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let json = crate::instances::read_sidecar_meta(mods_dir, filename)?;
     json["project_id"].as_str().map(|s| s.to_string())
 }
 
-/// Read the provider (modrinth/curseforge/local) from the `.voidlauncher.json` sidecar.
+/// Read the provider (modrinth/curseforge/local) from the sidecar metadata.
 fn read_mod_sidecar_provider(mods_dir: &std::path::Path, filename: &str) -> Option<String> {
-    let stem = filename
-        .trim_end_matches(".jar")
-        .trim_end_matches(".disabled");
-    let sidecar_path = mods_dir.join(format!("{}.voidlauncher.json", stem));
-    let contents = std::fs::read_to_string(sidecar_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let json = crate::instances::read_sidecar_meta(mods_dir, filename)?;
     json["provider"].as_str().map(|s| s.to_string())
 }
 
@@ -827,7 +865,7 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
         if let Ok(mut file) = archive.by_name(toml_name) {
             let mut contents = String::new();
             if file.read_to_string(&mut contents).is_ok() {
-                if let Ok(toml_val) = contents.parse::<toml::Value>() {
+                if let Ok(toml_val) = contents.parse::<toml::Table>() {
                     if let Some(mods_arr) = toml_val.get("mods").and_then(|v| v.as_array()) {
                         if let Some(first_mod) = mods_arr.first() {
                             let mod_id = first_mod
@@ -1001,22 +1039,15 @@ pub async fn cmd_get_mod_icon(
 
     // Fallback: try CurseForge API by project_id from sidecar (only if API key is configured)
     if !curseforge_api_key.is_empty() {
-        let sidecar_name = format!(
-            "{}.voidlauncher.json",
-            safe_filename.trim_end_matches(".jar")
-        );
-        if let Some(sidecar_path) = jar_path.parent() {
-            let sidecar_path = sidecar_path.join(&sidecar_name);
-            if let Ok(contents) = std::fs::read_to_string(&sidecar_path) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
-                    if val["provider"].as_str() == Some("curseforge") {
-                        if let Some(pid_str) = val["project_id"].as_str() {
-                            if let Ok(pid) = pid_str.parse::<u64>() {
-                                if let Ok(Some(icon)) =
-                                    fetch_curseforge_mod_icon(pid, &curseforge_api_key).await
-                                {
-                                    return Ok(Some(icon));
-                                }
+        if let Some(mods_dir) = jar_path.parent() {
+            if let Some(val) = crate::instances::read_sidecar_meta(mods_dir, &safe_filename) {
+                if val["provider"].as_str() == Some("curseforge") {
+                    if let Some(pid_str) = val["project_id"].as_str() {
+                        if let Ok(pid) = pid_str.parse::<u64>() {
+                            if let Ok(Some(icon)) =
+                                fetch_curseforge_mod_icon(pid, &curseforge_api_key).await
+                            {
+                                return Ok(Some(icon));
                             }
                         }
                     }
@@ -1026,19 +1057,28 @@ pub async fn cmd_get_mod_icon(
     }
 
     // Fallback: try Modrinth project API for icon_url
-    let sidecar_name = format!("{}.voidlauncher.json", safe_filename.trim_end_matches(".jar"));
+    // (sidecar first, then Prism packwiz .pw.toml metadata from imported instances)
     if let Some(mods_dir) = jar_path.parent() {
-        let sidecar_path = mods_dir.join(&sidecar_name);
-        if let Ok(contents) = std::fs::read_to_string(&sidecar_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
-                if val["provider"].as_str() == Some("modrinth") {
-                    if let Some(pid) = val["project_id"].as_str().map(|s| s.to_string()) {
-                        if let Ok(project) = modrinth::get_project(&pid).await {
-                            if let Some(icon_url) = project.icon_url {
-                                if let Some(icon_data) = fetch_remote_icon(&icon_url).await {
-                                    return Ok(Some(icon_data));
-                                }
-                            }
+        let mut provider = None;
+        let mut pid = None;
+        if let Some(val) = crate::instances::read_sidecar_meta(mods_dir, &safe_filename) {
+            provider = val["provider"].as_str().map(|s| s.to_string());
+            pid = val["project_id"].as_str().map(|s| s.to_string());
+        }
+        if pid.is_none() {
+            if let Some(pw) = crate::instances::read_packwiz_meta(mods_dir, &safe_filename) {
+                if !pw.provider.is_empty() && !pw.project_id.is_empty() {
+                    provider = Some(pw.provider);
+                    pid = Some(pw.project_id);
+                }
+            }
+        }
+        if provider.as_deref() == Some("Modrinth") {
+            if let Some(pid) = pid {
+                if let Ok(project) = modrinth::get_project(&pid).await {
+                    if let Some(icon_url) = project.icon_url {
+                        if let Some(icon_data) = fetch_remote_icon(&icon_url).await {
+                            return Ok(Some(icon_data));
                         }
                     }
                 }
@@ -1127,7 +1167,7 @@ fn extract_icon_from_jar(
                 let mut contents = String::new();
                 if f.read_to_string(&mut contents).is_ok() {
                     // Parse TOML for logoFile
-                    if let Ok(toml_val) = contents.parse::<toml::Value>() {
+                    if let Ok(toml_val) = contents.parse::<toml::Table>() {
                         if let Some(mods_array) = toml_val.get("mods").and_then(|v| v.as_array()) {
                             for m in mods_array {
                                 if let Some(logo) = m.get("logoFile").and_then(|v| v.as_str()) {

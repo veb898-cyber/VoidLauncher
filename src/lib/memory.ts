@@ -4,7 +4,7 @@
  * Recommendations:
  *   total RAM  ≤ 8 GB  → 4 GB default
  *   total RAM  = 16 GB → 6 GB default
- *   total RAM  ≥ 32 GB → 8 GB default (so ZGC preset is selectable)
+ *   total RAM  ≥ 24 GB → 8 GB default (so ZGC preset is selectable)
  *
  * Returns MB. Rounded to the nearest 512 MB step.
  */
@@ -17,7 +17,7 @@ export const MAX_MEMORY_PCT = 0.8;        // ... or 80% of total, whichever is l
 /** Tiered recommendation table (in MB). */
 export function getRecommendedMemoryMb(totalRamMb: number): number {
   if (totalRamMb <= 0) return 4096;
-  if (totalRamMb >= 32 * 1024) return 8192;   // ≥ 32 GB → 8 GB
+  if (totalRamMb >= 24 * 1024) return 8192;   // ≥ 24 GB → 8 GB
   if (totalRamMb >= 16 * 1024) return 6144;   // = 16 GB  → 6 GB
   return 4096;                                // ≤ 8 GB   → 4 GB
 }

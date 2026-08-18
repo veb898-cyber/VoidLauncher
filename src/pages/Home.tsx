@@ -82,8 +82,7 @@ export function Home({ onNavigate }: HomeProps) {
         multiple: false,
       });
       if (!selected) return;
-      const { readFile } = await import('@tauri-apps/plugin-fs');
-      const bytes = await readFile(selected);
+      const bytes = await invoke<number[]>('cmd_read_image_file', { path: selected });
       const ext = selected.split('.').pop()?.toLowerCase() || 'png';
       const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : 'image/png';
       let binary = '';

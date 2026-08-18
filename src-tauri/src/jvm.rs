@@ -13,21 +13,22 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 pub enum GcPreset {
     /// No special GC flags. Caller is responsible for any flags they want.
     Standard,
-    /// Aikar's Flags — universal, safe for Java 8/17/21.
-    G1gcAikar,
-    /// Modern ZGC — low pause times, requires Java 17+ and 6+ GB of heap.
+    /// Prism Launcher's default G1GC set — tuned for interactive Minecraft
+    /// clients (texture/pack loading, world gen, connecting to servers).
+    G1gcPrism,
+    /// Modern ZGC — low pause times, requires Java 17+ and 8+ GB of heap.
     ModernZgc,
 }
 
 impl GcPreset {
     /// Parse from the lowercase string stored in the instance config.
-    /// Unknown values fall back to G1gcAikar (the safe default).
+    /// Unknown values fall back to G1gcPrism (the safe default).
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "standard" | "std" | "" => GcPreset::Standard,
-            "g1gc" | "g1" | "aikar" | "aikars" => GcPreset::G1gcAikar,
+            "g1gc" | "g1" | "aikar" | "aikars" => GcPreset::G1gcPrism,
             "zgc" | "modern" | "modern-zgc" => GcPreset::ModernZgc,
-            _ => GcPreset::G1gcAikar,
+            _ => GcPreset::G1gcPrism,
         }
     }
 }
@@ -86,7 +87,7 @@ fn parse_java_major(output: &str) -> u32 {
 /// - Xms and Xmx are always set equal, using the supplied `memory_mb`.
 /// - The flag list never includes the user's custom args; those should be appended
 ///   by the caller AFTER this function returns.
-/// - ZGC requires Java >= 17 AND >= 6 GB of heap. If either condition fails,
+/// - ZGC requires Java >= 17 AND >= 8 GB of heap. If either condition fails,
 ///   the preset silently downgrades to G1GC and a warning is logged.
 pub fn build_jvm_args(
     requested: GcPreset,
@@ -127,7 +128,7 @@ pub fn build_jvm_args(
 
     let effective = match requested {
         GcPreset::Standard => GcPreset::Standard,
-        GcPreset::G1gcAikar => GcPreset::G1gcAikar,
+        GcPreset::G1gcPrism => GcPreset::G1gcPrism,
         GcPreset::ModernZgc => {
             if java_major < 17 {
                 tracing::warn!(
@@ -135,14 +136,14 @@ pub fn build_jvm_args(
                     "ZGC requires Java 17+ (detected: {}). Falling back to G1GC.",
                     java_major
                 );
-                GcPreset::G1gcAikar
-            } else if memory_mb < 6144 {
+                GcPreset::G1gcPrism
+            } else if memory_mb < 8192 {
                 tracing::warn!(
                     target: "launcher",
-                    "ZGC requires at least 6 GB of heap (allocated: {} MB). Falling back to G1GC.",
+                    "ZGC requires at least 8 GB of heap (allocated: {} MB). Falling back to G1GC.",
                     memory_mb
                 );
-                GcPreset::G1gcAikar
+                GcPreset::G1gcPrism
             } else {
                 GcPreset::ModernZgc
             }
@@ -154,12 +155,23 @@ pub fn build_jvm_args(
             // No GC flags added by the preset; the caller's custom args
             // (or instance.jvm_args) provide whatever they want.
         }
-        GcPreset::G1gcAikar => {
-            // Universal Aikar's flags. Supported on Java 8, 11, 17, 21.
+        GcPreset::G1gcPrism => {
+            // Prism Launcher's default client GC set. Prism never uses ZGC —
+            // G1GC with fixed region sizing and a short pause target is what
+            // avoids the "freeze while loading packs / joining servers" stalls
+            // that aggressive server-style tuning (or ZGC on a small heap)
+            // causes on interactive clients. Safe on Java 8, 11, 17, 21.
+            args.push("-XX:+UnlockExperimentalVMOptions".into());
             args.push("-XX:+UseG1GC".into());
             args.push("-XX:+ParallelRefProcEnabled".into());
             args.push("-XX:MaxGCPauseMillis=50".into());
-            args.push("-XX:+UnlockExperimentalVMOptions".into());
+            args.push("-XX:G1NewSizePercent=20".into());
+            args.push("-XX:G1ReservePercent=20".into());
+            args.push("-XX:G1HeapRegionSize=32M".into());
+            args.push("-XX:-UseAdaptiveSizePolicy".into());
+            args.push("-XX:-OmitStackTraceInFastThrow".into());
+            args.push("-XX:-DontCompileHugeMethods".into());
+            args.push("-Xss4M".into());
             // Note: `-XX:+G1UnlockCommercialFeatures` was never a valid
             // HotSpot flag. The actual flag was `-XX:+UnlockCommercialFeatures`
             // (Java 8 only), which we intentionally skip — it had no effect
@@ -167,7 +179,13 @@ pub fn build_jvm_args(
         }
         GcPreset::ModernZgc => {
             args.push("-XX:+UseZGC".into());
-            args.push("-XX:+UnlockExperimentalVMOptions".into());
+            // Generational ZGC (JEP 439) exists since Java 21 and removes most
+            // of ZGC's overhead on young-object-heavy workloads like Minecraft.
+            // On Java 17-20 the flag is unknown and would abort the JVM, so it
+            // is only added for Java >= 21.
+            if java_major >= 21 {
+                args.push("-XX:+ZGenerational".into());
+            }
         }
     }
 
@@ -248,9 +266,12 @@ mod tests {
 
     #[test]
     fn g1gc_always_works() {
-        let (args, eff) = build_jvm_args(GcPreset::G1gcAikar, 4096, 8);
-        assert_eq!(eff, GcPreset::G1gcAikar);
+        let (args, eff) = build_jvm_args(GcPreset::G1gcPrism, 4096, 8);
+        assert_eq!(eff, GcPreset::G1gcPrism);
         assert!(args.contains(&"-XX:+UseG1GC".to_string()));
+        assert!(args.contains(&"-XX:G1HeapRegionSize=32M".to_string()));
+        assert!(args.contains(&"-XX:G1ReservePercent=20".to_string()));
+        assert!(args.contains(&"-Xss4M".to_string()));
         // `-XX:+G1UnlockCommercialFeatures` is never added: it never existed
         // as a valid HotSpot flag in any Java version.
         assert!(!args.contains(&"-XX:+G1UnlockCommercialFeatures".to_string()));
@@ -261,20 +282,43 @@ mod tests {
     #[test]
     fn zgc_falls_back_when_old_java() {
         let (_, eff) = build_jvm_args(GcPreset::ModernZgc, 8192, 11);
-        assert_eq!(eff, GcPreset::G1gcAikar);
+        assert_eq!(eff, GcPreset::G1gcPrism);
     }
 
     #[test]
     fn zgc_falls_back_when_low_memory() {
         let (_, eff) = build_jvm_args(GcPreset::ModernZgc, 4096, 21);
-        assert_eq!(eff, GcPreset::G1gcAikar);
+        assert_eq!(eff, GcPreset::G1gcPrism);
     }
 
     #[test]
-    fn zgc_works_with_java_17_and_8gb() {
+    fn zgc_falls_back_at_6gb() {
+        // 6 GB is below the 8 GB ZGC floor — the preset that caused the
+        // "freeze while loading packs / joining servers" stalls must not
+        // apply there.
+        let (_, eff) = build_jvm_args(GcPreset::ModernZgc, 6144, 21);
+        assert_eq!(eff, GcPreset::G1gcPrism);
+    }
+
+    #[test]
+    fn zgc_works_with_java_21_and_8gb() {
         let (args, eff) = build_jvm_args(GcPreset::ModernZgc, 8192, 21);
         assert_eq!(eff, GcPreset::ModernZgc);
         assert!(args.contains(&"-XX:+UseZGC".to_string()));
+        // Generational ZGC (JEP 439) applies on Java 21+
+        assert!(args.contains(&"-XX:+ZGenerational".to_string()));
+        // ZGC is production since JDK 15 — no experimental unlock needed
+        assert!(!args.contains(&"-XX:+UnlockExperimentalVMOptions".to_string()));
+    }
+
+    #[test]
+    fn zgc_java_17_omits_generational_flag() {
+        // `-XX:+ZGenerational` does not exist on Java 17 — it must not be
+        // passed or the JVM aborts with "Unrecognized VM option".
+        let (args, eff) = build_jvm_args(GcPreset::ModernZgc, 8192, 17);
+        assert_eq!(eff, GcPreset::ModernZgc);
+        assert!(args.contains(&"-XX:+UseZGC".to_string()));
+        assert!(!args.contains(&"-XX:+ZGenerational".to_string()));
     }
 
     fn s(v: &[&str]) -> Vec<String> {

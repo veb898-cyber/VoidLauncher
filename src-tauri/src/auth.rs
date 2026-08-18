@@ -3,6 +3,11 @@ use tracing;
 use hex;
 use crate::error::{LauncherError, Result};
 
+/// Service name for Windows Credential Manager entries (shared with accounts.rs).
+const CM_SERVICE: &str = "VoidLauncher";
+/// Vault username for the serialized Microsoft auth state.
+const CM_AUTH_USER: &str = "auth-state";
+
 /// Microsoft OAuth2 token response
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MicrosoftToken {
@@ -345,17 +350,25 @@ pub async fn full_auth_flow(ms_token: &MicrosoftToken) -> Result<(MinecraftToken
     Ok((mc_token, profile))
 }
 
-/// Save auth state to disk (hex-encoded to avoid plaintext tokens; atomic write)
-pub fn save_auth_state(path: &std::path::Path, state: &AuthState) -> Result<()> {
+/// Save auth state to the OS credential vault (Windows Credential Manager).
+/// The `path` argument is kept for backward compatibility with callers; the
+/// legacy `auth.json` file is no longer written. On load, an existing file
+/// is migrated into the vault and then deleted.
+pub fn save_auth_state(_path: &std::path::Path, state: &AuthState) -> Result<()> {
     let json = serde_json::to_string(state)?;
-    let encoded = hex::encode(json.as_bytes());
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &encoded)?;
-    std::fs::rename(&tmp, path)?;
+    let entry = keyring::Entry::new(CM_SERVICE, CM_AUTH_USER)
+        .map_err(|e| LauncherError::Auth(format!("vault init failed: {e}")))?;
+    entry
+        .set_password(&json)
+        .map_err(|e| LauncherError::Auth(format!("vault write failed: {e}")))?;
     Ok(())
+}
+
+/// Remove the Microsoft auth state from the OS vault and delete the legacy
+/// `auth.json` file if it still exists.
+pub fn clear_auth_state(path: &std::path::Path) {
+    let _ = keyring::Entry::new(CM_SERVICE, CM_AUTH_USER).and_then(|e| e.delete_credential());
+    let _ = std::fs::remove_file(path);
 }
 
 /// Check if a Minecraft token is expired (with a 5-minute buffer).
@@ -404,16 +417,31 @@ pub fn get_offline_credentials(path: &std::path::Path) -> Option<(String, String
     None
 }
 
-/// Load auth state from disk (supports both hex-encoded and plain JSON)
+/// Load auth state. Prefers the OS credential vault; falls back to the legacy
+/// `auth.json` file (plain or hex-encoded) and migrates it into the vault.
 pub fn load_auth_state(path: &std::path::Path) -> Option<AuthState> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    // Try plain JSON first (backward compat)
-    if let Ok(state) = serde_json::from_str(&contents) {
-        return Some(state);
+    // 1) OS credential vault (current storage).
+    if let Ok(entry) = keyring::Entry::new(CM_SERVICE, CM_AUTH_USER) {
+        if let Ok(json) = entry.get_password() {
+            if let Ok(state) = serde_json::from_str(&json) {
+                return Some(state);
+            }
+        }
     }
-    // Try hex-encoded JSON
-    let bytes = hex::decode(contents.trim()).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    // 2) Legacy auth.json (plain JSON or hex-encoded) → migrate and remove.
+    let contents = std::fs::read_to_string(path).ok()?;
+    let state = if let Ok(state) = serde_json::from_str(&contents) {
+        Some(state)
+    } else {
+        let bytes = hex::decode(contents.trim()).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }?;
+    // Delete the legacy file ONLY after the vault write succeeded —
+    // otherwise an update would silently log the user out.
+    if save_auth_state(path, &state).is_ok() {
+        let _ = std::fs::remove_file(path);
+    }
+    Some(state)
 }
 
 /// Ely.by authentication
