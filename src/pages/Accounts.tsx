@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore, type AccountEntry } from '../stores/accountsStore';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
@@ -39,7 +38,6 @@ function validateOfflineUsername(name: string): string | null {
 
 export function Accounts() {
   const { accounts, loadAccounts, addOfflineAccount, addElybyAccount, removeAccount, setDefaultAccount, changeSkin } = useAccountsStore();
-  const { isLoggedIn } = useAuthStore();
 
   const [showAddOffline, setShowOffline] = useState(false);
   const [offlineName, setOfflineName] = useState('');
@@ -50,15 +48,6 @@ export function Accounts() {
   const [showMicrosoftLogin, setShowMicrosoftLogin] = useState(false);
 
   useEffect(() => { loadAccounts(); }, [loadAccounts]);
-
-  // Reload accounts when Microsoft login completes so the new
-  // Microsoft entry shows up in the list and the modal closes.
-  useEffect(() => {
-    if (isLoggedIn) {
-      loadAccounts();
-      setShowMicrosoftLogin(false);
-    }
-  }, [isLoggedIn, loadAccounts]);
 
   const handleAddOffline = async () => {
     if (offlineNameError) {
@@ -120,21 +109,21 @@ export function Accounts() {
         <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
           <Button onClick={() => setShowOffline(true)}>{t('accounts.btn_add_offline')}</Button>
           <Button onClick={() => setShowElyby(true)} variant="secondary">{t('accounts.btn_add_elyby')}</Button>
-          {!isLoggedIn && (
-            <Button onClick={() => setShowMicrosoftLogin(true)} variant="primary">
-              {t('accounts.btn_add_microsoft')}
-            </Button>
-          )}
+          <Button onClick={() => setShowMicrosoftLogin(true)} variant="primary">
+            {t('accounts.btn_add_microsoft')}
+          </Button>
         </div>
       </div>
 
       {/* Accounts list */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
         {accounts.map((acc) => (
-          <div key={acc.id} className="glass-card" style={{
-            padding: 'var(--space-lg)', display: 'flex', alignItems: 'center', gap: 'var(--space-lg)',
-            border: acc.default ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
-          }}>
+          <div key={acc.id} className={`glass-card account-card${acc.default ? ' account-card--active' : ''}`}
+            onClick={() => { if (!acc.default) setDefaultAccount(acc.id); }}
+            style={{
+              padding: 'var(--space-lg)', display: 'flex', alignItems: 'center', gap: 'var(--space-lg)',
+              border: acc.default ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
+            }}>
             {acc.uuid ? (
               <img
                 src={`https://mc-heads.net/avatar/${acc.uuid}/40`}
@@ -171,6 +160,14 @@ export function Accounts() {
                     {t('accounts.badge_licensed')}
                   </span>
                 )}
+                {acc.account_type === 'Microsoft' && acc.has_ms_session === false && (
+                  <span
+                    title={t('accounts.needs_login_hint')}
+                    style={{ fontSize: 10, background: 'var(--warning)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}
+                  >
+                    {t('accounts.badge_needs_login')}
+                  </span>
+                )}
               </div>
               <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
                 {getTypeLabel(acc.account_type)}
@@ -178,13 +175,10 @@ export function Accounts() {
               </div>
             </div>
             <div style={{ display: 'flex', gap: 'var(--space-xs)', flexShrink: 0 }}>
-              {!acc.default && (
-                <Button size="sm" variant="ghost" onClick={() => setDefaultAccount(acc.id)}>{t('accounts.btn_set_active')}</Button>
-              )}
               {acc.account_type === 'Microsoft' && (
-                <Button size="sm" variant="ghost" onClick={() => handleSkinChange(acc)}>{t('accounts.btn_change_skin')}</Button>
+                <Button size="sm" variant="ghost" onClick={(e) => { e.stopPropagation(); handleSkinChange(acc); }}>{t('accounts.btn_change_skin')}</Button>
               )}
-              <Button size="sm" variant="ghost" onClick={() => { removeAccount(acc.id); addToast(t('accounts.removed_toast'), 'info'); }}>{t('accounts.btn_remove')}</Button>
+              <Button size="sm" variant="ghost" onClick={(e) => { e.stopPropagation(); removeAccount(acc.id); addToast(t('accounts.removed_toast'), 'info'); }}>{t('accounts.btn_remove')}</Button>
             </div>
           </div>
         ))}
@@ -223,9 +217,11 @@ export function Accounts() {
 
       {/* Add Microsoft Modal — reuses the same login card as the main-menu "ВОЙТИ" page.
           `bare` removes the dark blurred backdrop so this dialog looks identical
-          to the standalone Sign-In page, not like a "popover over dimmed content". */}
+          to the standalone Sign-In page, not like a "popover over dimmed content".
+          onSuccess closes the modal and reloads so any number of Microsoft
+          accounts can be added one after another. */}
       <Modal open={showMicrosoftLogin} onClose={() => setShowMicrosoftLogin(false)} maxWidth={460} bare>
-        <MicrosoftLoginCard onSuccess={() => setShowMicrosoftLogin(false)} />
+        <MicrosoftLoginCard onSuccess={() => { setShowMicrosoftLogin(false); loadAccounts(); }} />
       </Modal>
     </div>
   );

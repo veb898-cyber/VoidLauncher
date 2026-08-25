@@ -3,11 +3,6 @@ use tracing;
 use hex;
 use crate::error::{LauncherError, Result};
 
-/// Service name for Windows Credential Manager entries (shared with accounts.rs).
-const CM_SERVICE: &str = "VoidLauncher";
-/// Vault username for the serialized Microsoft auth state.
-const CM_AUTH_USER: &str = "auth-state";
-
 /// Microsoft OAuth2 token response
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MicrosoftToken {
@@ -56,16 +51,17 @@ pub struct AuthState {
 pub async fn start_device_code_flow(client_id: &str) -> Result<serde_json::Value> {
     tracing::info!(target: "launcher", "Starting device code flow");
     let client = crate::download::global_http_client();
-    let resp = client
-        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
-        .form(&[
-            ("client_id", client_id),
-            ("scope", "XboxLive.SignIn XboxLive.offline_access"),
-        ])
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
+            .form(&[
+                ("client_id", client_id),
+                ("scope", "XboxLive.SignIn XboxLive.offline_access"),
+            ]),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
 
     if resp.get("error").is_some() {
         let msg = resp["error_description"]
@@ -84,17 +80,18 @@ pub async fn poll_device_code(
     device_code: &str,
 ) -> Result<MicrosoftToken> {
     let client = crate::download::global_http_client();
-    let resp = client
-        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-            ("client_id", client_id),
-            ("device_code", device_code),
-        ])
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", client_id),
+                ("device_code", device_code),
+            ]),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
 
     if let Some(error) = resp.get("error") {
         let error_str = error.as_str().unwrap_or("");
@@ -133,18 +130,19 @@ pub async fn refresh_microsoft_token(
 ) -> Result<MicrosoftToken> {
     tracing::info!(target: "launcher", "Refreshing Microsoft token");
     let client = crate::download::global_http_client();
-    let resp = client
-        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", client_id),
-            ("refresh_token", refresh_token),
-            ("scope", "XboxLive.SignIn XboxLive.offline_access"),
-        ])
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", client_id),
+                ("refresh_token", refresh_token),
+                ("scope", "XboxLive.SignIn XboxLive.offline_access"),
+            ]),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
 
     if resp.get("error").is_some() {
         tracing::error!(target: "launcher", "Token refresh failed");
@@ -176,16 +174,17 @@ pub async fn get_xbox_token(ms_token: &str) -> Result<XboxToken> {
         "TokenType": "JWT"
     });
 
-    let resp = client
-        .post("https://user.auth.xboxlive.com/user/authenticate")
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("x-xbl-contract-version", "1")
-        .json(&body)
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .post("https://user.auth.xboxlive.com/user/authenticate")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("x-xbl-contract-version", "1")
+            .json(&body),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
 
     let token = resp["Token"]
         .as_str()
@@ -217,16 +216,17 @@ pub async fn get_xsts_token(xbox_token: &str) -> Result<XboxToken> {
         "TokenType": "JWT"
     });
 
-    let resp = client
-        .post("https://xsts.auth.xboxlive.com/xsts/authorize")
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("x-xbl-contract-version", "1")
-        .json(&body)
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .post("https://xsts.auth.xboxlive.com/xsts/authorize")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("x-xbl-contract-version", "1")
+            .json(&body),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
 
     if let Some(xerr) = resp.get("XErr") {
         let code = xerr.as_u64().unwrap_or(0);
@@ -267,14 +267,15 @@ pub async fn get_minecraft_token(xsts_token: &str, user_hash: &str) -> Result<Mi
         "platform": "PC_LAUNCHER"
     });
 
-    let resp = client
-        .post("https://api.minecraftservices.com/launcher/login")
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .post("https://api.minecraftservices.com/launcher/login")
+            .header("Content-Type", "application/json")
+            .json(&body),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -295,13 +296,14 @@ pub async fn get_minecraft_token(xsts_token: &str, user_hash: &str) -> Result<Mi
 /// Verify game ownership
 pub async fn check_ownership(mc_token: &str) -> Result<bool> {
     let client = crate::download::global_http_client();
-    let resp = client
-        .get("https://api.minecraftservices.com/entitlements/license")
-        .header("Authorization", format!("Bearer {}", mc_token))
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .get("https://api.minecraftservices.com/entitlements/license")
+            .header("Authorization", format!("Bearer {}", mc_token)),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
 
     let items = resp["items"].as_array();
     Ok(items.is_some_and(|items| !items.is_empty()))
@@ -310,13 +312,14 @@ pub async fn check_ownership(mc_token: &str) -> Result<bool> {
 /// Get Minecraft profile (username + UUID)
 pub async fn get_profile(mc_token: &str) -> Result<MinecraftProfile> {
     let client = crate::download::global_http_client();
-    let resp = client
-        .get("https://api.minecraftservices.com/minecraft/profile")
-        .header("Authorization", format!("Bearer {}", mc_token))
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .get("https://api.minecraftservices.com/minecraft/profile")
+            .header("Authorization", format!("Bearer {}", mc_token)),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
 
     if resp.get("error").is_some() {
         return Err(LauncherError::Auth(
@@ -356,18 +359,14 @@ pub async fn full_auth_flow(ms_token: &MicrosoftToken) -> Result<(MinecraftToken
 /// is migrated into the vault and then deleted.
 pub fn save_auth_state(_path: &std::path::Path, state: &AuthState) -> Result<()> {
     let json = serde_json::to_string(state)?;
-    let entry = keyring::Entry::new(CM_SERVICE, CM_AUTH_USER)
-        .map_err(|e| LauncherError::Auth(format!("vault init failed: {e}")))?;
-    entry
-        .set_password(&json)
-        .map_err(|e| LauncherError::Auth(format!("vault write failed: {e}")))?;
-    Ok(())
+    crate::accounts::store_auth_state_blob(&json)
+        .map_err(LauncherError::Auth)
 }
 
 /// Remove the Microsoft auth state from the OS vault and delete the legacy
 /// `auth.json` file if it still exists.
 pub fn clear_auth_state(path: &std::path::Path) {
-    let _ = keyring::Entry::new(CM_SERVICE, CM_AUTH_USER).and_then(|e| e.delete_credential());
+    crate::accounts::clear_auth_state_blob();
     let _ = std::fs::remove_file(path);
 }
 
@@ -420,12 +419,10 @@ pub fn get_offline_credentials(path: &std::path::Path) -> Option<(String, String
 /// Load auth state. Prefers the OS credential vault; falls back to the legacy
 /// `auth.json` file (plain or hex-encoded) and migrates it into the vault.
 pub fn load_auth_state(path: &std::path::Path) -> Option<AuthState> {
-    // 1) OS credential vault (current storage).
-    if let Ok(entry) = keyring::Entry::new(CM_SERVICE, CM_AUTH_USER) {
-        if let Ok(json) = entry.get_password() {
-            if let Ok(state) = serde_json::from_str(&json) {
-                return Some(state);
-            }
+    // 1) OS credential vault (current storage, chunked or legacy single entry).
+    if let Some(json) = crate::accounts::load_auth_state_blob() {
+        if let Ok(state) = serde_json::from_str(&json) {
+            return Some(state);
         }
     }
     // 2) Legacy auth.json (plain JSON or hex-encoded) → migrate and remove.
@@ -458,14 +455,15 @@ pub async fn elyby_login(username: &str, password: &str) -> Result<(String, Stri
         }
     });
 
-    let resp = client
-        .post("https://authserver.ely.by/auth/authenticate")
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .post("https://authserver.ely.by/auth/authenticate")
+            .header("Content-Type", "application/json")
+            .json(&body),
+    )
+    .await?
+    .json::<serde_json::Value>()
+    .await?;
 
     if resp.get("error").is_some() {
         let msg = resp["errorMessage"]
@@ -519,13 +517,14 @@ pub async fn change_microsoft_skin(mc_token: &str, skin_path: &std::path::Path, 
     body.extend_from_slice(&skin_data);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-    let resp = client
-        .post("https://api.minecraftservices.com/minecraft/profile/skins")
-        .header("Authorization", format!("Bearer {}", mc_token))
-        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
-        .body(body)
-        .send()
-        .await?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .post("https://api.minecraftservices.com/minecraft/profile/skins")
+            .header("Authorization", format!("Bearer {}", mc_token))
+            .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+            .body(body),
+    )
+    .await?;
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();

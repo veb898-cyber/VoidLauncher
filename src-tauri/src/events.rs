@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::broadcast;
 
@@ -28,6 +29,59 @@ pub struct LogPayload {
     pub level: String,
     pub source: String,
     pub message: String,
+}
+
+/// Global app handle used for fire-and-forget progress events from
+/// modules that don't otherwise receive an AppHandle.
+static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+
+/// Store the app handle at startup so any module can emit Tauri events.
+pub fn set_app_handle(app: &AppHandle) {
+    let _ = APP_HANDLE.set(app.clone());
+}
+
+/// Retry notification while fetching a modpack catalog (ATL/CF/Modrinth).
+#[derive(Debug, Clone, Serialize)]
+pub struct FetchRetryPayload {
+    pub source: String,
+    pub attempt: usize,
+    pub total: usize,
+    pub message: String,
+}
+
+pub fn emit_fetch_retry(source: &str, attempt: usize, total: usize, message: &str) {
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.emit(
+            "modpack_fetch_retry",
+            FetchRetryPayload {
+                source: source.to_string(),
+                attempt,
+                total,
+                message: message.to_string(),
+            },
+        );
+    }
+}
+
+/// Byte-level progress of a single file download (throttled by caller).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileProgressPayload {
+    pub url: String,
+    pub downloaded: u64,
+    pub total: u64,
+}
+
+pub fn emit_file_progress(url: &str, downloaded: u64, total: u64) {
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.emit(
+            "modpack_file_progress",
+            FileProgressPayload {
+                url: url.to_string(),
+                downloaded,
+                total,
+            },
+        );
+    }
 }
 
 /// A progress sender that wraps a broadcast::Sender
@@ -81,6 +135,26 @@ pub fn emit_log(app: &AppHandle, level: &str, source: &str, message: &str) {
             );
         }
     }
+}
+
+/// Emit a "launch" log message to the frontend ONLY — without appending to
+/// the current game session file. Used for messages that are already written
+/// to the session file by another writer in guaranteed chronological order
+/// (e.g. the final "Game exited" line comes from the pipe-reader thread).
+pub fn emit_launch_event(app: &AppHandle, level: &str, message: &str) {
+    match level {
+        "error" => tracing::error!(target: "launcher", source = "launch", "{}", message),
+        "warn"  => tracing::warn!(target: "launcher", source = "launch", "{}", message),
+        _       => tracing::info!(target: "launcher", source = "launch", "{}", message),
+    }
+    let _ = app.emit(
+        "log_message",
+        LogPayload {
+            level: level.to_string(),
+            source: "launch".to_string(),
+            message: message.to_string(),
+        },
+    );
 }
 
 /// Spawn a background task that bridges broadcast channel → Tauri events

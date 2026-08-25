@@ -1,14 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
 import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, Loader2, X, Check, Download } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { addToast } from '../ui/Toast';
 import { useT } from '../../lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
+import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
 
 interface Hit {
   project_id: string;
@@ -67,7 +66,13 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const [popular, setPopular] = useState<Hit[]>([]);
   const [selected, setSelected] = useState<Hit | null>(null);
   const [modDetail, setModDetail] = useState<any>(null);
+  const mdBodyRef = useRef<HTMLDivElement | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  // Re-route remote description images through the backend after render
+  // (the webview alone has no proxy fallback).
+  useEffect(() => {
+    if (!loadingDetail) hydrateRemoteImages(mdBodyRef.current);
+  }, [loadingDetail, modDetail]);
   const [versions, setVersions] = useState<any[]>([]);
   const [sortMode, setSortMode] = useState<SortMode>('downloads');
   // Modrinth has no "oldest" index; we request newest and page backwards.
@@ -115,20 +120,28 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     }
   };
 
+  // Sequence guards: a slow response from an outdated request (fast sort /
+  // filter switching) must never overwrite fresher results.
+  const popularReqRef = useRef(0);
+  const searchReqRef = useRef(0);
+
   const loadPopular = useCallback(async () => {
+    const reqId = ++popularReqRef.current;
     setLoading(true);
     setPopular([]);
     setPopularOffset(0);
     setHasMorePopular(true);
     try {
       const base = { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
-      const res = await invoke<any>('cmd_popular_modrinth', base);
+      let res = await invoke<any>('cmd_popular_modrinth', base);
+      if (reqId !== popularReqRef.current) return;
       if (sortMode === 'oldest') {
         const total = Math.max(res.total_hits ?? 0, 0);
         const lastOffset = Math.max(0, total - PAGE_SIZE);
         const page = lastOffset > 0
           ? await invoke<any>('cmd_popular_modrinth', { ...base, offset: lastOffset })
           : res;
+        if (reqId !== popularReqRef.current) return;
         const hits: Hit[] = [...((page.hits as Hit[]) || [])].reverse();
         setPopular(hits);
         setPopularOffset(Math.max(0, lastOffset - PAGE_SIZE));
@@ -140,7 +153,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         setHasMorePopular(hits.length >= PAGE_SIZE);
       }
     } catch { }
-    setLoading(false);
+    if (reqId === popularReqRef.current) setLoading(false);
   }, [contentType, mcVersion, loader, sortMode]);
 
   const popularOffsetRef = useRef(0);
@@ -148,10 +161,12 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
 
   const loadMorePopular = useCallback(async () => {
     if (!hasMorePopular || loadingMore) return;
+    const reqId = popularReqRef.current;
     setLoadingMore(true);
     const offset = popularOffsetRef.current;
     try {
       const res = await invoke<any>('cmd_popular_modrinth', { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
+      if (reqId !== popularReqRef.current) { setLoadingMore(false); return; }
       const raw: Hit[] = res.hits || [];
       const hits: Hit[] = sortMode === 'oldest' ? [...raw].reverse() : raw;
       setPopular((prev) => {
@@ -177,6 +192,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     if (!query.trim()) {
       // Clearing the search must return to the default "popular" list;
       // otherwise stale results would keep being displayed.
+      ++searchReqRef.current;
       setResults([]);
       setResultsOffset(0);
       setHasMoreResults(true);
@@ -184,6 +200,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       loadPopular();
       return;
     }
+    const reqId = ++searchReqRef.current;
     setLoading(true);
     setResults([]);
     setResultsOffset(0);
@@ -191,13 +208,15 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setSelected(null);
     try {
       const base = { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
-      const res = await invoke<any>('cmd_search_modrinth', base);
+      let res = await invoke<any>('cmd_search_modrinth', base);
+      if (reqId !== searchReqRef.current) return;
       if (sortMode === 'oldest') {
         const total = Math.max(res.total_hits ?? 0, 0);
         const lastOffset = Math.max(0, total - PAGE_SIZE);
         const page = lastOffset > 0
           ? await invoke<any>('cmd_search_modrinth', { ...base, offset: lastOffset })
           : res;
+        if (reqId !== searchReqRef.current) return;
         const hits: Hit[] = [...((page.hits as Hit[]) || [])].reverse();
         setResults(hits);
         setResultsOffset(Math.max(0, lastOffset - PAGE_SIZE));
@@ -209,7 +228,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         setHasMoreResults(hits.length >= PAGE_SIZE);
       }
     } catch (e: any) { addToast(t('content.search_error', { error: e.toString() }), 'error'); }
-    setLoading(false);
+    if (reqId === searchReqRef.current) setLoading(false);
   };
 
   const resultsOffsetRef = useRef(0);
@@ -217,10 +236,12 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
 
   const loadMoreResults = useCallback(async () => {
     if (!hasMoreResults || loadingMore || !query.trim()) return;
+    const reqId = searchReqRef.current;
     setLoadingMore(true);
     const offset = resultsOffsetRef.current;
     try {
       const res = await invoke<any>('cmd_search_modrinth', { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
+      if (reqId !== searchReqRef.current) { setLoadingMore(false); return; }
       const raw: Hit[] = res.hits || [];
       const hits: Hit[] = sortMode === 'oldest' ? [...raw].reverse() : raw;
       setResults((prev) => {
@@ -418,31 +439,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
 
   const displayHits = results.length > 0 ? results : popular;
 
-  const renderMarkdown = (text: string): string => {
-    if (!text) return '';
-    // Rewrite raw <img>/<a> HTML to markdown so the marked pipeline gets a
-    // single, consistent input.
-    const clean = text
-      .replace(/<img\s[^>]*>/gi, (m) => { const src = m.match(/src=["']([^"']+)["']/i); return src ? `![](${src[1]})` : ''; })
-      .replace(/<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, '[$2]($1)');
-    try {
-      const html = marked.parse(clean, { gfm: true, breaks: false }) as string;
-      const sanitized = DOMPurify.sanitize(html, {
-        ALLOWED_TAGS: [
-          'a', 'b', 'blockquote', 'br', 'code', 'del', 'div', 'em', 'h1',
-          'h2', 'h3', 'h4', 'h5', 'h6', 'hr', 'i', 'img', 'ins', 'li',
-          'ol', 'p', 'pre', 's', 'span', 'strong', 'sub', 'sup', 'table',
-          'tbody', 'td', 'th', 'thead', 'tr', 'ul',
-        ],
-        ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class'],
-        ALLOWED_URI_REGEXP: /^https?:\/\//i,
-        ADD_ATTR: [],
-        FORBID_TAGS: ['script', 'iframe', 'object', 'embed', 'style', 'form', 'input', 'button'],
-        FORBID_ATTR: ['onerror', 'onload', 'onclick', 'onmouseover', 'onfocus', 'onblur', 'onchange', 'onsubmit', 'style'],
-      });
-      return sanitized;
-    } catch { return ''; }
-  };
+  const renderMarkdown = (text: string): string => renderMarkdownToHtml(text);
 
   const formatDownloads = (n?: number) => {
     if (n == null) return '';
@@ -614,7 +611,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                     <h3 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700 }}>{selected.title}</h3>
                     <p style={{ margin: 0, fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>{selected.description}</p>
                     {selected.downloads != null && (
-                      <p style={{ margin: '4px 0 0', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{formatDownloads(selected.downloads)} downloads</p>
+                      <p style={{ margin: '4px 0 0', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('content.download_count', { n: formatDownloads(selected.downloads) })}</p>
                     )}
                   </div>
                   <Button size="sm" variant={isInstalled(selected.project_id, selected.slug, selected.title) ? 'ghost' : isAdded(selected.project_id, selected.slug, selected.title) ? 'ghost' : 'primary'}
@@ -628,7 +625,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
 
                 {/* Full description */}
                 {modDetail?.body && (
-                  <div className="md-content" style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}
+                  <div ref={mdBodyRef} className="md-content" style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}
                     dangerouslySetInnerHTML={{ __html: renderMarkdown(modDetail.body) }}
                     onClick={(e) => {
                       const a = (e.target as HTMLElement).closest('a');
@@ -636,9 +633,12 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                     }} />
                 )}
                 {modDetail?.description && !modDetail.body && (
-                  <div className="md-content" style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}>
-                    {modDetail.description}
-                  </div>
+                  <div ref={modDetail.description ? mdBodyRef : undefined} className="md-content" style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(modDetail.description) }}
+                    onClick={(e) => {
+                      const a = (e.target as HTMLElement).closest('a');
+                      if (a?.href?.startsWith('http')) { e.preventDefault(); openUrl(a.href); }
+                    }} />
                 )}
 
                 {/* Version selector */}

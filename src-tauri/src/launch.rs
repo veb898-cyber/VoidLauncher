@@ -14,17 +14,16 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Open (create) files to receive the game process stdout/stderr.
+/// Open (create) files to receive a raw byte-for-byte copy of the game
+/// process stdout/stderr (crash forensics).
 ///
-/// The game writes a LOT to stdout (log4j console appender, warn/error
-/// spam from broken resource packs, mod errors, …). Piping it (Stdio::piped())
-/// without any reader would fill the OS pipe buffer and block the game
-/// forever once the buffer is full — the game then hangs hard on any log
-/// write. Redirecting to files guarantees the game never blocks on logging.
+/// Returns `None` for a stream when its file cannot be created — the unified
+/// session log still receives every line via the pipe readers, so a tee
+/// failure must never block the game.
 fn open_game_output_files(
     data_dir: &std::path::Path,
     instance_name: &str,
-) -> Result<(std::fs::File, std::fs::File)> {
+) -> Result<(Option<std::fs::File>, Option<std::fs::File>)> {
     use std::io::Write;
 
     let game_logs_dir = data_dir.join("logs").join("game");
@@ -34,24 +33,22 @@ fn open_game_output_files(
 
     let now = chrono::Local::now();
     let timestamp = now.format("%Y%m%d_%H%M%S");
-    let safe_name: String = instance_name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
+    let safe_name = crate::game_logs::sanitize_instance_name(instance_name);
     let base = game_logs_dir.join(format!("{}_{}", safe_name, timestamp));
     let stdout_path = format!("{}.stdout.log", base.display());
     let stderr_path = format!("{}.stderr.log", base.display());
 
-    let mut stdout_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&stdout_path)
-        .map_err(|e| LauncherError::Launch(format!("Failed to open {}: {}", stdout_path, e)))?;
-    let mut stderr_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&stderr_path)
-        .map_err(|e| LauncherError::Launch(format!("Failed to open {}: {}", stderr_path, e)))?;
+    let open_raw = |path: &str, label: &str| -> Option<std::fs::File> {
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::warn!(target: "launcher", "Raw {} tee unavailable ({}): {}", label, path, e);
+                None
+            }
+        }
+    };
+    let stdout_file = open_raw(&stdout_path, "stdout");
+    let stderr_file = open_raw(&stderr_path, "stderr");
 
     let header = format!(
         "VoidLauncher game stdout\nInstance: {}\nStarted: {}\n{}\n",
@@ -59,8 +56,14 @@ fn open_game_output_files(
         now.format("%Y-%m-%d %H:%M:%S"),
         "=".repeat(60),
     );
-    let _ = writeln!(stdout_file, "{}", header);
-    let _ = writeln!(stderr_file, "{}", header);
+    if let Some(f) = &stdout_file {
+        let mut f = f;
+        let _ = writeln!(f, "{}", header);
+    }
+    if let Some(f) = &stderr_file {
+        let mut f = f;
+        let _ = writeln!(f, "{}", header);
+    }
 
     tracing::info!(target: "launcher", "Game stdout -> {}, stderr -> {}", stdout_path, stderr_path);
     Ok((stdout_file, stderr_file))
@@ -445,7 +448,7 @@ pub fn launch_minecraft(
     // "0" is the conventional offline token.
     let auth_session = format!("0:{}:{}", uuid, username);
 
-    // For legacy loaders (MC <= 1.12.2 Forge/LiteLoader), the loader
+    // For legacy loaders (MC <= 1.12.2 Forge), the loader
     // profile carries the FULL game argument list in its
     // `minecraftArguments` string — those REPLACE the vanilla args.
     let legacy_full_args = instance
@@ -453,6 +456,16 @@ pub fn launch_minecraft(
         .as_ref()
         .map(|p| p.legacy_args && !p.game_args.is_empty())
         .unwrap_or(false);
+
+    // Resolution: when the instance sets it, the manifest's
+    // `has_custom_resolution` feature rule emits --width/--height for
+    // versions with structured arguments; for legacy versions the
+    // manifest has no resolution placeholders, so add them here —
+    // but only if the manifest did not already provide them.
+    let (res_w, res_h) = match &instance.resolution {
+        Some(res) => (res.width.to_string(), res.height.to_string()),
+        None => ("1280".to_string(), "720".to_string()),
+    };
 
     let substitute_args = |arg: &str| -> String {
         arg
@@ -470,12 +483,12 @@ pub fn launch_minecraft(
             .replace("${auth_xuid}", "0")
             .replace("${clientid}", "")
             .replace("${user_properties}", "{}")
-            .replace("${resolution_width}", "1280")
-            .replace("${resolution_height}", "720")
+            .replace("${resolution_width}", &res_w)
+            .replace("${resolution_height}", &res_h)
     };
 
     if !legacy_full_args {
-        let game_args = get_game_arguments(version_info);
+        let game_args = get_game_arguments(version_info, instance.resolution.is_some());
         for arg in &game_args {
             args.push(substitute_args(arg));
         }
@@ -490,12 +503,19 @@ pub fn launch_minecraft(
         }
     }
 
-    // Add resolution if specified
+    // Add resolution if specified AND not already provided by the manifest
+    // (feature rule has_custom_resolution above)
     if let Some(res) = &instance.resolution {
-        args.push("--width".to_string());
-        args.push(res.width.to_string());
-        args.push("--height".to_string());
-        args.push(res.height.to_string());
+        let has_width = args.iter().any(|a| a == "--width");
+        let has_height = args.iter().any(|a| a == "--height");
+        if !has_width {
+            args.push("--width".to_string());
+            args.push(res.width.to_string());
+        }
+        if !has_height {
+            args.push("--height".to_string());
+            args.push(res.height.to_string());
+        }
     }
 
     // 6. Launch
@@ -519,16 +539,14 @@ pub fn launch_minecraft(
     tracing::info!(target: "launcher", "Spawning Java process...");
 
     let mut cmd = Command::new(&java_path);
-    let (stdout_file, stderr_file) =
-        open_game_output_files(&config.data_dir, &instance.name)?;
     cmd.args(&args)
         .current_dir(&game_dir)
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| {
             let msg = if e.raw_os_error() == Some(740) {
@@ -541,6 +559,29 @@ pub fn launch_minecraft(
         })?;
 
     tracing::info!(target: "launcher", "Java process spawned with PID: {}", child.id());
+
+    // Prism-style unified logging: drain BOTH pipes concurrently and append
+    // every line to the current session log as it arrives (interleaved with
+    // the launcher's own messages). Raw bytes are also teed to forensic
+    // files. Piping is safe here — dedicated reader threads guarantee the
+    // OS pipe buffers never fill up and block the game.
+    if let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) {
+        // Raw tee files are best-effort: if they fail we still stream to the
+        // session log (passing None disables only the forensic copy).
+        let raw = open_game_output_files(&config.data_dir, &instance.name);
+        if let Err(e) = &raw {
+            tracing::warn!(target: "launcher", "Raw output tee unavailable: {}", e);
+        }
+        let (raw_out, raw_err) = raw.unwrap_or((None, None));
+        crate::game_logs::attach_output_readers(
+            child.id(),
+            Box::new(out),
+            Box::new(err),
+            raw_out,
+            raw_err,
+        );
+    }
+
     Ok(child)
 }
 

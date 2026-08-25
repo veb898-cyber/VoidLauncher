@@ -10,7 +10,7 @@ import { Button } from './ui/Button';
 interface MicrosoftLoginCardProps {
   /**
    * Called when Microsoft login completes successfully
-   * (isLoggedIn transitions to true).
+   * (the signed-in profile changes to a different account).
    * The Login page uses this to navigate home;
    * the Accounts modal uses this to close itself.
    */
@@ -28,7 +28,6 @@ interface MicrosoftLoginCardProps {
  */
 export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
   const {
-    isLoggedIn,
     isLoading,
     error,
     userCode,
@@ -37,19 +36,34 @@ export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
     pollLogin,
     clearError,
   } = useAuthStore();
+  const profileId = useAuthStore((s) => s.profile?.id ?? null);
   const pollInterval = useRef<number | null>(null);
   const [copied, setCopied] = useState(false);
+  const seenProfileId = useRef<string | null>(null);
+  const seenInit = useRef(false);
 
   useLogPlaque(error, 'error', 'auth');
 
+  // Fire on every completed login: the first one (isLoggedIn false → true)
+  // and any further one when an already-signed-in user adds another
+  // Microsoft account.
   useEffect(() => {
-    if (isLoggedIn) {
+    if (!seenInit.current) {
+      seenInit.current = true;
+      seenProfileId.current = profileId;
+      return;
+    }
+    if (profileId && profileId !== seenProfileId.current) {
+      seenProfileId.current = profileId;
       onSuccess?.();
     }
-  }, [isLoggedIn, onSuccess]);
+  }, [profileId, onSuccess]);
 
   useEffect(() => {
-    if (userCode && !isLoggedIn) {
+    // No isLoggedIn guard here: an already signed-in user must still be
+    // able to add another Microsoft account. Once polling succeeds the
+    // device code is cleared and further ticks become no-ops.
+    if (userCode) {
       pollInterval.current = window.setInterval(() => {
         pollLogin();
       }, 5000);
@@ -61,7 +75,7 @@ export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
         pollInterval.current = null;
       }
     };
-  }, [userCode, isLoggedIn, pollLogin]);
+  }, [userCode, pollLogin]);
 
   const handleCopyCode = () => {
     if (userCode) {

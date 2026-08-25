@@ -1103,3 +1103,24 @@ pub async fn install(
     tracing::info!(target: "launcher", "Forge install completed for MC {}", mc_version);
     Ok(profile)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forge_java_matrix() {
+        assert_eq!(required_forge_java_major("1.8.9"), 8);
+        assert_eq!(required_forge_java_major("1.12.2"), 8);
+        assert_eq!(required_forge_java_major("1.16.5"), 8);
+        assert_eq!(required_forge_java_major("1.17.1"), 16);
+        assert_eq!(required_forge_java_major("1.18.2"), 17);
+        assert_eq!(required_forge_java_major("1.20.1"), 17);
+        assert_eq!(required_forge_java_major("1.20.4"), 17);
+        assert_eq!(required_forge_java_major("1.20.5"), 21);
+        assert_eq!(required_forge_java_major("1.21.4"), 21);
+        // Unknown/unparseable input degrades to the oldest supported Java.
+        assert_eq!(required_forge_java_major(""), 8);
+        assert_eq!(required_forge_java_major("banana"), 8);
+    }
+}

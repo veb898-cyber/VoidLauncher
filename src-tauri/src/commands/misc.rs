@@ -1,12 +1,10 @@
-﻿// ==================== Misc Commands ====================
-// File operations, icon cache, launch state, cache clearing,
+// ==================== Misc Commands ====================
+// File operations, launch state, cache clearing,
 // system info, and configuration commands.
 
 use crate::config::AppConfig;
 use crate::events;
-use crate::save_icon_cache_to_disk;
 use crate::AppState;
-use std::collections::HashMap;
 use tauri::{AppHandle, State};
 
 #[tauri::command]
@@ -83,27 +81,161 @@ pub fn cmd_read_image_file(path: String) -> Result<Vec<u8>, String> {
     std::fs::read(&file).map_err(|e| e.to_string())
 }
 
-
-// ==================== Icon Cache ====================
-
+/// Fetch a description-page asset (screenshot, banner, badge) from ANY public
+/// host and return it as a base64 data URL. The webview honors only the
+/// system proxy without our proxy->direct fallback, so images embedded in
+/// Modrinth/CurseForge markdown often fail to render when loaded directly.
+/// SSRF guard: the URL must be http(s), and both the original and the final
+/// redirect host must resolve to a PUBLIC address (loopback / private /
+/// link-local targets are refused). Response is capped at 10 MB.
 #[tauri::command]
-pub fn cmd_get_icon_cache(state: State<'_, AppState>) -> Result<HashMap<String, String>, String> {
-    let cache = state.icon_cache.read().map_err(|e| e.to_string())?;
-    Ok(cache.clone())
+pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String> {
+    const MAX_ASSET_BYTES: usize = 10 * 1024 * 1024;
+
+    fn extract_host(url: &str) -> Option<String> {
+        let rest = url.split("://").nth(1)?;
+        let end = rest
+            .find(|c: char| c == '/' || c == '?' || c == '#' || c == '@')
+            .unwrap_or(rest.len());
+        let authority = &rest[..end];
+        // Strip userinfo if present, then port.
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host_port.split(':').next()?;
+        let host = host.trim_matches(['[', ']']);
+        if host.is_empty() { None } else { Some(host.to_string()) }
+    }
+
+    fn is_public_ip(ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                !(v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                    || v4.is_broadcast() || v4.is_multicast() || v4.is_unspecified())
+            }
+            std::net::IpAddr::V6(v6) => {
+                let seg = v6.segments();
+                let unique_local = (seg[0] & 0xfe00) == 0xfc00;
+                let link_local = (seg[0] & 0xffc0) == 0xfe80;
+                !(v6.is_loopback() || v6.is_multicast() || v6.is_unspecified()
+                    || unique_local || link_local)
+            }
+        }
+    }
+
+    async fn host_is_public(url: &str) -> Result<bool, String> {
+        let host = extract_host(url).ok_or_else(|| "Invalid URL".to_string())?;
+        // IP literals are checked directly; names are resolved first so a
+        // hostname pointing at 127.0.0.1 cannot bypass the guard.
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Ok(is_public_ip(ip));
+        }
+        tokio::task::spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            match (host.as_str(), 443u16).to_socket_addrs() {
+                Ok(addrs) => {
+                    let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+                    if ips.is_empty() {
+                        return Err("Host resolved to no addresses".to_string());
+                    }
+                    Ok(ips.iter().all(|ip| is_public_ip(*ip)))
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    let url = url.trim().to_string();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Only http(s) URLs are allowed".into());
+    }
+
+    let check_url = url.clone();
+    for hop in 0..4 {
+        match host_is_public(&check_url).await {
+            Ok(true) => break,
+            Ok(false) => return Err("Refusing to fetch from a private address".into()),
+            Err(_) if hop > 0 => break, // final hop unreachable: accept earlier verdicts
+            Err(e) => return Err(e),
+        }
+    }
+
+    let client = crate::download::global_http_client();
+    let resp = crate::download::send_with_fallback(client.get(&url))
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    // Re-check the FINAL url after redirects (redirect target could be private).
+    let final_url = resp.url().to_string();
+    if final_url != url {
+        match host_is_public(&final_url).await {
+            Ok(false) => return Err("Refusing to fetch from a private address".into()),
+            _ => {}
+        }
+    }
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_ASSET_BYTES {
+            return Ok(None);
+        }
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) if b.len() <= MAX_ASSET_BYTES => b,
+        _ => return Ok(None),
+    };
+
+    // Sniff the MIME type from magic bytes; fall back to the extension.
+    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml") {
+        "image/svg+xml"
+    } else {
+        match url.split('?').next().and_then(|p| p.rsplit('.').next()).unwrap_or("") {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "avif" => "image/avif",
+            _ => return Ok(None),
+        }
+    };
+    let b64 = crate::commands::mods::base64_encode_pub(&bytes);
+    Ok(Some(format!("data:{};base64,{}", mime, b64)))
 }
 
+/// Check for launcher updates by fetching `latest.json` from GitHub through
+/// the launcher's HTTP stack (proxy with direct fallback). The URL is
+/// hardcoded here so the renderer cannot abuse this as an SSRF proxy; doing
+/// it in the backend (instead of a webview `fetch`) means users behind
+/// proxies that block raw.githubusercontent.com still get update checks.
 #[tauri::command]
-pub fn cmd_set_icon_cache_entry(
-    state: State<'_, AppState>,
-    key: String,
-    value: String,
-) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut cache = state.icon_cache.write().map_err(|e| e.to_string())?;
-    cache.insert(key, value);
-    save_icon_cache_to_disk(&config, &cache);
-    Ok(())
+pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
+    const LATEST_JSON_URL: &str =
+        "https://raw.githubusercontent.com/veb898-cyber/VoidLauncher/main/latest.json";
+    let client = crate::download::global_http_client();
+    let resp = crate::download::send_with_fallback(
+        client.get(LATEST_JSON_URL).timeout(std::time::Duration::from_secs(15)),
+    )
+    .await
+    .map_err(|e| format!("Update check failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let v = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|j| j.get("version").and_then(|v| v.as_str()).map(String::from));
+    Ok(v)
 }
+
 
 // ==================== Launch State Commands ====================
 

@@ -5,6 +5,7 @@ import { Button } from '../ui/Button';
 import { addToast } from '../ui/Toast';
 import { PackBrowser } from './PackBrowser';
 import { t } from '../../lib/i18n';
+import { formatSize as fmtSize } from '../../lib/format';
 
 interface PackEntry {
   filename: string;
@@ -49,11 +50,7 @@ export function PacksManager({ instanceName, packType, onOpenFolder }: Props) {
     return () => window.removeEventListener('click', handler);
   }, []);
 
-  const formatSize = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
+  const formatSize = (bytes: number) => fmtSize(bytes);
 
   const isDisabled = (filename: string) => filename.endsWith('.disabled');
 

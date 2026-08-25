@@ -1,24 +1,18 @@
-import { useRef, useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useLogStore } from '../stores/logStore';
-import { t } from '../lib/i18n';
+import { useT } from '../lib/i18n';
 
 export function Logs() {
+  const t = useT();
   const { logs, clearLogs } = useLogStore();
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Launcher activity only — game output lives in its own "Game Logs" page.
   const launcherLogs = logs.filter((l) => l.source !== 'minecraft' && l.source !== 'launch');
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [launcherLogs.length]);
-
-  const getLevelClass = (level: string) => {
-    switch (level) {
-      case 'error': return 'log-line--error';
-      case 'warn': return 'log-line--warn';
-      case 'debug': return 'log-line--debug';
-      default: return '';
-    }
-  };
 
   return (
     <div className="page animate-fade-in" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -27,7 +21,7 @@ export function Logs() {
           <h1 className="page__title">{t('logs.title')}</h1>
           <p className="page__subtitle">{t('logs.subtitle')}</p>
         </div>
-        <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
+        <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'center' }}>
           <button className="btn btn--ghost btn--sm" onClick={() => {
             const text = launcherLogs.map(l => `[${l.timestamp}] [${l.source}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
             navigator.clipboard.writeText(text);
@@ -56,7 +50,11 @@ export function Logs() {
           </div>
         ) : (
           launcherLogs.map((log) => (
-            <div key={log.id} className={`log-line ${getLevelClass(log.level)}`} style={{
+            <div key={log.id} className={`log-line ${
+              log.level === 'error' ? 'log-line--error' :
+              log.level === 'warn' ? 'log-line--warn' :
+              log.level === 'debug' ? 'log-line--debug' : ''
+            }`} style={{
               display: 'flex',
               gap: 'var(--space-sm)',
               padding: '1px 0',

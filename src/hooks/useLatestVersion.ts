@@ -1,12 +1,10 @@
 import { useEffect, useState, useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 
 declare const __APP_VERSION__: string;
 
 export const APP_VERSION: string =
   typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '0.0.0';
-
-const LATEST_JSON_URL =
-  'https://raw.githubusercontent.com/veb898-cyber/VoidLauncher/main/latest.json';
 
 export interface LatestVersionState {
   /** Latest version published on the `main` branch (e.g. "0.1.7"). */
@@ -72,16 +70,16 @@ export function useLatestVersion(): LatestVersionState {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(LATEST_JSON_URL, { cache: 'no-store' });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+      // Fetched through the backend HTTP stack (proxy with direct fallback):
+      // a webview fetch would follow only the system proxy, so users whose
+      // proxy blocks raw.githubusercontent.com never saw update checks.
+      const v = await invoke<string | null>('cmd_check_latest_version');
+      if (v) {
+        setLatest(v);
+      } else {
+        setLatest(null);
+        setError('Invalid manifest');
       }
-      const data = await res.json();
-      const v = typeof data?.version === 'string' ? data.version : null;
-      if (!v) {
-        throw new Error('Invalid manifest');
-      }
-      setLatest(v);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);

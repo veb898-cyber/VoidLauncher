@@ -52,7 +52,6 @@ pub enum LoaderType {
     Fabric,
     Forge,
     NeoForge,
-    LiteLoader,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -468,7 +467,16 @@ pub fn list_packs(instances_dir: &PathBuf, name: &str, pack_type: &str) -> Resul
         }
 
         // Read sidecar metadata (project_name is the Modrinth/CurseForge display name)
-        let (provider, version, project_id, project_name) = read_pack_sidecar(&path).unwrap_or_default();
+        let (provider, mut version, project_id, project_name) = read_pack_sidecar(&path).unwrap_or_default();
+        // Local packs have no real version — fall back to a version found in
+        // the filename, then to the MC version range implied by pack.mcmeta
+        // (pack_format), so the Version column is never empty for them.
+        if version.is_empty() {
+            version = extract_version_from_filename(&filename);
+        }
+        if version.is_empty() {
+            version = pack_format_to_mc_version(&path);
+        }
         // Name resolution: sidecar project_name > pack.mcmeta pack.name/description > filename
         let name = if !project_name.is_empty() {
             Some(project_name)
@@ -528,10 +536,15 @@ pub(crate) fn legacy_sidecar_path(content_dir: &std::path::Path, filename: &str)
 }
 
 /// Read sidecar metadata: new `.index/` layout first, legacy layout as fallback.
+///
+/// Legacy sidecars historically used two name variants: the content stem
+/// (`Faithful 32x.voidlauncher.json`) and the full filename including the
+/// extension (`Faithful 32x.zip.voidlauncher.json`). Both are probed.
 pub(crate) fn read_sidecar_meta(content_dir: &std::path::Path, filename: &str) -> Option<serde_json::Value> {
     for p in [
         sidecar_meta_path(content_dir, filename),
         legacy_sidecar_path(content_dir, filename),
+        content_dir.join(format!("{}.voidlauncher.json", filename)),
     ] {
         if let Ok(contents) = std::fs::read_to_string(&p) {
             if let Ok(v) = serde_json::from_str(&contents) {
@@ -666,6 +679,245 @@ pub(crate) fn strip_minecraft_color_codes(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Extract a plausible version from a file name (e.g. "Pack 1.20.1.zip"
+/// → "1.20.1", "mod_v5.8.1.jar" → "5.8.1", "foo-1.20.1-4.7.jar" → "4.7",
+/// "Hearths v1.0.5.mod.jar" → "1.0.5",
+/// "twilightforest-1.20.1-4.3.2508-universal.jar" → "4.3.2508",
+/// "curios-forge-5.14.1+1.20.1.jar" → "5.14.1+1.20.1",
+/// "CataclysmCompat1.0.zip" → "1.0"). Returns "" when nothing usable.
+pub(crate) fn extract_version_from_filename(filename: &str) -> String {
+    let mut stem = filename
+        .trim_end_matches(".disabled")
+        .trim_end_matches(".zip")
+        .trim_end_matches(".jar");
+    // Strip trailing ".word" junk like ".mod" / ".jar2" that some CurseForge
+    // downloads carry ("Hearths v1.0.5.mod.jar"); numeric suffixes are part of
+    // the version and must stay.
+    loop {
+        match stem.rfind('.') {
+            Some(idx) => {
+                let suffix = &stem[idx + 1..];
+                if !suffix.is_empty()
+                    && suffix.len() <= 8
+                    && suffix.chars().all(|c| c.is_ascii_alphanumeric())
+                    && suffix.chars().any(|c| c.is_ascii_alphabetic())
+                {
+                    stem = &stem[..idx];
+                    continue;
+                }
+            }
+            None => {}
+        }
+        break;
+    }
+    // Strip trailing loader/build markers ("-forge", "-neoforge", "-universal",
+    // "-all", ...) so the version right before them is exposed.
+    loop {
+        let lower = stem.to_lowercase();
+        let mut cut = None;
+        for marker in [
+            "neoforge", "forge", "universal", "universal_jar", "fabric", "fml", "all", "mod", "srg", "dev", "official", "mapped",
+        ] {
+            let marker_len = marker.len();
+            if lower.ends_with(&format!("-{}", marker)) || lower.ends_with(&format!("_{}", marker)) {
+                cut = Some(stem.len() - 1 - marker_len);
+                break;
+            }
+        }
+        match cut {
+            Some(idx) => stem = &stem[..idx],
+            None => break,
+        }
+    }
+    let bytes = stem.as_bytes();
+    let n = bytes.len();
+    if n == 0 {
+        return String::new();
+    }
+
+    // 1) Plain numeric tail: "Pack 1.20.1", "mod_v5.8.1", "foo-1.2.3"
+    let mut end = n;
+    while end > 0 && (bytes[end - 1].is_ascii_whitespace() || bytes[end - 1] == b'[' || bytes[end - 1] == b']') {
+        end -= 1;
+    }
+    let mut start = end;
+    let mut dots = 0;
+    let mut seen_digit = false;
+    while start > 0 {
+        let c = bytes[start - 1];
+        if c.is_ascii_digit() {
+            seen_digit = true;
+            start -= 1;
+        } else if c == b'.' && seen_digit && dots < 3 {
+            dots += 1;
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    if seen_digit {
+        if start < n && bytes[start] == b'.' {
+            start += 1;
+        }
+        let mut ver_end = end;
+        while ver_end > start && bytes[ver_end - 1].is_ascii_alphabetic() {
+            ver_end -= 1;
+        }
+        if ver_end > start {
+            let version = String::from_utf8_lossy(&bytes[start..ver_end]).into_owned();
+            if start == 0 {
+                return version;
+            }
+            let prev = bytes[start - 1];
+            if prev == b'v' || prev == b'V' || prev == b'r' || prev == b'R' {
+                if start == 1
+                    || bytes[start - 2].is_ascii_whitespace()
+                    || bytes[start - 2] == b'-'
+                    || bytes[start - 2] == b'_'
+                {
+                    return version;
+                }
+            } else if prev.is_ascii_whitespace() || prev == b'-' || prev == b'_' {
+                return version;
+            }
+        }
+    }
+
+    // 2) Version token from the first separator that leads into a number
+    //    ("name-1.11.2+1.20.1", "name-1.0.0-beta.49+1.20.1", "mod 5.14.1+1.20.1").
+    //    The leftmost candidate wins (longest tail), but loader words like
+    //    "forge"/"neoforge" between name and version are skipped.
+    let mut best: Option<String> = None;
+    let mut chars = stem.char_indices().peekable();
+    while let Some((idx, c)) = chars.next() {
+        let is_sep = c == ' ' || c == '-' || c == '_' || c == '+';
+        if !is_sep {
+            continue;
+        }
+        let after = idx + c.len_utf8();
+        let tail = &stem[after..];
+        let tb = tail.as_bytes();
+        if tb.is_empty() {
+            continue;
+        }
+        let first = tb[0];
+        let version_start = first.is_ascii_digit() || matches!(first, b'v' | b'V' | b'r' | b'R');
+        if !version_start {
+            continue;
+        }
+        let lower = tail.to_lowercase();
+        if lower.starts_with("forge") || lower.starts_with("neoforge") || lower.starts_with("fabric") || lower.starts_with("universal") {
+            continue;
+        }
+        if tail.contains('[') || tail.contains(']') || tail.contains('(') || tail.contains(')') {
+            continue;
+        }
+        let has_digit = tail.chars().any(|c| c.is_ascii_digit());
+        if !has_digit || (!tail.contains('.') && !tail.contains('+') && tail.len() > 6) {
+            continue;
+        }
+        // Tail must not end on a long word ("...-noStone" → skip)
+        let tail_end = tail.len();
+        let mut letters = 0;
+        let mut k = tail_end;
+        while k > 0 && tb[k - 1].is_ascii_alphabetic() {
+            letters += 1;
+            k -= 1;
+        }
+        if letters > 4 {
+            continue;
+        }
+        if best.is_none() {
+            best = Some(tail.to_string());
+        }
+    }
+    if let Some(v) = best {
+        return v;
+    }
+
+    // 3) Glued digits at the very end: "CataclysmCompat1.0" → "1.0"
+    let mut s = n;
+    let mut d = 0;
+    let mut gseen = false;
+    while s > 0 {
+        let c = bytes[s - 1];
+        if c.is_ascii_digit() {
+            gseen = true;
+            s -= 1;
+        } else if c == b'.' && gseen && d < 3 {
+            d += 1;
+            s -= 1;
+        } else {
+            break;
+        }
+    }
+    if gseen && s == 0 {
+        let v = String::from_utf8_lossy(&bytes[s..n]).into_owned();
+        if !v.is_empty() && v.len() <= 12 {
+            return v;
+        }
+    }
+    if gseen && s > 0 && (bytes[s - 1].is_ascii_alphabetic() || bytes[s - 1] == b'_' || bytes[s - 1] == b'-') {
+        let v = String::from_utf8_lossy(&bytes[s..n]).into_owned();
+        if !v.is_empty() && v.len() <= 12 {
+            return v;
+        }
+    }
+
+    String::new()
+}
+
+/// Map a pack.mcmeta `pack_format` to the Minecraft version range it targets,
+/// so local resource packs without any metadata can still show a version.
+pub(crate) fn pack_format_to_mc_version(pack_path: &std::path::Path) -> String {
+    pack_format_to_mc_version_inner(read_pack_format(pack_path))
+}
+
+fn pack_format_to_mc_version_inner(pack_format: Option<u64>) -> String {
+    let range = match pack_format {
+        Some(1..=3) => "MC 1.6-1.12",
+        Some(4) => "MC 1.13",
+        Some(5) => "MC 1.14",
+        Some(6) => "MC 1.15",
+        Some(7) => "MC 1.16",
+        Some(8) => "MC 1.17-1.18",
+        Some(9) => "MC 1.18",
+        Some(10) => "MC 1.19-1.19.2",
+        Some(12) => "MC 1.19.3",
+        Some(13) => "MC 1.19.4-1.20",
+        Some(15) => "MC 1.20.1",
+        Some(16) => "MC 1.20.2",
+        Some(17) => "MC 1.20.3-1.20.4",
+        Some(18) => "MC 1.21-1.21.1",
+        Some(19) => "MC 1.21.2-1.21.3",
+        Some(22) => "MC 1.21.4",
+        Some(32) => "MC 1.21.5",
+        Some(34) => "MC 1.21.6",
+        Some(42) => "MC 1.21.8",
+        _ => return String::new(),
+    };
+    range.to_string()
+}
+
+/// Read the `pack.pack_format` integer from a resource pack (zip or folder).
+pub(crate) fn read_pack_format(pack_path: &std::path::Path) -> Option<u64> {
+    let read_json = |contents: &str| -> Option<u64> {
+        let v: serde_json::Value = serde_json::from_str(contents).ok()?;
+        v["pack"]["pack_format"].as_u64()
+    };
+    if pack_path.is_dir() {
+        let f = pack_path.join("pack.mcmeta");
+        std::fs::read_to_string(f).ok().and_then(|c| read_json(&c))
+    } else {
+        let file = std::fs::File::open(pack_path).ok()?;
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let mut f = archive.by_name("pack.mcmeta").ok()?;
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut f, &mut contents).ok()?;
+        read_json(&contents)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PackEntry {
     pub filename: String,
@@ -685,20 +937,15 @@ fn read_pack_icon_from_dir(path: &std::path::Path) -> Option<String> {
     let icon_path = path.join("pack.png");
     if icon_path.exists() { return read_image_as_base64(&icon_path); }
 
-    // Recursively scan for any image file (shader packs often have screenshots/ in subdirs)
-    let exts = [".png", ".jpg", ".jpeg"];
+    // Recurse ONLY for files literally named pack.png in subfolders.
+    // Never fall back to arbitrary images: shader-pack folders are full of
+    // internal GLSL textures (noise/dither/LUT maps) that would surface as
+    // garbled "static" icons.
     for entry in std::fs::read_dir(path).ok()?.flatten() {
         let path = entry.path();
         if path.is_dir() {
             if let Some(img) = read_pack_icon_from_dir(&path) {
                 return Some(img);
-            }
-        } else {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            if exts.iter().any(|e| name.ends_with(e)) {
-                if let Some(img) = read_image_as_base64(&path) {
-                    return Some(img);
-                }
             }
         }
     }
@@ -721,7 +968,6 @@ fn read_pack_icon_from_zip(path: &std::path::Path) -> Option<String> {
         })
         .collect();
 
-    let exts_img = [".png", ".jpg", ".jpeg"];
     let root_preferred = ["pack.png", "pack.jpg", "pack.jpeg", "preview.png", "thumb.png", "icon.png", "logo.png"];
 
     // Pass 1: root-level preferred names
@@ -735,24 +981,15 @@ fn read_pack_icon_from_zip(path: &std::path::Path) -> Option<String> {
         }
     }
 
-    // Pass 2: pack.png in any subdir, then fallback to first image
-    let mut fallback_name: Option<String> = None;
+    // Pass 2: a literal pack.png inside a subfolder (e.g. "<sub>/pack.png").
+    // NO arbitrary-image fallback: shader archives are packed with internal
+    // GLSL textures (noise, dithering, LUTs) that render as garbled icons.
     for (name, is_dir) in &entries {
         if *is_dir { continue; }
-        let lower = name.to_lowercase();
-
-        if lower.ends_with("pack.png") {
+        if name.to_lowercase().ends_with("/pack.png") {
             if let Some(img) = try_read_zip_image(&mut archive, name) {
                 return Some(img);
             }
-        } else if fallback_name.is_none() && exts_img.iter().any(|e| lower.ends_with(e)) {
-            fallback_name = Some(name.clone());
-        }
-    }
-
-    if let Some(ref name) = fallback_name {
-        if let Some(img) = try_read_zip_image(&mut archive, name) {
-            return Some(img);
         }
     }
 
@@ -1738,5 +1975,32 @@ version = 'hIibTfxn'
         assert_eq!(packs[0].filename, "BSL_v10.zip");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_version_from_filename_handles_common_shapes() {
+        assert_eq!(extract_version_from_filename("SE Vanilla Consistency 1.20.1.zip"), "1.20.1");
+        assert_eq!(extract_version_from_filename("Aether Regenerated v1.3.1.zip"), "1.3.1");
+        assert_eq!(extract_version_from_filename("recipeessentials-1.20.1-4.7.jar"), "4.7");
+        assert_eq!(extract_version_from_filename("Ping-Wheel-1.12.1-forge-1.20.1.jar"), "1.20.1");
+        assert_eq!(extract_version_from_filename("mod_v5.8.1.jar"), "5.8.1");
+        assert_eq!(extract_version_from_filename("Hearths v1.0.5.mod.jar"), "1.0.5");
+        assert_eq!(extract_version_from_filename("twilightforest-1.20.1-4.3.2508-universal.jar"), "4.3.2508");
+        assert_eq!(extract_version_from_filename("aether-1.20.1-1.5.2-neoforge.jar"), "1.5.2");
+        assert_eq!(extract_version_from_filename("Patchouli-1.20.1-85-FORGE.jar"), "85");
+        assert_eq!(extract_version_from_filename("TerraBlender-forge-1.20.1-3.0.1.10.jar"), "3.0.1.10");
+        assert_eq!(extract_version_from_filename("kotlinforforge-4.12.0-all.jar"), "4.12.0");
+        assert_eq!(extract_version_from_filename("ConnectorExtras-1.11.2+1.20.1.jar"), "1.11.2+1.20.1");
+        assert_eq!(extract_version_from_filename("Connector-1.0.0-beta.49+1.20.1.jar"), "1.0.0-beta.49+1.20.1");
+        assert_eq!(extract_version_from_filename("curios-forge-5.14.1+1.20.1.jar"), "5.14.1+1.20.1");
+        assert_eq!(extract_version_from_filename("CataclysmCompat1.0.zip"), "1.0");
+        assert_eq!(extract_version_from_filename("BoP x FD Bark Cutting Compat.zip"), "");
+        assert_eq!(extract_version_from_filename("Better_Modded_GUI.zip"), "");
+        assert_eq!(extract_version_from_filename("NoBushyLeaves.zip"), "");
+        assert_eq!(extract_version_from_filename("fresh_waystones.zip"), "");
+        assert_eq!(extract_version_from_filename("BetterBetterX-v1.1-noStone.zip"), "");
+        assert_eq!(extract_version_from_filename("Geophilic v3.6.mod.jar"), "3.6");
+        assert_eq!(extract_version_from_filename("LessStructures-SpacingTweaks-1.20.1-2.1.56.zip"), "2.1.56");
+        assert_eq!(extract_version_from_filename("Modded Omelet [120] [162].zip"), "");
     }
 }

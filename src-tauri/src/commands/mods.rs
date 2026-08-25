@@ -2,6 +2,7 @@
 //! mod installation/download, local mod metadata parsing, mod icons.
 
 use crate::commands::instances::validate_instance_name;
+use crate::config::AppConfig;
 use crate::curseforge;
 use crate::download;
 use crate::instances;
@@ -9,6 +10,8 @@ use crate::modrinth;
 use crate::AppState;
 use crate::is_allowed_download_host;
 use std::io::Read as _;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use tauri::State;
 
 // ==================== Modrinth API ====================
@@ -248,17 +251,13 @@ pub async fn cmd_check_mod_updates(
 
 /// Read pack name and version from sidecar metadata, falling back to pack.mcmeta
 fn read_pack_name_and_version(path: &std::path::Path) -> Option<(String, String)> {
-    // Try sidecar first
+    // Try sidecar first (`.index/`, legacy stem or legacy full-filename layouts)
     let filename = path.file_name()?.to_string_lossy().to_string();
-    let meta_name = format!("{}.voidlauncher.json", filename);
-    let meta_path = path.parent()?.join(&meta_name);
-    if let Ok(contents) = std::fs::read_to_string(&meta_path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) {
-            let name = val["project_name"].as_str().unwrap_or("").to_string();
-            let version = val["version_number"].as_str().unwrap_or("").to_string();
-            if !name.is_empty() {
-                return Some((name, version));
-            }
+    if let Some(val) = crate::instances::read_sidecar_meta(path.parent()?, &filename) {
+        let name = val["project_name"].as_str().unwrap_or("").to_string();
+        let version = val["version_number"].as_str().unwrap_or("").to_string();
+        if !name.is_empty() {
+            return Some((name, version));
         }
     }
 
@@ -389,7 +388,7 @@ pub async fn cmd_popular_curseforge(
 
 // ==================== Mod Installation ====================
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ModMetadata {
     pub filename: String,
     pub name: String,
@@ -409,6 +408,29 @@ pub struct ModMetadata {
     /// warnings in the compatibility check.
     #[serde(default)]
     pub slug_verified: bool,
+}
+
+/// All sidecar fields `get_mod_metadata` needs, read from the sidecar file
+/// in ONE pass (the old code re-read + re-parsed the same JSON up to 4 times
+/// per mod).
+#[derive(Default)]
+struct SidecarFields {
+    project_id: Option<String>,
+    provider: Option<String>,
+    project_name: Option<String>,
+    version_number: Option<String>,
+}
+
+fn read_sidecar_fields(mods_dir: &std::path::Path, filename: &str) -> SidecarFields {
+    match crate::instances::read_sidecar_meta(mods_dir, filename) {
+        Some(json) => SidecarFields {
+            project_id: json["project_id"].as_str().map(str::to_string),
+            provider: json["provider"].as_str().map(str::to_string),
+            project_name: json["project_name"].as_str().map(str::to_string),
+            version_number: json["version_number"].as_str().map(str::to_string),
+        },
+        None => SidecarFields::default(),
+    }
 }
 
 #[tauri::command]
@@ -690,72 +712,262 @@ pub fn cmd_get_mod_metadata(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<Vec<ModMetadata>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
+    // Clone-and-release: the scan below can take a while on big mod folders;
+    // holding the config lock through it would stall every other command
+    // that needs it (instance lists, launch checks, ...).
+    let config = state.config.lock().map_err(|e| e.to_string())?.clone();
+    get_mod_metadata(&config, &instance_name).map_err(|e| e.to_string())
+}
+
+/// Session-level metadata cache: path -> (mtime, size, parsed metadata).
+/// Opening the mods tab re-scans the folder on every visit; with this cache a
+/// repeat visit skips re-opening every jar (the cold scan of ~250 jars took
+/// seconds). Entries invalidate automatically when file size/mtime changes.
+type ModMetaCache = std::collections::HashMap<PathBuf, (std::time::SystemTime, u64, ModMetadata)>;
+static META_CACHE: OnceLock<Mutex<ModMetaCache>> = OnceLock::new();
+
+fn meta_cache() -> &'static Mutex<ModMetaCache> {
+    META_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[derive(Clone)]
+struct ModFileEntry {
+    path: PathBuf,
+    filename: String,
+    enabled: bool,
+    mtime: std::time::SystemTime,
+    size: u64,
+}
+
+/// Pure implementation of `cmd_get_mod_metadata` (unit-testable without Tauri).
+pub(crate) fn get_mod_metadata(
+    config: &AppConfig,
+    instance_name: &str,
+) -> crate::error::Result<Vec<ModMetadata>> {
+    let instance = instances::get_instance(&config.instances_dir(), instance_name)?;
     let mods_dir = instance.minecraft_dir(&config.instances_dir()).join("mods");
     if !mods_dir.exists() {
         return Ok(Vec::new());
     }
-    let mut mods = Vec::new();
-    let pw_index = crate::instances::load_packwiz_index(&mods_dir);
+    let pw_index = std::sync::Arc::new(instances::load_packwiz_index(&mods_dir));
+
+    // Collect candidate files (cheap stat calls) before spawning workers.
+    let mut files: Vec<ModFileEntry> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&mods_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
+            let Some(filename) = path.file_name().and_then(|n| n.to_str()).map(str::to_string)
+            else {
+                continue;
+            };
             let is_jar = filename.ends_with(".jar");
             let is_disabled = filename.ends_with(".jar.disabled");
-            if is_jar || is_disabled {
-                let enabled = is_jar && !is_disabled;
-                let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let meta = read_mod_meta_from_jar(&path);
-                let pw = pw_index.get(&filename);
-                // Check sidecar for verified Modrinth/CurseForge project slug.
-                let sidecar_project_id = read_mod_sidecar_slug(&mods_dir, &filename);
-                let project_id = sidecar_project_id
-                    .clone()
-                    .or_else(|| pw.filter(|p| !p.project_id.is_empty()).map(|p| p.project_id.clone()));
-                let (slug, slug_verified) = project_id.as_ref()
-                    .map(|s| (Some(s.clone()), sidecar_project_id.is_some()))
-                    .unwrap_or_else(|| (meta.slug, false));
-                // Provider priority: sidecar (modrinth/curseforge/local) > packwiz > JAR metadata
-                let sidecar_provider = read_mod_sidecar_provider(&mods_dir, &filename);
-                let provider = match sidecar_provider.as_deref() {
-                    Some(s) => normalize_provider(s),
-                    None => pw
-                        .filter(|p| !p.provider.is_empty())
-                        .map(|p| p.provider.clone())
-                        .unwrap_or_else(|| meta.provider.clone()),
-                };
-                let name = pw
-                    .filter(|p| !p.name.is_empty())
-                    .map(|p| p.name.clone())
-                    .unwrap_or_else(|| meta.name.clone());
-                let version = pw
-                    .filter(|p| !p.version.is_empty())
-                    .map(|p| p.version.clone())
-                    .unwrap_or_else(|| meta.version.clone());
-                mods.push(ModMetadata {
-                    filename,
-                    name,
-                    version,
-                    provider,
-                    enabled,
-                    file_size,
-                    icon: meta.icon,
-                    slug,
-                    project_id,
-                    slug_verified,
-                });
+            // Only real .jar mods are listed — datapacks/resource packs that
+            // a modpack ships inside `mods/` as .zip stay invisible, exactly
+            // like Prism Launcher behaves. They are not mods, just bundled data.
+            if !(is_jar || is_disabled) {
+                continue;
             }
+            let (mtime, size) = match std::fs::metadata(&path) {
+                Ok(m) => (
+                    m.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    m.len(),
+                ),
+                Err(_) => (std::time::UNIX_EPOCH, 0),
+            };
+            files.push(ModFileEntry {
+                path,
+                filename,
+                enabled: is_jar && !is_disabled,
+                mtime,
+                size,
+            });
+        }
+    }
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Serve cache hits first; only cache misses need the expensive jar parse.
+    enum Job<'a> {
+        Cached(ModMetadata),
+        Fresh(&'a ModFileEntry),
+    }
+    let mut jobs: Vec<Job> = Vec::with_capacity(files.len());
+    let mut missed_idx: Vec<usize> = Vec::new();
+    {
+        let cache = meta_cache().lock().unwrap_or_else(|p| p.into_inner());
+        for (i, f) in files.iter().enumerate() {
+            match cache.get(&f.path) {
+                Some((m, s, meta)) if *m == f.mtime && *s == f.size => {
+                    jobs.push(Job::Cached(meta.clone()));
+                }
+                _ => {
+                    jobs.push(Job::Fresh(f));
+                    missed_idx.push(i);
+                }
+            }
+        }
+    }
+
+    // Parse misses in parallel across a few worker threads. Each jar used to
+    // be opened sequentially; a cold scan of a big pack was disk-bound and
+    // took several seconds.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
+    let fresh: Vec<&ModFileEntry> = missed_idx.iter().map(|&i| &files[i]).collect();
+    let computed: Vec<Vec<(usize, ModMetadata)>> = if fresh.len() >= 4 && threads > 1 {
+        let chunk_size = fresh.len().div_ceil(threads);
+        let start_indices: Vec<usize> = (0..threads)
+            .map(|t| t * chunk_size)
+            .take_while(|&s| s < fresh.len())
+            .collect();
+        let mods_dir_ref = &mods_dir;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = start_indices
+                .iter()
+                .map(|&start| {
+                    let slice = &fresh[start..(start + chunk_size).min(fresh.len())];
+                    let pw_index = &pw_index;
+                    scope.spawn(move || {
+                        slice
+                            .iter()
+                            .enumerate()
+                            .map(|(k, f)| (start + k, build_mod_metadata(mods_dir_ref, pw_index, f)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .collect()
+        })
+    } else {
+        vec![fresh
+            .iter()
+            .enumerate()
+            .map(|(k, f)| (k, build_mod_metadata(&mods_dir, &pw_index, f)))
+            .collect()]
+    };
+
+    // Store freshly computed entries in the cache, then merge results back
+    // into job order (jobs[i] for i in missed_idx are replaced).
+    {
+        let mut cache = meta_cache().lock().unwrap_or_else(|p| p.into_inner());
+        for per_thread in &computed {
+            for (k, meta) in per_thread {
+                let f = fresh[*k];
+                cache.insert(f.path.clone(), (f.mtime, f.size, meta.clone()));
+                jobs[missed_idx[*k]] = Job::Cached(meta.clone());
+            }
+        }
+    }
+    let mut mods: Vec<ModMetadata> = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        match job {
+            Job::Cached(meta) => mods.push(meta),
+            Job::Fresh(_) => unreachable!("all fresh jobs were computed"),
         }
     }
     mods.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(mods)
+}
+
+/// Build metadata for a single mod file: jar parse + ONE sidecar read +
+/// packwiz fallback. Priority rules preserved from the original sequential
+/// implementation.
+fn build_mod_metadata(
+    mods_dir: &std::path::Path,
+    pw_index: &std::collections::HashMap<String, instances::PackwizMeta>,
+    f: &ModFileEntry,
+) -> ModMetadata {
+    let ModFileEntry {
+        path,
+        filename,
+        enabled,
+        size,
+        ..
+    } = f;
+    let meta = read_mod_meta_from_jar(path);
+    let pw = pw_index.get(filename);
+    // Single sidecar read for all fields.
+    let sidecar = read_sidecar_fields(mods_dir, filename);
+    let project_id = sidecar
+        .project_id
+        .clone()
+        .or_else(|| pw.filter(|p| !p.project_id.is_empty()).map(|p| p.project_id.clone()));
+    let (slug, slug_verified) = project_id.as_ref()
+        .map(|s| (Some(s.clone()), sidecar.project_id.is_some()))
+        .unwrap_or_else(|| (meta.slug, false));
+    // Provider priority: sidecar (modrinth/curseforge/local) > packwiz > JAR metadata
+    let provider = match sidecar.provider.as_deref() {
+        Some(s) => normalize_provider(s),
+        None => pw
+            .filter(|p| !p.provider.is_empty())
+            .map(|p| p.provider.clone())
+            .unwrap_or_else(|| meta.provider.clone()),
+    };
+    // Name priority: JAR metadata (when it has a real name) >
+    // sidecar project name > packwiz > filename. JAR parsing
+    // sometimes yields "Unknown" or garbage, the sidecar carries
+    // the proper CurseForge display name.
+    let jar_name = meta.name.trim().to_string();
+    let jar_name = if jar_name.is_empty() || jar_name.eq_ignore_ascii_case("unknown") {
+        String::new()
+    } else {
+        jar_name
+    };
+    let name = if !jar_name.is_empty() {
+        jar_name
+    } else {
+        sidecar
+            .project_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| pw.filter(|p| !p.name.is_empty()).map(|p| p.name.clone()))
+            .unwrap_or_else(|| filename.trim_end_matches(".jar").to_string())
+    };
+    // Version priority: sidecar (verified from Modrinth API) >
+    // packwiz > sanitized JAR version. "${version}" and "Unknown"
+    // are build-placeholders, not real versions.
+    let mut version = sidecar
+        .version_number
+        .filter(|v| !v.is_empty())
+        .or_else(|| pw.filter(|p| !p.version.is_empty()).map(|p| p.version.clone()))
+        .unwrap_or_else(|| sanitize_version(&meta.version));
+    // No real version anywhere — extract one from the file name
+    // (works for JARs with version-less metadata like "${file.jarVersion}").
+    if version.is_empty() {
+        version = crate::instances::extract_version_from_filename(filename);
+    }
+    // Packs installed before the sidecar carried a version have
+    // nothing left to show — fall back to the CurseForge display
+    // name ("[Forge 1.20.1] v2.8.0") instead of an empty cell, but
+    // only when it actually looks like a version (never for garbage
+    // like "mod-1.20.1-4.7.jar").
+    if version.is_empty() {
+        if let Some(pn) = sidecar.project_name {
+            if looks_like_version(&pn) {
+                version = pn;
+            }
+        }
+    }
+    ModMetadata {
+        filename: filename.clone(),
+        name,
+        version,
+        provider,
+        enabled: *enabled,
+        file_size: *size,
+        icon: meta.icon,
+        slug,
+        project_id,
+        slug_verified,
+    }
 }
 
 /// Normalize a raw provider string from sidecar/packwiz metadata.
@@ -782,12 +994,60 @@ fn read_mod_sidecar_provider(mods_dir: &std::path::Path, filename: &str) -> Opti
     json["provider"].as_str().map(|s| s.to_string())
 }
 
-struct ModMetaResult {
-    name: String,
-    version: String,
-    provider: String,
-    icon: Option<String>,
-    slug: Option<String>,
+/// Read an arbitrary field from the sidecar metadata.
+fn read_mod_sidecar_field(
+    mods_dir: &std::path::Path,
+    filename: &str,
+    field: &str,
+) -> Option<String> {
+    let json = crate::instances::read_sidecar_meta(mods_dir, filename)?;
+    json[field].as_str().map(|s| s.to_string())
+}
+
+/// Strip build-placeholder versions ("${version}", "${file.jarVersion}",
+/// "Unknown", ...) so the UI never shows them as real versions.
+fn sanitize_version(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("${")
+        || trimmed.eq_ignore_ascii_case("unknown")
+    {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// A project display name can be a usable version ("[Forge 1.20.1] v2.8.0",
+/// "v1.0.5") or plain garbage ("recipeessentials-1.20.1-4.7.jar", the raw
+/// filename). Only trust it when it starts like a version and carries no
+/// file extension or full-file-name smell.
+fn looks_like_version(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 60 {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.contains(".jar") || lower.contains(".zip") || lower.contains(".pw.toml") {
+        return false;
+    }
+    let first = trimmed.chars().next().unwrap_or('\0');
+    first == '['
+        || first.is_ascii_digit()
+        || matches!(lower.as_bytes().first(), Some(&b'v') | Some(&b'r'))
+}
+
+#[cfg(test)]
+pub(crate) fn sanitize_version_pub(raw: &str) -> String {
+    sanitize_version(raw)
+}
+
+pub(crate) struct ModMetaResult {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) provider: String,
+    pub(crate) icon: Option<String>,
+    pub(crate) slug: Option<String>,
 }
 
 fn fallback_meta_from_filename(path: &std::path::Path) -> ModMetaResult {
@@ -817,6 +1077,11 @@ fn fallback_meta_from_filename(path: &std::path::Path) -> ModMetaResult {
         icon: None,
         slug: None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn read_mod_meta_from_jar_pub(path: &std::path::Path) -> ModMetaResult {
+    read_mod_meta_from_jar(path)
 }
 
 fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
@@ -1012,16 +1277,26 @@ pub async fn cmd_get_mod_icon(
     instance_name: String,
     filename: String,
 ) -> Result<Option<String>, String> {
-    let safe_filename = std::path::Path::new(&filename)
+    let config = state.config.lock().map_err(|e| e.to_string())?.clone();
+    cmd_get_mod_icon_impl(&config, &instance_name, &filename)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn cmd_get_mod_icon_impl(
+    config: &crate::config::AppConfig,
+    instance_name: &str,
+    filename: &str,
+) -> crate::error::Result<Option<String>> {
+    let safe_filename = std::path::Path::new(filename)
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or("Invalid filename")?
+        .ok_or_else(|| crate::error::LauncherError::Download("Invalid filename".into()))?
         .to_string();
 
     let (jar_path, curseforge_api_key) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
+        let instance = instances::get_instance(&config.instances_dir(), instance_name)
+            .map_err(|e| crate::error::LauncherError::Download(e.to_string()))?;
         let mods_dir = instance.minecraft_dir(&config.instances_dir()).join("mods");
         let jar_path = mods_dir.join(&safe_filename);
         let cf_key = config.curseforge_api_key.clone();
@@ -1090,6 +1365,23 @@ pub async fn cmd_get_mod_icon(
 }
 
 /// Fetch a mod's logo icon from CurseForge API and return as base64 data URL
+#[cfg(test)]
+pub(crate) async fn fetch_curseforge_mod_icon_pub(
+    project_id: u64,
+    api_key: &str,
+) -> crate::error::Result<Option<String>> {
+    fetch_curseforge_mod_icon(project_id, api_key).await
+}
+
+#[cfg(test)]
+pub(crate) async fn cmd_get_mod_icon_pub(
+    config: &crate::config::AppConfig,
+    instance_name: &str,
+    filename: &str,
+) -> crate::error::Result<Option<String>> {
+    cmd_get_mod_icon_impl(config, instance_name, filename).await
+}
+
 async fn fetch_curseforge_mod_icon(
     project_id: u64,
     api_key: &str,
@@ -1098,15 +1390,17 @@ async fn fetch_curseforge_mod_icon(
         .await
         .map_err(|e| crate::error::LauncherError::Download(format!("CF API error: {}", e)))?;
 
-    let thumbnail_url = match detail.logo {
-        Some(logo) if !logo.thumbnail_url.is_empty() => logo.thumbnail_url,
-        _ => return Ok(None),
+    let thumbnail_url = match detail.logo.as_ref().and_then(|logo| logo.best_url()) {
+        Some(url) => url.to_string(),
+        None => return Ok(None),
     };
 
     let client = crate::download::global_http_client();
-    let resp = client.get(&thumbnail_url).send().await.map_err(|e| {
-        crate::error::LauncherError::Download(format!("Failed to fetch CF logo: {}", e))
-    })?;
+    let resp = crate::download::send_with_fallback(client.get(&thumbnail_url).timeout(std::time::Duration::from_secs(20)))
+        .await
+        .map_err(|e| {
+            crate::error::LauncherError::Download(format!("Failed to fetch CF logo: {}", e))
+        })?;
 
     if !resp.status().is_success() {
         return Ok(None);
@@ -1129,12 +1423,26 @@ async fn fetch_curseforge_mod_icon(
 /// Download an image from a URL and return as base64 data URL.
 async fn fetch_remote_icon(url: &str) -> Option<String> {
     let client = crate::download::global_http_client();
-    let resp = client.get(url).send().await.ok()?;
+    let resp = crate::download::send_with_fallback(client.get(url)).await.ok()?;
     if !resp.status().is_success() { return None; }
     let bytes = resp.bytes().await.ok()?;
     let b64 = base64_encode(&bytes);
     let mime = if url.ends_with(".jpg") || url.ends_with(".jpeg") { "image/jpeg" } else { "image/png" };
     Some(format!("data:{};base64,{}", mime, b64))
+}
+
+/// Fetch a remote icon through the launcher's HTTP stack (proxy with direct
+/// fallback) and return it as a base64 data URL. The renderer must NOT load
+/// CDN images directly via <img src="https://...">: the webview honors only
+/// the system proxy without our fallback logic, so a flaky proxy leaves
+/// icons permanently blank. Restricted to trusted download hosts so the
+/// renderer cannot abuse this as an SSRF proxy.
+#[tauri::command]
+pub async fn cmd_fetch_icon_url(url: String) -> Result<Option<String>, String> {
+    if !crate::is_allowed_download_host(&url) {
+        return Err("Host not allowed".into());
+    }
+    Ok(fetch_remote_icon(&url).await)
 }
 
 fn extract_icon_from_jar(
@@ -1204,7 +1512,7 @@ fn extract_icon_from_jar(
     }
 
     // Fallback: look for icon.png in root or assets
-    for candidate in &["icon.png", "logo.png", "assets/icon.png"] {
+    for candidate in &["icon.png", "logo.png", "pack.png", "assets/icon.png"] {
         if let Ok(mut f) = archive.by_name(candidate) {
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
@@ -1218,7 +1526,7 @@ fn extract_icon_from_jar(
         if let Ok(entry) = archive.by_index(i) {
             let name = entry.name().to_string();
             let lower = name.to_lowercase();
-            if (lower.ends_with("icon.png") || lower.ends_with("logo.png"))
+            if (lower.ends_with("icon.png") || lower.ends_with("logo.png") || lower.ends_with("pack.png"))
                 && !lower.contains("META-INF")
             {
                 let mut buf = Vec::new();
@@ -1231,6 +1539,12 @@ fn extract_icon_from_jar(
     }
 
     Ok(None)
+}
+
+/// Public wrapper around the manual base64 encoder for other modules
+/// (e.g. misc.rs asset fetching). Standard alphabet with padding.
+pub(crate) fn base64_encode_pub(data: &[u8]) -> String {
+    base64_encode(data)
 }
 
 fn base64_encode(data: &[u8]) -> String {

@@ -78,14 +78,14 @@ pub async fn supported_versions() -> Result<Vec<String>> {
         }
     }
     let client = crate::download::global_http_client();
-    let versions: Vec<FabricGameVersion> = client
-        .get("https://meta.fabricmc.net/v2/versions/game")
-        .send()
-        .await
-        .map_err(|e| LauncherError::ModLoader(format!("Failed to fetch Fabric game versions: {}", e)))?
-        .json()
-        .await
-        .map_err(|e| LauncherError::ModLoader(format!("Failed to parse Fabric game versions: {}", e)))?;
+    let versions: Vec<FabricGameVersion> = crate::download::send_with_fallback(
+        client.get("https://meta.fabricmc.net/v2/versions/game"),
+    )
+    .await
+    .map_err(|e| LauncherError::ModLoader(format!("Failed to fetch Fabric game versions: {}", e)))?
+    .json()
+    .await
+    .map_err(|e| LauncherError::ModLoader(format!("Failed to parse Fabric game versions: {}", e)))?;
     let list: Vec<String> = versions.into_iter().map(|v| v.version).collect();
     let cache = SUPPORTED_VERSIONS_CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache.lock().map_err(|e| LauncherError::ModLoader(e.to_string()))?;
@@ -148,9 +148,10 @@ pub async fn get_loader_versions(offset: usize, limit: usize) -> Result<LoaderVe
 
     // Fetch from Fabric official API
     let client = crate::download::global_http_client();
-    let versions: Vec<FabricLoaderVersion> = client
-        .get("https://meta.fabricmc.net/v2/versions/loader")
-        .send()
+    let versions: Vec<FabricLoaderVersion> =
+        crate::download::send_with_fallback(
+            client.get("https://meta.fabricmc.net/v2/versions/loader"),
+        )
         .await
         .map_err(|e| {
             tracing::error!(target: "launcher", "Failed to fetch Fabric loader versions: {}", e);
@@ -188,12 +189,12 @@ pub async fn get_loader_versions(offset: usize, limit: usize) -> Result<LoaderVe
 #[allow(dead_code)]
 pub async fn get_game_versions() -> Result<Vec<String>> {
     let client = crate::download::global_http_client();
-    let versions: Vec<FabricGameVersion> = client
-        .get("https://meta.fabricmc.net/v2/versions/game")
-        .send()
-        .await?
-        .json()
-        .await?;
+    let versions: Vec<FabricGameVersion> = crate::download::send_with_fallback(
+        client.get("https://meta.fabricmc.net/v2/versions/game"),
+    )
+    .await?
+    .json()
+    .await?;
 
     Ok(versions.into_iter().map(|v| v.version).collect())
 }
@@ -212,9 +213,7 @@ pub async fn get_profile(mc_version: &str, loader_version: &str) -> Result<Loade
         mc_version, loader_version
     );
 
-    let profile: FabricProfile = client
-        .get(&url)
-        .send()
+    let profile: FabricProfile = crate::download::send_with_fallback(client.get(&url))
         .await
         .map_err(|e| {
             LauncherError::ModLoader(format!("Failed to fetch Fabric profile: {}", e))

@@ -1,10 +1,11 @@
-import { useState, useEffect, useCallback } from 'react';
+﻿import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, Loader2, X, Check, Download } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { addToast } from '../ui/Toast';
 import { t } from '../../lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
 
 interface Hit {
   project_id: string;
@@ -39,6 +40,12 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
   const [installing, setInstalling] = useState(false);
   const [installedVersion, setInstalledVersion] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const mdBodyRef = useRef<HTMLDivElement | null>(null);
+  // Re-route remote description images through the backend after render
+  // (the webview alone has no proxy fallback).
+  useEffect(() => {
+    if (!loadingDetail) hydrateRemoteImages(mdBodyRef.current);
+  }, [loadingDetail, modDetail]);
 
   const label = packType === 'resourcepacks' ? t('content.type_resourcepack') : t('content.type_shader');
   const projectType = packType === 'resourcepacks' ? 'resourcepack' : 'shader';
@@ -126,112 +133,15 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
 
   const displayHits = results.length > 0 ? results : popular;
 
-  const resolveUrl = (url: string): string => {
-    if (!url) return url;
-    const trimmed = url.trim();
-    if (trimmed.startsWith('//')) return `https:${trimmed}`;
-    return trimmed;
-  };
-
-  const renderMarkdown = (text: string): any[] => {
-    if (!text) return [];
-    let processed = text
-      .replace(/<img\s[^>]*>/gi, (m) => {
-        const src = m.match(/src=["']([^"']+)["']/i);
-        const altMatch = m.match(/alt=["']([^"']*)["']/i);
-        const alt = altMatch ? altMatch[1] : '';
-        return src ? `![${alt}](${resolveUrl(src[1])})` : m;
-      })
-      .replace(/<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, '[$2]($1)')
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<\/?p[^>]*>/gi, '\n')
-      .replace(/<\/?strong[^>]*>/gi, '**')
-      .replace(/<\/?b[^>]*>/gi, '**')
-      .replace(/<\/?em[^>]*>/gi, '*')
-      .replace(/<\/?i[^>]*>/gi, '*')
-      .replace(/<\/?h[1-6][^>]*>/gi, '\n')
-      .replace(/<\/?ul[^>]*>/gi, '')
-      .replace(/<\/?ol[^>]*>/gi, '')
-      .replace(/<li[^>]*>/gi, '- ')
-      .replace(/<\/li>/gi, '\n')
-      .replace(/<hr\s*\/?>/gi, '---')
-      .replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`')
-      .replace(/<pre[^>]*>(.*?)<\/pre>/gi, '\n```\n$1\n```\n')
-      .replace(/<[^>]+>/g, '');
-
-    const lines = processed.split('\n').map(l => l.replace(/\r$/, ''));
-    const elements: any[] = [];
-    let i = 0;
-    let keyCounter = 0;
-
-    while (i < lines.length) {
-      const line = lines[i];
-      if (line.trim() === '') { i++; continue; }
-
-      if (line.trim().startsWith('```')) {
-        const codeLines: string[] = [];
-        const lang = line.trim().slice(3).trim();
-        i++;
-        while (i < lines.length && !lines[i].trim().startsWith('```')) {
-          codeLines.push(lines[i]); i++;
-        }
-        if (i < lines.length) i++;
-        elements.push(
-          <div key={`code${keyCounter++}`} style={{ margin: '8px 0', borderRadius: 'var(--radius-md)', overflow: 'hidden', background: 'hsla(0,0%,0%,0.3)', border: '1px solid var(--surface-border)' }}>
-            {lang && <div style={{ padding: '4px 12px', fontSize: 10, color: 'var(--text-tertiary)', borderBottom: '1px solid var(--surface-border)', fontFamily: 'monospace' }}>{lang}</div>}
-            <pre style={{ margin: 0, padding: '12px', fontSize: 'var(--font-size-xs)', fontFamily: "'Cascadia Code','Fira Code',monospace", color: 'var(--text-secondary)', overflowX: 'auto', whiteSpace: 'pre', lineHeight: 1.5 }}>{codeLines.join('\n')}</pre>
-          </div>
-        );
-        continue;
-      }
-
-      if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line.trim())) {
-        elements.push(<hr key={`hr${keyCounter++}`} style={{ border: 'none', borderTop: '1px solid var(--surface-border)', margin: '12px 0' }} />);
-        i++; continue;
-      }
-
-      const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
-      if (headingMatch) {
-        const level = headingMatch[1].length;
-        const sz = level === 1 ? '1.2em' : level === 2 ? '1.1em' : '1em';
-        elements.push(<div key={`h${keyCounter++}`} style={{ fontWeight: 700, margin: '12px 0 4px', fontSize: sz, color: 'var(--text-primary)' }}>{headingMatch[2]}</div>);
-        i++; continue;
-      }
-
-      if (line.startsWith('>')) {
-        const quoteLines: string[] = [];
-        while (i < lines.length && lines[i].startsWith('>')) { quoteLines.push(lines[i].replace(/^>\s?/, '')); i++; }
-        elements.push(
-          <blockquote key={`bq${keyCounter++}`} style={{ margin: '8px 0', padding: '8px 16px', borderLeft: '3px solid var(--primary)', background: 'hsla(265,100%,65%,0.05)', borderRadius: '0 var(--radius-sm) var(--radius-sm) 0', fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
-            {quoteLines.map((ql, qi) => <div key={qi}>{ql}</div>)}
-          </blockquote>
-        );
-        continue;
-      }
-
-      const listMatch = line.match(/^[-*+]\s+(.+)/);
-      if (listMatch) {
-        const items: string[] = [listMatch[1]];
-        while (i + 1 < lines.length) {
-          const nextMatch = lines[i + 1].match(/^[-*+]\s+(.+)/);
-          if (nextMatch) { items.push(nextMatch[1]); i++; } else break;
-        }
-        elements.push(<ul key={`ul${keyCounter++}`} style={{ margin: '4px 0', paddingLeft: '20px', fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>{items.map((item, j) => <li key={j} style={{ marginBottom: 2 }}>{item}</li>)}</ul>);
-        i++; continue;
-      }
-
-      elements.push(<p key={`p${keyCounter++}`} style={{ margin: '4px 0', color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)', lineHeight: 1.6 }}>{line}</p>);
-      i++;
-    }
-    return elements;
-  };
-
   const formatDownloads = (n?: number) => {
     if (n == null) return '';
     if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
     if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
     return String(n);
   };
+
+  // Full CommonMark+GFM rendering via marked (shared module).
+  const renderMarkdown = (text: string): string => renderMarkdownToHtml(text);
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -335,16 +245,14 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
 
                 {/* Full description */}
                 {modDetail?.body && (
-                  <div style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)', fontSize: 'var(--font-size-sm)' }}
-                    onClick={(e) => { const a = (e.target as HTMLElement).closest('a'); if (a?.href?.startsWith('http')) { e.preventDefault(); openUrl(a.href); } }}>
-                    {renderMarkdown(modDetail.body)}
-                  </div>
+                  <div ref={mdBodyRef} className="md-content" style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(modDetail.body) }}
+                    onClick={(e) => { const a = (e.target as HTMLElement).closest('a'); if (a?.href?.startsWith('http')) { e.preventDefault(); openUrl(a.href); } }} />
                 )}
                 {modDetail?.description && !modDetail.body && (
-                  <div style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)', fontSize: 'var(--font-size-sm)' }}
-                    onClick={(e) => { const a = (e.target as HTMLElement).closest('a'); if (a?.href?.startsWith('http')) { e.preventDefault(); openUrl(a.href); } }}>
-                    {renderMarkdown(modDetail.description)}
-                  </div>
+                  <div ref={modDetail.description ? mdBodyRef : undefined} className="md-content" style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(modDetail.description) }}
+                    onClick={(e) => { const a = (e.target as HTMLElement).closest('a'); if (a?.href?.startsWith('http')) { e.preventDefault(); openUrl(a.href); } }} />
                 )}
 
                 {/* Version selector */}
@@ -367,7 +275,7 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
                             <div style={{ flex: 1, overflow: 'hidden' }}>
                               <div style={{ fontWeight: 500 }}>{v.name || v.version_number}</div>
                               <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
-                                {v.game_versions && v.game_versions.length > 0 && <span>{v.game_versions.join(', ')} · </span>}
+                                {v.game_versions && v.game_versions.length > 0 && <span>{v.game_versions.join(', ')} В· </span>}
                                 {v.date_published && new Date(v.date_published).toLocaleDateString()}
                               </div>
                             </div>

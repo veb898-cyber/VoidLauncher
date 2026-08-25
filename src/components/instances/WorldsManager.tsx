@@ -6,6 +6,7 @@ import { Modal } from '../ui/Modal';
 import { Input } from '../ui/Input';
 import { addToast } from '../ui/Toast';
 import { t } from '../../lib/i18n';
+import { formatSize as fmtSize } from '../../lib/format';
 
 interface SaveEntry {
   name: string;
@@ -48,12 +49,7 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
     return new Date(ts * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   };
 
-  const formatSize = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-  };
+  const formatSize = (bytes: number) => fmtSize(bytes);
 
   const gameModeLabel = (mode: string | null) => {
     if (!mode) return t('worlds.game_unknown');

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -30,6 +30,32 @@ function build_name_variants(name: string): string[] {
   if (words.length >= 2) variants.push(words.slice(0, 2).join(' '));
   if (words.length >= 1) variants.push(words[0]);
   return variants;
+}
+
+/// Extract a plausible version from a pack filename (e.g. "Pack 1.20.1.zip"
+/// → "1.20.1", "mod_v5.8.1.jar" → "5.8.1"). Returns "" when nothing found.
+function extractVersionFromFilename(filename: string): string {
+  const stem = filename.replace(/\.disabled$/i, '').replace(/\.(zip|jar)$/i, '');
+  const m = stem.match(/(?:[vVrR]|\s|-|_)(\d+(?:\.\d+){1,3}[a-z]*)\s*$/i);
+  return m ? m[1] : '';
+}
+
+/// Run `fn` over `items` with at most `limit` concurrent invocations.
+/// Unlike fixed-size batches, one slow item (e.g. a network fallback with
+/// retries) only occupies its own slot instead of stalling everyone else's.
+async function runPool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let idx = 0;
+  const workers: Promise<void>[] = [];
+  const n = Math.max(1, Math.min(limit, items.length));
+  for (let w = 0; w < n; w++) {
+    workers.push((async () => {
+      while (idx < items.length) {
+        const item = items[idx++];
+        try { await fn(item); } catch { }
+      }
+    })());
+  }
+  await Promise.all(workers);
 }
 
 interface ContentItem {
@@ -71,7 +97,123 @@ const SUBFOLDER: Record<ContentType, string> = {
   shader: 'shaderpacks',
 };
 
-export function ContentManager({ instanceName, contentType, mcVersion, loader, onOpenFolder }: Props) {
+interface ContentRowProps {
+  item: ContentItem;
+  idx: number;
+  isSelected: boolean;
+  failed: boolean;
+  iconSrc: string | null;
+  hasCompatWarn: boolean;
+  mcVersion?: string | null;
+  compatTarget: string;
+  onRowClick: (filename: string, e: React.MouseEvent) => void;
+  onContext: (e: React.MouseEvent, filename: string) => void;
+  onToggle: (item: ContentItem) => void;
+  onIconError: (filename: string) => void;
+}
+
+/// Memoized table row. With ~250 mods, re-rendering the whole table on every
+/// parent state change (selection, search, icon cache updates) caused visible
+/// UI jank; with memo only the actually-changed rows re-render.
+const ContentRow = memo(function ContentRow({
+  item, idx, isSelected, failed, iconSrc, hasCompatWarn,
+  mcVersion, compatTarget,
+  onRowClick, onContext, onToggle, onIconError,
+}: ContentRowProps) {
+  const t = useT();
+  return (
+    <div
+      onClick={(e) => onRowClick(item.filename, e)}
+      onContextMenu={(e) => { e.preventDefault(); onContext(e, item.filename); }}
+      style={{
+        display: 'grid', gridTemplateColumns: '28px 36px 1fr 1fr 80px 28px',
+        padding: '4px var(--space-2xl)', alignItems: 'center', cursor: 'pointer',
+        borderBottom: '1px solid var(--surface-border)',
+        background: isSelected ? 'var(--primary-dim)' : idx % 2 === 0 ? 'transparent' : 'hsla(0, 0%, 100%, 0.02)',
+        opacity: item.enabled ? 1 : 0.45,
+        transition: 'background 0.12s',
+        minHeight: 36,
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'center' }}>
+        <div onClick={(e) => { e.stopPropagation(); onToggle(item); }}
+          style={{ width: 16, height: 16, borderRadius: 3, cursor: 'pointer', border: '1.5px solid ' + (!item.enabled ? 'var(--text-tertiary)' : 'var(--primary)'), background: !item.enabled ? 'transparent' : 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s' }}>
+          {item.enabled && <Check size={10} color="white" strokeWidth={3} />}
+        </div>
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'center' }}>
+        {iconSrc && !failed ? (
+          <img src={iconSrc} alt="" style={{ width: 28, height: 28, borderRadius: 4, objectFit: 'cover' }}
+            onError={() => onIconError(item.filename)} />
+        ) : (
+          <div style={{ width: 28, height: 28, borderRadius: 4, background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, color: 'var(--text-tertiary)' }}>
+            {item.name.charAt(0)}
+          </div>
+        )}
+      </div>
+      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }}>
+        {item.name}
+      </div>
+      <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {item.version}
+      </div>
+      <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+        {item.provider || ''}
+      </div>
+      <div>
+        {hasCompatWarn && (() => {
+          // Build a localized warning string. The yellow
+          // "this mod may be incompatible" tooltip used to be
+          // hardcoded English, which broke the Russian UI.
+          const title =
+            !item.version && !item.provider
+              ? t('manager.compat_unknown')
+              : mcVersion && !item.version
+                ? t('manager.compat_maybe', { version: mcVersion })
+                : t('manager.compat_no', { target: compatTarget });
+          return (
+            <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }} title={title}>
+              <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
+                <AlertTriangle size={12} />
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+    </div>
+  );
+});
+
+// ---- Remote icon fetching --------------------------------------------------
+// CDN icon URLs are NEVER passed directly to <img src="https://...">: the
+// webview uses only the system proxy (no proxy→direct fallback), so one
+// flaky request used to leave the icon blank until the tab was remounted.
+// Instead, icons are downloaded through cmd_fetch_icon_url (send_with_fallback)
+// and stored as data URLs. In-flight set dedupes concurrent renders; failed
+// URLs get a cooldown so they retry later instead of hammering every render.
+const iconUrlInFlight = new Set<string>();
+const iconUrlFailedAt = new Map<string, number>();
+const ICON_URL_RETRY_MS = 30_000;
+
+function fetchRemoteIconCached(url: string, cacheIcon: (key: string, value: string) => void) {
+  if (iconUrlInFlight.has(url)) return;
+  const failedAt = iconUrlFailedAt.get(url);
+  if (failedAt && Date.now() - failedAt < ICON_URL_RETRY_MS) return;
+  iconUrlInFlight.add(url);
+  invoke<string | null>('cmd_fetch_icon_url', { url })
+    .then((data) => {
+      if (data) {
+        iconUrlFailedAt.delete(url);
+        cacheIcon(`url:${url}`, data);
+      } else {
+        iconUrlFailedAt.set(url, Date.now());
+      }
+    })
+    .catch(() => { iconUrlFailedAt.set(url, Date.now()); })
+    .finally(() => { iconUrlInFlight.delete(url); });
+}
+
+function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOpenFolder }: Props) {
   const t = useT();
   const [items, setItems] = useState<ContentItem[]>([]);
   const [failedIcons, setFailedIcons] = useState<Set<string>>(new Set());
@@ -94,8 +236,9 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
   // remain mounted; only the network/CPU work is suspended.
   const isFrozen = useFocusStore((s) => s.isFrozen);
 
-  // Global icon cache (persists across remounts)
-  const { cache: iconCache, getIcon, setIcon, setCache, hydrated } = useIconCacheStore();
+  // Global icon cache (session memory only, like Prism: survives remounts,
+  // re-extracted from the archives after an app restart)
+  const { cache: iconCache, getIcon, setIcon } = useIconCacheStore();
   const projectNameCache = useRef<Map<string, string>>(new Map());
   const loadGen = useRef(0);
 
@@ -111,8 +254,8 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
   const cacheIcon = useCallback((key: string, value: string) => {
     if (!key) return;
     if (getIcon(key) === value) return;
+    // Memory-only session store; nothing is written to disk.
     setIcon(key, value);
-    invoke('cmd_set_icon_cache_entry', { key, value }).catch(() => {});
   }, [getIcon, setIcon]);
 
   const fetchPackIcons = useCallback(async (rawPacks: any[]) => {
@@ -145,9 +288,26 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
       if (plan.hasModrinth || plan.hasLocal) plan.resolved = true;
     }
 
-    // Step 2: for packs without a project_id, search Modrinth by name (in parallel)
-    const needSearch = Array.from(plans.values()).filter((p) => !p.projectId && !p.resolved);
-    await Promise.all(needSearch.map(async (plan) => {
+    // Step 2: fetch the local pack.png for every pack that still needs an
+    // icon (resource packs almost always ship one). Doing this BEFORE the
+    // network search guarantees that locally-shipped packs (Better MC
+    // overrides, datapacks, etc.) always get their real icon.
+    const needLocal = Array.from(plans.values()).filter((p) => !p.hasModrinth && !p.hasLocal);
+    await runPool(needLocal, 8, async (plan) => {
+      try {
+        const icon = await invoke<string | null>('cmd_get_pack_icon', { instanceName, packType: subfolder, filename: plan.filename });
+        if (icon) {
+          plan.hasLocal = true;
+          plan.resolved = true;
+          cacheIcon(plan.localKey, icon);
+        }
+      } catch { }
+    });
+
+    // Step 3: for packs still lacking an icon and a project_id, search
+    // Modrinth by name. Packs that got a local icon are skipped.
+    const needSearch = Array.from(plans.values()).filter((p) => !p.projectId && !p.resolved && !p.hasLocal);
+    await runPool(needSearch, 4, async (plan) => {
       if (!plan.name) return;
       const variants = build_name_variants(plan.name);
       for (const query of variants) {
@@ -165,38 +325,27 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
             projectNameCache.current.set(plan.name, hit.project_id);
             if (cache.has(plan.modrinthKey)) {
               plan.hasModrinth = true;
+              plan.resolved = true;
               cacheIcon(plan.modrinthKey, cache.get(plan.modrinthKey)!);
             }
             return;
           }
         } catch { }
       }
-    }));
+    });
 
-    // Step 3: fetch Modrinth project info for plans that need it
+    // Step 4: fetch Modrinth project info for plans that need it
     const needModrinthFetch = Array.from(plans.values()).filter((p) => p.projectId && p.modrinthKey && !p.hasModrinth && !p.resolved);
-    await Promise.all(needModrinthFetch.map(async (plan) => {
+    await runPool(needModrinthFetch, 6, async (plan) => {
       try {
         const project = await invoke<{ icon_url?: string | null }>('cmd_get_modrinth_project', { id: plan.projectId! });
         if (project?.icon_url) {
           plan.hasModrinth = true;
+          plan.resolved = true;
           cacheIcon(plan.modrinthKey, project.icon_url);
         }
       } catch { }
-    }));
-
-    // Step 4: fallback to local pack.png for all plans that still lack a Modrinth icon
-    // (works for resource packs that include pack.png; shader packs rarely have one but try anyway)
-    const needLocal = Array.from(plans.values()).filter((p) => !p.hasModrinth && !p.hasLocal);
-    await Promise.all(needLocal.map(async (plan) => {
-      try {
-        const icon = await invoke<string | null>('cmd_get_pack_icon', { instanceName, packType: subfolder, filename: plan.filename });
-        if (icon) {
-          plan.hasLocal = true;
-          cacheIcon(plan.localKey, icon);
-        }
-      } catch { }
-    }));
+    });
   }, [instanceName, subfolder, contentType, cacheIcon]);
 
   const loadItems = useCallback(async () => {
@@ -226,26 +375,24 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
           return !cache.get(`file:${m.filename}`);
         });
 
-        const CONCURRENCY = 5;
-        for (let i = 0; i < uncached.length; i += CONCURRENCY) {
+        // Sliding-window pool: a slow item (network fallback with retries)
+        // only occupies its own slot instead of stalling the next batch.
+        await runPool(uncached, 10, async (m) => {
           if (gen !== loadGen.current) return;
-          const batch = uncached.slice(i, i + CONCURRENCY);
-          await Promise.allSettled(batch.map(async (m) => {
-            const key = `file:${m.filename}`;
-            try {
-              const icon = await invoke<string | null>('cmd_get_mod_icon', { instanceName, filename: m.filename });
-              if (icon && gen === loadGen.current) cacheIcon(key, icon);
-            } catch { }
-          }));
-        }
+          const key = `file:${m.filename}`;
+          try {
+            const icon = await invoke<string | null>('cmd_get_mod_icon', { instanceName, filename: m.filename });
+            if (icon && gen === loadGen.current) cacheIcon(key, icon);
+          } catch { }
+        });
       } else {
         const raw = await invoke<any[]>('cmd_list_packs', { instanceName, packType: subfolder });
         if (gen !== loadGen.current) return;
         setItems(raw.map((p) => ({
           filename: p.filename,
           name: p.name,
-          version: p.version || '',
-          provider: p.provider || '',
+          version: p.version || extractVersionFromFilename(p.filename) || '',
+          provider: p.provider || t('manager.provider_local'),
           project_id: p.project_id || '',
           slug: p.project_id || undefined,
           enabled: !p.filename.endsWith('.disabled'),
@@ -272,22 +419,14 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
     checkedRef.current = new Set();
   }, [loadItems, mcVersion, loader]);
 
-  // Hydrate the global icon cache from disk on mount (runs once).
-  // Subsequent remounts skip disk read since cache persists in store.
+  // Watch the instance directory for external file changes; reload list on event.
+  // UI-state values are read via refs so opening a context menu / browser does
+  // NOT tear down and recreate the backend watcher on every click.
+  const skipReloadRef = useRef(false);
   useEffect(() => {
-    if (hydrated) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const cache = await invoke<Record<string, string>>('cmd_get_icon_cache');
-        if (cancelled) return;
-        setCache(cache);
-      } catch { }
-    })();
-    return () => { cancelled = true; };
-  }, [hydrated, setCache]);
+    skipReloadRef.current = !!(showBrowser || checkingUpdates || updates || contextMenu);
+  }, [showBrowser, checkingUpdates, updates, contextMenu]);
 
-  // Watch the instance directory for external file changes; reload list on event
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
     const setup = async () => {
@@ -300,7 +439,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
           // Only react if the change is in the subfolder we currently display
           if (e.payload.instance !== instanceName) return;
           if (e.payload.subfolder !== subfolder) return;
-          if (showBrowser || checkingUpdates || updates || contextMenu) return;
+          if (skipReloadRef.current) return;
           // While the launcher is frozen (unfocused during a game), defer the reload
           // — a single loadItems will be triggered by the [isFrozen] effect below
           // when focus returns. This avoids running fetches in the background.
@@ -315,7 +454,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
       if (unlistenFn) unlistenFn();
       invoke('cmd_unwatch_instance').catch(() => {});
     };
-  }, [instanceName, subfolder, loadItems, showBrowser, checkingUpdates, updates, contextMenu, isFrozen]);
+  }, [instanceName, subfolder, loadItems, isFrozen]);
 
   const checkedRef = useRef<Set<string>>(new Set());
 
@@ -426,7 +565,7 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
       .filter((x): x is ContentItem => !!x);
   };
 
-  const toggleEnabled = async (item: ContentItem) => {
+  const toggleEnabled = useCallback(async (item: ContentItem) => {
     try {
       const dir = await invoke<string>('cmd_get_instance_dir', { instanceName });
       const itemDir = `${dir}/${subfolder}`;
@@ -448,10 +587,9 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
       const cachedIcon = getIcon(oldIconKey);
       if (cachedIcon) {
         setIcon(`file:${newName}`, cachedIcon);
-        invoke('cmd_set_icon_cache_entry', { key: `file:${newName}`, value: cachedIcon }).catch(() => {});
       }
     } catch (e: any) { addToast(t('manager.toggle_error', { error: e.toString() }), 'error'); }
-  };
+  }, [instanceName, subfolder, getIcon, setIcon, t]);
 
   const toggleSelectedEnabled = async () => {
     const selected = getSelectedItems();
@@ -607,15 +745,22 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
     const fileKey = `file:${item.filename}`;
     const v2 = getIcon(fileKey);
     if (v2) return v2;
+    // Remote CDN icon: fetch through the backend (proxy fallback) and cache
+    // as a data URL; show the placeholder until it arrives.
     if (item.icon && !item.icon.startsWith('data:') && item.icon.includes('/')) {
-      return `https://cdn.modrinth.com/data/${item.icon}`;
+      const vUrl = getIcon(`url:${item.icon}`);
+      if (vUrl) return vUrl;
+      fetchRemoteIconCached(item.icon, cacheIcon);
     }
     return null;
   };
 
-  const filtered = items.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()) || p.filename.toLowerCase().includes(search.toLowerCase()));
+  const filtered = useMemo(
+    () => items.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()) || p.filename.toLowerCase().includes(search.toLowerCase())),
+    [items, search]
+  );
 
-  const handleRowClick = (filename: string, e: React.MouseEvent) => {
+  const handleRowClick = useCallback((filename: string, e: React.MouseEvent) => {
     if (e.ctrlKey || e.metaKey) {
       setSelectedFilenames((prev) => {
         const next = new Set(prev);
@@ -629,10 +774,27 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
         return new Set([filename]);
       });
     }
-  };
+  }, []);
 
-  const selectedItems = getSelectedItems();
+  const handleRowContext = useCallback((e: React.MouseEvent, filename: string) => {
+    setContextMenu({ x: e.clientX, y: e.clientY, filename });
+  }, []);
+
+  const handleIconError = useCallback((filename: string) => {
+    setFailedIcons((prev) => {
+      if (prev.has(filename)) return prev;
+      const next = new Set(prev);
+      next.add(filename);
+      return next;
+    });
+  }, []);
+
+  const selectedItems = useMemo(getSelectedItems, [items, selectedFilenames]);
   const hasSelection = selectedFilenames.size > 0;
+  const compatTarget = useMemo(
+    () => [mcVersion ? `MC ${mcVersion}` : '', loader && loader !== 'Vanilla' ? loader : ''].filter(Boolean).join(' / '),
+    [mcVersion, loader]
+  );
 
   if (showBrowser) {
     // Normalize: lowercase + underscore→dash so fabric mod ids (e.g. "My_Cool_Mod")
@@ -720,74 +882,23 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
               <div>{items.length === 0 ? t('manager.empty', { label: label.toLowerCase() }) : t('manager.empty_search')}</div>
             </div>
           ) : (
-            filtered.map((item, idx) => {
-              const isSelected = selectedFilenames.has(item.filename);
-              const iconSrc = getItemIcon(item);
-              return (
-                <div key={item.filename}
-                  onClick={(e) => handleRowClick(item.filename, e)}
-                  onContextMenu={(e) => { e.preventDefault(); setContextMenu({ x: e.clientX, y: e.clientY, filename: item.filename }); }}
-                  style={{
-          display: 'grid', gridTemplateColumns: '28px 36px 1fr 1fr 80px 28px',
-                    padding: '4px var(--space-2xl)', alignItems: 'center', cursor: 'pointer',
-                    borderBottom: '1px solid var(--surface-border)',
-                    background: isSelected ? 'var(--primary-dim)' : idx % 2 === 0 ? 'transparent' : 'hsla(0, 0%, 100%, 0.02)',
-                    opacity: item.enabled ? 1 : 0.45,
-                    transition: 'background 0.12s',
-                    minHeight: 36,
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'center' }}>
-                    <div onClick={(e) => { e.stopPropagation(); toggleEnabled(item); }}
-                      style={{ width: 16, height: 16, borderRadius: 3, cursor: 'pointer', border: '1.5px solid ' + (!item.enabled ? 'var(--text-tertiary)' : 'var(--primary)'), background: !item.enabled ? 'transparent' : 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s' }}>
-                      {item.enabled && <Check size={10} color="white" strokeWidth={3} />}
-                    </div>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'center' }}>
-                    {iconSrc && !failedIcons.has(item.filename) ? (
-                      <img key={item.filename} src={iconSrc} alt="" style={{ width: 28, height: 28, borderRadius: 4, objectFit: 'cover' }}
-                        onError={() => setFailedIcons((prev) => new Set(prev).add(item.filename))} />
-                    ) : (
-                      <div style={{ width: 28, height: 28, borderRadius: 4, background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, color: 'var(--text-tertiary)' }}>
-                        {item.name.charAt(0)}
-                      </div>
-                    )}
-                  </div>
-                  <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }}>
-                    {item.name}
-                  </div>
-                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {item.version}
-                  </div>
-                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
-                    {item.provider || ''}
-                  </div>
-                  <div>
-                    {contentType === 'mod' && compatibility[item.filename] && (() => {
-                      // Build a localized warning string. The yellow
-                      // "this mod may be incompatible" tooltip used to be
-                      // hardcoded English, which broke the Russian UI.
-                      const versionPart = mcVersion ? `MC ${mcVersion}` : '';
-                      const loaderPart = loader && loader !== 'Vanilla' ? loader : '';
-                      const target = [versionPart, loaderPart].filter(Boolean).join(' / ');
-                      const title =
-                        !item.version && !item.provider
-                          ? t('manager.compat_unknown')
-                          : mcVersion && !item.version
-                            ? t('manager.compat_maybe', { version: mcVersion })
-                            : t('manager.compat_no', { target });
-                      return (
-                        <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }} title={title}>
-                          <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
-                            <AlertTriangle size={12} />
-                          </div>
-                        </div>
-                      );
-                    })()}
-                  </div>
-                </div>
-              );
-            })
+            filtered.map((item, idx) => (
+              <ContentRow
+                key={item.filename}
+                item={item}
+                idx={idx}
+                isSelected={selectedFilenames.has(item.filename)}
+                failed={failedIcons.has(item.filename)}
+                iconSrc={getItemIcon(item)}
+                hasCompatWarn={contentType === 'mod' && !!compatibility[item.filename]}
+                mcVersion={mcVersion}
+                compatTarget={compatTarget}
+                onRowClick={handleRowClick}
+                onContext={handleRowContext}
+                onToggle={toggleEnabled}
+                onIconError={handleIconError}
+              />
+            ))
           )}
         </div>
 
@@ -921,4 +1032,9 @@ export function ContentManager({ instanceName, contentType, mcVersion, loader, o
   );
 }
 
+
+
+// Memoized: the parent (InstanceDetail) re-renders on every menu/tab click;
+// without memo the whole ~250-row mod table re-rendered each time.
+export const ContentManager = memo(ContentManagerImpl);
 

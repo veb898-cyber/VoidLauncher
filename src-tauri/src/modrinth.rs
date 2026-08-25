@@ -86,32 +86,76 @@ pub struct ModrinthVersionResponse {
 }
 
 async fn api_get<T: serde::de::DeserializeOwned>(url: &str) -> Result<T> {
+    crate::download::ensure_proxy_resolved().await;
     let client = crate::download::global_http_client();
-    let response = client
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .send()
-        .await?;
+    let mut last_err = None;
+    for attempt in 0..4 {
+        let attempt_result = crate::download::send_with_fallback(
+            client
+                .get(url)
+                .header("User-Agent", USER_AGENT)
+                .timeout(std::time::Duration::from_secs(15)),
+        )
+        .await;
+        let response = match attempt_result {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(crate::error::LauncherError::Network(e));
+                if attempt < 3 {
+                    crate::events::emit_fetch_retry(
+                        "modrinth",
+                        attempt + 2,
+                        4,
+                        "Retrying Modrinth request",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        [500, 1000, 2000][attempt],
+                    ))
+                    .await;
+                }
+                continue;
+            }
+        };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(crate::error::LauncherError::Download(
-            format!("Modrinth API error ({}): {}", status, text)
-        ));
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(crate::error::LauncherError::Download(
+                format!("Modrinth API error ({}): {}", status, text)
+            ));
+        }
+
+        let text = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                last_err = Some(crate::error::LauncherError::Network(e));
+                if attempt < 3 {
+                    crate::events::emit_fetch_retry(
+                        "modrinth",
+                        attempt + 2,
+                        4,
+                        "Retrying Modrinth request",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        [500, 1000, 2000][attempt],
+                    ))
+                    .await;
+                }
+                continue;
+            }
+        };
+
+        return serde_json::from_str::<T>(&text).map_err(|e| {
+            crate::error::LauncherError::Download(format!(
+                "Failed to decode Modrinth response: {}. Body preview: {}",
+                e,
+                &text.chars().take(500).collect::<String>()
+            ))
+        });
     }
-
-    let text = response.text().await.map_err(|e| {
-        crate::error::LauncherError::Download(format!("Failed to read response body: {}", e))
-    })?;
-
-    serde_json::from_str::<T>(&text).map_err(|e| {
-        crate::error::LauncherError::Download(format!(
-            "Failed to decode Modrinth response: {}. Body preview: {}",
-            e,
-            &text.chars().take(500).collect::<String>()
-        ))
-    })
+    Err(last_err.unwrap_or_else(|| {
+        crate::error::LauncherError::Download("Modrinth request failed".to_string())
+    }))
 }
 
 pub async fn search_mods(
@@ -221,12 +265,13 @@ pub async fn check_version_updates(
         loaders,
         game_versions,
     };
-    let response = client
-        .post(format!("{}/version_files/update", BASE_URL))
-        .header("User-Agent", USER_AGENT)
-        .json(&body)
-        .send()
-        .await?;
+    let response = crate::download::send_with_fallback(
+        client
+            .post(format!("{}/version_files/update", BASE_URL))
+            .header("User-Agent", USER_AGENT)
+            .json(&body),
+    )
+    .await?;
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();

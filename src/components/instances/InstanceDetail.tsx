@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useT, type MessageKey } from '../../lib/i18n';
 import { invoke } from '@tauri-apps/api/core';
@@ -11,7 +11,7 @@ import { InstanceEditor } from './InstanceEditor';
 import { ContentManager } from './ContentManager';
 import { WorldsManager } from './WorldsManager';
 import { ScreenshotsGallery } from './ScreenshotsGallery';
-import { BANNER_PRESETS, isGradientBanner } from '../../lib/bannerPresets';
+import { BANNER_PRESETS, isGradientBanner, getGradientValue } from '../../lib/bannerPresets';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 
 type Tab = 'mods' | 'resourcepacks' | 'shaderpacks' | 'worlds' | 'screenshots';
@@ -34,6 +34,18 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
   const [showBannerPicker, setShowBannerPicker] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
+
+  // Stable identity so memoized children (ContentManager etc.) don't re-render
+  // on unrelated parent updates (menu open/close, tab switches).
+  const handleOpenFolder = useCallback(async (subdir: string) => {
+    try {
+      await invoke('cmd_open_instance_folder', { instanceName: selectedInstance, subfolder: subdir });
+    } catch (e: any) { addToast(t('instance_detail.folder_error', { error: e.toString() }), 'error'); }
+  }, [selectedInstance, t]);
+
+  const openContentFolder = useCallback(() => {
+    handleOpenFolder(tab === 'mods' ? 'mods' : tab);
+  }, [handleOpenFolder, tab]);
 
   const selectTab = (tb: Tab) => {
     if (tb === tab) return;
@@ -69,12 +81,6 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
       </div>
     );
   }
-
-  const handleOpenFolder = async (subdir: string) => {
-    try {
-      await invoke('cmd_open_instance_folder', { instanceName: instance.name, subfolder: subdir });
-    } catch (e: any) { addToast(t('instance_detail.folder_error', { error: e.toString() }), 'error'); }
-  };
 
   const handleDuplicate = async () => {
     const newName = prompt(t('instance_detail.duplicate_prompt'), `${instance.name} (copy)`);
@@ -153,7 +159,16 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
       {/* Top bar */}
       <div style={{ padding: 'var(--space-md) var(--space-2xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', alignItems: 'center', gap: 'var(--space-lg)', flexShrink: 0 }}>
         <div onClick={() => { setShowMenu(!showMenu); setShowBannerPicker(false); }} style={{ width: 40, height: 40, borderRadius: 'var(--radius-md)', overflow: 'hidden', cursor: 'pointer', flexShrink: 0, position: 'relative' }} title={t('instance_detail.change_icon')}>
-          {instance.icon ? (
+          {/* The header square mirrors the banner (gradient or image) so it
+              always matches what the home card shows; falls back to the
+              custom icon, then to the letter tile. */}
+          {isGradientBanner(instance.banner ?? '') ? (
+            <div style={{ width: '100%', height: '100%', background: getGradientValue(instance.banner!), display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18, fontWeight: 700, color: 'white' }}>
+              {instance.name.charAt(0).toUpperCase()}
+            </div>
+          ) : instance.banner ? (
+            <img src={instance.banner} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          ) : instance.icon ? (
             <img src={instance.icon} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
           ) : (
             <div style={{ width: '100%', height: '100%', background: 'var(--gradient-primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18, fontWeight: 700, color: 'white' }}>
@@ -317,7 +332,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
             contentType={tab === 'mods' ? 'mod' : tab === 'resourcepacks' ? 'resourcepack' : 'shader'}
             mcVersion={instance.mc_version}
             loader={instance.loader}
-            onOpenFolder={() => handleOpenFolder(tab === 'mods' ? 'mods' : tab)}
+            onOpenFolder={openContentFolder}
           />
         )}
         {tab === 'worlds' && (

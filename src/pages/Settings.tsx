@@ -2,16 +2,17 @@ import { useEffect, useState, useCallback } from 'react';
 import { useSettingsStore } from '../stores/settingsStore';
 import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore } from '../stores/accountsStore';
+import { useJavaDownloadStore } from '../stores/javaDownloadStore';
+import { useBrowserGuardStore } from '../stores/browserGuardStore';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 import { Button } from '../components/ui/Button';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { addToast } from '../components/ui/Toast';
 import { CustomSelect } from '../components/ui/CustomSelect';
 import { getRecommendedMemoryMb, snapToMemoryStep } from '../lib/memory';
-import { useT, Language } from '../lib/i18n';
+import { useT, getLanguage, Language } from '../lib/i18n';
 import { useLanguageStore } from '../stores/languageStore';
 import { useThemeStore, Theme } from '../stores/themeStore';
 import {
@@ -53,9 +54,8 @@ export function Settings() {
   const [availableJava, setAvailableJava] = useState<AvailableJavaVersion[]>([]);
   const [managedJava, setManagedJava] = useState<ManagedJavaRuntime[]>([]);
   const [checkingJava, setCheckingJava] = useState(false);
-  const [downloadingJava, setDownloadingJava] = useState<number | null>(null);
-  const [javaProgress, setJavaProgress] = useState<{ percent: number; message: string } | null>(null);
   const [javaError, setJavaError] = useState(false);
+  const javaDownload = useJavaDownloadStore((s) => s.active);
 
   useEffect(() => {
     loadConfig();
@@ -67,20 +67,6 @@ export function Settings() {
   useEffect(() => {
     setLocalConfig(config);
   }, [config]);
-
-  useEffect(() => {
-    const unlisten = listen<{ major_version: number; percent: number; stage: string; message: string }>(
-      'java_download_progress',
-      (event) => {
-        if (event.payload.stage === 'done') {
-          setJavaProgress(null);
-        } else {
-          setJavaProgress({ percent: event.payload.percent, message: event.payload.message });
-        }
-      }
-    );
-    return () => { unlisten.then((fn) => fn()).catch(() => {}); };
-  }, []);
 
   const loadJavaVersions = useCallback(async () => {
     setCheckingJava(true);
@@ -122,6 +108,15 @@ export function Settings() {
     setLocalConfig(updated);
   };
 
+  const dirty = !!localConfig && !!config && JSON.stringify(localConfig) !== JSON.stringify(config);
+
+  // While there are unsaved changes, page navigation asks for confirmation
+  // (shared leave-guard, see browserGuardStore).
+  useEffect(() => {
+    useBrowserGuardStore.getState().setUnsaved(dirty);
+    return () => { useBrowserGuardStore.getState().setUnsaved(false); };
+  }, [dirty]);
+
   if (!localConfig) {
     return (
       <div className="page animate-fade-in">
@@ -135,14 +130,11 @@ export function Settings() {
 
   return (
     <div className="page animate-fade-in">
-      <div className="page__header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div className="page__header">
         <div>
           <h1 className="page__title">{t('settings.title')}</h1>
           <p className="page__subtitle">{t('settings.subtitle')}</p>
         </div>
-        <button className="btn btn--primary" onClick={handleSave} id="save-settings-btn" disabled={!localConfig}>
-          {saveSuccess ? `✓ ${t('settings.save_btn')}` : t('settings.save_btn')}
-        </button>
       </div>
 
       {/* Account Section */}
@@ -238,7 +230,7 @@ export function Settings() {
               options={[
                 { value: 'standard', label: 'Standard', description: t('instance_editor.gc_standard_desc') },
                 { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: 'Java 8+' },
-                { value: 'zgc', label: t('instance_editor.gc_zgc'), description: 'Java 17+, \u2265 8 GB' },
+                { value: 'zgc', label: t('instance_editor.gc_zgc'), description: `Java 17+, \u2265 8 ${getLanguage() === 'ru' ? 'ГБ' : 'GB'}` },
               ]}
               onChange={(v) => updateConfig('default_gc_preset', v)}
             />
@@ -323,7 +315,7 @@ export function Settings() {
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)', marginBottom: 'var(--space-lg)' }}>
             {availableJava.map((jv) => {
-              const isDownloading = downloadingJava === jv.major_version;
+              const isDownloading = javaDownload?.majorVersion === jv.major_version;
               const isInstalled = managedJava.some((m) => m.major_version === jv.major_version);
               return (
                 <div key={jv.major_version} className="glass-card" style={{
@@ -334,9 +326,9 @@ export function Settings() {
                 }}>
                    <div>
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-md)' }}>{jv.label}</div>
-                    {isDownloading && javaProgress && (
+                    {isDownloading && javaDownload && (
                       <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', marginTop: '2px' }}>
-                        {javaProgress.message}
+                        {javaDownload.message}
                       </div>
                     )}
                   </div>
@@ -345,9 +337,8 @@ export function Settings() {
                     variant={isInstalled ? 'secondary' : 'primary'}
                     disabled={isDownloading}
                     onClick={async () => {
-                      if (isInstalled) return;
-                      setDownloadingJava(jv.major_version);
-                      setJavaProgress({ percent: 0, message: 'Starting...' });
+                      if (isInstalled || isDownloading) return;
+                      useJavaDownloadStore.getState().startDownload(jv.major_version);
                       try {
                         await invoke('cmd_download_java', { majorVersion: jv.major_version });
                         addToast(t('settings.java_install_success', { version: jv.major_version.toString() }), 'success');
@@ -356,12 +347,11 @@ export function Settings() {
                       } catch (e) {
                         addToast(t('settings.java_install_error', { error: String(e) }), 'error');
                       } finally {
-                        setDownloadingJava(null);
-                        setJavaProgress(null);
+                        useJavaDownloadStore.getState().clear();
                       }
                     }}
                   >
-                    {isDownloading ? <><LoadingSpinner size={14} /> {javaProgress ? `${Math.round(javaProgress.percent)}%` : ''}</> : isInstalled ? `✓ ${t('settings.java_downloaded')}` : t('settings.java_download_btn')}
+                    {isDownloading ? <><LoadingSpinner size={14} /> {javaDownload ? `${Math.round(javaDownload.percent)}%` : ''}</> : isInstalled ? `✓ ${t('settings.java_downloaded')}` : t('settings.java_download_btn')}
                   </Button>
                 </div>
               );
@@ -625,6 +615,14 @@ export function Settings() {
       </section>
 
       <LatestVersionSection />
+
+      {dirty && (
+        <div className="settings-save-fab">
+          <button className="btn btn--primary" onClick={handleSave} id="save-settings-btn">
+            {saveSuccess ? `✓ ${t('settings.save_btn')}` : t('settings.save_btn')}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -685,6 +683,11 @@ function AccountCard({
             referrerPolicy="no-referrer"
             alt={activeName}
             style={{ width: 48, height: 48, borderRadius: 'var(--radius-md)' }}
+            onError={(e) => {
+              const ch = encodeURIComponent(activeName.charAt(0).toUpperCase());
+              (e.target as HTMLImageElement).src =
+                `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48"><rect fill="%23333" width="48" height="48" rx="8"/><text x="24" y="31" text-anchor="middle" fill="%23999" font-size="20">${ch}</text></svg>`;
+            }}
           />
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 600, fontSize: 'var(--font-size-lg)' }}>{activeName}</div>

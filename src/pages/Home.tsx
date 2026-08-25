@@ -139,6 +139,11 @@ export function Home({ onNavigate }: HomeProps) {
             referrerPolicy="no-referrer"
             alt={activeName ?? ''}
             style={{ width: 56, height: 56, borderRadius: 'var(--radius-md)' }}
+            onError={(e) => {
+              const ch = encodeURIComponent((activeName ?? '?').charAt(0).toUpperCase());
+              (e.target as HTMLImageElement).src =
+                `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56"><rect fill="%23333" width="56" height="56" rx="10"/><text x="28" y="36" text-anchor="middle" fill="%23999" font-size="24">${ch}</text></svg>`;
+            }}
           />
         ) : (
           <div style={{
@@ -195,19 +200,11 @@ export function Home({ onNavigate }: HomeProps) {
 
       {/* Instance grid */}
       <div style={{ flex: 1 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-md)' }}>
-          <h2 style={{ fontSize: 'var(--font-size-lg)', fontWeight: 600 }}>
-            {instances.length > 0 ? t('home.section_instances') : ''}
+        {instances.length > 0 && (
+          <h2 style={{ fontSize: 'var(--font-size-lg)', fontWeight: 600, marginBottom: 'var(--space-md)' }}>
+            {t('home.section_instances')}
           </h2>
-          {instances.length > 0 && (
-            <button
-              className="btn btn--ghost btn--sm"
-              onClick={() => onNavigate('instances')}
-            >
-              {t('home.view_all')}
-            </button>
-          )}
-        </div>
+        )}
 
         {instances.length === 0 ? (
           <div style={{

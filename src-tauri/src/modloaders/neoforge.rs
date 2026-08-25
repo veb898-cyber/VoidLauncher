@@ -103,7 +103,7 @@ pub async fn get_profile(_mc_version: &str, neo_version: &str) -> Result<LoaderP
         neo_version, neo_version
     );
 
-    if let Ok(resp) = client.get(&profile_url).send().await {
+    if let Ok(resp) = crate::download::send_with_fallback(client.get(&profile_url)).await {
         if resp.status().is_success() {
             if let Ok(text) = resp.text().await {
                 if let Ok(profile) = serde_json::from_str::<NeoForgeInstallProfile>(&text) {
@@ -276,7 +276,7 @@ pub async fn install(
 
     // Download installer (kept on disk for the processor pipeline below)
     let (raw_profile, installer_path) = download_installer(loader_version).await?;
-    let mut profile = build_profile(raw_profile)?;
+    let profile = build_profile(raw_profile)?;
 
     // The installer also carries install_profile.json with the full
     // processor library list (70 libs for 21.1.248, vs 47 in version.json).

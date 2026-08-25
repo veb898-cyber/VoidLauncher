@@ -49,18 +49,38 @@ fn emit_progress(app: Option<&AppHandle>, stage: &str, current: usize, total: us
     }
 }
 
-/// Reject any path component that equals ".." to prevent zip slip.
+/// Reject zip slip: ".." components, absolute paths and drive prefixes.
 fn check_safe_relative(relative: &str) -> Result<()> {
     if relative.contains('\0') {
         return Err(LauncherError::Instance("Null byte in zip entry path".into()));
     }
+    if Path::new(relative).is_absolute() {
+        return Err(LauncherError::Instance(format!(
+            "Absolute path in zip entry: {}", relative
+        )));
+    }
     let normalised = relative.replace('\\', "/");
+    // Rooted paths (e.g. "/etc/passwd") are not `is_absolute` on Windows
+    // but still escape the base when joined.
+    if normalised.starts_with('/') {
+        return Err(LauncherError::Instance(format!(
+            "Rooted path in zip entry: {}", relative
+        )));
+    }
+    let mut first_component = true;
     for component in normalised.split('/') {
         if component == ".." {
             return Err(LauncherError::Instance(format!(
                 "Path traversal detected in zip entry: {}", relative
             )));
         }
+        // "C:foo" / "C:/foo" style drive-relative paths must not escape base.
+        if first_component && component.contains(':') {
+            return Err(LauncherError::Instance(format!(
+                "Drive prefix in zip entry: {}", relative
+            )));
+        }
+        first_component = false;
     }
     Ok(())
 }
@@ -69,6 +89,13 @@ fn check_safe_relative(relative: &str) -> Result<()> {
 fn extract_entry(base: &Path, entry_name: &str, data: &[u8]) -> Result<()> {
     check_safe_relative(entry_name)?;
     let target = base.join(entry_name);
+    // Defense in depth: joined path must stay under base
+    // (Path::join replaces base on absolute/drive-relative paths).
+    if !target.starts_with(base) {
+        return Err(LauncherError::Instance(format!(
+            "Zip entry escapes extraction directory: {}", entry_name
+        )));
+    }
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -78,6 +105,24 @@ fn extract_entry(base: &Path, entry_name: &str, data: &[u8]) -> Result<()> {
 
 fn normalize_zip_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+/// Extract every entry of a zip archive into `dest`, rejecting zip-slip paths.
+pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        let entry_name = entry.name().to_string();
+        if entry.is_dir() {
+            continue;
+        }
+        check_safe_relative(&entry_name)?;
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf)?;
+        extract_entry(dest, &entry_name, &buf)?;
+    }
+    Ok(())
 }
 
 /// Client-side import: skip files marked client=unsupported (server-only).
@@ -455,7 +500,7 @@ pub async fn import_modpack(
 }
 
 /// Import a Modrinth .mrpack
-async fn import_mrpack(
+pub(crate) async fn import_mrpack(
     instances_dir: &PathBuf,
     path: &str,
     instance_name: &str,
@@ -639,22 +684,15 @@ async fn import_mrpack(
     }
 
     // Detect loader from dependencies
-    let loader = index["dependencies"].as_object()
-        .and_then(|d| d.keys().find(|k| *k != "minecraft"))
-        .cloned();
-    let loader_version = index["dependencies"].as_object()
-        .and_then(|d| {
-            loader.as_ref().and_then(|ldr| {
-                d.get(ldr)
-                    .or_else(|| d.get(&format!("{}-loader", ldr)))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-        });
+    let deps = index["dependencies"].as_object().cloned().unwrap_or_default();
+    let (loader, loader_version) = detect_mrpack_loader(&deps);
     let ldr_type = match loader.as_deref() {
-        Some("fabric") => LoaderType::Fabric,
-        Some("forge") => LoaderType::Forge,
         Some("neoforge") => LoaderType::NeoForge,
+        Some("forge") => LoaderType::Forge,
+        Some("fabric-loader") | Some("fabric") => LoaderType::Fabric,
+        // Quilt is not supported yet; report Fabric so the UI doesn't
+        // claim the pack is vanilla.
+        Some("quilt-loader") => LoaderType::Fabric,
         _ => LoaderType::Vanilla,
     };
 
@@ -684,7 +722,7 @@ async fn import_mrpack(
 }
 
 /// Import a CurseForge modpack
-async fn import_curseforge_pack(
+pub(crate) async fn import_curseforge_pack(
     instances_dir: &PathBuf,
     path: &str,
     instance_name: &str,
@@ -717,11 +755,18 @@ async fn import_curseforge_pack(
         .to_string();
 
     let (loader, loader_version) = manifest["minecraft"]["modLoaders"].as_array()
-        .and_then(|arr| arr.first())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|v| v["primary"].as_bool().unwrap_or(false))
+                .or_else(|| arr.first())
+        })
         .map(|v| {
             let id = v["id"].as_str().unwrap_or("");
             let parts: Vec<&str> = id.splitn(2, '-').collect();
-            (parts.first().copied(), parts.get(1).copied())
+            let loader = parts.first().copied();
+            // "forge-1.20.1-47.2.0" -> "47.2.0"
+            let version = parts.get(1).and_then(|p| p.rsplit('-').next());
+            (loader, version)
         })
         .unwrap_or((None, None));
 
@@ -820,10 +865,15 @@ async fn import_curseforge_pack(
                             "project_id": pid.to_string(),
                             "project_name": cf_file.display_name,
                             "version_id": null,
-                            "version_number": null,
+                            // CurseForge has no separate version field; the
+                            // display name (e.g. "jei-1.20.1-forge-15.21.0.138")
+                            // is the closest thing to a real version and beats
+                            // the "${file.jarVersion}" placeholder many JARs
+                            // ship with.
+                            "version_number": cf_file.display_name,
                         });
                         let sidecar_name = format!("{}.voidlauncher.json",
-                            cf_file.file_name.trim_end_matches(".jar"));
+                            cf_file.file_name.trim_end_matches(".jar").trim_end_matches(".zip"));
                         let index_dir = mods_dir.join(".index");
                         let _ = std::fs::create_dir_all(&index_dir);
                         let _ = std::fs::write(index_dir.join(sidecar_name), sidecar.to_string());
@@ -1009,4 +1059,95 @@ fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &s
     instances::save_instance(instances_dir, &instance, None)?;
     tracing::info!(target: "launcher", "Imported ATLauncher pack as '{}'", instance_name);
     Ok(instance)
+}
+
+/// Deterministic loader detection from an mrpack manifest's dependencies
+/// object. Keys can be "fabric-loader", "forge", "neoforge", "quilt-loader"
+/// — and JSON key order is not guaranteed, so we probe known keys in
+/// priority order instead of taking the first non-minecraft key.
+fn detect_mrpack_loader(
+    deps: &serde_json::Map<String, serde_json::Value>,
+) -> (Option<String>, Option<String>) {
+    let loader = ["neoforge", "forge", "fabric-loader", "fabric", "quilt-loader"]
+        .iter()
+        .find(|k| deps.contains_key(**k))
+        .map(|s| s.to_string());
+    let version = loader
+        .as_ref()
+        .and_then(|l| deps.get(l))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (loader, version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_relative_allows_normal_paths() {
+        assert!(check_safe_relative("mods/foo.jar").is_ok());
+        assert!(check_safe_relative("config/backslash\\dir\\file.cfg").is_ok());
+        assert!(check_safe_relative("file.txt").is_ok());
+    }
+
+    #[test]
+    fn safe_relative_rejects_traversal() {
+        assert!(check_safe_relative("../evil.jar").is_err());
+        assert!(check_safe_relative("mods/../../evil.jar").is_err());
+        assert!(check_safe_relative("mods/..\\..\\evil.jar").is_err());
+    }
+
+    #[test]
+    fn safe_relative_rejects_absolute_and_drive_paths() {
+        assert!(check_safe_relative("/etc/passwd").is_err());
+        assert!(check_safe_relative("\\Windows\\system32").is_err());
+        assert!(check_safe_relative("C:/evil.exe").is_err());
+        assert!(check_safe_relative("C:\\evil.exe").is_err());
+        assert!(check_safe_relative("C:evil.exe").is_err());
+    }
+
+    #[test]
+    fn mrpack_detect_fabric_loader_key() {
+        let deps: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"fabric-loader":"0.15.11","minecraft":"1.20.4"}"#).unwrap();
+        let (l, v) = detect_mrpack_loader(&deps);
+        assert_eq!(l.as_deref(), Some("fabric-loader"));
+        assert_eq!(v.as_deref(), Some("0.15.11"));
+    }
+
+    #[test]
+    fn mrpack_detect_forge_and_neoforge() {
+        let deps: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"forge":"47.2.0","minecraft":"1.20.1"}"#).unwrap();
+        let (l, _) = detect_mrpack_loader(&deps);
+        assert_eq!(l.as_deref(), Some("forge"));
+
+        let deps: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"neoforge":"21.1.135","minecraft":"1.21.1"}"#).unwrap();
+        let (l, v) = detect_mrpack_loader(&deps);
+        assert_eq!(l.as_deref(), Some("neoforge"));
+        assert_eq!(v.as_deref(), Some("21.1.135"));
+    }
+
+    #[test]
+    fn mrpack_detect_vanilla_when_no_loader() {
+        let deps: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"minecraft":"1.21.4"}"#).unwrap();
+        let (l, v) = detect_mrpack_loader(&deps);
+        assert_eq!(l, None);
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn extract_entry_writes_inside_base() {
+        let base = std::env::temp_dir().join(format!("vl_zip_test_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        // Absolute entry must be rejected by starts_with guard even if the
+        // component check somehow passed.
+        assert!(extract_entry(&base, "C:/escape/evil.txt", b"x").is_err());
+        assert!(extract_entry(&base, "sub/file.txt", b"ok").is_ok());
+        assert!(base.join("sub/file.txt").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

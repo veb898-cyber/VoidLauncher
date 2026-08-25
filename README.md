@@ -10,7 +10,7 @@ Lightweight Minecraft launcher for Windows, built with Tauri 2 (Rust + React 19)
 ## Features
 
 - **Accounts** — Microsoft (OAuth device code), Ely.by, Offline
-- **Mod loaders** — Vanilla, Fabric, Quilt, Forge, NeoForge
+- **Mod loaders** — Vanilla, Fabric, Forge, NeoForge
 - **Mod browsing** — search, install, update mods & modpacks via Modrinth
 - **CurseForge** — backend ready, UI coming soon
 - **Java management** — auto-detect, custom path, RAM sliders, GC presets (G1GC / ZGC)

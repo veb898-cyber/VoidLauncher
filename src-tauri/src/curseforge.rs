@@ -20,8 +20,22 @@ pub struct CfSearchResult {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CfLogo {
+    /// Small square preview. Null/empty for some older packs; `url` then
+    /// carries the full-size image and is used as a fallback.
     #[serde(rename = "thumbnailUrl")]
-    pub thumbnail_url: String,
+    pub thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl CfLogo {
+    /// Best available image URL (thumbnail preferred, full image as fallback).
+    pub fn best_url(&self) -> Option<&str> {
+        self.thumbnail_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .or(self.url.as_deref().filter(|u| !u.is_empty()))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -150,39 +164,134 @@ pub fn loader_type_id(loader: &str) -> Option<u32> {
 }
 
 async fn api_get<T: serde::de::DeserializeOwned>(url: &str, api_key: &str) -> Result<T> {
+    crate::download::ensure_proxy_resolved().await;
     let client = crate::download::global_http_client();
-    let response = client
-        .get(url)
-        .header("x-api-key", api_key)
-        .header("Accept", "application/json")
-        .send()
-        .await?;
+    let mut last_err = None;
+    for attempt in 0..4 {
+        let attempt_result = crate::download::send_with_fallback(
+            client
+                .get(url)
+                .header("x-api-key", api_key)
+                .header("Accept", "application/json")
+                // API replies are small; a 120s default timeout would let a
+                // silent connection block the whole install for minutes.
+                .timeout(std::time::Duration::from_secs(15)),
+        )
+        .await;
+        let response = match attempt_result {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(crate::error::LauncherError::Network(e));
+                if attempt < 3 {
+                    crate::events::emit_fetch_retry(
+                        "curseforge",
+                        attempt + 2,
+                        4,
+                        "Retrying CurseForge request",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        [500, 1000, 2000][attempt],
+                    ))
+                    .await;
+                }
+                continue;
+            }
+        };
 
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(crate::error::LauncherError::Download(format!(
+                "CurseForge API error ({}): {}",
+                status, text
+            )));
+        }
+
+        let text = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                last_err = Some(crate::error::LauncherError::Network(e));
+                if attempt < 3 {
+                    crate::events::emit_fetch_retry(
+                        "curseforge",
+                        attempt + 2,
+                        4,
+                        "Retrying CurseForge request",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        [500, 1000, 2000][attempt],
+                    ))
+                    .await;
+                }
+                continue;
+            }
+        };
+
+        return serde_json::from_str::<T>(&text).map_err(|e| {
+            crate::error::LauncherError::Download(format!(
+                "Failed to decode CurseForge response: {}. Body preview: {}",
+                e,
+                &text.chars().take(500).collect::<String>()
+            ))
+        });
+    }
+    Err(last_err.unwrap_or_else(|| {
+        crate::error::LauncherError::Download("CurseForge request failed".to_string())
+    }))
+}
+
+/// Single-attempt API request with a short timeout. Used for optional calls
+/// like the signed download URL, where a fallback (CDN URL) exists — no need
+/// to burn 4 retries on a stalled connection.
+async fn api_get_once<T: serde::de::DeserializeOwned>(
+    url: &str,
+    api_key: &str,
+    timeout_secs: u64,
+) -> Result<T> {
+    let client = crate::download::global_http_client();
+    let response = crate::download::send_with_fallback(
+        client
+            .get(url)
+            .header("x-api-key", api_key)
+            .header("Accept", "application/json")
+            .timeout(std::time::Duration::from_secs(timeout_secs)),
+    )
+    .await?;
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(crate::error::LauncherError::Download(
-            format!("CurseForge API error ({}): {}", status, text)
-        ));
+        return Err(crate::error::LauncherError::Download(format!(
+            "CurseForge API error ({}): {}",
+            status, text
+        )));
     }
-
-    let text = response.text().await.map_err(|e| {
-        crate::error::LauncherError::Download(format!("Failed to read response body: {}", e))
-    })?;
-
-    serde_json::from_str::<T>(&text).map_err(|e| {
+    let text = response.text().await?;
+    Ok(serde_json::from_str::<T>(&text).map_err(|e| {
         crate::error::LauncherError::Download(format!(
-            "Failed to decode CurseForge response: {}. Body preview: {}",
-            e,
-            &text.chars().take(500).collect::<String>()
+            "Failed to decode CurseForge response: {}",
+            e
         ))
-    })
+    })?)
 }
 
 pub async fn search_mods(
     query: &str,
     mc_version: Option<&str>,
     loader: Option<&str>,
+    offset: u32,
+    limit: u32,
+    api_key: &str,
+) -> Result<CfSearchResponse> {
+    search_mods_filtered(query, mc_version, loader, None, None, offset, limit, api_key).await
+}
+
+/// Search with optional classId (e.g. 4471 = modpacks) and categoryId filters.
+pub async fn search_mods_filtered(
+    query: &str,
+    mc_version: Option<&str>,
+    loader: Option<&str>,
+    class_id: Option<u32>,
+    category_id: Option<u32>,
     offset: u32,
     limit: u32,
     api_key: &str,
@@ -195,6 +304,13 @@ pub async fn search_mods(
         "sortField=2".to_string(),
         "sortOrder=desc".to_string(),
     ];
+
+    if let Some(c) = class_id {
+        params.push(format!("classId={}", c));
+    }
+    if let Some(c) = category_id {
+        params.push(format!("categoryId={}", c));
+    }
 
     if let Some(v) = mc_version {
         params.push(format!("gameVersion={}", urlencoding::encode(v)));
@@ -245,9 +361,10 @@ pub async fn get_mod_file(mod_id: u64, file_id: u64, api_key: &str) -> Result<Cf
 }
 
 /// Official signed download URL from the CurseForge API (most reliable).
+/// Single fast attempt — on failure the installer falls back to CDN URLs.
 pub async fn get_mod_file_download_url(mod_id: u64, file_id: u64, api_key: &str) -> Result<String> {
     let url = format!("{}/v1/mods/{}/files/{}/download-url", BASE_URL, mod_id, file_id);
-    let resp: CfDataResponse<String> = api_get(&url, api_key).await?;
+    let resp: CfDataResponse<String> = api_get_once(&url, api_key, 8).await?;
     Ok(resp.data)
 }
 

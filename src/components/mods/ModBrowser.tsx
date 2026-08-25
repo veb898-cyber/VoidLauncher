@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react';
+﻿import { useEffect, useRef, useState } from 'react';
 import { t } from '../../lib/i18n';
 import { invoke } from '@tauri-apps/api/core';
 import { Search, X, Check, Loader2, ArrowUpDown, Star, Calendar } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { addToast } from '../ui/Toast';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
 
 interface ModBrowserProps {
   mcVersion: string;
@@ -53,6 +54,12 @@ export function ModBrowser({ mcVersion, loader, onConfirm, onCancel }: ModBrowse
   const [sortMode, setSortMode] = useState<SortMode>('downloads');
   const [selectedMods, setSelectedMods] = useState<SelectedMod[]>([]);
   const [addingModId, setAddingModId] = useState<string | number | null>(null);
+  const mdBodyRef = useRef<HTMLDivElement | null>(null);
+  // Re-route remote description images through the backend after render
+  // (the webview alone has no proxy fallback).
+  useEffect(() => {
+    if (!loadingDetail) hydrateRemoteImages(mdBodyRef.current);
+  }, [loadingDetail, modDetail]);
 
   useEffect(() => { loadPopular(); }, [source, mcVersion, loader]);
 
@@ -230,211 +237,11 @@ export function ModBrowser({ mcVersion, loader, onConfirm, onCancel }: ModBrowse
     return String(n);
   };
 
-  const resolveUrl = (url: string, src?: string): string => {
-    if (!url) return url;
-    const trimmed = url.trim();
-    if (trimmed.startsWith('//')) return `https:${trimmed}`;
-    if (trimmed.startsWith('/')) {
-      const base = src === 'curseforge' ? 'https://www.curseforge.com' : 'https://modrinth.com';
-      return `${base}${trimmed}`;
-    }
-    return trimmed;
-  };
-
-  const renderMarkdown = (text: string, source?: string): any[] => {
-    if (!text) return [];
-    let processed = text
-      .replace(/<img\s[^>]*>/gi, (m) => {
-        const src = m.match(/src=["']([^"']+)["']/i);
-        const altMatch = m.match(/alt=["']([^"']*)["']/i);
-        const alt = altMatch ? altMatch[1] : '';
-        return src ? `![${alt}](${resolveUrl(src[1], source)})` : m;
-      })
-      .replace(/<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, '[$2]($1)')
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<\/?p[^>]*>/gi, '\n')
-      .replace(/<\/?strong[^>]*>/gi, '**')
-      .replace(/<\/?b[^>]*>/gi, '**')
-      .replace(/<\/?em[^>]*>/gi, '*')
-      .replace(/<\/?i[^>]*>/gi, '*')
-      .replace(/<\/?h[1-6][^>]*>/gi, '\n')
-      .replace(/<\/?ul[^>]*>/gi, '')
-      .replace(/<\/?ol[^>]*>/gi, '')
-      .replace(/<li[^>]*>/gi, '- ')
-      .replace(/<\/li>/gi, '\n')
-      .replace(/<hr\s*\/?>/gi, '---')
-      .replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`')
-      .replace(/<pre[^>]*>(.*?)<\/pre>/gi, '\n```\n$1\n```\n')
-      .replace(/<[^>]+>/g, '');
-
-    const lines = processed.split('\n').map(l => l.replace(/\r$/, ''));
-    const elements: any[] = [];
-    let i = 0;
-    let keyCounter = 0;
-
-    while (i < lines.length) {
-      const line = lines[i];
-      if (line.trim() === '') { i++; continue; }
-
-      if (line.trim().startsWith('```')) {
-        const codeLines: string[] = [];
-        const lang = line.trim().slice(3).trim();
-        i++;
-        while (i < lines.length && !lines[i].trim().startsWith('```')) {
-          codeLines.push(lines[i]); i++;
-        }
-        if (i < lines.length) i++;
-        elements.push(
-          <div key={`code${keyCounter++}`} style={{ margin: '8px 0', borderRadius: 'var(--radius-md)', overflow: 'hidden', background: 'hsla(0,0%,0%,0.3)', border: '1px solid var(--surface-border)' }}>
-            {lang && <div style={{ padding: '4px 12px', fontSize: 10, color: 'var(--text-tertiary)', borderBottom: '1px solid var(--surface-border)', fontFamily: 'monospace' }}>{lang}</div>}
-            <pre style={{ margin: 0, padding: '12px', fontSize: 'var(--font-size-xs)', fontFamily: "'Cascadia Code','Fira Code',monospace", color: 'var(--text-secondary)', overflowX: 'auto', whiteSpace: 'pre', lineHeight: 1.5 }}>{codeLines.join('\n')}</pre>
-          </div>
-        );
-        continue;
-      }
-
-      if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line.trim())) {
-        elements.push(<hr key={`hr${keyCounter++}`} style={{ border: 'none', borderTop: '1px solid var(--surface-border)', margin: '12px 0' }} />);
-        i++; continue;
-      }
-
-      const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
-      if (headingMatch) {
-        const level = headingMatch[1].length;
-        const sz = level === 1 ? '1.2em' : level === 2 ? '1.1em' : '1em';
-        const Tag = `h${level}` as any;
-        elements.push(<Tag key={`h${keyCounter++}`} style={{ fontWeight: 700, margin: '12px 0 4px', fontSize: sz, color: 'var(--text-primary)' }}>{renderInline(headingMatch[2], source)}</Tag>);
-        i++; continue;
-      }
-
-      if (line.startsWith('>')) {
-        const quoteLines: string[] = [];
-        while (i < lines.length && lines[i].startsWith('>')) { quoteLines.push(lines[i].replace(/^>\s?/, '')); i++; }
-        elements.push(
-          <blockquote key={`bq${keyCounter++}`} style={{ margin: '8px 0', padding: '8px 16px', borderLeft: '3px solid var(--primary)', background: 'hsla(265,100%,65%,0.05)', borderRadius: '0 var(--radius-sm) var(--radius-sm) 0', fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
-            {quoteLines.map((ql, qi) => <div key={qi}>{renderInline(ql, source)}</div>)}
-          </blockquote>
-        );
-        continue;
-      }
-
-      if (line.includes('|') && line.trim().startsWith('|')) {
-        const tableRows: string[][] = [];
-        while (i < lines.length && lines[i].includes('|') && lines[i].trim().startsWith('|')) {
-          const cells = lines[i].split('|').filter((_c, idx, arr) => idx > 0 && idx < arr.length - 1).map((c) => c.trim());
-          if (!cells.every((c) => /^[-:]+$/.test(c))) tableRows.push(cells);
-          i++;
-        }
-        if (tableRows.length > 0) {
-          elements.push(
-            <table key={`tbl${keyCounter++}`} style={{ width: '100%', borderCollapse: 'collapse', margin: '8px 0', fontSize: 'var(--font-size-sm)' }}>
-              <thead><tr>{tableRows[0].map((cell, ci) => <th key={ci} style={{ padding: '6px 10px', borderBottom: '2px solid var(--surface-border)', textAlign: 'left', fontWeight: 600, color: 'var(--text-primary)' }}>{renderInline(cell, source)}</th>)}</tr></thead>
-              <tbody>{tableRows.slice(1).map((row, ri) => <tr key={ri}>{row.map((cell, ci) => <td key={ci} style={{ padding: '6px 10px', borderBottom: '1px solid var(--surface-border)', color: 'var(--text-secondary)' }}>{renderInline(cell, source)}</td>)}</tr>)}</tbody>
-            </table>
-          );
-        }
-        continue;
-      }
-
-      const imgMatch = line.match(/^!\[([^\]]*)\]\(([^)]*(?:\([^)]*\)[^)]*)*)\)\s*$/);
-      if (imgMatch) {
-        const url = resolveUrl(imgMatch[2], source);
-        const alt = imgMatch[1];
-        elements.push(
-          <div key={`img${keyCounter++}`} style={{ margin: '8px 0' }}>
-            <a href={url} style={{ color: 'var(--primary)', textDecoration: 'none', fontSize: 'var(--font-size-sm)' }}>
-              <img src={url} alt={alt} style={{ maxWidth: '100%', borderRadius: 'var(--radius-md)', cursor: 'pointer', display: 'block' }}
-                onError={(e) => {
-                  const img = e.target as HTMLImageElement;
-                  const parent = img.parentElement;
-                  if (parent) parent.textContent = alt || url;
-                }} />
-            </a>
-          </div>
-        );
-        i++; continue;
-      }
-
-      const looseImgMatch = line.match(/^!\[([^\]]*)\]\(([^)\s]+)\s*$/);
-      if (looseImgMatch) {
-        const url = resolveUrl(looseImgMatch[2], source);
-        const alt = looseImgMatch[1];
-        elements.push(<div key={`link${keyCounter++}`} style={{ margin: '8px 0' }}><a href={url} style={{ color: 'var(--primary)', textDecoration: 'none', fontSize: 'var(--font-size-sm)' }}>{alt || url}</a></div>);
-        i++; continue;
-      }
-
-      const listMatch = line.match(/^[-*+]\s+(.+)/);
-      if (listMatch) {
-        const items: string[] = [listMatch[1]];
-        while (i + 1 < lines.length) {
-          const nextMatch = lines[i + 1].match(/^[-*+]\s+(.+)/);
-          if (nextMatch) { items.push(nextMatch[1]); i++; } else break;
-        }
-        elements.push(<ul key={`ul${keyCounter++}`} style={{ margin: '4px 0', paddingLeft: '20px', fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>{items.map((item, j) => <li key={j} style={{ marginBottom: 2 }}>{renderInline(item, source)}</li>)}</ul>);
-        i++; continue;
-      }
-
-      elements.push(<p key={`p${keyCounter++}`} style={{ margin: '4px 0', color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)', lineHeight: 1.6 }}>{renderInline(line, source)}</p>);
-      i++;
-    }
-    return elements;
-  };
-
-  const renderInline = (text: string, source?: string): any[] => {
-    if (!text) return [];
-    const parts: any[] = [];
-    let remaining = text;
-    let keyIdx = 0;
-
-    while (remaining.length > 0) {
-      const codeMatch = remaining.match(/`([^`]+)`/);
-      const imgMatch = remaining.match(/!\[([^\]]*)\]\(([^)]*(?:\([^)]*\)[^)]*)*)\)/);
-      const linkMatch = remaining.match(/\[([^\]]+)\]\(([^)]*(?:\([^)]*\)[^)]*)*)\)/);
-      const boldMatch = remaining.match(/\*\*(.+?)\*\*/);
-      const italicMatch = remaining.match(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/);
-
-      let earliestIndex = Infinity;
-      let matchType = '';
-      let matchResult: RegExpMatchArray | null = null;
-
-      [{ m: codeMatch, t: 'code' }, { m: imgMatch, t: 'img' }, { m: linkMatch, t: 'link' }, { m: boldMatch, t: 'bold' }, { m: italicMatch, t: 'italic' }].forEach(({ m, t }) => {
-        if (m && m.index !== undefined && m.index < earliestIndex) { earliestIndex = m.index; matchType = t; matchResult = m; }
-      });
-
-      if (!matchResult) { parts.push(<span key={keyIdx++}>{remaining}</span>); break; }
-      const mr = matchResult! as RegExpMatchArray;
-
-      if (earliestIndex > 0) parts.push(<span key={keyIdx++}>{remaining.slice(0, earliestIndex)}</span>);
-
-      if (matchType === 'code') {
-        parts.push(<code key={keyIdx++} style={{ background: 'hsla(0,0%,100%,0.08)', padding: '1px 5px', borderRadius: 3, fontFamily: "'Cascadia Code','Fira Code',monospace", fontSize: '0.9em', color: 'var(--primary)' }}>{mr[1]}</code>);
-      } else if (matchType === 'img') {
-        const url = resolveUrl(mr[2], source);
-        const alt = mr[1];
-        parts.push(
-          <a key={keyIdx++} href={url} style={{ color: 'var(--primary)', textDecoration: 'none', fontSize: 'var(--font-size-sm)' }}>
-            <img src={url} alt={alt} style={{ maxWidth: '100%', borderRadius: 4, display: 'block', margin: '4px 0', cursor: 'pointer' }}
-              onError={(e) => {
-                const img = e.target as HTMLImageElement;
-                const parent = img.parentElement;
-                if (parent) parent.textContent = alt || url;
-              }} />
-          </a>
-        );
-      } else if (matchType === 'link') {
-        const url = resolveUrl(mr[2], source);
-        parts.push(<a key={keyIdx++} href={url} style={{ color: 'var(--primary)', textDecoration: 'none' }}>{mr[1]}</a>);
-      } else if (matchType === 'bold') {
-        parts.push(<strong key={keyIdx++} style={{ fontWeight: 600 }}>{mr[1]}</strong>);
-      } else if (matchType === 'italic') {
-        parts.push(<em key={keyIdx++} style={{ fontStyle: 'italic' }}>{mr[1]}</em>);
-      }
-
-      remaining = remaining.slice(earliestIndex + mr[0].length);
-    }
-    return parts;
-  };
-
+  // Full CommonMark+GFM rendering via marked (shared module). CurseForge
+  // bodies arrive as HTML and are normalized inside renderMarkdownToHtml;
+  // relative URLs resolve against the source platform.
+  const renderMarkdown = (text: string, src?: string): string =>
+    renderMarkdownToHtml(text, src);
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)', height: '100%' }}>
       {/* Source tabs + search + sort */}
@@ -489,7 +296,7 @@ export function ModBrowser({ mcVersion, loader, onConfirm, onCancel }: ModBrowse
                   </div>
                   <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {mod.author || mod.authors?.[0]?.name}
-                    {mod.downloads != null && ` · ${t('content.download_count', { n: formatDownloads(mod.downloads) })}`}
+                    {mod.downloads != null && ` В· ${t('content.download_count', { n: formatDownloads(mod.downloads) })}`}
                   </div>
                 </div>
                 <Button size="sm" variant={isAdded ? 'ghost' : 'primary'} onClick={(e) => { e.stopPropagation(); addModLatest(mod); }} disabled={isAdded || addingModId === mod.id} style={{ flexShrink: 0, alignSelf: 'center' }}>
@@ -516,7 +323,7 @@ export function ModBrowser({ mcVersion, loader, onConfirm, onCancel }: ModBrowse
                     <h3 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700 }}>{selectedMod.name}</h3>
                     <p style={{ margin: 0, fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>{selectedMod.description}</p>
                     {selectedMod.downloads != null && (
-                      <p style={{ margin: '4px 0 0', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{formatDownloads(selectedMod.downloads)} downloads</p>
+                      <p style={{ margin: '4px 0 0', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('content.download_count', { n: formatDownloads(selectedMod.downloads) })}</p>
                     )}
                   </div>
                   <Button size="sm" variant={selectedMods.some((m) => String(m.modId) === String(selectedMod.id)) ? 'ghost' : 'primary'}
@@ -530,16 +337,14 @@ export function ModBrowser({ mcVersion, loader, onConfirm, onCancel }: ModBrowse
 
                 {/* Full description */}
                 {modDetail?.body && (
-                  <div style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)', fontSize: 'var(--font-size-sm)' }}
-                    onClick={(e) => { const a = (e.target as HTMLElement).closest('a'); if (a?.href?.startsWith('http')) { e.preventDefault(); openUrl(a.href); } }}>
-                    {renderMarkdown(modDetail.body, source)}
-                  </div>
+                  <div ref={mdBodyRef} className="md-content" style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(modDetail.body, source) }}
+                    onClick={(e) => { const a = (e.target as HTMLElement).closest('a'); if (a?.href?.startsWith('http')) { e.preventDefault(); openUrl(a.href); } }} />
                 )}
                 {modDetail?.description && !modDetail.body && (
-                  <div style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)', fontSize: 'var(--font-size-sm)' }}
-                    onClick={(e) => { const a = (e.target as HTMLElement).closest('a'); if (a?.href?.startsWith('http')) { e.preventDefault(); openUrl(a.href); } }}>
-                    {renderMarkdown(modDetail.description, source)}
-                  </div>
+                  <div ref={modDetail.description ? mdBodyRef : undefined} className="md-content" style={{ marginBottom: 'var(--space-md)', padding: 'var(--space-md)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)' }}
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(modDetail.description, source) }}
+                    onClick={(e) => { const a = (e.target as HTMLElement).closest('a'); if (a?.href?.startsWith('http')) { e.preventDefault(); openUrl(a.href); } }} />
                 )}
 
                 {/* Version selector */}

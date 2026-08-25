@@ -1,23 +1,55 @@
-import { Plus, Package } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { Plus, Package, Play, Settings, FolderOpen, Trash2 } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { t } from '../../lib/i18n';
 import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
+import { InstanceEditor } from './InstanceEditor';
 import { useEventStore } from '../../hooks/useGameEvents';
 
 interface InstanceListProps {
   onCreateClick: () => void;
 }
 
+interface ContextMenuState {
+  x: number;
+  y: number;
+  name: string;
+}
+
 export function InstanceList({ onCreateClick }: InstanceListProps) {
   const instances = useInstanceStore((s) => s.instances);
   const selectedInstance = useInstanceStore((s) => s.selectedInstance);
   const selectInstance = useInstanceStore((s) => s.selectInstance);
+  const launchGame = useInstanceStore((s) => s.launchGame);
+  const deleteInstance = useInstanceStore((s) => s.deleteInstance);
   const isLaunching = useInstanceStore((s) => s.isLaunching);
   const installProgress = useEventStore((s) => s.installProgress);
 
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [deleteConfirmName, setDeleteConfirmName] = useState<string | null>(null);
+  const [editorName, setEditorName] = useState<string | null>(null);
+  const editorInstance = editorName ? instances.find((i) => i.name === editorName) ?? null : null;
+
   const installingName = installProgress?.instance_id || null;
+
+  // Close the context menu on any click outside of it.
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handler = () => setContextMenu(null);
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [contextMenu]);
+
+  const openFolder = async (name: string, subfolder?: string) => {
+    try {
+      await invoke('cmd_open_instance_folder', { instanceName: name, subfolder: subfolder ?? null });
+    } catch (e) {
+      console.error('Failed to open instance folder:', e);
+    }
+  };
 
   return (
     <div
@@ -71,6 +103,10 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
               <div
                 key={instance.name}
                 onClick={() => useBrowserGuardStore.getState().askLeave(() => selectInstance(instance.name))}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setContextMenu({ x: e.clientX, y: e.clientY, name: instance.name });
+                }}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -137,6 +173,69 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           })
         )}
       </div>
+
+      {/* Context Menu */}
+      {contextMenu && (
+        <div
+          className="ctx-menu"
+          style={{
+            left: Math.min(contextMenu.x, window.innerWidth - 200),
+            top: Math.min(contextMenu.y, window.innerHeight - 170),
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <ContextMenuItem icon={<Play size={14} fill="currentColor" />} label={t('instances.play')} disabled={isLaunching}
+            onClick={() => { launchGame(contextMenu.name); setContextMenu(null); }} />
+          <ContextMenuItem icon={<Settings size={14} />} label={t('instances.ctx_settings')}
+            onClick={() => { setEditorName(contextMenu.name); setContextMenu(null); }} />
+          <ContextMenuItem icon={<FolderOpen size={14} />} label={t('instances.ctx_open_folder')}
+            onClick={() => { openFolder(contextMenu.name); setContextMenu(null); }} />
+          <ContextMenuItem icon={<Trash2 size={14} />} label={t('common.delete')} danger
+            onClick={() => { setDeleteConfirmName(contextMenu.name); setContextMenu(null); }} />
+        </div>
+      )}
+
+      {/* Instance Settings Editor (opened from the card context menu) */}
+      {editorInstance && (
+        <InstanceEditor
+          open
+          instance={editorInstance}
+          onClose={() => setEditorName(null)}
+          onSaved={() => useInstanceStore.getState().loadInstances()}
+        />
+      )}
+
+      {/* Delete Confirmation */}
+      {deleteConfirmName && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
+          <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }}>
+            <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('instance_detail.confirm_delete_title')}</h3>
+            <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('instance_detail.confirm_delete_text', { name: deleteConfirmName })}</p>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+              <Button variant="ghost" onClick={() => setDeleteConfirmName(null)}>{t('common.cancel')}</Button>
+              <Button onClick={() => { deleteInstance(deleteConfirmName); setDeleteConfirmName(null); }} style={{ background: 'var(--color-danger)', color: 'white' }}>{t('common.delete')}</Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+function ContextMenuItem({ icon, label, onClick, disabled, danger }: {
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      className={`ctx-menu__item${danger ? ' ctx-menu__item--danger' : ''}`}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {icon} {label}
+    </button>
   );
 }

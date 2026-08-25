@@ -32,6 +32,9 @@ pub enum LauncherError {
     #[error("Download error: {0}")]
     Download(String),
 
+    #[error("Download paused")]
+    Paused,
+
     #[error("Mod loader error: {0}")]
     ModLoader(String),
 }

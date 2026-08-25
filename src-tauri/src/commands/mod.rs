@@ -9,6 +9,7 @@ pub mod auth;
 pub mod instances;
 pub mod launcher;
 pub mod misc;
+pub mod modpacks;
 pub mod mods;
 pub mod versions;
 // pub mod misc;

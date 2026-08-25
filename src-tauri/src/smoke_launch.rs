@@ -19,9 +19,6 @@ use std::time::{Duration, Instant};
 const POLL_STEP: Duration = Duration::from_millis(1000);
 const COMBO_TIMEOUT: Duration = Duration::from_secs(120);
 
-// LiteLoader is intentionally absent: the upstream artifact host
-// (dl.liteloader.com) is dead, so even Prism meta can't serve the JAR;
-// the app gates it with a "not supported" toast (liteloader.rs).
 const COMBOS: &[(&str, &str)] = &[
     ("1.8.9", "Forge"),
     ("1.12.2", "Vanilla"),
@@ -41,7 +38,6 @@ fn loader_type(s: &str) -> LoaderType {
         "Fabric" => LoaderType::Fabric,
         "Forge" => LoaderType::Forge,
         "NeoForge" => LoaderType::NeoForge,
-        "LiteLoader" => LoaderType::LiteLoader,
         _ => LoaderType::Vanilla,
     }
 }
@@ -51,7 +47,6 @@ fn loader_marker(s: &str) -> Option<&'static str> {
         "Fabric" => Some("FabricLoader"),
         "Forge" => Some("MinecraftForge"),
         "NeoForge" => Some("NeoForge"),
-        "LiteLoader" => Some("LiteLoader"),
         _ => None,
     }
 }
@@ -203,7 +198,6 @@ async fn install_loader_for(
         "Fabric" => modloaders::fabric::get_loader_versions(0, 40).await,
         "Forge" => modloaders::forge::get_loader_versions(mc, 0, 40).await,
         "NeoForge" => modloaders::neoforge::get_loader_versions(mc, 0, 40).await,
-        "LiteLoader" => modloaders::liteloader::get_loader_versions(mc, 0, 40).await,
         _ => return Err("vanilla has no loader version".into()),
     }
     .map_err(|e| format!("list {} versions: {}", loader, e))?;
@@ -248,7 +242,7 @@ async fn install_version(config: &AppConfig, mc: &str) -> Result<versions::Versi
     let files = versions::collect_downloads(&vi, &config.libraries_dir(), &config.versions_dir());
     if !files.is_empty() {
         report_line(&format!("downloading {} files for {}...", files.len(), mc));
-        download::download_files(files, |_, _, _| {}).await.map_err(|e| e.to_string())?;
+        download::download_files(files, |_, _, _, _, _| {}).await.map_err(|e| e.to_string())?;
     }
 
     versions::ensure_native_libraries(&vi, &config.libraries_dir())
@@ -263,7 +257,7 @@ async fn install_version(config: &AppConfig, mc: &str) -> Result<versions::Versi
         std::fs::create_dir_all(idx_path.parent().unwrap()).map_err(|e| e.to_string())?;
         let json = serde_json::to_string_pretty(&asset_index).map_err(|e| e.to_string())?;
         std::fs::write(&idx_path, json).map_err(|e| e.to_string())?;
-        download::download_assets(&asset_index, &config.assets_dir(), |_, _, _| {})
+        download::download_assets(&asset_index, &config.assets_dir(), |_, _, _, _, _| {})
             .await
             .map_err(|e| format!("assets {}: {}", mc, e))?;
         let asset_index = versions::load_asset_index(&idx_path).map_err(|e| e.to_string())?;
@@ -289,30 +283,34 @@ fn kill_tree(pid: u32) {
     }
 }
 
-/// Drain a piped game-process handle (stdout/stderr) after the process
-/// died, with a hard timeout so a stuck grandchild holding the write
-/// end can never hang the harness.
-async fn drain_pipe(mut r: Option<impl std::io::Read + Send + 'static>) -> Vec<u8> {
-    use std::io::Read;
-    let Some(mut r) = r.take() else { return Vec::new(); };
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::task::spawn_blocking(move || {
-        let mut buf = Vec::new();
-        let _ = r.read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-    match tokio::time::timeout(Duration::from_secs(3), rx).await {
-        Ok(Ok(b)) => b,
-        _ => Vec::new(),
-    }
-}
-
 /// Tail of a byte buffer as lossy UTF-8, capped for error messages.
 fn pipe_tail(buf: &[u8], max: usize) -> String {
     let s = String::from_utf8_lossy(buf);
     let s = s.trim();
     let start = s.len().saturating_sub(max);
     s[start..].to_string()
+}
+
+/// Read the newest raw stdout/stderr tee file produced by the launcher's
+/// unified logging (launch_minecraft now owns the pipes, so the harness
+/// can no longer drain them directly).
+fn newest_tee(dir: &std::path::Path, suffix: &str) -> Vec<u8> {
+    let logs_dir = dir.join("logs").join("game");
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    if let Ok(rd) = std::fs::read_dir(&logs_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if !name.ends_with(suffix) {
+                continue;
+            }
+            let mtime = p.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                best = Some((mtime, p));
+            }
+        }
+    }
+    best.map(|(_, p)| std::fs::read(&p).unwrap_or_default()).unwrap_or_default()
 }
 
 type Verdict = Result<String, String>;
@@ -484,8 +482,10 @@ async fn run_combo(
         if let Ok(Some(status)) = child.try_wait() {
             let code = status.code().unwrap_or(-1);
             let _ = kill_tree(child.id());
-            let out = drain_pipe(child.stdout.take()).await;
-            let err = drain_pipe(child.stderr.take()).await;
+            // The launcher owns the pipes now (unified session logging);
+            // fall back to the raw tee files for diagnostics.
+            let out = newest_tee(&data_dir, ".stdout.log");
+            let err = newest_tee(&data_dir, ".stderr.log");
             if let Ok(p) = std::env::var("SMOKE_STDERR_FILE") {
                 std::fs::write(&p, &err).ok();
                 std::fs::write(format!("{}.stdout", p), &out).ok();

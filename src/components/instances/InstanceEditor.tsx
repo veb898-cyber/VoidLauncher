@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { Button } from '../ui/Button';
@@ -14,7 +15,7 @@ import {
   resolveInitialMemoryMb,
 } from '../../lib/memory';
 import { useSettingsStore } from '../../stores/settingsStore';
-import { useT } from '../../lib/i18n';
+import { useT, getLanguage } from '../../lib/i18n';
 
 interface InstanceData {
   name: string;
@@ -41,10 +42,11 @@ type GcPreset = 'standard' | 'g1gc' | 'zgc';
 
 export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const t = useT();
+  const gb = getLanguage() === 'ru' ? 'ГБ' : 'GB';
   const presetOptions: SelectOption<GcPreset>[] = [
     { value: 'standard', label: t('instance_editor.gc_standard'), description: 'No special GC flags' },
     { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: 'Java 8+' },
-    { value: 'zgc', label: t('instance_editor.gc_zgc'), description: 'Java 17+, ≥6 GB' },
+    { value: 'zgc', label: t('instance_editor.gc_zgc'), description: `Java 17+, \u2265 8 ${gb}` },
   ];
   const globalConfig = useSettingsStore((s) => s.config);
   const globalDefaultMemoryMb = globalConfig?.default_memory_mb ?? null;
@@ -63,23 +65,48 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const [resWidth, setResWidth] = useState(instance.resolution?.width?.toString() || '');
   const [resHeight, setResHeight] = useState(instance.resolution?.height?.toString() || '');
   const [systemRamMb, setSystemRamMb] = useState<number>(8192);
+  const [baseline, setBaseline] = useState('');
+  const [confirmClose, setConfirmClose] = useState(false);
 
   useEffect(() => {
-    setName(instance.name);
-    setNotes(instance.notes || '');
     // Initial memory resolves in this order:
     //   1. instance.memory_mb (explicit per-instance value)
     //   2. global default_memory_mb from Settings (synced)
     //   3. tiered RAM recommendation (4/6/8 GB) as final fallback
-    setMemoryMb(
-      resolveInitialMemoryMb(instance.memory_mb, systemRamMb, globalDefaultMemoryMb)
+    const resolvedMemory = resolveInitialMemoryMb(
+      instance.memory_mb, systemRamMb, globalDefaultMemoryMb
     );
+    setName(instance.name);
+    setNotes(instance.notes || '');
+    setMemoryMb(resolvedMemory);
     setJvmArgs(instance.jvm_args?.join(' ') || '');
     setGcPreset((instance.gc_preset as GcPreset) ?? globalDefaultGcPreset);
     setJavaPath(instance.java_path || '');
     setResWidth(instance.resolution?.width?.toString() ?? '');
     setResHeight(instance.resolution?.height?.toString() ?? '');
+    // Snapshot of the just-loaded form: "dirty" means the user changed
+    // something relative to this snapshot (same pattern as global Settings).
+    setBaseline(JSON.stringify({
+      name: instance.name,
+      notes: instance.notes || '',
+      memoryMb: resolvedMemory,
+      jvmArgs: instance.jvm_args?.join(' ') || '',
+      gcPreset: (instance.gc_preset as GcPreset) ?? globalDefaultGcPreset,
+      javaPath: instance.java_path || '',
+      resWidth: instance.resolution?.width?.toString() ?? '',
+      resHeight: instance.resolution?.height?.toString() ?? '',
+    }));
   }, [instance, systemRamMb, globalDefaultMemoryMb, globalDefaultGcPreset]);
+
+  const dirty =
+    baseline !== '' &&
+    JSON.stringify({ name, notes, memoryMb, jvmArgs, gcPreset, javaPath, resWidth, resHeight }) !== baseline;
+
+  /** Close via overlay click / Escape / Cancel — but ask first when dirty. */
+  const requestClose = () => {
+    if (dirty) setConfirmClose(true);
+    else onClose();
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -151,7 +178,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const zgcDisabled = memoryMb < 8192;
 
   return (
-    <Modal open={open} onClose={onClose} title={t('instance_editor.title')}>
+    <Modal open={open} onClose={requestClose} title={t('instance_editor.title')}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
         <Input label={t('instance_editor.name_label')} id="edit-name" type="text" value={name} onChange={(e) => setName(e.target.value)} />
         <Input label={t('instance_editor.notes_label')} id="edit-notes" type="text" value={notes} onChange={(e) => setNotes(e.target.value)} />
@@ -159,7 +186,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
         {/* Memory slider with dynamic max */}
         <div>
           <label className="input__label" style={{ display: 'block', marginBottom: 6 }}>
-            {t('instance_editor.memory_label')} <strong>{allocatedGb} GB</strong>
+            {t('instance_editor.memory_label')} <strong>{allocatedGb} {gb}</strong>
             <span style={{ color: 'var(--text-tertiary)', marginLeft: 8, fontSize: 'var(--font-size-xs)' }}>
               {t('instance_editor.memory_max_info', { maxGb, systemRamGb })}
             </span>
@@ -236,10 +263,31 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
           </div>
         </div>
       </div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
-        <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
-        <Button onClick={handleSave}>{t('common.save')}</Button>
-      </div>
+      {/* Floating save button (bottom-right), only while there are unsaved
+          changes — same pattern as the global Settings page. Portaled above
+          the modal overlay (z 1000). */}
+      {dirty && createPortal(
+        <div className="settings-save-fab" style={{ zIndex: 1100 }}>
+          <button className="btn btn--primary" onClick={handleSave}>{t('common.save')}</button>
+        </div>,
+        document.body
+      )}
+      {/* Unsaved-changes confirmation when closing via overlay / Escape */}
+      {confirmClose && createPortal(
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 12000 }}>
+          <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }}>
+            <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('instance_editor.close_confirm_title')}</h3>
+            <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('instance_editor.close_confirm_text')}</p>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+              <Button variant="ghost" onClick={() => setConfirmClose(false)}>{t('instance_editor.close_stay')}</Button>
+              <Button onClick={() => { setConfirmClose(false); onClose(); }} style={{ background: 'var(--color-danger)', color: 'white' }}>
+                {t('instance_editor.close_discard')}
+              </Button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
     </Modal>
   );
 }

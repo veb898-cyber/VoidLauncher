@@ -16,6 +16,8 @@ export interface AccountEntry {
   uuid?: string;
   skin_variant?: string;
   default: boolean;
+  /** Microsoft only: whether a stored session exists in the OS vault. */
+  has_ms_session?: boolean;
 }
 
 interface AccountsState {

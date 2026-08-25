@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VoidLauncher",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "identifier": "com.voidlauncher.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' https://crafatar.com https://mc-heads.net https://piston-meta.mojang.com https://cdn.modrinth.com https://modrinth.com https://mediafilez.forgecdn.net https://edge.forgecdn.net https://media.forgecdn.net https://asset.localhost data: blob:; connect-src 'self' https://piston-meta.mojang.com https://piston-data.mojang.com https://launchermeta.mojang.com https://resources.download.minecraft.net https://libraries.minecraft.net https://login.microsoftonline.com https://user.auth.xboxlive.com https://xsts.auth.xboxlive.com https://api.minecraftservices.com https://meta.fabricmc.net https://maven.minecraftforge.net https://maven.neoforged.net https://api.modrinth.com https://api.curseforge.com https://authserver.ely.by https://raw.githubusercontent.com https://github.com https://objects.githubusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com",
+        "csp": "default-src 'self'; img-src 'self' https://crafatar.com https://mc-heads.net https://piston-meta.mojang.com https://cdn.modrinth.com https://modrinth.com https://mediafilez.forgecdn.net https://edge.forgecdn.net https://media.forgecdn.net https://download.nodecdn.net https://asset.localhost data: blob:; connect-src 'self' https://piston-meta.mojang.com https://piston-data.mojang.com https://launchermeta.mojang.com https://resources.download.minecraft.net https://libraries.minecraft.net https://login.microsoftonline.com https://user.auth.xboxlive.com https://xsts.auth.xboxlive.com https://api.minecraftservices.com https://meta.fabricmc.net https://maven.minecraftforge.net https://maven.neoforged.net https://api.modrinth.com https://api.curseforge.com https://authserver.ely.by https://raw.githubusercontent.com https://github.com https://objects.githubusercontent.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com",
       "assetProtocol": {
         "scope": ["$APPDATA/**"]
       }
@@ -41,7 +41,9 @@
     ],
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "displayLanguageSelector": true,
+        "languages": ["English", "Russian"]
       }
     }
   },

@@ -337,15 +337,11 @@ impl AppConfig {
         self.data_dir.join("auth.json")
     }
 
-    /// Get icon cache file
-    pub fn icon_cache_file(&self) -> PathBuf {
-        self.data_dir.join("icon_cache.json")
-    }
-
-    /// Proxy URL for reqwest (`None` when disabled). E.g. `http://127.0.0.1:8080`.
+    /// Proxy `host:port` for reqwest (`None` when disabled). The scheme is
+    /// resolved automatically (HTTP first, then SOCKS5) in `download.rs`.
     pub fn proxy_url(&self) -> Option<String> {
         if self.proxy_enabled && !self.proxy_addr.trim().is_empty() && self.proxy_port > 0 {
-            Some(format!("http://{}:{}", self.proxy_addr.trim(), self.proxy_port))
+            Some(format!("{}:{}", self.proxy_addr.trim(), self.proxy_port))
         } else {
             None
         }
@@ -371,7 +367,7 @@ mod tests {
         c.proxy_enabled = true;
         c.proxy_addr = " 127.0.0.1 ".into();
         c.proxy_port = 8080;
-        assert_eq!(c.proxy_url(), Some("http://127.0.0.1:8080".to_string()));
+        assert_eq!(c.proxy_url(), Some("127.0.0.1:8080".to_string()));
     }
 
     #[test]

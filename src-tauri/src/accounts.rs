@@ -58,10 +58,17 @@ pub struct PublicAccountEntry {
     pub uuid: Option<String>,
     pub skin_variant: Option<String>,
     pub default: bool,
+    /// Microsoft only: whether the account has a stored session. A
+    /// Microsoft account without one cannot launch until the user signs
+    /// in again (the sign-in targets the same entry by uuid).
+    #[serde(default)]
+    pub has_ms_session: bool,
 }
 
 impl From<AccountEntry> for PublicAccountEntry {
     fn from(a: AccountEntry) -> Self {
+        let has_ms_session = a.account_type == AccountType::Microsoft
+            && load_ms_session(&a.id).is_some();
         Self {
             id: a.id,
             name: a.name,
@@ -69,6 +76,7 @@ impl From<AccountEntry> for PublicAccountEntry {
             uuid: a.uuid,
             skin_variant: a.skin_variant,
             default: a.default,
+            has_ms_session,
         }
     }
 }
@@ -110,28 +118,111 @@ impl AccountEntry {
 
 // ==================== OS credential vault ====================
 
+/// Windows Credential Manager caps a single password blob at 2560 bytes,
+/// which the keyring crate fills as UTF-16 (~1280 chars). A serialized
+/// Microsoft session (OAuth + Minecraft tokens + profile) easily exceeds
+/// that, so values are split across numbered entries `<key>#0`, `<key>#1`, ...
+const VAULT_CHUNK_CHARS: usize = 1024;
+/// Upper bound on chunks scanned on read/delete (32 KB is far more than any
+/// session needs); also stops the scan loop from running away.
+const VAULT_MAX_CHUNKS: usize = 32;
+
+fn chunk_key(user: &str, index: usize) -> String {
+    format!("{user}#{index}")
+}
+
+/// Split `value` into vault-sized chunks. Always returns at least one chunk
+/// (possibly empty) so a written marker entry exists even for blank values.
+fn split_into_chunks(value: &str) -> Vec<String> {
+    let chars: Vec<char> = value.chars().collect();
+    let chunk_count = ((chars.len() + VAULT_CHUNK_CHARS - 1) / VAULT_CHUNK_CHARS).max(1);
+    (0..chunk_count)
+        .map(|i| {
+            let start = i * VAULT_CHUNK_CHARS;
+            let end = (start + VAULT_CHUNK_CHARS).min(chars.len());
+            chars[start..end].iter().collect()
+        })
+        .collect()
+}
+
 fn vault_set(user: &str, value: &str) -> Result<(), String> {
-    keyring::Entry::new(CM_SERVICE, user)
-        .map_err(|e| format!("vault init failed: {e}"))?
-        .set_password(value)
-        .map_err(|e| format!("vault write failed: {e}"))
+    // Windows Credential Manager rejects single entries above ~1280 UTF-16
+    // chars, so every value is stored in numbered chunks `<key>#0`, `<key>#1`...
+    let chunks = split_into_chunks(value);
+    for (i, part) in chunks.iter().enumerate() {
+        keyring::Entry::new(CM_SERVICE, &chunk_key(user, i))
+            .map_err(|e| format!("vault init failed: {e}"))?
+            .set_password(part)
+            .map_err(|e| format!("vault write failed: {e}"))?;
+    }
+    // Drop stale tail chunks left over from a previous, larger write.
+    let mut stale = chunks.len();
+    while stale < VAULT_MAX_CHUNKS {
+        let entry = match keyring::Entry::new(CM_SERVICE, &chunk_key(user, stale)) {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+        if entry.get_password().is_err() {
+            break;
+        }
+        let _ = entry.delete_credential();
+        stale += 1;
+    }
+    Ok(())
 }
 
 fn vault_get(user: &str) -> Option<String> {
-    match keyring::Entry::new(CM_SERVICE, user)
-        .and_then(|e| e.get_password())
-    {
-        Ok(v) => Some(v),
-        Err(_) => None,
+    // Chunked layout first: concatenate #0..#N until an entry is missing.
+    let mut parts: Vec<String> = Vec::new();
+    while parts.len() < VAULT_MAX_CHUNKS {
+        match keyring::Entry::new(CM_SERVICE, &chunk_key(user, parts.len()))
+            .and_then(|e| e.get_password())
+        {
+            Ok(part) => parts.push(part),
+            Err(_) => break,
+        }
     }
+    if !parts.is_empty() {
+        return Some(parts.concat());
+    }
+    // Legacy single-entry layout (sessions saved before chunking).
+    keyring::Entry::new(CM_SERVICE, user)
+        .and_then(|e| e.get_password())
+        .ok()
 }
 
 fn vault_delete(user: &str) {
     let _ = keyring::Entry::new(CM_SERVICE, user).and_then(|e| e.delete_credential());
+    for i in 0..VAULT_MAX_CHUNKS {
+        let _ = keyring::Entry::new(CM_SERVICE, &chunk_key(user, i))
+            .and_then(|e| e.delete_credential());
+    }
+}
+
+/// Store the global Microsoft auth-state blob (shared legacy slot).
+pub fn store_auth_state_blob(json: &str) -> Result<(), String> {
+    vault_set("auth-state", json)
+}
+
+/// Read the global Microsoft auth-state blob (shared legacy slot).
+pub fn load_auth_state_blob() -> Option<String> {
+    vault_get("auth-state")
+}
+
+/// Remove the global Microsoft auth-state blob.
+pub fn clear_auth_state_blob() {
+    vault_delete("auth-state");
 }
 
 fn elyby_key(account_id: &str) -> String {
     format!("account:{account_id}:elyby")
+}
+
+/// Vault slot holding a Microsoft account's own session (OAuth tokens +
+/// Minecraft token + profile). One slot per account enables any number of
+/// simultaneously signed-in Microsoft accounts.
+fn ms_session_key(account_id: &str) -> String {
+    format!("account:{account_id}:msauth")
 }
 
 /// Persist an Ely.by access token in the OS credential vault.
@@ -140,13 +231,27 @@ pub fn store_elyby_token(account_id: &str, token: &str) -> Result<(), String> {
 }
 
 /// Read an Ely.by access token from the OS credential vault.
+#[allow(dead_code)]
 pub fn get_elyby_token(account_id: &str) -> Option<String> {
     vault_get(&elyby_key(account_id))
+}
+
+/// Persist a Microsoft account's session in the OS credential vault.
+pub fn store_ms_session(account_id: &str, state: &crate::auth::AuthState) -> Result<(), String> {
+    let json = serde_json::to_string(state).map_err(|e| e.to_string())?;
+    vault_set(&ms_session_key(account_id), &json)
+}
+
+/// Load a Microsoft account's session from the OS credential vault.
+pub fn load_ms_session(account_id: &str) -> Option<crate::auth::AuthState> {
+    let json = vault_get(&ms_session_key(account_id))?;
+    serde_json::from_str(&json).ok()
 }
 
 /// Remove every vault entry belonging to an account.
 pub fn delete_account_tokens(account_id: &str) {
     vault_delete(&elyby_key(account_id));
+    vault_delete(&ms_session_key(account_id));
 }
 
 // ==================== accounts.json (non-secret profile data) ====================
@@ -260,33 +365,30 @@ pub fn remove_account(accounts_dir: &std::path::Path, id: &str) -> Result<Vec<Ac
 }
 
 /// Update or insert a Microsoft account entry (matches by account_type + uuid)
-pub fn upsert_microsoft_account(accounts_dir: &std::path::Path, name: &str, uuid: &str) -> Result<Vec<AccountEntry>, String> {
+/// and return the stored entry (its `id` keys the per-account vault slots).
+pub fn upsert_microsoft_account(accounts_dir: &std::path::Path, name: &str, uuid: &str) -> Result<AccountEntry, String> {
     let mut accounts = list_accounts(accounts_dir);
     // Look for existing Microsoft account with same UUID
     let existing_idx = accounts.iter().position(|a| a.account_type == AccountType::Microsoft && a.uuid.as_deref() == Some(uuid));
-    if let Some(idx) = existing_idx {
-        let entry = &mut accounts[idx];
-        entry.name = name.to_string();
-    } else {
-        let entry = AccountEntry::new_microsoft(name, uuid);
-        // If no accounts exist, make this one the default
-        let is_first = accounts.is_empty();
-        let entry = AccountEntry {
-            default: is_first,
-            ..entry
-        };
-        accounts.push(entry);
-    }
+    let entry = match existing_idx {
+        Some(idx) => {
+            accounts[idx].name = name.to_string();
+            accounts[idx].clone()
+        }
+        None => {
+            let entry = AccountEntry::new_microsoft(name, uuid);
+            // Make it the default when no other account is marked as such.
+            let has_default = accounts.iter().any(|a| a.default);
+            let entry = AccountEntry {
+                default: !has_default,
+                ..entry
+            };
+            accounts.push(entry.clone());
+            entry
+        }
+    };
     save_accounts(accounts_dir, &accounts)?;
-    Ok(accounts)
-}
-
-/// Remove the Microsoft account with the given UUID
-pub fn remove_microsoft_account(accounts_dir: &std::path::Path, uuid: &str) -> Result<Vec<AccountEntry>, String> {
-    let mut accounts = list_accounts(accounts_dir);
-    accounts.retain(|a| !(a.account_type == AccountType::Microsoft && a.uuid.as_deref() == Some(uuid)));
-    save_accounts(accounts_dir, &accounts)?;
-    Ok(accounts)
+    Ok(entry)
 }
 
 pub fn set_default_account(accounts_dir: &std::path::Path, id: &str) -> Result<Vec<AccountEntry>, String> {
@@ -348,5 +450,50 @@ mod tests {
         let entry = AccountEntry::new_offline("Alex");
         let public = PublicAccountEntry::from(entry);
         assert_eq!(public.name, "Alex");
+    }
+
+    #[test]
+    fn vault_chunks_respect_size_limit_and_roundtrip() {
+        // Short value → single chunk.
+        let short = split_into_chunks("hello");
+        assert_eq!(short, vec!["hello".to_string()]);
+
+        // Exactly at the limit → still one chunk.
+        let exact = split_into_chunks(&"x".repeat(VAULT_CHUNK_CHARS));
+        assert_eq!(exact.len(), 1);
+
+        // One char over → two chunks, and joining restores the original.
+        let long: String = "abcdefgh".repeat(1024); // 8192 chars
+        let chunks = split_into_chunks(&long);
+        assert_eq!(chunks.len(), 8);
+        assert!(chunks.iter().all(|c| c.chars().count() <= VAULT_CHUNK_CHARS));
+        assert_eq!(chunks.concat(), long);
+
+        // Empty value still produces a marker chunk.
+        assert_eq!(split_into_chunks(""), vec![String::new()]);
+    }
+
+    #[test]
+    fn upsert_supports_multiple_microsoft_accounts() {
+        let dir = std::env::temp_dir().join(format!("voidl_acc_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = upsert_microsoft_account(&dir, "Steve", "uuid-steve").expect("first upsert");
+        assert!(first.default, "first ever account becomes the default");
+
+        let second = upsert_microsoft_account(&dir, "Alex", "uuid-alex").expect("second upsert");
+        assert!(!second.default, "a second account must not steal the default flag");
+        assert_ne!(first.id, second.id, "distinct accounts need distinct ids");
+
+        // Re-login of an existing account keeps its id and default state.
+        let again = upsert_microsoft_account(&dir, "Stevie", "uuid-steve").expect("re-upsert");
+        assert_eq!(again.id, first.id, "same uuid must map to the same account entry");
+        assert_eq!(again.name, "Stevie");
+
+        let list = list_accounts(&dir);
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().filter(|a| a.default).count() == 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

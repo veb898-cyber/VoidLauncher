@@ -159,20 +159,20 @@ pub struct AssetObject {
 pub async fn fetch_version_manifest() -> Result<VersionManifest> {
     tracing::info!(target: "launcher", "Fetching version manifest from Mojang");
     let client = crate::download::global_http_client();
-    let manifest = client
-        .get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(target: "launcher", "Failed to fetch version manifest: {}", e);
-            e
-        })?
-        .json::<VersionManifest>()
-        .await
-        .map_err(|e| {
-            tracing::error!(target: "launcher", "Failed to parse version manifest: {}", e);
-            e
-        })?;
+    let manifest = crate::download::send_with_fallback(
+        client.get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to fetch version manifest: {}", e);
+        e
+    })?
+    .json::<VersionManifest>()
+    .await
+    .map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to parse version manifest: {}", e);
+        e
+    })?;
     Ok(manifest)
 }
 
@@ -180,12 +180,14 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest> {
 pub async fn fetch_version_info(url: &str) -> Result<VersionInfo> {
     tracing::info!(target: "launcher", "Fetching version info from {}", url);
     let client = crate::download::global_http_client();
-    let info = client.get(url).send().await
+    let info = crate::download::send_with_fallback(client.get(url))
+        .await
         .map_err(|e| {
             tracing::error!(target: "launcher", "Failed to fetch version info: {}", e);
             e
         })?
-        .json::<VersionInfo>().await
+        .json::<VersionInfo>()
+        .await
         .map_err(|e| {
             tracing::error!(target: "launcher", "Failed to parse version info: {}", e);
             e
@@ -197,12 +199,14 @@ pub async fn fetch_version_info(url: &str) -> Result<VersionInfo> {
 pub async fn fetch_asset_index(url: &str) -> Result<AssetIndexData> {
     tracing::info!(target: "launcher", "Fetching asset index from {}", url);
     let client = crate::download::global_http_client();
-    let index = client.get(url).send().await
+    let index = crate::download::send_with_fallback(client.get(url))
+        .await
         .map_err(|e| {
             tracing::error!(target: "launcher", "Failed to fetch asset index: {}", e);
             e
         })?
-        .json::<AssetIndexData>().await
+        .json::<AssetIndexData>()
+        .await
         .map_err(|e| {
             tracing::error!(target: "launcher", "Failed to parse asset index: {}", e);
             e
@@ -333,29 +337,137 @@ pub fn build_classpath(version_info: &VersionInfo, libraries_dir: &PathBuf, clie
     classpath_entries.join(";")
 }
 
-/// Extract game arguments from version info (handles both old and new format)
-pub fn get_game_arguments(version_info: &VersionInfo) -> Vec<String> {
+/// Evaluate a single Mojang argument rule entry (`{"rules": [...], "value": ...}`).
+/// `has_custom_resolution` is the only feature flag this launcher can enable.
+fn argument_rule_allows(entry: &serde_json::Value, has_custom_resolution: bool) -> bool {
+    let Some(rules) = entry.get("rules").and_then(|r| r.as_array()) else {
+        return true;
+    };
+    let mut action = "disallow";
+    for rule in rules {
+        let rule_action = rule
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("disallow");
+        let mut matches = true;
+        if let Some(os) = rule.get("os") {
+            if let Some(name) = os.get("name").and_then(|n| n.as_str()) {
+                if name != std::env::consts::OS {
+                    matches = false;
+                }
+            }
+            if matches {
+                if let Some(arch) = os.get("arch").and_then(|a| a.as_str()) {
+                    let current = std::env::consts::ARCH;
+                    let arch_ok = match arch {
+                        // Launcher always ships 64-bit JVMs; 32-bit rules never apply.
+                        "x86" => false,
+                        "x86_64" => current == "x86_64",
+                        a => a == current,
+                    };
+                    if !arch_ok {
+                        matches = false;
+                    }
+                }
+            }
+        }
+        if matches {
+            if let Some(features) = rule.get("features").and_then(|f| f.as_object()) {
+                for (name, required) in features {
+                    let enabled = match name.as_str() {
+                        "has_custom_resolution" => has_custom_resolution,
+                        _ => false,
+                    };
+                    if required.as_bool() != Some(enabled) {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if matches {
+            action = rule_action;
+        }
+    }
+    action == "allow"
+}
+
+/// Expand a `value` field (string or array of strings) into the argument list.
+fn expand_argument_value(value: &serde_json::Value, has_custom_resolution: bool, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                expand_argument_value(item, has_custom_resolution, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Evaluate Mojang `arguments` entries: plain strings pass through, objects
+/// with `rules`/`value` are evaluated against the current OS/arch/features.
+fn evaluate_arguments(args: &[serde_json::Value], has_custom_resolution: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for arg in args {
+        if let Some(s) = arg.as_str() {
+            out.push(s.to_string());
+        } else if arg.is_object() && argument_rule_allows(arg, has_custom_resolution) {
+            if let Some(value) = arg.get("value") {
+                expand_argument_value(value, has_custom_resolution, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Split legacy `minecraftArguments` respecting double quotes
+/// (e.g. `--foo "some value"` stays one token).
+fn split_mc_arguments(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ' ' | '\t' if !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            '\\' if in_quotes => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Extract game arguments from version info (handles both old and new format).
+/// `has_custom_resolution` enables the manifest's `has_custom_resolution`
+/// feature rules so `--width/--height` come from the manifest itself
+/// (no duplicate resolution args added by the launcher).
+pub fn get_game_arguments(version_info: &VersionInfo, has_custom_resolution: bool) -> Vec<String> {
     if let Some(arguments) = &version_info.arguments {
-        arguments
-            .game
-            .iter()
-            .filter_map(|arg| arg.as_str().map(|s| s.to_string()))
-            .collect()
+        evaluate_arguments(&arguments.game, has_custom_resolution)
     } else if let Some(mc_args) = &version_info.minecraft_arguments {
-        mc_args.split_whitespace().map(|s| s.to_string()).collect()
+        split_mc_arguments(mc_args)
     } else {
         Vec::new()
     }
 }
 
-/// Extract JVM arguments from version info
+/// Extract JVM arguments from version info (rules evaluated against current OS).
 pub fn get_jvm_arguments(version_info: &VersionInfo) -> Vec<String> {
     if let Some(arguments) = &version_info.arguments {
-        arguments
-            .jvm
-            .iter()
-            .filter_map(|arg| arg.as_str().map(|s| s.to_string()))
-            .collect()
+        evaluate_arguments(&arguments.jvm, false)
     } else {
         vec![
             "-Djava.library.path=${natives_directory}".to_string(),
@@ -668,5 +780,50 @@ mod tests {
         assert!(index.map_to_resources);
         assert!(index.objects["sound/a.ogg"].is_virtual);
         assert!(!index.objects["texts/b.txt"].is_virtual);
+    }
+
+    #[test]
+    fn arguments_strings_pass_through() {
+        let args = serde_json::json!([
+            "--username", "${auth_player_name}", "--version", "${version_name}"
+        ]);
+        let out = evaluate_arguments(args.as_array().unwrap(), false);
+        assert_eq!(out, vec!["--username", "${auth_player_name}", "--version", "${version_name}"]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn arguments_object_os_rules_are_evaluated() {
+        // macOS-only arg must be dropped on Windows/Linux
+        let args = serde_json::json!([
+            "--gameDir", "${game_directory}",
+            { "rules": [{ "action": "allow", "os": { "name": "osx" } }], "value": "-XstartOnFirstThread" }
+        ]);
+        let out = evaluate_arguments(args.as_array().unwrap(), false);
+        assert_eq!(out, vec!["--gameDir", "${game_directory}"]);
+    }
+
+    #[test]
+    fn arguments_object_value_array_expands() {
+        let args = serde_json::json!([
+            {
+                "rules": [{ "action": "allow", "features": { "has_custom_resolution": true } }],
+                "value": ["--width", "${resolution_width}", "--height", "${resolution_height}"]
+            }
+        ]);
+        // Feature disabled → skipped
+        let out = evaluate_arguments(args.as_array().unwrap(), false);
+        assert!(out.is_empty());
+        // Feature enabled → array expands
+        let out = evaluate_arguments(args.as_array().unwrap(), true);
+        assert_eq!(out, vec!["--width", "${resolution_width}", "--height", "${resolution_height}"]);
+    }
+
+    #[test]
+    fn legacy_arguments_split_respects_quotes() {
+        let out = split_mc_arguments(r#"--username ${auth_player_name} --demo --foo "some value""#);
+        assert_eq!(out, vec![
+            "--username", "${auth_player_name}", "--demo", "--foo", "some value"
+        ]);
     }
 }

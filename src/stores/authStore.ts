@@ -61,8 +61,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   pollLogin: async () => {
-    const { deviceCode } = get();
-    if (!deviceCode) return;
+    const { deviceCode, isLoading } = get();
+    // Skip when a poll is already in flight: two concurrent requests would
+    // redeem the same device_code twice and Microsoft rejects the second
+    // one with AADSTS70000 ("device_code has already been used").
+    if (!deviceCode || isLoading) return;
 
     set({ isLoading: true });
     try {
@@ -79,11 +82,30 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       });
     } catch (e: any) {
       const errMsg = e.toString();
-      if (errMsg.includes('authorization_pending')) {
+      if (errMsg.includes('authorization_pending') || errMsg.includes('slow_down')) {
         set({ isLoading: false });
-        // Still waiting, don't set error
+        // Still waiting (or asked to slow down), don't set error
+      } else if (
+        (errMsg.includes('been used') || errMsg.includes('invalid_grant')) &&
+        get().isLoggedIn
+      ) {
+        // A previous poll already completed the sign-in; the stale
+        // duplicate request lost the race. Treat as success.
+        set({
+          isLoading: false,
+          deviceCode: null,
+          userCode: null,
+          verificationUri: null,
+        });
       } else {
-        set({ error: errMsg, isLoading: false });
+        // Real failure: stop polling, return the card to its initial state.
+        set({
+          error: errMsg,
+          isLoading: false,
+          deviceCode: null,
+          userCode: null,
+          verificationUri: null,
+        });
       }
     }
   },

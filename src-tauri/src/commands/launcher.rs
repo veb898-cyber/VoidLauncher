@@ -13,7 +13,7 @@ use crate::launch;
 use crate::modloaders;
 use crate::playtime;
 use crate::versions;
-use crate::{accounts, auth, i18n};
+use crate::{accounts, i18n};
 use crate::AppState;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,13 +91,20 @@ pub async fn cmd_install_version(
         &format!("Downloading {} libraries...", files.len()),
     );
     send_progress(10.0, "libraries", "Downloading libraries...");
-    download::download_files(files, move |completed, total, _msg| {
-        let pct = 10.0 + (completed as f64 / total as f64) * 60.0;
+    download::download_files(files, move |completed, total, bytes_done, bytes_total, _msg| {
+        let frac = if bytes_total > 0 {
+            bytes_done as f64 / bytes_total as f64
+        } else if total > 0 {
+            completed as f64 / total as f64
+        } else {
+            1.0
+        };
+        let pct = 10.0 + frac * 60.0;
         progress_tx_clone.send(InstallProgressPayload {
             instance_id: instance_id_clone.clone(),
             percent: pct,
-            downloaded_bytes: completed as u64,
-            total_bytes: total as u64,
+            downloaded_bytes: bytes_done,
+            total_bytes: bytes_total,
             stage: "libraries".to_string(),
             message: format!("Downloading libraries ({}/{})", completed, total),
         });
@@ -144,13 +151,13 @@ pub async fn cmd_install_version(
     download::download_assets(
         &asset_index,
         &config.assets_dir(),
-        move |completed, total, _msg| {
+        move |completed, total, bytes_done, bytes_total, _msg| {
             let pct = 78.0 + (completed as f64 / total as f64) * 20.0;
             progress_tx_assets.send(InstallProgressPayload {
                 instance_id: instance_id_assets.clone(),
                 percent: pct,
-                downloaded_bytes: completed as u64,
-                total_bytes: total as u64,
+                downloaded_bytes: bytes_done,
+                total_bytes: bytes_total,
                 stage: "assets".to_string(),
                 message: format!("Downloading assets ({}/{})", completed, total),
             });
@@ -220,10 +227,9 @@ pub async fn cmd_launch_game(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
 
-    let (config, mut auth, data_dir) = {
+    let (config, data_dir) = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
-        let a = state.auth_state.lock().map_err(|e| e.to_string())?;
-        (c.clone(), a.clone(), c.data_dir.clone())
+        (c.clone(), c.data_dir.clone())
     };
 
     // Create game log file early so all launch messages are captured in it
@@ -236,168 +242,79 @@ pub async fn cmd_launch_game(
         &format!("Preparing to launch: {}", instance_name),
     );
 
-    // Try Microsoft account first, then check accounts list for offline/Ely.by
-    //
-    // Pre-check: if the cached Minecraft access token has expired, try a
-    // full re-authentication (Microsoft -> Xbox -> XSTS -> Minecraft) using
-    // the stored OAuth refresh_token.  Without this, Hypixel and other
-    // online servers reject the session once the initial ~24-hour token
-    // lifetime runs out (Mojang's error: HTTP 401 "Invalid session").
-    //
-    // If the whole OAuth chain fails, `auth` keeps the stale token and
-    // the outer `if let` below will fall through to the accounts-list
-    // fallback (offline / Ely.by / cached-offline) so the user can at
-    // least play offline.
-    if let Some(ref mc_token) = auth.minecraft_token {
-        if let Some(ref ms_token) = auth.microsoft_token {
-            if auth::is_token_expired(mc_token) && !ms_token.refresh_token.is_empty() {
-                events::emit_log(
-                    &app,
-                    "info",
-                    "launch",
-                    "Minecraft token expired; re-authenticating via Microsoft OAuth...",
-                );
-                let client_id = config.client_id.clone();
-                let refresh_tok = ms_token.refresh_token.clone();
-                match auth::refresh_microsoft_token(&client_id, &refresh_tok).await {
-                    Ok(new_ms) => {
-                        match auth::full_auth_flow(&new_ms).await {
-                            Ok((new_mc, new_profile)) => {
-                                events::emit_log(
-                                    &app,
-                                    "info",
-                                    "launch",
-                                    &format!("Token refreshed for user: {}", new_profile.name),
-                                );
-                                let fresh_state = auth::AuthState {
-                                    microsoft_token: Some(new_ms),
-                                    minecraft_token: Some(new_mc),
-                                    profile: Some(new_profile),
-                                    timestamp: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs(),
-                                    offline_mode: false,
-                                };
-                                let _ = auth::save_auth_state(&config.auth_file(), &fresh_state);
-                                {
-                                    let mut as_guard =
-                                        state.auth_state.lock().map_err(|e| e.to_string())?;
-                                    *as_guard = fresh_state.clone();
-                                }
-                                auth = fresh_state; // <-- the if-let below will see the fresh token
-                            }
-                            Err(e) => {
-                                events::emit_log(
-                                    &app,
-                                    "warn",
-                                    "launch",
-                                    &format!("Full re-auth failed: {}", e),
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
+    // Launch strictly as the active account (the one marked "active" on the
+    // Accounts page). Each account type resolves its own credentials;
+    // Microsoft accounts use their per-account stored session.
+    let accounts_list = accounts::list_accounts(&data_dir);
+    let default_account = accounts_list
+        .iter()
+        .find(|a| a.default)
+        .or_else(|| accounts_list.first())
+        .cloned();
+
+    let Some(account) = default_account else {
+        let msg = "No account available to launch the game. Please add an account first."
+            .to_string();
+        events::emit_log(&app, "error", "launch", &msg);
+        return Err(msg);
+    };
+
+    let (access_token, uuid, username) = match account.account_type {
+        accounts::AccountType::Offline => {
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                &format!("Launching offline as '{}'", account.name),
+            );
+            let uuid_val = account
+                .uuid
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            (String::new(), uuid_val, account.name.clone())
+        }
+        accounts::AccountType::ElyBy => {
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                &format!("Launching via Ely.by as '{}'", account.name),
+            );
+            (String::new(), account.uuid.clone().unwrap_or_default(), account.name.clone())
+        }
+        accounts::AccountType::Microsoft => {
+            match super::auth::ensure_ms_session(state.inner(), &account).await {
+                Ok(session) => {
+                    if let (Some(mc_token), Some(profile)) =
+                        (&session.minecraft_token, &session.profile)
+                    {
                         events::emit_log(
                             &app,
-                            "warn",
+                            "info",
                             "launch",
-                            &format!("Microsoft token refresh failed: {}", e),
+                            &format!(
+                                "Online mode: launching as '{}' (Microsoft)",
+                                profile.name
+                            ),
                         );
+                        (
+                            mc_token.access_token.clone(),
+                            profile.id.clone(),
+                            profile.name.clone(),
+                        )
+                    } else {
+                        let msg = format!(
+                            "Stored Microsoft session for '{}' is incomplete. Please sign in again.",
+                            account.name
+                        );
+                        events::emit_log(&app, "error", "launch", &msg);
+                        return Err(msg);
                     }
                 }
-            }
-        }
-    }
-
-    // Determine which account to launch with: the cached Microsoft session,
-    // or the default account from accounts.json (offline / Ely.by / cached
-    // Microsoft credentials).
-    let (access_token, uuid, username) = if let (Some(mc_token), Some(profile)) =
-        (&auth.minecraft_token, &auth.profile)
-    {
-        events::emit_log(
-            &app,
-            "info",
-            "launch",
-            "Online mode: using Microsoft account",
-        );
-        (
-            mc_token.access_token.clone(),
-            profile.id.clone(),
-            profile.name.clone(),
-        )
-    } else {
-        // Try accounts from accounts.json (offline / Ely.by)
-        let accounts_list = accounts::list_accounts(&data_dir);
-        let default_account = accounts_list
-            .iter()
-            .find(|a| a.default)
-            .or_else(|| accounts_list.first());
-
-        let Some(account) = default_account else {
-            let msg = "No account available to launch the game. Please add an account first."
-                .to_string();
-            events::emit_log(&app, "error", "launch", &msg);
-            return Err(msg);
-        };
-
-        match account.account_type {
-            accounts::AccountType::Offline => {
-                let uuid_val = account
-                    .uuid
-                    .clone()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                (String::new(), uuid_val, account.name.clone())
-            }
-            accounts::AccountType::ElyBy => {
-                let uuid_val = account.uuid.clone().unwrap_or_default();
-                (String::new(), uuid_val, account.name.clone())
-            }
-            accounts::AccountType::Microsoft => {
-                // Try to refresh Microsoft token first
-                let auth_path = config.auth_file();
-                if let Some(auth_state) = auth::load_auth_state(&auth_path) {
-                    if let Some(ref ms_token) = auth_state.microsoft_token {
-                        if !ms_token.refresh_token.is_empty() {
-                            events::emit_log(
-                                &app,
-                                "info",
-                                "launch",
-                                "Refreshing Microsoft token...",
-                            );
-                            let client_id = config.client_id.clone();
-                            let refresh_tok = ms_token.refresh_token.clone();
-                            match auth::refresh_microsoft_token(&client_id, &refresh_tok).await {
-                                Ok(new_token) => {
-                                    let fresh_state = auth::AuthState {
-                                        microsoft_token: Some(new_token),
-                                        ..auth_state
-                                    };
-                                    let _ = auth::save_auth_state(&auth_path, &fresh_state);
-                                }
-                                Err(e) => {
-                                    events::emit_log(
-                                        &app,
-                                        "warn",
-                                        "launch",
-                                        &format!("Token refresh failed: {}, using cached", e),
-                                    );
-                                }
-                            }
-                        }
-                    }
+                Err(e) => {
+                    events::emit_log(&app, "error", "launch", &e);
+                    return Err(e);
                 }
-                // Fall through to cached credentials
-                if !auth::can_launch_offline(&auth_path) {
-                    let msg =
-                        "Cannot launch offline: no valid cached credentials found.".to_string();
-                    events::emit_log(&app, "error", "launch", &msg);
-                    return Err(msg);
-                }
-                let (un, uid) = auth::get_offline_credentials(&config.auth_file())
-                    .ok_or("Failed to get offline credentials")?;
-                (String::new(), uid, un)
             }
         }
     };
@@ -417,7 +334,6 @@ pub async fn cmd_launch_game(
             instances::LoaderType::Fabric => "Fabric",
             instances::LoaderType::Forge => "Forge",
             instances::LoaderType::NeoForge => "NeoForge",
-            instances::LoaderType::LiteLoader => "LiteLoader",
             _ => "Vanilla",
         };
         let loader_version = match instance.loader_version.clone() {
@@ -539,8 +455,8 @@ pub async fn cmd_launch_game(
                 missing.len()
             ),
         );
-        download::download_files(missing, |completed, total, _msg| {
-            tracing::info!(target: "launcher", "Version file download {}/{}", completed, total);
+        download::download_files(missing, |completed, total, bytes_done, bytes_total, _msg| {
+            tracing::info!(target: "launcher", "Version file download {}/{} ({} / {} bytes)", completed, total, bytes_done, bytes_total);
         })
         .await
         .map_err(|e| {
@@ -590,8 +506,8 @@ pub async fn cmd_launch_game(
             "launch",
             &format!("Downloading assets for {}...", version_info.assets),
         );
-        download::download_assets(&asset_index, &config.assets_dir(), |completed, total, _msg| {
-            tracing::info!(target: "launcher", "Asset download {}/{}", completed, total);
+        download::download_assets(&asset_index, &config.assets_dir(), |completed, total, bytes_done, bytes_total, _msg| {
+            tracing::info!(target: "launcher", "Asset download {}/{} ({} / {} bytes)", completed, total, bytes_done, bytes_total);
         })
         .await
         .map_err(|e| {
@@ -780,6 +696,7 @@ pub async fn cmd_launch_game(
     let app_clone = app.clone();
     let instance_clone = instance_name.clone();
     let child_for_wait = child_handle.clone();
+    let pid_for_exit = pid;
     tokio::spawn(async move {
         // Poll try_wait in a loop; multiple try_wait callers are safe.
         let exit_code: i32 = loop {
@@ -801,10 +718,13 @@ pub async fn cmd_launch_game(
             }
         };
 
-        events::emit_log(
+        // Hand the exit code to the pipe-reader threads: whichever finishes
+        // LAST appends the final chronological line to the session log, so
+        // no game output can land after it.
+        crate::game_logs::mark_game_exit(pid_for_exit, exit_code);
+        events::emit_launch_event(
             &app_clone,
             "info",
-            "launch",
             &format!("Game exited with code {}", exit_code),
         );
         game_logs::clear_current_log_path();
@@ -861,18 +781,6 @@ pub async fn cmd_get_neoforge_versions(
 ) -> Result<modloaders::LoaderVersionPage, String> {
     let limit = if limit == 0 { PAGE_SIZE } else { limit };
     modloaders::neoforge::get_loader_versions(&mc_version, offset, limit)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn cmd_get_liteloader_versions(
-    mc_version: String,
-    offset: usize,
-    limit: usize,
-) -> Result<modloaders::LoaderVersionPage, String> {
-    let limit = if limit == 0 { PAGE_SIZE } else { limit };
-    modloaders::liteloader::get_loader_versions(&mc_version, offset, limit)
         .await
         .map_err(|e| e.to_string())
 }
@@ -994,38 +902,6 @@ pub async fn cmd_install_neoforge(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn cmd_install_liteloader(
-    state: State<'_, AppState>,
-    mc_version: String,
-    loader_version: String,
-    instance_name: String,
-    lang: Option<String>,
-) -> Result<(), String> {
-    validate_instance_name(&instance_name)?;
-    let lang = lang.as_deref().unwrap_or("en");
-    let libraries_dir = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
-        ensure_loader_mc_match(lang, "LiteLoader", &instance, &mc_version)?;
-        config.libraries_dir()
-    };
-    let profile = modloaders::liteloader::install(&mc_version, &loader_version, &libraries_dir)
-        .await
-        .map_err(|e| i18n::tr(lang, "loader_install_failed", &[("loader", "LiteLoader"), ("error", &e.to_string())]))?;
-
-    // Save loader profile to instance
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
-    instance.loader = instances::LoaderType::LiteLoader;
-    instance.loader_version = Some(loader_version.clone());
-    instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoaderCheckResult {
@@ -1048,7 +924,6 @@ pub fn cmd_check_instance_loader(
         instances::LoaderType::Fabric => "Fabric",
         instances::LoaderType::Forge => "Forge",
         instances::LoaderType::NeoForge => "NeoForge",
-        instances::LoaderType::LiteLoader => "LiteLoader",
     }
     .to_string();
     let needs_install = instance.loader != instances::LoaderType::Vanilla
@@ -1081,7 +956,6 @@ pub async fn cmd_install_instance_loader(
             instances::LoaderType::Fabric => "Fabric",
             instances::LoaderType::Forge => "Forge",
             instances::LoaderType::NeoForge => "NeoForge",
-            instances::LoaderType::LiteLoader => "LiteLoader",
             instances::LoaderType::Vanilla => {
                 return Err(i18n::tr(lang, "instance_no_loader", &[]));
             }
@@ -1156,11 +1030,8 @@ pub async fn cmd_install_instance_loader(
         }),
     );
 
-    let msg_saved = if lang == "ru" {
-        format!("{} {} СѓСЃС‚Р°РЅРѕРІР»РµРЅ РґР»СЏ {}", loader_type, loader_version, instance_name)
-    } else {
-        format!("{} {} installed for {}", loader_type, loader_version, instance_name)
-    };
+    // Launcher logs stay English regardless of the UI language.
+    let msg_saved = format!("{} {} installed for {}", loader_type, loader_version, instance_name);
     events::emit_log(&app, "info", "loader", &msg_saved);
     Ok(())
 }
@@ -1189,7 +1060,10 @@ pub fn cmd_emit_log(
     Ok(())
 }
 #[tauri::command]
-pub fn cmd_list_game_logs(state: State<'_, AppState>) -> Vec<game_logs::GameLogSession> {
+pub fn cmd_list_game_logs(
+    state: State<'_, AppState>,
+    instance_name: Option<String>,
+) -> Vec<game_logs::GameLogSession> {
     let data_dir = {
         let c = state.config.lock().map_err(|e| e.to_string());
         match c {
@@ -1197,17 +1071,28 @@ pub fn cmd_list_game_logs(state: State<'_, AppState>) -> Vec<game_logs::GameLogS
             Err(_) => return Vec::new(),
         }
     };
-    game_logs::list_game_log_sessions(&data_dir)
+    let mut sessions = game_logs::list_game_log_sessions(&data_dir);
+    // Optional per-instance filter (frontend passes the raw instance name;
+    // matching uses the same filename-sanitization scheme as creation).
+    if let Some(name) = instance_name {
+        let wanted = game_logs::sanitize_instance_name(&name);
+        sessions.retain(|s| s.instance_name == wanted);
+    }
+    sessions
 }
 
 #[tauri::command]
-pub fn cmd_read_game_log(state: State<'_, AppState>, path: String) -> Result<String, String> {
+pub fn cmd_read_game_log(
+    state: State<'_, AppState>,
+    path: String,
+    max_lines: Option<usize>,
+) -> Result<String, String> {
     let data_dir = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.data_dir.clone()
     };
     let safe_path = game_logs::validate_log_path(&data_dir, &path)?;
-    game_logs::read_game_log(&safe_path, None)
+    game_logs::read_game_log(&safe_path, max_lines)
 }
 
 #[tauri::command]
@@ -1223,6 +1108,36 @@ pub fn cmd_delete_game_log(state: State<'_, AppState>, path: String) -> Result<(
     };
     game_logs::delete_game_log(&data_dir, &path)
 }
+
+/// Open the `.minecraft/logs` folder of an instance in the file manager.
+#[tauri::command]
+pub fn cmd_open_instance_logs_folder(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    instance_name: String,
+) -> Result<(), String> {
+    crate::commands::instances::validate_instance_name(&instance_name)?;
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let logs_dir = config
+        .instances_dir()
+        .join(&instance_name)
+        .join(".minecraft")
+        .join("logs");
+    crate::commands::misc::cmd_open_folder(app, logs_dir.to_string_lossy().to_string())
+}
+/// Open the root game-logs folder (`%DATA_DIR%/logs/game`) in the file
+/// manager. Used by the Game Logs page, which is no longer tied to a
+/// specific instance.
+#[tauri::command]
+pub fn cmd_open_game_logs_root(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.data_dir.join("logs").join("game")
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    crate::commands::misc::cmd_open_folder(app, dir.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 pub fn cmd_get_playtime(state: State<'_, AppState>, instance_name: String) -> Result<u64, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;

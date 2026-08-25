@@ -64,7 +64,7 @@ const MANAGED_JAVA_DIR: &str = "java";
 /// Rebuilt automatically when the proxy setting changes.
 fn download_client() -> reqwest::Client {
     static CLIENT: OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>> = OnceLock::new();
-    let proxy = crate::download::configured_proxy();
+    let proxy = crate::download::resolved_proxy_url(crate::download::active_proxy_raw());
     let mut slot = CLIENT
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -78,9 +78,16 @@ fn download_client() -> reqwest::Client {
             .no_deflate()
             .redirect(crate::download::redirect_policy())
             .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")));
-        if let Some(p) = &proxy {
-            if let Ok(pp) = reqwest::Proxy::all(p.clone()) {
-                builder = builder.proxy(pp);
+        match &proxy {
+            Some(p) => {
+                if let Ok(pp) = reqwest::Proxy::all(p.clone()) {
+                    builder = builder.proxy(pp);
+                }
+            }
+            None => {
+                // Truly direct: ignore HTTP_PROXY-style env variables so the
+                // send_with_fallback retry cannot loop through the same proxy.
+                builder = builder.no_proxy();
             }
         }
         *slot = Some((
@@ -137,7 +144,11 @@ pub async fn list_available_java_versions() -> Result<Vec<AvailableJavaVersion>>
 
     let supported: Vec<u32> = {
         let url = format!("{}/info/available_releases", ADOPTIUM_API);
-        let result = tokio::time::timeout(Duration::from_secs(15), client.get(&url).send()).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            crate::download::send_with_fallback(client.get(&url)),
+        )
+        .await;
         let releases = match result {
             Ok(Ok(resp)) if resp.status().is_success() => match resp.json::<AdoptiumReleasesInfo>().await {
                 Ok(info) => Some(info.available_releases),
@@ -244,7 +255,12 @@ pub async fn download_java_runtime(
 
     let mut resolved = None;
     for attempt in 1..=3 {
-        match tokio::time::timeout(Duration::from_secs(90), client.get(&url).send()).await {
+        match tokio::time::timeout(
+            Duration::from_secs(90),
+            crate::download::send_with_fallback(client.get(&url)),
+        )
+        .await
+        {
             Ok(Ok(resp)) if resp.status().is_success() => {
                 resolved = Some(resp);
                 break;
@@ -289,7 +305,7 @@ pub async fn download_java_runtime(
     // Phase 2: Download
     emit_progress(10.0, "downloading", &format!("Downloading {}...", pkg_name));
 
-    let response = client.get(&pkg_link).send().await.map_err(|e| {
+    let response = crate::download::send_with_fallback(client.get(&pkg_link)).await.map_err(|e| {
         tracing::error!(target: "launcher", "Failed to download Java {}: {}", major_version, e);
         LauncherError::Download(format!("Failed to download Java: {}", e))
     })?;

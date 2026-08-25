@@ -17,6 +17,7 @@ import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useFocusStore } from './stores/focusStore';
 import { useUpdater } from './hooks/useUpdater';
 import { useBrowserGuardStore } from './stores/browserGuardStore';
+import { useJavaDownloadStore } from './stores/javaDownloadStore';
 import { Button } from './components/ui/Button';
 import { useT } from './lib/i18n';
 
@@ -26,6 +27,7 @@ const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.S
 const Logs = lazy(() => import('./pages/Logs').then(m => ({ default: m.Logs })));
 const GameLogs = lazy(() => import('./pages/GameLogs').then(m => ({ default: m.GameLogs })));
 const Accounts = lazy(() => import('./pages/Accounts').then(m => ({ default: m.Accounts })));
+const Modpacks = lazy(() => import('./pages/Modpacks').then(m => ({ default: m.Modpacks })));
 const HomeLayout = lazy(() => import('./components/layout/HomeLayout').then(m => ({ default: m.HomeLayout })));
 
 function App() {
@@ -51,6 +53,7 @@ function App() {
 
   const [javaSetupVisible, setJavaSetupVisible] = useState(false);
   const leavePending = useBrowserGuardStore((s) => s.pending);
+  const leaveUnsaved = useBrowserGuardStore((s) => s.unsaved);
   const leaveRequest = useBrowserGuardStore((s) => s.request);
 
   // Sidebar / page navigation is guarded: if the content browser has selected
@@ -69,13 +72,20 @@ function App() {
       }
     });
 
-    const unlisten = listen<{ stage: string; percent: number; message: string }>(
+    const unlisten = listen<{ major_version: number; stage: string; percent: number; message: string }>(
       'java_download_progress',
       (event) => {
-        if (isLaunchingRef.current) {
-          if (event.payload.stage === 'done') {
+        const p = event.payload;
+        if (p.stage === 'done') {
+          useJavaDownloadStore.getState().clear();
+          if (isLaunchingRef.current) {
             setTimeout(() => setJavaSetupVisible(false), 500);
-          } else {
+          }
+        } else {
+          // Keep the global store fresh even while Settings is not mounted,
+          // so re-entering it mid-download still shows progress.
+          useJavaDownloadStore.getState().reportProgress(p.major_version, p.percent, p.message);
+          if (isLaunchingRef.current) {
             setJavaSetupVisible(true);
           }
         }
@@ -123,6 +133,8 @@ function App() {
         return <Login onNavigate={navigate} />;
       case 'instances':
         return <HomeLayout onNavigate={navigate} />;
+      case 'modpacks':
+        return <Modpacks />;
       case 'accounts':
         return <Accounts />;
       case 'logs':
@@ -175,12 +187,22 @@ function App() {
         onClose={() => setJavaSetupVisible(false)}
       />
 
-      {/* Leave guard: navigating away would discard the content browser selection */}
+      {/* Leave guard: navigating away would discard the content browser
+          selection or unsaved settings changes. */}
       {leaveRequest && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
           <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }}>
-            <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('content.leave_confirm_title')}</h3>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('content.leave_confirm_text', { count: leavePending.toString() })}</p>
+            {leaveUnsaved && leavePending === 0 ? (
+              <>
+                <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('content.leave_unsaved_title')}</h3>
+                <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('content.leave_unsaved_text')}</p>
+              </>
+            ) : (
+              <>
+                <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('content.leave_confirm_title')}</h3>
+                <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('content.leave_confirm_text', { count: leavePending.toString() })}</p>
+              </>
+            )}
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
               <Button variant="ghost" onClick={() => useBrowserGuardStore.getState().cancelLeave()}>{t('common.cancel')}</Button>
               <Button onClick={() => useBrowserGuardStore.getState().resolveLeave()}>{t('common.leave')}</Button>

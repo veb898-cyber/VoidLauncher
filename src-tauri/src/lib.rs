@@ -1,4 +1,5 @@
 ﻿mod accounts;
+mod atlauncher;
 mod auth;
 mod commands;
 mod config;
@@ -24,9 +25,11 @@ mod versions;
 #[cfg(test)]
 mod smoke_launch;
 
+#[cfg(test)]
+mod diag;
+
 use config::AppConfig;
-use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 use std::time::Instant;
 use tauri::{Manager, WindowEvent};
 
@@ -36,30 +39,8 @@ pub struct AppState {
     pub auth_state: Mutex<auth::AuthState>,
     pub running_instance_id: Mutex<Option<String>>,
     pub pack_watcher: Mutex<Option<PackWatcherHandle>>,
-    /// Persistent icon cache: key (project_id / filename) в†’ data URL or HTTPS URL
-    pub icon_cache: RwLock<HashMap<String, String>>,
     /// Active playtime-tracking session, if a game is running
     pub active_session: Mutex<Option<playtime::ActiveSession>>,
-}
-
-/// Load the icon cache from disk; returns empty map on any error
-fn load_icon_cache_from_disk(config: &AppConfig) -> HashMap<String, String> {
-    let path = config.icon_cache_file();
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&contents).unwrap_or_default()
-}
-
-/// Persist the icon cache to disk (atomic write via temp file + rename)
-pub(crate) fn save_icon_cache_to_disk(config: &AppConfig, cache: &HashMap<String, String>) {
-    let _ = std::fs::create_dir_all(&config.data_dir);
-    if let Ok(json) = serde_json::to_string(cache) {
-        let dest = config.icon_cache_file();
-        let tmp = dest.with_extension("json.tmp");
-        let _ = std::fs::write(&tmp, &json);
-        let _ = std::fs::rename(&tmp, &dest);
-    }
 }
 
 /// Handle to an active file system watcher; dropping stops the watcher
@@ -119,22 +100,87 @@ pub fn run() {
     logger::init(&data_dir);
 
     let config = AppConfig::load(&data_dir);
-    let auth_state = auth::load_auth_state(&config.auth_file()).unwrap_or_default();
-    let icon_cache = load_icon_cache_from_disk(&config);
+    let mut auth_state = auth::load_auth_state(&config.auth_file()).unwrap_or_default();
+
+    // One-time cleanup of the retired persistent icon cache. It grew to
+    // ~140 MB and froze the UI on first open; icons now live only in
+    // renderer memory for the session (same as Prism Launcher).
+    let _ = std::fs::remove_file(data_dir.join("icon_cache.json"));
 
     download::set_global_proxy(config.proxy_url());
+    atlauncher::set_atl_cache_dir(config.data_dir.clone());
 
     tracing::info!(target: "launcher", "Data dir: {}", data_dir.display());
     tracing::info!(target: "launcher", "Config: data_dir={}, default_memory_mb={}, gc={}",
         config.data_dir.display(), config.default_memory_mb, config.default_gc_preset);
 
-    // If there's a cached Microsoft session, ensure it's in accounts.json
+    // Multi-account migration: give the cached Microsoft session (if any) its
+    // own per-account vault slot, then make sure the ACTIVE session matches
+    // the default account: a different default Microsoft account loads its
+    // own stored session; a default offline/Ely.by account hides Microsoft
+    // from the UI (its tokens stay safe in the vault for re-activation).
     if let Some(ref profile) = auth_state.profile {
         tracing::info!(target: "launcher", "Restoring cached Microsoft session for {}", profile.name);
-        let _ = accounts::upsert_microsoft_account(&data_dir, &profile.name, &profile.id);
+        match accounts::upsert_microsoft_account(&data_dir, &profile.name, &profile.id) {
+            Ok(entry) => {
+                if accounts::load_ms_session(&entry.id).is_none() {
+                    // The vault write can transiently fail (Credential Manager
+                    // contention right after boot). Retry once; if it still
+                    // fails, log loudly — the account would otherwise look
+                    // signed-out on the Accounts page while still launching.
+                    match accounts::store_ms_session(&entry.id, &auth_state) {
+                        Ok(()) => {}
+                        Err(e1) => {
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            if let Err(e2) = accounts::store_ms_session(&entry.id, &auth_state) {
+                                tracing::error!(
+                                    target: "launcher",
+                                    "Could not migrate Microsoft session of '{}' to per-account vault slot: {} / {}",
+                                    profile.name, e1, e2
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "launcher", "Failed to register Microsoft account {}: {}", profile.name, e);
+            }
+        }
+    }
+    {
+        let list = accounts::list_accounts(&data_dir);
+        let active_uuid = auth_state.profile.as_ref().map(|p| p.id.as_str());
+        let default_acc = list.iter().find(|a| a.default).or_else(|| list.first());
+        match default_acc {
+            Some(acc) if acc.account_type == accounts::AccountType::Microsoft => {
+                let matches = acc.uuid.as_deref().zip(active_uuid).map(|(u, a)| u == a);
+                if matches != Some(true) {
+                    if let Some(session) = accounts::load_ms_session(&acc.id) {
+                        tracing::info!(
+                            target: "launcher",
+                            "Activating stored session of default account '{}'",
+                            acc.name
+                        );
+                        auth_state = session;
+                    }
+                }
+            }
+            Some(_) => {
+                if auth_state.profile.is_some() {
+                    tracing::info!(target: "launcher", "Default account is not a Microsoft one; hiding Microsoft session from UI");
+                    auth_state = auth::AuthState::default();
+                }
+            }
+            None => {}
+        }
     }
 
     tauri::Builder::default()
+        .setup(|app| {
+            events::set_app_handle(app.handle());
+            Ok(())
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -153,7 +199,6 @@ pub fn run() {
             auth_state: Mutex::new(auth_state),
             running_instance_id: Mutex::new(None),
             pack_watcher: Mutex::new(None),
-            icon_cache: RwLock::new(icon_cache),
             active_session: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
@@ -180,16 +225,16 @@ pub fn run() {
             commands::launcher::cmd_get_fabric_versions,
             commands::launcher::cmd_get_forge_versions,
             commands::launcher::cmd_get_neoforge_versions,
-            commands::launcher::cmd_get_liteloader_versions,
             commands::launcher::cmd_install_fabric,
             commands::launcher::cmd_install_forge,
             commands::launcher::cmd_install_neoforge,
-            commands::launcher::cmd_install_liteloader,
             commands::launcher::cmd_check_instance_loader,
             commands::launcher::cmd_install_instance_loader,
             commands::misc::cmd_get_config,
             commands::misc::cmd_save_config,
             commands::misc::cmd_read_image_file,
+            commands::misc::cmd_fetch_page_asset,
+            commands::misc::cmd_check_latest_version,
             commands::misc::cmd_get_launch_state,
             commands::instances::cmd_check_instance_installed,
             commands::misc::cmd_detect_system_ram,
@@ -217,11 +262,14 @@ pub fn run() {
             commands::mods::cmd_remove_instance_mod,
             commands::mods::cmd_get_mod_metadata,
             commands::mods::cmd_get_mod_icon,
+            commands::mods::cmd_fetch_icon_url,
             commands::launcher::cmd_emit_log,
             commands::launcher::cmd_list_game_logs,
             commands::launcher::cmd_read_game_log,
             commands::launcher::cmd_get_current_game_log,
             commands::launcher::cmd_delete_game_log,
+            commands::launcher::cmd_open_instance_logs_folder,
+            commands::launcher::cmd_open_game_logs_root,
             commands::misc::cmd_rename_file,
             commands::misc::cmd_delete_file,
             commands::mods::cmd_download_to_folder,
@@ -245,13 +293,23 @@ pub fn run() {
             commands::instances::cmd_watch_instance,
             commands::instances::cmd_unwatch_instance,
             commands::instances::cmd_open_instance_folder,
-            commands::misc::cmd_get_icon_cache,
-            commands::misc::cmd_set_icon_cache_entry,
             commands::launcher::cmd_get_playtime,
             commands::launcher::cmd_format_playtime,
             commands::launcher::cmd_flush_playtime,
             commands::misc::cmd_clear_cache,
             commands::misc::cmd_open_folder,
+            commands::modpacks::cmd_search_atlauncher,
+            commands::modpacks::cmd_pause_modpack_install,
+            commands::modpacks::cmd_resume_modpack_install,
+            commands::modpacks::cmd_get_atlauncher_pack_versions,
+            commands::modpacks::cmd_get_atlauncher_version_detail,
+            commands::modpacks::cmd_install_atlauncher_modpack,
+            commands::modpacks::cmd_search_curseforge_modpacks,
+            commands::modpacks::cmd_get_curseforge_modpack_files,
+            commands::modpacks::cmd_install_curseforge_modpack,
+            commands::modpacks::cmd_search_modrinth_modpacks,
+            commands::modpacks::cmd_get_modrinth_modpack_versions,
+            commands::modpacks::cmd_install_modrinth_modpack,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {

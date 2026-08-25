@@ -22,8 +22,10 @@
 //! are still pulled from each loader's upstream source because the
 //! Prism install JSONs contain Prism-specific wrappers (e.g. the
 //! `zekerzhayard:ForgeWrapper` fork) that wouldn't work in our
-//! launcher. The exception is LiteLoader, which has no working
-//! upstream install profile and only lives on the Prism mirror.
+//! launcher. The exception is Forge: its Prism install JSON wraps the
+//! upstream profile with Prism-specific forks (e.g.
+//! `zekerzhayard:ForgeWrapper`) that wouldn't work in our launcher.
+//! Forge/NeoForge/Fabric profiles are pulled from upstream sources.
 //!
 //! # Pagination
 //!
@@ -108,7 +110,7 @@ struct PrismVersionEntry {
     #[allow(dead_code)]
     r#type: String,
     /// What MC / mapping / dependency versions this loader build
-    /// requires. For Forge/NeoForge/LiteLoader, one entry has
+    /// requires. For Forge/NeoForge, one entry has
     /// `uid == "net.minecraft"` and `equals == "<mc version>"`. For
     /// Fabric/Quilt the only requirement is `net.fabricmc.intermediary`
     /// (no `equals`) so the loader works for *every* MC version.
@@ -130,9 +132,8 @@ struct PrismRequire {
 /// pre-release. We use it only to derive the `stable` flag for
 /// non-recommended entries — we still *display* these builds.
 ///
-/// Case-insensitive on the `-snapshot` tag because LiteLoader
-/// versions come back as `1.12.2-SNAPSHOT` (uppercase) — the
-/// Prism convention is mixed and we don't want to miss any.
+/// Case-insensitive on the `-snapshot` tag because the Prism
+/// convention is mixed and we don't want to miss any.
 fn is_prerelease(version: &str) -> bool {
     let v = version.to_ascii_lowercase();
     v.contains("-beta")
@@ -157,19 +158,22 @@ async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
     }
     let client = crate::download::global_http_client();
     let url = format!("{}/{}/index.json", META_BASE, uid);
-    let resp_value = client
-        .get(&url)
-        .timeout(REQUEST_TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "launcher",
-                "Failed to fetch Prism meta index (uid={}): {}",
-                uid, e
-            );
-            e
-        })?;
+    // send_with_fallback retries through a real proxy-free client when the
+    // configured proxy can't reach this host (VPN proxies often whitelist
+    // only some domains) — without it every loader list would silently
+    // come back empty on such networks.
+    let resp_value = crate::download::send_with_fallback(
+        client.get(&url).timeout(REQUEST_TIMEOUT),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            target: "launcher",
+            "Failed to fetch Prism meta index (uid={}): {}",
+            uid, e
+        );
+        e
+    })?;
     let body = resp_value.text().await.map_err(|e| {
         tracing::error!(
             target: "launcher",
@@ -264,7 +268,7 @@ fn page_from(
 /// * `mc_version = None` → no MC filter (Fabric, Quilt).
 /// * `mc_version = Some(mc)` → only entries whose `requires` array
 ///   contains `{uid: "net.minecraft", equals: mc}` (Forge,
-///   NeoForge, LiteLoader).
+///   NeoForge).
 ///
 /// `offset` and `limit` are into the *filtered, sorted (newest
 /// first)* result. `offset >= total` returns an empty page with
@@ -327,23 +331,23 @@ mod tests {
         assert_eq!(parsed.versions.len(), 4);
     }
 
-    /// A real LiteLoader entry has a `type` field (unlike Forge/NeoForge
-    /// which omit it). Make sure `type: "snapshot"` deserializes fine.
-    const SAMPLE_LITELOADER: &str = r#"{
+    /// Some index entries carry a `type` field (e.g. `"snapshot"`) while
+/// Forge/NeoForge omit it. Make sure it deserializes fine.
+    const SAMPLE_TYPE_FIELD: &str = r#"{
         "formatVersion": 1,
-        "name": "LiteLoader",
-        "uid": "com.mumfrey.liteloader",
+        "name": "Sample",
+        "uid": "com.example.sample",
         "versions": [
-            {"version":"1.12.2-SNAPSHOT","recommended":false,"type":"snapshot","releaseTime":"2017-11-28T14:44:31+00:00","requires":[{"uid":"net.minecraft","equals":"1.12.2"}],"sha256":"x"}
+            {"version":"1.2.3-SNAPSHOT","recommended":false,"type":"snapshot","releaseTime":"2017-11-28T14:44:31+00:00","requires":[{"uid":"net.minecraft","equals":"1.12.2"}],"sha256":"x"}
         ]
     }"#;
 
     #[test]
-    fn parses_liteloader_index_with_type_field() {
-        let parsed: PrismIndex = serde_json::from_str(SAMPLE_LITELOADER)
-            .expect("SAMPLE_LITELOADER must parse");
+    fn parses_index_entry_with_type_field() {
+        let parsed: PrismIndex = serde_json::from_str(SAMPLE_TYPE_FIELD)
+            .expect("SAMPLE_TYPE_FIELD must parse");
         assert_eq!(parsed.versions.len(), 1);
-        assert_eq!(parsed.versions[0].version, "1.12.2-SNAPSHOT");
+        assert_eq!(parsed.versions[0].version, "1.2.3-SNAPSHOT");
     }
 
     /// Fabric entry: no `type`, no `equals` in `requires` (universal

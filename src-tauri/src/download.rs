@@ -1,6 +1,7 @@
 use crate::error::{LauncherError, Result};
 use sha1::{Digest, Sha1};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -8,6 +9,26 @@ use tokio::time::sleep;
 const MAX_RETRIES: u32 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 const CONCURRENT_LIMIT: usize = 32;
+
+/// Global pause flag for modpack installs: when set, the currently active
+/// download stops at the next chunk (keeping the .part file) and install
+/// commands fail with `LauncherError::Paused`. Resuming re-runs the install
+/// and `download_to_part` continues from the saved offset via Range.
+static PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Request that the current download stop as soon as possible.
+pub fn request_pause() {
+    PAUSE_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Clear the pause flag (called when the user resumes an install).
+pub fn clear_pause() {
+    PAUSE_REQUESTED.store(false, Ordering::Relaxed);
+}
+
+fn pause_requested() -> bool {
+    PAUSE_REQUESTED.load(Ordering::Relaxed)
+}
 
 /// Shared allowlist of trusted download mirrors.
 pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
@@ -17,6 +38,7 @@ pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
     "github.com",
     "raw.githubusercontent.com",
     "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
     "edge.forgecdn.net",
     "mediafilez.forgecdn.net",
     "media.forgecdn.net",
@@ -44,6 +66,8 @@ pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
     "bmclapi2.bangbang93.com",
     "mirrors.cernet.edu.cn",
     "api.adoptium.net",
+    "download.nodecdn.net",
+    "api.atlauncher.com",
 ];
 
 /// Check whether `host` is in the allowlist (exact or subdomain match).
@@ -70,7 +94,7 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
 /// Global HTTP client with connection pooling
 fn http_client() -> reqwest::Client {
     static CLIENT: OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>> = OnceLock::new();
-    let proxy = configured_proxy();
+    let proxy = resolved_proxy_url(active_proxy_raw());
     let mut slot = CLIENT
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -94,9 +118,19 @@ fn build_client(proxy: Option<&str>) -> reqwest::Client {
         .no_deflate()
         .redirect(redirect_policy())
         .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")));
-    if let Some(proxy) = proxy {
-        if let Ok(p) = reqwest::Proxy::all(proxy.to_string()) {
-            builder = builder.proxy(p);
+    match proxy {
+        Some(proxy) => {
+            if let Ok(p) = reqwest::Proxy::all(proxy.to_string()) {
+                builder = builder.proxy(p);
+            }
+        }
+        None => {
+            // A truly direct client: without `.no_proxy()` reqwest would still
+            // honor HTTP_PROXY/HTTPS_PROXY environment variables, so the
+            // "proxy -> direct" fallback could silently retry through the very
+            // same broken proxy. The launcher's own setting is the single
+            // source of truth; system-level detection is handled separately.
+            builder = builder.no_proxy();
         }
     }
     builder
@@ -107,12 +141,212 @@ fn build_client(proxy: Option<&str>) -> reqwest::Client {
 /// Proxy URL configured in the settings (None = direct connection).
 static PROXY_CFG: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+/// Cached Windows system proxy (`ProxyEnable`/`ProxyServer` from the
+/// Internet Settings registry key), refreshed at most every 60 s so users who
+/// toggle their VPN app on/off get picked up without a restart.
+#[cfg(windows)]
+static SYSTEM_PROXY_CACHE: OnceLock<Mutex<Option<(std::time::Instant, Option<String>)>>> =
+    OnceLock::new();
+
+/// Resolved proxy scheme, cached per configured `host:port`.
+/// `(raw, Some(url))` = working proxy; `(raw, None)` = proxy unusable.
+static PROXY_RESOLVED: OnceLock<Mutex<Option<(String, Option<String>)>>> = OnceLock::new();
+
 pub(crate) fn configured_proxy() -> Option<String> {
     PROXY_CFG
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap()
         .clone()
+}
+
+/// Parse the `ProxyServer` registry value into a `host:port` string.
+/// Supported formats: `host:port`, `http://host:port`,
+/// `http=host:p;https=host:p[;socks=...]` (https preferred, then http, then socks).
+#[cfg(windows)]
+fn parse_win_proxy_server(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if !v.contains('=') {
+        // Plain "host:port" (optionally with scheme prefix).
+        let bare = v
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_start_matches("socks://")
+            .trim_start_matches("socks5://");
+        return (!bare.is_empty()).then(|| bare.to_string());
+    }
+    // Per-protocol map.
+    let mut https = None;
+    let mut http = None;
+    let mut socks = None;
+    for part in v.split(';') {
+        let Some((proto, addr)) = part.split_once('=') else { continue };
+        let addr = addr.trim();
+        if addr.is_empty() {
+            continue;
+        }
+        match proto.trim().to_ascii_lowercase().as_str() {
+            "https" => https = Some(addr.to_string()),
+            "http" => http = Some(addr.to_string()),
+            "socks" | "socks5" => socks = Some(addr.to_string()),
+            _ => {}
+        }
+    }
+    https.or(http).or(socks)
+}
+
+/// Read the Windows system proxy (WinINET settings used by browsers/WebView).
+/// Returns the raw `host:port`, or None when disabled/unreadable/non-Windows.
+#[cfg(windows)]
+fn system_proxy_hint() -> Option<String> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    let slot = SYSTEM_PROXY_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = slot.lock().unwrap();
+        if let Some((at, val)) = guard.as_ref() {
+            if at.elapsed() < TTL {
+                return val.clone();
+            }
+        }
+    }
+    let detected = (|| {
+        let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+        let key = hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings").ok()?;
+        let enabled: u32 = key.get_value("ProxyEnable").ok()?;
+        if enabled == 0 {
+            return None;
+        }
+        let server: String = key.get_value("ProxyServer").ok()?;
+        parse_win_proxy_server(&server)
+    })();
+    *slot.lock().unwrap() = Some((std::time::Instant::now(), detected.clone()));
+    tracing::info!(target: "launcher", "System proxy detection: {}", detected.as_deref().unwrap_or("none"));
+    detected
+}
+
+#[cfg(not(windows))]
+fn system_proxy_hint() -> Option<String> {
+    None
+}
+
+/// The proxy the launcher should actively use: the explicit in-app setting
+/// when present, otherwise the Windows system proxy (VPN apps like v2rayN set
+/// it system-wide; WebView already follows it, so using it for backend traffic
+/// too keeps everything consistent and toggle-safe — an unreachable proxy is
+/// re-probed by `ensure_proxy_resolved` and degrades to direct).
+pub(crate) fn active_proxy_raw() -> Option<String> {
+    configured_proxy().or_else(system_proxy_hint)
+}
+
+/// Best-known proxy URL for the configured `host:port`: the resolved scheme
+/// when already tested, otherwise the HTTP guess (the most common case).
+pub fn resolved_proxy_url(raw: Option<String>) -> Option<String> {
+    let Some(raw) = raw else { return None };
+    if let Some((r, url)) = PROXY_RESOLVED
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+    {
+        if r == raw {
+            return url;
+        }
+    }
+    Some(format!("http://{}", raw))
+}
+
+/// Test the configured proxy once (HTTP first, then SOCKS5) and cache the
+/// scheme that actually connects. Called before the first network request.
+/// `127.0.0.1:10808` style SOCKS ports (VPN apps) are detected this way.
+pub async fn ensure_proxy_resolved() {
+    let Some(raw) = active_proxy_raw() else { return };
+    {
+        let slot = PROXY_RESOLVED
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        if slot.as_ref().map(|(r, _)| r == &raw).unwrap_or(false) {
+            return;
+        }
+    }
+    let candidates = [format!("http://{}", raw), format!("socks5://{}", raw)];
+    let mut chosen: Option<String> = None;
+    for url in &candidates {
+        let Ok(proxy) = reqwest::Proxy::all(url.clone()) else { continue };
+        let Ok(client) = reqwest::Client::builder()
+            .proxy(proxy)
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(4))
+            .build()
+        else {
+            continue;
+        };
+        let ok = tokio::time::timeout(
+            Duration::from_secs(4),
+            client.get("https://api.modrinth.com/").send(),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+        if ok {
+            chosen = Some(url.clone());
+            break;
+        }
+    }
+    if chosen.is_none() {
+        tracing::warn!(
+            target: "launcher",
+            "Proxy {}://{} unreachable — falling back to direct connection",
+            candidates[0],
+            raw
+        );
+    }
+    *PROXY_RESOLVED
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some((raw, chosen));
+}
+
+/// Send a request through the configured proxy; if that fails at the network
+/// level and a proxy is configured, retry the same request directly. VPN
+/// proxies often work for some hosts but not others (e.g. CurseForge, Mojang)
+/// — falling back keeps the launcher usable instead of showing a dead catalog
+/// or failing an install.
+pub async fn send_with_fallback(
+    req: reqwest::RequestBuilder,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let Some(proxied) = req.try_clone() else {
+        return req.send().await;
+    };
+    match proxied.send().await {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if active_proxy_raw().is_some() {
+                // Retry on a REAL proxy-free client: a VPN proxy that works
+                // for most hosts can still refuse specific ones (Mojang CDN).
+                if let Some(builder) = req.try_clone() {
+                    if let Ok(request) = builder.build() {
+                        let direct = build_client(None);
+                        match direct.execute(request).await {
+                            Ok(r) => {
+                                tracing::warn!(
+                                    target: "launcher",
+                                    "Proxy failed for request, retried directly: {}",
+                                    r.url()
+                                );
+                                return Ok(r);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Update the global proxy used by every HTTP request. Called when the
@@ -122,6 +356,10 @@ pub fn set_global_proxy(proxy: Option<String>) {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap() = proxy;
+    *PROXY_RESOLVED
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = None;
 }
 
 /// Validate a completed download file: SHA1 check or JSON-content rejection.
@@ -155,10 +393,16 @@ fn validate_download(path: &std::path::Path, expected_sha1: &str) -> Result<()> 
 /// Validate URL + host, then download to a .part temp file, validate,
 /// and atomically rename to `path` on success. On ANY error the .part file
 /// is cleaned up and `path` is never touched.
+///
+/// Downloads are RESUMABLE: the .part file is kept between attempts and
+/// subsequent requests use a `Range` header so interrupted transfers
+/// continue from the last byte instead of restarting from zero (important
+/// on flaky connections). Servers that ignore `Range` simply restart.
 async fn download_to_part(
     url: &str,
     path: &std::path::Path,
     expected_sha1: &str,
+    expected_size: Option<u64>,
     timeout: Option<Duration>,
 ) -> Result<()> {
     // Auto-upgrade http:// to https://
@@ -196,55 +440,215 @@ async fn download_to_part(
         std::path::PathBuf::from(p)
     };
 
-    // Always remove any stale .part from a previous attempt
-    let _ = std::fs::remove_file(&part_path);
-
-    let client = http_client();
-    let mut req = client.get(&url);
-    if let Some(t) = timeout {
-        req = req.timeout(t);
-    }
-    let response = req
-        .send()
-        .await
-        .map_err(|e| LauncherError::Download(format!("Failed to download {}: {}", url, e)))?;
-
-    let status = response.status();
-    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(LauncherError::Download(format!("HTTP {} for {}", status, &url)));
-    }
-
-    // Reject non-binary responses (only when no SHA1 to validate)
-    if expected_sha1.is_empty() {
-        if let Some(ct) = response.headers().get("content-type") {
-            let ct_str = ct.to_str().unwrap_or("");
-            if is_rejected_content_type(ct_str) {
-                return Err(LauncherError::Download(format!(
-                    "Server returned unexpected content-type '{}' for {}",
-                    ct_str, url
-                )));
+    // A leftover .part larger than the expected file is a different artifact
+    // (mirror switch, new version) — drop it and restart fresh.
+    if let Some(size) = expected_size {
+        if let Ok(meta) = std::fs::metadata(&part_path) {
+            if meta.len() > size {
+                let _ = std::fs::remove_file(&part_path);
             }
         }
     }
 
-    // Download entire body into memory first, then write to .part file.
-    // Using bytes() instead of bytes_stream() avoids potential chunked-encoding
-    // or HTTP framing issues in the streaming decoder.
-    let write_result = {
-        use std::io::Write;
+    let client = http_client();
+    let max_attempts = MAX_RETRIES as usize + 2;
+    let mut offset: u64 = std::fs::metadata(&part_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let mut last_err: Option<String> = None;
+    let mut complete = false;
+    // After the body stream breaks once (proxy cutting mid-transfer), the
+    // remaining attempts go straight to the host — retrying through the same
+    // proxy would just repeat the stall. Progress is also kept monotonic so
+    // the bar never walks backwards when a retry restarts from zero.
+    let mut direct_only = false;
+    let mut last_downloaded: u64 = 0;
 
-        let bytes = response.bytes().await.map_err(|e| {
-            LauncherError::Download(format!("Failed to read response body: {}", e))
-        })?;
-        let mut file = std::fs::File::create(&part_path)
-            .map_err(|e| LauncherError::Download(format!("Failed to create .part: {}", e)))?;
-        file.write_all(&bytes)
-            .map_err(|e| LauncherError::Download(format!("Failed to write .part: {}", e)))
-    };
+    ensure_proxy_resolved().await;
 
-    if let Err(e) = write_result {
+    for attempt in 1..=max_attempts {
+        if pause_requested() {
+            return Err(LauncherError::Paused);
+        }
+        if attempt > 1 {
+            // Sleep in 1-second steps so a pause request lands promptly even
+            // during the backoff window.
+            let secs = 1u64 << attempt.min(4);
+            for _ in 0..secs {
+                if pause_requested() {
+                    return Err(LauncherError::Paused);
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+
+        let mut req = client.get(&url);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        if offset > 0 {
+            req = req.header("Range", format!("bytes={}-", offset));
+        }
+
+        let response = match if direct_only {
+            req.send().await
+        } else {
+            send_with_fallback(req).await
+        } {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(format!("send: {}", e));
+                continue;
+            }
+        };
+
+        let status = response.status();
+        // Server says the range we asked for is already past the end of the
+        // file — everything we have is everything there is.
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            complete = true;
+            break;
+        }
+        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(LauncherError::Download(format!("HTTP {} for {}", status, &url)));
+        }
+
+        // Reject non-binary responses (only when no SHA1 to validate)
+        if expected_sha1.is_empty() && attempt == 1 {
+            if let Some(ct) = response.headers().get("content-type") {
+                let ct_str = ct.to_str().unwrap_or("");
+                if is_rejected_content_type(ct_str) {
+                    return Err(LauncherError::Download(format!(
+                        "Server returned unexpected content-type '{}' for {}",
+                        ct_str, url
+                    )));
+                }
+            }
+        }
+
+        let total_hint: Option<u64> = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.rsplit('/').next())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        // If the server ignored the Range header (plain 200), restart from zero.
+        let mut file = if status == reqwest::StatusCode::PARTIAL_CONTENT && offset > 0 {
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&part_path)
+                .await
+                .map_err(|e| LauncherError::Download(format!("Failed to open .part: {}", e)))?
+        } else {
+            offset = 0;
+            tokio::fs::File::create(&part_path)
+                .await
+                .map_err(|e| LauncherError::Download(format!("Failed to create .part: {}", e)))?
+        };
+
+        // Stream the body chunk by chunk — flat memory usage even for large
+        // files, and interrupted transfers keep their partial bytes.
+        {
+            use futures::StreamExt;
+            use tokio::io::AsyncWriteExt;
+
+            let mut stream = response.bytes_stream();
+            let mut received: u64 = 0;
+            let mut broken = false;
+            let mut last_emit = std::time::Instant::now() - Duration::from_secs(1);
+            // No-data timeout: if the server goes silent for 30s (no chunk at
+            // all), abort the attempt so a stalled host doesn't block the
+            // whole install for minutes (reqwest's overall timeout covers the
+            // whole request and can be 120-900s).
+            loop {
+                match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+                    Ok(Some(chunk)) => {
+                        if pause_requested() {
+                            last_err = Some("paused by user".to_string());
+                            broken = true;
+                            break;
+                        }
+                        match chunk {
+Ok(c) => {
+                                file.write_all(&c).await.map_err(|e| {
+                                    LauncherError::Download(format!("Failed to write .part: {}", e))
+                                })?;
+                                received += c.len() as u64;
+if last_emit.elapsed() >= Duration::from_millis(300) {
+                            last_emit = std::time::Instant::now();
+                            let downloaded = offset + received;
+                            // Keep the progress bar monotonic: a retry that
+                            // restarts from zero (server ignoring Range) must
+                            // not walk the bar backwards.
+                            if downloaded > last_downloaded {
+                                last_downloaded = downloaded;
+                                crate::events::emit_file_progress(
+                                    &url,
+                                    downloaded,
+                                    // Prefer the known file size (from the pack
+                                    // manifest) over the Content-Range header;
+                                    // never show "37/37 MB" when 100 MB is known.
+                                    expected_size.or(total_hint).unwrap_or(downloaded),
+                                );
+                            }
+                        }
+                            }
+                            Err(e) => {
+                                last_err = Some(format!("body: {}", e));
+                                broken = true;
+                                direct_only = true;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        last_err = Some("no data for 30s (stalled connection)".to_string());
+                        broken = true;
+                        direct_only = true;
+                        break;
+                    }
+                }
+            }
+            file.flush()
+                .await
+                .map_err(|e| LauncherError::Download(format!("Failed to flush .part: {}", e)))?;
+            offset += received;
+            if !broken {
+                complete = true;
+                break;
+            }
+        }
+    }
+
+    if !complete {
+        if pause_requested() {
+            return Err(LauncherError::Paused);
+        }
         let _ = std::fs::remove_file(&part_path);
-        return Err(e);
+        return Err(LauncherError::Download(format!(
+            "Failed to download {}: {}",
+            url,
+            last_err.unwrap_or_else(|| "connection interrupted".to_string())
+        )));
+    }
+
+    // Size check: when the manifest knows the expected size, reject files
+    // that don't match (truncated transfers, wrong artifact, error pages).
+    if let Some(expected) = expected_size {
+        let actual = std::fs::metadata(&part_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if actual != expected {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(LauncherError::Download(format!(
+                "Size mismatch for {}: expected {} bytes, got {}",
+                path.display(),
+                expected,
+                actual
+            )));
+        }
     }
 
     // Validate the .part file content
@@ -321,13 +725,24 @@ pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Re
     let mut last_err = None;
 
     for (ci, candidate) in candidates.iter().enumerate() {
+        // Mirrors serve different URLs — a .part resumed from the primary
+        // host would mix two files. Reset it when switching candidates.
+        if ci > 0 {
+            let part_path = {
+                let mut p = path.as_os_str().to_os_string();
+                p.push(".part");
+                std::path::PathBuf::from(p)
+            };
+            let _ = std::fs::remove_file(&part_path);
+        }
         // If mirrors exist, the primary host gets only one attempt so a
         // blocked/dead host fails over to a mirror quickly instead of
         // burning MAX_RETRIES worth of timeouts per file.
         let attempts = if candidates.len() > 1 && ci == 0 { 1 } else { MAX_RETRIES };
         for attempt in 1..=attempts {
-            match download_to_part(candidate, path, expected_sha1, None).await {
+            match download_to_part(candidate, path, expected_sha1, None, None).await {
                 Ok(()) => return Ok(()),
+                Err(e) if matches!(e, LauncherError::Paused) => return Err(e),
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < attempts {
@@ -368,12 +783,21 @@ pub async fn download_file_sized(
     let mut last_err = None;
 
     for (ci, candidate) in candidates.iter().enumerate() {
+        if ci > 0 {
+            let part_path = {
+                let mut p = path.as_os_str().to_os_string();
+                p.push(".part");
+                std::path::PathBuf::from(p)
+            };
+            let _ = std::fs::remove_file(&part_path);
+        }
         // Mirrors get full retries; the primary host gets a single attempt
         // so it can't stall the whole install with repeated timeouts.
         let attempts = if candidates.len() > 1 && ci == 0 { 1 } else { MAX_RETRIES };
         for attempt in 1..=attempts {
-            match download_to_part(candidate, path, expected_sha1, Some(timeout)).await {
+            match download_to_part(candidate, path, expected_sha1, Some(size_bytes), Some(timeout)).await {
                 Ok(()) => return Ok(()),
+                Err(e) if matches!(e, LauncherError::Paused) => return Err(e),
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < attempts {
@@ -402,43 +826,61 @@ fn is_rejected_content_type(ct: &str) -> bool {
         || ct_lower.starts_with("application/xhtml")
 }
 
-/// Download up to CONCURRENT_LIMIT files in parallel with progress callback
+/// Download up to CONCURRENT_LIMIT files in parallel with progress callback.
+///
+/// The callback receives `(files_done, files_total, bytes_done, bytes_total,
+/// message)`. Byte totals come from the known file sizes; per-file bytes done
+/// are read from the actual on-disk size after each file completes, so the
+/// numbers stay truthful even when the index reports size = 0.
 pub async fn download_files(
     files: Vec<(String, PathBuf, String, u64)>,
-    on_progress: impl Fn(usize, usize, &str) + Send + Sync,
+    on_progress: impl Fn(usize, usize, u64, u64, &str) + Send + Sync,
 ) -> Result<()> {
     let total = files.len();
-    let mut completed = 0;
+    let total_bytes: u64 = files.iter().map(|(_, _, _, s)| *s).sum();
+    let mut completed = 0usize;
+    let mut completed_bytes = 0u64;
     let mut errors = Vec::new();
+
+    // Emit once upfront so the UI can show real totals from the start
+    // instead of "0 / 0 MB".
+    on_progress(0, total, 0, total_bytes, "Downloading...");
 
     for chunk in files.chunks(CONCURRENT_LIMIT) {
         let mut handles = Vec::with_capacity(chunk.len());
 
-        for (url, path, sha1, _size) in chunk {
+        for (url, path, sha1, size) in chunk {
             let url = url.clone();
             let path = path.clone();
             let sha1 = sha1.clone();
+            let size = *size;
 
-            handles.push(tokio::spawn(async move {
-                download_file(&url, &path, &sha1).await
-            }));
+            handles.push((path.clone(), tokio::spawn(async move {
+                if size > 0 {
+                    download_file_sized(&url, &path, &sha1, size).await
+                } else {
+                    download_file(&url, &path, &sha1).await
+                }
+            })));
         }
 
-        for handle in handles {
+        for (path, handle) in handles {
             match handle.await {
                 Ok(Ok(())) => {
                     completed += 1;
-                    on_progress(completed, total, "Downloading...");
+                    completed_bytes +=
+                        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    on_progress(completed, total, completed_bytes, total_bytes, "Downloading...");
                 }
                 Ok(Err(e)) => {
                     errors.push(e);
                     completed += 1;
-                    on_progress(completed, total, "Downloading...");
+                    on_progress(completed, total, completed_bytes, total_bytes, "Downloading...");
                 }
                 Err(e) => {
                     errors.push(LauncherError::Download(format!("Task failed: {}", e)));
                     completed += 1;
-                    on_progress(completed, total, "Downloading...");
+                    on_progress(completed, total, completed_bytes, total_bytes, "Downloading...");
                 }
             }
         }
@@ -464,7 +906,7 @@ pub async fn download_files(
 pub async fn download_assets(
     asset_index: &crate::versions::AssetIndexData,
     assets_dir: &PathBuf,
-    on_progress: impl Fn(usize, usize, &str) + Send + Sync,
+    on_progress: impl Fn(usize, usize, u64, u64, &str) + Send + Sync,
 ) -> Result<()> {
     let objects_dir = assets_dir.join("objects");
     std::fs::create_dir_all(&objects_dir)?;
@@ -670,5 +1112,41 @@ mod tests {
         assert!(!is_host_allowed("github.com.attacker.example"));
         assert!(!is_host_allowed("notgithub.com"));
         assert!(!is_host_allowed(""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_proxy_server_plain_formats() {
+        assert_eq!(
+            parse_win_proxy_server("127.0.0.1:10808"),
+            Some("127.0.0.1:10808".to_string())
+        );
+        assert_eq!(
+            parse_win_proxy_server("http://127.0.0.1:8080"),
+            Some("127.0.0.1:8080".to_string())
+        );
+        assert_eq!(parse_win_proxy_server("  "), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_proxy_server_protocol_map_prefers_https() {
+        assert_eq!(
+            parse_win_proxy_server("http=127.0.0.1:80;https=127.0.0.1:443"),
+            Some("127.0.0.1:443".to_string())
+        );
+        assert_eq!(
+            parse_win_proxy_server("http=10.0.0.1:8080"),
+            Some("10.0.0.1:8080".to_string())
+        );
+        assert_eq!(
+            parse_win_proxy_server("socks=127.0.0.1:1080"),
+            Some("127.0.0.1:1080".to_string())
+        );
+        // Empty https entry falls through to http.
+        assert_eq!(
+            parse_win_proxy_server("https=;http=127.0.0.1:88"),
+            Some("127.0.0.1:88".to_string())
+        );
     }
 }
