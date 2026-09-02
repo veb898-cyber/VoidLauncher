@@ -23,6 +23,8 @@ const icons: Record<ToastType, React.ReactNode> = {
   info: <Info size={16} color="var(--info)" />,
 };
 
+const TOAST_DURATION_MS = 4000;
+
 function ToastItem({ toast, onDismiss }: ToastItemProps) {
   const [exiting, setExiting] = useState(false);
 
@@ -30,7 +32,7 @@ function ToastItem({ toast, onDismiss }: ToastItemProps) {
     const timer = setTimeout(() => {
       setExiting(true);
       setTimeout(() => onDismiss(toast.id), 300);
-    }, 4000);
+    }, TOAST_DURATION_MS);
     return () => clearTimeout(timer);
   }, [toast.id, onDismiss]);
 
@@ -38,6 +40,7 @@ function ToastItem({ toast, onDismiss }: ToastItemProps) {
     <div
       className={`toast toast--${toast.type}`}
       style={{
+        ['--toast-duration' as string]: `${TOAST_DURATION_MS}ms`,
         animation: exiting ? 'fadeOut 0.3s ease-out forwards' : undefined,
       }}
     >

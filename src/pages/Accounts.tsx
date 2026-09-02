@@ -4,8 +4,12 @@ import { useAccountsStore, type AccountEntry } from '../stores/accountsStore';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Modal } from '../components/ui/Modal';
+import { CustomSelect } from '../components/ui/CustomSelect';
+import { Tooltip } from '../components/ui/Tooltip';
+import { EmptyState } from '../components/ui/EmptyState';
 import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
 import { addToast } from '../components/ui/Toast';
+import { Trash2, Shirt, UserRoundPlus } from 'lucide-react';
 import { t } from '../lib/i18n';
 
 /**
@@ -46,6 +50,9 @@ export function Accounts() {
   const [elybyUser, setElybyUser] = useState('');
   const [elybyPass, setElybyPass] = useState('');
   const [showMicrosoftLogin, setShowMicrosoftLogin] = useState(false);
+  const [skinModalAccount, setSkinModalAccount] = useState<AccountEntry | null>(null);
+  const [skinModalPath, setSkinModalPath] = useState('');
+  const [skinVariant, setSkinVariant] = useState<'classic' | 'slim'>('classic');
 
   useEffect(() => { loadAccounts(); }, [loadAccounts]);
 
@@ -55,17 +62,25 @@ export function Accounts() {
       return;
     }
     if (!offlineName.trim()) return;
-    await addOfflineAccount(offlineName.trim());
-    setOfflineName('');
-    setShowOffline(false);
+    try {
+      await addOfflineAccount(offlineName.trim());
+      setOfflineName('');
+      setShowOffline(false);
+    } catch (e) {
+      addToast(t('accounts.add_failed', { service: 'Offline', error: String(e) }), 'error');
+    }
   };
 
   const handleAddElyby = async () => {
     if (!elybyUser.trim() || !elybyPass.trim()) return;
-    await addElybyAccount(elybyUser.trim(), elybyPass.trim());
-    setElybyUser('');
-    setElybyPass('');
-    setShowElyby(false);
+    try {
+      await addElybyAccount(elybyUser.trim(), elybyPass.trim());
+      setElybyUser('');
+      setElybyPass('');
+      setShowElyby(false);
+    } catch (e) {
+      addToast(t('accounts.add_failed', { service: 'Ely.by', error: String(e) }), 'error');
+    }
   };
 
   const handleSkinChange = async (account: AccountEntry) => {
@@ -76,9 +91,21 @@ export function Accounts() {
     });
     if (!selected) return;
 
-    const variant = window.prompt(t('accounts.skin_variant_prompt'), account.skin_variant || 'classic') || 'classic';
-    await changeSkin(account.id, selected, variant);
-    addToast(t('accounts.skin_updated_toast'), 'success');
+    setSkinModalAccount(account);
+    setSkinModalPath(selected);
+    setSkinVariant((account.skin_variant || 'classic') as 'classic' | 'slim');
+  };
+
+  const confirmSkinChange = async () => {
+    if (!skinModalAccount) return;
+    try {
+      await changeSkin(skinModalAccount.id, skinModalPath, skinVariant);
+      addToast(t('accounts.skin_updated_toast'), 'success');
+      setSkinModalAccount(null);
+      setSkinModalPath('');
+    } catch (e) {
+      addToast(t('accounts.skin_update_error', { error: String(e) }), 'error');
+    }
   };
 
   const getTypeLabel = (t: string) => {
@@ -161,12 +188,13 @@ export function Accounts() {
                   </span>
                 )}
                 {acc.account_type === 'Microsoft' && acc.has_ms_session === false && (
-                  <span
-                    title={t('accounts.needs_login_hint')}
-                    style={{ fontSize: 10, background: 'var(--warning)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}
-                  >
-                    {t('accounts.badge_needs_login')}
-                  </span>
+                  <Tooltip content={t('accounts.needs_login_hint')}>
+                    <span
+                      style={{ fontSize: 10, background: 'var(--warning)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}
+                    >
+                      {t('accounts.badge_needs_login')}
+                    </span>
+                  </Tooltip>
                 )}
               </div>
               <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
@@ -176,15 +204,34 @@ export function Accounts() {
             </div>
             <div style={{ display: 'flex', gap: 'var(--space-xs)', flexShrink: 0 }}>
               {acc.account_type === 'Microsoft' && (
-                <Button size="sm" variant="ghost" onClick={(e) => { e.stopPropagation(); handleSkinChange(acc); }}>{t('accounts.btn_change_skin')}</Button>
+                <Tooltip content={t('accounts.btn_change_skin')}>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    aria-label={t('accounts.btn_change_skin')}
+                    onClick={(e) => { e.stopPropagation(); handleSkinChange(acc); }}
+                  >
+                    <Shirt size={14} />
+                  </Button>
+                </Tooltip>
               )}
-              <Button size="sm" variant="ghost" onClick={(e) => { e.stopPropagation(); removeAccount(acc.id); addToast(t('accounts.removed_toast'), 'info'); }}>{t('accounts.btn_remove')}</Button>
+              <Button size="sm" variant="ghost" onClick={async (e) => {
+              e.stopPropagation();
+              try {
+                await removeAccount(acc.id);
+                addToast(t('accounts.removed_toast'), 'success');
+              } catch (err) {
+                addToast(t('accounts.removed_error', { error: String(err) }), 'error');
+              }
+            }} style={{ color: 'var(--color-danger)' }}>
+                <Trash2 size={14} />
+              </Button>
             </div>
           </div>
         ))}
         {accounts.length === 0 && (
-          <div className="glass-card" style={{ padding: 'var(--space-xl)', textAlign: 'center', color: 'var(--text-tertiary)' }}>
-            {t('accounts.empty_text')}
+          <div className="glass-card" style={{ padding: 'var(--space-lg)' }}>
+            <EmptyState compact icon={<UserRoundPlus size={24} />} title={t('accounts.empty_text')} />
           </div>
         )}
       </div>
@@ -222,6 +269,24 @@ export function Accounts() {
           accounts can be added one after another. */}
       <Modal open={showMicrosoftLogin} onClose={() => setShowMicrosoftLogin(false)} maxWidth={460} bare>
         <MicrosoftLoginCard onSuccess={() => { setShowMicrosoftLogin(false); loadAccounts(); }} />
+      </Modal>
+
+      {/* Skin Variant Modal */}
+      <Modal open={!!skinModalAccount} onClose={() => setSkinModalAccount(null)} title={t('accounts.skin_variant_title')}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
+          <CustomSelect<'classic' | 'slim'>
+            value={skinVariant}
+            options={[
+              { value: 'classic', label: t('accounts.skin_variant_classic') },
+              { value: 'slim', label: t('accounts.skin_variant_slim') },
+            ]}
+            onChange={setSkinVariant}
+          />
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
+          <Button variant="ghost" onClick={() => setSkinModalAccount(null)}>{t('common.cancel')}</Button>
+          <Button onClick={confirmSkinChange}>{t('common.confirm')}</Button>
+        </div>
       </Modal>
     </div>
   );

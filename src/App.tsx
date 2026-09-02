@@ -24,10 +24,8 @@ import { useT } from './lib/i18n';
 const Home = lazy(() => import('./pages/Home').then(m => ({ default: m.Home })));
 const Login = lazy(() => import('./pages/Login').then(m => ({ default: m.Login })));
 const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.Settings })));
-const Logs = lazy(() => import('./pages/Logs').then(m => ({ default: m.Logs })));
-const GameLogs = lazy(() => import('./pages/GameLogs').then(m => ({ default: m.GameLogs })));
+const Terminal = lazy(() => import('./pages/Terminal').then(m => ({ default: m.Terminal })));
 const Accounts = lazy(() => import('./pages/Accounts').then(m => ({ default: m.Accounts })));
-const Modpacks = lazy(() => import('./pages/Modpacks').then(m => ({ default: m.Modpacks })));
 const HomeLayout = lazy(() => import('./components/layout/HomeLayout').then(m => ({ default: m.HomeLayout })));
 
 function App() {
@@ -127,18 +125,14 @@ function App() {
     switch (activePage) {
       case 'home':
         return <Home onNavigate={navigate} />;
-      case 'game_logs':
-        return <GameLogs />;
+      case 'terminal':
+        return <Terminal />;
       case 'login':
         return <Login onNavigate={navigate} />;
       case 'instances':
         return <HomeLayout onNavigate={navigate} />;
-      case 'modpacks':
-        return <Modpacks />;
       case 'accounts':
         return <Accounts />;
-      case 'logs':
-        return <Logs />;
       case 'settings':
         return <Settings />;
       default:

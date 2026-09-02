@@ -29,6 +29,7 @@ mod smoke_launch;
 mod diag;
 
 use config::AppConfig;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 use tauri::{Manager, WindowEvent};
@@ -37,10 +38,13 @@ use tauri::{Manager, WindowEvent};
 pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub auth_state: Mutex<auth::AuthState>,
-    pub running_instance_id: Mutex<Option<String>>,
+    /// Names of instances whose game processes are currently running.
+    /// Multiple games may run simultaneously.
+    pub running_instances: Mutex<Vec<String>>,
     pub pack_watcher: Mutex<Option<PackWatcherHandle>>,
-    /// Active playtime-tracking session, if a game is running
-    pub active_session: Mutex<Option<playtime::ActiveSession>>,
+    /// Active playtime-tracking sessions, keyed by instance name. One per
+    /// running game, allowing concurrent sessions.
+    pub active_sessions: Mutex<HashMap<String, playtime::ActiveSession>>,
 }
 
 /// Handle to an active file system watcher; dropping stops the watcher
@@ -197,9 +201,9 @@ pub fn run() {
         .manage(AppState {
             config: Mutex::new(config),
             auth_state: Mutex::new(auth_state),
-            running_instance_id: Mutex::new(None),
+            running_instances: Mutex::new(Vec::new()),
             pack_watcher: Mutex::new(None),
-            active_session: Mutex::new(None),
+            active_sessions: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             commands::auth::cmd_start_login,
@@ -314,16 +318,22 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {
                 // Flush any active playtime session before the app exits.
-                // We do NOT call api.prevent_close() вЂ” we let the window close,
+                // We do NOT call api.prevent_close() — we let the window close,
                 // but first we write the unpaid minutes to disk synchronously.
                 let state: tauri::State<'_, AppState> = window.state();
                 let now = Instant::now();
-                if let Some((name, delta)) = playtime::take_session(&state.active_session, now) {
-                    if delta > 0 {
-                        if let Ok(cfg) = state.config.lock() {
-                            playtime::add_minutes_and_save(&cfg.data_dir, &name, delta);
+                let flushed = playtime::flush_all_sessions(
+                    &state.active_sessions,
+                    &{
+                        match state.config.lock() {
+                            Ok(cfg) => cfg.data_dir.clone(),
+                            Err(_) => std::path::PathBuf::new(),
                         }
-                    }
+                    },
+                    now,
+                );
+                if flushed > 0 {
+                    tracing::info!(target: "launcher", "Flushed {} playtime session(s) on close", flushed);
                 }
             }
         })

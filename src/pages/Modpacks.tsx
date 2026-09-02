@@ -3,6 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Search, Loader2, X, Check, Download, CirclePause, CirclePlay } from 'lucide-react';
 import { Button } from '../components/ui/Button';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ResultListSkeleton } from '../components/ui/ResultListSkeleton';
 import { useT } from '../lib/i18n';
 import { useModpacksStore, type ModpacksTab, type MrHit, type CfHit, type AtlPack } from '../stores/modpacksStore';
 import { formatBytes, formatDownloads } from '../lib/format';
@@ -162,8 +164,9 @@ export function Modpacks() {
     return `data:image/png;base64,${raw}`;
   };
 
-  const renderCard = (name: string, desc: string, icon: string | null, meta: string, onClick: () => void, keyId: string, isSelected: boolean) => (
-    <div key={keyId} className={`modpack-card ${isSelected ? 'modpack-card--selected' : ''}`} onClick={onClick} role="button" tabIndex={0}
+  const renderCard = (name: string, desc: string, icon: string | null, meta: string, onClick: () => void, keyId: string, isSelected: boolean, idx: number) => (
+    <div key={keyId} className={`modpack-card stagger-in ${isSelected ? 'modpack-card--selected' : ''}`} onClick={onClick} role="button" tabIndex={0}
+      style={{ animationDelay: `${Math.min(idx, 9) * 24}ms` }}
       onKeyDown={(e) => { if (e.key === 'Enter') onClick(); }}>
       <div className="modpack-card__icon modpack-card__icon--frame">
         <div className="modpack-card__icon-fallback-letter">{name.charAt(0).toUpperCase()}</div>
@@ -404,9 +407,9 @@ export function Modpacks() {
               <span>{progress && progress.total > 0 ? `${Math.round((progress.current / progress.total) * 100)}%` : ''}</span>
             </div>
             <div style={{ height: 6, background: 'var(--bg-tertiary)', borderRadius: 999, overflow: 'hidden' }}>
-              <div style={{
+              <div className="progress-fill" style={{
                 height: '100%',
-                width: progress && progress.total > 0 ? `${Math.min(100, (progress.current / progress.total) * 100)}%` : '10%',
+                width: progress && progress.total > 0 ? `${Math.min(100, (progress.current / progress.total) * 100)}%` : '100%',
                 background: paused ? 'var(--text-tertiary)' : 'var(--primary)',
                 transition: 'width 0.2s ease',
                 animation: !paused && (!progress || progress.total === 0) ? 'indeterminate 1.2s ease-in-out infinite' : undefined,
@@ -440,19 +443,18 @@ export function Modpacks() {
       </div>
 
       {/* Search */}
-      {tab !== 'atlauncher' && (
-        <div className="search-bar" style={{ marginBottom: 'var(--space-md)' }}>
-          <Search size={16} style={{ color: 'var(--text-tertiary)', flexShrink: 0 }} />
-          <input
-            className="input input--bare"
-            placeholder={t('modpacks.search_placeholder')}
-            value={query}
-            onChange={(e) => store.setQuery(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') store.search(); }}
-          />
-          {query && <X size={14} style={{ cursor: 'pointer', color: 'var(--text-tertiary)' }} onClick={() => { store.setQuery(''); store.loadInitial(tab); }} />}
-        </div>
-      )}
+      <div className="search-bar" style={{ marginBottom: 'var(--space-md)' }}>
+        <Search size={16} style={{ color: 'var(--text-tertiary)', flexShrink: 0 }} />
+        <input
+          className="input input--bare"
+          placeholder={t('modpacks.search_placeholder')}
+          value={query}
+          onChange={(e) => store.setQuery(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') store.search(); }}
+          style={{ paddingLeft: 4 }}
+        />
+        {query && <X size={14} style={{ cursor: 'pointer', color: 'var(--text-tertiary)' }} onClick={() => { store.setQuery(''); store.loadInitial(tab); }} />}
+      </div>
 
       {tab === 'curseforge' && !curseforgeApiKey && (
         <div style={{ padding: 'var(--space-lg)', background: 'var(--warning-dim)', borderRadius: 'var(--radius-md)', color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
@@ -460,48 +462,50 @@ export function Modpacks() {
         </div>
       )}
 
-      <div style={{ display: 'flex', gap: 'var(--space-lg)', height: 'calc(100vh - 260px)', minHeight: 320 }}>
+      <div className="modpacks-main" style={{ display: 'flex', gap: 'var(--space-lg)', height: 'calc(100vh - 260px)', minHeight: 320 }}>
         {/* Results list */}
         <div style={{ flex: 1, overflowY: 'auto', paddingRight: 2 }}>
           {loading && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-tertiary)', fontSize: 'var(--font-size-sm)', padding: 'var(--space-md)' }}>
-              <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} /> {t('modpacks.loading')}
+            <div>
+              <ResultListSkeleton variant="card" rows={6} />
               {fetchRetry && (
-                <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', padding: 'var(--space-sm) var(--space-md)' }}>
                   {t('modpacks.retry_hint', { attempt: String(fetchRetry.attempt), total: String(fetchRetry.total) })}
-                </span>
+                </div>
               )}
             </div>
           )}
           {!loading && tab === 'modrinth' && mrResults.length === 0 && (
-            <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-2xl)' }}>{t('modpacks.empty')}</div>
+            <EmptyState icon={<Search size={28} />} title={t('modpacks.empty')} compact />
           )}
           {!loading && tab === 'curseforge' && cfResults.length === 0 && (
-            <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-2xl)' }}>{t('modpacks.empty')}</div>
+            <EmptyState icon={<Search size={28} />} title={t('modpacks.empty')} compact />
           )}
           {!loading && tab === 'atlauncher' && atlFiltered.length === 0 && (
-            <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-2xl)' }}>{t('modpacks.empty')}</div>
+            <EmptyState icon={<Search size={28} />} title={t('modpacks.empty')} compact />
           )}
 
-          {tab === 'modrinth' && mrResults.map((h) => renderCard(
+          {tab === 'modrinth' && mrResults.map((h, i) => renderCard(
             h.title, h.description,
             h.icon_url,
             t('modpacks.downloads_count', { count: formatDownloads(h.downloads) }),
             () => store.selectMr(h),
             h.project_id,
             !!selected && 'project_id' in selected && (selected as MrHit).project_id === h.project_id,
+            i,
           ))}
 
-          {tab === 'curseforge' && cfResults.map((h) => renderCard(
+          {tab === 'curseforge' && cfResults.map((h, i) => renderCard(
             h.name, h.summary,
             h.logo?.thumbnailUrl || h.logo?.url || null,
             t('modpacks.downloads_count', { count: formatDownloads(h.downloadCount) }),
             () => store.selectCf(h),
             String(h.id),
             !!selected && 'downloadCount' in selected && (selected as CfHit).id === h.id,
+            i,
           ))}
 
-          {tab === 'atlauncher' && atlFiltered.map((p) => renderCard(
+          {tab === 'atlauncher' && atlFiltered.map((p, i) => renderCard(
             p.name,
             p.description ?? '',
             toIconSrc(p.icon),
@@ -509,6 +513,7 @@ export function Modpacks() {
             () => store.selectAtlPack(p),
             p.safeName,
             !!selected && 'safeName' in selected && (selected as AtlPack).safeName === p.safeName,
+            i,
           ))}
 
           {loadingMore && (

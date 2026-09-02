@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Modal } from '../ui/Modal';
 import { ProgressBar } from '../ui/ProgressBar';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { useT, getLanguage } from '../../lib/i18n';
 import { useLogPlaque } from '../../lib/uiLog';
 
@@ -143,7 +144,7 @@ export function LoaderInstallModal({ open, onClose, onInstalled, instanceName }:
                   {message || t('common.installing')}
                 </span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
-                  <div className="spinner-sm" style={{ width: 16, height: 16 }} />
+                  <SnakeSpinner size={18} />
                 </div>
               </>
             )}

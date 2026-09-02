@@ -98,7 +98,7 @@ fn http_client() -> reqwest::Client {
     let mut slot = CLIENT
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .unwrap();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Rebuild the client when the proxy setting changes (including disabled).
     if slot.as_ref().map(|(p, _)| p != &proxy).unwrap_or(true) {
         *slot = Some((proxy.clone(), build_client(proxy.as_deref())));
@@ -347,6 +347,90 @@ pub async fn send_with_fallback(
             Err(e)
         }
     }
+}
+
+/// Perform a GET with retry on transient failures only: network errors,
+/// HTTP 429 (rate limit, honoring `Retry-After` when present, capped so a
+/// retry never blocks an install for too long) and 5xx. Non-transient 4xx
+/// return immediately. The final error message carries a truncated body
+/// preview (500 chars) so API noise doesn't flood the UI or logs.
+///
+/// Shared by the Modrinth and CurseForge API clients whose retry semantics
+/// are identical — keep both callers on this helper so the behavior cannot
+/// drift apart.
+pub async fn get_with_retry(
+    req: reqwest::RequestBuilder,
+    provider: &str,
+    attempts: usize,
+    backoff_ms: &[u64],
+) -> Result<reqwest::Response> {
+    let mut last_err: Option<LauncherError> = None;
+    for attempt in 0..attempts {
+        let attempt_req = match req.try_clone() {
+            Some(r) => r,
+            None => return req.send().await.map_err(LauncherError::Network),
+        };
+        let response = match send_with_fallback(attempt_req).await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(LauncherError::Network(e));
+                if attempt < attempts - 1 {
+                    crate::events::emit_fetch_retry(
+                        provider,
+                        attempt + 2,
+                        attempts,
+                        &format!("Retrying {} request", provider),
+                    );
+                    sleep(Duration::from_millis(
+                        backoff_ms[attempt.min(backoff_ms.len() - 1)],
+                    ))
+                    .await;
+                }
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        let retriable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.as_u16() >= 500;
+        if retriable && attempt < attempts - 1 {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|secs| secs.min(10))
+                .unwrap_or_else(|| {
+                    (backoff_ms[attempt.min(backoff_ms.len() - 1)] / 1000).max(1)
+                });
+            last_err = Some(LauncherError::Download(format!(
+                "{} API error ({})",
+                provider, status
+            )));
+            crate::events::emit_fetch_retry(
+                provider,
+                attempt + 2,
+                attempts,
+                &format!("{} returned {}, retrying", provider, status),
+            );
+            sleep(Duration::from_secs(retry_after)).await;
+            continue;
+        }
+
+        let text = response.text().await.unwrap_or_default();
+        let preview: String = text.chars().take(500).collect();
+        return Err(LauncherError::Download(format!(
+            "{} API error ({}): {}",
+            provider, status, preview
+        )));
+    }
+    Err(last_err.unwrap_or_else(|| {
+        LauncherError::Download(format!("{} request failed", provider))
+    }))
 }
 
 /// Update the global proxy used by every HTTP request. Called when the
@@ -740,7 +824,15 @@ pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Re
         // burning MAX_RETRIES worth of timeouts per file.
         let attempts = if candidates.len() > 1 && ci == 0 { 1 } else { MAX_RETRIES };
         for attempt in 1..=attempts {
-            match download_to_part(candidate, path, expected_sha1, None, None).await {
+            match download_to_part(
+                candidate,
+                path,
+                expected_sha1,
+                None,
+                Some(timeout_for_unknown_size()),
+            )
+            .await
+            {
                 Ok(()) => return Ok(()),
                 Err(e) if matches!(e, LauncherError::Paused) => return Err(e),
                 Err(e) => {
@@ -765,6 +857,15 @@ pub async fn download_file(url: &str, path: &PathBuf, expected_sha1: &str) -> Re
 pub fn timeout_for_size(size_bytes: u64) -> Duration {
     let secs = size_bytes / 512_000 + 60;
     Duration::from_secs(secs.clamp(120, 900))
+}
+
+/// Overall timeout for downloads whose size is unknown. Such downloads are
+/// guarded against stalls by a per-chunk no-data timeout (30 s), so the
+/// overall cap only needs to be generous enough for a large file on a slow
+/// link (e.g. a Forge installer or a library of tens of MB) — the flat 120 s
+/// HTTP-client default would otherwise abort a slow-but-steady transfer.
+pub fn timeout_for_unknown_size() -> Duration {
+    Duration::from_secs(900)
 }
 
 /// Download a file with streaming, retries, and a timeout scaled to expected size.
@@ -993,15 +1094,6 @@ pub fn ensure_virtual_assets(
     Ok(())
 }
 
-/// Verify file SHA1 hash
-pub fn verify_sha1(path: &std::path::Path, expected: &str) -> Result<bool> {
-    let bytes = std::fs::read(path)?;
-    let mut hasher = Sha1::new();
-    hasher.update(&bytes);
-    let result = hex::encode(hasher.finalize());
-    Ok(result == expected)
-}
-
 /// Verify a downloaded file is a valid ZIP/JAR archive by its magic bytes.
 /// Guards against error pages (HTML/JSON) or truncated responses being saved
 /// under a .jar/.zip name when no SHA1 is available to check.
@@ -1036,6 +1128,26 @@ pub fn hash_file_sha1(path: &std::path::Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Verify file SHA1 hash without loading the whole file into memory.
+pub fn verify_sha1(path: &std::path::Path, expected: &str) -> Result<bool> {
+    Ok(hash_file_sha1(path)? == expected)
+}
+
+/// Reject archive entry paths that could escape their extraction directory:
+/// absolute paths, ".." components and Windows drive prefixes (e.g. "C:").
+/// Callers normalize backslashes to forward slashes before splitting.
+pub(crate) fn is_unsafe_archive_path(relative: &str) -> bool {
+    let normalized = relative.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return true;
+    }
+    if normalized.split('/').any(|c| c == "..") {
+        return true;
+    }
+    let bytes = normalized.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Expose global client for use by other modules (versions, modloaders).
@@ -1148,5 +1260,20 @@ mod tests {
             parse_win_proxy_server("https=;http=127.0.0.1:88"),
             Some("127.0.0.1:88".to_string())
         );
+    }
+
+    #[test]
+    fn unsafe_archive_path_rejects_traversal_and_absolutes() {
+        assert!(is_unsafe_archive_path("../evil.dll"));
+        assert!(is_unsafe_archive_path("a/b/../../evil.dll"));
+        assert!(is_unsafe_archive_path("/abs/path.dll"));
+        assert!(is_unsafe_archive_path("C:/windows/evil.dll"));
+        assert!(is_unsafe_archive_path("..\\evil.dll"));
+        assert!(is_unsafe_archive_path("a\\..\\b\\evil.dll"));
+
+        // Safe relative paths must be accepted.
+        assert!(!is_unsafe_archive_path("lwjgl.dll"));
+        assert!(!is_unsafe_archive_path("org/lwjgl/foo.dll"));
+        assert!(!is_unsafe_archive_path("jdk-21/bin/java.exe"));
     }
 }

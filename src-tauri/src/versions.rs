@@ -155,12 +155,18 @@ pub struct AssetObject {
     pub is_virtual: bool,
 }
 
-/// Fetch version manifest from Mojang
+/// Fetch version manifest from Mojang (with retries honoring Retry-After,
+/// since Mojang periodically throttles this endpoint with HTTP 429).
 pub async fn fetch_version_manifest() -> Result<VersionManifest> {
     tracing::info!(target: "launcher", "Fetching version manifest from Mojang");
     let client = crate::download::global_http_client();
-    let manifest = crate::download::send_with_fallback(
-        client.get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"),
+    let manifest = crate::download::get_with_retry(
+        client
+            .get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+            .timeout(std::time::Duration::from_secs(20)),
+        "Mojang",
+        4,
+        &[1000, 2000, 4000],
     )
     .await
     .map_err(|e| {
@@ -180,18 +186,23 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest> {
 pub async fn fetch_version_info(url: &str) -> Result<VersionInfo> {
     tracing::info!(target: "launcher", "Fetching version info from {}", url);
     let client = crate::download::global_http_client();
-    let info = crate::download::send_with_fallback(client.get(url))
-        .await
-        .map_err(|e| {
-            tracing::error!(target: "launcher", "Failed to fetch version info: {}", e);
-            e
-        })?
-        .json::<VersionInfo>()
-        .await
-        .map_err(|e| {
-            tracing::error!(target: "launcher", "Failed to parse version info: {}", e);
-            e
-        })?;
+    let info = crate::download::get_with_retry(
+        client.get(url).timeout(std::time::Duration::from_secs(20)),
+        "Mojang",
+        4,
+        &[1000, 2000, 4000],
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to fetch version info: {}", e);
+        e
+    })?
+    .json::<VersionInfo>()
+    .await
+    .map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to parse version info: {}", e);
+        e
+    })?;
     Ok(info)
 }
 
@@ -199,18 +210,23 @@ pub async fn fetch_version_info(url: &str) -> Result<VersionInfo> {
 pub async fn fetch_asset_index(url: &str) -> Result<AssetIndexData> {
     tracing::info!(target: "launcher", "Fetching asset index from {}", url);
     let client = crate::download::global_http_client();
-    let index = crate::download::send_with_fallback(client.get(url))
-        .await
-        .map_err(|e| {
-            tracing::error!(target: "launcher", "Failed to fetch asset index: {}", e);
-            e
-        })?
-        .json::<AssetIndexData>()
-        .await
-        .map_err(|e| {
-            tracing::error!(target: "launcher", "Failed to parse asset index: {}", e);
-            e
-        })?;
+    let index = crate::download::get_with_retry(
+        client.get(url).timeout(std::time::Duration::from_secs(20)),
+        "Mojang",
+        4,
+        &[1000, 2000, 4000],
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to fetch asset index: {}", e);
+        e
+    })?
+    .json::<AssetIndexData>()
+    .await
+    .map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to parse asset index: {}", e);
+        e
+    })?;
     Ok(index)
 }
 
@@ -559,17 +575,6 @@ pub fn collect_downloads(
     files
 }
 
-/// Load version info from file
-pub fn version_info_from_file(path: &PathBuf) -> Result<VersionInfo> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| LauncherError::Version(format!("Failed to read version file: {}", e)))?;
-    
-    let info: VersionInfo = serde_json::from_str(&contents)
-        .map_err(|e| LauncherError::Version(format!("Failed to parse version JSON: {}", e)))?;
-    
-    Ok(info)
-}
-
 /// Load a saved asset index (e.g. `indexes/legacy.json`) from disk
 pub fn load_asset_index(path: &PathBuf) -> Result<AssetIndexData> {
     let contents = std::fs::read_to_string(path)
@@ -662,7 +667,16 @@ pub fn extract_natives(version_info: &VersionInfo, libraries_dir: &PathBuf, nati
                                 if name.starts_with("META-INF/") || name.ends_with('/') {
                                     continue;
                                 }
+                                // Refuse path traversal: an entry such as
+                                // "../../evil.dll" must not escape natives_dir.
+                                if crate::download::is_unsafe_archive_path(&name) {
+                                    tracing::warn!(target: "launcher", "Skipping unsafe native entry: {}", name);
+                                    continue;
+                                }
                                 let dest = natives_dir.join(&name);
+                                if !dest.starts_with(natives_dir) {
+                                    continue;
+                                }
                                 if dest.exists() {
                                     continue;
                                 }

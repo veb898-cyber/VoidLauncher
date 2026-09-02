@@ -163,7 +163,11 @@ fn find_java() -> Option<PathBuf> {
             }
         }
     }
-    if std::process::Command::new("java").arg("-version").output().is_ok() {
+    let mut sys = std::process::Command::new("java");
+    sys.arg("-version");
+    #[cfg(target_os = "windows")]
+    sys.creation_flags(0x08000000);
+    if crate::java::run_command_with_timeout(&mut sys, std::time::Duration::from_secs(15)).is_ok() {
         return Some(PathBuf::from("java"));
     }
     None
@@ -492,13 +496,26 @@ pub(crate) fn run_forge_processors(
         #[cfg(not(target_os = "windows"))]
         let mut cmd = std::process::Command::new(java_path);
 
-        let output = cmd
-            .arg("-cp")
-            .arg(&classpath)
-            .arg(&main_class)
-            .args(&processed_args)
-            .output()
-            .map_err(|e| LauncherError::ModLoader(format!("Failed to run processor {}: {}", idx, e)))?;
+        let output = crate::java::run_command_with_timeout(
+            &mut cmd
+                .arg("-cp")
+                .arg(&classpath)
+                .arg(&main_class)
+                .args(&processed_args),
+            std::time::Duration::from_secs(600),
+        )
+        .map_err(|e| {
+            LauncherError::ModLoader(format!(
+                "Failed to run processor {} ({}): {}",
+                idx,
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    "timed out after 10 minutes"
+                } else {
+                    "spawn error"
+                },
+                e
+            ))
+        })?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -877,17 +894,33 @@ pub async fn ensure_processor_jars(
         .unwrap_or_else(|| std::env::temp_dir());
     if let Some(java_path) = find_java_for(&data_dir, mc_version) {
         tracing::info!(target: "launcher", "Running Forge processors with Java: {:?}", java_path);
-        if let Err(e) = run_forge_processors(
-            &install_profile,
-            &installer_path,
-            &java_path,
-            &libraries_dir,
-            mc_version,
-            &client_jar,
-            &root_dir,
-            "net/minecraftforge/forge",
-        ) {
-            tracing::warn!(target: "launcher", "Forge processor run failed: {}", e);
+        // Long-lived subprocess pipeline (30-120s for some versions) — run on
+        // the blocking pool so it can't stall the async runtime that drives
+        // the UI and other downloads.
+        let profile = install_profile.clone();
+        let installer = installer_path.clone();
+        let java = java_path.clone();
+        let libs = libraries_dir.clone();
+        let ver = mc_version.to_string();
+        let cjar = client_jar.clone();
+        let root = root_dir.clone();
+        match tokio::task::spawn_blocking(move || {
+            run_forge_processors(
+                &profile,
+                &installer,
+                &java,
+                &libs,
+                &ver,
+                &cjar,
+                &root,
+                "net/minecraftforge/forge",
+            )
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(target: "launcher", "Forge processor run failed: {}", e),
+            Err(e) => tracing::warn!(target: "launcher", "Forge processor task failed: {}", e),
         }
     } else {
         tracing::warn!(target: "launcher", "Java not found — cannot run Forge processors");
@@ -970,6 +1003,12 @@ fn extract_embedded_forge_jars<R: Read + std::io::Seek>(
         if let Ok(mut entry) = archive.by_index(i) {
             let entry_name = entry.name().replace('\\', "/");
             if entry_name.starts_with(embedded_maven_base) && entry_name.ends_with(".jar") {
+                // Refuse path traversal: only entries that stay under the
+                // "maven/" root of the libraries dir may be written.
+                if crate::download::is_unsafe_archive_path(entry_name.strip_prefix("maven/").unwrap_or(&entry_name)) {
+                    tracing::warn!(target: "launcher", "Skipping unsafe Forge library entry: {}", entry_name);
+                    continue;
+                }
                 // Extract to libraries dir maintaining the path after "maven/"
                 let relative_path = entry_name.strip_prefix("maven/").unwrap_or(&entry_name);
                 let dest = libraries_dir.join(relative_path);

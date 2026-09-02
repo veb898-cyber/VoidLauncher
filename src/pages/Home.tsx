@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState, useRef } from 'react';
-import { Play, Plus, Package, Settings, Clock, Image, Upload } from 'lucide-react';
+import { Play, Plus, Package, Settings, Clock, Image, Upload, X } from 'lucide-react';
 import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore } from '../stores/accountsStore';
 import { useInstanceStore } from '../stores/instanceStore';
 import { useBrowserGuardStore } from '../stores/browserGuardStore';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { Tooltip } from '../components/ui/Tooltip';
 import { useT, formatPlayTime, formatRelativeTime, type MessageKey } from '../lib/i18n';
 import { createPortal } from 'react-dom';
 import { addToast } from '../components/ui/Toast';
@@ -69,7 +70,7 @@ export function Home({ onNavigate }: HomeProps) {
       setMenuInstance(null);
       loadInstances();
     } catch (e: any) {
-      addToast(e?.message || 'Failed to set banner', 'error');
+      addToast(e?.message || t('home.banner_error', { error: e?.message || 'unknown' }), 'error');
     }
   };
 
@@ -191,7 +192,6 @@ export function Home({ onNavigate }: HomeProps) {
           <button
             className="btn btn--ghost"
             onClick={() => onNavigate('settings')}
-            title={t('home.settings_title')}
           >
             <Settings size={18} />
           </button>
@@ -231,16 +231,26 @@ export function Home({ onNavigate }: HomeProps) {
           </div>
         ) : (
           <div className="instance-grid">
-            {instances.map((inst) => (
+            {instances.map((inst, i) => (
               <div
                 key={inst.name}
-                className="instance-card"
+                className="instance-card stagger-in"
+                style={{ animationDelay: `${Math.min(i, 9) * 24}ms` }}
                 onClick={() => useBrowserGuardStore.getState().askLeave(() => {
                   selectInstance(inst.name);
                   onNavigate('instances');
                 })}
                 role="button"
                 tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    useBrowserGuardStore.getState().askLeave(() => {
+                      selectInstance(inst.name);
+                      onNavigate('instances');
+                    });
+                  }
+                }}
               >
                 <div className="instance-card__banner" style={isGradientBanner(inst.banner) ? {
                   background: getGradientValue(inst.banner),
@@ -272,7 +282,7 @@ export function Home({ onNavigate }: HomeProps) {
                   )}
                 </div>
                 <div className="instance-card__body instance-card__body--horizontal">
-                  <div className="instance-card__icon" style={{ position: 'relative', cursor: 'pointer' }}
+                  <div className="instance-card__icon icon-editable" style={{ position: 'relative', cursor: 'pointer' }}
                     onClick={(e) => {
                       e.stopPropagation();
                       setMenuInstance(menuInstance === inst.name ? null : inst.name);
@@ -312,7 +322,6 @@ export function Home({ onNavigate }: HomeProps) {
                       e.stopPropagation();
                       launchGame(inst.name);
                     }}
-                    title={t('home.instance_play_btn')}
                     disabled={isLaunching}
                   >
                     <Play size={14} fill="currentColor" />
@@ -387,20 +396,20 @@ export function Home({ onNavigate }: HomeProps) {
                       </div>
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 'var(--space-xs)', marginBottom: 'var(--space-sm)' }}>
                         {BANNER_PRESETS.map((p) => (
-                          <div
-                            key={p.id}
-                            title={bannerLabel(p.id)}
-                            onClick={() => setBanner(inst.name, `gradient:${p.id}`)}
-                            style={{
-                              width: '100%',
-                              aspectRatio: '16/9',
-                              borderRadius: 'var(--radius-sm)',
-                              background: p.gradient,
-                              cursor: 'pointer',
-                              border: inst.banner === `gradient:${p.id}` ? '2px solid var(--primary)' : '2px solid transparent',
-                              transition: 'border-color 0.15s',
-                            }}
-                          />
+                          <Tooltip key={p.id} content={bannerLabel(p.id)}>
+                            <div
+                              onClick={() => setBanner(inst.name, `gradient:${p.id}`)}
+                              style={{
+                                width: '100%',
+                                aspectRatio: '16/9',
+                                borderRadius: 'var(--radius-sm)',
+                                background: p.gradient,
+                                cursor: 'pointer',
+                                border: inst.banner === `gradient:${p.id}` ? '2px solid var(--primary)' : '2px solid transparent',
+                                transition: 'border-color 0.15s',
+                              }}
+                            />
+                          </Tooltip>
                         ))}
                       </div>
                       <div style={{ display: 'flex', gap: 'var(--space-xs)' }}>
@@ -413,14 +422,15 @@ export function Home({ onNavigate }: HomeProps) {
                           {t('home.upload_image')}
                         </button>
                         {inst.banner && (
-                          <button
-                            className="btn btn--ghost btn--sm"
-                            style={{ justifyContent: 'center', color: 'var(--color-danger)' }}
-                            onClick={() => setBanner(inst.name, '')}
-                            title={t('home.remove_banner')}
-                          >
-                            x
-                          </button>
+                          <Tooltip content={t('home.remove_banner')}>
+                            <button
+                              className="btn btn--ghost btn--sm"
+                              style={{ justifyContent: 'center', color: 'var(--color-danger)' }}
+                              onClick={() => setBanner(inst.name, '')}
+                            >
+                              <X size={14} />
+                            </button>
+                          </Tooltip>
                         )}
                       </div>
                     </div>

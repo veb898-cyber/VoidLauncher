@@ -6,6 +6,7 @@ import { t } from '../lib/i18n';
 import { useLogPlaque } from '../lib/uiLog';
 import { LoadingSpinner } from './ui/LoadingSpinner';
 import { Button } from './ui/Button';
+import { Tooltip } from './ui/Tooltip';
 
 interface MicrosoftLoginCardProps {
   /**
@@ -157,28 +158,29 @@ export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
               {t('login.instruction')}
             </p>
 
-            <div
-              onClick={handleCopyCode}
-              style={{
-                fontSize: 'var(--font-size-3xl)',
-                fontWeight: 800,
-                letterSpacing: '4px',
-                fontFamily: 'monospace',
-                background: 'var(--gradient-primary)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-                cursor: 'pointer',
-                marginBottom: 'var(--space-sm)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: 'var(--space-sm)',
-              }}
-              title={t('login.click_to_copy')}
-            >
-              {userCode}
-              {copied ? <Check size={24} color="var(--success)" /> : <Copy size={24} />}
-            </div>
+<Tooltip content={t('login.click_to_copy')}>
+                <div
+                  onClick={handleCopyCode}
+                  style={{
+                    fontSize: 36,
+                    fontWeight: 800,
+                    letterSpacing: '4px',
+                    fontFamily: 'monospace',
+                    background: 'var(--gradient-primary)',
+                    WebkitBackgroundClip: 'text',
+                    WebkitTextFillColor: 'transparent',
+                    cursor: 'pointer',
+                    marginBottom: 'var(--space-sm)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: 'var(--space-sm)',
+                  }}
+                >
+                  {userCode}
+                  {copied ? <Check size={24} color="var(--success)" /> : <Copy size={24} />}
+                </div>
+              </Tooltip>
 
             <p style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
               {copied ? t('login.copied') : t('login.click_to_copy')}

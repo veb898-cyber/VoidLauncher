@@ -9,6 +9,47 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+/// Run a command and collect its output, aborting with a timeout instead of
+/// hanging forever. `std::process::Command::output()` blocks indefinitely —
+/// a stuck java.exe (mid-update, broken install, locked by antivirus) would
+/// otherwise freeze the launcher's Java probes and Forge install processors.
+pub(crate) fn run_command_with_timeout(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("command timed out after {}s", timeout.as_secs()),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => break Err(e),
+        }
+    }?;
+    // The process has exited; drain its piped output.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) {
+        let _ = out.read_to_end(&mut stdout);
+        let _ = err.read_to_end(&mut stderr);
+    }
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
 /// Detected Java installation
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JavaInstallation {
@@ -113,7 +154,10 @@ pub fn probe_java_by_path(path: &PathBuf) -> Option<JavaInstallation> {
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let output = match cmd.output() {
+    let output = match run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(20),
+    ) {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(target: "launcher", "Failed to run java -version at {:?}: {}", path, e);

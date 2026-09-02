@@ -12,9 +12,11 @@ import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { addToast } from '../components/ui/Toast';
 import { CustomSelect } from '../components/ui/CustomSelect';
 import { getRecommendedMemoryMb, snapToMemoryStep } from '../lib/memory';
-import { useT, getLanguage, Language } from '../lib/i18n';
+import { useT, type Language } from '../lib/i18n';
 import { useLanguageStore } from '../stores/languageStore';
 import { useThemeStore, Theme } from '../stores/themeStore';
+import { useFontStore, Font, ConsoleFont } from '../stores/fontStore';
+import { Tooltip } from '../components/ui/Tooltip';
 import {
   APP_VERSION,
   useLatestVersion,
@@ -39,6 +41,8 @@ export function Settings() {
   const language = useLanguageStore((s) => s.language);
   const theme = useThemeStore((s) => s.theme);
   const setTheme = useThemeStore((s) => s.setTheme);
+  const font = useFontStore((s) => s.font);
+  const consoleFont = useFontStore((s) => s.consoleFont);
   const config = useSettingsStore((s) => s.config);
   const javaInstallations = useSettingsStore((s) => s.javaInstallations);
   const loadConfig = useSettingsStore((s) => s.loadConfig);
@@ -97,10 +101,12 @@ export function Settings() {
     try {
       await saveConfig(localConfig);
       setSaveSuccess(true);
+      addToast(t('settings.save_success'), 'success');
       setTimeout(() => setSaveSuccess(false), 2000);
-    } catch {
+    } catch (e) {
+      addToast(t('settings.save_error', { error: String(e) }), 'error');
     }
-  }, [localConfig, saveConfig]);
+  }, [localConfig, saveConfig, t]);
 
   const updateConfig = (key: string, value: any) => {
     if (!localConfig) return;
@@ -131,10 +137,7 @@ export function Settings() {
   return (
     <div className="page animate-fade-in">
       <div className="page__header">
-        <div>
-          <h1 className="page__title">{t('settings.title')}</h1>
-          <p className="page__subtitle">{t('settings.subtitle')}</p>
-        </div>
+        <h1 className="page__title">{t('settings.title')}</h1>
       </div>
 
       {/* Account Section */}
@@ -198,22 +201,22 @@ export function Settings() {
               onChange={(e) => updateConfig('default_memory_mb', Math.max(2048, parseInt(e.target.value) || 2048))}
               style={{ width: 100, textAlign: 'center' }}
               id="min-memory-input"
-              title={t('settings.memory_title')}
             />
             <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>{t('settings.memory_unit')}</span>
-            <button
-              className="btn btn--ghost btn--sm"
-              onClick={async () => {
-                const totalMb = await detectSystemRam();
-                // Tiered: 4 / 6 / 8 GB depending on total RAM, snapped to 512 MB step
-                const recommended = snapToMemoryStep(getRecommendedMemoryMb(totalMb));
-                updateConfig('default_memory_mb', recommended);
-              }}
-              id="reset-memory-btn"
-              title={t('settings.memory_reset_tooltip')}
-            >
-              {t('settings.memory_reset')}
-            </button>
+            <Tooltip content={t('settings.memory_reset_tooltip')}>
+              <button
+                className="btn btn--ghost btn--sm"
+                onClick={async () => {
+                  const totalMb = await detectSystemRam();
+                  // Tiered: 4 / 6 / 8 GB depending on total RAM, snapped to 512 MB step
+                  const recommended = snapToMemoryStep(getRecommendedMemoryMb(totalMb));
+                  updateConfig('default_memory_mb', recommended);
+                }}
+                id="reset-memory-btn"
+              >
+                {t('settings.memory_reset')}
+              </button>
+            </Tooltip>
           </div>
         </div>
 
@@ -228,9 +231,9 @@ export function Settings() {
             <CustomSelect
               value={localConfig.default_gc_preset}
               options={[
-                { value: 'standard', label: 'Standard', description: t('instance_editor.gc_standard_desc') },
-                { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: 'Java 8+' },
-                { value: 'zgc', label: t('instance_editor.gc_zgc'), description: `Java 17+, \u2265 8 ${getLanguage() === 'ru' ? 'ГБ' : 'GB'}` },
+                { value: 'standard', label: t('instance_editor.gc_standard'), description: t('instance_editor.gc_standard_short') },
+                { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: t('instance_editor.gc_g1gc_short') },
+                { value: 'zgc', label: t('instance_editor.gc_zgc'), description: t('instance_editor.gc_zgc_req') },
               ]}
               onChange={(v) => updateConfig('default_gc_preset', v)}
             />
@@ -426,6 +429,54 @@ export function Settings() {
         </div>
         <div className="settings-row">
           <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.font_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.font_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control" style={{ width: 220 }}>
+            <CustomSelect
+              value={font}
+              options={[
+                { value: 'default', label: t('settings.font_default') },
+                { value: 'monocraft', label: t('settings.font_monocraft') },
+              ]}
+              onChange={(v) => useFontStore.getState().setFont(v as Font)}
+            />
+          </div>
+        </div>
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.console_font_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.console_font_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control" style={{ width: 220 }}>
+            <CustomSelect
+              value={consoleFont}
+              options={[
+                {
+                  value: 'auto',
+                  label: t('settings.console_font_auto'),
+                  tooltip: t('settings.console_font_auto_hint'),
+                },
+                {
+                  value: 'default',
+                  label: t('settings.console_font_default'),
+                  tooltip: t('settings.console_font_default_hint'),
+                },
+                {
+                  value: 'monocraft',
+                  label: t('settings.console_font_monocraft'),
+                },
+              ]}
+              onChange={(v) => useFontStore.getState().setConsoleFont(v as ConsoleFont)}
+            />
+          </div>
+        </div>
+        <div className="settings-row">
+          <div className="settings-row__info">
             <div className="settings-row__title">{t('settings.theme_title')}</div>
             <div className="settings-row__desc">
               {t('settings.theme_desc')}
@@ -436,8 +487,9 @@ export function Settings() {
               value={theme}
               options={[
                 { value: 'standard', label: t('settings.theme_standard') },
+                { value: 'blueprint', label: t('settings.theme_blueprint') },
+                { value: 'ember', label: t('settings.theme_ember') },
                 { value: 'dark', label: t('settings.theme_dark') },
-                { value: 'light', label: t('settings.theme_light') },
               ]}
               onChange={(v) => setTheme(v as Theme)}
             />
@@ -672,6 +724,10 @@ function AccountCard({
   const hasAccount = !!defaultAccountName || !!microsoftName;
   const activeName = defaultAccountName ?? microsoftName ?? '';
   const activeUuid = defaultAccountUuid ?? microsoftUuid ?? null;
+  // Свежий UUID текущего профиля Microsoft надёжнее, чем из сохранённого
+  // списка аккаунтов: id активной сессии точно рабочий (тот же, что в сайдбаре),
+  // тогда как сохранённое значение может устареть или отличаться форматом.
+  const avatarUuid = microsoftUuid ?? defaultAccountUuid ?? null;
   const typeLabel = typeLabelKey ? t(typeLabelKey) : '';
 
   return (
@@ -679,7 +735,7 @@ function AccountCard({
       {hasAccount ? (
         <>
           <img
-            src={`https://mc-heads.net/avatar/${activeUuid}/48`}
+            src={`https://mc-heads.net/avatar/${avatarUuid}/48`}
             referrerPolicy="no-referrer"
             alt={activeName}
             style={{ width: 48, height: 48, borderRadius: 'var(--radius-md)' }}
@@ -767,7 +823,7 @@ function LatestVersionSection() {
             <span
               style={{
                 fontWeight: 600,
-                fontFamily: 'monospace',
+                fontFamily: 'var(--font-ui)',
                 color: 'var(--text-primary)',
               }}
             >
@@ -780,7 +836,7 @@ function LatestVersionSection() {
             <span
               style={{
                 fontWeight: 600,
-                fontFamily: 'monospace',
+                fontFamily: 'var(--font-ui)',
                 color: statusColor,
               }}
             >

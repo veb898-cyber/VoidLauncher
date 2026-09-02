@@ -20,15 +20,15 @@ let nextId = 0;
 /**
  * Launcher logs are English-only by design, but UI mirrors (toasts, inline
  * banners) follow the interface language and would leak Russian into the log.
- * Such entries are dropped here; game output sources pass through untouched.
+ * Non-critical entries (info) are dropped to keep the log clean, but errors
+ * and warnings always pass through — users need to see failures regardless
+ * of the interface language. Game output sources pass through untouched.
  */
 const CYRILLIC_RE = /[\u0400-\u04FF]/;
-function isLocalizedUiNoise(entry: { source: string; message: string }): boolean {
-  return (
-    entry.source !== 'minecraft' &&
-    entry.source !== 'launch' &&
-    CYRILLIC_RE.test(entry.message)
-  );
+function isLocalizedUiNoise(entry: { source: string; message: string; level: string }): boolean {
+  if (entry.source === 'minecraft' || entry.source === 'launch') return false;
+  if (entry.level === 'error' || entry.level === 'warn') return false;
+  return CYRILLIC_RE.test(entry.message);
 }
 
 export const useLogStore = create<LogState>((set) => ({

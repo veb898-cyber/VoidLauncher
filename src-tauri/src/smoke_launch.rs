@@ -94,12 +94,17 @@ fn java_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("java")
 }
 
+fn check_java_availability(data_dir: &Path, required_major: u32) -> bool {
+    let installations = launch::find_all_java_installations(&data_dir.to_path_buf());
+    crate::java::get_recommended_java(Some(required_major), &installations).is_some()
+}
+
 /// Ensure a managed JRE of `major` exists in `data_dir/java/jdk-<major>`.
 /// Uses the exact same Adoptium source + layout as the launcher's own
 /// `java_download` module so `list_managed_java` picks it up.
 async fn ensure_java(data_dir: &Path, major: u32) -> Result<(), String> {
     let data_dir = data_dir.to_path_buf();
-    if launch::check_java_availability(&data_dir, major).is_some() {
+    if check_java_availability(&data_dir, major) {
         return Ok(());
     }
     let dir = java_dir(&data_dir);
@@ -173,7 +178,7 @@ async fn ensure_java(data_dir: &Path, major: u32) -> Result<(), String> {
     std::fs::write(dest.join(".extracted"), b"1").map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&tmp_zip);
 
-    if launch::check_java_availability(&data_dir, major).is_some() {
+    if check_java_availability(&data_dir, major) {
         report_line(&format!("Java {} ready in managed runtimes", major));
         Ok(())
     } else {

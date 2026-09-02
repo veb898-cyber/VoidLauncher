@@ -412,17 +412,38 @@ pub async fn install(
                 .unwrap_or_else(|| std::env::temp_dir());
             if let Some(java_path) = super::forge::find_java_for(&data_dir, mc_version) {
                 tracing::info!(target: "launcher", "Running NeoForge processors with Java: {:?}", java_path);
-                if let Err(e) = super::forge::run_forge_processors(
-                    &install_profile,
-                    &installer_path,
-                    &java_path,
-                    libraries_dir,
-                    mc_version,
-                    &client_jar,
-                    &root_dir,
-                    data_base,
-                ) {
-                    tracing::warn!(target: "launcher", "NeoForge processor run failed: {}", e);
+                // Long-lived subprocess pipeline (30-120s) — run on the
+                // blocking pool so it can't stall the async runtime that
+                // drives the UI and other downloads.
+                let profile = install_profile.clone();
+                let installer = installer_path.clone();
+                let java = java_path.clone();
+                let libs = libraries_dir.to_path_buf();
+                let ver = mc_version.to_string();
+                let cjar = client_jar.clone();
+                let root = root_dir.clone();
+                let data_base_owned = data_base.to_string();
+                match tokio::task::spawn_blocking(move || {
+                    super::forge::run_forge_processors(
+                        &profile,
+                        &installer,
+                        &java,
+                        &libs,
+                        &ver,
+                        &cjar,
+                        &root,
+                        &data_base_owned,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(target: "launcher", "NeoForge processor run failed: {}", e)
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "launcher", "NeoForge processor task failed: {}", e)
+                    }
                 }
             } else {
                 tracing::warn!(target: "launcher", "Java not found — cannot run NeoForge processors");

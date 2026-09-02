@@ -162,7 +162,6 @@ fn pick_modrinth_file<'a>(
         .iter()
         .find(|f| f.filename == filename)
         .or_else(|| files.iter().find(|f| f.primary))
-        .or_else(|| files.first())
 }
 
 async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> Vec<String> {
@@ -253,17 +252,34 @@ fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) {
     }
 }
 
+/// Validate an mrpack index path and resolve its destination under `mc_dir`,
+/// rejecting path traversal, absolute/rooted paths and drive prefixes — the
+/// path comes straight from the pack's `modrinth.index.json` and must not
+/// escape the instance directory.
+fn mrpack_dest(mc_dir: &Path, path_str: &str) -> Result<PathBuf> {
+    if path_str.is_empty() {
+        return Err(LauncherError::Instance("Missing path in mrpack file entry".into()));
+    }
+    check_safe_relative(path_str)?;
+    let dest_path = mc_dir.join(path_str);
+    // Defense in depth: Path::join replaces the base entirely on absolute or
+    // drive-relative paths, so the joined path must stay under mc_dir.
+    if !dest_path.starts_with(mc_dir) {
+        return Err(LauncherError::Instance(format!(
+            "Mrpack file path escapes the instance directory: {}",
+            path_str
+        )));
+    }
+    Ok(dest_path)
+}
+
 async fn install_mrpack_file(
     path_str: &str,
     file_entry: &serde_json::Value,
     mc_dir: &Path,
-    embedded: &HashMap<String, Vec<u8>>,
+    embedded: &Arc<HashMap<String, Vec<u8>>>,
 ) -> Result<()> {
-    if path_str.is_empty() {
-        return Err(LauncherError::Instance("Missing path in mrpack file entry".into()));
-    }
-
-    let dest_path = mc_dir.join(path_str);
+    let dest_path = mrpack_dest(mc_dir, path_str)?;
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -477,26 +493,94 @@ pub async fn import_modpack(
     emit_progress(app, "reading", 0, 1, "Reading archive...");
 
     let zip_bytes = std::fs::read(path)?;
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))?;
 
-    let names: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
-        .collect();
+    // Sniff the archive format cheaply (one pass over the entry names), then
+    // drop the bytes before handing off to the format-specific importer. The
+    // importers re-read the file from disk themselves; keeping the archive
+    // alive here would hold a second full copy of the pack in memory for the
+    // whole install (up to 2× the file size).
+    let format = {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))?;
+        let names: Vec<String> = (0..archive.len())
+            .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
+            .collect();
+        if names.iter().any(|n| n == "instance.cfg") {
+            ModpackFormat::Prism
+        } else if names.iter().any(|n| n == "modrinth.index.json") {
+            ModpackFormat::Modrinth
+        } else if names.iter().any(|n| n == "manifest.json") {
+            ModpackFormat::CurseForge
+        } else if names.iter().any(|n| n == "instance.json") {
+            ModpackFormat::ATLauncher
+        } else {
+            return Err(LauncherError::Instance(
+                "Unrecognized modpack format. Supported: Prism/MultiMC (.zip), Modrinth (.mrpack), CurseForge/FTB (.zip), ATLauncher (.zip)".to_string()
+            ));
+        }
+    };
+    drop(zip_bytes);
 
-    let instance = if names.iter().any(|n| n == "instance.cfg") {
-        instances::import_prism_pack(instances_dir, path)?
-    } else if names.iter().any(|n| n == "modrinth.index.json") {
-        import_mrpack(instances_dir, path, instance_name, app).await?
-    } else if names.iter().any(|n| n == "manifest.json") {
-        import_curseforge_pack(instances_dir, path, instance_name, curseforge_api_key, libraries_dir, app).await?
-    } else if names.iter().any(|n| n == "instance.json") {
-        import_atlauncher_pack(instances_dir, path, instance_name)?
-    } else {
-        return Err(LauncherError::Instance("Unrecognized modpack format".to_string()));
+    let instance = match format {
+        ModpackFormat::Prism => import_with_cleanup(
+            instances_dir,
+            instance_name,
+            || async { instances::import_prism_pack(instances_dir, path) },
+        )
+        .await?,
+        ModpackFormat::Modrinth => import_with_cleanup(
+            instances_dir,
+            instance_name,
+            || async { import_mrpack(instances_dir, path, instance_name, app).await },
+        )
+        .await?,
+        ModpackFormat::CurseForge => import_with_cleanup(
+            instances_dir,
+            instance_name,
+            || async {
+                import_curseforge_pack(instances_dir, path, instance_name, curseforge_api_key, libraries_dir, app).await
+            },
+        )
+        .await?,
+        ModpackFormat::ATLauncher => import_with_cleanup(
+            instances_dir,
+            instance_name,
+            || async { import_atlauncher_pack(instances_dir, path, instance_name) },
+        )
+        .await?,
     };
 
     emit_progress(app, "done", 1, 1, "Import complete!");
     Ok(instance)
+}
+
+/// Run a format-specific importer against `instances_dir/<instance_name>` and,
+/// if it fails, remove the partially-created instance directory so a failed
+/// import never leaves broken/missing files behind.
+///
+/// A directory is only removed when it did NOT exist before the import — a
+/// re-import over an existing instance must not wipe the previous good copy.
+async fn import_with_cleanup<F, Fut>(
+    instances_dir: &PathBuf,
+    instance_name: &str,
+    importer: F,
+) -> Result<Instance>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Instance>>,
+{
+    let target = instances_dir.join(instance_name);
+    let existed_before = target.exists();
+
+    let result = importer().await;
+
+    if result.is_err() && !existed_before {
+        tracing::warn!(target: "launcher", "Import failed, removing partially-created instance {}", target.display());
+        if let Err(e) = std::fs::remove_dir_all(&target) {
+            // Missing dir is fine; anything else masks the original error intent.
+            tracing::warn!(target: "launcher", "Cleanup of {} failed: {}", target.display(), e);
+        }
+    }
+    result
 }
 
 /// Import a Modrinth .mrpack
@@ -576,6 +660,8 @@ pub(crate) async fn import_mrpack(
         entry.read_to_end(&mut buf)?;
         embedded.insert(normalize_zip_path(&entry_name), buf);
     }
+
+    let embedded = Arc::new(embedded);
 
     if !extracted_any {
         tracing::warn!(target: "launcher", "Modrinth pack has no overrides/ folder");
@@ -1137,6 +1223,51 @@ mod tests {
         let (l, v) = detect_mrpack_loader(&deps);
         assert_eq!(l, None);
         assert_eq!(v, None);
+    }
+
+    #[test]
+    fn mrpack_dest_rejects_traversal() {
+        let base = std::env::temp_dir().join(format!("vl_mrpack_dest_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        for evil in [
+            "../evil.json",
+            "mods/../../evil.json",
+            "mods/..\\..\\evil.json",
+            "C:/Windows/evil.exe",
+            "C:\\Windows\\evil.exe",
+            "\\evil.json",
+            "/etc/passwd",
+            "",
+            "mods/\0evil.json",
+        ] {
+            assert!(
+                mrpack_dest(&base, evil).is_err(),
+                "path {:?} must be rejected",
+                evil
+            );
+        }
+        let ok = mrpack_dest(&base, "mods/foo.jar").unwrap();
+        assert_eq!(ok, base.join("mods/foo.jar"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn install_mrpack_file_rejects_unsafe_path() {
+        // Regression: a malicious mrpack index entry must fail before any file
+        // is written or any download is attempted.
+        let base = std::env::temp_dir().join(format!("vl_mrpack_inst_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let entry = serde_json::json!({"path": "../evil.json", "hashes": {}});
+        let embedded = Arc::new(HashMap::new());
+        let result = tauri::async_runtime::block_on(install_mrpack_file(
+            "../evil.json",
+            &entry,
+            &base,
+            &embedded,
+        ));
+        assert!(result.is_err());
+        assert!(!base.parent().unwrap().join("evil.json").exists());
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

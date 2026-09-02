@@ -3,9 +3,10 @@ import { createPortal } from 'react-dom';
 import { useT, type MessageKey } from '../../lib/i18n';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { Package, Settings, Copy, Palette, Image, Upload, Trash2 } from 'lucide-react';
+import { Package, Settings, Palette, Image, Upload, Trash2, X } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
 import { Button } from '../ui/Button';
+import { Tooltip } from '../ui/Tooltip';
 import { addToast } from '../ui/Toast';
 import { InstanceEditor } from './InstanceEditor';
 import { ContentManager } from './ContentManager';
@@ -82,16 +83,6 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
     );
   }
 
-  const handleDuplicate = async () => {
-    const newName = prompt(t('instance_detail.duplicate_prompt'), `${instance.name} (copy)`);
-    if (!newName || newName === instance.name) return;
-    try {
-      await invoke('cmd_duplicate_instance', { name: instance.name, newName });
-      addToast(t('instance_detail.duplicated_toast', { name: newName }), 'success');
-      useInstanceStore.getState().loadInstances();
-    } catch (e: any) { addToast(t('instance_detail.duplicate_error', { error: e.toString() }), 'error'); }
-  };
-
   const handlePickIcon = async () => {
     const selected = await openFileDialog({
       title: t('instance_detail.icon_file_title'),
@@ -129,7 +120,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
       await invoke('cmd_set_instance_banner', { instanceName: instance.name, bannerData: dataUrl });
       addToast(t('home.banner_updated'), 'success');
       useInstanceStore.getState().loadInstances();
-    } catch (e: any) { addToast(e?.message || 'Failed to set banner', 'error'); }
+    } catch (e: any) { addToast(e?.message || t('home.banner_error', { error: e?.message || 'unknown' }), 'error'); }
   };
 
   const setBannerGradient = async (gradientId: string) => {
@@ -139,7 +130,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
       setShowMenu(false);
       useInstanceStore.getState().loadInstances();
     } catch (e: any) {
-      addToast(e?.message || 'Failed to set banner', 'error');
+      addToast(e?.message || t('home.banner_error', { error: e?.message || 'unknown' }), 'error');
     }
   };
 
@@ -150,7 +141,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
       setShowMenu(false);
       useInstanceStore.getState().loadInstances();
     } catch (e: any) {
-      addToast(e?.message || 'Failed to remove banner', 'error');
+      addToast(e?.message || t('home.banner_remove_error', { error: e?.message || 'unknown' }), 'error');
     }
   };
 
@@ -158,7 +149,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {/* Top bar */}
       <div style={{ padding: 'var(--space-md) var(--space-2xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', alignItems: 'center', gap: 'var(--space-lg)', flexShrink: 0 }}>
-        <div onClick={() => { setShowMenu(!showMenu); setShowBannerPicker(false); }} style={{ width: 40, height: 40, borderRadius: 'var(--radius-md)', overflow: 'hidden', cursor: 'pointer', flexShrink: 0, position: 'relative' }} title={t('instance_detail.change_icon')}>
+        <div onClick={() => { setShowMenu(!showMenu); setShowBannerPicker(false); }} className="icon-editable" style={{ width: 40, height: 40, borderRadius: 'var(--radius-md)', overflow: 'hidden', cursor: 'pointer', flexShrink: 0, position: 'relative' }}>
           {/* The header square mirrors the banner (gradient or image) so it
               always matches what the home card shows; falls back to the
               custom icon, then to the letter tile. */}
@@ -185,18 +176,8 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
         {showMenu && !showBannerPicker && (
           <div
             ref={menuRef}
-            style={{
-              position: 'absolute',
-              top: 52,
-              left: 24,
-              zIndex: 100,
-              background: 'var(--bg-elevated)',
-              border: '1px solid var(--surface-border)',
-              borderRadius: 'var(--radius-md)',
-              boxShadow: 'var(--shadow-lg)',
-              padding: 'var(--space-xs)',
-              minWidth: 180,
-            }}
+            className="floating-menu"
+            style={{ top: 52, left: 24 }}
             onClick={(e) => e.stopPropagation()}
           >
             <button
@@ -232,15 +213,8 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
           >
             <div
               ref={pickerRef}
-              style={{
-                background: 'var(--bg-elevated)',
-                border: '1px solid var(--surface-border)',
-                borderRadius: 'var(--radius-md)',
-                boxShadow: 'var(--shadow-lg)',
-                padding: 'var(--space-md)',
-                width: 300,
-                maxWidth: '90vw',
-              }}
+              className="floating-menu floating-menu--picker"
+              style={{ width: 300, maxWidth: '90vw' }}
               onClick={(e) => e.stopPropagation()}
             >
               <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600, marginBottom: 'var(--space-sm)' }}>
@@ -248,20 +222,20 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 'var(--space-xs)', marginBottom: 'var(--space-sm)' }}>
                 {BANNER_PRESETS.map((p) => (
-                  <div
-                    key={p.id}
-                    title={bannerLabel(p.id)}
-                    onClick={() => setBannerGradient(p.id)}
-                    style={{
-                      width: '100%',
-                      aspectRatio: '16/9',
-                      borderRadius: 'var(--radius-sm)',
-                      background: p.gradient,
-                      cursor: 'pointer',
-                      border: (isGradientBanner(instance.banner ?? '') && instance.banner === `gradient:${p.id}`) ? '2px solid var(--primary)' : '2px solid transparent',
-                      transition: 'border-color 0.15s',
-                    }}
-                  />
+                  <Tooltip key={p.id} content={bannerLabel(p.id)}>
+                    <div
+                      onClick={() => setBannerGradient(p.id)}
+                      style={{
+                        width: '100%',
+                        aspectRatio: '16/9',
+                        borderRadius: 'var(--radius-sm)',
+                        background: p.gradient,
+                        cursor: 'pointer',
+                        border: (isGradientBanner(instance.banner ?? '') && instance.banner === `gradient:${p.id}`) ? '2px solid var(--primary)' : '2px solid transparent',
+                        transition: 'border-color 0.15s',
+                      }}
+                    />
+                  </Tooltip>
                 ))}
               </div>
               <div style={{ display: 'flex', gap: 'var(--space-xs)' }}>
@@ -274,14 +248,15 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
                   {t('home.upload_image')}
                 </button>
                 {instance.banner && (
-                  <button
-                    className="btn btn--ghost btn--sm"
-                    style={{ justifyContent: 'center', color: 'var(--color-danger)' }}
-                    onClick={removeBanner}
-                    title={t('home.remove_banner')}
-                  >
-                    x
-                  </button>
+                  <Tooltip content={t('home.remove_banner')}>
+                    <button
+                      className="btn btn--ghost btn--sm"
+                      style={{ justifyContent: 'center', color: 'var(--color-danger)' }}
+                      onClick={removeBanner}
+                    >
+                      <X size={14} />
+                    </button>
+                  </Tooltip>
                 )}
               </div>
             </div>
@@ -298,13 +273,10 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
           </div>
         </div>
         <div style={{ display: 'flex', gap: 'var(--space-sm)', flexShrink: 0 }}>
-          <Button size="sm" variant="ghost" onClick={handleDuplicate} title={t('instance_detail.duplicate')}>
-            <Copy size={14} />
-          </Button>
-          <Button size="sm" variant="ghost" onClick={() => setShowEditor(true)} title={t('instance_detail.edit_settings')}>
+          <Button size="sm" variant="ghost" onClick={() => setShowEditor(true)}>
             <Settings size={14} />
           </Button>
-          <Button size="sm" variant="ghost" onClick={() => setShowDeleteConfirm(true)} title={t('instance_detail.delete_instance')} style={{ color: 'var(--color-danger)' }}>
+          <Button size="sm" variant="ghost" onClick={() => setShowDeleteConfirm(true)} style={{ color: 'var(--color-danger)' }}>
             <Trash2 size={14} />
           </Button>
         </div>

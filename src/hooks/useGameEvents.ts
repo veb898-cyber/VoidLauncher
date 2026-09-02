@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { create } from 'zustand';
 import { useLogStore } from '../stores/logStore';
 import type { LogEntry } from '../stores/logStore';
-import { useFocusStore } from '../stores/focusStore';
+import { useFocusStore, adjustRunningCount } from '../stores/focusStore';
 
 interface InstallProgress {
   instance_id: string;
@@ -30,22 +30,34 @@ interface LogPayload {
 
 interface EventState {
   installProgress: InstallProgress | null;
-  runningGameId: string | null;
+  /** Names of the instances whose games are currently running (may be several). */
+  runningGameIds: string[];
   setInstallProgress: (p: InstallProgress | null) => void;
-  setRunningGameId: (id: string | null) => void;
+  /** Add or remove a single instance from the running set. */
+  setRunningGameId: (id: string, running: boolean) => void;
+  /** Replace the whole running set (used when seeding from backend state). */
+  seedRunningGameIds: (ids: string[]) => void;
 }
 
 export const useEventStore = create<EventState>((set) => ({
   installProgress: null,
-  runningGameId: null,
+  runningGameIds: [],
   setInstallProgress: (p) => set({ installProgress: p }),
-  setRunningGameId: (id) => set({ runningGameId: id }),
+  setRunningGameId: (id, running) =>
+    set((state) => {
+      if (!running) {
+        return { runningGameIds: state.runningGameIds.filter((g) => g !== id) };
+      }
+      return state.runningGameIds.includes(id)
+        ? state
+        : { runningGameIds: [...state.runningGameIds, id] };
+    }),
+  seedRunningGameIds: (ids) => set({ runningGameIds: [...ids] }),
 }));
 
 export function useGameEvents() {
-  const { setInstallProgress, setRunningGameId } = useEventStore();
+  const { setInstallProgress, setRunningGameId, seedRunningGameIds } = useEventStore();
   const addLog = useLogStore((s) => s.addLog);
-  const setGameRunning = useFocusStore((s) => s.setGameRunning);
   const setWindowFocused = useFocusStore((s) => s.setWindowFocused);
 
   useEffect(() => {
@@ -58,6 +70,18 @@ export function useGameEvents() {
     // effect runs twice in development.
     let cancelled = false;
     const unlisteners: Array<() => void> = [];
+
+    // Seed the running-instance list from the backend so the "Running"
+    // badges survive a frontend reload while a game is still up.
+    (async () => {
+      try {
+        const ids = await invoke<string[]>('cmd_get_launch_state');
+        if (!cancelled) {
+          seedRunningGameIds(ids);
+          useFocusStore.getState().setRunningCount(ids.length);
+        }
+      } catch { /* ignore */ }
+    })();
 
     const register = (
       promise: Promise<() => void>,
@@ -87,8 +111,8 @@ export function useGameEvents() {
     register(listen<LaunchEvent>('game_started', async (event) => {
       const p = event.payload;
       if (p.status === 'running') {
-        setRunningGameId(p.instance_id);
-        setGameRunning(true);
+        setRunningGameId(p.instance_id, true);
+        adjustRunningCount(1);
         // Minimize the launcher only once the game process is actually
         // running. If the launch fails before this point, the window stays
         // visible so the user sees the error.
@@ -101,8 +125,8 @@ export function useGameEvents() {
 
     register(listen<LaunchEvent>('launch_complete', async (event) => {
       const p = event.payload;
-      setRunningGameId(null);
-      setGameRunning(false);
+      setRunningGameId(p.instance_id, false);
+      adjustRunningCount(-1);
       // If the launcher minimized itself when the game started (see the
       // `game_started` handler), restore it on a crash so the user actually
       // sees the error. A non-zero exit code means the Java process died —
@@ -147,7 +171,7 @@ export function useGameEvents() {
         try { fn(); } catch { /* ignore */ }
       }
     };
-  }, [setInstallProgress, setRunningGameId, addLog, setGameRunning, setWindowFocused]);
+  }, [setInstallProgress, setRunningGameId, seedRunningGameIds, addLog, setWindowFocused]);
 }
 
 export function emitFrontendLog(level: string, source: string, message: string) {

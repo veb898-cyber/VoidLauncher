@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
+import { addToast } from '../components/ui/Toast';
 
 interface GameLogSession {
   path: string;
@@ -199,19 +200,13 @@ export function GameLogs() {
   };
 
   return (
-    <div className="page animate-fade-in" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div className="page__header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 }}>
-        <div>
-          <h1 className="page__title">{t('game_logs.title')}</h1>
-          <p className="page__subtitle">{t('game_logs.subtitle')}</p>
-        </div>
-        <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'center' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 'var(--space-md)' }}>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 'var(--space-sm)', flexShrink: 0, flexWrap: 'wrap' }}>
           {/* Recent runs picker: last launches of ANY instance, newest first */}
           <button
             ref={runsBtnRef}
             className="game-logs-picker-trigger"
             onClick={toggleRuns}
-            title={shownSession ? `${shownSession.instance_name} — ${shownSession.started_at}` : ''}
           >
             <span className={`game-logs-picker-dot${shownSession?.path === currentPath ? ' game-logs-picker-dot--live' : ''}`} />
             <span className="game-logs-picker-trigger-instance">
@@ -262,8 +257,13 @@ export function GameLogs() {
             document.body,
           )}
 
-          <button className="btn btn--ghost btn--sm" onClick={() => {
-            navigator.clipboard.writeText(displayLines.join('\n'));
+          <button className="btn btn--ghost btn--sm" onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(displayLines.join('\n'));
+              addToast(t('common.copied'), 'success');
+            } catch {
+              addToast(t('common.copy_failed'), 'error');
+            }
           }}>
             {t('common.copy_all')}
           </button>
@@ -276,7 +276,6 @@ export function GameLogs() {
           }}>
             {t('game_logs.open_folder')}
           </button>
-        </div>
       </div>
 
       <div className="log-container" ref={logContainerRef} style={{
@@ -285,7 +284,7 @@ export function GameLogs() {
         background: 'var(--bg-primary)',
         borderRadius: 'var(--radius-lg)',
         padding: 'var(--space-md)',
-        fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace",
+        fontFamily: 'var(--font-mono)',
         fontSize: 'var(--font-size-xs)',
         lineHeight: 1.6,
       }} onScroll={handleScroll}>

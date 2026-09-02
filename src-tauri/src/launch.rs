@@ -654,12 +654,6 @@ fn get_java_path(
     }
 }
 
-/// Check if suitable Java exists, return its major version if found
-pub fn check_java_availability(data_dir: &PathBuf, required_major: u32) -> Option<JavaInstallation> {
-    let installations = find_all_java_installations(data_dir);
-    get_recommended_java(Some(required_major), &installations)
-}
-
 /// Extract "group:artifact" from a Maven coordinate like
 /// "org.ow2.asm:asm:9.8" or "com.google.code.findbugs:jsr305:3.0.2".
 fn artifact_key(name: &str) -> Option<String> {

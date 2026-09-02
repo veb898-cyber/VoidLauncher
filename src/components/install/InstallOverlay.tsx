@@ -1,4 +1,4 @@
-import { Loader2 } from 'lucide-react';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { ProgressBar } from '../ui/ProgressBar';
 import { useEventStore } from '../../hooks/useGameEvents';
 import { useT } from '../../lib/i18n';
@@ -66,7 +66,7 @@ export function InstallOverlay() {
               justifyContent: 'center',
             }}
           >
-            <Loader2 size={24} style={{ animation: 'spin 1s linear infinite' }} />
+            <SnakeSpinner size={24} />
           </div>
           <div>
             <div style={{ fontWeight: 600, fontSize: 'var(--font-size-lg)' }}>

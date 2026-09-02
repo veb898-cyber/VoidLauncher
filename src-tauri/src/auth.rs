@@ -155,9 +155,17 @@ pub async fn refresh_microsoft_token(
         .unwrap_or_default()
         .as_secs();
     Ok(MicrosoftToken {
-        access_token: resp["access_token"].as_str().unwrap_or("").to_string(),
-        refresh_token: resp["refresh_token"].as_str().unwrap_or("").to_string(),
-        expires_in: now + resp["expires_in"].as_u64().unwrap_or(86400),
+        access_token: resp["access_token"]
+            .as_str()
+            .ok_or_else(|| {
+                tracing::error!(target: "launcher", "Missing access_token in refresh response");
+                LauncherError::Auth("Missing access_token in refresh response".into())
+            })?
+            .to_string(),
+        // Microsoft does not always rotate the refresh_token on refresh; an
+        // absent field must NOT clobber the stored session (see ensure_ms_session).
+        refresh_token: resp["refresh_token"].as_str().unwrap_or_default().to_string(),
+        expires_in: now + resp["expires_in"].as_u64().unwrap_or(3600),
     })
 }
 

@@ -166,78 +166,31 @@ pub fn loader_type_id(loader: &str) -> Option<u32> {
 async fn api_get<T: serde::de::DeserializeOwned>(url: &str, api_key: &str) -> Result<T> {
     crate::download::ensure_proxy_resolved().await;
     let client = crate::download::global_http_client();
-    let mut last_err = None;
-    for attempt in 0..4 {
-        let attempt_result = crate::download::send_with_fallback(
-            client
-                .get(url)
-                .header("x-api-key", api_key)
-                .header("Accept", "application/json")
-                // API replies are small; a 120s default timeout would let a
-                // silent connection block the whole install for minutes.
-                .timeout(std::time::Duration::from_secs(15)),
-        )
-        .await;
-        let response = match attempt_result {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = Some(crate::error::LauncherError::Network(e));
-                if attempt < 3 {
-                    crate::events::emit_fetch_retry(
-                        "curseforge",
-                        attempt + 2,
-                        4,
-                        "Retrying CurseForge request",
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        [500, 1000, 2000][attempt],
-                    ))
-                    .await;
-                }
-                continue;
-            }
-        };
+    let response = crate::download::get_with_retry(
+        client
+            .get(url)
+            .header("x-api-key", api_key)
+            .header("Accept", "application/json")
+            // API replies are small; a 120s default timeout would let a
+            // silent connection block the whole install for minutes.
+            .timeout(std::time::Duration::from_secs(15)),
+        "CurseForge",
+        4,
+        &[500, 1000, 2000],
+    )
+    .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(crate::error::LauncherError::Download(format!(
-                "CurseForge API error ({}): {}",
-                status, text
-            )));
-        }
-
-        let text = match response.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                last_err = Some(crate::error::LauncherError::Network(e));
-                if attempt < 3 {
-                    crate::events::emit_fetch_retry(
-                        "curseforge",
-                        attempt + 2,
-                        4,
-                        "Retrying CurseForge request",
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        [500, 1000, 2000][attempt],
-                    ))
-                    .await;
-                }
-                continue;
-            }
-        };
-
-        return serde_json::from_str::<T>(&text).map_err(|e| {
-            crate::error::LauncherError::Download(format!(
-                "Failed to decode CurseForge response: {}. Body preview: {}",
-                e,
-                &text.chars().take(500).collect::<String>()
-            ))
-        });
-    }
-    Err(last_err.unwrap_or_else(|| {
-        crate::error::LauncherError::Download("CurseForge request failed".to_string())
-    }))
+    let text = response
+        .text()
+        .await
+        .map_err(crate::error::LauncherError::Network)?;
+    serde_json::from_str::<T>(&text).map_err(|e| {
+        crate::error::LauncherError::Download(format!(
+            "Failed to decode CurseForge response: {}. Body preview: {}",
+            e,
+            &text.chars().take(500).collect::<String>()
+        ))
+    })
 }
 
 /// Single-attempt API request with a short timeout. Used for optional calls

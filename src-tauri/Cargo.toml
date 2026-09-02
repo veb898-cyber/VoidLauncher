@@ -1,6 +1,6 @@
 [package]
 name = "voidlauncher"
-version = "0.1.8"
+version = "0.1.9"
 description = "VoidLauncher — Custom Minecraft Launcher"
 authors = ["VoidLauncher"]
 edition = "2021"
@@ -8,6 +8,12 @@ edition = "2021"
 [lib]
 name = "voidlauncher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# Required for production builds: embeds dist/ assets instead of the dev server URL.
+# `cargo build --release` WITHOUT this feature produces an exe that loads
+# http://localhost:1420 (the tauri devUrl) and shows a connection error.
+custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

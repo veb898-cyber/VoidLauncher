@@ -68,7 +68,7 @@ fn download_client() -> reqwest::Client {
     let mut slot = CLIENT
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .unwrap();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if slot.as_ref().map(|(p, _)| p != &proxy).unwrap_or(true) {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(1800))
@@ -139,6 +139,9 @@ pub async fn list_available_java_versions() -> Result<Vec<AvailableJavaVersion>>
             return Ok(versions.clone());
         }
     }
+
+    // Resolve proxy scheme before the first Adoptium API call (see download_java_runtime).
+    crate::download::ensure_proxy_resolved().await;
 
     let client = download_client();
 
@@ -242,6 +245,12 @@ pub async fn download_java_runtime(
 
     std::fs::create_dir_all(&runtime_dir)?;
 
+    // Ensure the proxy scheme (HTTP vs SOCKS5) is resolved before the first
+    // Adoptium request. Without this, a system-detected SOCKS proxy would be
+    // tried as HTTP — the connection opens (port is listening) but the proxy
+    // never responds, causing a multi-minute hang before the timeout fires.
+    crate::download::ensure_proxy_resolved().await;
+
     let client = download_client();
 
     // Phase 1: Resolve download URL. The /assets endpoint is sometimes
@@ -265,12 +274,41 @@ pub async fn download_java_runtime(
                 resolved = Some(resp);
                 break;
             }
-            Ok(Ok(resp)) => tracing::warn!(target: "launcher", "Adoptium API returned HTTP {} (attempt {}/3)", resp.status(), attempt),
-            Ok(Err(e)) => tracing::warn!(target: "launcher", "Adoptium API request failed (attempt {}/3): {}", attempt, e),
-            Err(_) => tracing::warn!(target: "launcher", "Adoptium API request timed out (attempt {}/3)", attempt),
-        }
-        if attempt < 3 {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(Ok(resp)) => {
+                let code = resp.status();
+                // Honor Retry-After when Adoptium throttles us (HTTP 429), so
+                // we wait out the rate-limit window instead of hammering it.
+                let mut delay = Duration::from_secs(3);
+                if let Some(ra) = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                {
+                    delay = ra.min(Duration::from_secs(60));
+                }
+                tracing::warn!(
+                    target: "launcher",
+                    "Adoptium API returned HTTP {}, waiting {}s",
+                    code, delay.as_secs()
+                );
+                if attempt < 3 {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(target: "launcher", "Adoptium API request failed (attempt {}/3): {}", attempt, e);
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            }
+            Err(_) => {
+                tracing::warn!(target: "launcher", "Adoptium API request timed out (attempt {}/3)", attempt);
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            }
         }
     }
 
@@ -328,18 +366,31 @@ pub async fn download_java_runtime(
             .map_err(|e| LauncherError::Download(format!("Failed to create archive file: {}", e)))?;
         let mut stream = response.bytes_stream();
         let mut downloaded: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                tracing::error!(target: "launcher", "Java download stream error: {}", e);
-                LauncherError::Download(format!("Download stream error: {}", e))
-            })?;
-            std::io::Write::write_all(&mut file, &chunk)?;
-            downloaded += chunk.len() as u64;
-            if total_size > 0 {
-                let pct = 10.0 + (downloaded as f64 / total_size as f64) * 70.0;
-                let mb_done = downloaded as f64 / (1024.0 * 1024.0);
-                let mb_total = total_size as f64 / (1024.0 * 1024.0);
-                emit_progress(pct, "downloading", &format!("{:.1}/{:.1} MB", mb_done, mb_total));
+        // No-data timeout: if the server goes silent for 30s (no chunk at
+        // all), abort instead of stalling the Java install indefinitely.
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), stream.next()).await {
+                Ok(Some(chunk)) => {
+                    let chunk = chunk.map_err(|e| {
+                        tracing::error!(target: "launcher", "Java download stream error: {}", e);
+                        LauncherError::Download(format!("Download stream error: {}", e))
+                    })?;
+                    std::io::Write::write_all(&mut file, &chunk)?;
+                    downloaded += chunk.len() as u64;
+                    if total_size > 0 {
+                        let pct = 10.0 + (downloaded as f64 / total_size as f64) * 70.0;
+                        let mb_done = downloaded as f64 / (1024.0 * 1024.0);
+                        let mb_total = total_size as f64 / (1024.0 * 1024.0);
+                        emit_progress(pct, "downloading", &format!("{:.1}/{:.1} MB", mb_done, mb_total));
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::error!(target: "launcher", "Java download stalled (no data for 30s)");
+                    return Err(LauncherError::Download(
+                        "Download stalled: no data received for 30 seconds. Check the network and retry.".into(),
+                    ));
+                }
             }
         }
     }
@@ -484,7 +535,22 @@ fn extract_archive(archive_path: &PathBuf, dest_dir: &PathBuf) -> Result<()> {
             _ => continue,
         };
 
+        // Refuse path traversal: entries like "jdk-21/../evil.exe" must not
+        // escape dest_dir (defense against a malicious/truncated archive).
+        if crate::download::is_unsafe_archive_path(&relative) {
+            return Err(LauncherError::Download(format!(
+                "Archive entry has an unsafe path: {}",
+                full_name
+            )));
+        }
+
         let out_path = dest_dir.join(&relative);
+        if !out_path.starts_with(dest_dir) {
+            return Err(LauncherError::Download(format!(
+                "Archive entry escapes destination directory: {}",
+                full_name
+            )));
+        }
 
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)?;

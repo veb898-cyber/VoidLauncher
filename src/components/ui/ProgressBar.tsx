@@ -9,7 +9,7 @@ export function ProgressBar({ percent, className = '', showLabel = false }: Prog
 
   return (
     <div className={`progress ${className}`.trim()}>
-      <div className="progress__bar" style={{ width: `${clamped}%` }} />
+      <div className="progress__bar progress-fill" style={{ width: `${clamped}%` }} />
       {showLabel && (
         <span style={{
           fontSize: 'var(--font-size-xs)',

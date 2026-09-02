@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect } from 'react';
+import { type ReactNode, useEffect, useRef } from 'react';
 
 interface ModalProps {
   open: boolean;
@@ -15,9 +15,43 @@ interface ModalProps {
    * standalone "ВОЙТИ" page exactly.
    */
   bare?: boolean;
+  /**
+   * `fitContent` sizes the dialog to its content instead of capping it at
+   * 85vh with an internal scrollbar. The dialog still falls back to a
+   * scrollbar when it would exceed the viewport (max-height caps at the
+   * viewport minus breathing room), so nothing gets clipped on short
+   * windows. Used by the instance editor whose settings fit on screen.
+   */
+  fitContent?: boolean;
 }
 
-export function Modal({ open, onClose, title, children, footer, maxWidth, bare }: ModalProps) {
+export function Modal({ open, onClose, title, children, footer, maxWidth, bare, fitContent }: ModalProps) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const wasOpen = useRef(false);
+
+  // Focus management tied to the `open` flag only: on show, move focus into
+  // the dialog (without stealing it from an already-focused element inside,
+  // e.g. an autoFocus input); on hide, restore focus to whatever had it
+  // before the dialog opened.
+  useEffect(() => {
+    if (open && !wasOpen.current) {
+      wasOpen.current = true;
+      const previouslyFocused = document.activeElement as HTMLElement | null;
+      requestAnimationFrame(() => {
+        const el = dialogRef.current;
+        if (el && !el.contains(document.activeElement)) {
+          el.focus({ preventScroll: true });
+        }
+      });
+      return () => {
+        wasOpen.current = false;
+        if (previouslyFocused && typeof previouslyFocused.focus === 'function') {
+          try { previouslyFocused.focus({ preventScroll: true }); } catch { /* ignore */ }
+        }
+      };
+    }
+  }, [open]);
+
   useEffect(() => {
     if (!open) return;
     const handler = (e: KeyboardEvent) => {
@@ -35,7 +69,12 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare }
       onClick={onClose}
     >
       <div
-        className="modal animate-slide-up"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title || undefined}
+        tabIndex={-1}
+        className={`modal animate-slide-up${fitContent ? ' modal--fit' : ''}`}
         onClick={(e) => e.stopPropagation()}
         style={maxWidth ? { maxWidth } : undefined}
       >

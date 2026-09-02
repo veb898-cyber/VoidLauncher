@@ -15,9 +15,9 @@ fn test_state() -> AppState {
     AppState {
         config: Mutex::new(AppConfig::load(&PathBuf::from(DATA_DIR))),
         auth_state: Mutex::new(crate::auth::AuthState::default()),
-        running_instance_id: Mutex::new(None),
+        running_instances: Mutex::new(Vec::new()),
         pack_watcher: Mutex::new(None),
-        active_session: Mutex::new(None),
+        active_sessions: Mutex::new(std::collections::HashMap::new()),
     }
 }
 

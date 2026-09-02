@@ -12,17 +12,37 @@
       (function(){
         try {
           var t = localStorage.getItem('voidlauncher-theme');
-          if (t === 'dark' || t === 'light') {
+          // 'light' (OLED Light) support was removed; an older stored value
+          // simply falls back to the default Neon theme (no data-theme attr).
+          if (t === 'dark' || t === 'blueprint' || t === 'ember') {
             document.documentElement.setAttribute('data-theme', t);
-            document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
+            document.documentElement.style.colorScheme = 'dark';
+          }
+          var f = localStorage.getItem('voidlauncher-font');
+          var cf = localStorage.getItem('voidlauncher-console-font');
+          // Legacy "inter" values are ignored (treated as default).
+          if (f === 'monocraft') {
+            document.documentElement.setAttribute('data-font', 'monocraft');
+          }
+          var validCf = (cf === 'auto' || cf === 'default' || cf === 'monocraft');
+          if (!validCf) {
+            // Migrate from the short-lived "font scope" setting.
+            var fs = localStorage.getItem('voidlauncher-font-scope');
+            validCf = (fs === 'ui' || fs === 'all' || fs === 'logs');
+          }
+          if (validCf) {
+            var mono = (cf === 'monocraft') ? 'monocraft' : (cf === 'auto' && f === 'monocraft') ? 'monocraft' : null;
+            if (mono) {
+              document.documentElement.setAttribute('data-font-mono', mono);
+            }
           }
         } catch(e) {}
       })();
     </script>
     <style>
       body { background: hsl(230, 25%, 7%); margin: 0; }
-      [data-theme="light"] body, [data-theme="light"] #splash { background: #ffffff; }
       [data-theme="dark"] body, [data-theme="dark"] #splash { background: #000000; }
+      [data-theme="ember"] body, [data-theme="ember"] #splash { background: #121110; }
       #splash {
         position: fixed; inset: 0; z-index: 9999;
         display: flex; flex-direction: column;

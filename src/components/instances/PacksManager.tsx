@@ -195,10 +195,10 @@ export function PacksManager({ instanceName, packType, onOpenFolder }: Props) {
           <input className="input" type="text" value={search} onChange={(e) => setSearch(e.target.value)} style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
         </div>
         <Button size="sm" variant="secondary" onClick={() => setShowBrowser(true)}>
-          <Download size={14} /> {t('common.download')}
+          <Download size={14} style={{ flexShrink: 0 }} /> {t('common.download')}
         </Button>
         <Button size="sm" variant="ghost" onClick={onOpenFolder}>
-          <FolderOpen size={14} /> {t('common.open_folder')}
+          <FolderOpen size={14} style={{ flexShrink: 0 }} /> {t('common.open_folder')}
         </Button>
       </div>
 

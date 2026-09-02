@@ -61,6 +61,8 @@ export const useSettingsStore = create<SettingsState>((set) => ({
       set({ config });
     } catch (e) {
       console.error('Failed to save config:', e);
+      // Re-throw so the UI can surface a real failure instead of a fake "saved".
+      throw e;
     }
   },
 

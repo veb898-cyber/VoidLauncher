@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { Button } from '../ui/Button';
+import { Tooltip } from '../ui/Tooltip';
 import { Input } from '../ui/Input';
 import { Modal } from '../ui/Modal';
 import { Slider } from '../ui/Slider';
@@ -44,9 +45,9 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const t = useT();
   const gb = getLanguage() === 'ru' ? 'ГБ' : 'GB';
   const presetOptions: SelectOption<GcPreset>[] = [
-    { value: 'standard', label: t('instance_editor.gc_standard'), description: 'No special GC flags' },
-    { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: 'Java 8+' },
-    { value: 'zgc', label: t('instance_editor.gc_zgc'), description: `Java 17+, \u2265 8 ${gb}` },
+    { value: 'standard', label: t('instance_editor.gc_standard'), description: t('instance_editor.gc_standard_short') },
+    { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: t('instance_editor.gc_g1gc_short') },
+    { value: 'zgc', label: t('instance_editor.gc_zgc'), description: t('instance_editor.gc_zgc_req') },
   ];
   const globalConfig = useSettingsStore((s) => s.config);
   const globalDefaultMemoryMb = globalConfig?.default_memory_mb ?? null;
@@ -178,7 +179,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const zgcDisabled = memoryMb < 8192;
 
   return (
-    <Modal open={open} onClose={requestClose} title={t('instance_editor.title')}>
+    <Modal open={open} onClose={requestClose} title={t('instance_editor.title')} fitContent>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
         <Input label={t('instance_editor.name_label')} id="edit-name" type="text" value={name} onChange={(e) => setName(e.target.value)} />
         <Input label={t('instance_editor.notes_label')} id="edit-notes" type="text" value={notes} onChange={(e) => setNotes(e.target.value)} />
@@ -204,14 +205,15 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
           </div>
           {globalDefaultMemoryMb && globalDefaultMemoryMb !== memoryMb && (
             <div style={{ marginTop: 6 }}>
-              <button
-                type="button"
-                className="btn btn--ghost btn--sm"
-                onClick={() => setMemoryMb(globalDefaultMemoryMb)}
-                title={`Set to global default (${(globalDefaultMemoryMb / 1024).toFixed(1)} GB)`}
-              >
-                {t('instance_editor.memory_reset_to_global')}
-              </button>
+              <Tooltip content={t('instance_editor.gc_default_tooltip', { gb: (globalDefaultMemoryMb / 1024).toFixed(1) })}>
+                <button
+                  type="button"
+                  className="btn btn--ghost btn--sm"
+                  onClick={() => setMemoryMb(globalDefaultMemoryMb)}
+                >
+                  {t('instance_editor.memory_reset_to_global')}
+                </button>
+              </Tooltip>
             </div>
           )}
         </div>

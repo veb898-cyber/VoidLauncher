@@ -5,6 +5,7 @@ import { useInstanceStore } from '../../stores/instanceStore';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { t } from '../../lib/i18n';
 import { Button } from '../ui/Button';
+import { EmptyState } from '../ui/EmptyState';
 import { ProgressBar } from '../ui/ProgressBar';
 import { InstanceEditor } from './InstanceEditor';
 import { useEventStore } from '../../hooks/useGameEvents';
@@ -83,25 +84,16 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
       {/* List */}
       <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-sm)' }}>
         {instances.length === 0 ? (
-          <div
-            style={{
-              padding: 'var(--space-xl)',
-              textAlign: 'center',
-              color: 'var(--text-tertiary)',
-              fontSize: 'var(--font-size-sm)',
-            }}
-          >
-            <Package size={24} style={{ opacity: 0.3, marginBottom: 'var(--space-sm)' }} />
-            <div>{t('instances.empty_title')}</div>
-          </div>
+          <EmptyState compact icon={<Package size={24} />} title={t('instances.empty_title')} />
         ) : (
-          instances.map((instance) => {
+          instances.map((instance, i) => {
             const isInstalling = installingName === instance.name;
             const isSelected = selectedInstance === instance.name;
 
             return (
               <div
                 key={instance.name}
+                className="stagger-in"
                 onClick={() => useBrowserGuardStore.getState().askLeave(() => selectInstance(instance.name))}
                 onContextMenu={(e) => {
                   e.preventDefault();
@@ -118,6 +110,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
                   transition: 'background var(--transition-fast)',
                   marginBottom: 2,
                   opacity: isLaunching && !isSelected ? 0.6 : 1,
+                  animationDelay: `${Math.min(i, 9) * 24}ms`,
                 }}
                 onMouseEnter={(e) => {
                   if (!isSelected) e.currentTarget.style.background = 'var(--surface-glass-hover)';

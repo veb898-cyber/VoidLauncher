@@ -4,6 +4,7 @@ import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, X, AlertTriangle } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { Tooltip } from '../ui/Tooltip';
 import { addToast } from '../ui/Toast';
 import { ContentBrowser, type ContentType } from './ContentBrowser';
 import { useFocusStore } from '../../stores/focusStore';
@@ -172,11 +173,13 @@ const ContentRow = memo(function ContentRow({
                 ? t('manager.compat_maybe', { version: mcVersion })
                 : t('manager.compat_no', { target: compatTarget });
           return (
-            <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }} title={title}>
-              <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
-                <AlertTriangle size={12} />
+            <Tooltip content={title}>
+              <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }}>
+                <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
+                  <AlertTriangle size={12} />
+                </div>
               </div>
-            </div>
+            </Tooltip>
           );
         })()}
       </div>
@@ -912,9 +915,9 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
             <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('common.items_selected', { n: selectedFilenames.size.toString() })}</span>
           )}
           <div style={{ flex: 1 }} />
-          <Button size="sm" variant="ghost" onClick={loadItems} disabled={loading} title={t('manager.auto_refresh_title')} style={{ minWidth: 80 }}>
+          <Button size="sm" variant="ghost" onClick={loadItems} disabled={loading} style={{ minWidth: 80 }}>
             {loading ? <RefreshCw size={14} style={{ animation: 'spin 1s linear infinite' }} /> : <RefreshCw size={14} />}
-            {loading ? t('common.refresh') : t('common.refresh')}
+            {t('common.refresh')}
           </Button>
         </div>
 
@@ -922,27 +925,26 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
       {/* Right actions panel */}
       <div style={{ width: 200, flexShrink: 0, borderLeft: '1px solid var(--surface-border)', padding: 'var(--space-md)', display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
-        <Button size="sm" variant="secondary" onClick={() => setShowBrowser(true)} style={{ width: '100%' }}>
-          <Download size={14} /> {t('common.download')} {label}
+        <Button size="sm" variant="secondary" onClick={() => setShowBrowser(true)} style={{ width: '100%', whiteSpace: 'normal' }}>
+          <Download size={14} style={{ flexShrink: 0 }} /> {t('common.download')} {label.toLowerCase()}
         </Button>
-        <Button size="sm" variant="ghost" onClick={handleAddLocalFile} style={{ width: '100%' }}>
-          <Package size={14} /> {t('manager.add_file_btn')}
+        <Button size="sm" variant="ghost" onClick={handleAddLocalFile} style={{ width: '100%', whiteSpace: 'normal' }}>
+          <Package size={14} style={{ flexShrink: 0 }} /> {t('manager.add_file_btn')}
         </Button>
         <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
-        <Button size="sm" variant="ghost" onClick={handleCheckUpdates} loading={checkingUpdates} disabled={checkingUpdates} style={{ width: '100%' }}>
-          {!checkingUpdates && <RefreshCw size={14} />}
+        <Button size="sm" variant="ghost" onClick={handleCheckUpdates} loading={checkingUpdates} disabled={checkingUpdates} style={{ width: '100%', whiteSpace: 'normal' }}>
+          {!checkingUpdates && <RefreshCw size={14} style={{ flexShrink: 0 }} />}
           {t('common.check_updates')}
         </Button>
         {hasSelection && (
           <>
-            <Button size="sm" variant="ghost" onClick={toggleSelectedEnabled} style={{ width: '100%' }}>
+            <Button size="sm" variant="ghost" onClick={toggleSelectedEnabled} style={{ width: '100%', whiteSpace: 'normal' }}>
               {selectedItems.every((m) => m.enabled) ? t('common.disable') : t('common.enable')}{selectedFilenames.size > 1 ? ` (${selectedFilenames.size})` : ''}
             </Button>
-            <Button size="sm" variant="ghost" onClick={removeSelected} style={{ width: '100%', color: 'var(--color-danger)' }}>
-              <Trash2 size={14} /> {t('common.remove')}{selectedFilenames.size > 1 ? ` (${selectedFilenames.size})` : ''}
+            <Button size="sm" variant="ghost" onClick={removeSelected} style={{ width: '100%', color: 'var(--color-danger)', whiteSpace: 'normal' }}>
+              <Trash2 size={14} style={{ flexShrink: 0 }} /> {t('common.remove')}{selectedFilenames.size > 1 ? ` (${selectedFilenames.size})` : ''}
             </Button>
-          </>
-        )}
+          </>)}
         {hasSelection && selectedItems.length === 1 && (
           <>
             <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />

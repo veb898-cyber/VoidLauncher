@@ -146,8 +146,8 @@ pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String>
     }
 
     let url = url.trim().to_string();
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("Only http(s) URLs are allowed".into());
+    if !url.starts_with("https://") {
+        return Err("Only https URLs are allowed".into());
     }
 
     let check_url = url.clone();
@@ -239,10 +239,11 @@ pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
 
 // ==================== Launch State Commands ====================
 
+/// Return the names of all instances whose game processes are currently running.
 #[tauri::command]
-pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Option<String>, String> {
+pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let running = state
-        .running_instance_id
+        .running_instances
         .lock()
         .map_err(|e| e.to_string())?;
     Ok(running.clone())

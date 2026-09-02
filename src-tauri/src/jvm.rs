@@ -41,7 +41,11 @@ pub fn detect_java_major(java_path: &Path) -> Option<u32> {
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let output = cmd.output().ok()?;
+    let output = crate::java::run_command_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(20),
+    )
+    .ok()?;
     // `java -version` writes to stderr
     let combined = if !output.stderr.is_empty() {
         String::from_utf8_lossy(&output.stderr).to_string()

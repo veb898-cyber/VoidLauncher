@@ -404,7 +404,7 @@ pub struct ModMetadata {
     /// verified Modrinth/CurseForge project ID). `false` when the slug is
     /// derived from the jar's internal metadata (e.g. `fabric.mod.json`
     /// `id`), which is the mod's *internal* identifier and may NOT match
-    /// the Modrinth project slug вЂ” causing false-positive "incompatible"
+    /// the Modrinth project slug — causing false-positive "incompatible"
     /// warnings in the compatibility check.
     #[serde(default)]
     pub slug_verified: bool,
@@ -433,6 +433,20 @@ fn read_sidecar_fields(mods_dir: &std::path::Path, filename: &str) -> SidecarFie
     }
 }
 
+/// Extract a local filesystem path from a `file://` URI (as passed by the UI
+/// for local mod installation, e.g. `file://C:\path\to\mod.jar`). Accepts the
+/// `file:///C:/...` variant too. Returns an error for anything not file-based.
+fn local_path_from_uri(uri: &str) -> Result<std::path::PathBuf, String> {
+    let rest = uri
+        .strip_prefix("file://")
+        .ok_or_else(|| "Local install requires a file:// path".to_string())?
+        .trim_start_matches('/');
+    if rest.is_empty() || rest == "." || rest == ".." {
+        return Err("Empty or invalid local file path".to_string());
+    }
+    Ok(std::path::PathBuf::from(rest))
+}
+
 #[tauri::command]
 pub async fn cmd_install_mod(
     state: State<'_, AppState>,
@@ -447,16 +461,7 @@ pub async fn cmd_install_mod(
     provider: String,
 ) -> Result<String, String> {
     validate_instance_name(&instance_name)?;
-    // Validate the URL is HTTPS and points to a known Modrinth / CurseForge CDN.
-    if !download_url.starts_with("https://") {
-        return Err("Download URL must be HTTPS.".to_string());
-    }
-    if !is_allowed_download_host(&download_url) {
-        return Err(format!(
-            "Download host is not in the allowlist: {}",
-            download_url
-        ));
-    }
+
     let (mods_dir, safe_name, dest) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let instance = instances::get_instance(&config.instances_dir(), &instance_name)
@@ -470,10 +475,38 @@ pub async fn cmd_install_mod(
         let dest = mods_dir.join(&safe_name);
         (mods_dir, safe_name, dest)
     };
+
+    // Local file installation: the UI passes a `file://` URI in `download_url`
+    // and `provider: "local"`. Copy the file into the mods dir instead of
+    // downloading it — the HTTPS/host allowlist checks below only apply to
+    // remote downloads.
+    if provider == "local" {
+        let local_path = local_path_from_uri(&download_url)?;
+        if !local_path.is_file() {
+            return Err(format!(
+                "Local file not found: {}",
+                local_path.display()
+            ));
+        }
+        std::fs::copy(&local_path, &dest).map_err(|e| e.to_string())?;
+        download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
+        return Ok(safe_name);
+    }
+
+    // Validate the URL is HTTPS and points to a known Modrinth / CurseForge CDN.
+    if !download_url.starts_with("https://") {
+        return Err("Download URL must be HTTPS.".to_string());
+    }
+    if !is_allowed_download_host(&download_url) {
+        return Err(format!(
+            "Download host is not in the allowlist: {}",
+            download_url
+        ));
+    }
     download::download_file(&download_url, &dest, "")
         .await
         .map_err(|e| e.to_string())?;
-    // No SHA1 is available for mod downloads вЂ” at least verify the result is
+    // No SHA1 is available for mod downloads — at least verify the result is
     // a real JAR archive and not an error page / bogus response.
     download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
     let final_name = safe_name.clone();
@@ -789,9 +822,9 @@ pub(crate) fn get_mod_metadata(
     }
 
     // Serve cache hits first; only cache misses need the expensive jar parse.
-    enum Job<'a> {
+    enum Job {
         Cached(ModMetadata),
-        Fresh(&'a ModFileEntry),
+        Fresh,
     }
     let mut jobs: Vec<Job> = Vec::with_capacity(files.len());
     let mut missed_idx: Vec<usize> = Vec::new();
@@ -803,7 +836,7 @@ pub(crate) fn get_mod_metadata(
                     jobs.push(Job::Cached(meta.clone()));
                 }
                 _ => {
-                    jobs.push(Job::Fresh(f));
+                    jobs.push(Job::Fresh);
                     missed_idx.push(i);
                 }
             }
@@ -869,7 +902,7 @@ pub(crate) fn get_mod_metadata(
     for job in jobs {
         match job {
             Job::Cached(meta) => mods.push(meta),
-            Job::Fresh(_) => unreachable!("all fresh jobs were computed"),
+            Job::Fresh => unreachable!("all fresh jobs were computed"),
         }
     }
     mods.sort_by(|a, b| a.name.cmp(&b.name));
@@ -992,16 +1025,6 @@ fn read_mod_sidecar_slug(mods_dir: &std::path::Path, filename: &str) -> Option<S
 fn read_mod_sidecar_provider(mods_dir: &std::path::Path, filename: &str) -> Option<String> {
     let json = crate::instances::read_sidecar_meta(mods_dir, filename)?;
     json["provider"].as_str().map(|s| s.to_string())
-}
-
-/// Read an arbitrary field from the sidecar metadata.
-fn read_mod_sidecar_field(
-    mods_dir: &std::path::Path,
-    filename: &str,
-    field: &str,
-) -> Option<String> {
-    let json = crate::instances::read_sidecar_meta(mods_dir, filename)?;
-    json[field].as_str().map(|s| s.to_string())
 }
 
 /// Strip build-placeholder versions ("${version}", "${file.jarVersion}",
@@ -1131,42 +1154,6 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
             let mut contents = String::new();
             if file.read_to_string(&mut contents).is_ok() {
                 if let Ok(toml_val) = contents.parse::<toml::Table>() {
-                    if let Some(mods_arr) = toml_val.get("mods").and_then(|v| v.as_array()) {
-                        if let Some(first_mod) = mods_arr.first() {
-                            let mod_id = first_mod
-                                .get("modId")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Unknown")
-                                .to_string();
-                            let display_name = first_mod
-                                .get("displayName")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(&mod_id)
-                                .to_string();
-                            let version = first_mod
-                                .get("version")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Unknown")
-                                .to_string();
-                            let logo = first_mod
-                                .get("logoFile")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let provider = if toml_name.contains("neoforge") {
-                                "NeoForge"
-                            } else {
-                                "Forge"
-                            };
-                            return ModMetaResult {
-                                name: display_name,
-                                version,
-                                provider: provider.into(),
-                                icon: logo,
-                                slug: Some(mod_id),
-                            };
-                        }
-                    }
-                    // Inline format: mods = [{modId = "x", ...}]
                     if let Some(mods_arr) = toml_val.get("mods").and_then(|v| v.as_array()) {
                         if let Some(first_mod) = mods_arr.first() {
                             let mod_id = first_mod
@@ -1395,20 +1382,12 @@ async fn fetch_curseforge_mod_icon(
         None => return Ok(None),
     };
 
+    const MAX_LOGO_BYTES: u64 = 3 * 1024 * 1024;
     let client = crate::download::global_http_client();
-    let resp = crate::download::send_with_fallback(client.get(&thumbnail_url).timeout(std::time::Duration::from_secs(20)))
-        .await
-        .map_err(|e| {
-            crate::error::LauncherError::Download(format!("Failed to fetch CF logo: {}", e))
-        })?;
-
-    if !resp.status().is_success() {
-        return Ok(None);
-    }
-
-    let bytes = resp.bytes().await.map_err(|e| {
-        crate::error::LauncherError::Download(format!("Failed to read CF logo: {}", e))
-    })?;
+    let bytes = match fetch_remote_image_capped(&client, thumbnail_url.as_str(), MAX_LOGO_BYTES).await {
+        Some(b) if !b.is_empty() => b,
+        _ => return Ok(None),
+    };
 
     let b64 = base64_encode(&bytes);
     let mime = if thumbnail_url.ends_with(".jpg") || thumbnail_url.ends_with(".jpeg") {
@@ -1422,13 +1401,47 @@ async fn fetch_curseforge_mod_icon(
 
 /// Download an image from a URL and return as base64 data URL.
 async fn fetch_remote_icon(url: &str) -> Option<String> {
+    const MAX_ICON_BYTES: u64 = 3 * 1024 * 1024;
     let client = crate::download::global_http_client();
-    let resp = crate::download::send_with_fallback(client.get(url)).await.ok()?;
-    if !resp.status().is_success() { return None; }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = fetch_remote_image_capped(&client, url, MAX_ICON_BYTES).await?;
+    if bytes.is_empty() { return None; }
     let b64 = base64_encode(&bytes);
     let mime = if url.ends_with(".jpg") || url.ends_with(".jpeg") { "image/jpeg" } else { "image/png" };
     Some(format!("data:{};base64,{}", mime, b64))
+}
+
+/// Remote images (mod icons, thumbnails, CDN logos) are buffered whole into
+/// RAM and then base64-expanded (×4/3) for the renderer, so a malicious or
+/// broken host could otherwise force the launcher to allocate arbitrarily
+/// much memory. Fetch with a strict byte cap; anything larger is ignored.
+async fn fetch_remote_image_capped<S: reqwest::IntoUrl>(client: &reqwest::Client, url: S, max_bytes: u64) -> Option<Vec<u8>> {
+    let resp = crate::download::send_with_fallback(client.get(url))
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    // Pre-check Content-Length when the server advertises it.
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes {
+            tracing::warn!(target: "launcher", "Image too large ({} bytes, cap {}), skipping", len, max_bytes);
+            return None;
+        }
+    }
+    let mut remaining = max_bytes;
+    let mut buf = Vec::with_capacity(resp.content_length().unwrap_or(0).min(max_bytes) as usize);
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        if (remaining as usize) < chunk.len() {
+            tracing::warn!(target: "launcher", "Image exceeded cap {}, skipping", max_bytes);
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+        remaining -= chunk.len() as u64;
+    }
+    Some(buf)
 }
 
 /// Fetch a remote icon through the launcher's HTTP stack (proxy with direct

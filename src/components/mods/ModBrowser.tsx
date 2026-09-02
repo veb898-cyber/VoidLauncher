@@ -4,6 +4,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { Search, X, Check, Loader2, ArrowUpDown, Star, Calendar } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { addToast } from '../ui/Toast';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
+import { EmptyState } from '../ui/EmptyState';
+import { ResultListSkeleton } from '../ui/ResultListSkeleton';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
 
@@ -273,20 +276,17 @@ export function ModBrowser({ mcVersion, loader, onConfirm, onCancel }: ModBrowse
       <div style={{ display: 'flex', gap: 'var(--space-md)', flex: 1, overflow: 'hidden' }}>
         {/* Results list */}
         <div style={{ flex: selectedMod ? '0 0 38%' : '1', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
-          {searching && (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 40, color: 'var(--text-tertiary)' }}>
-              <Loader2 size={24} style={{ animation: 'spin 1s linear infinite' }} />
-            </div>
-          )}
-          {sortResults(results).map((mod) => {
+          {searching && <ResultListSkeleton variant="row" rows={5} />}
+          {sortResults(results).map((mod, i) => {
             const isAdded = selectedMods.some((m) => String(m.modId) === String(mod.id));
             return (
-              <div key={mod.id} onClick={() => selectMod(mod)} style={{
+              <div key={mod.id} className="stagger-in" onClick={() => selectMod(mod)} style={{
                 display: 'flex', gap: 'var(--space-sm)', padding: '8px 10px', cursor: 'pointer',
                 borderRadius: 'var(--radius-md)', border: '1px solid',
                 borderColor: selectedMod?.id === mod.id ? 'var(--primary)' : isAdded ? 'var(--success)' : 'transparent',
                 background: selectedMod?.id === mod.id ? 'var(--primary-dim)' : isAdded ? 'hsla(150, 60%, 50%, 0.08)' : 'var(--bg-secondary)',
                 transition: 'all 0.15s', position: 'relative',
+                animationDelay: `${Math.min(i, 9) * 24}ms`,
               }}>
                 {getIcon(mod) && <img src={getIcon(mod)} alt="" style={{ width: 36, height: 36, borderRadius: 6, objectFit: 'cover', flexShrink: 0 }} />}
                 <div style={{ flex: 1, minWidth: 0 }}>
@@ -306,7 +306,7 @@ export function ModBrowser({ mcVersion, loader, onConfirm, onCancel }: ModBrowse
             );
           })}
           {!searching && results.length === 0 && loaded && (
-            <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 'var(--font-size-sm)' }}>{t('mod.empty_results')}</div>
+            <EmptyState compact icon={<Search size={24} />} title={t('mod.empty_results')} />
           )}
         </div>
 
@@ -314,7 +314,7 @@ export function ModBrowser({ mcVersion, loader, onConfirm, onCancel }: ModBrowse
         {selectedMod && (
           <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-md)', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)' }}>
             {loadingDetail ? (
-              <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Loader2 size={24} style={{ animation: 'spin 1s linear infinite' }} /></div>
+              <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><SnakeSpinner size={24} /></div>
             ) : (
               <>
                 <div style={{ display: 'flex', gap: 'var(--space-md)', marginBottom: 'var(--space-md)' }}>

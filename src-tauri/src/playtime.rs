@@ -168,21 +168,53 @@ pub fn get_playtime(data_dir: &Path, instance_name: &str) -> u64 {
     map.get(instance_name).map(|e| e.minutes).unwrap_or(0)
 }
 
-/// Take the active session out (returns instance name + unpaid minutes delta).
-/// Returns None if there is no active session.
-pub fn take_session(session: &Mutex<Option<ActiveSession>>, now: Instant) -> Option<(String, u64)> {
-    let mut guard = session.lock().ok()?;
-    let s = guard.as_ref()?;
+/// Take the session for a single instance out of a multi-instance map
+/// (returns instance name + unpaid minutes delta). Returns None if that
+/// instance has no active session.
+pub fn take_keyed_session(
+    sessions: &Mutex<HashMap<String, ActiveSession>>,
+    instance_name: &str,
+    now: Instant,
+) -> Option<(String, u64)> {
+    let mut guard = sessions.lock().ok()?;
+    let s = guard.remove(instance_name)?;
     let delta = s.unpaid_minutes(now);
-    let name = s.instance_name.clone();
-    *guard = None;
-    Some((name, delta))
+    Some((instance_name.to_string(), delta))
 }
 
-/// Bump `last_flush` on the active session (called when committing a minute).
-pub fn touch_session(session: &Mutex<Option<ActiveSession>>, now: Instant) {
-    if let Ok(mut guard) = session.lock() {
-        if let Some(s) = guard.as_mut() {
+/// Take and commit all active sessions (used on window close). Returns the
+/// total number of flushed sessions for logging.
+pub fn flush_all_sessions(
+    sessions: &Mutex<HashMap<String, ActiveSession>>,
+    data_dir: &Path,
+    now: Instant,
+) -> usize {
+    let mut guards = HashMap::new();
+    {
+        if let Ok(mut map) = sessions.lock() {
+            for (name, s) in map.drain() {
+                let delta = s.unpaid_minutes(now);
+                if delta > 0 {
+                    guards.insert(name, delta);
+                }
+            }
+        }
+    }
+    let count = guards.len();
+    for (name, delta) in guards {
+        add_minutes_and_save(data_dir, &name, delta);
+    }
+    count
+}
+
+/// Bump `last_flush` on the session for a single instance in a multi-instance map.
+pub fn touch_keyed_session(
+    sessions: &Mutex<HashMap<String, ActiveSession>>,
+    instance_name: &str,
+    now: Instant,
+) {
+    if let Ok(mut guard) = sessions.lock() {
+        if let Some(s) = guard.get_mut(instance_name) {
             if s.unpaid_minutes(now) > 0 {
                 s.last_flush = now;
             }
@@ -240,5 +272,76 @@ mod tests {
         // The legacy `format_playtime` wrapper must keep returning Russian
         // (existing callers + older saves rely on it).
         assert_eq!(format_playtime(60), "1 час");
+    }
+
+    fn fake_session(instance_name: &str, started: Instant) -> ActiveSession {
+        ActiveSession {
+            instance_name: instance_name.to_string(),
+            pid: 1234,
+            started_at: started,
+            last_flush: started,
+            child: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn take_keyed_session_returns_and_removes_only_requested() {
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        map.insert("A".to_string(), fake_session("A", now));
+        map.insert("B".to_string(), fake_session("B", now));
+        let sessions = Mutex::new(map);
+
+        let taken = take_keyed_session(&sessions, "A", now).expect("A session present");
+        assert_eq!(taken.0, "A");
+        assert_eq!(taken.1, 0);
+
+        // B remains untouched; A is gone.
+        {
+            let guard = sessions.lock().unwrap();
+            assert!(!guard.contains_key("A"));
+            assert!(guard.contains_key("B"));
+        }
+        assert!(take_keyed_session(&sessions, "A", now).is_none());
+    }
+
+    #[test]
+    fn touch_keyed_session_advances_last_flush_for_one_instance() {
+        let start = Instant::now();
+        let mut map = HashMap::new();
+        map.insert("A".to_string(), fake_session("A", start));
+        let sessions = Mutex::new(map);
+
+        let later = start + std::time::Duration::from_secs(121);
+        touch_keyed_session(&sessions, "A", later);
+
+        {
+            let guard = sessions.lock().unwrap();
+            let s = guard.get("A").unwrap();
+            assert_eq!(s.unpaid_minutes(later), 0); // advanced flush cursor
+        }
+    }
+
+    #[test]
+    fn flush_all_sessions_writes_only_instances_with_whole_minutes() {
+        let start = Instant::now();
+        let from = |name: &str| -> ActiveSession {
+            // 1 full minute already elapsed for these.
+            let mut s = fake_session(name, start - std::time::Duration::from_secs(60));
+            s
+        };
+        let mut map = HashMap::new();
+        map.insert("X".to_string(), from("X"));
+        map.insert("Y".to_string(), from("Y"));
+        let sessions = Mutex::new(map);
+
+        let dir = std::env::temp_dir().join(format!("void_playtime_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = Instant::now();
+        let flushed = flush_all_sessions(&sessions, &dir, now);
+        assert_eq!(flushed, 2);
+        assert_eq!(get_playtime(&dir, "X"), 1);
+        assert_eq!(get_playtime(&dir, "Y"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,8 +1,11 @@
 ﻿import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, Loader2, X, Check, Download } from 'lucide-react';
+import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, X, Check, Download } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { addToast } from '../ui/Toast';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
+import { EmptyState } from '../ui/EmptyState';
+import { ResultListSkeleton } from '../ui/ResultListSkeleton';
 import { t } from '../../lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
@@ -16,6 +19,7 @@ interface Hit {
   downloads: number;
   slug: string;
   author?: string;
+  date_published?: string;
 }
 
 interface Props {
@@ -124,10 +128,15 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
 
   const sortHits = (items: Hit[]): Hit[] => {
     const sorted = [...items];
+    // "Newest"/"oldest" reflect the actual release date (date_published from
+    // the API), with the title as a stable tiebreaker — sorting by title
+    // alone made "newest" just an alphabetical reorder.
+    const byDate = (a: Hit, b: Hit) =>
+      new Date(a.date_published || 0).getTime() - new Date(b.date_published || 0).getTime();
     switch (sortMode) {
       case 'downloads': return sorted.sort((a, b) => (b.downloads || 0) - (a.downloads || 0));
-      case 'newest': return sorted.sort((a, b) => (b.title || '').localeCompare(a.title || ''));
-      case 'oldest': return sorted.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+      case 'newest': return sorted.sort((a, b) => byDate(b, a) || (b.title || '').localeCompare(a.title || ''));
+      case 'oldest': return sorted.sort((a, b) => byDate(a, b) || (b.title || '').localeCompare(a.title || ''));
     }
   };
 
@@ -180,19 +189,13 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
       <div style={{ display: 'flex', gap: 'var(--space-md)', flex: 1, overflow: 'hidden', padding: 'var(--space-sm) var(--space-xl)' }}>
         {/* Results list */}
         <div style={{ flex: selected ? '0 0 38%' : '1', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
-          {loading && (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 40, color: 'var(--text-tertiary)' }}>
-              <Loader2 size={24} style={{ animation: 'spin 1s linear infinite' }} />
-            </div>
-          )}
+          {loading && <ResultListSkeleton variant="row" rows={5} />}
           {!loading && sortHits(displayHits).length === 0 && loaded && (
-            <div style={{ textAlign: 'center', padding: 40, color: 'var(--text-tertiary)' }}>
-              <Package size={32} style={{ opacity: 0.3, marginBottom: 'var(--space-sm)' }} />
-              <div>{t('pack.empty_results')}</div>
-            </div>
+            <EmptyState compact icon={<Package size={24} />} title={t('pack.empty_results')} />
           )}
-          {sortHits(displayHits).map((hit) => (
+          {sortHits(displayHits).map((hit, i) => (
             <div key={hit.project_id}
+              className="stagger-in"
               onClick={() => handleSelect(hit)}
               style={{
                 display: 'flex', gap: 'var(--space-sm)', padding: '8px 10px', cursor: 'pointer',
@@ -200,6 +203,7 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
                 borderColor: selected?.project_id === hit.project_id ? 'var(--primary)' : 'transparent',
                 background: selected?.project_id === hit.project_id ? 'var(--primary-dim)' : 'var(--bg-secondary)',
                 transition: 'all 0.15s',
+                animationDelay: `${Math.min(i, 9) * 24}ms`,
               }}
             >
               {hit.icon_url ? (
@@ -228,7 +232,7 @@ export function PackBrowser({ instanceName, packType, onClose, onInstalled }: Pr
         {selected && (
           <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-md)', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)' }}>
             {loadingDetail ? (
-              <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Loader2 size={24} style={{ animation: 'spin 1s linear infinite' }} /></div>
+              <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><SnakeSpinner size={24} /></div>
             ) : (
               <>
                 <div style={{ display: 'flex', gap: 'var(--space-md)', marginBottom: 'var(--space-md)' }}>

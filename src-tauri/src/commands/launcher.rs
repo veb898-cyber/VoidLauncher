@@ -227,6 +227,20 @@ pub async fn cmd_launch_game(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
 
+    // Guard against launching the same instance twice concurrently — a
+    // second click on a running instance must be a no-op, not a second copy.
+    {
+        let running = state.running_instances.lock().map_err(|e| e.to_string())?;
+        if running.iter().any(|n| n == &instance_name) {
+            let msg = format!(
+                "Instance '{}' is already running. Launch it again after it exits.",
+                instance_name
+            );
+            events::emit_log(&app, "warn", "launch", &msg);
+            return Err(msg);
+        }
+    }
+
     let (config, data_dir) = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
         (c.clone(), c.data_dir.clone())
@@ -610,23 +624,27 @@ pub async fn cmd_launch_game(
         }
     }
 
-    // Mark this instance as the running one (the frontend shows a "Running" badge)
+    // Mark this instance as running (the frontend shows a "Running" badge).
+    // Multiple games may run at once, so this is an append to a list.
     {
-        let mut slot = state.running_instance_id.lock().map_err(|e| e.to_string())?;
-        *slot = Some(instance_name.clone());
+        let mut running = state.running_instances.lock().map_err(|e| e.to_string())?;
+        running.push(instance_name.clone());
     }
 
-    // Start the playtime-tracking session
+    // Start the playtime-tracking session, keyed by instance name.
     {
         let now = Instant::now();
-        let mut session = state.active_session.lock().map_err(|e| e.to_string())?;
-        *session = Some(playtime::ActiveSession {
-            instance_name: instance_name.clone(),
-            pid,
-            started_at: now,
-            last_flush: now,
-            child: child_handle.clone(),
-        });
+        let mut sessions = state.active_sessions.lock().map_err(|e| e.to_string())?;
+        sessions.insert(
+            instance_name.clone(),
+            playtime::ActiveSession {
+                instance_name: instance_name.clone(),
+                pid,
+                started_at: now,
+                last_flush: now,
+                child: child_handle.clone(),
+            },
+        );
     }
     events::emit_log(
         &app,
@@ -655,10 +673,11 @@ pub async fn cmd_launch_game(
                 }
             };
             if exited {
-                // Process exited вЂ” commit any final sub-minute tail via the helper
+                // Process exited — commit any final sub-minute tail via the helper.
                 let now = Instant::now();
                 let app_state = app_for_timer.state::<AppState>();
-                if let Some((name, delta)) = playtime::take_session(&app_state.active_session, now)
+                if let Some((name, delta)) =
+                    playtime::take_keyed_session(&app_state.active_sessions, &instance_for_timer, now)
                 {
                     if delta > 0 {
                         playtime::add_minutes_and_save(&data_dir_for_timer, &name, delta);
@@ -673,21 +692,24 @@ pub async fn cmd_launch_game(
                 break;
             }
             // Commit the actual unpaid minutes since the last flush. The timer
-            // tick is just a cadence hint вЂ” a slow tick (GC pause, system suspend)
+            // tick is just a cadence hint — a slow tick (GC pause, system suspend)
             // should credit 2+ minutes, and a fast tick should credit 0. The
-            // `last_flush` cursor is advanced by `take_session` / `touch_session`
-            // so the sub-minute remainder is preserved for the next tick or the
-            // final teardown.
+            // `last_flush` cursor is advanced by `take_keyed_session` /
+            // `touch_keyed_session` so the sub-minute remainder is preserved for
+            // the next tick or the final teardown.
             let now = Instant::now();
             let app_state = app_for_timer.state::<AppState>();
-            let delta = if let Ok(guard) = app_state.active_session.lock() {
-                guard.as_ref().map(|s| s.unpaid_minutes(now)).unwrap_or(0)
+            let delta = if let Ok(guard) = app_state.active_sessions.lock() {
+                guard
+                    .get(&instance_for_timer)
+                    .map(|s| s.unpaid_minutes(now))
+                    .unwrap_or(0)
             } else {
                 0
             };
             if delta > 0 {
                 playtime::add_minutes_and_save(&data_dir_for_timer, &instance_for_timer, delta);
-                playtime::touch_session(&app_state.active_session, now);
+                playtime::touch_keyed_session(&app_state.active_sessions, &instance_for_timer, now);
             }
         }
     });
@@ -722,6 +744,11 @@ pub async fn cmd_launch_game(
         // LAST appends the final chronological line to the session log, so
         // no game output can land after it.
         crate::game_logs::mark_game_exit(pid_for_exit, exit_code);
+        // Clear only THIS instance from the running list. Other games may
+        // still be running, so never wipe the whole list.
+        if let Ok(mut running) = app_clone.state::<AppState>().running_instances.lock() {
+            running.retain(|n| n != &instance_clone);
+        }
         events::emit_launch_event(
             &app_clone,
             "info",
@@ -1149,7 +1176,7 @@ pub fn cmd_get_playtime(state: State<'_, AppState>, instance_name: String) -> Re
 pub fn cmd_format_playtime(minutes: u64, language: Option<String>) -> String {
     let lang = match language.as_deref() {
         Some("en") => playtime::PlaytimeLang::En,
-        // Default to English on unknown / null / "ru" вЂ” historically this
+        // Default to English on unknown / null / "ru" — historically this
         // command always returned Russian, but the launcher's UI now ships
         // in English by default and the playtime label should match.
         _ => playtime::PlaytimeLang::En,
@@ -1157,13 +1184,19 @@ pub fn cmd_format_playtime(minutes: u64, language: Option<String>) -> String {
     playtime::format_playtime_in(minutes, lang)
 }
 
-/// Flush the active playtime session (commits whole minutes and clears the session).
-/// Called manually from the frontend (e.g., when the user closes a running game).
+/// Flush the active playtime session for a given instance (commits whole
+/// minutes and clears that session). Called manually from the frontend
+/// (e.g., when the user closes a running game).
 #[tauri::command]
-pub fn cmd_flush_playtime(state: State<'_, AppState>) -> Result<(), String> {
+pub fn cmd_flush_playtime(
+    state: State<'_, AppState>,
+    instance_name: String,
+) -> Result<(), String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let now = Instant::now();
-    if let Some((name, delta)) = playtime::take_session(&state.active_session, now) {
+    if let Some((name, delta)) =
+        playtime::take_keyed_session(&state.active_sessions, &instance_name, now)
+    {
         if delta > 0 {
             playtime::add_minutes_and_save(&config.data_dir, &name, delta);
         }

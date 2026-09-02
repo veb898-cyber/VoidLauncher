@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Modal } from '../ui/Modal';
 import { ProgressBar } from '../ui/ProgressBar';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { useT } from '../../lib/i18n';
 
 interface JavaProgress {
@@ -73,7 +74,7 @@ export function JavaSetupModal({ open, onClose }: Props) {
           </div>
         ) : (
           <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
-            <div className="spinner-sm" style={{ width: 16, height: 16 }} />
+            <SnakeSpinner size={18} />
             <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
               {stageLabel}
             </span>

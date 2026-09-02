@@ -53,6 +53,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       set({ accounts, isLoading: false });
     } catch (e: any) {
       set({ error: e.toString(), isLoading: false });
+      throw e;
     }
   },
 
@@ -63,6 +64,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       set({ accounts, isLoading: false });
     } catch (e: any) {
       set({ error: e.toString(), isLoading: false });
+      throw e;
     }
   },
 
@@ -72,6 +74,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       set({ accounts });
     } catch (e: any) {
       set({ error: e.toString() });
+      throw e;
     }
   },
 
@@ -90,6 +93,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       get().loadAccounts();
     } catch (e: any) {
       set({ error: e.toString() });
+      throw e;
     }
   },
 }));

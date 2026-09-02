@@ -237,35 +237,43 @@ pub(crate) async fn ensure_ms_session(
         if auth::is_token_expired(&mc_token) && !ms_token.refresh_token.is_empty() {
             tracing::info!(target: "launcher", "Refreshing Microsoft token for account '{}'", account.name);
             match auth::refresh_microsoft_token(&client_id, &ms_token.refresh_token).await {
-                Ok(new_ms) => match auth::full_auth_flow(&new_ms).await {
-                    Ok((new_mc, new_profile)) => {
-                        tracing::info!(target: "launcher", "Token refreshed for user: {}", new_profile.name);
-                        *session = auth::AuthState {
-                            microsoft_token: Some(new_ms),
-                            minecraft_token: Some(new_mc),
-                            profile: Some(new_profile),
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            offline_mode: false,
-                        };
-                        let _ = accounts::store_ms_session(&account.id, session);
-                        let is_active = accounts::list_accounts(&data_dir)
-                            .iter()
-                            .any(|a| a.default && a.id == account.id);
-                        if is_active {
-                            let config = state.config.lock().map_err(|e| e.to_string())?;
-                            let _ = auth::save_auth_state(&config.auth_file(), session);
-                            let mut auth_state =
-                                state.auth_state.lock().map_err(|e| e.to_string())?;
-                            *auth_state = session.clone();
+                Ok(mut new_ms) => {
+                    // If Microsoft did not return a rotated refresh_token, keep
+                    // the stored one so a future refresh is still possible.
+                    // (Only happens for offline_access scopes; guard the clobber.)
+                    if new_ms.refresh_token.is_empty() {
+                        new_ms.refresh_token = ms_token.refresh_token.clone();
+                    }
+                    match auth::full_auth_flow(&new_ms).await {
+                        Ok((new_mc, new_profile)) => {
+                            tracing::info!(target: "launcher", "Token refreshed for user: {}", new_profile.name);
+                            *session = auth::AuthState {
+                                microsoft_token: Some(new_ms),
+                                minecraft_token: Some(new_mc),
+                                profile: Some(new_profile),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                offline_mode: false,
+                            };
+                            let _ = accounts::store_ms_session(&account.id, session);
+                            let is_active = accounts::list_accounts(&data_dir)
+                                .iter()
+                                .any(|a| a.default && a.id == account.id);
+                            if is_active {
+                                let config = state.config.lock().map_err(|e| e.to_string())?;
+                                let _ = auth::save_auth_state(&config.auth_file(), session);
+                                let mut auth_state =
+                                    state.auth_state.lock().map_err(|e| e.to_string())?;
+                                *auth_state = session.clone();
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "launcher", "Full re-auth failed for '{}': {}", account.name, e);
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(target: "launcher", "Full re-auth failed for '{}': {}", account.name, e);
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(target: "launcher", "Microsoft token refresh failed for '{}': {}", account.name, e);
                 }

@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Globe, FolderOpen, Pencil, Copy, Trash2, KeyRound } from 'lucide-react';
+import { Globe, FolderOpen, Pencil, Copy, Trash2, KeyRound, RefreshCw } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { Tooltip } from '../ui/Tooltip';
 import { Modal } from '../ui/Modal';
 import { Input } from '../ui/Input';
 import { addToast } from '../ui/Toast';
@@ -117,7 +118,9 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
             {t('worlds.count', { n: saves.length.toString() })}
           </span>
         </h2>
-        <Button size="sm" variant="ghost" onClick={loadSaves}>{t('common.refresh')}</Button>
+        <Button size="sm" variant="ghost" onClick={loadSaves}>
+          <RefreshCw size={14} /> {t('common.refresh')}
+        </Button>
       </div>
 
       <div style={{ flex: 1, overflowY: 'auto' }}>
@@ -152,11 +155,11 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
               <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)' }}>{gameModeLabel(save.game_mode)}</div>
               <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', textAlign: 'right' }}>{formatSize(save.size_bytes)}</div>
               <div style={{ display: 'flex', gap: 2, justifyContent: 'flex-end' }}>
-                <button title={t('worlds.rename')} onClick={() => { setRenameTarget(save); setRenameValue(save.name); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Pencil size={14} /></button>
-                <button title={t('worlds.copy')} onClick={() => { setCopyTarget(save); setCopyValue(`${save.name} (Copy)`); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Copy size={14} /></button>
-                <button title={t('worlds.delete')} onClick={() => setDeleteTarget(save)} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Trash2 size={14} /></button>
+                <Tooltip content={t('worlds.rename')}><button onClick={() => { setRenameTarget(save); setRenameValue(save.name); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Pencil size={14} /></button></Tooltip>
+                <Tooltip content={t('worlds.copy')}><button onClick={() => { setCopyTarget(save); setCopyValue(`${save.name} ${t('worlds.copy_suffix')}`); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Copy size={14} /></button></Tooltip>
+                <Tooltip content={t('worlds.delete')}><button onClick={() => setDeleteTarget(save)} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Trash2 size={14} /></button></Tooltip>
                 {save.seed != null && (
-                  <button title={t('worlds.copy_seed')} onClick={() => handleCopySeed(save.seed!)} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><KeyRound size={14} /></button>
+                  <Tooltip content={t('worlds.copy_seed')}><button onClick={() => handleCopySeed(save.seed!)} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><KeyRound size={14} /></button></Tooltip>
                 )}
               </div>
             </div>

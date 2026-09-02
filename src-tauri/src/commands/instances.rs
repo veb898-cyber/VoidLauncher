@@ -27,15 +27,28 @@ pub(crate) fn validate_instance_name(name: &str) -> Result<(), String> {
     if trimmed.chars().count() > 64 {
         return Err("Instance name is too long (max 64 characters).".to_string());
     }
+    if trimmed.starts_with('.') {
+        return Err("Instance name may not start with a dot.".to_string());
+    }
+    validate_safe_folder_name(trimmed, "Instance name")
+}
+
+/// Validates a raw folder name for path safety only (no length/leading-dot
+/// constraints). Used for Minecraft world/save names, which are free-form:
+/// a single character is valid, and names may legitimately start with a dot.
+/// The only enforced rules are the ones that keep the name from escaping the
+/// containing directory (traversal, separators, NUL) or from breaking on
+/// Windows (control chars, `<>:"|?*`, reserved device names).
+fn validate_safe_folder_name(trimmed: &str, what: &str) -> Result<(), String> {
     if trimmed.contains("..")
         || trimmed.contains('/')
         || trimmed.contains('\\')
         || trimmed.contains('\0')
     {
-        return Err("Instance name contains invalid path characters.".to_string());
+        return Err(format!("{} contains invalid path characters.", what));
     }
-    if trimmed.starts_with('.') {
-        return Err("Instance name may not start with a dot.".to_string());
+    if trimmed == "." || trimmed == ".." {
+        return Err(format!("Invalid {}: '{}'.", what, trimmed));
     }
     // Reject Windows reserved device names (CON, PRN, AUX, NUL, COM1..9, LPT1..9)
     let upper = trimmed.to_ascii_uppercase();
@@ -47,13 +60,14 @@ pub(crate) fn validate_instance_name(name: &str) -> Result<(), String> {
         return Err(format!("'{}' is a reserved name.", trimmed));
     }
     // Allow any printable Unicode character (including Cyrillic, CJK, emoji)
-    // — instance names are folder names and the user can call them whatever
-    // they want. The only thing we block here are control characters and
-    // characters that would break path joining on any major platform.
+    // — the folder can be called whatever the user wants. The only thing we
+    // block here are control characters and characters that would break path
+    // joining on any major platform.
     for ch in trimmed.chars() {
         if ch.is_control() {
             return Err(format!(
-                "Instance name contains a control character (U+{:04X}).",
+                "{} contains a control character (U+{:04X}).",
+                what,
                 ch as u32
             ));
         }
@@ -61,12 +75,17 @@ pub(crate) fn validate_instance_name(name: &str) -> Result<(), String> {
         // even when escaped: < > : " | ? *
         if matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
             return Err(format!(
-                "Instance name contains an invalid character: {:?}",
-                ch
+                "{} contains an invalid character: {:?}",
+                what, ch
             ));
         }
     }
     Ok(())
+}
+
+/// Path-safety validation for free-form world/save folder names.
+pub(crate) fn validate_world_name(name: &str) -> Result<(), String> {
+    validate_safe_folder_name(name.trim(), "World name")
 }
 
 // ==================== Instance Commands ====================
@@ -289,8 +308,8 @@ pub fn cmd_rename_world(
     new_name: String,
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
-    validate_instance_name(&old_name)?;
-    validate_instance_name(&new_name)?;
+    validate_world_name(&old_name)?;
+    validate_world_name(&new_name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
     instances::rename_world(
         &config.instances_dir(),
@@ -309,8 +328,8 @@ pub fn cmd_copy_world(
     new_name: String,
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
-    validate_instance_name(&world_name)?;
-    validate_instance_name(&new_name)?;
+    validate_world_name(&world_name)?;
+    validate_world_name(&new_name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
     instances::copy_world(
         &config.instances_dir(),
@@ -328,7 +347,7 @@ pub fn cmd_delete_world(
     world_name: String,
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
-    validate_instance_name(&world_name)?;
+    validate_world_name(&world_name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
     instances::delete_world(&config.instances_dir(), &instance_name, &world_name)
         .map_err(|e| e.to_string())
@@ -352,8 +371,13 @@ pub fn cmd_delete_screenshot(
     filename: String,
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
+    let safe_filename = std::path::Path::new(&filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid filename")?
+        .to_string();
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::delete_screenshot(&config.instances_dir(), &instance_name, &filename)
+    instances::delete_screenshot(&config.instances_dir(), &instance_name, &safe_filename)
         .map_err(|e| e.to_string())
 }
 
@@ -594,6 +618,7 @@ pub fn cmd_check_instance_installed(
 #[cfg(test)]
 mod instance_name_tests {
     use super::validate_instance_name;
+    use super::validate_world_name;
 
     #[test]
     fn accepts_valid_names() {
@@ -667,5 +692,25 @@ mod instance_name_tests {
     fn rejects_empty() {
         assert!(validate_instance_name("").is_err());
         assert!(validate_instance_name("   ").is_err());
+    }
+
+    #[test]
+    fn world_names_allow_freeform_but_still_reject_traversal() {
+        // World/save names are free-form: a single char and a leading dot are
+        // both legitimate (unlike instance names which need 3+ and no dot).
+        assert!(validate_world_name("A").is_ok());
+        assert!(validate_world_name(".hidden").is_ok());
+        assert!(validate_world_name("My World").is_ok());
+        assert!(validate_world_name("1").is_ok());
+        // Security invariants must still hold: never escape the saves dir.
+        assert!(validate_world_name("..").is_err());
+        assert!(validate_world_name(".").is_err());
+        assert!(validate_world_name("../escape").is_err());
+        assert!(validate_world_name("a\\..").is_err());
+        assert!(validate_world_name("a/b").is_err());
+        assert!(validate_world_name("a\\b").is_err());
+        assert!(validate_world_name("a\0b").is_err());
+        assert!(validate_world_name("foo:bar").is_err());
+        assert!(validate_world_name("CON").is_err());
     }
 }

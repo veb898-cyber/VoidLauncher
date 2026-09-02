@@ -3,7 +3,7 @@ import { t, getLanguage } from '../lib/i18n';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { Search, FileArchive, Package, Plus, Upload } from 'lucide-react';
+import { Search, FileArchive, Package, Plus, Upload, Compass } from 'lucide-react';
 import { Modal } from '../components/ui/Modal';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
@@ -41,6 +41,12 @@ interface ModpackMetadata {
 interface CreateWizardProps {
   open: boolean;
   onClose: () => void;
+  onOpenModpacks?: () => void;
+  /** True after the modpack catalog was opened from this menu (highlight it
+      as the current/active destination when the menu is shown again). */
+  viaModpacks?: boolean;
+  /** Clear the modpacks highlight when the user picks another menu item. */
+  onClearViaModpacks?: () => void;
 }
 
 type LoaderType = 'Vanilla' | 'Fabric' | 'Forge' | 'NeoForge';
@@ -50,7 +56,7 @@ const SCROLL_LOAD_THRESHOLD_PX = 50;
 
 type WizardMode = 'new' | 'import';
 
-export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
+export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpacks = false, onClearViaModpacks }: CreateWizardProps) {
   const { createInstance, installVersion, loadInstances } = useInstanceStore();
 
   const [mode, setMode] = useState<WizardMode>('new');
@@ -338,33 +344,22 @@ export function CreateInstanceWizard({ open, onClose }: CreateWizardProps) {
           borderRight: '1px solid var(--surface-border)', paddingRight: 'var(--space-lg)',
         }}>
           <div
-            onClick={() => setMode('new')}
-            style={{
-              padding: 'var(--space-md) var(--space-lg)',
-              borderRadius: 'var(--radius-md)',
-              cursor: 'pointer',
-              background: mode === 'new' ? 'var(--primary-dim)' : 'transparent',
-              color: mode === 'new' ? 'var(--primary)' : 'var(--text-secondary)',
-              fontWeight: mode === 'new' ? 600 : 400,
-              display: 'flex', alignItems: 'center', gap: 'var(--space-sm)',
-              fontSize: 'var(--font-size-sm)',
-            }}
+            onClick={() => { setMode('new'); onClearViaModpacks?.(); }}
+            className={`create-wizard__mode-item${mode === 'new' && !viaModpacks ? ' create-wizard__mode-item--active' : ''}`}
           >
             <Plus size={16} /> {t('create_instance.mode_new')}
           </div>
 
           <div
-            onClick={() => setMode('import')}
-            style={{
-              padding: 'var(--space-md) var(--space-lg)',
-              borderRadius: 'var(--radius-md)',
-              cursor: 'pointer',
-              background: mode === 'import' ? 'var(--primary-dim)' : 'transparent',
-              color: mode === 'import' ? 'var(--primary)' : 'var(--text-secondary)',
-              fontWeight: mode === 'import' ? 600 : 400,
-              display: 'flex', alignItems: 'center', gap: 'var(--space-sm)',
-              fontSize: 'var(--font-size-sm)',
-            }}
+            onClick={() => onOpenModpacks?.()}
+            className={`create-wizard__mode-item${viaModpacks ? ' create-wizard__mode-item--active' : ''}`}
+          >
+            <Compass size={16} /> {t('modpacks.title')}
+          </div>
+
+          <div
+            onClick={() => { setMode('import'); onClearViaModpacks?.(); }}
+            className={`create-wizard__mode-item${mode === 'import' && !viaModpacks ? ' create-wizard__mode-item--active' : ''}`}
           >
             <Upload size={16} /> {t('create_instance.mode_import')}
           </div>

@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
+import { Tooltip } from './Tooltip';
 
 export interface SelectOption<T extends string> {
   value: T;
   label: string;
   disabled?: boolean;
   description?: string;
+  tooltip?: string;
 }
 
 interface CustomSelectProps<T extends string> {
@@ -152,7 +154,13 @@ export function CustomSelect<T extends string>({
                   setOpen(false);
                 }}
               >
-                <span className="custom-select__option-label">{opt.label}</span>
+                {opt.tooltip ? (
+                  <Tooltip content={opt.tooltip}>
+                    <span className="custom-select__option-label">{opt.label}</span>
+                  </Tooltip>
+                ) : (
+                  <span className="custom-select__option-label">{opt.label}</span>
+                )}
                 {opt.description && (
                   <span className="custom-select__option-desc">{opt.description}</span>
                 )}

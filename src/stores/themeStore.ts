@@ -1,13 +1,13 @@
 import { create } from 'zustand';
 
-export type Theme = 'standard' | 'dark' | 'light';
+export type Theme = 'standard' | 'dark' | 'blueprint' | 'ember';
 
 const STORAGE_KEY = 'voidlauncher-theme';
 
 function getInitialTheme(): Theme {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored === 'standard' || stored === 'dark' || stored === 'light') {
+    if (stored === 'standard' || stored === 'dark' || stored === 'blueprint' || stored === 'ember') {
       return stored;
     }
   } catch {}
@@ -16,8 +16,8 @@ function getInitialTheme(): Theme {
 
 function applyTheme(theme: Theme) {
   document.documentElement.setAttribute('data-theme', theme);
-  // Set color-scheme for native <select> popup
-  document.documentElement.style.colorScheme = theme === 'light' ? 'light' : 'dark';
+  // color-scheme: dark for all current themes (OLED Light was removed)
+  document.documentElement.style.colorScheme = 'dark';
 }
 
 interface ThemeState {

@@ -4,6 +4,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, Loader2, X, Check, Download } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { addToast } from '../ui/Toast';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
+import { EmptyState } from '../ui/EmptyState';
+import { ResultListSkeleton } from '../ui/ResultListSkeleton';
 import { useT } from '../../lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
@@ -541,21 +544,15 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       <div style={{ display: 'flex', gap: 'var(--space-md)', flex: 1, overflow: 'hidden', padding: 'var(--space-sm) var(--space-xl)' }}>
         {/* Results list */}
         <div style={{ flex: selected ? '0 0 38%' : '1', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
-          {loading && (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 40, color: 'var(--text-tertiary)' }}>
-              <Loader2 size={24} style={{ animation: 'spin 1s linear infinite' }} />
-            </div>
-          )}
+          {loading && <ResultListSkeleton variant="row" rows={5} />}
           {!loading && sortHits(displayHits).length === 0 && (
-            <div style={{ textAlign: 'center', padding: 40, color: 'var(--text-tertiary)' }}>
-              <Package size={32} style={{ opacity: 0.3, marginBottom: 'var(--space-sm)' }} />
-              <div>{t('content.empty_results', { label: label.toLowerCase() })}</div>
-            </div>
+            <EmptyState compact icon={<Package size={24} />} title={t('content.empty_results', { label: label.toLowerCase() })} />
           )}
-          {sortHits(displayHits).map((hit) => {
+          {sortHits(displayHits).map((hit, i) => {
             const added = isAdded(hit.project_id, hit.slug, hit.title);
             return (
               <div key={hit.project_id}
+                className="stagger-in"
                 onClick={() => handleSelect(hit)}
                 style={{
                   display: 'flex', gap: 'var(--space-sm)', padding: '8px 10px', cursor: 'pointer',
@@ -563,6 +560,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                   borderColor: selected?.project_id === hit.project_id ? 'var(--primary)' : added ? 'var(--success)' : 'transparent',
                   background: selected?.project_id === hit.project_id ? 'var(--primary-dim)' : added ? 'hsla(150, 60%, 50%, 0.08)' : 'var(--bg-secondary)',
                   transition: 'all 0.15s',
+                  animationDelay: `${Math.min(i, 9) * 24}ms`,
                 }}
               >
                 {hit.icon_url ? (
@@ -602,7 +600,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         {selected && (
           <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-md)', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)' }}>
             {loadingDetail ? (
-              <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Loader2 size={24} style={{ animation: 'spin 1s linear infinite' }} /></div>
+              <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><SnakeSpinner size={24} /></div>
             ) : (
               <>
                 <div style={{ display: 'flex', gap: 'var(--space-md)', marginBottom: 'var(--space-md)' }}>
@@ -697,7 +695,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
 
       {/* Bottom bar with selected count + Confirm */}
       {selectedItems.length > 0 && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: 'var(--space-sm) var(--space-xl)', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', border: '1px solid var(--surface-border)', flexShrink: 0, margin: '0 var(--space-xl) var(--space-md)' }}>
+        <div className="selection-bar" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: 'var(--space-sm) var(--space-md)', flexShrink: 0, margin: '0 var(--space-xl) var(--space-md)' }}>
           <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', flexShrink: 0 }}>{t('common.items_selected', { n: selectedItems.length.toString() })}</span>
           <div style={{ flex: 1, display: 'flex', gap: 4, overflowX: 'auto' }}>
             {selectedItems.map((m, i) => (

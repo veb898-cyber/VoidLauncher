@@ -280,15 +280,97 @@ pub fn list_game_log_sessions(data_dir: &PathBuf) -> Vec<GameLogSession> {
 
 /// Read a game log file and return its content (with line limit)
 pub fn read_game_log(path: &str, max_lines: Option<usize>) -> Result<String, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let max = max_lines.unwrap_or(5000);
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.len() > max {
-        let truncated = lines[lines.len().saturating_sub(max)..].join("\n");
-        Ok(format!("... (showing last {} lines)\n{}", max, truncated))
+    // Read only the tail of the log instead of loading the whole file:
+    // sessions can grow to hundreds of thousands of lines, and this command
+    // is polled every second while the console is open. A full read would
+    // re-materialize the entire file in RAM on every poll.
+    let (content, truncated) = read_tail_lossy(path, max);
+    if truncated {
+        Ok(format!("... (showing last {} lines)\n{}", max, content))
     } else {
         Ok(content)
     }
+}
+
+/// Read the trailing `max` lines of a file, decoding only those bytes. Scans
+/// backwards from the end for `max` newline boundaries and returns the bytes
+/// after the last one, falling back to the whole file when it is smaller.
+/// The returned bool is `true` when the file held more lines than `max` (i.e.
+/// the result is a truncated tail rather than the complete file).
+fn read_tail_lossy(path: &str, max: usize) -> (String, bool) {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (String::new(), false),
+    };
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return (String::new(), false),
+    };
+    if max == 0 {
+        return (String::new(), true);
+    }
+    const CHUNK: u64 = 64 * 1024;
+
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    let mut reader = file;
+
+    // Collect, newest-first, the *absolute byte offsets* of newline characters,
+    // walking backwards in 64 KiB blocks. We gather up to `max + 1` so that
+    // removing a trailing (empty-line) newline below still leaves `max` usable
+    // boundaries. The loop stops when it has enough or reaches file start
+    // (returning everything).
+    let mut boundaries: Vec<u64> = Vec::with_capacity(max + 1);
+    let mut block_end: u64 = file_len;
+    let mut buf = vec![0u8; CHUNK as usize];
+    while block_end > 0 && boundaries.len() < max + 1 {
+        let read_start = block_end.saturating_sub(CHUNK);
+        let len = (block_end - read_start) as usize;
+        if reader.seek(SeekFrom::Start(read_start)).is_err() {
+            break;
+        }
+        if reader.read_exact(&mut buf[..len]).is_err() {
+            break;
+        }
+        // Record newlines newest-first (walk this block back-to-front).
+        let piece = &buf[..len];
+        for i in (0..len).rev() {
+            if boundaries.len() >= max + 1 {
+                break;
+            }
+            if piece[i] == b'\n' {
+                boundaries.push(read_start + i as u64);
+            }
+        }
+        block_end = read_start;
+    }
+
+    // If the file's final newline sits at its very end, the byte after it is
+    // empty and doesn't start a visible line — drop it so the "last N lines"
+    // wording stays truthful.
+    if file_len > 0 && boundaries.first() == Some(&(file_len - 1)) {
+        boundaries.remove(0);
+    }
+
+    let tail_start = if boundaries.len() >= max {
+        // `max`-th newline from the end: first line starts right after it.
+        boundaries[max - 1] + 1
+    } else {
+        // Fewer newlines than asked for — include the whole file.
+        0
+    };
+    let truncated = tail_start > 0;
+
+    let mut tail = Vec::new();
+    if reader.seek(SeekFrom::Start(tail_start)).is_err() {
+        return (String::new(), truncated);
+    }
+    if reader.read_to_end(&mut tail).is_err() {
+        return (String::new(), truncated);
+    }
+    (String::from_utf8_lossy(&tail).to_string(), truncated)
 }
 
 pub fn delete_game_log(data_dir: &PathBuf, path: &str) -> Result<(), String> {
@@ -362,6 +444,57 @@ mod tests {
         assert_eq!(sanitize_instance_name("Better MC [FORGE] BMC4"), "Better_MC__FORGE__BMC4");
 
         clear_current_log_path();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_game_log_returns_last_n_lines() {
+        let dir = std::env::temp_dir().join(format!("vl_readlog_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.log");
+        let lines: Vec<String> = (1..=100).map(|i| format!("line {}", i)).collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let tail = read_game_log(path.to_str().unwrap(), Some(5)).unwrap();
+        assert!(tail.contains("line 96"));
+        assert!(tail.contains("line 100"));
+        assert!(tail.ends_with("line 100"));
+        assert!(tail.starts_with("... (showing last 5 lines)"));
+        // Header plus exactly 5 data lines.
+        assert_eq!(tail.matches('\n').count(), 5);
+
+        // Larger cap than the file returns everything.
+        let all = read_game_log(path.to_str().unwrap(), Some(500)).unwrap();
+        assert!(all.starts_with("line 1"));
+        assert!(all.contains("line 100"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_game_log_tail_spans_multiple_blocks_and_trailing_newline() {
+        let dir = std::env::temp_dir().join(format!("vl_readlog_blocks_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.log");
+
+        // Produce >2× the 64 KiB block so the backward scan crosses block
+        // boundaries, and end the file with a trailing newline.
+        let mut content = String::new();
+        for _ in 0..300_000 {
+            content.push_str("0123456789abcdef\n");
+        }
+        std::fs::write(&path, &content).unwrap();
+
+        let tail = read_game_log(path.to_str().unwrap(), Some(7)).unwrap();
+        let kept: Vec<&str> = tail.lines().collect();
+        // First element is the truncation header; the rest are the 7 newest
+        // visible lines (the file's trailing \n must not add an empty line).
+        assert_eq!(kept.len(), 8, "header + exactly 7 lines");
+        assert!(kept[0].starts_with("... (showing last 7 lines)"));
+        for l in &kept[1..] {
+            assert_eq!(*l, "0123456789abcdef");
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

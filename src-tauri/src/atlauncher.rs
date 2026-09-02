@@ -545,7 +545,18 @@ pub async fn install_atlauncher_pack(
             {
                 Ok(profile) => instance.loader_profile = Some(profile),
                 Err(e) => {
-                    tracing::warn!(target: "launcher", "Loader install failed for ATL pack: {}", e);
+                    // A broken loader install must fail the whole import — the
+                    // instance would otherwise be saved and reported as
+                    // "installed" while it cannot actually launch. Clean up the
+                    // partially created instance directory first.
+                    let _ = std::fs::remove_dir_all(&target_dir);
+                    return Err(LauncherError::ModLoader(format!(
+                        "Failed to install {} {} for pack '{}': {}",
+                        loader_display_name(&loader_type),
+                        lv,
+                        pack.name,
+                        e
+                    )));
                 }
             }
         }

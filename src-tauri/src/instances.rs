@@ -422,14 +422,30 @@ pub fn read_screenshot(instances_dir: &PathBuf, instance_name: &str, filename: &
     if buf.is_empty() {
         return Err(LauncherError::Instance(format!("Screenshot is empty: {}", path.display())));
     }
-    Ok(format!("data:image/png;base64,{}", base64_encode(&buf)))
+    // Screenshots may be PNG or JPG depending on the in-game setting; sniff the
+    // MIME from the file extension so the browser decodes the data URL correctly.
+    let mime = match Path::new(filename).extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") => "image/jpeg",
+        Some(ext) if ext.eq_ignore_ascii_case("png") => "image/png",
+        _ => "image/png",
+    };
+    Ok(format!("data:{mime};base64,{}", base64_encode(&buf)))
 }
 
 pub fn delete_screenshot(instances_dir: &PathBuf, instance_name: &str, filename: &str) -> Result<()> {
+    // The filename reaches the filesystem through the command layer; strip
+    // any path components so a crafted name cannot escape the screenshots dir.
+    let safe_filename = Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| LauncherError::Instance("Invalid screenshot filename".into()))?;
+    if safe_filename.is_empty() || safe_filename == "." || safe_filename == ".." {
+        return Err(LauncherError::Instance("Invalid screenshot filename".into()));
+    }
     let instance = get_instance(instances_dir, instance_name)?;
-    let path = instance.minecraft_dir(instances_dir).join("screenshots").join(filename);
+    let path = instance.minecraft_dir(instances_dir).join("screenshots").join(safe_filename);
     if !path.exists() {
-        return Err(LauncherError::Instance(format!("Screenshot not found: {}", filename)));
+        return Err(LauncherError::Instance(format!("Screenshot not found: {}", safe_filename)));
     }
     std::fs::remove_file(&path)?;
     Ok(())
@@ -1729,6 +1745,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn delete_screenshot_rejects_path_traversal() {
+        let dir = temp_dir("shots");
+        let instances_dir = dir.join("instances");
+        let instance = Instance {
+            name: "Test".into(),
+            mc_version: "1.20.1".into(),
+            loader: LoaderType::Vanilla,
+            loader_version: None,
+            loader_profile: None,
+            memory_mb: None,
+            jvm_args: None,
+            gc_preset: None,
+            java_path: None,
+            resolution: None,
+            icon: None,
+            banner: None,
+            created_at: Utc::now().to_rfc3339(),
+            last_played: None,
+            play_time_seconds: 0,
+            notes: String::new(),
+        };
+        save_instance(&instances_dir, &instance, None).unwrap();
+
+        let screenshots_dir = instance.minecraft_dir(&instances_dir).join("screenshots");
+        std::fs::create_dir_all(&screenshots_dir).unwrap();
+        std::fs::write(screenshots_dir.join("shot.png"), b"png").unwrap();
+        // Decoy files that must NOT be deletable by a crafted screenshot name.
+        let decoy = instance.dir(&instances_dir).join("decoy.txt");
+        std::fs::write(&decoy, b"keep").unwrap();
+        let cfg_decoy = instance.config_file(&instances_dir);
+        let cfg_ok = std::fs::read(&cfg_decoy).unwrap();
+
+        for evil in [
+            "../decoy.txt",
+            "..\\decoy.txt",
+            "C:/Windows/decoy.txt",
+            "C:\\Windows\\decoy.txt",
+            "/decoy.txt",
+            "\\decoy.txt",
+            "../instance.json",
+            "..\\instance.json",
+            "..",
+            ".",
+            "",
+        ] {
+            assert!(
+                delete_screenshot(&instances_dir, "Test", evil).is_err(),
+                "name {:?} must be rejected",
+                evil
+            );
+        }
+        assert!(decoy.exists(), "decoy must survive");
+        assert_eq!(std::fs::read(&cfg_decoy).unwrap(), cfg_ok, "instance.json must survive");
+
+        delete_screenshot(&instances_dir, "Test", "shot.png").unwrap();
+        assert!(!screenshots_dir.join("shot.png").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
