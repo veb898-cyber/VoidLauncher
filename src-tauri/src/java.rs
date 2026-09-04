@@ -17,11 +17,25 @@ pub(crate) fn run_command_with_timeout(
     cmd: &mut Command,
     timeout: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
-    use std::io::Read;
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
+
+    // Drain stdout/stderr on dedicated reader threads *while* the child runs.
+    //
+    // Reading each pipe as soon as data arrives (rather than only after the
+    // child exits) is what makes a pipe deadlock impossible: the OS pipes we
+    // hand to the child are backed by a fixed-size kernel buffer (64 KiB on
+    // Windows). A child that writes more than that — e.g. Forge's `jarsplitter`
+    // processor printing its full asset listing, or a noisy Java probe — would
+    // otherwise block forever on write() once the buffer fills, `try_wait()`
+    // would keep returning `None`, and the command would hang until killed.
+    // Reading the pipes concurrently with `try_wait()` lets the child always
+    // make progress, so it actually reaches its exit.
+    let stdout_handle = spawn_reader(child.stdout.take());
+    let stderr_handle = spawn_reader(child.stderr.take());
+
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -40,14 +54,32 @@ pub(crate) fn run_command_with_timeout(
             Err(e) => break Err(e),
         }
     }?;
-    // The process has exited; drain its piped output.
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let (Some(mut out), Some(mut err)) = (child.stdout.take(), child.stderr.take()) {
-        let _ = out.read_to_end(&mut stdout);
-        let _ = err.read_to_end(&mut stderr);
-    }
+
+    // Join the reader threads to collect whatever output was produced. A
+    // reader thread only unblocks once its pipe reaches EOF, which happens
+    // once the (already-exited) child has been reaped and all handles to the
+    // write end are dropped.
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+
     Ok(std::process::Output { status, stdout, stderr })
+}
+
+/// Spawn a background thread that reads a piped stream to EOF and returns the
+/// captured bytes. Returns a joined handle; the handle yields an empty `Vec`
+/// if the thread panicked or if `stream` was already taken.
+fn spawn_reader<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = match stream {
+            Some(s) => s,
+            None => return buf,
+        };
+        let _ = reader.read_to_end(&mut buf);
+        buf
+    })
 }
 
 /// Detected Java installation
@@ -261,4 +293,90 @@ pub fn get_recommended_java(
         .filter(|j| j.is_64bit && j.major_version >= required_major)
         .min_by_key(|j| j.major_version - required_major)
         .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+
+    /// Child-mode marker: when set, the test binary acts as a helper that
+    /// writes a large volume of output to BOTH stdout and stderr (well past
+    /// the ~64 KiB OS pipe buffer) and exits successfully. This reproduces the
+    /// scenario that would deadlock a naive "drain after exit" implementation.
+    const HELPER_ENV: &str = "VOIDLAUNCHER_RUN_CMD_HELPER";
+
+    fn helper_writes_big_output() -> bool {
+        std::env::var(HELPER_ENV).as_deref() == Ok("big-output")
+    }
+
+    #[test]
+    fn run_command_with_timeout_drains_large_stdout_and_stderr() {
+        if helper_writes_big_output() {
+            // Child mode: emit enough data on both pipes to fill and overflow
+            // the OS pipe buffer, then exit 0.
+            let chunk = vec![b'x'; 8192];
+            let mut out = std::io::stdout();
+            let mut err = std::io::stderr();
+            for _ in 0..256 {
+                let _ = out.write_all(&chunk);
+                let _ = err.write_all(&chunk);
+            }
+            let _ = out.flush();
+            let _ = err.flush();
+            return;
+        }
+
+        // Parent mode: spawn our own binary in child mode through
+        // run_command_with_timeout and assert it completes normally.
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.env(HELPER_ENV, "big-output");
+
+        let output = run_command_with_timeout(&mut cmd, Duration::from_secs(30))
+            .expect("command should complete without hanging");
+
+        assert!(output.status.success(), "helper should exit 0");
+        // The helper emits 256 chunks of 8192 bytes = 2 MiB per stream, well
+        // past the ~64 KiB OS pipe buffer. The captured output must be at
+        // least that full volume (the child also appends a bit of test-harness
+        // output), which proves the pipes were drained while the child ran
+        // instead of deadlocking and being killed.
+        let expected = 256 * 8192;
+        assert!(
+            output.stdout.len() >= expected,
+            "stdout should be fully drained (got {}, want at least {})",
+            output.stdout.len(),
+            expected
+        );
+        assert!(
+            output.stderr.len() >= expected,
+            "stderr should be fully drained (got {}, want at least {})",
+            output.stderr.len(),
+            expected
+        );
+    }
+
+    /// The timeout path must still work: a child that never exits is killed
+    /// and reported as TimedOut, not left to hang the test forever.
+    #[test]
+    fn run_command_with_timeout_kills_on_timeout() {
+        if helper_writes_big_output() {
+            // not used by this test
+            return;
+        }
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.env(HELPER_ENV, "big-output");
+        // A 30s child with a 50ms timeout must be reaped and surface TimedOut.
+        let start = std::time::Instant::now();
+        let res = run_command_with_timeout(&mut cmd, Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        let err = res.expect_err("should time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "timeout kill took too long: {:?}",
+            elapsed
+        );
+    }
 }

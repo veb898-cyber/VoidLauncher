@@ -22,7 +22,7 @@ const COMBO_TIMEOUT: Duration = Duration::from_secs(120);
 const COMBOS: &[(&str, &str)] = &[
     ("1.8.9", "Forge"),
     ("1.12.2", "Vanilla"),
-    ("1.12.2", "Fabric"),
+    ("1.14.4", "Fabric"),
     ("1.12.2", "Forge"),
     ("1.16.5", "Forge"),
     ("1.18.2", "Fabric"),

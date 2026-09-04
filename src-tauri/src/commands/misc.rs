@@ -89,61 +89,130 @@ pub fn cmd_read_image_file(path: String) -> Result<Vec<u8>, String> {
 /// redirect host must resolve to a PUBLIC address (loopback / private /
 /// link-local targets are refused). Response is capped at 10 MB.
 #[tauri::command]
-pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String> {
-    const MAX_ASSET_BYTES: usize = 10 * 1024 * 1024;
+/// Extract the host portion of a URL. Handles IPv6 literals in brackets
+/// (with or without a port), a trailing port, and userinfo (`user@host`).
+/// Returns `None` when there is no parseable host.
+///
+/// Security note: we deliberately parse independently of `url`'s URL crate
+/// semantics here so the SSRF guard can never be confused by scheme or
+/// authority edge cases that a URL parser might normalise differently.
+fn extract_host(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1)?;
+    let end = rest
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(rest.len());
+    let authority = &rest[..end];
+    // Strip userinfo if present.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
 
-    fn extract_host(url: &str) -> Option<String> {
-        let rest = url.split("://").nth(1)?;
-        let end = rest
-            .find(|c: char| c == '/' || c == '?' || c == '#' || c == '@')
-            .unwrap_or(rest.len());
-        let authority = &rest[..end];
-        // Strip userinfo if present, then port.
-        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Bracketed IPv6 literal, e.g. `[::1]` or `[2001:db8::1]:8080`.
+    if host_port.starts_with('[') {
+        let close = host_port.find(']')?;
+        let host = &host_port[1..close];
+        if host.is_empty() { None } else { Some(host.to_string()) }
+    } else {
+        // IPv4 / hostname, possibly with a port.
         let host = host_port.split(':').next()?;
-        let host = host.trim_matches(['[', ']']);
         if host.is_empty() { None } else { Some(host.to_string()) }
     }
+}
 
-    fn is_public_ip(ip: std::net::IpAddr) -> bool {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                !(v4.is_loopback() || v4.is_private() || v4.is_link_local()
-                    || v4.is_broadcast() || v4.is_multicast() || v4.is_unspecified())
-            }
-            std::net::IpAddr::V6(v6) => {
-                let seg = v6.segments();
-                let unique_local = (seg[0] & 0xfe00) == 0xfc00;
-                let link_local = (seg[0] & 0xffc0) == 0xfe80;
-                !(v6.is_loopback() || v6.is_multicast() || v6.is_unspecified()
-                    || unique_local || link_local)
-            }
+/// True when `ip` is a routable public address. Every private / loopback /
+/// link-local / unspecified / broadcast / multicast / reserved address is
+/// rejected — this is the SSRF hard-line predicate.
+///
+/// IPv4-mapped IPv6 addresses (e.g. `::ffff:127.0.0.1`) and IPv4-compatible
+/// forms (`::127.0.0.1`) are unwrapped to their embedded IPv4 and judged by
+/// IPv4 rules, so a private IPv4 smuggled through the IPv6 namespace cannot
+/// bypass the guard.
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    // Unwrap IPv4-mapped / IPv4-compatible IPv6 addresses and re-check as v4.
+    if let std::net::IpAddr::V6(v6) = ip {
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return is_public_ip(std::net::IpAddr::V4(v4));
+        }
+        // `::127.0.0.1`, `::10.0.0.1`, etc. (IPv4-compatible form, now legacy
+        // but still accepted by some stacks) — inspect the trailing 4 bytes.
+        if v6.segments()[..4].iter().all(|&s| s == 0) {
+            let octets = v6.octets();
+            let v4 = std::net::Ipv4Addr::new(octets[4], octets[5], octets[6], octets[7]);
+            return is_public_ip(std::net::IpAddr::V4(v4));
         }
     }
 
-    async fn host_is_public(url: &str) -> Result<bool, String> {
-        let host = extract_host(url).ok_or_else(|| "Invalid URL".to_string())?;
-        // IP literals are checked directly; names are resolved first so a
-        // hostname pointing at 127.0.0.1 cannot bypass the guard.
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            return Ok(is_public_ip(ip));
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                || is_v4_reserved(&v4)
+                || v4.is_broadcast() || v4.is_multicast() || v4.is_unspecified())
         }
-        tokio::task::spawn_blocking(move || {
-            use std::net::ToSocketAddrs;
-            match (host.as_str(), 443u16).to_socket_addrs() {
-                Ok(addrs) => {
-                    let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
-                    if ips.is_empty() {
-                        return Err("Host resolved to no addresses".to_string());
-                    }
-                    Ok(ips.iter().all(|ip| is_public_ip(*ip)))
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let unique_local = (seg[0] & 0xfe00) == 0xfc00;
+            let link_local = (seg[0] & 0xffc0) == 0xfe80;
+            // `v6.is_unicast_link_local()` covers fe80::/10; the 2001:db8::
+            // documentation range and the 2001::/32 Teredo range are neither
+            // routable to the public internet nor something we should fetch.
+            let documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
+            let teredo = seg[0] == 0x2001 && seg[1] == 0x0000;
+            !(v6.is_loopback() || v6.is_multicast() || v6.is_unspecified()
+                || unique_local || link_local || documentation || teredo)
+        }
+    }
+}
+
+/// Additional deprecated / documentation / globally-reserved IPv4 ranges the
+/// stdlib's `is_private`/`is_link_local` do not cover for SSRF purposes:
+///   192.0.0.0/24  (IETF protocol assignments, incl. 192.0.0.170/171)
+///   192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24  (documentation)
+///   198.18.0.0/15 (benchmarking)
+///   240.0.0.0/4   (reserved / future use)
+fn is_v4_reserved(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    match o[0] {
+        192 => {
+            (o[1] == 0 && o[2] == 0)        // 192.0.0.0/24
+                || (o[1] == 0 && o[2] == 2) // 192.0.2.0/24 documentation
+        }
+        198 => (o[1] == 18 || o[1] == 19)   // 198.18.0.0/15 benchmarking
+            || (o[1] == 51 && o[2] == 100)  // 198.51.100.0/24 documentation
+            || (o[1] == 0 && o[2] == 0),    // 198.0.0.0 reserved block (198.0.0.0/8 partly)
+        203 => o[1] == 0 && o[2] == 113,    // 203.0.113.0/24 documentation
+        240..=255 => true,                  // 240.0.0.0/4 reserved
+        _ => false,
+    }
+}
+
+/// Resolve a URL's host and decide whether it points at a purely public
+/// address. IP literals (v4 and v6) are judged directly; hostnames are
+/// resolved to all of their addresses and every one must be public (if any
+/// single address is private/local the host is refused) — this catches a
+/// hostname that resolves to 127.0.0.1 or a private NAT range.
+async fn host_is_public(url: &str) -> Result<bool, String> {
+    let host = extract_host(url).ok_or_else(|| "Invalid URL".to_string())?;
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(is_public_ip(ip));
+    }
+    tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        match (host.as_str(), 443u16).to_socket_addrs() {
+            Ok(addrs) => {
+                let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+                if ips.is_empty() {
+                    return Err("Host resolved to no addresses".to_string());
                 }
-                Err(e) => Err(e.to_string()),
+                Ok(ips.iter().all(|ip| is_public_ip(*ip)))
             }
-        })
-        .await
-        .map_err(|e| e.to_string())?
-    }
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String> {
+    const MAX_ASSET_BYTES: usize = 10 * 1024 * 1024;
 
     let url = url.trim().to_string();
     if !url.starts_with("https://") {
@@ -328,16 +397,302 @@ pub fn cmd_save_config(
     Ok(())
 }
 
+/// Resolve a path against `base` for folder-open containment. The target is
+/// canonicalized (resolving `..`, absolute/drive paths, symlinks/junctions)
+/// and must end up strictly inside `base` (or equal to it). If the target
+/// does not exist yet it is created first so it can be canonicalized.
+///
+/// Returns the canonical, contained target path.
+fn resolve_open_folder_path(base: &std::path::Path, target: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    if !target.exists() {
+        std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    }
+    let target_canon = target
+        .canonicalize()
+        .map_err(|_| "Access denied: invalid folder path".to_string())?;
+    let base_canon = base
+        .canonicalize()
+        .map_err(|_| "Access denied: data folder unavailable".to_string())?;
+    if !target_canon.starts_with(&base_canon) {
+        return Err("Access denied: folder is outside the launcher data directory".to_string());
+    }
+    Ok(target_canon)
+}
+
 /// Open a folder in the system file manager. Used by the settings page
 /// (data folder, game logs). Creates the folder if it does not exist.
+///
+/// Path containment: the requested path must live inside the launcher's
+/// `data_dir` (which already covers `data_dir` itself, `logs/game`, and any
+/// other launcher subfolder). This prevents the renderer from opening or
+/// creating arbitrary system directories.
 #[tauri::command]
-pub fn cmd_open_folder(app: AppHandle, path: String) -> Result<(), String> {
-    let target = std::path::PathBuf::from(&path);
-    if !target.exists() {
-        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-    }
+pub fn cmd_open_folder(state: State<'_, AppState>, app: AppHandle, path: String) -> Result<(), String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let data_dir = config.data_dir.clone();
+    drop(config);
+
+    let target_canon = resolve_open_folder_path(&data_dir, std::path::Path::new(&path))?;
+
     use tauri_plugin_opener::OpenerExt;
     app.opener()
-        .open_path(target.to_string_lossy().to_string(), None::<&str>)
+        .open_path(target_canon.to_string_lossy().to_string(), None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod open_folder_tests {
+    use super::resolve_open_folder_path;
+
+    #[test]
+    fn allows_child_of_base() {
+        let tmp = std::env::temp_dir().join(format!(
+            "void-open-test-{}",
+            std::process::id()
+        ));
+        let base = tmp.join("data");
+        let child = base.join("logs").join("game");
+        std::fs::create_dir_all(&child).unwrap();
+        let got = resolve_open_folder_path(&base, &child).unwrap();
+        assert!(got.starts_with(&base.canonicalize().unwrap()));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn allows_base_itself() {
+        let tmp = std::env::temp_dir().join(format!(
+            "void-open-test-base-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let got = resolve_open_folder_path(&tmp, &tmp).unwrap();
+        assert_eq!(got, tmp.canonicalize().unwrap());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn rejects_path_outside_base() {
+        let tmp = std::env::temp_dir().join(format!(
+            "void-open-test-out-{}",
+            std::process::id()
+        ));
+        let base = tmp.join("data");
+        let outside = tmp.join("other");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(resolve_open_folder_path(&base, &outside).is_err());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn rejects_traversal_attempt() {
+        let tmp = std::env::temp_dir().join(format!(
+            "void-open-test-trav-{}",
+            std::process::id()
+        ));
+        let base = tmp.join("data").join("sub");
+        std::fs::create_dir_all(&base).unwrap();
+        let escape = base.join("..").join("..").join("other");
+        std::fs::create_dir_all(&escape).unwrap();
+        assert!(resolve_open_folder_path(&base, &escape).is_err());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn creates_missing_folder_and_contains_it() {
+        let tmp = std::env::temp_dir().join(format!(
+            "void-open-test-create-{}",
+            std::process::id()
+        ));
+        let base = tmp.join("data");
+        let missing = base.join("logs").join("game");
+        let got = resolve_open_folder_path(&base, &missing).unwrap();
+        assert!(got.is_dir());
+        assert!(got.starts_with(&base.canonicalize().unwrap()));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::extract_host;
+    use super::is_public_ip;
+    use std::net::IpAddr;
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d))
+    }
+    fn v6(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    // ==================== host extraction ====================
+
+    #[test]
+    fn extract_host_plain_hostname() {
+        assert_eq!(extract_host("https://cdn.example.com/img.png"), Some("cdn.example.com".into()));
+    }
+
+    #[test]
+    fn extract_host_with_port() {
+        assert_eq!(extract_host("https://cdn.example.com:8443/img.png"), Some("cdn.example.com".into()));
+    }
+
+    #[test]
+    fn extract_host_ipv4() {
+        assert_eq!(extract_host("https://127.0.0.1/x"), Some("127.0.0.1".into()));
+        assert_eq!(extract_host("https://192.168.1.5:80/x"), Some("192.168.1.5".into()));
+    }
+
+    #[test]
+    fn extract_host_ipv6_literal() {
+        assert_eq!(extract_host("https://[::1]/x"), Some("::1".into()));
+        assert_eq!(extract_host("https://[2001:db8::1]/x"), Some("2001:db8::1".into()));
+    }
+
+    #[test]
+    fn extract_host_ipv6_literal_with_port() {
+        assert_eq!(extract_host("https://[::1]:8080/x"), Some("::1".into()));
+        assert_eq!(extract_host("https://[fe80::1]:8443/x"), Some("fe80::1".into()));
+    }
+
+    #[test]
+    fn extract_host_strips_userinfo() {
+        assert_eq!(extract_host("https://user@example.com/x"), Some("example.com".into()));
+        assert_eq!(extract_host("https://a:b@127.0.0.1/x"), Some("127.0.0.1".into()));
+    }
+
+    #[test]
+    fn extract_host_missing_or_malformed() {
+        assert_eq!(extract_host("https:///x"), None);
+        assert_eq!(extract_host("not-a-url"), None);
+        assert_eq!(extract_host("https://[::1"), None); // unterminated bracket
+    }
+
+    // ==================== IPv4 addresses ====================
+
+    #[test]
+    fn public_ipv4_is_public() {
+        assert!(is_public_ip(v4(8, 8, 8, 8)));
+        assert!(is_public_ip(v4(93, 184, 216, 34)));
+        assert!(is_public_ip(v4(1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn ipv4_loopback_is_private() {
+        assert!(!is_public_ip(v4(127, 0, 0, 1)));
+        assert!(!is_public_ip(v4(127, 255, 255, 254)));
+        assert!(!is_public_ip(v4(127, 1, 2, 3)));
+    }
+
+    #[test]
+    fn private_ipv4_ranges_are_private() {
+        // 10/8, 172.16/12, 192.168/16
+        assert!(!is_public_ip(v4(10, 0, 0, 1)));
+        assert!(!is_public_ip(v4(10, 255, 255, 255)));
+        assert!(!is_public_ip(v4(172, 16, 0, 1)));
+        assert!(!is_public_ip(v4(172, 31, 255, 255)));
+        // 172.32.0.0 is OUTSIDE RFC1918's 172.16/12 range (that covers only
+        // 172.16.0.0-172.31.255.255), so it is not private — must stay public.
+        assert!(is_public_ip(v4(172, 32, 0, 1)));
+        assert!(!is_public_ip(v4(192, 168, 0, 1)));
+        assert!(!is_public_ip(v4(192, 168, 255, 255)));
+    }
+
+    #[test]
+    fn link_local_ipv4_is_private() {
+        assert!(!is_public_ip(v4(169, 254, 0, 1)));
+        assert!(!is_public_ip(v4(169, 254, 169, 254)));
+    }
+
+    #[test]
+    fn unspecified_broadcast_multicast_are_private() {
+        assert!(!is_public_ip(v4(0, 0, 0, 0)));
+        assert!(!is_public_ip(v4(255, 255, 255, 255)));
+        assert!(!is_public_ip(v4(224, 0, 0, 1)));
+    }
+
+    #[test]
+    fn reserved_ipv4_ranges_are_private() {
+        // Documentation 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        assert!(!is_public_ip(v4(192, 0, 2, 1)));
+        assert!(!is_public_ip(v4(198, 51, 100, 5)));
+        assert!(!is_public_ip(v4(203, 0, 113, 7)));
+        // Benchmarking 198.18.0.0/15
+        assert!(!is_public_ip(v4(198, 18, 0, 1)));
+        assert!(!is_public_ip(v4(198, 19, 255, 255)));
+        // 240.0.0.0/4 reserved
+        assert!(!is_public_ip(v4(240, 0, 0, 1)));
+        assert!(!is_public_ip(v4(250, 0, 0, 1)));
+    }
+
+    // ==================== IPv6 addresses ====================
+
+    #[test]
+    fn ipv6_loopback_is_private() {
+        assert!(!is_public_ip(v6("::1")));
+    }
+
+    #[test]
+    fn ipv6_unique_local_is_private() {
+        assert!(!is_public_ip(v6("fc00::1")));
+        assert!(!is_public_ip(v6("fd12:3456:789a::1")));
+    }
+
+    #[test]
+    fn ipv6_link_local_is_private() {
+        assert!(!is_public_ip(v6("fe80::1")));
+        assert!(!is_public_ip(v6("fe80::a:b:c:d")));
+    }
+
+    #[test]
+    fn ipv6_unspecified_multicast_are_private() {
+        assert!(!is_public_ip(v6("::")));
+        assert!(!is_public_ip(v6("ff02::1")));
+    }
+
+    #[test]
+    fn ipv6_documentation_and_teredo_are_private() {
+        assert!(!is_public_ip(v6("2001:db8::1")));
+        // Teredo 2001::/32 relays reachable private addresses
+        assert!(!is_public_ip(v6("2001:0000:4136:e378:8000:63bf:3fff:fdd2")));
+    }
+
+    #[test]
+    fn public_ipv6_is_public() {
+        assert!(is_public_ip(v6("2606:4700:4700::64")));       // Cloudflare
+        assert!(is_public_ip(v6("2a00:1450:4001:812::200e"))); // Google
+        assert!(is_public_ip(v6("2001:4860:4860::8888")));
+    }
+
+    // ==================== IPv4-mapped / IPv4-compatible IPv6 ====================
+
+    #[test]
+    fn ipv4_mapped_loopback_is_private() {
+        assert!(!is_public_ip(v6("::ffff:127.0.0.1")));
+        assert!(!is_public_ip(v6("::ffff:7f00:0001")));
+    }
+
+    #[test]
+    fn ipv4_mapped_private_is_private() {
+        assert!(!is_public_ip(v6("::ffff:192.168.1.1")));
+        assert!(!is_public_ip(v6("::ffff:c0a8:0101")));
+        assert!(!is_public_ip(v6("::ffff:10.0.0.1")));
+        assert!(!is_public_ip(v6("::ffff:0a00:0001")));
+    }
+
+    #[test]
+    fn ipv4_mapped_public_is_public() {
+        assert!(is_public_ip(v6("::ffff:8.8.8.8")));
+        assert!(is_public_ip(v6("::ffff:0808:0808")));
+    }
+
+    #[test]
+    fn ipv4_compatible_loopback_is_private() {
+        // Legacy ::a.b.c.d form — no v4-mapped prefix, but the embedded
+        // IPv4 is a loopback / private address.
+        assert!(!is_public_ip(v6("::127.0.0.1")));
+        assert!(!is_public_ip(v6("::192.168.0.1")));
+        assert!(!is_public_ip(v6("::ffff:0:127.0.0.1")));
+    }
 }

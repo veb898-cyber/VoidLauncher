@@ -1144,13 +1144,15 @@ pub fn cmd_open_instance_logs_folder(
     instance_name: String,
 ) -> Result<(), String> {
     crate::commands::instances::validate_instance_name(&instance_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let logs_dir = config
-        .instances_dir()
-        .join(&instance_name)
-        .join(".minecraft")
-        .join("logs");
-    crate::commands::misc::cmd_open_folder(app, logs_dir.to_string_lossy().to_string())
+    let logs_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config
+            .instances_dir()
+            .join(&instance_name)
+            .join(".minecraft")
+            .join("logs")
+    };
+    crate::commands::misc::cmd_open_folder(state, app, logs_dir.to_string_lossy().to_string())
 }
 /// Open the root game-logs folder (`%DATA_DIR%/logs/game`) in the file
 /// manager. Used by the Game Logs page, which is no longer tied to a
@@ -1162,7 +1164,7 @@ pub fn cmd_open_game_logs_root(app: tauri::AppHandle, state: State<'_, AppState>
         config.data_dir.join("logs").join("game")
     };
     let _ = std::fs::create_dir_all(&dir);
-    crate::commands::misc::cmd_open_folder(app, dir.to_string_lossy().to_string())
+    crate::commands::misc::cmd_open_folder(state, app, dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]

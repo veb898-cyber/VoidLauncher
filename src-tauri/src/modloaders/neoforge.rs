@@ -6,6 +6,30 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
+/// Maven group path + version used in the artifact URL for a given NeoForge
+/// `neo_version` (bare, e.g. `47.1.106` or `21.4.157`) for a Minecraft version.
+///
+/// NeoForge 1.20.1 (the 47.x generation) is a fork of Forge and lives under
+/// the `net.neoforged:forge` coordinate *with* the Minecraft version prefixed
+/// to the artifact version (maven path `net/neoforged/forge/{mc}-{loader}/...`,
+/// artifact `forge-{mc}-{loader}.jar`). Every newer NeoForge (1.20.2+,
+/// renumbered to 20.x) uses its own `net.neoforged:neoforge` coordinate with
+/// the bare loader version (maven path `net/neoforged/neoforge/{loader}/...`,
+/// artifact `neoforge-{loader}.jar`). Verifying against
+/// `maven.neoforged.net`: only the 1.20.1 line exists under `neoforged/forge`,
+/// everything else is under `neoforged/neoforge`.
+///
+/// Returns `(group_path, maven_version)` — e.g. `("net/neoforged/forge",
+/// "1.20.1-47.1.106")` for 1.20.1, or `("net/neoforged/neoforge", "21.4.157")`
+/// for modern NeoForge.
+fn neoforge_maven(mc_version: &str, neo_version: &str) -> (String, String) {
+    if mc_version == "1.20.1" {
+        (format!("net/neoforged/forge"), format!("{}-{}", mc_version, neo_version))
+    } else {
+        (format!("net/neoforged/neoforge"), neo_version.to_string())
+    }
+}
+
 /// NeoForge install profile (same structure as Minecraft version JSON)
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -94,13 +118,15 @@ pub async fn get_loader_versions(
 ///
 /// We first try the legacy standalone JSON (works for older NeoForge),
 /// then fall back to extracting from the installer JAR.
-pub async fn get_profile(_mc_version: &str, neo_version: &str) -> Result<LoaderProfile> {
+pub async fn get_profile(mc_version: &str, neo_version: &str) -> Result<LoaderProfile> {
     let client = crate::download::global_http_client();
+
+    let (group_path, maven_version) = neoforge_maven(mc_version, neo_version);
 
     // Try legacy standalone JSON first
     let profile_url = format!(
-        "https://maven.neoforged.net/releases/net/neoforged/neoforge/{}/neoforge-{}.json",
-        neo_version, neo_version
+        "https://maven.neoforged.net/releases/{}/{}/{}-{}.json",
+        group_path, maven_version, group_path.rsplit('/').next().unwrap_or("neoforge"), maven_version
     );
 
     if let Ok(resp) = crate::download::send_with_fallback(client.get(&profile_url)).await {
@@ -114,7 +140,7 @@ pub async fn get_profile(_mc_version: &str, neo_version: &str) -> Result<LoaderP
     }
 
     // Fallback: download installer JAR and extract install_profile.json
-    let (profile, _installer_path) = download_installer(neo_version).await?;
+    let (profile, _installer_path) = download_installer(mc_version, neo_version).await?;
 
     build_profile(profile)
 }
@@ -125,16 +151,19 @@ pub async fn get_profile(_mc_version: &str, neo_version: &str) -> Result<LoaderP
 /// The installer path is NOT deleted here: the processor pipeline in
 /// `install` needs the JAR (it carries `data/client.lzma` and the
 /// `install_profile.json` processor list).
-async fn download_installer(neo_version: &str) -> Result<(NeoForgeInstallProfile, PathBuf)> {
+async fn download_installer(mc_version: &str, neo_version: &str) -> Result<(NeoForgeInstallProfile, PathBuf)> {
+    let (group_path, maven_version) = neoforge_maven(mc_version, neo_version);
+    let artifact = group_path.rsplit('/').next().unwrap_or("neoforge");
     let installer_url = format!(
-        "https://maven.neoforged.net/releases/net/neoforged/neoforge/{}/neoforge-{}-installer.jar",
-        neo_version, neo_version
+        "https://maven.neoforged.net/releases/{}/{}/{}-{}-installer.jar",
+        group_path, maven_version, artifact, maven_version
     );
 
     tracing::info!(target: "launcher", "Fetching NeoForge installer JAR: {}", installer_url);
 
     // Use download_file with retries for reliable download
-    let installer_path = std::env::temp_dir().join(format!("neoforge-{}-installer.jar", neo_version));
+    let installer_path = std::env::temp_dir()
+        .join(format!("neoforge-{}--{}-installer.jar", mc_version, neo_version));
     let mut last_err = String::new();
     for attempt in 1..=3u32 {
         match crate::download::download_file(&installer_url, &installer_path, "").await {
@@ -275,7 +304,7 @@ pub async fn install(
     tracing::info!(target: "launcher", "Installing NeoForge for MC {} (loader {})", mc_version, loader_version);
 
     // Download installer (kept on disk for the processor pipeline below)
-    let (raw_profile, installer_path) = download_installer(loader_version).await?;
+    let (raw_profile, installer_path) = download_installer(mc_version, loader_version).await?;
     let profile = build_profile(raw_profile)?;
 
     // The installer also carries install_profile.json with the full
@@ -349,12 +378,20 @@ pub async fn install(
 
     // --- Step 3: run the processor pipeline to generate the client JAR ---
     if has_processors {
-        let data_base = "net/neoforged/neoforge";
-        // PATCHED = [net.neoforged:neoforge:{version}:client] — the client JAR
-        // lives in the plain loader-version dir (21.4.153, NOT 1.21.4-21.4.153
-        // as Forge does).
-        let client_path = libraries_dir.join("net").join("neoforged").join("neoforge")
-            .join(loader_version).join(format!("neoforge-{}-client.jar", loader_version));
+        // The loader's maven directory inside libraries_dir. For NeoForge
+        // 1.20.1 this is the `net.neoforged:forge` fork ("net/neoforged/forge/<mc-loader>"),
+        // for modern NeoForge it is "net/neoforged/neoforge/<loader>". The
+        // PATCHED client coordinate in install_profile.json references exactly
+        // this path, so it must match for the post-pipeline existence check.
+        let (group_path, maven_version) = neoforge_maven(mc_version, loader_version);
+        let data_base = group_path.clone();
+        let artifact = group_path.rsplit('/').next().unwrap_or("neoforge");
+        // PATCHED = [net.neoforged:{forge|neoforge}:{version}:client] — the
+        // client JAR the processors produce (plain loader-version dir for
+        // modern NeoForge, e.g. 21.4.153, NOT 1.21.4-21.4.153 as Forge does;
+        // for 1.20.1 it is the MC-prefixed gradle-style forge coordinate).
+        let client_path = libraries_dir.join(&group_path)
+            .join(&maven_version).join(format!("{}-{}-client.jar", artifact, maven_version));
 
         if !client_path.exists() {
             tracing::info!(target: "launcher", "NeoForge client JAR missing, running installer processors...");
@@ -371,7 +408,7 @@ pub async fn install(
                     if client_val.starts_with('/') {
                         let jar_path = client_val.trim_start_matches('/');
                         let fname = Path::new(jar_path).file_name().and_then(|n| n.to_str()).unwrap_or("data");
-                        let dest = libraries_dir.join(data_base)
+                        let dest = libraries_dir.join(&data_base)
                             .join("_data").join(&key.to_lowercase()).join(fname);
                         if !dest.exists() {
                             if let Some(parent) = dest.parent() {
@@ -472,4 +509,44 @@ pub async fn install(
 
     tracing::info!(target: "launcher", "NeoForge install completed for MC {}", mc_version);
     Ok(profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::neoforge_maven;
+
+    /// NeoForge 1.20.1 (the `net.neoforged:forge` fork) must use the MC-prefixed
+    /// gradle-style version under the forge group.
+    #[test]
+    fn neoforge_maven_uses_forge_fork_for_1_20_1() {
+        let (group, version) = neoforge_maven("1.20.1", "47.1.106");
+        assert_eq!(group, "net/neoforged/forge");
+        assert_eq!(version, "1.20.1-47.1.106");
+    }
+
+    /// Modern NeoForge (renumbered, e.g. 1.20.2+ / 20.x line) uses its own
+    /// `neoforge` group with the bare loader version.
+    #[test]
+    fn neoforge_maven_uses_neoforge_group_for_modern_versions() {
+        let (group, version) = neoforge_maven("1.20.4", "20.4.251");
+        assert_eq!(group, "net/neoforged/neoforge");
+        assert_eq!(version, "20.4.251");
+    }
+
+    /// 1.21.4 (the currently targeted modern release) also uses the bare version.
+    #[test]
+    fn neoforge_maven_uses_neoforge_group_for_1_21_4() {
+        let (group, version) = neoforge_maven("1.21.4", "21.4.157");
+        assert_eq!(group, "net/neoforged/neoforge");
+        assert_eq!(version, "21.4.157");
+    }
+
+    /// Other old-generation forks around 1.20.1 (e.g. 1.18/1.19 Forge-compat)
+    /// are not part of NeoForge — only 1.20.1 gates on the forge fork.
+    #[test]
+    fn neoforge_maven_1_20_2_uses_neoforge_group() {
+        let (group, version) = neoforge_maven("1.20.2", "20.2.93");
+        assert_eq!(group, "net/neoforged/neoforge");
+        assert_eq!(version, "20.2.93");
+    }
 }

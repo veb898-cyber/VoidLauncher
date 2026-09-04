@@ -611,6 +611,17 @@ fn get_java_path(
     // Priority: instance java > config java > auto-detect (system + managed)
     if let Some(path) = &instance.java_path {
         if path.exists() {
+            // A user-supplied path must actually be a runnable Java — never
+            // let a non-Java executable be launched. `detect_java_major` runs
+            // `java -version` once, which is exactly the on-launch check we
+            // want; the result is not cached unnecessarily because launch is
+            // a one-shot, per-instance operation.
+            if crate::jvm::detect_java_major(path).is_none() {
+                return Err(LauncherError::Java(format!(
+                    "The configured Java path does not appear to be a runnable Java: {:?}",
+                    path
+                )));
+            }
             tracing::info!(target: "launcher", "Using instance Java: {:?}", path);
             return Ok(path.clone());
         }
@@ -619,6 +630,12 @@ fn get_java_path(
 
     if let Some(path) = &config.java_path {
         if path.exists() {
+            if crate::jvm::detect_java_major(path).is_none() {
+                return Err(LauncherError::Java(format!(
+                    "The configured Java path does not appear to be a runnable Java: {:?}",
+                    path
+                )));
+            }
             tracing::info!(target: "launcher", "Using config Java: {:?}", path);
             return Ok(path.clone());
         }
