@@ -44,7 +44,11 @@ pnpm run tauri build
 
 ## License
 
-All rights reserved. Contact the author before use or redistribution.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+VoidLauncher is released under the [MIT License](LICENSE). You are free to use,
+modify, and redistribute it for any purpose, including commercial use, provided
+you retain the copyright and permission notice.
 
 ## Author
 
