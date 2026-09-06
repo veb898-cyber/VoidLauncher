@@ -87,7 +87,7 @@ pub struct ModrinthVersionResponse {
 
 async fn api_get<T: serde::de::DeserializeOwned>(url: &str) -> Result<T> {
     crate::download::ensure_proxy_resolved().await;
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let response = crate::download::get_with_retry(
         client
             .get(url)
@@ -212,7 +212,7 @@ pub async fn check_version_updates(
     loaders: Option<Vec<String>>,
     game_versions: Option<Vec<String>>,
 ) -> Result<std::collections::HashMap<String, Option<ModrinthVersion>>> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let body = VersionFilesUpdateRequest {
         hashes,
         algorithm: algorithm.to_string(),

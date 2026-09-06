@@ -12,6 +12,3 @@ pub mod misc;
 pub mod modpacks;
 pub mod mods;
 pub mod versions;
-// pub mod misc;
-// pub mod mods;
-// pub mod versions;

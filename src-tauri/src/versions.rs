@@ -159,7 +159,7 @@ pub struct AssetObject {
 /// since Mojang periodically throttles this endpoint with HTTP 429).
 pub async fn fetch_version_manifest() -> Result<VersionManifest> {
     tracing::info!(target: "launcher", "Fetching version manifest from Mojang");
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let manifest = crate::download::get_with_retry(
         client
             .get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
@@ -185,7 +185,7 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest> {
 /// Fetch detailed version info
 pub async fn fetch_version_info(url: &str) -> Result<VersionInfo> {
     tracing::info!(target: "launcher", "Fetching version info from {}", url);
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let info = crate::download::get_with_retry(
         client.get(url).timeout(std::time::Duration::from_secs(20)),
         "Mojang",
@@ -209,7 +209,7 @@ pub async fn fetch_version_info(url: &str) -> Result<VersionInfo> {
 /// Fetch asset index
 pub async fn fetch_asset_index(url: &str) -> Result<AssetIndexData> {
     tracing::info!(target: "launcher", "Fetching asset index from {}", url);
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let index = crate::download::get_with_retry(
         client.get(url).timeout(std::time::Duration::from_secs(20)),
         "Mojang",

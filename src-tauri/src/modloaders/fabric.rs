@@ -77,7 +77,7 @@ pub async fn supported_versions() -> Result<Vec<String>> {
             }
         }
     }
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let versions: Vec<FabricGameVersion> = crate::download::send_with_fallback(
         client.get("https://meta.fabricmc.net/v2/versions/game"),
     )
@@ -147,7 +147,7 @@ pub async fn get_loader_versions(offset: usize, limit: usize) -> Result<LoaderVe
     }
 
     // Fetch from Fabric official API
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let versions: Vec<FabricLoaderVersion> =
         crate::download::send_with_fallback(
             client.get("https://meta.fabricmc.net/v2/versions/loader"),
@@ -188,7 +188,7 @@ pub async fn get_loader_versions(offset: usize, limit: usize) -> Result<LoaderVe
 /// Fetch game versions supported by Fabric
 #[allow(dead_code)]
 pub async fn get_game_versions() -> Result<Vec<String>> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let versions: Vec<FabricGameVersion> = crate::download::send_with_fallback(
         client.get("https://meta.fabricmc.net/v2/versions/game"),
     )
@@ -207,7 +207,7 @@ pub async fn get_profile(mc_version: &str, loader_version: &str) -> Result<Loade
             mc_version
         )));
     }
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let url = format!(
         "https://meta.fabricmc.net/v2/versions/loader/{}/{}/profile/json",
         mc_version, loader_version

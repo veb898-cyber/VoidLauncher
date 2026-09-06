@@ -229,7 +229,7 @@ pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String>
         }
     }
 
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client().map_err(|e| e.to_string())?;
     let resp = crate::download::send_with_fallback(client.get(&url))
         .await
         .map_err(|e| e.to_string())?;
@@ -289,7 +289,7 @@ pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String>
 pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
     const LATEST_JSON_URL: &str =
         "https://raw.githubusercontent.com/veb898-cyber/VoidLauncher/main/latest.json";
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client().map_err(|e| e.to_string())?;
     let resp = crate::download::send_with_fallback(
         client.get(LATEST_JSON_URL).timeout(std::time::Duration::from_secs(15)),
     )

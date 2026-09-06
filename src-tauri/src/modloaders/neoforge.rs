@@ -119,7 +119,7 @@ pub async fn get_loader_versions(
 /// We first try the legacy standalone JSON (works for older NeoForge),
 /// then fall back to extracting from the installer JAR.
 pub async fn get_profile(mc_version: &str, neo_version: &str) -> Result<LoaderProfile> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
 
     let (group_path, maven_version) = neoforge_maven(mc_version, neo_version);
 

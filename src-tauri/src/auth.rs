@@ -50,7 +50,7 @@ pub struct AuthState {
 /// This flow is simpler and doesn't require a redirect server
 pub async fn start_device_code_flow(client_id: &str) -> Result<serde_json::Value> {
     tracing::info!(target: "launcher", "Starting device code flow");
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let resp = crate::download::send_with_fallback(
         client
             .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
@@ -79,7 +79,7 @@ pub async fn poll_device_code(
     client_id: &str,
     device_code: &str,
 ) -> Result<MicrosoftToken> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let resp = crate::download::send_with_fallback(
         client
             .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
@@ -129,7 +129,7 @@ pub async fn refresh_microsoft_token(
     refresh_token: &str,
 ) -> Result<MicrosoftToken> {
     tracing::info!(target: "launcher", "Refreshing Microsoft token");
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let resp = crate::download::send_with_fallback(
         client
             .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
@@ -171,7 +171,7 @@ pub async fn refresh_microsoft_token(
 
 /// Exchange Microsoft token for Xbox Live token
 pub async fn get_xbox_token(ms_token: &str) -> Result<XboxToken> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let body = serde_json::json!({
         "Properties": {
             "AuthMethod": "RPS",
@@ -214,7 +214,7 @@ pub async fn get_xbox_token(ms_token: &str) -> Result<XboxToken> {
 
 /// Exchange Xbox Live token for XSTS token
 pub async fn get_xsts_token(xbox_token: &str) -> Result<XboxToken> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let body = serde_json::json!({
         "Properties": {
             "SandboxId": "RETAIL",
@@ -269,7 +269,7 @@ pub async fn get_xsts_token(xbox_token: &str) -> Result<XboxToken> {
 
 /// Exchange XSTS token for Minecraft token
 pub async fn get_minecraft_token(xsts_token: &str, user_hash: &str) -> Result<MinecraftToken> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let body = serde_json::json!({
         "xtoken": format!("XBL3.0 x={};{}", user_hash, xsts_token),
         "platform": "PC_LAUNCHER"
@@ -303,7 +303,7 @@ pub async fn get_minecraft_token(xsts_token: &str, user_hash: &str) -> Result<Mi
 
 /// Verify game ownership
 pub async fn check_ownership(mc_token: &str) -> Result<bool> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let resp = crate::download::send_with_fallback(
         client
             .get("https://api.minecraftservices.com/entitlements/license")
@@ -319,7 +319,7 @@ pub async fn check_ownership(mc_token: &str) -> Result<bool> {
 
 /// Get Minecraft profile (username + UUID)
 pub async fn get_profile(mc_token: &str) -> Result<MinecraftProfile> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let resp = crate::download::send_with_fallback(
         client
             .get("https://api.minecraftservices.com/minecraft/profile")
@@ -452,7 +452,7 @@ pub fn load_auth_state(path: &std::path::Path) -> Option<AuthState> {
 /// Ely.by authentication
 pub async fn elyby_login(username: &str, password: &str) -> Result<(String, String, String)> {
     tracing::info!(target: "launcher", "Starting Ely.by login");
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let body = serde_json::json!({
         "username": username,
         "password": password,
@@ -509,7 +509,7 @@ pub async fn elyby_login(username: &str, password: &str) -> Result<(String, Stri
 
 /// Change skin for Microsoft account
 pub async fn change_microsoft_skin(mc_token: &str, skin_path: &std::path::Path, variant: &str) -> Result<()> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let skin_data = std::fs::read(skin_path)?;
 
     let boundary = "----VoidLauncherSkinBoundary";

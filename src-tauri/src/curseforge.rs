@@ -165,7 +165,7 @@ pub fn loader_type_id(loader: &str) -> Option<u32> {
 
 async fn api_get<T: serde::de::DeserializeOwned>(url: &str, api_key: &str) -> Result<T> {
     crate::download::ensure_proxy_resolved().await;
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let response = crate::download::get_with_retry(
         client
             .get(url)
@@ -201,7 +201,7 @@ async fn api_get_once<T: serde::de::DeserializeOwned>(
     api_key: &str,
     timeout_secs: u64,
 ) -> Result<T> {
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let response = crate::download::send_with_fallback(
         client
             .get(url)

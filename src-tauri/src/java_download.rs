@@ -62,7 +62,7 @@ const MANAGED_JAVA_DIR: &str = "java";
 /// HTTP client without auto-decompression — prevents "error decoding response body"
 /// when the server sends brotli/deflate despite us not requesting it.
 /// Rebuilt automatically when the proxy setting changes.
-fn download_client() -> reqwest::Client {
+fn download_client() -> reqwest::Result<reqwest::Client> {
     static CLIENT: OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>> = OnceLock::new();
     let proxy = crate::download::resolved_proxy_url(crate::download::active_proxy_raw());
     let mut slot = CLIENT
@@ -90,14 +90,10 @@ fn download_client() -> reqwest::Client {
                 builder = builder.no_proxy();
             }
         }
-        *slot = Some((
-            proxy,
-            builder
-                .build()
-                .expect("Failed to create Java download client (check TLS libraries)"),
-        ));
+        let client = builder.build()?;
+        *slot = Some((proxy, client));
     }
-    slot.as_ref().unwrap().1.clone()
+    Ok(slot.as_ref().unwrap().1.clone())
 }
 
 /// Adoptium /info/available_releases response (subset of fields)
@@ -143,7 +139,7 @@ pub async fn list_available_java_versions() -> Result<Vec<AvailableJavaVersion>>
     // Resolve proxy scheme before the first Adoptium API call (see download_java_runtime).
     crate::download::ensure_proxy_resolved().await;
 
-    let client = download_client();
+    let client = download_client()?;
 
     let supported: Vec<u32> = {
         let url = format!("{}/info/available_releases", ADOPTIUM_API);
@@ -251,7 +247,7 @@ pub async fn download_java_runtime(
     // never responds, causing a multi-minute hang before the timeout fires.
     crate::download::ensure_proxy_resolved().await;
 
-    let client = download_client();
+    let client = download_client()?;
 
     // Phase 1: Resolve download URL. The /assets endpoint is sometimes
     // throttled ~30-40s on certain networks, so retry a few times.

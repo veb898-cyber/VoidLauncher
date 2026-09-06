@@ -156,7 +156,7 @@ async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
             return Ok(cached);
         }
     }
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let url = format!("{}/{}/index.json", META_BASE, uid);
     // send_with_fallback retries through a real proxy-free client when the
     // configured proxy can't reach this host (VPN proxies often whitelist

@@ -396,19 +396,6 @@ export const en = {
   'manager.compat_maybe':              'This mod may not support Minecraft {version}',
   'manager.compat_no':                 'This mod is not compatible with {target}',
 
-  // ── Pack Browser ────────────────────────────────────────────
-  'pack.browse_heading':               'Browse {label}',
-  'pack.empty_results':                'No packs found',
-  'pack.download_count':               '{n} downloads',
-  'pack.versions_label':               'Versions',
-  'pack.versions_available':           '{n} available',
-  'pack.no_file':                      'No file available',
-  'pack.installed_toast':              'Installed {title} {version}',
-  'pack.install_error':                'Failed to install: {error}',
-  'pack.search_error':                 'Search failed: {error}',
-  'pack.detail_error':                 'Failed to load details: {error}',
-  'pack.status_installed':             'Installed',
-
   // ── Packs Manager ───────────────────────────────────────────
   'packs.installed_count':             '{n} installed',
   'packs.empty_helper':                'Click "Download" to browse or "Open Folder" to add manually.',
@@ -455,19 +442,6 @@ export const en = {
   'worlds.game_adventure':             'Adventure',
   'worlds.game_hardcore':              'Hardcore',
   'worlds.game_unknown':               'Unknown',
-
-  // ── Mod Browser ─────────────────────────────────────────────
-  'mod.source_modrinth':               'Modrinth',
-  'mod.source_curseforge':             'CurseForge',
-  'mod.empty_results':                 'No mods found',
-  'mod.already_added':                 'Already added',
-  'mod.no_compatible_version':         'No compatible version found',
-  'mod.added_toast':                   'Added: {name}',
-  'mod.add_error':                     'Failed to add mod: {error}',
-  'mod.load_error':                    'Failed to load mods: {error}',
-  'mod.search_error':                  'Search failed: {error}',
-  'mod.detail_error':                  'Failed to load mod details: {error}',
-  'mod.added_dep_toast':               'Added dependency: {name}',
 
   // ── Login ───────────────────────────────────────────────────
   'login.title':                       'Sign In',

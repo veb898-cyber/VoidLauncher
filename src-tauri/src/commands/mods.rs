@@ -1383,7 +1383,7 @@ async fn fetch_curseforge_mod_icon(
     };
 
     const MAX_LOGO_BYTES: u64 = 3 * 1024 * 1024;
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let bytes = match fetch_remote_image_capped(&client, thumbnail_url.as_str(), MAX_LOGO_BYTES).await {
         Some(b) if !b.is_empty() => b,
         _ => return Ok(None),
@@ -1402,7 +1402,10 @@ async fn fetch_curseforge_mod_icon(
 /// Download an image from a URL and return as base64 data URL.
 async fn fetch_remote_icon(url: &str) -> Option<String> {
     const MAX_ICON_BYTES: u64 = 3 * 1024 * 1024;
-    let client = crate::download::global_http_client();
+    let client = match crate::download::global_http_client() {
+        Ok(client) => client,
+        Err(_) => return None,
+    };
     let bytes = fetch_remote_image_capped(&client, url, MAX_ICON_BYTES).await?;
     if bytes.is_empty() { return None; }
     let b64 = base64_encode(&bytes);

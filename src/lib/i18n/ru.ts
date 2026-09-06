@@ -400,19 +400,6 @@ export const ru: Record<string, string> = {
   'manager.compat_maybe':              'Этот мод может не поддерживать Minecraft {version}',
   'manager.compat_no':                 'Этот мод несовместим с {target}',
 
-  // ── Pack Browser ────────────────────────────────────────────
-  'pack.browse_heading':               'Обзор: {label}',
-  'pack.empty_results':                'Паки не найдены',
-  'pack.download_count':               '{n} скачиваний',
-  'pack.versions_label':               'Версии',
-  'pack.versions_available':           '{n} доступно',
-  'pack.no_file':                      'Нет файла',
-  'pack.installed_toast':              'Установлен {title} {version}',
-  'pack.install_error':                'Не удалось установить: {error}',
-  'pack.search_error':                 'Ошибка поиска: {error}',
-  'pack.detail_error':                 'Не удалось загрузить информацию: {error}',
-  'pack.status_installed':             'Установлено',
-
   // ── Packs Manager ───────────────────────────────────────────
   'packs.installed_count':             '{n} установлено',
   'packs.empty_helper':                'Нажмите "Скачать" для обзора или "Открыть папку" для добавления вручную.',
@@ -459,19 +446,6 @@ export const ru: Record<string, string> = {
   'worlds.game_adventure':             'Приключение',
   'worlds.game_hardcore':              'Хардкор',
   'worlds.game_unknown':               'Неизвестно',
-
-  // ── Mod Browser ─────────────────────────────────────────────
-  'mod.source_modrinth':               'Modrinth',
-  'mod.source_curseforge':             'CurseForge',
-  'mod.empty_results':                 'Моды не найдены',
-  'mod.already_added':                 'Уже добавлен',
-  'mod.no_compatible_version':         'Совместимая версия не найдена',
-  'mod.added_toast':                   'Добавлен: {name}',
-  'mod.add_error':                     'Не удалось добавить мод: {error}',
-  'mod.load_error':                    'Не удалось загрузить моды: {error}',
-  'mod.search_error':                  'Ошибка поиска: {error}',
-  'mod.detail_error':                  'Не удалось загрузить информацию: {error}',
-  'mod.added_dep_toast':               'Добавлена зависимость: {name}',
 
   // ── Login ───────────────────────────────────────────────────
   'login.title':                       'Вход',

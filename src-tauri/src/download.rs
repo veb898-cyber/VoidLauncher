@@ -91,8 +91,10 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-/// Global HTTP client with connection pooling
-fn http_client() -> reqwest::Client {
+/// Global HTTP client with connection pooling. On failure (rare: TLS backend
+/// trouble) returns the error instead of panicking; nothing is cached, so the
+/// next call retries the build.
+fn http_client() -> reqwest::Result<reqwest::Client> {
     static CLIENT: OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>> = OnceLock::new();
     let proxy = resolved_proxy_url(active_proxy_raw());
     let mut slot = CLIENT
@@ -101,12 +103,13 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Rebuild the client when the proxy setting changes (including disabled).
     if slot.as_ref().map(|(p, _)| p != &proxy).unwrap_or(true) {
-        *slot = Some((proxy.clone(), build_client(proxy.as_deref())));
+        let client = build_client(proxy.as_deref())?;
+        *slot = Some((proxy.clone(), client));
     }
-    slot.as_ref().unwrap().1.clone()
+    Ok(slot.as_ref().unwrap().1.clone())
 }
 
-fn build_client(proxy: Option<&str>) -> reqwest::Client {
+fn build_client(proxy: Option<&str>) -> reqwest::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .connect_timeout(Duration::from_secs(5))
@@ -133,9 +136,7 @@ fn build_client(proxy: Option<&str>) -> reqwest::Client {
             builder = builder.no_proxy();
         }
     }
-    builder
-        .build()
-        .expect("Failed to create HTTP client (check TLS libraries)")
+    builder.build()
 }
 
 /// Proxy URL configured in the settings (None = direct connection).
@@ -329,7 +330,10 @@ pub async fn send_with_fallback(
                 // for most hosts can still refuse specific ones (Mojang CDN).
                 if let Some(builder) = req.try_clone() {
                     if let Ok(request) = builder.build() {
-                        let direct = build_client(None);
+                        let direct = match build_client(None) {
+                            Ok(client) => client,
+                            Err(_) => return Err(e),
+                        };
                         match direct.execute(request).await {
                             Ok(r) => {
                                 tracing::warn!(
@@ -534,7 +538,7 @@ async fn download_to_part(
         }
     }
 
-    let client = http_client();
+    let client = http_client()?;
     let max_attempts = MAX_RETRIES as usize + 2;
     let mut offset: u64 = std::fs::metadata(&part_path)
         .map(|m| m.len())
@@ -1153,7 +1157,7 @@ pub(crate) fn is_unsafe_archive_path(relative: &str) -> bool {
 /// Expose global client for use by other modules (versions, modloaders).
 /// Returns a cheap clone; the underlying client is rebuilt automatically
 /// when the proxy setting changes.
-pub fn global_http_client() -> reqwest::Client {
+pub fn global_http_client() -> reqwest::Result<reqwest::Client> {
     http_client()
 }
 

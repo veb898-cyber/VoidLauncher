@@ -211,7 +211,7 @@ pub async fn fetch_packs() -> Result<Vec<AtPack>> {
         }
     }
     crate::download::ensure_proxy_resolved().await;
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let mut last_err = None;
     for attempt in 0..=ATL_RETRY_DELAYS_MS.len() {
         match crate::download::send_with_fallback(
@@ -280,7 +280,7 @@ pub async fn fetch_version_detail(safe_name: &str, version: &str) -> Result<AtPa
         version
     );
     crate::download::ensure_proxy_resolved().await;
-    let client = crate::download::global_http_client();
+    let client = crate::download::global_http_client()?;
     let mut last_err = None;
     for attempt in 0..=ATL_RETRY_DELAYS_MS.len() {
         match crate::download::send_with_fallback(
@@ -652,7 +652,8 @@ pub async fn install_atlauncher_pack(
                 }
                 return Ok::<(), String>(());
             }
-            let client = crate::download::global_http_client();
+let client = crate::download::global_http_client()
+                .map_err(|e| format!("HTTP client error: {}", e))?;
             let result = download_atl_mod(&m, &dest, &client).await;
             match result {
                 Ok(()) => {
