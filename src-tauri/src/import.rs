@@ -85,8 +85,10 @@ fn check_safe_relative(relative: &str) -> Result<()> {
     Ok(())
 }
 
-/// Extract a zip entry to disk under `base`, verifying no path traversal.
-fn extract_entry(base: &Path, entry_name: &str, data: &[u8]) -> Result<()> {
+/// Stream a zip entry to disk under `base`, verifying no path traversal.
+/// File-backed writer: large entries are copied in chunks instead of being
+/// buffered in memory (`std::io::copy`).
+fn write_extracted(base: &Path, entry_name: &str, reader: &mut dyn Read) -> Result<()> {
     check_safe_relative(entry_name)?;
     let target = base.join(entry_name);
     // Defense in depth: joined path must stay under base
@@ -99,8 +101,15 @@ fn extract_entry(base: &Path, entry_name: &str, data: &[u8]) -> Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&target, data)?;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&target)?);
+    std::io::copy(reader, &mut out)?;
     Ok(())
+}
+
+/// Extract a zip entry to disk under `base`, verifying no path traversal.
+#[cfg(test)]
+fn extract_entry(base: &Path, entry_name: &str, data: &[u8]) -> Result<()> {
+    write_extracted(base, entry_name, &mut std::io::Cursor::new(data))
 }
 
 fn normalize_zip_path(path: &str) -> String {
@@ -117,10 +126,7 @@ pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
         if entry.is_dir() {
             continue;
         }
-        check_safe_relative(&entry_name)?;
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
-        extract_entry(dest, &entry_name, &buf)?;
+        write_extracted(dest, &entry_name, &mut entry)?;
     }
     Ok(())
 }
@@ -349,10 +355,12 @@ fn extract_mrpack_override(entry_name: &str) -> Option<&str> {
 
 /// Detect modpack format from a zip file by peeking at known manifest files.
 pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
-    let zip_bytes = std::fs::read(path).map_err(|e| {
+    // File-backed archive: no need to load potentially multi-hundred-MB packs
+    // into memory just to read the manifest entries.
+    let file = std::fs::File::open(path).map_err(|e| {
         LauncherError::Instance(format!("Cannot read file: {}", e))
     })?;
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))
+    let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| LauncherError::Instance(format!("Invalid archive: {}", e)))?;
 
     let names: Vec<String> = (0..archive.len())
@@ -492,15 +500,11 @@ pub async fn import_modpack(
 ) -> Result<Instance> {
     emit_progress(app, "reading", 0, 1, "Reading archive...");
 
-    let zip_bytes = std::fs::read(path)?;
-
-    // Sniff the archive format cheaply (one pass over the entry names), then
-    // drop the bytes before handing off to the format-specific importer. The
-    // importers re-read the file from disk themselves; keeping the archive
-    // alive here would hold a second full copy of the pack in memory for the
-    // whole install (up to 2× the file size).
+    // Sniff the archive format cheaply (one pass over the entry names). The
+    // archive is file-backed, so no full copy of the pack is held in memory;
+    // the format-specific importer below re-opens the file from disk itself.
     let format = {
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))?;
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
         let names: Vec<String> = (0..archive.len())
             .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
             .collect();
@@ -518,7 +522,6 @@ pub async fn import_modpack(
             ));
         }
     };
-    drop(zip_bytes);
 
     let instance = match format {
         ModpackFormat::Prism => import_with_cleanup(
@@ -592,8 +595,8 @@ pub(crate) async fn import_mrpack(
 ) -> Result<Instance> {
     emit_progress(app, "extracting", 0, 1, "Extracting overrides...");
 
-    let zip_bytes = std::fs::read(path)?;
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))?;
+    // File-backed archive: the pack is not buffered in memory.
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
 
     // Read index
     let mut index_str = String::new();
@@ -640,13 +643,10 @@ pub(crate) async fn import_mrpack(
             check_safe_relative(relative)?;
             extracted_any = true;
 
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-
             if entry.is_dir() {
                 std::fs::create_dir_all(mc_dir.join(relative))?;
             } else {
-                extract_entry(&mc_dir, relative, &buf)?;
+                write_extracted(&mc_dir, relative, &mut entry)?;
             }
             continue;
         }
@@ -656,6 +656,11 @@ pub(crate) async fn import_mrpack(
         }
 
         check_safe_relative(&entry_name)?;
+        // Embedded files stay in memory: the per-file install tasks below run
+        // concurrently against a shared map, and file-backed lookup would
+        // require re-architecting the concurrency model. Pack payloads are
+        // typically small mod jars; keeping this bounded is preferable to
+        // loosening the hash-checked install path.
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
         embedded.insert(normalize_zip_path(&entry_name), buf);
@@ -818,8 +823,8 @@ pub(crate) async fn import_curseforge_pack(
 ) -> Result<Instance> {
     emit_progress(app, "extracting", 0, 1, "Extracting overrides...");
 
-    let zip_bytes = std::fs::read(path)?;
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))?;
+    // File-backed archive: the pack is not buffered in memory.
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
 
     // Read manifest
     let mut manifest_str = String::new();
@@ -878,13 +883,10 @@ pub(crate) async fn import_curseforge_pack(
             if relative.is_empty() { continue; }
             check_safe_relative(relative)?;
 
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-
             if entry.is_dir() {
                 std::fs::create_dir_all(mc_dir.join(relative))?;
             } else {
-                extract_entry(&mc_dir, relative, &buf)?;
+                write_extracted(&mc_dir, relative, &mut entry)?;
             }
         }
     }
@@ -1081,8 +1083,8 @@ pub(crate) async fn import_curseforge_pack(
 
 /// Import an ATLauncher instance
 fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &str) -> Result<Instance> {
-    let zip_bytes = std::fs::read(path)?;
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))?;
+    // File-backed archive: the pack is not buffered in memory.
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
 
     // Read instance.json for metadata
     let mut inst_str = String::new();
@@ -1117,9 +1119,7 @@ fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &s
         if entry_name == "instance.json" || entry.is_dir() { continue; }
         check_safe_relative(&entry_name)?;
 
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
-        extract_entry(&mc_dir, &entry_name, &buf)?;
+        write_extracted(&mc_dir, &entry_name, &mut entry)?;
     }
 
     let now = chrono::Utc::now().to_rfc3339();

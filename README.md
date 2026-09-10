@@ -38,8 +38,8 @@ VoidLauncher_<version>_x64-setup.exe
 Prerequisites: Node.js 24+, Rust stable, Tauri 2 prerequisites, WebView2.
 
 ```bash
-pnpm install
-pnpm run tauri build
+npm install
+npm run tauri build
 ```
 
 ## License

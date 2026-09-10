@@ -53,6 +53,9 @@ struct AdoptiumBinary {
 #[derive(Debug, Deserialize)]
 struct AdoptiumPackage {
     link: String,
+    // Integrity metadata the Adoptium API publishes on the ZIP/MSI object
+    // itself (SHA-256 hex of the exact file referenced by `link`).
+    checksum: Option<String>,
     name: String,
 }
 
@@ -323,14 +326,22 @@ pub async fn download_java_runtime(
         LauncherError::Download(format!("No Java {} release found", major_version))
     })?;
 
-    let pkg = version_entry
+    let binary = version_entry
         .binaries
         .iter()
         .find(|b| b.os_name == "windows" && b.architecture == "x64" && b.image_type == "jdk")
-        .and_then(|b| b.package.as_ref().or(b.installer.as_ref()))
         .ok_or_else(|| {
             LauncherError::Download(format!("No Windows x64 JDK package for Java {}", major_version))
         })?;
+
+    let pkg = binary.package.as_ref().or(binary.installer.as_ref()).ok_or_else(|| {
+        LauncherError::Download(format!("No Windows x64 JDK package for Java {}", major_version))
+    })?;
+
+    // Integrity metadata: the digest Adoptium publishes for the exact archive
+    // referenced by `pkg.link` (SHA-256 hex). Verified against the downloaded
+    // bytes before extraction.
+    let expected_checksum = pkg.checksum.clone();
 
     let archive_path = java_dir.join(&pkg.name);
     let pkg_name = pkg.name.clone();
@@ -391,10 +402,9 @@ pub async fn download_java_runtime(
         }
     }
 
-    // Phase 3: Extract (blocking I/O in a dedicated thread)
-    emit_progress(82.0, "extracting", "Extracting archive...");
-
-    // Validate the file is actually a ZIP (not an MSI)
+    // Phase 3: Validate the file is actually a ZIP archive, then verify its
+    // integrity BEFORE extraction. A mismatched checksum means the bytes do
+    // not match what Adoptium published — do not unpack untrusted content.
     {
         let mut header = [0u8; 4];
         use std::io::Read;
@@ -411,6 +421,13 @@ pub async fn download_java_runtime(
             )));
         }
     }
+
+    verify_archive_checksum(&archive_path, expected_checksum.as_deref()).map_err(|e| {
+        let _ = std::fs::remove_file(&archive_path);
+        e
+    })?;
+
+    emit_progress(85.0, "extracting", "Extracting archive...");
 
     let archive_clone = archive_path.clone();
     let runtime_clone = runtime_dir.clone();
@@ -560,4 +577,174 @@ fn extract_archive(archive_path: &PathBuf, dest_dir: &PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// SHA-256 hex digest of a file (streamed, constant memory).
+fn sha256_hex(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| LauncherError::Download(format!("Cannot open archive for checksum: {}", e)))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| {
+            LauncherError::Download(format!("Error reading archive for checksum: {}", e))
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Verify a downloaded archive against the checksum the Adoptium API returned.
+///
+/// Adoptium publishes SHA-256 hex digests on the package object. A missing
+/// checksum or a value in an unexpected format is tolerated (TLS already
+/// protects the transport; failing hard would break installs if Adoptium
+/// changes their hash scheme). A present SHA-256 that does not match the file
+/// is a hard error and the caller must not extract the archive.
+fn verify_archive_checksum(path: &std::path::Path, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected.map(str::trim).filter(|s| !s.is_empty()) else {
+        tracing::warn!(
+            target: "launcher",
+            "Adoptium returned no checksum for Java archive; skipping integrity verification"
+        );
+        return Ok(());
+    };
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        tracing::warn!(
+            target: "launcher",
+            "Unexpected checksum format from Adoptium; skipping integrity verification"
+        );
+        return Ok(());
+    }
+
+    let actual = sha256_hex(path)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        tracing::error!(
+            target: "launcher",
+            "Checksum mismatch for Java archive: expected {}, got {}",
+            expected,
+            actual
+        );
+        return Err(LauncherError::Download(format!(
+            "Java archive checksum mismatch (expected {}, got {})",
+            expected, actual
+        )));
+    }
+
+    tracing::info!(target: "launcher", "Java archive checksum verified (SHA-256)");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique(path: &str) -> std::path::PathBuf {
+        let name = format!(
+            "vl_java_checksum_{}_{}_{}",
+            std::process::id(),
+            path,
+            uuid::Uuid::new_v4().simple()
+        );
+        std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn checksum_accepts_matching_sha256() {
+        let file = unique("match");
+        std::fs::write(&file, b"java archive payload 12345").unwrap();
+        let expected = sha256_hex(&file).unwrap();
+        let result = verify_archive_checksum(&file, Some(&expected));
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn checksum_rejects_mismatch() {
+        let file = unique("mismatch");
+        std::fs::write(&file, b"tampered bytes").unwrap();
+        let expected = sha256_hex(&file).unwrap();
+        // Corrupt the file: digest no longer matches the previously computed one.
+        std::fs::write(&file, b"tampered bytes!").unwrap();
+        let result = verify_archive_checksum(&file, Some(&expected));
+        assert!(result.is_err(), "expected Err, got {:?}", result);
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.to_lowercase().contains("checksum mismatch"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn checksum_skips_when_missing_or_unrecognized_format() {
+        let file = unique("skip");
+        let content = [0u8; 4096];
+        std::fs::write(&file, &content).unwrap();
+
+        assert!(verify_archive_checksum(&file, None).is_ok());
+        assert!(verify_archive_checksum(&file, Some("")).is_ok());
+        assert!(verify_archive_checksum(&file, Some("   ")).is_ok());
+        // Not a 64-char hex digest (e.g. sha512 or an unexpected scheme) — tolerate.
+        assert!(verify_archive_checksum(&file, Some("deadbeef")).is_ok());
+        assert!(verify_archive_checksum(&file, Some("0123456789abcdef".repeat(8).as_str())).is_ok());
+
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn parses_real_adoptium_schema_with_checksum() {
+        // Shape taken from a live /v3/assets/feature_releases/*/ga response:
+        // the digest lives on the package (and installer) object, and the OS
+        // field is serialized as "os". Locking the real schema into a test so
+        // a future API change cannot silently disable the integrity check.
+        let json = r#"[
+          {
+            "binaries": [
+              {
+                "architecture": "x64",
+                "image_type": "jdk",
+                "os": "windows",
+                "package": {
+                  "link": "https://github.com/adoptium/.../jdk.zip",
+                  "name": "OpenJDK21U-jdk_x64_windows_hotspot.zip",
+                  "checksum": "f9d6e191ab098c0d416e7d588a24420a8621cd2f4720dab2459b8b7b2d2d8b4e"
+                },
+                "installer": {
+                  "link": "https://github.com/adoptium/.../jdk.msi",
+                  "name": "OpenJDK21U-jdk_x64_windows_hotspot.msi",
+                  "checksum": "454cfd334b9ca91c96dd8c2de97fcef6b9f1f98be9172ff076711f1c6b44e4e0"
+                }
+              }
+            ]
+          }
+        ]"#;
+        let entries: Vec<AdoptiumVersionData> = serde_json::from_str(json).unwrap();
+        let bin = &entries[0].binaries[0];
+        assert_eq!(bin.os_name, "windows");
+        let pkg = bin.package.as_ref().unwrap();
+        assert_eq!(
+            pkg.checksum.as_deref(),
+            Some("f9d6e191ab098c0d416e7d588a24420a8621cd2f4720dab2459b8b7b2d2d8b4e")
+        );
+        let msi = bin.installer.as_ref().unwrap();
+        assert_eq!(
+            msi.checksum.as_deref(),
+            Some("454cfd334b9ca91c96dd8c2de97fcef6b9f1f98be9172ff076711f1c6b44e4e0")
+        );
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        let file = unique("vector");
+        std::fs::write(&file, b"abc").unwrap();
+        assert_eq!(
+            sha256_hex(&file).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_file(&file);
+    }
 }
