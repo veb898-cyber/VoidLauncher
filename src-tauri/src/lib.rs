@@ -21,6 +21,7 @@ mod modloaders;
 mod modrinth;
 mod playtime;
 mod versions;
+pub mod voidlink;
 
 #[cfg(test)]
 mod smoke_launch;
