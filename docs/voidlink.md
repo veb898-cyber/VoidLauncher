@@ -44,9 +44,19 @@ stress testing.
 ## CLI
 
 ```
-voidlink host   [--listen 127.0.0.1:25588] [--server 127.0.0.1:25565] [options]
-voidlink client [--listen 127.0.0.1:25566] [--host-addr 127.0.0.1:25588] [options]
+voidlink host        [--listen 127.0.0.1:25588] [--server 127.0.0.1:25565] [options]
+voidlink client      [--listen 127.0.0.1:25566] [--host-addr 127.0.0.1:25588] [options]
+voidlink test        [--profile <name>] [--all] [--repeat <n>]   automatic end-to-end test
+voidlink test-server [--listen 127.0.0.1:25589]   standalone echo TCP endpoint
 ```
+
+`test` runs the whole pipeline automatically (embedded echo server + VoidLink
+Host + VoidLink Client + test client) and stops itself — no Minecraft server,
+no second PC, no external programs, no internet needed. `test --all` runs the
+full test matrix (load, fuzz, abort scenarios, every profile, a repeat sweep);
+`test --repeat <n>` runs the standard pipeline n times, each run with
+completely fresh endpoints. `test-server` is a plain TCP echo endpoint for
+manual experiments.
 
 All addresses are **loopback-only** (127.0.0.1 or ::1). External addresses are
 rejected at parse time.
@@ -55,21 +65,34 @@ rejected at parse time.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--listen` | host:25588 / client:25566 | Local address to bind |
+| `--listen` | host:25588 / client:25566 / test-server:25589 | Local address to bind |
 | `--server` | 127.0.0.1:25565 | Minecraft server address (host only) |
 | `--host-addr` | 127.0.0.1:25588 | Host address (client only) |
-| `--profile` | normal | Network profile |
+| `--profile` | normal | Network profile (test: ignore when `--all` is used) |
+| `--all` | off | With `test`: run the full matrix (load, fuzz, abort, every profile, repeat sweep). Cannot be combined with `--profile`. Endpoints are `:0` (auto-assigned ports). |
+| `--repeat <n>` | 1 (3 for `--all`) | With `test`: run the pipeline n times, each run in a fresh harness with its own endpoints. Aggregated `Runs / Passed / Failed` footer; failed runs print full diag. n ≥ 1. |
 | `--latency-ms` | from profile | Override one-way latency |
 | `--jitter-ms` | from profile | Override jitter |
-| `--loss-percent` | from profile | Override loss probability (0-100) |
-| `--loss-stall-ms` | from profile | Override stall length |
-| `--drop-percent` | 0 | Destructive chunk drop probability |
+| `--loss-percent` | from profile | Override "loss" probability (0-100). Loss = **stall**, bytes preserved. |
+| `--loss-stall-ms` | from profile | Override stall length of a "loss" event |
+| `--drop-percent` | 0 | **Destructive** test: silently drop chunks, corrupting the stream (0-100) |
 | `--bandwidth-kbps` | 0 (unlimited) | Bandwidth cap |
 | `--outage-after-ms` | 0 (never) | Break link once after N ms |
 | `--connect-timeout-secs` | 2 | Dial timeout |
 | `--idle-timeout-secs` | 0 (disabled) | Close idle sessions |
 
-### Status output
+## Terminology (exact, not marketing)
+
+- **Latency / jitter** — an artificial one-way delay added to each chunk.
+- **Loss** — is **NOT packet loss**. Every "loss" event only *stalls* the
+  connection for `loss-stall-ms` (emulating a TCP retransmission / bad
+  queueing). All bytes are still delivered; **stream integrity is preserved**
+  under every default profile, including `very-bad`.
+- **Drop (`--drop-percent`)** — a **destructive stress test**: a chunk is
+  silently discarded, so the byte stream is corrupted on purpose. This is
+  **not** a realistic simulation of network packet loss.
+
+## Status output
 
 Events are printed as `[voidlink host]` / `[voidlink client]` with one of:
 
@@ -89,7 +112,8 @@ Run all VoidLink tests:
 cargo test voidlink -- --test-threads=2
 ```
 
-Test count: **21 unit/integration tests** covering:
+Test count: **27 VoidLink tests** (26 run by default + 1 ignored full-matrix
+test), covering:
 
 | Test | What it verifies |
 |------|-----------------|
@@ -101,6 +125,12 @@ Test count: **21 unit/integration tests** covering:
 | `parse_cli_defaults_by_command` | Default addresses correct for host/client |
 | `parse_cli_manual_test_line` | Manual test commands parse correctly |
 | `parse_cli_rejects_bad_input` | Non-loopback, bad ports, missing command, --help, --version |
+| `e2e_mode_parses_test_command` | `test --profile x` parses into `Command::Test` |
+| `e2e_mode_parses_test_server_command` | `test-server` parses into `Command::TestServer` |
+| `e2e_mode_parses_all_and_repeat` | `test --all` / `test --repeat n` parse and validate correctly |
+| `e2e_mode_passes_full_pipeline` | The whole `voidlink test` harness passes under `normal` |
+| `repeat_test_passes` | `run_repeat_test(normal, 2)` — two full runs, fresh endpoints, both pass |
+| `full_test_all_passes` (ignored) | The whole `--all` matrix passes (run with `-- --ignored`) |
 | `basic_echo` | Single 11-byte echo through the tunnel |
 | `large_message_integrity` | 1 MiB payload echoed with SHA-256 integrity check |
 | `bulk_streaming` | 1 MiB bidirectional streaming with SHA-256 integrity |
@@ -115,21 +145,155 @@ Test count: **21 unit/integration tests** covering:
 | `lossy_and_high_latency_integrity` | Integrity under lossy (1 MiB) and high-latency (512 KiB) |
 | `drop_mode_corrupts_stream` | Destructive 30% drop breaks stream integrity |
 
+## Automated E2E testing
+
+### Why `voidlink test` exists
+
+The unit and integration tests above already exercise the tunnel engine, but
+they run inside the same process as the test harness. `voidlink test` is a
+**real TCP end-to-end run**: it starts four genuinely separate network
+components over real sockets —
+
+```
+Test Client → VoidLink Client → VoidLink Host → Test Server (echo)
+```
+
+and verifies real bytes travel through the whole chain in both directions,
+including the return path:
+
+```
+Test Server → VoidLink Host → VoidLink Client → Test Client
+```
+
+### What it checks
+
+One command runs the entire pipeline:
+
+```bash
+voidlink test
+```
+
+Checks under `normal`:
+
+1. small payload (11 B);
+2. minimal payload (1 B);
+3. 1 KiB;
+4. 64 KiB;
+5. 1 MiB;
+6. bidirectional duplex (simultaneous write + read on one connection);
+7. 10 sequential connections;
+8. 25 concurrent connections with per-session integrity;
+9. graceful close (clean EOF propagation);
+10. reconnect after close;
+11. error handling (dialing a closed port must fail cleanly);
+12. cleanup (no listener may remain bound after teardown).
+
+On failure, the report shows which check failed, how many bytes were received
+vs expected, the TCP error, and a trace of the last Host/Client events.
+
+### Profiles
+
+```bash
+voidlink test --profile normal
+voidlink test --profile high-latency
+voidlink test --profile lossy
+voidlink test --profile very-bad
+voidlink test --profile disconnect
+```
+
+The stable profiles run the same 12 checks; on slow links the payload sizes
+are scaled down (e.g. `very-bad` uses 16 KiB / 64 KiB instead of 64 KiB /
+1 MiB because of its 128 kbps cap). The `disconnect` profile would break long
+transfers on purpose (the link drops once 4 s after connect), so it runs a
+recovery suite instead: healthy session → outage drops it → reconnect works →
+error handling.
+
+### Full test matrix: `voidlink test --all`
+
+```bash
+voidlink test --all
+```
+
+Runs the whole battery in one process and prints one aggregated report
+(`Summary: N checks across M sections`, then `RESULT: PASS/FAIL`). Every
+section uses a completely fresh harness (its own echo server / Host / Client
+on auto-assigned ports). Sections and what they cover:
+
+| Section | What it verifies |
+|---------|------------------|
+| Basic E2E | the standard 12 checks under `normal` |
+| Heavier load | 1 MiB and 8 MiB payloads, 20 connect/close cycles, 50 and 100 concurrent sessions, 1 MiB duplex, recovery echo |
+| Fuzz payloads | random payload sizes 1 B..256 KiB and 1 B..1 MiB, byte-exact + SHA-256 |
+| Abort: abnormal client close | abrupt client close (ungraceful, no clean EOF) mid-transfer is torn down; tunnel recovers |
+| Abort: host shutdown | Host stops mid-transfer; the reset/EOF is surfaced instead of hanging |
+| Abort: echo server shutdown | echo dies mid-transfer; restart proves no stale state, dial-refused handled |
+| Error classification | clean remote close → EOF; silent peer → timeout (not a hang); refused dial → connect error |
+| Profile high-latency / lossy / very-bad | the stable suites under each profile |
+| Profile disconnect | recovery suite under the outage profile |
+| Repeat | 3 full runs (`--repeat`), fresh endpoints each |
+
+The abort suites stop a component mid-transfer and verify the connection is
+torn down with an observable EOF/reset/timeout on the client — never a hang —
+exactly the error surface a Minecraft client would see.
+
+### Repeating runs: `voidlink test --repeat <n>`
+
+```bash
+voidlink test --repeat 10
+voidlink test --all --repeat 5   # full matrix, 5-run sweep
+```
+
+Each run is a genuinely fresh pipeline: new echo server, new Host, new
+Client, new test client, auto-assigned ports, full teardown between runs. The
+footer is `Runs: 10 / Passed: 10 / Failed: 0`; any failed run prints its check
+list with reasons. Failed runs keep per-run diagnostics — a single flaky run
+does not hide the failing check.
+
+### A Minecraft server is NOT needed
+
+The embedded **Test Server** is a plain TCP *echo* endpoint. It does not
+pretend to be a Minecraft server and it is not one. That is a feature: the
+test proves VoidLink proxies an arbitrary TCP byte stream end to end, nothing
+more.
+
+### What success does and does NOT prove
+
+A green `voidlink test` proves VoidLink's **TCP proxying** is correct: bytes
+flow, integrity holds, close and reconnect work, scaling to 25 sessions. It
+does **NOT** prove Minecraft compatibility — Minecraft speaks its own
+protocol (handshake, status/ping, compression, encryption), and this test
+never speaks it. The only way to prove Minecraft compatibility is the manual
+Minecraft test below.
+
+### Manual test server
+
+```bash
+voidlink test-server --listen 127.0.0.1:25589
+```
+
+Binds a plain echo endpoint (NOT a Minecraft server) for manual experiments,
+e.g. `Test-NetConnection 127.0.0.1 -Port 25589` or a raw-socket client.
+
 ## Stress test profiles
 
-| Profile | Latency | Jitter | Loss | Stall | Bandwidth | Outage |
-|---------|---------|--------|------|-------|-----------|--------|
+| Profile | Latency | Jitter | Loss (stall) | Stall | Bandwidth | Outage |
+|---------|---------|--------|--------------|-------|-----------|--------|
 | `normal` | 0 ms | 0 ms | 0% | 0 ms | unlimited | never |
 | `high-latency` | 70 ms | 15 ms | 0% | 0 ms | unlimited | never |
 | `lossy` | 40 ms | 20 ms | 3% | 250 ms | unlimited | never |
 | `very-bad` | 110 ms | 60 ms | 6% | 500 ms | 128 kbps | never |
 | `disconnect` | 0 ms | 0 ms | 0% | 0 ms | unlimited | 4000 ms |
 
+There is no byte-dropping in any profile above — the "Loss (stall)" column is
+exactly what it says: a percentage of chunks that get delayed by `Stall`
+milliseconds. Stream integrity is always preserved. Byte dropping exists only
+as the **destructive** `--drop-percent` override.
+
 **Parameter justification:**
 
 - **high-latency (70/15)**: Plausible high-ping link (e.g. cross-continent Wi-Fi).
-- **lossy (40/20/3%/250ms)**: Moderate congestion. Loss emulated as 250 ms stall
-  (TCP retransmission + congestion backoff), so integrity is preserved.
+- **lossy (40/20/3%/250ms)**: Moderate congestion. Each "loss" is emulated as
+  a 250 ms stall (TCP retransmission + congestion backoff); bytes preserved.
 - **very-bad (110/60/6%/500ms/128kbps)**: Worst tolerable mobile link.
   128 kbps bandwidth cap is a hard ceiling; all other params stacked.
 - **disconnect (outage 4000ms)**: Simulates a connection dropping exactly once
