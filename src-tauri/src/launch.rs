@@ -12,7 +12,7 @@ const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Open (create) files to receive a raw byte-for-byte copy of the game
 /// process stdout/stderr (crash forensics).
@@ -77,6 +77,8 @@ pub fn launch_minecraft(
     access_token: &str,
     uuid: &str,
     username: &str,
+    server_address: Option<&str>,
+    server_port: Option<u16>,
 ) -> Result<std::process::Child> {
     tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
     tracing::info!(target: "launcher", "MC version: {}", instance.mc_version);
@@ -516,6 +518,19 @@ pub fn launch_minecraft(
             args.push("--height".to_string());
             args.push(res.height.to_string());
         }
+    }
+
+    // Room auto-join (legacy `--server/--port`, Minecraft ≤ 1.18). Newer
+    // versions are joined manually via Direct Connect (see MinecraftConnector).
+    if let (Some(host), Some(port)) = (
+        server_address.filter(|h| !h.trim().is_empty()),
+        server_port,
+    ) {
+        args.push("--server".to_string());
+        args.push(host.trim().to_string());
+        args.push("--port".to_string());
+        args.push(port.to_string());
+        tracing::info!(target: "launcher", "Room join args: --server {} --port {}", host.trim(), port);
     }
 
     // 6. Launch

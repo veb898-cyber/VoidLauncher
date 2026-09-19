@@ -11,4 +11,5 @@ pub mod launcher;
 pub mod misc;
 pub mod modpacks;
 pub mod mods;
+pub mod rooms;
 pub mod versions;

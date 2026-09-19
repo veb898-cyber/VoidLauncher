@@ -20,8 +20,8 @@ mod logger;
 mod modloaders;
 mod modrinth;
 mod playtime;
+mod rooms;
 mod versions;
-pub mod voidlink;
 
 #[cfg(test)]
 mod smoke_launch;
@@ -31,7 +31,7 @@ mod diag;
 
 use config::AppConfig;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{Manager, WindowEvent};
 
@@ -46,6 +46,10 @@ pub struct AppState {
     /// Active playtime-tracking sessions, keyed by instance name. One per
     /// running game, allowing concurrent sessions.
     pub active_sessions: Mutex<HashMap<String, playtime::ActiveSession>>,
+    /// Room networking state (host/guest), shared with the VoidLink bridge.
+    pub room_state: Arc<rooms::room_state::RoomStateManager>,
+    /// Tailscale integration handle.
+    pub tailscale: rooms::tailscale::TailscaleManager,
 }
 
 /// Handle to an active file system watcher; dropping stops the watcher
@@ -205,6 +209,8 @@ pub fn run() {
             running_instances: Mutex::new(Vec::new()),
             pack_watcher: Mutex::new(None),
             active_sessions: Mutex::new(HashMap::new()),
+            room_state: Arc::new(rooms::room_state::RoomStateManager::new(&data_dir)),
+            tailscale: rooms::tailscale::TailscaleManager::new(data_dir.clone()),
         })
         .invoke_handler(tauri::generate_handler![
             commands::auth::cmd_start_login,
@@ -315,6 +321,16 @@ pub fn run() {
             commands::modpacks::cmd_search_modrinth_modpacks,
             commands::modpacks::cmd_get_modrinth_modpack_versions,
             commands::modpacks::cmd_install_modrinth_modpack,
+            commands::rooms::cmd_room_status,
+            commands::rooms::cmd_room_check_link,
+            commands::rooms::cmd_room_create_host,
+            commands::rooms::cmd_room_join_guest,
+            commands::rooms::cmd_room_leave,
+            commands::rooms::cmd_room_refresh,
+            commands::rooms::cmd_room_report_minecraft_port,
+            commands::rooms::cmd_room_detect_minecraft_port,
+            commands::rooms::cmd_room_join_args,
+            commands::rooms::cmd_room_open_admin_console,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {

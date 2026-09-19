@@ -26,6 +26,7 @@ const Login = lazy(() => import('./pages/Login').then(m => ({ default: m.Login }
 const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.Settings })));
 const Terminal = lazy(() => import('./pages/Terminal').then(m => ({ default: m.Terminal })));
 const Accounts = lazy(() => import('./pages/Accounts').then(m => ({ default: m.Accounts })));
+const Rooms = lazy(() => import('./pages/Rooms').then(m => ({ default: m.Rooms })));
 const HomeLayout = lazy(() => import('./components/layout/HomeLayout').then(m => ({ default: m.HomeLayout })));
 
 function App() {
@@ -133,6 +134,8 @@ function App() {
         return <HomeLayout onNavigate={navigate} />;
       case 'accounts':
         return <Accounts />;
+      case 'rooms':
+        return <Rooms />;
       case 'settings':
         return <Settings />;
       default:

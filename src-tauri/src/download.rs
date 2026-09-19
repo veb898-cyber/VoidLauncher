@@ -68,6 +68,7 @@ pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
     "api.adoptium.net",
     "download.nodecdn.net",
     "api.atlauncher.com",
+    "pkgs.tailscale.com",
 ];
 
 /// Check whether `host` is in the allowlist (exact or subdomain match).

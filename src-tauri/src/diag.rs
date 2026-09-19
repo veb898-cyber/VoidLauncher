@@ -6,7 +6,7 @@ use crate::config::AppConfig;
 use crate::instances;
 use crate::AppState;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const DATA_DIR: &str = r"C:\Users\User\AppData\Roaming\VoidLauncher";
 const INSTANCE: &str = "Better MC [FORGE] BMC4";
@@ -18,6 +18,8 @@ fn test_state() -> AppState {
         running_instances: Mutex::new(Vec::new()),
         pack_watcher: Mutex::new(None),
         active_sessions: Mutex::new(std::collections::HashMap::new()),
+        room_state: Arc::new(crate::rooms::room_state::RoomStateManager::new(&PathBuf::from(DATA_DIR))),
+        tailscale: crate::rooms::tailscale::TailscaleManager::new(PathBuf::from(DATA_DIR)),
     }
 }
 
@@ -153,7 +155,7 @@ fn diag_packs_what_ui_sees() {
         }
     }
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let key = config.curseforge_api_key.clone();
+    let _key = config.curseforge_api_key.clone();
     let icon_fw = rt.block_on(crate::commands::mods::cmd_get_mod_icon_pub(&config, INSTANCE, "fresh_waystones.zip"));
     println!("  cmd_get_mod_icon fresh_waystones.zip => {:?}", icon_fw.map(|o| o.is_some()));
     let icon_cx = rt.block_on(crate::commands::mods::cmd_get_mod_icon_pub(&config, INSTANCE, "ConnectorExtras-1.11.2+1.20.1.jar"));

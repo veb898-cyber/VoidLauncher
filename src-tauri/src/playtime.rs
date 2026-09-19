@@ -327,7 +327,7 @@ mod tests {
         let start = Instant::now();
         let from = |name: &str| -> ActiveSession {
             // 1 full minute already elapsed for these.
-            let mut s = fake_session(name, start - std::time::Duration::from_secs(60));
+            let s = fake_session(name, start - std::time::Duration::from_secs(60));
             s
         };
         let mut map = HashMap::new();

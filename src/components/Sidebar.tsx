@@ -14,6 +14,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const navItems = [
     { id: 'home', icon: <HomeIcon />, label: t('sidebar.home') },
     { id: 'instances', icon: <InstancesIcon />, label: t('sidebar.instances') },
+    { id: 'rooms', icon: <RoomsIcon />, label: t('sidebar.rooms') },
     { id: 'accounts', icon: <AccountsIcon />, label: t('sidebar.accounts') },
     { id: 'terminal', icon: <TerminalIcon />, label: t('sidebar.terminal') },
   ];
@@ -88,6 +89,17 @@ function InstancesIcon() {
       <rect x="14" y="3" width="7" height="7" rx="1" />
       <rect x="3" y="14" width="7" height="7" rx="1" />
       <rect x="14" y="14" width="7" height="7" rx="1" />
+    </svg>
+  );
+}
+
+function RoomsIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="9" cy="7" r="3" />
+      <path d="M2 21v-2a4 4 0 0 1 4-4h6a4 4 0 0 1 4 4v2" />
+      <path d="M17 3.5a3 3 0 0 1 0 6" />
+      <path d="M19.5 21v-1.5a4 4 0 0 0-2.5-3.7" />
     </svg>
   );
 }

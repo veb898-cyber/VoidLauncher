@@ -52,7 +52,7 @@ interface InstanceState {
   createInstance: (name: string, mcVersion: string, loader?: string, loaderVersion?: string) => Promise<void>;
   deleteInstance: (name: string) => Promise<void>;
   selectInstance: (name: string | null) => void;
-  launchGame: (instanceName: string) => Promise<void>;
+  launchGame: (instanceName: string, serverAddress?: string, serverPort?: number) => Promise<void>;
   dismissLoaderInstall: () => void;
   installVersion: (versionUrl: string, instanceId?: string) => Promise<string>;
   checkInstalled: (instanceName: string) => Promise<boolean>;
@@ -117,7 +117,7 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     set({ selectedInstance: name });
   },
 
-  launchGame: async (instanceName: string) => {
+  launchGame: async (instanceName: string, serverAddress?: string, serverPort?: number) => {
     set({ isLaunching: true, launchStatus: 'Checking instance...' });
     reportLaunchStatus('Checking instance...');
 
@@ -138,7 +138,11 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     // `game_started` event arrives from the backend (see useGameEvents),
     // i.e. when the Minecraft process is actually running.
     try {
-      const result = await invoke<string>('cmd_launch_game', { instanceName });
+      const result = await invoke<string>('cmd_launch_game', {
+        instanceName,
+        serverAddress: serverAddress ?? null,
+        serverPort: serverPort ?? null,
+      });
       reportLaunchStatus(result);
       set({ isLaunching: false, launchStatus: result });
     } catch (e: any) {

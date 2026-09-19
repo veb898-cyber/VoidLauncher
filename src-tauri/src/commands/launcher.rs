@@ -224,6 +224,8 @@ pub async fn cmd_launch_game(
     app: AppHandle,
     state: State<'_, AppState>,
     instance_name: String,
+    server_address: Option<String>,
+    server_port: Option<u16>,
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
 
@@ -592,6 +594,8 @@ pub async fn cmd_launch_game(
         &access_token,
         &uuid,
         &username,
+        server_address.as_deref(),
+        server_port,
     )
     .map_err(|e| {
         events::emit_log(&app, "error", "launch", &format!("Launch failed: {}", e));

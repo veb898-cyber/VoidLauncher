@@ -84,6 +84,28 @@ pub fn emit_file_progress(url: &str, downloaded: u64, total: u64) {
     }
 }
 
+/// Room workflow progress (Tailscale install / login / discovery), emitted
+/// by the rooms task loops and forwarded to the Rooms UI.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomProgressPayload {
+    pub stage: String,
+    pub fraction: f64,
+    pub message: String,
+}
+
+pub fn emit_room_progress(stage: &str, fraction: f64, message: &str) {
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.emit(
+            "room_progress",
+            RoomProgressPayload {
+                stage: stage.to_string(),
+                fraction,
+                message: message.to_string(),
+            },
+        );
+    }
+}
+
 /// A progress sender that wraps a broadcast::Sender
 #[derive(Debug, Clone)]
 pub struct ProgressSender {

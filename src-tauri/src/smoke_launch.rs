@@ -406,7 +406,7 @@ async fn run_combo(
 
     let start = Instant::now();
     let mut child = match launch::launch_minecraft(
-        config, &instance, &vi, token, uuid, username,
+        config, &instance, &vi, token, uuid, username, None, None,
     ) {
         Ok(c) => c,
         Err(e) => return Err(format!("launch spawn error: {}", e)),
