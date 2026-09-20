@@ -6,8 +6,8 @@
 use crate::events;
 use crate::rooms::minecraft_connector::{compose_endpoint, MinecraftConnector};
 use crate::rooms::peer_discovery::{resolve_host_for_room, HostInfo};
-use crate::rooms::room_state::{RoomRole, RoomStateManager};
-use crate::rooms::tailscale::{TailscaleManager, TailscaleStatusPublic};
+use crate::rooms::room_state::{RoomRole, RoomStateManager, RoomStateRow};
+use crate::rooms::tailscale::{TailscaleManager, TailscaleStatus, TailscaleStatusPublic};
 use crate::AppState;
 use serde::Serialize;
 use std::sync::Arc;
@@ -34,12 +34,30 @@ pub struct RoomStatusPublic {
     pub bridge_port: u16,
     pub endpoint: Option<String>,
     pub host_online: bool,
-    pub discovery_error: Option<String>,
 }
 
-fn ts_public_from(ts: &TailscaleManager) -> TailscaleStatusPublic {
-    if !ts.is_installed() {
-        return TailscaleStatusPublic {
+/// The host the room UI should display. Guests use the peer discovered over
+/// the tailnet; the HOST machine has no peer to discover, so it presents its
+/// own node — this is what lets the host UI show port-found/endpoint state
+/// without ever having resolved a guest-side peer.
+fn display_host_for(room: &RoomStateRow, status: Option<&TailscaleStatus>) -> Option<HostInfo> {
+    room.host.clone().or_else(|| {
+        if room.role == RoomRole::Host {
+            status.and_then(TailscaleManager::self_host_info)
+        } else {
+            None
+        }
+    })
+}
+
+/// Pure status snapshot. Callers are responsible for keeping the bridge
+/// alive (`cmd_room_status`, `cmd_room_create_host`).
+pub fn build_status(state: &State<'_, AppState>) -> RoomStatusPublic {
+    let room = state.room_state.snapshot();
+    let ts = tailscale_manager_for(state);
+    let status = ts.status().ok();
+    let tailscale = if !ts.is_installed() {
+        TailscaleStatusPublic {
             installed: false,
             service_ok: false,
             logged_in: false,
@@ -48,17 +66,11 @@ fn ts_public_from(ts: &TailscaleManager) -> TailscaleStatusPublic {
             login_name: None,
             self_ip: None,
             auth_url: None,
-        };
-    }
-    crate::rooms::tailscale::public_status(true, ts.status().ok().as_ref())
-}
-
-/// Pure status snapshot. Callers are responsible for keeping the bridge
-/// alive (`cmd_room_status`, `cmd_room_create_host`).
-pub fn build_status(state: &State<'_, AppState>) -> RoomStatusPublic {
-    let room = state.room_state.snapshot();
-    let tailscale = ts_public_from(&tailscale_manager_for(state));
-    let host = room.host.clone();
+        }
+    } else {
+        crate::rooms::tailscale::public_status(true, status.as_ref())
+    };
+    let host = display_host_for(&room, status.as_ref());
     let host_online = host.as_ref().map(|h| h.online).unwrap_or(false);
     let endpoint = match (&host, room.minecraft_port) {
         (Some(h), Some(port)) => {
@@ -89,7 +101,6 @@ pub fn build_status(state: &State<'_, AppState>) -> RoomStatusPublic {
         bridge_port: room.void_link_port,
         endpoint,
         host_online,
-        discovery_error: None,
     }
 }
 
@@ -245,6 +256,12 @@ pub async fn cmd_room_create_host(
     let self_ip = TailscaleManager::self_ip(&status)
         .ok_or_else(|| "No tailnet IP — is the Tailscale connection healthy?".to_string())?;
 
+    // Capture the machine's real name BEFORE the room hint renames it, so a
+    // later `leave` can put it back (temporary discovery rename side effect).
+    if let Some(original) = TailscaleManager::self_hostname(&status) {
+        let _ = state.room_state.remember_original_hostname(&original);
+    }
+
     state
         .room_state
         .create_room(room_name)
@@ -263,7 +280,7 @@ pub async fn cmd_room_create_host(
         // The bridge failed to bind (e.g. port 48888 already in use): roll
         // the half-created room back so the launcher is not left in a Host
         // state that has no working bridge. The error is reported to the UI.
-        let _ = state.room_state.leave();
+        let _ = leave_room_and_restore(&state);
         return Err(e.to_string());
     }
 
@@ -308,11 +325,29 @@ pub fn cmd_room_join_guest(
 }
 
 /// Leave the current room. The Tailscale Machine Sharing grant itself stays
-/// (it is managed in the Tailscale admin console).
+/// (it is managed in the Tailscale admin console). The temporary hostname
+/// hint is restored and the VoidLink bridge is torn down.
 #[tauri::command]
 pub fn cmd_room_leave(state: State<'_, AppState>) -> Result<RoomStatusPublic, String> {
-    state.room_state.leave().map_err(|e| e.to_string())?;
+    leave_room_and_restore(&state)?;
     Ok(build_status(&state))
+}
+
+/// Tear the room down: restore the machine's original hostname (if a room
+/// hint renamed it), stop the host-side VoidLink bridge, then clear the room
+/// state. Shared by `cmd_room_leave` and the create-host rollback.
+fn leave_room_and_restore(state: &State<'_, AppState>) -> Result<(), String> {
+    if let Some(name) = state.room_state.previous_hostname() {
+        if let Err(e) = state.tailscale.set_hostname(&name) {
+            tracing::warn!(target: "rooms", "Hostname restore failed: {}", e);
+        }
+    }
+    crate::rooms::void_link::stop_void_link_server();
+    state
+        .room_state
+        .leave()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Single discovery pass (guest): resolve the host, then read its advertised
@@ -322,7 +357,7 @@ pub async fn cmd_room_refresh(state: State<'_, AppState>) -> Result<RoomStatusPu
     if state.room_state.role() != RoomRole::Guest {
         return Ok(build_status(&state));
     }
-    run_discovery_pass(&state).await;
+    run_discovery_pass(&state.room_state, &data_dir_of(&state)).await;
     Ok(build_status(&state))
 }
 
@@ -376,84 +411,72 @@ pub fn cmd_room_open_admin_console(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Identity + port tuple produced by one discovery pass. The background loop
+/// compares consecutive tuples to emit UI events only when something changed.
+type DiscoverySnapshot = (Option<String>, bool, Option<u16>);
+
 /// Background task for the guest: poll the tailnet, resolve the host, read
-/// its Minecraft port over VoidLink, and notify the UI on any change.
+/// its Minecraft port over VoidLink, and notify the UI only on change.
 fn spawn_discovery_loop(
     app: AppHandle,
     room: Arc<RoomStateManager>,
     data_dir: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
+        let mut last: Option<DiscoverySnapshot> = None;
         loop {
-            let snapshot = room.snapshot();
-            if snapshot.role != RoomRole::Guest {
+            if room.snapshot().role != RoomRole::Guest {
                 break;
             }
-            let code = snapshot.room_id.clone().unwrap_or_default();
-            let ts = TailscaleManager::new(data_dir.clone());
-            match ts.status() {
-                Ok(status) => {
-                    let peers = crate::rooms::peer_discovery::peers_from_status(&status);
-                    if let Some(host) =
-                        resolve_host_for_room(&peers, snapshot.room_id.as_deref())
-                    {
-                        let _ = room.set_host(Some(host.clone()));
-                        let mc_port = match host.ip() {
-                            Some(ip) if !code.is_empty() => {
-                                match crate::rooms::void_link::query_host_status(
-                                    ip,
-                                    snapshot.void_link_port,
-                                    &code,
-                                )
-                                .await
-                                {
-                                    Ok(st) => st.mc_port,
-                                    Err(_) => None,
-                                }
-                            }
-                            _ => None,
-                        };
-                        let _ = room.set_minecraft_port(mc_port);
-                    } else {
-                        let _ = room.set_host(None);
-                        let _ = room.set_minecraft_port(None);
-                    }
-                    let _ = app.emit("room_status_changed", serde_json::json!({}));
-                }
-                Err(_) => {}
+            let current = run_discovery_pass(&room, &data_dir).await;
+            if last.as_ref() != Some(&current) {
+                last = Some(current);
+                let _ = app.emit("room_status_changed", serde_json::json!({}));
             }
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     });
 }
 
-/// One synchronous discovery pass (used by `cmd_room_refresh`).
-async fn run_discovery_pass(state: &State<'_, AppState>) {
-    let snapshot = state.room_state.snapshot();
+/// One discovery pass (guest): resolve the host from the current tailnet
+/// peers, read its advertised Minecraft port over VoidLink, persist both, and
+/// return the resulting key tuple for emit-on-change deduplication. A flaky
+/// tailnet or a briefly-unreachable host just yields an absent snapshot —
+/// never an error the caller must handle.
+async fn run_discovery_pass(
+    room: &Arc<RoomStateManager>,
+    data_dir: &std::path::Path,
+) -> DiscoverySnapshot {
+    let snapshot = room.snapshot();
     let code = snapshot.room_id.clone().unwrap_or_default();
-    let ts = tailscale_manager_for(state);
-    if let Ok(status) = ts.status() {
-        let peers = crate::rooms::peer_discovery::peers_from_status(&status);
-        if let Some(host) = resolve_host_for_room(&peers, snapshot.room_id.as_deref()) {
-            let _ = state.room_state.set_host(Some(host.clone()));
-            if let Some(ip) = host.ip() {
-                if !code.is_empty() {
-                    if let Ok(st) = crate::rooms::void_link::query_host_status(
-                        ip,
-                        snapshot.void_link_port,
-                        &code,
-                    )
-                    .await
-                    {
-                        let _ = state.room_state.set_minecraft_port(st.mc_port);
-                    }
-                }
+    let ts = TailscaleManager::new(data_dir.to_path_buf());
+    let Ok(status) = ts.status() else {
+        return (None, false, None);
+    };
+    let peers = crate::rooms::peer_discovery::peers_from_status(&status);
+    let Some(host) = resolve_host_for_room(&peers, snapshot.room_id.as_deref()) else {
+        let _ = room.set_host(None);
+        let _ = room.set_minecraft_port(None);
+        return (None, false, None);
+    };
+    let _ = room.set_host(Some(host.clone()));
+    let mc_port = match host.ip() {
+        Some(ip) if !code.is_empty() => {
+            match crate::rooms::void_link::query_host_status(
+                ip,
+                snapshot.void_link_port,
+                &code,
+            )
+            .await
+            {
+                Ok(st) => st.mc_port,
+                Err(_) => None,
             }
-        } else {
-            let _ = state.room_state.set_host(None);
-            let _ = state.room_state.set_minecraft_port(None);
         }
-    }
+        _ => None,
+    };
+    let _ = room.set_minecraft_port(mc_port);
+    (Some(host.node_key.clone()), host.online, mc_port)
 }
 
 /// Kick off `tailscale up` (detached) right after a fresh install and open
@@ -505,5 +528,100 @@ async fn auto_login_and_open(app: &AppHandle, ts: &TailscaleManager) {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rooms::room_state::RoomStateRow;
+    use crate::rooms::tailscale::PeerNode;
+
+    fn self_status() -> TailscaleStatus {
+        TailscaleStatus {
+            version: Some("1.102.4".into()),
+            backend_state: Some("Running".into()),
+            auth_url: None,
+            current_tailnet: None,
+            self_node: Some(PeerNode {
+                node_key: Some("nodekey:self:me".into()),
+                host_name: Some("gaming-pc".into()),
+                dns_name: Some("gaming-pc.tail3e2a10.ts.net.".into()),
+                tailnet_ips: Some(vec!["100.101.102.103".into()]),
+                online: Some(true),
+                last_seen: None,
+                sharee_node: None,
+                logged_in: None,
+                user_id: None,
+            }),
+            peer: None,
+            user: None,
+            magic_dns_suffix: Some("tail3e2a10.ts.net".into()),
+        }
+    }
+
+    #[test]
+    fn host_role_renders_self_node_as_display_host() {
+        let room = RoomStateRow {
+            role: RoomRole::Host,
+            ..Default::default()
+        };
+        let host = display_host_for(&room, Some(&self_status())).expect("host has a display host");
+        assert_eq!(host.host_name, "gaming-pc");
+        assert!(host.online, "self node is online");
+    }
+
+    #[test]
+    fn guest_role_has_no_self_display_host() {
+        let room = RoomStateRow {
+            role: RoomRole::Guest,
+            ..Default::default()
+        };
+        assert!(
+            display_host_for(&room, Some(&self_status())).is_none(),
+            "guests only use a discovered peer"
+        );
+    }
+
+    #[test]
+    fn discovered_peer_wins_over_self_host() {
+        let mut room = RoomStateRow {
+            role: RoomRole::Host,
+            ..Default::default()
+        };
+        room.host = Some(HostInfo {
+            node_key: "nodekey:peer:host".into(),
+            host_name: "abcd-1234-host".into(),
+            dns_name: "abcd-1234-host.ts.net".into(),
+            tailnet_ips: vec!["100.64.0.10".into()],
+            online: true,
+        });
+        let shown = display_host_for(&room, Some(&self_status()));
+        assert_eq!(
+            shown.as_ref().map(|h| h.node_key.as_str()),
+            Some("nodekey:peer:host"),
+            "a resolved peer always wins over the self node"
+        );
+    }
+
+    #[test]
+    fn no_self_node_means_no_display_host() {
+        let room = RoomStateRow {
+            role: RoomRole::Host,
+            ..Default::default()
+        };
+        assert!(
+            display_host_for(&room, Some(&TailscaleStatus {
+                version: None,
+                backend_state: None,
+                auth_url: None,
+                current_tailnet: None,
+                self_node: None,
+                peer: None,
+                user: None,
+                magic_dns_suffix: None,
+            }))
+            .is_none()
+        );
     }
 }

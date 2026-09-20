@@ -42,6 +42,11 @@ pub struct RoomStateRow {
     pub minecraft_port: Option<u16>,
     /// TCP port of the VoidLink control bridge on the host.
     pub void_link_port: u16,
+    /// The machine's Tailscale hostname BEFORE the temporary `<room>-host`
+    /// discovery hint was applied. Restored when the host leaves the room so
+    /// the user's machine name is never left permanently renamed. Empty for
+    /// guests / machines where no hint was ever set.
+    pub previous_hostname: Option<String>,
 }
 
 impl Default for RoomStateRow {
@@ -53,6 +58,7 @@ impl Default for RoomStateRow {
             host: None,
             minecraft_port: None,
             void_link_port: crate::rooms::void_link::VOID_LINK_PORT,
+            previous_hostname: None,
         }
     }
 }
@@ -88,9 +94,18 @@ pub struct RoomStateManager {
 
 impl RoomStateManager {
     /// Load (or create) the persisted room state for `data_dir`.
+    ///
+    /// A persisted `Host` room is a room *restored after an app restart*; the
+    /// Minecraft world that advertised `minecraft_port` is gone, so the stale
+    /// port is cleared at load time and the cleared value is persisted — a
+    /// restart must never re-advertise an expired port.
     pub fn new(data_dir: &Path) -> Self {
         let dir = crate::rooms::rooms_dir(data_dir);
-        let row = resolve_persisted(&dir).unwrap_or_default();
+        let mut row = resolve_persisted(&dir).unwrap_or_default();
+        if row.role == RoomRole::Host && row.minecraft_port.is_some() {
+            row.minecraft_port = None;
+            let _ = persist_row(&dir, &row);
+        }
         // A fresh row must carry the default bridge port even if the file
         // predates it (serde `#[serde(default)]` on the field handles the
         // missing-key case; this covers a full-default fallback too).
@@ -114,6 +129,33 @@ impl RoomStateManager {
 
     pub fn void_link_port(&self) -> u16 {
         self.snapshot().void_link_port
+    }
+
+    /// The host's machine name captured before the temporary room hint was
+    /// applied (None when no hint was ever set or the room ended).
+    pub fn previous_hostname(&self) -> Option<String> {
+        self.snapshot().previous_hostname
+    }
+
+    /// Remember the machine's pre-room hostname so `leave` can restore it.
+    /// Only the FIRST remembered name is kept: a re-created room while a hint
+    /// is active would otherwise capture the hint itself as the "original".
+    pub fn remember_original_hostname(&self, name: &str) -> crate::error::Result<()> {
+        let mut row = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if row.previous_hostname.is_some() {
+            return Ok(());
+        }
+        row.previous_hostname = Some(name.to_string());
+        self.persist_locked(&row)
+    }
+
+    /// Override the control-bridge port; used by tests to bind an ephemeral
+    /// port instead of the production `48888`.
+    #[cfg(test)]
+    pub fn set_void_link_port(&self, port: u16) -> crate::error::Result<()> {
+        let mut row = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        row.void_link_port = port;
+        self.persist_locked(&row)
     }
 
     /// Create a room as host. Idempotent for the same room name.
@@ -154,7 +196,8 @@ impl RoomStateManager {
         Ok(out)
     }
 
-    /// Leave the room. The Tailscale Machine Sharing grant is preserved.
+    /// Leave the room. The Tailscale Machine Sharing grant is preserved; the
+    /// temporary hostname hint is cleared for `cmd_room_leave` to restore.
     pub fn leave(&self) -> crate::error::Result<RoomStateRow> {
         let mut row = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         row.role = RoomRole::None;
@@ -162,6 +205,7 @@ impl RoomStateManager {
         row.room_name = None;
         row.host = None;
         row.minecraft_port = None;
+        row.previous_hostname = None;
         let out = row.clone();
         self.persist_locked(&row)?;
         Ok(out)
@@ -187,13 +231,16 @@ impl RoomStateManager {
     }
 
     fn persist_locked(&self, row: &RoomStateRow) -> crate::error::Result<()> {
-        let dir = crate::rooms::rooms_dir(&self.data_dir);
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(ROOMS_FILE);
-        let json = serde_json::to_string_pretty(row)?;
-        std::fs::write(path, json)?;
-        Ok(())
+        persist_row(&crate::rooms::rooms_dir(&self.data_dir), row)
     }
+}
+
+fn persist_row(dir: &Path, row: &RoomStateRow) -> crate::error::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(ROOMS_FILE);
+    let json = serde_json::to_string_pretty(row)?;
+    std::fs::write(path, json)?;
+    Ok(())
 }
 
 fn resolve_persisted(dir: &Path) -> Option<RoomStateRow> {
@@ -265,6 +312,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vl_rooms_test_{}", std::process::id()));
         let mgr = RoomStateManager::new(&dir);
         mgr.create_room(Some("Вечерняя игра".into())).unwrap();
+        mgr.remember_original_hostname("gaming-pc").unwrap();
         mgr.set_minecraft_port(Some(45565)).unwrap();
         mgr.set_host(Some(HostInfo {
             node_key: "node-key-1".into(),
@@ -279,8 +327,11 @@ mod tests {
         let row = loaded.snapshot();
         assert_eq!(row.role, RoomRole::Host);
         assert_eq!(row.room_name.as_deref(), Some("Вечерняя игра"));
-        assert_eq!(row.minecraft_port, Some(45565));
+        // The advertised port never survives a restart (stale-port policy).
+        assert_eq!(row.minecraft_port, None, "stale port must be cleared on restore");
         assert_eq!(row.host.as_ref().map(|h| h.node_key.as_str()), Some("node-key-1"));
+        // The pre-room hostname survives so a later `leave` can restore it.
+        assert_eq!(row.previous_hostname.as_deref(), Some("gaming-pc"));
 
         // Leaving preserves nothing on the launcher side (share lives in Tailscale).
         loaded.leave().unwrap();
@@ -288,6 +339,55 @@ mod tests {
         assert_eq!(row.role, RoomRole::None);
         assert!(row.room_id.is_none());
         assert!(row.host.is_none());
+        assert!(row.previous_hostname.is_none(), "hint origin cleared on leave");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persisted_host_room_clears_stale_port_on_restart() {
+        let dir = std::env::temp_dir().join(format!("vl_rooms_stale_{}", std::process::id()));
+        let mgr = RoomStateManager::new(&dir);
+        mgr.create_room(None).unwrap();
+        mgr.set_minecraft_port(Some(45565)).unwrap();
+
+        // Simulate an app restart: the same persisted file is re-read by a
+        // fresh manager. The stale port must not be advertised again — and
+        // the cleared value must be written back to disk.
+        let reloaded = RoomStateManager::new(&dir);
+        let snap = reloaded.snapshot();
+        assert_eq!(snap.role, RoomRole::Host, "role survives restart");
+        assert_eq!(snap.minecraft_port, None, "stale port cleared on restart");
+
+        let on_disk = resolve_persisted(&crate::rooms::rooms_dir(&dir)).expect("file");
+        assert_eq!(on_disk.minecraft_port, None, "cleared port persisted");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn original_hostname_remembered_once_and_cleared_on_leave() {
+        let dir = std::env::temp_dir().join(format!("vl_rooms_hint_{}", std::process::id()));
+        let mgr = RoomStateManager::new(&dir);
+        mgr.create_room(None).unwrap();
+
+        // First room session: capture the real machine name.
+        mgr.remember_original_hostname("gaming-pc").unwrap();
+        assert_eq!(mgr.previous_hostname().as_deref(), Some("gaming-pc"));
+
+        // Re-entry while a hint `<code>-host` is active must NOT overwrite the
+        // original with the hint itself — the first name sticks.
+        mgr.remember_original_hostname("abcd-1234-host").unwrap();
+        assert_eq!(
+            mgr.previous_hostname().as_deref(),
+            Some("gaming-pc"),
+            "first remembered hostname must stick"
+        );
+
+        // Leaving the room drops the remembered name (the hint is restored by
+        // the command layer), so the NEXT room session can capture again.
+        mgr.leave().unwrap();
+        assert!(mgr.previous_hostname().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }

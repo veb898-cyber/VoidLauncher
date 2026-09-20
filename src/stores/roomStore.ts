@@ -35,7 +35,6 @@ export interface RoomStatus {
   bridgePort: number;
   endpoint: string | null;
   hostOnline: boolean;
-  discoveryError: string | null;
 }
 
 /** Progress payload of the `room_progress` event. */
@@ -48,7 +47,6 @@ export interface RoomProgress {
 interface RoomStore {
   status: RoomStatus | null;
   progress: RoomProgress | null;
-  detectedPort: number | null;
   busy: boolean;
   error: string | null;
   loaded: boolean;
@@ -69,7 +67,6 @@ interface RoomStore {
 export const useRoomStore = create<RoomStore>((set, get) => ({
   status: null,
   progress: null,
-  detectedPort: null,
   busy: false,
   error: null,
   loaded: false,
@@ -99,7 +96,7 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
       const status = await invoke<RoomStatus>('cmd_room_create_host', {
         roomName: roomName.trim() || null,
       });
-      set({ status, busy: false, detectedPort: null });
+      set({ status, busy: false });
     } catch (e: any) {
       set({ busy: false, error: e.toString() });
     }
@@ -111,7 +108,7 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
       const status = await invoke<RoomStatus>('cmd_room_join_guest', {
         roomCode: roomCode.trim(),
       });
-      set({ status, busy: false, detectedPort: null });
+      set({ status, busy: false });
     } catch (e: any) {
       set({ busy: false, error: e.toString() });
     }
@@ -121,7 +118,7 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
     set({ busy: true, error: null });
     try {
       const status = await invoke<RoomStatus>('cmd_room_leave');
-      set({ status, busy: false, progress: null, detectedPort: null });
+      set({ status, busy: false, progress: null });
     } catch (e: any) {
       set({ busy: false, error: e.toString() });
     }
@@ -139,10 +136,7 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
   detectMinecraftPort: async () => {
     try {
       const port = await invoke<number | null>('cmd_room_detect_minecraft_port');
-      set({ detectedPort: port ?? null });
-      if (port && port > 0) {
-        await invoke('cmd_room_report_minecraft_port', { port });
-      }
+      await invoke('cmd_room_report_minecraft_port', { port: port ?? null });
       await get().loadStatus();
       return port ?? null;
     } catch (e: any) {

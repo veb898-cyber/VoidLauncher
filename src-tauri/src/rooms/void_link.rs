@@ -21,15 +21,29 @@
 use crate::rooms::room_state::{RoomRole, RoomStateManager};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Default TCP port of the control bridge.
 pub const VOID_LINK_PORT: u16 = 48888;
 
-/// Single-instance guard so only one bridge task ever binds the port.
-static VOID_LINK_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
+/// The currently bound host-side bridge task, if any. Only one bridge ever
+/// lives at a time. The task is tied to the tailnet IP it was bound to; when
+/// the room ends or the IP changes, the old task is aborted and a fresh
+/// bridge is started on the current address.
+static VOID_LINK_STATE: std::sync::OnceLock<std::sync::Mutex<Option<BridgeTask>>> =
+    std::sync::OnceLock::new();
+
+/// A running control-bridge task bound to a single tailnet IP.
+struct BridgeTask {
+    /// Tailnet IP this bridge is bound to (e.g. `100.101.102.103`).
+    ip: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn void_link_state() -> &'static std::sync::Mutex<Option<BridgeTask>> {
+    VOID_LINK_STATE.get_or_init(|| std::sync::Mutex::new(None))
+}
 
 /// Control payload the host's bridge answers with.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,44 +196,74 @@ pub fn bind_addr(self_ip: &str, port: u16) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-/// Start the host-side bridge on the tailnet IP. Safe to call repeatedly —
-/// only the first call actually binds the port; later calls are no-ops.
+/// Start the host-side bridge on the tailnet IP. Safe to call repeatedly:
+/// a bridge already bound to the *same* IP is reused (idempotent no-op);
+/// a bridge bound to a different/stale IP (or an exited accept loop) is
+/// aborted and a fresh listener is bound to the requested address.
 pub async fn ensure_void_link_server(
     self_ip: String,
     room_state: Arc<RoomStateManager>,
 ) -> crate::error::Result<()> {
-    if VOID_LINK_TASK_RUNNING.swap(true, Ordering::SeqCst) {
-        return Ok(());
-    }
-    let port = room_state.void_link_port();
-    let bound = async {
-        let addr = bind_addr(&self_ip, port).ok_or_else(|| {
-            crate::error::LauncherError::Launch(format!("Invalid tailnet IP for the bridge: {}", self_ip))
-        })?;
-        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-            crate::error::LauncherError::Launch(format!("VoidLink bind {}: {}", addr, e))
-        })?;
-        Ok::<_, crate::error::LauncherError>((addr, listener))
-    }
-    .await;
-
-    let (addr, listener) = match bound {
-        Ok(pair) => pair,
-        Err(e) => {
-            // Release the single-instance guard: a failed start must not make
-            // every later attempt a silent no-op ("Ok" without a bridge).
-            VOID_LINK_TASK_RUNNING.store(false, Ordering::SeqCst);
-            return Err(e);
+    // Reconcile the current bridge OUTSIDE the await: no lock may be held
+    // across `bind().await` (the Tauri command future must stay `Send`).
+    {
+        let mut state = void_link_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match state.as_mut() {
+            Some(b) if b.ip == self_ip && !b.task.is_finished() => {
+                return Ok(());
+            }
+            Some(b) => {
+                // Stale bridge: bound to a previous IP, or the accept loop
+                // exited. Abort it so the old listener stops serving, then
+                // re-bind below.
+                if !b.task.is_finished() {
+                    b.task.abort();
+                }
+            }
+            None => {}
         }
-    };
+        *state = None;
+    } // guard dropped here, before the await
+
+    let port = room_state.void_link_port();
+    let addr = bind_addr(&self_ip, port).ok_or_else(|| {
+        crate::error::LauncherError::Launch(format!(
+            "Invalid tailnet IP for the bridge: {}",
+            self_ip
+        ))
+    })?;
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        crate::error::LauncherError::Launch(format!("VoidLink bind {}: {}", addr, e))
+    })?;
     tracing::info!(target: "rooms", "VoidLink bridge listening on {}", addr);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(e) = void_link_server(listener, room_state).await {
             tracing::error!(target: "rooms", "VoidLink server error: {}", e);
         }
-        VOID_LINK_TASK_RUNNING.store(false, Ordering::SeqCst);
     });
+
+    // Own the bridge now that it is fully started.
+    let mut state = void_link_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *state = Some(BridgeTask { ip: self_ip, task });
     Ok(())
+}
+
+/// Abort the host-side bridge (the room ended). The bridge never outlives a
+/// room session; the next `ensure_void_link_server` binds a fresh listener on
+/// the current tailnet IP.
+pub fn stop_void_link_server() {
+    let mut state = void_link_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(b) = state.take() {
+        if !b.task.is_finished() {
+            b.task.abort();
+        }
+    }
 }
 
 /// Locate `needle` in `haystack`; used to find the end of HTTP headers.

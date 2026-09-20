@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::error::{LauncherError, Result};
+use crate::rooms::peer_discovery::{HostInfo, PeerInfo};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -117,6 +118,24 @@ impl TailscaleManager {
     /// MagicDNS suffix (e.g. "tail3e2a10.ts.net").
     pub fn magic_dns_suffix(status: &TailscaleStatus) -> Option<String> {
         status.magic_dns_suffix.clone().filter(|s| !s.is_empty())
+    }
+
+    /// The node's own friendly hostname — exactly the value that
+    /// `tailscale set --hostname` expects. Used to restore the original name
+    /// after a temporary room-hint rename.
+    pub fn self_hostname(status: &TailscaleStatus) -> Option<String> {
+        status
+            .self_node
+            .as_ref()
+            .and_then(|n| n.host_name.clone())
+            .and_then(|h| sanitize_hostname(&h).ok())
+    }
+
+    /// The local node as a *host* endpoint. The HOST machine never has a
+    /// discovered peer, but the status UI needs a host to render
+    /// port-found/endpoint state — this presents the machine itself.
+    pub fn self_host_info(status: &TailscaleStatus) -> Option<HostInfo> {
+        status.self_node.as_ref().map(PeerInfo::from).map(|p| HostInfo::from_peer(&p))
     }
 
     /// Start the interactive login flow. Returns once `tailscale up` has
@@ -825,6 +844,22 @@ mod tests {
         );
         assert!(sanitize_hostname("-").is_err());
         assert!(sanitize_hostname("").is_err());
+    }
+
+    #[test]
+    fn self_hostname_is_the_sanitized_machine_name() {
+        let status = TailscaleManager::parse_status(STATUS_V2).unwrap();
+        assert_eq!(TailscaleManager::self_hostname(&status).as_deref(), Some("desktop-pc"));
+    }
+
+    #[test]
+    fn self_host_info_exposes_the_node_as_a_host_endpoint() {
+        let status = TailscaleManager::parse_status(STATUS_V2).unwrap();
+        let info = TailscaleManager::self_host_info(&status).expect("self host info");
+        assert_eq!(info.host_name, "desktop-pc");
+        assert_eq!(info.dns(), Some("desktop-pc.tail3e2a10.ts.net"));
+        assert_eq!(info.ip(), Some("100.101.102.103"));
+        assert!(info.online, "self node is online");
     }
 
     #[test]

@@ -26,7 +26,8 @@ use super::peer_discovery::{peers_from_status, resolve_host_for_room};
 use super::room_state::{valid_room_id, RoomRole, RoomStateManager};
 use super::tailscale::{PeerNode, TailscaleStatus};
 use super::void_link::{
-    bind_addr, ensure_void_link_server, query_host_status, void_link_server, VOID_LINK_PORT,
+    bind_addr, ensure_void_link_server, query_host_status, stop_void_link_server,
+    void_link_server, VOID_LINK_PORT,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +42,16 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("vl_e2e_{}_{}_{}", tag, std::process::id(), nanos));
     std::fs::remove_dir_all(&dir).ok();
     dir
+}
+
+/// Grab an ephemeral loopback port by binding to port 0 and dropping the
+/// listener. A tiny TOCTOU window with the real bind in the code under test
+/// is acceptable for a local harness.
+async fn pick_free_port() -> u16 {
+    let l = tokio::net::TcpListener::bind((HOST_IP, 0)).await.expect("bind ephemeral");
+    let port = l.local_addr().expect("local addr").port();
+    drop(l);
+    port
 }
 
 /// Send a raw HTTP/1.1 request over loopback and return (status_code, body).
@@ -188,8 +199,13 @@ async fn room_control_plane_lifecycle_over_loopback() {
     let snap = reloaded.snapshot();
     assert_eq!(snap.role, RoomRole::Host, "role survives restart");
     assert_eq!(snap.room_id.as_deref(), Some(code2.as_str()), "room id survives restart");
-    assert_eq!(snap.minecraft_port, Some(45679), "port survives restart");
-    println!("[e2e] restart: state persisted (role/room/port)");
+    // The advertised LAN port belongs to the world that was open before the
+    // restart; it must NOT be advertised again (stale-port policy), and the
+    // cleared value is written back to disk.
+    assert_eq!(snap.minecraft_port, None, "stale port cleared on restart");
+    let on_disk = RoomStateManager::new(&host_dir).snapshot();
+    assert_eq!(on_disk.minecraft_port, None, "cleared port persisted");
+    println!("[e2e] restart: role/room survive, stale port cleared");
 
     // ---------- 10. Discovery logic: hostname hint resolves the host ----------
     let peers = hinted_host(&code2);
@@ -223,7 +239,7 @@ async fn room_control_plane_lifecycle_over_loopback() {
     println!("[e2e] DONE (loopback control plane)");
 }
 
-/// Regression: a failed bridge start must release the single-instance guard,
+/// Regression: a failed bridge start must leave the bridge manager empty,
 /// otherwise every later Create Room silently no-ops and the guest never gets
 /// a port. The invalid-IP path fails before opening any socket, so this test
 /// never binds the fixed production port.
@@ -238,9 +254,60 @@ async fn void_link_flag_recovers_after_start_error() {
     let second = ensure_void_link_server("also-not-an-ip".into(), state.clone()).await;
     assert!(
         second.is_err(),
-        "guard must be reset after the first failure (a stuck guard would return Ok)"
+        "manager must be empty after the first failure (a stuck bridge would return Ok)"
     );
 
     std::fs::remove_dir_all(&dir).ok();
-    println!("[e2e] guard recovered after start error");
+    println!("[e2e] bridge manager empty after start error");
+}
+
+/// The host-side bridge follows the room session: idempotent for the same IP,
+/// rebinds when the tailnet IP changes, and is torn down on leave so a stale
+/// listener never outlives the room.
+#[tokio::test]
+async fn void_link_bridge_tracks_room_and_rebinds() {
+    let dir = temp_dir("bridge");
+    let state = Arc::new(RoomStateManager::new(&dir));
+    let row = state.create_room(None).expect("create room");
+    let code = row.room_id.expect("room id");
+
+    let port_a = pick_free_port().await;
+    state.set_void_link_port(port_a).unwrap();
+    ensure_void_link_server(HOST_IP.into(), state.clone())
+        .await
+        .expect("first bind");
+    let q = query_host_status(HOST_IP, port_a, &code).await.expect("bridge serves");
+    assert_eq!(q.room_id, code, "first bind answers");
+
+    // Same IP again → idempotent reuse, the live handler keeps answering.
+    ensure_void_link_server(HOST_IP.into(), state.clone())
+        .await
+        .expect("idempotent same ip");
+    let q2 = query_host_status(HOST_IP, port_a, &code).await.expect("still serves");
+    assert_eq!(q2.room_id, code, "idempotent call must not kill the bridge");
+
+    // IP change → the old listener is aborted and a fresh one answers on the
+    // NEW address (rebind with the current tailnet IP).
+    let port_b = pick_free_port().await;
+    state.set_void_link_port(port_b).unwrap();
+    ensure_void_link_server("127.0.0.2".into(), state.clone())
+        .await
+        .expect("rebind new ip");
+    assert!(
+        query_host_status(HOST_IP, port_a, &code).await.is_err(),
+        "old listener must be aborted on IP change"
+    );
+    let q3 = query_host_status("127.0.0.2", port_b, &code).await.expect("new bridge serves");
+    assert_eq!(q3.room_id, code, "rebound bridge answers");
+
+    // Leave → the bridge never outlives the room session.
+    state.leave().expect("leave");
+    stop_void_link_server();
+    assert!(
+        query_host_status("127.0.0.2", port_b, &code).await.is_err(),
+        "bridge must be stopped on leave"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    println!("[e2e] bridge idempotent / rebind / torn down on leave");
 }
