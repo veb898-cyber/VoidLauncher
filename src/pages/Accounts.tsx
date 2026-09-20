@@ -11,6 +11,7 @@ import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
 import { addToast } from '../components/ui/Toast';
 import { Trash2, Shirt, UserRoundPlus } from 'lucide-react';
 import { t } from '../lib/i18n';
+import { Avatar } from '../lib/remoteImage';
 
 /**
  * Validate an offline-account username on the frontend.
@@ -152,28 +153,19 @@ export function Accounts() {
               border: acc.default ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
             }}>
             {acc.uuid ? (
-              <img
-                src={`https://mc-heads.net/avatar/${acc.uuid}/40`}
-                referrerPolicy="no-referrer"
-                alt={acc.name}
-                style={{ width: 40, height: 40, borderRadius: 'var(--radius-md)' }}
-                onError={(e) => {
-                  const img = e.currentTarget;
-                  img.style.display = 'none';
-                  const fb = img.nextElementSibling as HTMLElement | null;
-                  if (fb) fb.style.display = 'flex';
+              <Avatar uuid={acc.uuid} name={acc.name} size={40} />
+            ) : (
+              <div
+                className="account-card__avatar"
+                style={{
+                  background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  width: 40, height: 40, borderRadius: 'var(--radius-md)', flexShrink: 0,
+                  fontWeight: 700, fontSize: 'var(--font-size-lg)', color: getTypeColor(acc.account_type),
                 }}
-              />
-            ) : null}
-            <div style={{
-              width: 40, height: 40, borderRadius: 'var(--radius-md)',
-              display: acc.uuid ? 'none' : 'flex',
-              alignItems: 'center', justifyContent: 'center',
-              background: 'var(--surface-glass)', fontWeight: 700, fontSize: 'var(--font-size-lg)',
-              color: getTypeColor(acc.account_type),
-            }}>
-              {acc.name.charAt(0).toUpperCase()}
-            </div>
+              >
+                {acc.name.charAt(0).toUpperCase()}
+              </div>
+            )}
             <div style={{ flex: 1 }}>
               <div style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
                 {acc.name}

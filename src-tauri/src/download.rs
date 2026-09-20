@@ -53,6 +53,7 @@ pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
     "maven.minecraftforge.net",
     "maven.neoforged.net",
     "maven.creeperhost.net",
+    "mc-heads.net",
     "repo.maven.apache.org",
     "meta.fabricmc.net",
     "meta.prismlauncher.org",

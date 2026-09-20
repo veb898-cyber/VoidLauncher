@@ -11,6 +11,7 @@ import { createPortal } from 'react-dom';
 import { addToast } from '../components/ui/Toast';
 import { invoke } from '@tauri-apps/api/core';
 import { BANNER_PRESETS, isGradientBanner, getGradientValue } from '../lib/bannerPresets';
+import { Avatar } from '../lib/remoteImage';
 
 interface HomeProps {
   onNavigate: (page: string) => void;
@@ -135,17 +136,7 @@ export function Home({ onNavigate }: HomeProps) {
       {/* Top bar: greeting + quick play */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-lg)' }}>
         {activeId ? (
-          <img
-            src={`https://mc-heads.net/avatar/${activeId}/56`}
-            referrerPolicy="no-referrer"
-            alt={activeName ?? ''}
-            style={{ width: 56, height: 56, borderRadius: 'var(--radius-md)' }}
-            onError={(e) => {
-              const ch = encodeURIComponent((activeName ?? '?').charAt(0).toUpperCase());
-              (e.target as HTMLImageElement).src =
-                `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56"><rect fill="%23333" width="56" height="56" rx="10"/><text x="28" y="36" text-anchor="middle" fill="%23999" font-size="24">${ch}</text></svg>`;
-            }}
-          />
+            <Avatar uuid={activeId} name={activeName ?? ''} size={56} />
         ) : (
           <div style={{
             width: 56, height: 56,

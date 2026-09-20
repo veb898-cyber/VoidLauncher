@@ -16,6 +16,7 @@ import { useT, type Language } from '../lib/i18n';
 import { useLanguageStore } from '../stores/languageStore';
 import { useThemeStore, Theme } from '../stores/themeStore';
 import { useFontStore, Font, ConsoleFont } from '../stores/fontStore';
+import { Avatar } from '../lib/remoteImage';
 import { Tooltip } from '../components/ui/Tooltip';
 import {
   APP_VERSION,
@@ -734,17 +735,7 @@ function AccountCard({
     <div className="glass-card" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xl)', padding: 'var(--space-xl)' }}>
       {hasAccount ? (
         <>
-          <img
-            src={`https://mc-heads.net/avatar/${avatarUuid}/48`}
-            referrerPolicy="no-referrer"
-            alt={activeName}
-            style={{ width: 48, height: 48, borderRadius: 'var(--radius-md)' }}
-            onError={(e) => {
-              const ch = encodeURIComponent(activeName.charAt(0).toUpperCase());
-              (e.target as HTMLImageElement).src =
-                `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48"><rect fill="%23333" width="48" height="48" rx="8"/><text x="24" y="31" text-anchor="middle" fill="%23999" font-size="20">${ch}</text></svg>`;
-            }}
-          />
+          <Avatar uuid={avatarUuid ?? ''} name={activeName ?? ''} size={48} />
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 600, fontSize: 'var(--font-size-lg)' }}>{activeName}</div>
             <div style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>

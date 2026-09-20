@@ -2,6 +2,7 @@ import { useAuthStore } from '../stores/authStore';
 import { GameRunningBadge } from './launch/GameRunningBadge';
 import { Tooltip } from './ui/Tooltip';
 import { t } from '../lib/i18n';
+import { Avatar } from '../lib/remoteImage';
 
 interface SidebarProps {
   activePage: string;
@@ -48,14 +49,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
             className="sidebar__avatar"
             onClick={() => onNavigate('accounts')}
           >
-            <img
-              src={`https://mc-heads.net/avatar/${profile.id}/36`}
-              referrerPolicy="no-referrer"
-              alt={profile.name}
-              onError={(e) => {
-                (e.target as HTMLImageElement).src = `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36"><rect fill="%23333" width="36" height="36" rx="6"/><text x="18" y="23" text-anchor="middle" fill="%23999" font-size="16">${profile.name.charAt(0).toUpperCase()}</text></svg>`;
-              }}
-            />
+            <Avatar uuid={profile.id} name={profile.name} size={36} />
           </div>
         ) : (
           <Tooltip content={t('sidebar.login')}>
@@ -94,13 +88,24 @@ function InstancesIcon() {
 }
 
 function RoomsIcon() {
+  // "Rooms" = P2P multiplayer: two peer monitors connected by a direct
+  // link (both heads are peers, neither is a server) — a small P2P node sits
+  // mid-link the way a room's join-token sits between the two players.
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="2" y="16" width="6" height="6" rx="1" />
-      <rect x="16" y="16" width="6" height="6" rx="1" />
-      <rect x="9" y="2" width="6" height="6" rx="1" />
-      <path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3" />
-      <path d="M12 12V8" />
+      {/* Peer A — верхний-правый монитор */}
+      <rect x="13" y="2" width="9" height="7.5" rx="1.2" />
+      <path d="M17.5 9.5V12" />
+      <path d="M15.25 12h4.5" />
+
+      {/* Peer B — нижний-левый монитор */}
+      <rect x="2" y="13.5" width="9" height="7.5" rx="1.2" />
+      <path d="M6.5 21V22.5" />
+      <path d="M4.25 22.5h4.5" />
+
+      {/* P2P-линк между ближними углами + узел-соединение */}
+      <path d="M13 9.5C12 10.8 12 11.8 11 13.2" />
+      <circle cx="12" cy="11.3" r="1.1" fill="currentColor" stroke="none" />
     </svg>
   );
 }
