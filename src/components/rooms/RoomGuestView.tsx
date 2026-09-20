@@ -32,6 +32,8 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
   const leave = useRoomStore((s) => s.leave);
   const busy = useRoomStore((s) => s.busy);
   const launchGame = useInstanceStore((s) => s.launchGame);
+  const isLaunching = useInstanceStore((s) => s.isLaunching);
+  const launchStatus = useInstanceStore((s) => s.launchStatus);
 
   const [selected, setSelected] = useState<string>(instances[0]?.name ?? '');
   const [autoJoin, setAutoJoin] = useState<boolean | null>(null);
@@ -128,11 +130,17 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
                 <p style={{ color: 'var(--text-tertiary)', margin: 0 }}>{t('rooms.no_instances')}</p>
               )}
             </div>
-            <Button onClick={handleJoin} disabled={!selected} loading={autoJoin === null}>
+            <Button onClick={handleJoin} disabled={!selected} loading={autoJoin === null || isLaunching}>
               <Play size={16} style={{ marginRight: 6 }} />
               {autoJoin ? t('rooms.guest_join') : t('rooms.guest_launch_manual')}
             </Button>
           </div>
+
+          {isLaunching && launchStatus && (
+            <p style={{ margin: 'var(--space-md) 0 0', color: 'var(--text-tertiary)', fontSize: 'var(--font-size-sm)' }}>
+              {launchStatus}
+            </p>
+          )}
 
           <div
             onClick={copyEndpoint}

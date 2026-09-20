@@ -330,6 +330,7 @@ pub fn run() {
             commands::rooms::cmd_room_report_minecraft_port,
             commands::rooms::cmd_room_detect_minecraft_port,
             commands::rooms::cmd_room_join_args,
+            commands::rooms::cmd_room_quick_play_join_status,
             commands::rooms::cmd_room_open_admin_console,
         ])
         .on_window_event(|window, event| {

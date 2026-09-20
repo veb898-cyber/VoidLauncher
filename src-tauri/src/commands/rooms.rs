@@ -4,7 +4,9 @@
 // and forwards progress to the frontend as events.
 
 use crate::events;
-use crate::rooms::minecraft_connector::{compose_endpoint, MinecraftConnector};
+use crate::rooms::minecraft_connector::{
+    compose_endpoint, parse_quick_play_confirmation, MinecraftConnector,
+};
 use crate::rooms::peer_discovery::{resolve_host_for_room, HostInfo};
 use crate::rooms::room_state::{RoomRole, RoomStateManager, RoomStateRow};
 use crate::rooms::tailscale::{TailscaleManager, TailscaleStatus, TailscaleStatusPublic};
@@ -399,6 +401,21 @@ pub fn cmd_room_join_args(
     Ok(MinecraftConnector::default()
         .discovery()
         .build_join_args(&mc_version, host.trim(), port))
+}
+
+/// Confirm an auto-join actually connected. For Quick Play versions (1.20+)
+/// the client writes a JSON log at the `--quickPlayPath` the launcher passed
+/// it; this reads the current session's copy and reports the joined world.
+/// `None` means no confirmation yet (game still loading, or the version has
+/// no Quick Play join log — e.g. legacy `--server/--port` up to 1.19.4).
+#[tauri::command]
+pub fn cmd_room_quick_play_join_status() -> Result<Option<crate::rooms::minecraft_connector::QuickJoinInfo>, String> {
+    let Some(path) = crate::game_logs::get_current_log_path() else {
+        return Ok(None);
+    };
+    let quickplay_path = format!("{}.quickplay.json", path);
+    let text = std::fs::read_to_string(&quickplay_path).unwrap_or_default();
+    Ok(parse_quick_play_confirmation(&text))
 }
 
 /// Revoke access: open the Tailscale Admin Console where the owner removes

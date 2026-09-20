@@ -520,17 +520,37 @@ pub fn launch_minecraft(
         }
     }
 
-    // Room auto-join (legacy `--server/--port`, Minecraft ≤ 1.18). Newer
-    // versions are joined manually via Direct Connect (see MinecraftConnector).
+    // Room auto-join, version-aware. Minecraft ≤ 1.19.4 still supports the
+    // legacy `--server/--port` pair; from 1.20+ (including 26.x and
+    // snapshots) the client reads Quick Play arguments instead:
+    // `--quickPlayMultiplayer <host>:<port>` plus `--quickPlayPath` — the
+    // client writes a machine-readable join-log there on a successful
+    // connection, which the launcher uses to confirm the auto-join.
     if let (Some(host), Some(port)) = (
         server_address.filter(|h| !h.trim().is_empty()),
         server_port,
     ) {
-        args.push("--server".to_string());
-        args.push(host.trim().to_string());
-        args.push("--port".to_string());
-        args.push(port.to_string());
-        tracing::info!(target: "launcher", "Room join args: --server {} --port {}", host.trim(), port);
+        let connector = crate::rooms::minecraft_connector::MinecraftConnector::default();
+        let join_args = connector
+            .discovery()
+            .build_join_args(&instance.mc_version, host.trim(), port);
+        if let Some(mut join_args) = join_args {
+            // For Quick Play, also hand the client the log file to write so
+            // the join can be verified (path derived from the active session).
+            if connector.discovery().join_mechanism(&instance.mc_version)
+                == Some(crate::rooms::minecraft_connector::JoinMechanism::QuickPlay)
+            {
+                if let Some(session_path) = crate::game_logs::get_current_log_path() {
+                    let quickplay_log = format!("{}.quickplay.json", session_path);
+                    join_args.push("--quickPlayPath".to_string());
+                    join_args.push(quickplay_log);
+                }
+            }
+            tracing::info!(target: "launcher", "Room join args for MC {}: {:?}", instance.mc_version, join_args);
+            args.extend(join_args);
+        } else {
+            tracing::warn!(target: "launcher", "MC {} has no auto-join mechanism; joining manually", instance.mc_version);
+        }
     }
 
     // 6. Launch

@@ -215,7 +215,7 @@ async fn room_control_plane_lifecycle_over_loopback() {
     assert_eq!(resolved.dns(), Some(expected_dns.as_str()), "resolved host dns");
     println!("[e2e] discovery: hostname hint resolved peer");
 
-    // ---------- 11. MC port parsing + legacy join args ----------
+    // ---------- 11. MC port parsing + version-aware join args ----------
     let log = "[12:00:00] [Server thread/INFO]: Local game hosted on port 45565";
     assert_eq!(LanLogDiscovery.detect_mc_port(log), Some(45565), "LAN port from log");
     assert_eq!(
@@ -230,10 +230,13 @@ async fn room_control_plane_lifecycle_over_loopback() {
     );
     assert_eq!(
         LanLogDiscovery.build_join_args("1.21.4", "100.64.0.10", 45565),
-        None,
-        "1.19+ has no auto-join (manual Direct Connect)"
+        Some(vec![
+            "--quickPlayMultiplayer".to_string(),
+            "100.64.0.10:45565".to_string()
+        ]),
+        "1.20+ auto-joins via Quick Play"
     );
-    println!("[e2e] mc connector: port parse ok, legacy args ok, 1.19+ = manual");
+    println!("[e2e] mc connector: port parse ok, legacy + quickplay join args ok");
 
     std::fs::remove_dir_all(&host_dir).ok();
     println!("[e2e] DONE (loopback control plane)");

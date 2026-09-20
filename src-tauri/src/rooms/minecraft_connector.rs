@@ -1,21 +1,34 @@
 //! MinecraftConnector: a thin layer between the room and the game launch.
 //!
-//! Kept abstract so the join mechanism can evolve (quickPlayMultiplayer,
-//! dedicated servers, embedded-server mods) without touching the Room UI:
-//! the Room UI sees only "here is the endpoint / join it (or not)".
+//! Kept abstract so the join mechanism can evolve (dedicated servers,
+//! embedded-server mods) without touching the Room UI: the Room UI sees only
+//! "here is the endpoint / join it (or not)".
 //!
-//! MVP implementation: read the "Open to LAN" port from the game's own
-//! output stream (captured by `game_logs`), and join via legacy
-//! `--server <host> --port <port>` arguments for Minecraft ≤ 1.18.
-//! For newer versions automatic join is not yet wired (needs a
-//! compatibility test of `--quickPlayMultiplayer`) — the UI offers the
-//! endpoint string for a manual Direct Connect instead.
+//! Implementation: detect the "Open to LAN" port from the game's own output
+//! stream (captured by `game_logs`), and auto-join version-selectively:
+//!   * Minecraft ≤ 1.19.4 → legacy `--server <host> --port <port>`;
+//!   * Minecraft 1.20+ (incl. 26.x, snapshots) → Quick Play
+//!     `--quickPlayMultiplayer <host>:<port>` plus `--quickPlayPath` so the
+//!     client writes its own machine-readable join-log (the version-agnostic
+//!     successor of `--server/--port`, removed in snapshot 23w14a).
+
+/// Join mechanism for a MC version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinMechanism {
+    /// `--server/--port` (Minecraft ≤ 1.19.4).
+    Legacy,
+    /// `--quickPlayMultiplayer host:port` (Minecraft 1.20+, 26.x, snapshots).
+    QuickPlay,
+}
 
 /// Input bytes for port detection (a slice of the live game log / output).
 pub trait MinecraftDiscovery: Send + Sync {
     /// Find the advertised "Open to LAN" port in game output. `None` when
     /// the world isn't open yet (or output has nothing LAN-related).
     fn detect_mc_port(&self, log_text: &str) -> Option<u16>;
+
+    /// Which join mechanism applies to `mc_version`, if any.
+    fn join_mechanism(&self, mc_version: &str) -> Option<JoinMechanism>;
 
     /// Build extra game arguments for automatic join. `None` means the given
     /// MC version cannot be auto-jointed by this mechanism (manual join).
@@ -46,29 +59,73 @@ impl MinecraftDiscovery for LanLogDiscovery {
         None
     }
 
-    fn build_join_args(&self, mc_version: &str, host: &str, port: u16) -> Option<Vec<String>> {
-        if !supports_legacy_server_args(mc_version) {
+    fn join_mechanism(&self, mc_version: &str) -> Option<JoinMechanism> {
+        if mc_version.trim().is_empty() {
             return None;
         }
-        Some(vec![
-            "--server".to_string(),
-            host.to_string(),
-            "--port".to_string(),
-            port.to_string(),
-        ])
+        if supports_legacy_server_args(mc_version) {
+            Some(JoinMechanism::Legacy)
+        } else {
+            Some(JoinMechanism::QuickPlay)
+        }
+    }
+
+    fn build_join_args(&self, mc_version: &str, host: &str, port: u16) -> Option<Vec<String>> {
+        match self.join_mechanism(mc_version)? {
+            JoinMechanism::Legacy => Some(vec![
+                "--server".to_string(),
+                host.to_string(),
+                "--port".to_string(),
+                port.to_string(),
+            ]),
+            JoinMechanism::QuickPlay => Some(vec![
+                "--quickPlayMultiplayer".to_string(),
+                compose_endpoint(host, port),
+            ]),
+        }
     }
 }
 
-/// Legacy `--server/--port` args were dropped when quickPlay landed (1.19+).
+/// Legacy `--server/--port` args worked until snapshot 23w13a (inclusive),
+/// so every released version through 1.19.4 still supports them. They were
+/// removed in 23w14a in favour of Quick Play.
 fn supports_legacy_server_args(mc_version: &str) -> bool {
     if let Some(rest) = mc_version.strip_prefix("1.") {
         let minor = rest.split('.').next().unwrap_or("");
         if let Ok(n) = minor.parse::<u32>() {
-            return n <= 18;
+            return n <= 19;
         }
     }
     // Snapshots ("25w05a") and the new yyyy-major scheme ("26.1.2") are modern.
     false
+}
+
+/// One entry of the machine-readable Quick Play log the official launcher
+/// writes at `--quickPlayPath` when the client successfully joins.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct QuickJoinInfo {
+    /// In-game name of the joined server/world (from the server list entry).
+    pub name: Option<String>,
+}
+
+/// Parse the Quick Play confirmation log: `[{ "type": "multiplayer", "id":
+/// "<address>", "name": ..., ... }]`. Returns `Some` when the log records a
+/// successful `multiplayer` join — the launcher's proof that the auto-join
+/// arguments reached the client and it actually connected.
+pub fn parse_quick_play_confirmation(text: &str) -> Option<QuickJoinInfo> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let entries = value.as_array()?;
+    for entry in entries {
+        if entry.get("type").and_then(|t| t.as_str()) != Some("multiplayer") {
+            continue;
+        }
+        if entry.get("id").and_then(|i| i.as_str()).map(str::is_empty).unwrap_or(true) {
+            continue;
+        }
+        let name = entry.get("name").and_then(|n| n.as_str()).map(str::to_string);
+        return Some(QuickJoinInfo { name });
+    }
+    None
 }
 
 /// Scan for the first integer after `port` in a lowercase line, tolerating any
@@ -143,7 +200,14 @@ mod tests {
 
     #[test]
     fn legacy_join_args_for_old_versions() {
-        for ver in ["1.8.9", "1.12.2", "1.16.5", "1.18.2"] {
+        // `--server/--port` worked until 23w13a — every release ≤ 1.19.4.
+        for ver in ["1.8.9", "1.12.2", "1.16.5", "1.18.2", "1.19.2", "1.19.4"] {
+            assert_eq!(
+                LanLogDiscovery.join_mechanism(ver),
+                Some(JoinMechanism::Legacy),
+                "{}",
+                ver
+            );
             let args = LanLogDiscovery.build_join_args(ver, "100.1.0.1", 12345);
             assert_eq!(
                 args,
@@ -160,10 +224,64 @@ mod tests {
     }
 
     #[test]
-    fn modern_versions_have_no_auto_join_yet() {
-        for ver in ["1.19.2", "1.20.4", "1.21.4", "26.1.2", "25w05a"] {
-            assert_eq!(LanLogDiscovery.build_join_args(ver, "h", 12345), None, "{}", ver);
+    fn quickplay_join_args_for_modern_versions() {
+        // Quick Play `--quickPlayMultiplayer host:port` from 23w14a/1.20+,
+        // including the 1.21 line, snapshots and the new yyyy-major scheme.
+        for ver in ["1.20", "1.20.4", "1.21.4", "26.1.2", "25w05a", "23w14a"] {
+            assert_eq!(
+                LanLogDiscovery.join_mechanism(ver),
+                Some(JoinMechanism::QuickPlay),
+                "{}",
+                ver
+            );
+            let args = LanLogDiscovery.build_join_args(ver, "100.1.0.1", 12345);
+            assert_eq!(
+                args,
+                Some(vec![
+                    "--quickPlayMultiplayer".to_string(),
+                    "100.1.0.1:12345".to_string(),
+                ]),
+                "{}",
+                ver
+            );
         }
+        // Quick play puts the port inline in the address (unlike legacy).
+        let args = LanLogDiscovery.build_join_args("1.21.4", "host.tail.ts.net.", 45565);
+        assert_eq!(args, Some(vec![
+            "--quickPlayMultiplayer".to_string(),
+            "host.tail.ts.net:45565".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn empty_version_has_no_auto_join() {
+        assert_eq!(LanLogDiscovery.join_mechanism(""), None);
+        assert_eq!(LanLogDiscovery.build_join_args("", "h", 1), None);
+    }
+
+    #[test]
+    fn parses_quick_play_confirmation_log() {
+        // Real-ish payload written by the vanilla client at --quickPlayPath
+        // after a successful multiplayer join.
+        let log = r#"[
+          {
+            "type": "multiplayer",
+            "id": "host.tail.ts.net:45565",
+            "name": "Host's World",
+            "lastPlayedTime": "2026-09-20T10:00:00Z",
+            "gamemode": "survival"
+          }
+        ]"#;
+        let info = parse_quick_play_confirmation(log);
+        assert_eq!(info, Some(QuickJoinInfo { name: Some("Host's World".to_string()) }));
+
+        // A log without a multiplayer entry (e.g. only single-player) is not
+        // a join confirmation.
+        let sp = r#"[{"type":"singleplayer","id":"World"}]"#;
+        assert_eq!(parse_quick_play_confirmation(sp), None);
+
+        assert_eq!(parse_quick_play_confirmation(""), None);
+        assert_eq!(parse_quick_play_confirmation("not json"), None);
     }
 
     #[test]
