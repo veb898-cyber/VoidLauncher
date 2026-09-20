@@ -10,6 +10,7 @@ import { RoomStatusBadge } from '../components/rooms/RoomStatusBadge';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { addToast } from '../components/ui/Toast';
 import { useT } from '../lib/i18n';
 
 // "Комнаты": host a world or join a friend's room over Tailscale Machine
@@ -31,6 +32,16 @@ export function Rooms() {
   const instances = useInstanceStore((s) => s.instances);
   const loadInstances = useInstanceStore((s) => s.loadInstances);
 
+  // Command errors go through the same global toast as everywhere else in
+  // the launcher (no inline banner). Background install failures arrive via
+  // the `room_error` event (see useRoomEvents).
+  useEffect(() => {
+    if (error) {
+      addToast(t('rooms.error_prefix', { error }), 'error');
+      clearError();
+    }
+  }, [error, clearError, t]);
+
   useEffect(() => {
     loadStatus();
     if (useInstanceStore.getState().instances.length === 0) {
@@ -49,7 +60,7 @@ export function Rooms() {
   }, [status, tsReady, loadStatus]);
 
   return (
-    <div className="page animate-fade-in">
+    <div className="page animate-fade-in" style={{ display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
       <div
         className="page__header"
         style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 'var(--space-md)', flexWrap: 'wrap' }}
@@ -61,32 +72,6 @@ export function Rooms() {
         <RoomStatusBadge status={status} />
       </div>
 
-      {error && (
-        <div
-          style={{
-            background: 'var(--banner-error-bg)',
-            border: '1px solid var(--banner-error-border)',
-            borderRadius: 'var(--radius-md)',
-            padding: 'var(--space-md) var(--space-lg)',
-            marginBottom: 'var(--space-xl)',
-            color: 'var(--error)',
-            fontSize: 'var(--font-size-sm)',
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            gap: 'var(--space-md)',
-          }}
-        >
-          <span>{t('rooms.error_prefix', { error })}</span>
-          <button
-            onClick={clearError}
-            style={{ background: 'none', border: 'none', color: 'var(--error)', cursor: 'pointer', textDecoration: 'underline' }}
-          >
-            {t('common.dismiss')}
-          </button>
-        </div>
-      )}
-
       {!loaded && !status ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', color: 'var(--text-secondary)' }}>
           <LoadingSpinner /> {t('rooms.loading')}
@@ -94,7 +79,9 @@ export function Rooms() {
       ) : !status ? (
         <Button onClick={() => { loadStatus(); }}>{t('rooms.retry')}</Button>
       ) : !tsReady ? (
-        <RoomSetupView status={status} progress={progress} busy={busy} onCheck={checkLink} />
+        <div style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+          <RoomSetupView status={status} progress={progress} busy={busy} onCheck={checkLink} />
+        </div>
       ) : status.role === 'host' ? (
         <RoomHostView status={status} instances={instances} />
       ) : status.role === 'guest' ? (

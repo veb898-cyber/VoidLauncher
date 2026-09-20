@@ -2,12 +2,15 @@ import { useEffect } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { useRoomStore } from '../stores/roomStore';
 import type { RoomProgress } from '../stores/roomStore';
+import { addToast } from '../components/ui/Toast';
 
 /**
  * Subscribe the Rooms page to room events.
  *
  * * `room_progress` — Tailscale install / sign-in progress (drives the
  *   progress bar in the setup view).
+ * * `room_error` — background workflow failure (e.g. Tailscale install) →
+ *   shown as a global toast, same as every other launcher error.
  * * `room_status_changed` — the room snapshot changed (peer discovery found
  *   the host, the host advertised a port, …); we simply reload the snapshot.
  *
@@ -15,6 +18,10 @@ import type { RoomProgress } from '../stores/roomStore';
  * async and the promise may resolve after unmount, so late listeners are
  * detached immediately.
  */
+interface RoomErrorPayload {
+  message: string;
+}
+
 export function useRoomEvents() {
   const setProgress = useRoomStore((s) => s.setProgress);
   const loadStatus = useRoomStore((s) => s.loadStatus);
@@ -37,6 +44,10 @@ export function useRoomEvents() {
 
     register(listen<RoomProgress>('room_progress', (event) => {
       setProgress(event.payload);
+    }));
+
+    register(listen<RoomErrorPayload>('room_error', (event) => {
+      addToast(event.payload.message, 'error');
     }));
 
     register(listen('room_status_changed', () => {

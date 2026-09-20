@@ -9,7 +9,6 @@
 //!     connectivity and peer state.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{LauncherError, Result};
@@ -57,23 +56,45 @@ impl TailscaleManager {
     }
 
     /// Parse a `tailscale status --json` document. Pure and unit-testable.
+    ///
+    /// Deliberately tolerant: every top-level field is extracted best-effort
+    /// from raw JSON so that a single unexpected/malformed node or field
+    /// (seen in real-world output) degrades gracefully instead of failing the
+    /// status entirely and leaving the Rooms page stuck on setup.
     pub fn parse_status(json: &str) -> Result<TailscaleStatus> {
-        serde_json::from_str::<TailscaleStatus>(json).map_err(LauncherError::Json)
+        let root: serde_json::Value =
+            serde_json::from_str(json).map_err(LauncherError::Json)?;
+        let field = |name: &str| root.get(name).cloned();
+        Ok(TailscaleStatus {
+            version: field("Version").and_then(|v| v.as_str().map(String::from)),
+            backend_state: field("BackendState").and_then(|v| v.as_str().map(String::from)),
+            auth_url: field("AuthURL").and_then(|v| v.as_str().map(String::from)),
+            current_tailnet: field("CurrentTailnet")
+                .and_then(|v| serde_json::from_value(v).ok()),
+            self_node: field("Self").and_then(|v| serde_json::from_value(v).ok()),
+            peer: field("Peer"),
+            user: field("User").and_then(|v| serde_json::from_value(v).ok()),
+            magic_dns_suffix: field("MagicDNSSuffix")
+                .and_then(|v| v.as_str().map(String::from)),
+        })
     }
 
     /// True once the local node is authenticated to a tailnet.
+    ///
+    /// `tailscale status --json` does NOT include a `LoggedIn` field on the
+    /// Self node — the authoritative signal is `BackendState`: the node is
+    /// logged in and reachable as long as it is `Running`/`Starting`.
+    /// A `Stopped` daemon (netstack disabled) is treated as not ready so that
+    /// "Check connection" re-runs `tailscale up` to restore the link.
     pub fn is_logged_in(status: &TailscaleStatus) -> bool {
-        status
+        let Some(state) = status
             .backend_state
             .as_deref()
-            .map(|s| s.eq_ignore_ascii_case("running"))
-            .unwrap_or(false)
-            && status
-                .self_node
-                .as_ref()
-                .map(|n| n.logged_in.unwrap_or(false))
-                .unwrap_or(false)
-                && status.self_node.is_some()
+            .map(|s| s.to_ascii_lowercase())
+        else {
+            return false;
+        };
+        matches!(state.as_str(), "running" | "starting")
     }
 
     /// Interactive-login URL, if the node still needs approval.
@@ -438,6 +459,15 @@ fn install_msi_silent(msi_path: &Path) -> Result<()> {
     let code = status.code().unwrap_or(-1);
     if code == 0 || code == 3010 {
         Ok(())
+    } else if code == 1603 {
+        // 1603 = fatal error during installation. When msiexec runs from a
+        // non-elevated process (typical: VoidLauncher not started as
+        // administrator) the Tailscale per-machine MSI often fails with this
+        // code, so give the user an actionable hint instead of a bare code.
+        Err(LauncherError::Launch(format!(
+            "msiexec exited with code 1603 while installing Tailscale \
+             (installation requires administrator rights — run VoidLauncher as administrator)",
+        )))
     } else {
         Err(LauncherError::Launch(format!(
             "msiexec exited with code {} while installing Tailscale",
@@ -467,10 +497,34 @@ pub struct TailscaleStatus {
     pub current_tailnet: Option<TailnetInfo>,
     #[serde(rename = "Self")]
     pub self_node: Option<PeerNode>,
-    pub peer: Option<PeerField>,
+    /// Raw `Peer` value. Its shape varies across Tailscale versions/OSes
+    /// (array vs map keyed by node key, sometimes with malformed entries), so
+    /// it is kept untyped and extracted node-by-node by [`TailscaleStatus::peers`]
+    /// — one bad node can never fail the whole status document again.
+    #[serde(rename = "Peer")]
+    pub peer: Option<serde_json::Value>,
     pub user: Option<Vec<SelfUser>>,
     #[serde(rename = "MagicDNSSuffix")]
     pub magic_dns_suffix: Option<String>,
+}
+
+impl TailscaleStatus {
+    /// Extract peer nodes from the raw `Peer` value, skipping any entry that
+    /// is not a parseable peer object. Never fails the whole status document.
+    pub fn peers(&self) -> Vec<PeerNode> {
+        let Some(peer) = &self.peer else {
+            return Vec::new();
+        };
+        let values: Vec<&serde_json::Value> = match peer {
+            serde_json::Value::Array(list) => list.iter().collect(),
+            serde_json::Value::Object(map) => map.values().collect(),
+            _ => return Vec::new(),
+        };
+        values
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -482,21 +536,27 @@ pub struct TailnetInfo {
     pub node_capabilities: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct PeerNode {
-    pub node_key: String,
-    pub host_name: Option<String>,
-    #[serde(rename = "DNSName")]
-    pub dns_name: Option<String>,
-    #[serde(rename = "TailscaleIPs")]
-    pub tailnet_ips: Option<Vec<String>>,
-    pub online: Option<bool>,
-    pub last_seen: Option<String>,
-    pub sharee_node: Option<bool>,
-    pub logged_in: Option<bool>,
-    pub user_id: Option<i64>,
-}
+/// A machine on the local tailnet (also used for the Self node).
+    ///
+    /// Only `node_key` is strictly required by real-world output; everything
+    /// else is optional. `NodeKey` is an identifier, never a connection
+    /// target — discovery resolves hosts by DNS name / tailnet IP — so a node
+    /// that omits it must not break the whole status document.
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    pub struct PeerNode {
+        pub node_key: Option<String>,
+        pub host_name: Option<String>,
+        #[serde(rename = "DNSName")]
+        pub dns_name: Option<String>,
+        #[serde(rename = "TailscaleIPs")]
+        pub tailnet_ips: Option<Vec<String>>,
+        pub online: Option<bool>,
+        pub last_seen: Option<String>,
+        pub sharee_node: Option<bool>,
+        pub logged_in: Option<bool>,
+        pub user_id: Option<i64>,
+    }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -504,24 +564,6 @@ pub struct SelfUser {
     pub id: Option<i64>,
     pub login_name: Option<String>,
     pub display_name: Option<String>,
-}
-
-/// `Peer` may be an array (tailscale status v2) or historically a map keyed
-/// by node key. Handle both defensively.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum PeerField {
-    List(Vec<PeerNode>),
-    Map(HashMap<String, PeerNode>),
-}
-
-impl PeerField {
-    pub fn nodes(&self) -> Vec<PeerNode> {
-        match self {
-            PeerField::List(list) => list.clone(),
-            PeerField::Map(map) => map.values().cloned().collect(),
-        }
-    }
 }
 
 // ======================================================================
@@ -576,7 +618,6 @@ mod tests {
         "DNSName": "desktop-pc.tail3e2a10.ts.net.",
         "TailscaleIPs": ["100.101.102.103"],
         "Online": true,
-        "LoggedIn": true,
         "OS": "windows"
       },
       "Peer": [
@@ -609,7 +650,7 @@ mod tests {
             Some("tail3e2a10.ts.net")
         );
 
-        let peers = status.peer.expect("peer list").nodes();
+        let peers = status.peers();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].host_name.as_deref(), Some("android-phone"));
         assert_eq!(peers[0].online, Some(false));
@@ -635,18 +676,25 @@ mod tests {
           }
         }"#;
         let status = TailscaleManager::parse_status(json).unwrap();
-        let peers = status.peer.expect("peer").nodes();
+        let peers = status.peers();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].host_name.as_deref(), Some("old-peer"));
     }
 
     #[test]
     fn not_logged_in_exposes_auth_url() {
+        // Real `tailscale status --json` shape: no LoggedIn field on Self,
+        // login state is carried by BackendState alone.
         let json = r#"{
           "Version": "1.102.4",
           "BackendState": "NeedsLogin",
           "AuthURL": "https://login.tailscale.com/a/xyz",
-          "Self": { "NodeKey": "n", "LoggedIn": false }
+          "Self": {
+            "NodeKey": "nodekey:self:n",
+            "HostName": "desktop-pc",
+            "DNSName": "desktop-pc.ts.net.",
+            "Online": false
+          }
         }"#;
         let status = TailscaleManager::parse_status(json).unwrap();
         assert!(!TailscaleManager::is_logged_in(&status));
@@ -655,6 +703,111 @@ mod tests {
             Some("https://login.tailscale.com/a/xyz")
         );
         assert_eq!(TailscaleManager::self_ip(&status), None);
+    }
+
+    #[test]
+    fn peer_without_nodekey_does_not_break_status_parsing() {
+        // Regression: real `tailscale status --json` can contain a peer that
+        // omits `NodeKey`; previously the whole document failed to parse and
+        // the Rooms setup was stuck on "waiting for sign-in".
+        let json = r#"{
+          "Version": "1.104.4",
+          "BackendState": "Running",
+          "AuthURL": "",
+          "Self": {
+            "NodeKey": "nodekey:self:x",
+            "HostName": "desktop-pc",
+            "DNSName": "desktop-pc.my-tail.ts.net.",
+            "OS": "windows",
+            "TailscaleIPs": ["100.100.100.100"],
+            "Online": true
+          },
+          "Peer": [
+            {
+              "HostName": "shared-pc",
+              "DNSName": "shared-pc.my-tail.ts.net.",
+              "OS": "windows",
+              "TailscaleIPs": ["100.100.100.5"],
+              "Online": true
+            }
+          ]
+        }"#;
+        let status = TailscaleManager::parse_status(json).unwrap();
+        assert!(TailscaleManager::is_logged_in(&status));
+        assert_eq!(
+            TailscaleManager::self_ip(&status).as_deref(),
+            Some("100.100.100.100")
+        );
+        let peers = crate::rooms::peer_discovery::peers_from_status(&status);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].host_name, "shared-pc");
+    }
+
+    #[test]
+    fn malformed_peers_map_never_fails_status() {
+        // Regression: the user's machine fed us a `Peer` that is a map with
+        // a malformed entry. The whole status must still parse and expose
+        // login state; the bad node is skipped, the good one survives.
+        let json = r#"{
+          "Version": "1.104.4",
+          "BackendState": "Running",
+          "AuthURL": "",
+          "Self": {
+            "NodeKey": "nodekey:self:x",
+            "HostName": "desktop-pc",
+            "DNSName": "desktop-pc.my-tail.ts.net.",
+            "TailscaleIPs": ["100.100.100.100"],
+            "Online": true
+          },
+          "Peer": {
+            "nodekey:peer:good": {
+              "NodeKey": "nodekey:peer:good",
+              "HostName": "shared-pc",
+              "DNSName": "shared-pc.my-tail.ts.net.",
+              "TailscaleIPs": ["100.100.100.5"],
+              "Online": true
+            },
+            "nodekey:peer:broken": "not-an-object"
+          }
+        }"#;
+        let status = TailscaleManager::parse_status(json).unwrap();
+        assert!(TailscaleManager::is_logged_in(&status));
+        let peers = status.peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].host_name.as_deref(), Some("shared-pc"));
+    }
+
+    #[test]
+    fn connected_node_without_loggedin_field_is_logged_in() {
+        // Regression: an authenticated node reports BackendState "Running"
+        // with no LoggedIn field on Self — the launcher must treat it as
+        // logged in (previously this returned false indefinitely, leaving
+        // the Rooms setup stuck on "waiting for sign-in").
+        let json = r#"{
+          "Version": "1.104.4",
+          "BackendState": "Running",
+          "AuthURL": "",
+          "Self": {
+            "NodeKey": "nodekey:self:abc",
+            "HostName": "desktop-pc",
+            "DNSName": "desktop-pc.my-tail.ts.net.",
+            "OS": "windows",
+            "TailscaleIPs": ["100.100.100.100"],
+            "Online": true,
+            "LastSeen": "2026-09-20T00:00:00Z",
+            "ShareeNode": false
+          },
+          "User": [
+            { "ID": 1, "LoginName": "me@example.com", "DisplayName": "me" }
+          ]
+        }"#;
+        let status = TailscaleManager::parse_status(json).unwrap();
+        assert!(TailscaleManager::is_logged_in(&status));
+        assert_eq!(TailscaleManager::auth_url(&status), None);
+        assert_eq!(
+            TailscaleManager::self_ip(&status).as_deref(),
+            Some("100.100.100.100")
+        );
     }
 
     #[test]

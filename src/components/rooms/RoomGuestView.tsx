@@ -5,6 +5,7 @@ import { Button } from '../ui/Button';
 import { CustomSelect } from '../ui/CustomSelect';
 import type { SelectOption } from '../ui/CustomSelect';
 import { LoadingSpinner } from '../ui/LoadingSpinner';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { useRoomStore } from '../../stores/roomStore';
 import type { RoomStatus } from '../../stores/roomStore';
 import { useInstanceStore } from '../../stores/instanceStore';
@@ -35,6 +36,7 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
   const [selected, setSelected] = useState<string>(instances[0]?.name ?? '');
   const [autoJoin, setAutoJoin] = useState<boolean | null>(null);
   const [copied, setCopied] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
 
   useEffect(() => {
     if (!selected && instances.length > 0) setSelected(instances[0].name);
@@ -83,7 +85,7 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xl)', maxWidth: 860 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xl)', width: '100%' }}>
       <div className="glass-card animate-slide-up">
         <h2 style={{ margin: '0 0 var(--space-sm)', fontSize: 'var(--font-size-xl)' }}>
           {t('rooms.guest_title', { code: status.roomId ?? '—' })}
@@ -180,11 +182,20 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
           <RefreshCw size={16} style={{ marginRight: 6 }} />
           {t('rooms.refresh')}
         </Button>
-        <Button variant="ghost" onClick={() => { leave(); }} loading={busy} disabled={busy}>
+        <Button variant="danger" onClick={() => { setConfirmLeave(true); }} disabled={busy}>
           <LogOut size={16} style={{ marginRight: 6 }} />
           {t('rooms.leave')}
         </Button>
       </div>
+
+      <ConfirmDialog
+        open={confirmLeave}
+        title={t('rooms.leave_confirm_title')}
+        description={t('rooms.leave_confirm_guest_desc')}
+        busy={busy}
+        onCancel={() => setConfirmLeave(false)}
+        onConfirm={() => { leave(); }}
+      />
 
       {!worldReady && !status.host && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', color: 'var(--text-tertiary)', fontSize: 'var(--font-size-sm)' }}>

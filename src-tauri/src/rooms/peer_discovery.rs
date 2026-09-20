@@ -9,7 +9,7 @@
 //!      provably the guest's own node, that peer must be the host (a single
 //!      Machine Sharing grant shows up as one peer).
 
-use crate::rooms::tailscale::{PeerNode, PeerField, TailscaleStatus};
+use crate::rooms::tailscale::{PeerNode, TailscaleStatus};
 use serde::{Deserialize, Serialize};
 
 /// A peer machine known to the tailnet (excluding the local node).
@@ -40,7 +40,7 @@ pub struct HostInfo {
 impl From<&PeerNode> for PeerInfo {
     fn from(n: &PeerNode) -> Self {
         Self {
-            node_key: n.node_key.clone(),
+            node_key: n.node_key.clone().unwrap_or_default(),
             host_name: n.host_name.clone().unwrap_or_default(),
             dns_name: n.dns_name.clone().unwrap_or_default(),
             tailnet_ips: n.tailnet_ips.clone().unwrap_or_default(),
@@ -78,13 +78,11 @@ impl HostInfo {
     }
 }
 
-/// Extract peer rows from a parsed status document.
+/// Extract peer rows from a parsed status document. The raw `Peer` field is
+/// tolerant of both array and map shapes and of individual malformed entries
+/// (see `TailscaleStatus::peers`).
 pub fn peers_from_status(status: &TailscaleStatus) -> Vec<PeerInfo> {
-    match &status.peer {
-        Some(PeerField::List(list)) => list.iter().map(PeerInfo::from).collect(),
-        Some(PeerField::Map(map)) => map.values().map(PeerInfo::from).collect(),
-        None => Vec::new(),
-    }
+    status.peers().iter().map(PeerInfo::from).collect()
 }
 
 /// Resolve the host peer for a room.
@@ -128,13 +126,13 @@ pub fn resolve_host_for_room(peers: &[PeerInfo], room_id: Option<&str>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rooms::tailscale::{PeerField, PeerNode, TailscaleStatus};
+    use crate::rooms::tailscale::{PeerNode, TailscaleStatus};
 
     /// A peer flagged `ShareeNode: false` — a node of the current account
     /// (the guest's own device), or a generic fixture.
     fn node(key: &str, host: &str, dns: &str, ip: Option<&str>, online: bool) -> PeerNode {
         PeerNode {
-            node_key: key.into(),
+            node_key: Some(key.into()),
             host_name: Some(host.into()),
             dns_name: Some(dns.into()),
             tailnet_ips: ip.map(|i| vec![i.into()]),
@@ -145,13 +143,26 @@ mod tests {
             user_id: None,
         }
     }
-
-    /// The host machine as the guest sees it: a node shared into the guest's
-    /// tailnet (Machine Sharing) → `ShareeNode: true`.
     fn shared_node(key: &str, host: &str, dns: &str, ip: Option<&str>, online: bool) -> PeerNode {
         PeerNode {
             sharee_node: Some(true),
             ..node(key, host, dns, ip, online)
+        }
+    }
+
+    /// A peer whose `NodeKey` is absent in the raw status document (seen in
+    /// real-world output) — must be kept as a host candidate, not dropped.
+    fn keyless_node(host: &str, dns: &str, ip: Option<&str>, online: bool) -> PeerNode {
+        PeerNode {
+            node_key: None,
+            host_name: Some(host.into()),
+            dns_name: Some(dns.into()),
+            tailnet_ips: ip.map(|i| vec![i.into()]),
+            online: Some(online),
+            last_seen: Some("now".into()),
+            sharee_node: Some(true),
+            logged_in: None,
+            user_id: None,
         }
     }
 
@@ -162,7 +173,7 @@ mod tests {
             auth_url: None,
             current_tailnet: None,
             self_node: None,
-            peer: Some(PeerField::List(peers)),
+            peer: Some(serde_json::to_value(peers).unwrap()),
             user: None,
             magic_dns_suffix: None,
         }
@@ -220,6 +231,18 @@ mod tests {
         let peers = peers_from_status(&status_with(vec![p]));
         let host = resolve_host_for_room(&peers, None).unwrap();
         assert_eq!(host.node_key, "host");
+    }
+
+    #[test]
+    fn node_without_key_is_still_a_host_candidate() {
+        // Regression: a real status document can contain a peer without
+        // `NodeKey`; it must remain eligible for host resolution (key is an
+        // identifier, the DNS name / IP carry the connectivity data).
+        let peers = vec![keyless_node("gaming-pc", "abcd-1234-host.tail1234.ts.net.", Some("100.1.0.9"), true)];
+        let peers = peers_from_status(&status_with(peers));
+        let host = resolve_host_for_room(&peers, Some("ABCD-1234")).unwrap();
+        assert_eq!(host.host_name, "gaming-pc");
+        assert_eq!(host.ip(), Some("100.1.0.9"));
     }
 
     #[test]

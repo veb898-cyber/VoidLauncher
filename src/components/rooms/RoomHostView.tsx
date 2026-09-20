@@ -4,6 +4,7 @@ import { Button } from '../ui/Button';
 import { CustomSelect } from '../ui/CustomSelect';
 import type { SelectOption } from '../ui/CustomSelect';
 import { RoomShareHelpModal } from './RoomShareHelpModal';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { useRoomStore } from '../../stores/roomStore';
 import { useInstanceStore } from '../../stores/instanceStore';
 import type { Instance } from '../../stores/instanceStore';
@@ -30,6 +31,7 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
   const [selected, setSelected] = useState<string>(instances[0]?.name ?? '');
   const [copied, setCopied] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
 
   // Instances this component has positively seen running (fed by the
   // game_started/launch_complete events in useGameEvents). Used to distinguish
@@ -83,7 +85,7 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
   const portReady = !!status.minecraftPort && !!status.endpoint;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xl)', maxWidth: 860 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xl)', width: '100%' }}>
       <div className="glass-card animate-slide-up">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 'var(--space-md)', flexWrap: 'wrap' }}>
           <div>
@@ -100,26 +102,32 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
 
         <div
           onClick={copyCode}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); copyCode(); } }}
           style={{
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
             gap: 'var(--space-md)',
-            background: 'var(--gradient-primary)',
-            borderRadius: 'var(--radius-lg)',
+            background: 'var(--surface-glass)',
+            border: '1px solid var(--surface-border)',
+            borderRadius: 'var(--radius-md)',
             padding: 'var(--space-lg) var(--space-xl)',
             marginTop: 'var(--space-lg)',
             cursor: 'pointer',
-            color: 'white',
+            transition: 'border-color 200ms ease-out, background 200ms ease-out',
           }}
         >
           <div>
-            <div style={{ fontSize: 'var(--font-size-xs)', opacity: 0.8, marginBottom: 2 }}>{t('rooms.host_code_label')}</div>
-            <div style={{ fontSize: 'var(--font-size-2xl)', fontWeight: 800, letterSpacing: '4px', fontFamily: 'var(--font-mono)' }}>
+            <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 2 }}>
+              {t('rooms.host_code_label')}
+            </div>
+            <div style={{ fontSize: 'var(--font-size-2xl)', fontWeight: 800, letterSpacing: '4px', fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
               {status.roomId ?? '—'}
             </div>
           </div>
-          {copied ? <Check size={22} /> : <Copy size={22} />}
+          {copied ? <Check size={22} color="var(--success)" /> : <Copy size={22} color="var(--text-secondary)" />}
         </div>
 
         <p style={{ margin: 'var(--space-md) 0 0', fontSize: 'var(--font-size-sm)', color: 'var(--text-tertiary)' }}>
@@ -196,11 +204,20 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
       </div>
 
       <div>
-        <Button variant="ghost" onClick={() => { leave(); }} loading={busy} disabled={busy}>
+        <Button variant="danger" onClick={() => { setConfirmLeave(true); }} disabled={busy}>
           <LogOut size={16} style={{ marginRight: 6 }} />
           {t('rooms.leave')}
         </Button>
       </div>
+
+      <ConfirmDialog
+        open={confirmLeave}
+        title={t('rooms.leave_confirm_title')}
+        description={t('rooms.leave_confirm_host_desc')}
+        busy={busy}
+        onCancel={() => setConfirmLeave(false)}
+        onConfirm={() => { leave(); }}
+      />
 
       <RoomShareHelpModal open={showHelp} onClose={() => setShowHelp(false)} code={status.roomId} />
     </div>

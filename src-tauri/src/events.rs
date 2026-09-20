@@ -106,6 +106,24 @@ pub fn emit_room_progress(stage: &str, fraction: f64, message: &str) {
     }
 }
 
+/// Room workflow error (e.g. Tailscale install failure), rendered by the UI
+/// as a global toast (same mechanism as every other launcher error).
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomErrorPayload {
+    pub message: String,
+}
+
+pub fn emit_room_error(message: &str) {
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.emit(
+            "room_error",
+            RoomErrorPayload {
+                message: message.to_string(),
+            },
+        );
+    }
+}
+
 /// A progress sender that wraps a broadcast::Sender
 #[derive(Debug, Clone)]
 pub struct ProgressSender {

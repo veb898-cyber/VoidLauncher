@@ -101,6 +101,7 @@ fn tailscale_manager_for(state: &State<'_, AppState>) -> TailscaleManager {
 /// survives an app restart.
 #[tauri::command]
 pub async fn cmd_room_status(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RoomStatusPublic, String> {
     if state.room_state.role() == RoomRole::Host {
@@ -118,7 +119,57 @@ pub async fn cmd_room_status(
             }
         }
     }
-    Ok(build_status(&state))
+    let snap = build_status(&state);
+    // Diagnostics: while Tailscale setup is stuck, surface the raw facts so
+    // the user can see in the launcher log what the CLI actually returned.
+    if !snap.tailscale.logged_in {
+        log_tailscale_diagnostics(&app, &state);
+    }
+    Ok(snap)
+}
+
+/// Best-effort diagnostics dumped to the launcher log / Terminal page while
+/// the Tailscale setup is not ready. Never logs keys or tokens — only the
+/// CLI path and parsed status fields, which are safe.
+fn log_tailscale_diagnostics(app: &AppHandle, state: &State<'_, AppState>) {
+    match crate::rooms::tailscale::tailscale_exe_path() {
+        Some(path) => events::emit_log(
+            app,
+            "info",
+            "rooms",
+            &format!("Tailscale CLI found: {}", path.display()),
+        ),
+        None => events::emit_log(
+            app,
+            "warn",
+            "rooms",
+            "Tailscale CLI not found under Program Files",
+        ),
+    }
+    match state.tailscale.status() {
+        Ok(status) => events::emit_log(
+            app,
+            "info",
+            "rooms",
+            &format!(
+                "tailscale status --json: backend_state={:?}, version={:?}, self_ip={:?}, login_name={:?}",
+                status.backend_state,
+                status.version,
+                TailscaleManager::self_ip(&status),
+                status
+                    .user
+                    .as_ref()
+                    .and_then(|u| u.first())
+                    .and_then(|u| u.login_name.clone()),
+            ),
+        ),
+        Err(e) => events::emit_log(
+            app,
+            "warn",
+            "rooms",
+            &format!("tailscale status --json failed: {}", e),
+        ),
+    }
 }
 
 /// Make sure Tailscale is installed and the node is logged in.
@@ -129,6 +180,7 @@ pub async fn cmd_room_status(
 ///   status is the link the UI opens for browser approval.
 #[tauri::command]
 pub async fn cmd_room_check_link(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RoomStatusPublic, String> {
     if !state.tailscale.is_installed() {
@@ -143,12 +195,17 @@ pub async fn cmd_room_check_link(
                 .await;
             let _ = room;
             match result {
-                Ok(_) => events::emit_room_progress("install", 1.0, "Tailscale installed"),
-                Err(e) => events::emit_room_progress(
-                    "install",
-                    1.0,
-                    &format!("Install failed: {}", e),
-                ),
+                Ok(_) => {
+                    events::emit_room_progress("install", 1.0, "Tailscale installed");
+                    auto_login_and_open(&app, &ts).await;
+                }
+                Err(e) => {
+                    let msg = format!("Install failed: {}", e);
+                    // Launcher log file + Terminal page, and a global toast
+                    // in the UI (see useRoomEvents → `room_error`).
+                    events::emit_log(&app, "error", "rooms", &msg);
+                    events::emit_room_error(&msg);
+                }
             }
         });
         return Ok(build_status(&state));
@@ -396,5 +453,57 @@ async fn run_discovery_pass(state: &State<'_, AppState>) {
             let _ = state.room_state.set_host(None);
             let _ = state.room_state.set_minecraft_port(None);
         }
+    }
+}
+
+/// Kick off `tailscale up` (detached) right after a fresh install and open
+/// the AuthURL in the system browser as soon as it appears, so the user can
+/// approve the device without a manual extra step. Retries `tailscale up` a
+/// few times because the daemon may still be registering immediately after
+/// the MSI install. The "Open login" button in the setup view remains as a
+/// fallback if the URL is slow to appear.
+async fn auto_login_and_open(app: &AppHandle, ts: &TailscaleManager) {
+    events::emit_room_progress("login", 0.0, "Please approve this device in the browser.");
+
+    use tauri_plugin_opener::OpenerExt;
+    let mut login_kicks = 0;
+    let mut attempts = 0;
+    loop {
+        if login_kicks < 4 {
+            login_kicks += 1;
+            let _ = ts.login();
+        }
+        if let Ok(status) = ts.status() {
+            if TailscaleManager::is_logged_in(&status) {
+                events::emit_room_progress("login", 1.0, "Logged in");
+                return;
+            }
+            if let Some(url) = TailscaleManager::auth_url(&status) {
+                if !url.trim().is_empty() {
+                    if app.opener().open_url(&url, None::<&str>).is_ok() {
+                        tracing::info!(target: "rooms", "Opened Tailscale login URL in the system browser");
+                    } else {
+                        events::emit_log(
+                            &app,
+                            "warn",
+                            "rooms",
+                            "Could not open the Tailscale login URL automatically — use the Open login button.",
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+        attempts += 1;
+        if attempts >= 40 {
+            events::emit_log(
+                &app,
+                "warn",
+                "rooms",
+                "Tailscale login URL has not appeared yet — click 'Check connection' again.",
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
     }
 }

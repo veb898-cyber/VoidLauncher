@@ -24,7 +24,7 @@
 use super::minecraft_connector::{LanLogDiscovery, MinecraftDiscovery};
 use super::peer_discovery::{peers_from_status, resolve_host_for_room};
 use super::room_state::{valid_room_id, RoomRole, RoomStateManager};
-use super::tailscale::{PeerField, PeerNode, TailscaleStatus};
+use super::tailscale::{PeerNode, TailscaleStatus};
 use super::void_link::{
     bind_addr, ensure_void_link_server, query_host_status, void_link_server, VOID_LINK_PORT,
 };
@@ -66,7 +66,7 @@ async fn raw_http(port: u16, request: &str) -> (u16, String) {
 fn hinted_host(room_id: &str) -> Vec<super::peer_discovery::PeerInfo> {
     let lower = room_id.to_ascii_lowercase();
     let peer = PeerNode {
-        node_key: "nodekey:peer:host".into(),
+        node_key: Some("nodekey:peer:host".into()),
         host_name: Some(format!("{}-host", lower)),
         dns_name: Some(format!("{}-host.tailnet.ts.net.", lower)),
         tailnet_ips: Some(vec!["100.64.0.10".into()]),
@@ -82,7 +82,7 @@ fn hinted_host(room_id: &str) -> Vec<super::peer_discovery::PeerInfo> {
         auth_url: None,
         current_tailnet: None,
         self_node: None,
-        peer: Some(PeerField::List(vec![peer])),
+        peer: Some(serde_json::to_value(vec![peer]).unwrap()),
         user: None,
         magic_dns_suffix: Some("tailnet.ts.net".into()),
     };
