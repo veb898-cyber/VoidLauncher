@@ -1,55 +1,84 @@
 # VoidLauncher
 
-Lightweight Minecraft launcher for Windows, built with Tauri 2 (Rust + React 19).
+A modern, open-source Minecraft launcher for Windows.
 
-> **Platform:** Windows 10/11 (x86_64)
-> **Install:** runs in `%LOCALAPPDATA%`, no admin rights required.
 
----
+VoidLauncher is a desktop launcher built around a simple idea: keep Minecraft versions, modded installations, configuration, and multiplayer in one place without turning the launcher itself into a complicated system.
 
-## Features
 
-- **Accounts** — Microsoft (OAuth device code), Ely.by, Offline
-- **Mod loaders** — Vanilla, Fabric, Forge, NeoForge
-- **Mod browsing** — search, install, update mods & modpacks via Modrinth, CurseForge, ATLauncher
-- **Java management** — auto-detect, custom path, RAM sliders, GC presets (G1GC / ZGC)
-- **Per-instance settings** — independent memory, JVM args, resolution, icon, notes
-- **Playtime tracking** — per-instance, survives suspend/resume
-- **Live logs** — real-time Minecraft stdout/stderr with CP1251 support
-- **Content manager** — worlds, screenshots, resource packs, shader packs
-- **Modpacks** — browse & install Modrinth, CurseForge, ATLauncher packs; import .zip/.mrpack
-- **Mod updates** — hash-based detection like Prism Launcher
-- **Banner & icon customization** — gradient presets or custom images per instance
-- **Network play (Rooms)** — play with friends over a private Tailscale network
-- **Auto-updates** — signed releases via minisign
-- **EN / RU localization** — switchable at runtime
-- **No telemetry** — zero background services
+Each Minecraft installation is managed independently, with its own game version, mod loader, Java configuration, content, and settings. The launcher handles the setup and management around Minecraft while keeping the actual game installations separate and easy to work with.
 
-## Install
 
-Download the latest installer from [Releases](../../releases):
+VoidLauncher is built with a native Rust backend and a React-based interface using Tauri 2. The project is designed primarily for Windows and focuses on a lightweight desktop experience rather than replicating the interface or architecture of an existing launcher.
 
-```
-VoidLauncher_<version>_x64-setup.exe
-```
 
-## Build from source
+## Getting Started
 
-Prerequisites: Node.js 24+, Rust stable, Tauri 2 prerequisites, WebView2.
+
+Download the latest release from the [Releases](../../releases) page and run the Windows installer.
+
+
+VoidLauncher uses a per-user installation, so administrator privileges are not required for a normal installation.
+
+
+## Building
+
+
+### Requirements
+
+
+* Windows 10/11 (x86_64)
+* Node.js 24+
+* Rust (stable)
+* Tauri 2 prerequisites
+* WebView2
+
+
+### Build from source
+
 
 ```bash
 npm install
 npm run tauri build
 ```
 
+
+## Technology
+
+
+VoidLauncher is built with:
+
+
+* [Tauri 2](https://tauri.app/)
+* Rust
+* React 19
+* TypeScript
+* Vite
+* Tokio
+
+
+The application keeps the desktop-side game management and system integration in Rust while the user interface is implemented with React.
+
+
+## Project
+
+
+VoidLauncher is an independent open-source project developed around Minecraft and its surrounding ecosystem.
+
+
+The project is still evolving, and its architecture and user experience may change as development continues.
+
+
 ## License
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-VoidLauncher is released under the [MIT License](LICENSE). You are free to use,
-modify, and redistribute it for any purpose, including commercial use, provided
-you retain the copyright and permission notice.
+VoidLauncher is licensed under the [MIT License](LICENSE).
+
+
+You are free to use, modify, and redistribute the project in accordance with the license terms.
+
 
 ## Author
+
 
 [veb898-cyber](https://github.com/veb898-cyber)
