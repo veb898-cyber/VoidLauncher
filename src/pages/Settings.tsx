@@ -16,7 +16,7 @@ import { useT, type Language } from '../lib/i18n';
 import { useLanguageStore } from '../stores/languageStore';
 import { useThemeStore, Theme } from '../stores/themeStore';
 import { useFontStore, Font, ConsoleFont } from '../stores/fontStore';
-import { Avatar } from '../lib/remoteImage';
+import { Avatar, OfflineAvatar } from '../lib/remoteImage';
 import { Tooltip } from '../components/ui/Tooltip';
 import {
   APP_VERSION,
@@ -735,7 +735,11 @@ function AccountCard({
     <div className="glass-card" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xl)', padding: 'var(--space-xl)' }}>
       {hasAccount ? (
         <>
-          <Avatar uuid={avatarUuid ?? ''} name={activeName ?? ''} size={48} />
+          {defaultAccountType === 'Offline' ? (
+            <OfflineAvatar size={48} />
+          ) : (
+            <Avatar uuid={avatarUuid ?? ''} name={activeName ?? ''} size={48} />
+          )}
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 600, fontSize: 'var(--font-size-lg)' }}>{activeName}</div>
             <div style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
@@ -754,9 +758,8 @@ function AccountCard({
           <div style={{
             width: 48, height: 48,
             borderRadius: 'var(--radius-md)',
-            background: 'var(--surface-glass)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            color: 'var(--text-tertiary)',
+            fontSize: 20, fontWeight: 700, color: 'var(--text-tertiary)',
           }}>
             ?
           </div>

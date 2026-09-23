@@ -11,7 +11,7 @@ import { createPortal } from 'react-dom';
 import { addToast } from '../components/ui/Toast';
 import { invoke } from '@tauri-apps/api/core';
 import { BANNER_PRESETS, isGradientBanner, getGradientValue } from '../lib/bannerPresets';
-import { Avatar } from '../lib/remoteImage';
+import { Avatar, OfflineAvatar } from '../lib/remoteImage';
 
 interface HomeProps {
   onNavigate: (page: string) => void;
@@ -135,17 +135,18 @@ export function Home({ onNavigate }: HomeProps) {
     <div className="page animate-fade-in" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xl)' }}>
       {/* Top bar: greeting + quick play */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-lg)' }}>
-        {activeId ? (
-            <Avatar uuid={activeId} name={activeName ?? ''} size={56} />
+        {defaultAccount?.account_type === 'Offline' ? (
+          <OfflineAvatar size={56} />
+        ) : activeId ? (
+          <Avatar uuid={activeId} name={activeName ?? ''} size={56} />
         ) : (
           <div style={{
             width: 56, height: 56,
             borderRadius: 'var(--radius-md)',
-            background: 'var(--surface-glass)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: 24, color: 'var(--text-tertiary)',
+            fontSize: 24, fontWeight: 700, color: 'var(--text-tertiary)',
           }}>
-            ?
+            {(activeName ?? '?').charAt(0).toUpperCase()}
           </div>
         )}
         <div style={{ flex: 1 }}>

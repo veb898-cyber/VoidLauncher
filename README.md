@@ -11,16 +11,16 @@ Lightweight Minecraft launcher for Windows, built with Tauri 2 (Rust + React 19)
 
 - **Accounts** — Microsoft (OAuth device code), Ely.by, Offline
 - **Mod loaders** — Vanilla, Fabric, Forge, NeoForge
-- **Mod browsing** — search, install, update mods & modpacks via Modrinth
-- **CurseForge** — backend ready, UI coming soon
+- **Mod browsing** — search, install, update mods & modpacks via Modrinth, CurseForge, ATLauncher
 - **Java management** — auto-detect, custom path, RAM sliders, GC presets (G1GC / ZGC)
 - **Per-instance settings** — independent memory, JVM args, resolution, icon, notes
 - **Playtime tracking** — per-instance, survives suspend/resume
 - **Live logs** — real-time Minecraft stdout/stderr with CP1251 support
 - **Content manager** — worlds, screenshots, resource packs, shader packs
-- **Instance import/export** — Prism, MultiMC, Modrinth, CurseForge, ATLauncher packs
+- **Modpacks** — browse & install Modrinth, CurseForge, ATLauncher packs; import .zip/.mrpack
 - **Mod updates** — hash-based detection like Prism Launcher
 - **Banner & icon customization** — gradient presets or custom images per instance
+- **Network play (Rooms)** — play with friends over a private Tailscale network
 - **Auto-updates** — signed releases via minisign
 - **EN / RU localization** — switchable at runtime
 - **No telemetry** — zero background services

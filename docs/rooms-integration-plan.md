@@ -1,9 +1,10 @@
-# План интеграции «комнат друзей» в VoidLauncher
+# План интеграции «сетевой игры» в VoidLauncher
 
 (исследование и архитектура MVP — см. `rooms-tailscale-report.md` и `rooms-tailscale-architecture.md`)
 
-Статус: ПРОЕКТИРОВАНИЕ. Код не написан. Задача этапа — карта интеграции 6 компонентов,
-точки встраивания, API frontend↔Rust, жизненный цикл, sequence diagrams, список файлов.
+Статус: **РЕАЛИЗОВАНО**. Функция доступна в интерфейсе как «Сетевая игра»
+(вкладка бокового меню). Код: `src-tauri/src/rooms/`, `src-tauri/src/commands/rooms.rs`,
+`src/pages/Rooms.tsx`, `src/stores/roomStore.ts`.
 
 ---
 

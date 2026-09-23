@@ -296,7 +296,22 @@ pub async fn cmd_launch_game(
                 "launch",
                 &format!("Launching via Ely.by as '{}'", account.name),
             );
-            (String::new(), account.uuid.clone().unwrap_or_default(), account.name.clone())
+            // Online-mode servers validate the join token against the session
+            // server (authserver.ely.by for Ely.by-aware servers). An empty
+            // token makes multiplayer fail with "Invalid session"; the token
+            // stored at login is required.
+            let token = accounts::get_elyby_token(&account.id)
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| {
+                    events::emit_log(
+                        &app,
+                        "warn",
+                        "launch",
+                        "No stored Ely.by token — multiplayer session may be rejected.",
+                    );
+                    String::new()
+                });
+            (token, account.uuid.clone().unwrap_or_default(), account.name.clone())
         }
         accounts::AccountType::Microsoft => {
             match super::auth::ensure_ms_session(state.inner(), &account).await {
@@ -943,28 +958,35 @@ pub struct LoaderCheckResult {
 }
 
 #[tauri::command]
-pub fn cmd_check_instance_loader(
+pub async fn cmd_check_instance_loader(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<LoaderCheckResult, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
-    let loader_type = match instance.loader {
-        instances::LoaderType::Vanilla => "Vanilla",
-        instances::LoaderType::Fabric => "Fabric",
-        instances::LoaderType::Forge => "Forge",
-        instances::LoaderType::NeoForge => "NeoForge",
-    }
-    .to_string();
-    let needs_install = instance.loader != instances::LoaderType::Vanilla
-        && instance.loader_profile.is_none();
-    Ok(LoaderCheckResult {
-        needs_install,
-        loader_type,
-        loader_version: instance.loader_version.clone().unwrap_or_default(),
-        mc_version: instance.mc_version.clone(),
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let instance = instances::get_instance(&instances_dir, &instance_name)
+            .map_err(|e| e.to_string())?;
+        let loader_type = match instance.loader {
+            instances::LoaderType::Vanilla => "Vanilla",
+            instances::LoaderType::Fabric => "Fabric",
+            instances::LoaderType::Forge => "Forge",
+            instances::LoaderType::NeoForge => "NeoForge",
+        }
+        .to_string();
+        let needs_install = instance.loader != instances::LoaderType::Vanilla
+            && instance.loader_profile.is_none();
+        Ok(LoaderCheckResult {
+            needs_install,
+            loader_type,
+            loader_version: instance.loader_version.clone().unwrap_or_default(),
+            mc_version: instance.mc_version.clone(),
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Install the mod loader for an instance, emitting progress events.
@@ -1091,29 +1113,33 @@ pub fn cmd_emit_log(
     Ok(())
 }
 #[tauri::command]
-pub fn cmd_list_game_logs(
+pub async fn cmd_list_game_logs(
     state: State<'_, AppState>,
     instance_name: Option<String>,
-) -> Vec<game_logs::GameLogSession> {
+) -> Result<Vec<game_logs::GameLogSession>, String> {
     let data_dir = {
         let c = state.config.lock().map_err(|e| e.to_string());
         match c {
             Ok(cfg) => cfg.data_dir.clone(),
-            Err(_) => return Vec::new(),
+            Err(_) => return Ok(Vec::new()),
         }
     };
-    let mut sessions = game_logs::list_game_log_sessions(&data_dir);
-    // Optional per-instance filter (frontend passes the raw instance name;
-    // matching uses the same filename-sanitization scheme as creation).
-    if let Some(name) = instance_name {
-        let wanted = game_logs::sanitize_instance_name(&name);
-        sessions.retain(|s| s.instance_name == wanted);
-    }
-    sessions
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let mut sessions = game_logs::list_game_log_sessions(&data_dir);
+        // Optional per-instance filter (frontend passes the raw instance name;
+        // matching uses the same filename-sanitization scheme as creation).
+        if let Some(name) = instance_name {
+            let wanted = game_logs::sanitize_instance_name(&name);
+            sessions.retain(|s| s.instance_name == wanted);
+        }
+        sessions
+    })
+    .await
+    .map_err(|e| e.to_string())?)
 }
 
 #[tauri::command]
-pub fn cmd_read_game_log(
+pub async fn cmd_read_game_log(
     state: State<'_, AppState>,
     path: String,
     max_lines: Option<usize>,
@@ -1122,8 +1148,12 @@ pub fn cmd_read_game_log(
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.data_dir.clone()
     };
-    let safe_path = game_logs::validate_log_path(&data_dir, &path)?;
-    game_logs::read_game_log(&safe_path, max_lines)
+    tauri::async_runtime::spawn_blocking(move || {
+        let safe_path = game_logs::validate_log_path(&data_dir, &path)?;
+        game_logs::read_game_log(&safe_path, max_lines)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1132,12 +1162,14 @@ pub fn cmd_get_current_game_log() -> Option<String> {
 }
 
 #[tauri::command]
-pub fn cmd_delete_game_log(state: State<'_, AppState>, path: String) -> Result<(), String> {
+pub async fn cmd_delete_game_log(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let data_dir = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.data_dir.clone()
     };
-    game_logs::delete_game_log(&data_dir, &path)
+    tauri::async_runtime::spawn_blocking(move || game_logs::delete_game_log(&data_dir, &path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Open the `.minecraft/logs` folder of an instance in the file manager.

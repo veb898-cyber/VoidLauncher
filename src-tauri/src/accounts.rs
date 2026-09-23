@@ -231,7 +231,7 @@ pub fn store_elyby_token(account_id: &str, token: &str) -> Result<(), String> {
 }
 
 /// Read an Ely.by access token from the OS credential vault.
-#[allow(dead_code)]
+/// Used by the launch flow (`cmd_launch_game`) as `--accessToken`.
 pub fn get_elyby_token(account_id: &str) -> Option<String> {
     vault_get(&elyby_key(account_id))
 }

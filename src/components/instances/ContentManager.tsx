@@ -10,6 +10,7 @@ import { ContentBrowser, type ContentType } from './ContentBrowser';
 import { useFocusStore } from '../../stores/focusStore';
 import { useT } from '../../lib/i18n';
 import { useIconCacheStore } from '../../stores/iconCacheStore';
+import { RemoteIcon } from '../../lib/remoteImage';
 
 /// Strip a trailing version like "_v1.2.3", "-1.0", " v3.2" from a name
 function strip_version_suffix(name: string): string {
@@ -102,28 +103,28 @@ interface ContentRowProps {
   item: ContentItem;
   idx: number;
   isSelected: boolean;
-  failed: boolean;
   iconSrc: string | null;
+  iconsResolving: boolean;
   hasCompatWarn: boolean;
   mcVersion?: string | null;
   compatTarget: string;
   onRowClick: (filename: string, e: React.MouseEvent) => void;
   onContext: (e: React.MouseEvent, filename: string) => void;
   onToggle: (item: ContentItem) => void;
-  onIconError: (filename: string) => void;
 }
 
 /// Memoized table row. With ~250 mods, re-rendering the whole table on every
 /// parent state change (selection, search, icon cache updates) caused visible
 /// UI jank; with memo only the actually-changed rows re-render.
 const ContentRow = memo(function ContentRow({
-  item, idx, isSelected, failed, iconSrc, hasCompatWarn,
+  item, idx, isSelected, iconSrc, iconsResolving, hasCompatWarn,
   mcVersion, compatTarget,
-  onRowClick, onContext, onToggle, onIconError,
+  onRowClick, onContext, onToggle,
 }: ContentRowProps) {
   const t = useT();
   return (
     <div
+      className="content-list-row"
       onClick={(e) => onRowClick(item.filename, e)}
       onContextMenu={(e) => { e.preventDefault(); onContext(e, item.filename); }}
       style={{
@@ -143,14 +144,14 @@ const ContentRow = memo(function ContentRow({
         </div>
       </div>
       <div style={{ display: 'flex', justifyContent: 'center' }}>
-        {iconSrc && !failed ? (
-          <img src={iconSrc} alt="" style={{ width: 28, height: 28, borderRadius: 4, objectFit: 'cover' }}
-            onError={() => onIconError(item.filename)} />
-        ) : (
-          <div style={{ width: 28, height: 28, borderRadius: 4, background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10, color: 'var(--text-tertiary)' }}>
-            {item.name.charAt(0)}
-          </div>
-        )}
+        <RemoteIcon
+          url={iconSrc}
+          letter={item.name.charAt(0)}
+          size={28}
+          radius={4}
+          fontSize={10}
+          pending={iconsResolving && !iconSrc}
+        />
       </div>
       <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }}>
         {item.name}
@@ -187,40 +188,11 @@ const ContentRow = memo(function ContentRow({
   );
 });
 
-// ---- Remote icon fetching --------------------------------------------------
-// CDN icon URLs are NEVER passed directly to <img src="https://...">: the
-// webview uses only the system proxy (no proxy→direct fallback), so one
-// flaky request used to leave the icon blank until the tab was remounted.
-// Instead, icons are downloaded through cmd_fetch_icon_url (send_with_fallback)
-// and stored as data URLs. In-flight set dedupes concurrent renders; failed
-// URLs get a cooldown so they retry later instead of hammering every render.
-const iconUrlInFlight = new Set<string>();
-const iconUrlFailedAt = new Map<string, number>();
-const ICON_URL_RETRY_MS = 30_000;
-
-function fetchRemoteIconCached(url: string, cacheIcon: (key: string, value: string) => void) {
-  if (iconUrlInFlight.has(url)) return;
-  const failedAt = iconUrlFailedAt.get(url);
-  if (failedAt && Date.now() - failedAt < ICON_URL_RETRY_MS) return;
-  iconUrlInFlight.add(url);
-  invoke<string | null>('cmd_fetch_icon_url', { url })
-    .then((data) => {
-      if (data) {
-        iconUrlFailedAt.delete(url);
-        cacheIcon(`url:${url}`, data);
-      } else {
-        iconUrlFailedAt.set(url, Date.now());
-      }
-    })
-    .catch(() => { iconUrlFailedAt.set(url, Date.now()); })
-    .finally(() => { iconUrlInFlight.delete(url); });
-}
-
 function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOpenFolder }: Props) {
   const t = useT();
   const [items, setItems] = useState<ContentItem[]>([]);
-  const [failedIcons, setFailedIcons] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
+  const [iconsResolving, setIconsResolving] = useState(false);
   const [search, setSearch] = useState('');
   // Selected by filename (NOT by filtered index) so changing the search
   // query doesn't shift the selection onto the wrong items. `Set<string>`
@@ -354,6 +326,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const loadItems = useCallback(async () => {
     const gen = ++loadGen.current;
     setLoading(true);
+    setIconsResolving(true);
     try {
       if (contentType === 'mod') {
         const raw = await invoke<any[]>('cmd_get_mod_metadata', { instanceName });
@@ -362,7 +335,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           filename: m.filename,
           name: m.name,
           version: m.version || '',
-          provider: m.provider || '',
+          provider: !m.provider || m.provider === 'Local' ? t('manager.provider_local') : m.provider,
           enabled: m.enabled,
           icon: m.icon,
           slug: m.slug,
@@ -378,16 +351,25 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           return !cache.get(`file:${m.filename}`);
         });
 
+        if (uncached.length === 0) {
+          if (gen === loadGen.current) setIconsResolving(false);
+          return;
+        }
+
         // Sliding-window pool: a slow item (network fallback with retries)
         // only occupies its own slot instead of stalling the next batch.
-        await runPool(uncached, 10, async (m) => {
-          if (gen !== loadGen.current) return;
-          const key = `file:${m.filename}`;
-          try {
-            const icon = await invoke<string | null>('cmd_get_mod_icon', { instanceName, filename: m.filename });
-            if (icon && gen === loadGen.current) cacheIcon(key, icon);
-          } catch { }
-        });
+        try {
+          await runPool(uncached, 10, async (m) => {
+            if (gen !== loadGen.current) return;
+            const key = `file:${m.filename}`;
+            try {
+              const icon = await invoke<string | null>('cmd_get_mod_icon', { instanceName, filename: m.filename });
+              if (icon && gen === loadGen.current) cacheIcon(key, icon);
+            } catch { }
+          });
+        } finally {
+          if (gen === loadGen.current) setIconsResolving(false);
+        }
       } else {
         const raw = await invoke<any[]>('cmd_list_packs', { instanceName, packType: subfolder });
         if (gen !== loadGen.current) return;
@@ -395,7 +377,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           filename: p.filename,
           name: p.name,
           version: p.version || extractVersionFromFilename(p.filename) || '',
-          provider: p.provider || t('manager.provider_local'),
+          provider: !p.provider || p.provider === 'Local' ? t('manager.provider_local') : p.provider,
           project_id: p.project_id || '',
           slug: p.project_id || undefined,
           enabled: !p.filename.endsWith('.disabled'),
@@ -403,12 +385,17 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           size: p.file_size,
         })));
         setLoading(false);
-        fetchPackIcons(raw).catch((e) => console.error('fetchPackIcons error:', e));
+        try {
+          await fetchPackIcons(raw);
+        } finally {
+          if (gen === loadGen.current) setIconsResolving(false);
+        }
       }
     } catch (e: any) {
       if (gen === loadGen.current) {
         addToast(t('manager.load_error', { label, error: e.toString() }), 'error');
         setLoading(false);
+        setIconsResolving(false);
       }
     }
   }, [instanceName, contentType, subfolder, fetchPackIcons, label, cacheIcon]);
@@ -418,7 +405,6 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     setSelectedFilenames(new Set());
     setSearch('');
     setCompatibility({});
-    setFailedIcons(new Set());
     checkedRef.current = new Set();
   }, [loadItems, mcVersion, loader]);
 
@@ -538,7 +524,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
               if (!filename.toLowerCase().endsWith(validExt)) continue;
               (async () => {
                 try {
-                  await invoke('cmd_install_mod', { instanceName, downloadUrl: `file://${filePath}`, fileName: filename, provider: 'local' });
+                  await invoke('cmd_install_mod', { instanceName, downloadUrl: `file://${filePath}`, fileName: filename, provider: 'local', subfolder });
                   loadItems();
                 } catch (e: any) { addToast(t('manager.dragdrop_error', { name: filename, error: e.toString() }), 'error'); }
               })();
@@ -639,7 +625,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     for (const filePath of files) {
       const filename = filePath.split(/[/\\]/).pop() || '';
       try {
-        await invoke('cmd_install_mod', { instanceName, downloadUrl: `file://${filePath}`, fileName: filename, provider: 'local' });
+        await invoke('cmd_install_mod', { instanceName, downloadUrl: `file://${filePath}`, fileName: filename, provider: 'local', subfolder });
       } catch (e: any) { addToast(t('manager.add_error', { name: filename, error: e.toString() }), 'error'); }
     }
     loadItems();
@@ -748,12 +734,11 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     const fileKey = `file:${item.filename}`;
     const v2 = getIcon(fileKey);
     if (v2) return v2;
-    // Remote CDN icon: fetch through the backend (proxy fallback) and cache
-    // as a data URL; show the placeholder until it arrives.
+    // Remote CDN icon: hand the remote URL to RemoteIcon — useRemoteImage
+    // fetches through cmd_fetch_icon_url, shows a shine while in flight and
+    // a letter only after a failed fetch (session cooldown).
     if (item.icon && !item.icon.startsWith('data:') && item.icon.includes('/')) {
-      const vUrl = getIcon(`url:${item.icon}`);
-      if (vUrl) return vUrl;
-      fetchRemoteIconCached(item.icon, cacheIcon);
+      return item.icon;
     }
     return null;
   };
@@ -781,15 +766,6 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
   const handleRowContext = useCallback((e: React.MouseEvent, filename: string) => {
     setContextMenu({ x: e.clientX, y: e.clientY, filename });
-  }, []);
-
-  const handleIconError = useCallback((filename: string) => {
-    setFailedIcons((prev) => {
-      if (prev.has(filename)) return prev;
-      const next = new Set(prev);
-      next.add(filename);
-      return next;
-    });
   }, []);
 
   const selectedItems = useMemo(getSelectedItems, [items, selectedFilenames]);
@@ -891,15 +867,14 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
                 item={item}
                 idx={idx}
                 isSelected={selectedFilenames.has(item.filename)}
-                failed={failedIcons.has(item.filename)}
                 iconSrc={getItemIcon(item)}
+                iconsResolving={iconsResolving}
                 hasCompatWarn={contentType === 'mod' && !!compatibility[item.filename]}
                 mcVersion={mcVersion}
                 compatTarget={compatTarget}
                 onRowClick={handleRowClick}
                 onContext={handleRowContext}
                 onToggle={toggleEnabled}
-                onIconError={handleIconError}
               />
             ))
           )}

@@ -11,6 +11,7 @@ import { useT } from '../../lib/i18n';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
+import { RemoteIcon } from '../../lib/remoteImage';
 
 interface Hit {
   project_id: string;
@@ -477,8 +478,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             <div style={{ marginBottom: 'var(--space-lg)' }}>
               <h3 style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, marginBottom: 'var(--space-sm)' }}>{t('content.mods_heading', { label, count: direct.length.toString() })}</h3>
               {direct.map((item, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', marginBottom: 4 }}>
-                  {item.iconUrl && <img src={item.iconUrl} alt="" style={{ width: 28, height: 28, borderRadius: 4, objectFit: 'cover' }} />}
+                <div key={i} className="content-list-row" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', marginBottom: 4 }}>
+                  <RemoteIcon url={item.iconUrl} letter={item.name.charAt(0)} size={28} radius={4} fontSize={11} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
                     <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{item.versionName} · {item.source}</div>
@@ -492,7 +493,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             <div style={{ marginBottom: 'var(--space-lg)' }}>
               <h3 style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, marginBottom: 'var(--space-sm)', color: 'var(--warning)' }}>{t('content.deps_heading', { count: deps.length.toString() })}</h3>
               {deps.map((item, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', border: '1px solid hsla(35, 90%, 55%, 0.2)', marginBottom: 4 }}>
+                <div key={i} className="content-list-row" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', border: '1px solid hsla(35, 90%, 55%, 0.2)', marginBottom: 4 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
                     <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('content.dep_required_by', { parent: item.parentMod ?? '' })}</div>
@@ -552,7 +553,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             const added = isAdded(hit.project_id, hit.slug, hit.title);
             return (
               <div key={hit.project_id}
-                className="stagger-in"
+                className="stagger-in content-list-row"
                 onClick={() => handleSelect(hit)}
                 style={{
                   display: 'flex', gap: 'var(--space-sm)', padding: '8px 10px', cursor: 'pointer',
@@ -563,13 +564,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                   animationDelay: `${Math.min(i, 9) * 24}ms`,
                 }}
               >
-                {hit.icon_url ? (
-                  <img src={hit.icon_url} alt="" style={{ width: 36, height: 36, borderRadius: 6, objectFit: 'cover', flexShrink: 0 }} />
-                ) : (
-                  <div style={{ width: 36, height: 36, borderRadius: 6, background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, color: 'var(--text-tertiary)', flexShrink: 0 }}>
-                    {hit.title.charAt(0)}
-                  </div>
-                )}
+                <RemoteIcon url={hit.icon_url} letter={hit.title.charAt(0)} size={36} radius={6} fontSize={14} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 600, fontSize: 'var(--font-size-sm)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6 }}>
                     {hit.title}
@@ -604,7 +599,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             ) : (
               <>
                 <div style={{ display: 'flex', gap: 'var(--space-md)', marginBottom: 'var(--space-md)' }}>
-                  {selected.icon_url && <img src={selected.icon_url} alt="" style={{ width: 48, height: 48, borderRadius: 8, objectFit: 'cover' }} />}
+                  <RemoteIcon url={selected.icon_url} letter={selected.title.charAt(0)} size={48} radius={8} fontSize={20} />
                   <div style={{ flex: 1 }}>
                     <h3 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700 }}>{selected.title}</h3>
                     <p style={{ margin: 0, fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>{selected.description}</p>

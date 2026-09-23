@@ -62,7 +62,7 @@ export const ru: Record<string, string> = {
   'error_boundary.try_again':          'Попробовать снова',
 
   // ── Home ────────────────────────────────────────────────────
-  'home.greeting_logged_in':           'Привет, {name}',
+  'home.greeting_logged_in':           'Здравствуйте, {name}',
   'home.greeting_guest':               'Добро пожаловать',
   'home.subtitle_last_played':         'Последний запуск: {name}',
   'home.subtitle_no_instances':        'Сборок пока нет',
@@ -124,6 +124,10 @@ export const ru: Record<string, string> = {
   'accounts.skin_variant_classic':     'Classic',
   'accounts.skin_variant_slim':        'Slim',
   'accounts.skin_updated_toast':       'Скин обновлён! Если используется Microsoft аккаунт, скин теперь глобальный.',
+  'accounts.elyby_skin_help_btn':      'Смена скина Ely.by',
+  'accounts.elyby_skin_help_title':    'Смена скина Ely.by',
+  'accounts.elyby_skin_help_body':     'Для аккаунтов Ely.by скин можно поменять только на официальном сайте Ely.by — лаунчер не имеет доступа к их API смены скина. Откройте страницу скинов, войдите в аккаунт и выберите новый скин.',
+  'accounts.elyby_skin_help_open':     'Открыть ely.by/skins',
 
   // ── Instance List ───────────────────────────────────────────
   'instances.page_title':              'Сборки',
@@ -234,7 +238,7 @@ export const ru: Record<string, string> = {
 
   'settings.section_account':          'Аккаунт',
   'settings.sign_out':                 'Выйти',
-  'settings.not_signed_in':            'Не вошёл',
+  'settings.not_signed_in':            'Вход не выполнен',
   'settings.sign_in_subtitle':         'Войдите, чтобы играть в Minecraft',
   'settings.account_type_microsoft':   'Microsoft',
   'settings.account_type_elyby':       'Ely.by',
@@ -372,7 +376,6 @@ export const ru: Record<string, string> = {
   'manager.column_on':                 'Вкл',
   'manager.column_name':               'Название',
   'manager.column_version':            'Версия',
-  'manager.column_size':               'Размер',
   'manager.column_provider':           'Источник',
   'manager.provider_local':            'Локальный файл',
   'manager.empty':                     '{label} не установлены.',
@@ -402,11 +405,6 @@ export const ru: Record<string, string> = {
 
   // ── Packs Manager ───────────────────────────────────────────
   'packs.installed_count':             '{n} установлено',
-  'packs.empty_helper':                'Нажмите "Скачать" для обзора или "Открыть папку" для добавления вручную.',
-  'packs.deleted_toast':               'Удалено: {name}',
-  'packs.delete_error':                'Не удалось удалить: {error}',
-  'packs.toggle_error':                'Не удалось переключить пак: {error}',
-  'packs.load_error':                  'Не удалось загрузить {label}: {error}',
 
   // ── Screenshots ─────────────────────────────────────────────
   'screenshots.title':                 'Скриншоты',
@@ -501,7 +499,6 @@ export const ru: Record<string, string> = {
   'updater.version':                    'Версия: {version}',
   'updater.downloading':                'Загрузка обновления...',
   'updater.installing':                 'Установка обновления...',
-  'updater.complete':                   'Обновление завершено! Перезапуск...',
   'updater.error':                      'Ошибка обновления: {error}',
   'updater.btn_update':                 'Обновить',
   'updater.btn_later':                  'Позже',
@@ -530,7 +527,7 @@ export const ru: Record<string, string> = {
   'modpacks.installing':               'Установка...',
   'modpacks.installed':                'Модпак установлен успешно',
   'modpacks.install_error':            'Ошибка установки: {error}',
-  'modpacks.name_placeholder':         'Имя инстанса',
+  'modpacks.name_placeholder':         'Название сборки',
   'modpacks.no_versions':              'Нет доступных версий',
   'modpacks.versions_for':             'Версии для Minecraft {mc}',
   'modpacks.recommended':              'Рекомендуемая',
@@ -552,8 +549,8 @@ export const ru: Record<string, string> = {
   'modpacks.progress_downloading_mods':'Скачивание модов: {current}/{total}',
 
   // ── Rooms ───────────────────────────────────────────────────
-  'sidebar.rooms':                     'Комнаты',
-  'rooms.title':                       'Комнаты',
+  'sidebar.rooms':                     'Сетевая игра',
+  'rooms.title':                       'Сетевая игра',
   'rooms.subtitle':                    'Играйте вместе через приватную сеть Tailscale — без настройки сервера и проброса портов.',
   'rooms.loading':                     'Загрузка состояния комнаты...',
   'rooms.retry':                       'Повторить',
@@ -564,7 +561,7 @@ export const ru: Record<string, string> = {
   'rooms.leave_confirm_title':         'Выйти из комнаты?',
   'rooms.leave_confirm_host_desc':     'Вы выйдете из комнаты, и гости потеряют доступ к вашему миру.',
   'rooms.leave_confirm_guest_desc':    'Вы выйдете из комнаты и потеряете доступ к миру хоста.',
-  'rooms.no_instances':                'Пока нет ни одного инстанса. Сначала создайте его.',
+  'rooms.no_instances':                'Сборок пока нет. Сначала создайте сборку.',
   'rooms.error_prefix':                'Ошибка комнат: {error}',
   'rooms.badge_host':                  'Хост',
   'rooms.badge_guest':                 'Гость',
@@ -602,7 +599,7 @@ export const ru: Record<string, string> = {
   'rooms.host_code_label':             'Код комнаты',
   'rooms.host_share_help':             'Как пригласить друга',
   'rooms.host_launch_step':            'Запустите мир в Minecraft и выберите «Открыть для сети» (Open to LAN).',
-  'rooms.host_instance_label':         'Инстанс для запуска',
+  'rooms.host_instance_label':         'Сборка для запуска',
   'rooms.host_launch':                 'Запустить мир',
   'rooms.host_detect':                 'Определить порт мира',
   'rooms.host_port_found':             'Порт мира определён: {port}',
@@ -620,7 +617,7 @@ export const ru: Record<string, string> = {
   'rooms.guest_host_offline':          'Хост пока недоступен. Убедитесь, что он принял ваш доступ и находится в сети.',
   'rooms.guest_waiting_port':          'Хост ещё не открыл мир для сети. Подождите.',
   'rooms.guest_ready':                 'Мир открыт. Можно присоединяться.',
-  'rooms.guest_instance_label':        'Инстанс для запуска',
+  'rooms.guest_instance_label':        'Сборка для запуска',
   'rooms.guest_join':                  'Присоединиться к миру',
   'rooms.guest_launch_manual':         'Запустить и подключиться вручную',
   'rooms.guest_manual_title':          'Подключение вручную',

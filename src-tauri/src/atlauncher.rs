@@ -381,17 +381,20 @@ fn mod_dest_dir(type_: &str) -> Option<&'static str> {
     }
 }
 
-fn write_atl_sidecar(mc_dir: &Path, dest: &Path, name: &str, version: Option<&str>) {
+fn write_atl_sidecar(dest: &Path, name: &str, version: Option<&str>) {
     let filename = dest
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(name);
+    // Sidecar lives next to the content file (mods/, resourcepacks/,
+    // shaderpacks/) so list_packs / list_mods can find it — not always in mods/.
+    let content_dir = dest.parent().unwrap_or_else(|| Path::new("."));
     let sidecar = serde_json::json!({
         "provider": "atlauncher",
         "project_name": name,
         "version_number": version,
     });
-    let path = instances::sidecar_meta_path(&mc_dir.join("mods"), filename);
+    let path = instances::sidecar_meta_path(content_dir, filename);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -663,7 +666,7 @@ let client = crate::download::global_http_client()
                         }
                         let _ = std::fs::remove_file(&dest);
                     } else {
-                        write_atl_sidecar(&mc_dir, &dest, &m.name, m.version.as_deref());
+                        write_atl_sidecar(&dest, &m.name, m.version.as_deref());
                     }
                     let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(ref a) = app_owned {

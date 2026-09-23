@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Search, Loader2, X, Check, Download, CirclePause, CirclePlay } from 'lucide-react';
 import { Button } from '../components/ui/Button';
@@ -9,75 +8,20 @@ import { useT } from '../lib/i18n';
 import { useModpacksStore, type ModpacksTab, type MrHit, type CfHit, type AtlPack } from '../stores/modpacksStore';
 import { formatBytes, formatDownloads } from '../lib/format';
 import { useSettingsStore } from '../stores/settingsStore';
+import { useRemoteImage, IconShine } from '../lib/remoteImage';
 
-// ---- Remote catalog icons ---------------------------------------------------
-// CDN icon URLs are never given to <img src="https://..."> directly: the
-// webview follows only the system proxy with no proxy→direct fallback, so a
-// single flaky host leaves every icon blank for some users. Icons are fetched
-// through cmd_fetch_icon_url (send_with_fallback) and rendered as data URLs;
-// session RAM cache + failure cooldown keep re-renders cheap.
-const remoteIconCache = new Map<string, string>();
-const remoteIconFailedAt = new Map<string, number>();
-const remoteIconInflight = new Set<string>();
-const remoteIconSubs = new Map<string, ((v: string | null) => void)[]>();
-const REMOTE_ICON_RETRY_MS = 60_000;
-
-function requestRemoteIcon(url: string) {
-  if (remoteIconInflight.has(url)) return;
-  const failedAt = remoteIconFailedAt.get(url);
-  if (failedAt && Date.now() - failedAt < REMOTE_ICON_RETRY_MS) {
-    setTimeout(() => {
-      (remoteIconSubs.get(url) ?? []).forEach((fn) => fn(null));
-      remoteIconSubs.delete(url);
-    }, 0);
-    return;
-  }
-  remoteIconInflight.add(url);
-  invoke<string | null>('cmd_fetch_icon_url', { url })
-    .then((data) => {
-      if (data) {
-        remoteIconCache.set(url, data);
-        remoteIconFailedAt.delete(url);
-      } else {
-        remoteIconFailedAt.set(url, Date.now());
-      }
-      (remoteIconSubs.get(url) ?? []).forEach((fn) => fn(data ?? null));
-    })
-    .catch(() => {
-      remoteIconFailedAt.set(url, Date.now());
-      (remoteIconSubs.get(url) ?? []).forEach((fn) => fn(null));
-    })
-    .finally(() => {
-      remoteIconInflight.delete(url);
-      remoteIconSubs.delete(url);
-    });
-}
-
+// Catalog icons go through the shared remote pipeline (useRemoteImage):
+// shine while loading, letter fallback only after a failed fetch.
 function RemoteIcon({ url, style, className }: { url: string; style?: React.CSSProperties; className?: string }) {
-  const [src, setSrc] = useState<string | null>(() =>
-    url.startsWith('data:') ? url : remoteIconCache.get(url) ?? null,
-  );
+  const { src, status, onError } = useRemoteImage(url);
 
-  useEffect(() => {
-    if (url.startsWith('data:')) {
-      setSrc(url);
-      return;
-    }
-    let alive = true;
-    setSrc(remoteIconCache.get(url) ?? null);
-    if (!remoteIconCache.has(url)) {
-      const subs = remoteIconSubs.get(url) ?? [];
-      subs.push((v) => { if (alive) setSrc(v); });
-      remoteIconSubs.set(url, subs);
-      requestRemoteIcon(url);
-    }
-    return () => { alive = false; };
-  }, [url]);
-
-  if (!src) return null;
+  if (status === 'loading') {
+    return <IconShine style={style} className={className} />;
+  }
+  if (status !== 'ready' || !src) return null;
   return (
     <img src={src} alt="" style={style} className={className} loading="lazy"
-      onError={() => setSrc(null)} />
+      onError={onError} />
   );
 }
 

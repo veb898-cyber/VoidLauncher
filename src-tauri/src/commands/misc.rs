@@ -8,7 +8,7 @@ use crate::AppState;
 use tauri::{AppHandle, State};
 
 #[tauri::command]
-pub fn cmd_rename_file(state: State<'_, AppState>, from: String, to: String) -> Result<(), String> {
+pub async fn cmd_rename_file(state: State<'_, AppState>, from: String, to: String) -> Result<(), String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let instances_dir = config.instances_dir();
     let from_path = std::path::Path::new(&from);
@@ -37,48 +37,58 @@ pub fn cmd_rename_file(state: State<'_, AppState>, from: String, to: String) -> 
 }
 
 #[tauri::command]
-pub fn cmd_delete_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let instances_dir = config.instances_dir();
-    let canon = std::path::Path::new(&path)
-        .canonicalize()
-        .map_err(|_| "Access denied: invalid path".to_string())?;
-    let base_canon = instances_dir
-        .canonicalize()
-        .map_err(|_| "Invalid base".to_string())?;
-    if !canon.starts_with(&base_canon) {
-        return Err("Access denied: path is outside instances directory".to_string());
-    }
-    std::fs::remove_file(&path).map_err(|e| e.to_string())
+pub async fn cmd_delete_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let canon = std::path::Path::new(&path)
+            .canonicalize()
+            .map_err(|_| "Access denied: invalid path".to_string())?;
+        let base_canon = instances_dir
+            .canonicalize()
+            .map_err(|_| "Invalid base".to_string())?;
+        if !canon.starts_with(&base_canon) {
+            return Err("Access denied: path is outside instances directory".to_string());
+        }
+        std::fs::remove_file(&path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Read an image file picked via the OS file dialog so the renderer never
 /// needs a broad filesystem scope. Restricted to image extensions and a
 /// size limit — an XSS in the renderer cannot exfiltrate arbitrary files.
 #[tauri::command]
-pub fn cmd_read_image_file(path: String) -> Result<Vec<u8>, String> {
-    const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
-    // Canonicalize first: resolves symlinks and rejects non-existent paths,
-    // so the extension check below cannot be bypassed by aliasing.
-    let file = std::path::Path::new(&path)
-        .canonicalize()
-        .map_err(|_| "Invalid file path".to_string())?;
-    if !file.is_file() {
-        return Err("Not a file".to_string());
-    }
-    let ext = file
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    if !["png", "jpg", "jpeg", "ico"].contains(&ext.as_str()) {
-        return Err("File must be a PNG, JPG or ICO image".to_string());
-    }
-    let meta = std::fs::metadata(&file).map_err(|e| e.to_string())?;
-    if meta.len() > MAX_IMAGE_BYTES {
-        return Err("Image file is too large (max 10 MB)".to_string());
-    }
-    std::fs::read(&file).map_err(|e| e.to_string())
+pub async fn cmd_read_image_file(path: String) -> Result<Vec<u8>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+        // Canonicalize first: resolves symlinks and rejects non-existent paths,
+        // so the extension check below cannot be bypassed by aliasing.
+        let file = std::path::Path::new(&path)
+            .canonicalize()
+            .map_err(|_| "Invalid file path".to_string())?;
+        if !file.is_file() {
+            return Err("Not a file".to_string());
+        }
+        let ext = file
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !["png", "jpg", "jpeg", "ico"].contains(&ext.as_str()) {
+            return Err("File must be a PNG, JPG or ICO image".to_string());
+        }
+        let meta = std::fs::metadata(&file).map_err(|e| e.to_string())?;
+        if meta.len() > MAX_IMAGE_BYTES {
+            return Err("Image file is too large (max 10 MB)".to_string());
+        }
+        std::fs::read(&file).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Fetch a description-page asset (screenshot, banner, badge) from ANY public
@@ -321,32 +331,36 @@ pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Vec<String>, S
 // ==================== Cache Commands ====================
 
 #[tauri::command]
-pub fn cmd_clear_cache(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let data_dir = config.data_dir.clone();
-    drop(config);
+pub async fn cmd_clear_cache(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
+    let data_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.data_dir.clone()
+    };
 
-    let mut freed: u64 = 0;
-    for subdir in &["assets", "libraries"] {
-        let dir = data_dir.join(subdir);
-        if dir.exists() {
-            let size = dir_size(&dir).unwrap_or(0);
-            std::fs::remove_dir_all(&dir).map_err(|e| {
-                let msg = format!("Failed to remove {:?}: {}", dir, e);
-                events::emit_log(&app, "error", "cache", &msg);
-                msg
-            })?;
-            freed += size;
-            events::emit_log(
-                &app,
-                "info",
-                "cache",
-                &format!("Removed {:?} ({} MB)", dir, size / 1024 / 1024),
-            );
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut freed: u64 = 0;
+        for subdir in &["assets", "libraries"] {
+            let dir = data_dir.join(subdir);
+            if dir.exists() {
+                let size = dir_size(&dir).unwrap_or(0);
+                std::fs::remove_dir_all(&dir).map_err(|e| {
+                    let msg = format!("Failed to remove {:?}: {}", dir, e);
+                    events::emit_log(&app, "error", "cache", &msg);
+                    msg
+                })?;
+                freed += size;
+                events::emit_log(
+                    &app,
+                    "info",
+                    "cache",
+                    &format!("Removed {:?} ({} MB)", dir, size / 1024 / 1024),
+                );
+            }
         }
-    }
-
-    Ok(freed)
+        Ok(freed)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
@@ -367,11 +381,15 @@ fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
 // ==================== System Commands ====================
 
 #[tauri::command]
-pub fn cmd_detect_system_ram() -> u64 {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    sys.total_memory() / (1024 * 1024) // Return MB
+pub async fn cmd_detect_system_ram() -> u64 {
+    tauri::async_runtime::spawn_blocking(|| {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.total_memory() / (1024 * 1024) // Return MB
+    })
+    .await
+    .unwrap_or(0)
 }
 
 // ==================== Config Commands ====================

@@ -293,7 +293,7 @@ pub async fn cmd_room_create_host(
 /// Join a room as guest: record the code and start the discovery loop that
 /// watches the tailnet for the host machine.
 #[tauri::command]
-pub fn cmd_room_join_guest(
+pub async fn cmd_room_join_guest(
     app: AppHandle,
     state: State<'_, AppState>,
     room_code: String,
@@ -301,10 +301,13 @@ pub fn cmd_room_join_guest(
     if !state.tailscale.is_installed() {
         return Err("Tailscale is not installed. Click 'Check connection' first.".into());
     }
-    let status = state
-        .tailscale
-        .status()
-        .map_err(|e| format!("Failed to read Tailscale status: {}", e))?;
+    let status = {
+        let ts = TailscaleManager::new(data_dir_of(&state));
+        tauri::async_runtime::spawn_blocking(move || ts.status())
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("Failed to read Tailscale status: {}", e))?
+    };
     if !TailscaleManager::is_logged_in(&status) {
         return Err("You must log in to Tailscale before joining a room.".into());
     }
@@ -330,7 +333,7 @@ pub fn cmd_room_join_guest(
 /// (it is managed in the Tailscale admin console). The temporary hostname
 /// hint is restored and the VoidLink bridge is torn down.
 #[tauri::command]
-pub fn cmd_room_leave(state: State<'_, AppState>) -> Result<RoomStatusPublic, String> {
+pub async fn cmd_room_leave(state: State<'_, AppState>) -> Result<RoomStatusPublic, String> {
     leave_room_and_restore(&state)?;
     Ok(build_status(&state))
 }
@@ -378,13 +381,19 @@ pub fn cmd_room_report_minecraft_port(
 
 /// Host side: scan the running game's log for an "Open to LAN" port line.
 #[tauri::command]
-pub fn cmd_room_detect_minecraft_port(_state: State<'_, AppState>) -> Result<Option<u16>, String> {
-    let Some(path) = crate::game_logs::get_current_log_path() else {
-        return Ok(None);
-    };
-    let text = crate::game_logs::read_game_log(&path, None).unwrap_or_default();
-    let connector = MinecraftConnector::default();
-    Ok(connector.detect_port(&text))
+pub async fn cmd_room_detect_minecraft_port(
+    _state: State<'_, AppState>,
+) -> Result<Option<u16>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Some(path) = crate::game_logs::get_current_log_path() else {
+            return Ok(None);
+        };
+        let text = crate::game_logs::read_game_log(&path, None).unwrap_or_default();
+        let connector = MinecraftConnector::default();
+        Ok(connector.detect_port(&text))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Build extra arguments to auto-join a host (`None` when the MC version
@@ -409,13 +418,18 @@ pub fn cmd_room_join_args(
 /// `None` means no confirmation yet (game still loading, or the version has
 /// no Quick Play join log — e.g. legacy `--server/--port` up to 1.19.4).
 #[tauri::command]
-pub fn cmd_room_quick_play_join_status() -> Result<Option<crate::rooms::minecraft_connector::QuickJoinInfo>, String> {
-    let Some(path) = crate::game_logs::get_current_log_path() else {
-        return Ok(None);
-    };
-    let quickplay_path = format!("{}.quickplay.json", path);
-    let text = std::fs::read_to_string(&quickplay_path).unwrap_or_default();
-    Ok(parse_quick_play_confirmation(&text))
+pub async fn cmd_room_quick_play_join_status(
+) -> Result<Option<crate::rooms::minecraft_connector::QuickJoinInfo>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Some(path) = crate::game_logs::get_current_log_path() else {
+            return Ok(None);
+        };
+        let quickplay_path = format!("{}.quickplay.json", path);
+        let text = std::fs::read_to_string(&quickplay_path).unwrap_or_default();
+        Ok(parse_quick_play_confirmation(&text))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Revoke access: open the Tailscale Admin Console where the owner removes

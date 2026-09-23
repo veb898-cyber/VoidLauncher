@@ -120,6 +120,10 @@ export const en = {
   'accounts.skin_variant_classic':     'Classic',
   'accounts.skin_variant_slim':        'Slim',
   'accounts.skin_updated_toast':       'Skin updated! If using a Microsoft account, the skin is now global.',
+  'accounts.elyby_skin_help_btn':      'Ely.by skin change',
+  'accounts.elyby_skin_help_title':    'Change Ely.by skin',
+  'accounts.elyby_skin_help_body':     'For Ely.by accounts the skin can only be changed on the official Ely.by website — the launcher has no access to their skin API. Open the skins page, sign in, and pick a new skin.',
+  'accounts.elyby_skin_help_open':     'Open ely.by/skins',
 
   // ── Instance List ───────────────────────────────────────────
   'instances.page_title':              'Instances',
@@ -368,7 +372,6 @@ export const en = {
   'manager.column_on':                 'ON',
   'manager.column_name':               'Name',
   'manager.column_version':            'Version',
-  'manager.column_size':               'Size',
   'manager.column_provider':           'Provider',
   'manager.provider_local':            'Local file',
   'manager.empty':                     'No {label} installed.',
@@ -398,11 +401,6 @@ export const en = {
 
   // ── Packs Manager ───────────────────────────────────────────
   'packs.installed_count':             '{n} installed',
-  'packs.empty_helper':                'Click "Download" to browse or "Open Folder" to add manually.',
-  'packs.deleted_toast':               'Deleted: {name}',
-  'packs.delete_error':                'Failed to remove: {error}',
-  'packs.toggle_error':                'Failed to toggle pack: {error}',
-  'packs.load_error':                  'Failed to load {label}: {error}',
 
   // ── Screenshots ─────────────────────────────────────────────
   'screenshots.title':                 'Screenshots',
@@ -488,7 +486,6 @@ export const en = {
   'updater.version':                    'Version: {version}',
   'updater.downloading':                'Downloading update...',
   'updater.installing':                 'Installing update...',
-  'updater.complete':                   'Update complete! Restarting...',
   'updater.error':                      'Update failed: {error}',
   'updater.btn_update':                 'Update Now',
   'updater.btn_later':                  'Later',
@@ -548,8 +545,8 @@ export const en = {
   'modpacks.progress_downloading_mods':'Downloading mods: {current}/{total}',
 
   // ── Rooms ───────────────────────────────────────────────────
-  'sidebar.rooms':                     'Rooms',
-  'rooms.title':                       'Rooms',
+  'sidebar.rooms':                     'Multiplayer',
+  'rooms.title':                       'Multiplayer',
   'rooms.subtitle':                    'Play together over a private Tailscale network — no server setup, no port forwarding.',
   'rooms.loading':                     'Loading room status...',
   'rooms.retry':                       'Retry',

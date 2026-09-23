@@ -116,6 +116,47 @@ fn normalize_zip_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
+/// Provider-only sidecar for a file extracted from a pack override into a
+/// tracked content folder (mods / resourcepacks / shaderpacks). Skips when a
+/// sidecar already exists (the index/manifest download may write a richer one
+/// with project_id, and it runs after overrides).
+fn write_override_sidecar(mc_dir: &Path, relative: &str, provider: &str) {
+    let norm = normalize_zip_path(relative);
+    let mut parts = norm.splitn(2, '/');
+    let top = match parts.next() {
+        Some(t) => t,
+        None => return,
+    };
+    if !matches!(top, "mods" | "resourcepacks" | "shaderpacks") {
+        return;
+    }
+    let rest = match parts.next() {
+        Some(r) if !r.contains('/') => r,
+        _ => return,
+    };
+    let lower = rest.to_lowercase();
+    if !(lower.ends_with(".jar")
+        || lower.ends_with(".zip")
+        || lower.ends_with(".jar.disabled")
+        || lower.ends_with(".zip.disabled"))
+    {
+        return;
+    }
+    let content_dir = mc_dir.join(top);
+    if crate::instances::read_sidecar_meta(&content_dir, rest).is_some() {
+        return;
+    }
+    let sidecar = serde_json::json!({
+        "provider": provider,
+        "downloaded_from_pack": true,
+    });
+    let path = crate::instances::sidecar_meta_path(&content_dir, rest);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, sidecar.to_string());
+}
+
 /// Extract every entry of a zip archive into `dest`, rejecting zip-slip paths.
 pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
@@ -647,6 +688,7 @@ pub(crate) async fn import_mrpack(
                 std::fs::create_dir_all(mc_dir.join(relative))?;
             } else {
                 write_extracted(&mc_dir, relative, &mut entry)?;
+                write_override_sidecar(&mc_dir, relative, "modrinth");
             }
             continue;
         }
@@ -887,6 +929,7 @@ pub(crate) async fn import_curseforge_pack(
                 std::fs::create_dir_all(mc_dir.join(relative))?;
             } else {
                 write_extracted(&mc_dir, relative, &mut entry)?;
+                write_override_sidecar(&mc_dir, relative, "curseforge");
             }
         }
     }
@@ -1120,6 +1163,7 @@ fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &s
         check_safe_relative(&entry_name)?;
 
         write_extracted(&mc_dir, &entry_name, &mut entry)?;
+        write_override_sidecar(&mc_dir, &entry_name, "atlauncher");
     }
 
     let now = chrono::Utc::now().to_rfc3339();

@@ -123,6 +123,9 @@ impl Default for AppConfig {
             proxy_port: 0,
             show_snapshots: false,
             show_old_versions: false,
+            // CurseForge public API key taken from Prism Launcher's open-source
+            // defaults — NOT a secret, safe to ship in the repo (CF treats it
+            // as an identifier, not a credential).
             curseforge_api_key: "$2a$10$wuAJuNZuted3NORVmpgUC.m8sI.pv1tOPKZyBgLFGjxFp/br0lZCC".into(),
         }
     }

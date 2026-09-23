@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAccountsStore, type AccountEntry } from '../stores/accountsStore';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
@@ -9,9 +10,11 @@ import { Tooltip } from '../components/ui/Tooltip';
 import { EmptyState } from '../components/ui/EmptyState';
 import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
 import { addToast } from '../components/ui/Toast';
-import { Trash2, Shirt, UserRoundPlus } from 'lucide-react';
+import { Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
 import { t } from '../lib/i18n';
-import { Avatar } from '../lib/remoteImage';
+import { Avatar, OfflineAvatar } from '../lib/remoteImage';
+
+const ELYBY_SKINS_URL = 'https://ely.by/skins';
 
 /**
  * Validate an offline-account username on the frontend.
@@ -54,6 +57,7 @@ export function Accounts() {
   const [skinModalAccount, setSkinModalAccount] = useState<AccountEntry | null>(null);
   const [skinModalPath, setSkinModalPath] = useState('');
   const [skinVariant, setSkinVariant] = useState<'classic' | 'slim'>('classic');
+  const [showElybySkinHelp, setShowElybySkinHelp] = useState(false);
 
   useEffect(() => { loadAccounts(); }, [loadAccounts]);
 
@@ -152,13 +156,14 @@ export function Accounts() {
               padding: 'var(--space-lg)', display: 'flex', alignItems: 'center', gap: 'var(--space-lg)',
               border: acc.default ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
             }}>
-            {acc.uuid ? (
+            {acc.account_type === 'Offline' ? (
+              <OfflineAvatar size={40} />
+            ) : acc.uuid ? (
               <Avatar uuid={acc.uuid} name={acc.name} size={40} />
             ) : (
               <div
-                className="account-card__avatar"
                 style={{
-                  background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
                   width: 40, height: 40, borderRadius: 'var(--radius-md)', flexShrink: 0,
                   fontWeight: 700, fontSize: 'var(--font-size-lg)', color: getTypeColor(acc.account_type),
                 }}
@@ -204,6 +209,18 @@ export function Accounts() {
                     onClick={(e) => { e.stopPropagation(); handleSkinChange(acc); }}
                   >
                     <Shirt size={14} />
+                  </Button>
+                </Tooltip>
+              )}
+              {acc.account_type === 'ElyBy' && (
+                <Tooltip content={t('accounts.elyby_skin_help_btn')}>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    aria-label={t('accounts.elyby_skin_help_btn')}
+                    onClick={(e) => { e.stopPropagation(); setShowElybySkinHelp(true); }}
+                  >
+                    <HelpCircle size={14} />
                   </Button>
                 </Tooltip>
               )}
@@ -278,6 +295,24 @@ export function Accounts() {
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
           <Button variant="ghost" onClick={() => setSkinModalAccount(null)}>{t('common.cancel')}</Button>
           <Button onClick={confirmSkinChange}>{t('common.confirm')}</Button>
+        </div>
+      </Modal>
+
+      {/* Ely.by skin help — no official API, point the user at the website */}
+      <Modal
+        open={showElybySkinHelp}
+        onClose={() => setShowElybySkinHelp(false)}
+        title={t('accounts.elyby_skin_help_title')}
+        maxWidth={420}
+      >
+        <p style={{ margin: 0, fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+          {t('accounts.elyby_skin_help_body')}
+        </p>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
+          <Button variant="ghost" onClick={() => setShowElybySkinHelp(false)}>{t('common.close')}</Button>
+          <Button onClick={() => { openUrl(ELYBY_SKINS_URL).catch(() => {}); }}>
+            {t('accounts.elyby_skin_help_open')}
+          </Button>
         </div>
       </Modal>
     </div>

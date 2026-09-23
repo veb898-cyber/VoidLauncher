@@ -91,22 +91,27 @@ pub(crate) fn validate_world_name(name: &str) -> Result<(), String> {
 // ==================== Instance Commands ====================
 
 #[tauri::command]
-pub fn cmd_list_instances(state: State<'_, AppState>) -> Result<Vec<instances::Instance>, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut insts =
-        instances::list_instances(&config.instances_dir()).map_err(|e| e.to_string())?;
-    // Merge playtime from playtime.json into each instance
-    let playtime_map = playtime::load_playtime(&config.data_dir);
-    for inst in &mut insts {
-        if let Some(entry) = playtime_map.get(&inst.name) {
-            inst.play_time_seconds = entry.minutes * 60;
+pub async fn cmd_list_instances(state: State<'_, AppState>) -> Result<Vec<instances::Instance>, String> {
+    let (instances_dir, data_dir) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (config.instances_dir(), config.data_dir.clone())
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut insts = instances::list_instances(&instances_dir).map_err(|e| e.to_string())?;
+        let playtime_map = playtime::load_playtime(&data_dir);
+        for inst in &mut insts {
+            if let Some(entry) = playtime_map.get(&inst.name) {
+                inst.play_time_seconds = entry.minutes * 60;
+            }
         }
-    }
-    Ok(insts)
+        Ok(insts)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_create_instance(
+pub async fn cmd_create_instance(
     state: State<'_, AppState>,
     name: String,
     mc_version: String,
@@ -114,71 +119,107 @@ pub fn cmd_create_instance(
     loader_version: Option<String>,
 ) -> Result<instances::Instance, String> {
     validate_instance_name(&name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let loader = loader.unwrap_or(instances::LoaderType::Vanilla);
-    let instance = instances::Instance::new(
-        &name,
-        &mc_version,
-        config.default_memory_mb,
-        &config.default_gc_preset,
-        loader.clone(),
-        if loader == instances::LoaderType::Vanilla { None } else { loader_version },
-    );
-    instances::create_instance(&config.instances_dir(), &instance).map_err(|e| e.to_string())?;
-    Ok(instance)
+    let (instances_dir, default_memory_mb, default_gc_preset) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (
+            config.instances_dir(),
+            config.default_memory_mb,
+            config.default_gc_preset.clone(),
+        )
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let loader = loader.unwrap_or(instances::LoaderType::Vanilla);
+        let instance = instances::Instance::new(
+            &name,
+            &mc_version,
+            default_memory_mb,
+            &default_gc_preset,
+            loader.clone(),
+            if loader == instances::LoaderType::Vanilla { None } else { loader_version },
+        );
+        instances::create_instance(&instances_dir, &instance).map_err(|e| e.to_string())?;
+        Ok(instance)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_delete_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
+pub async fn cmd_delete_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
     validate_instance_name(&name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::delete_instance(&config.instances_dir(), &name).map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::delete_instance(&instances_dir, &name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_get_instance(
+pub async fn cmd_get_instance(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<instances::Instance, String> {
     validate_instance_name(&name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut inst =
-        instances::get_instance(&config.instances_dir(), &name).map_err(|e| e.to_string())?;
-    // Merge playtime from playtime.json
-    let playtime_map = playtime::load_playtime(&config.data_dir);
-    if let Some(entry) = playtime_map.get(&inst.name) {
-        inst.play_time_seconds = entry.minutes * 60;
-    }
-    Ok(inst)
+    let (instances_dir, data_dir) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (config.instances_dir(), config.data_dir.clone())
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut inst = instances::get_instance(&instances_dir, &name).map_err(|e| e.to_string())?;
+        let playtime_map = playtime::load_playtime(&data_dir);
+        if let Some(entry) = playtime_map.get(&inst.name) {
+            inst.play_time_seconds = entry.minutes * 60;
+        }
+        Ok(inst)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_save_instance(
+pub async fn cmd_save_instance(
     state: State<'_, AppState>,
     instance: instances::Instance,
     old_name: Option<String>,
 ) -> Result<(), String> {
     validate_instance_name(&instance.name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::save_instance(&config.instances_dir(), &instance, old_name.as_deref())
-        .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::save_instance(&instances_dir, &instance, old_name.as_deref())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_duplicate_instance(
+pub async fn cmd_duplicate_instance(
     state: State<'_, AppState>,
     name: String,
     new_name: String,
 ) -> Result<instances::Instance, String> {
     validate_instance_name(&name)?;
     validate_instance_name(&new_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::duplicate_instance(&config.instances_dir(), &name, &new_name)
-        .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::duplicate_instance(&instances_dir, &name, &new_name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_import_prism_instance(
+pub async fn cmd_import_prism_instance(
     state: State<'_, AppState>,
     zip_path: String,
 ) -> Result<instances::Instance, String> {
@@ -189,28 +230,45 @@ pub fn cmd_import_prism_instance(
     if !zip.extension().map_or(false, |e| e == "zip") {
         return Err("File must be a .zip archive".to_string());
     }
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::import_prism_pack(&config.instances_dir(), &zip_path).map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::import_prism_pack(&instances_dir, &zip_path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_export_instance(
+pub async fn cmd_export_instance(
     state: State<'_, AppState>,
     name: String,
     output_path: String,
 ) -> Result<(), String> {
     validate_instance_name(&name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::export_instance(&config.instances_dir(), &name, &output_path)
-        .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::export_instance(&instances_dir, &name, &output_path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_probe_modpack(path: String) -> Result<crate::import::ModpackMetadata, String> {
+pub async fn cmd_probe_modpack(path: String) -> Result<crate::import::ModpackMetadata, String> {
     if !std::path::PathBuf::from(&path).exists() {
         return Err("File not found".to_string());
     }
-    crate::import::probe_modpack(&path).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::import::probe_modpack(&path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -291,17 +349,24 @@ pub fn cmd_log_toast(app: AppHandle, level: String, message: String) {
 }
 
 #[tauri::command]
-pub fn cmd_list_saves(
+pub async fn cmd_list_saves(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<Vec<instances::SaveEntry>, String> {
     validate_instance_name(&instance_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::list_saves(&config.instances_dir(), &instance_name).map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::list_saves(&instances_dir, &instance_name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_rename_world(
+pub async fn cmd_rename_world(
     state: State<'_, AppState>,
     instance_name: String,
     old_name: String,
@@ -310,18 +375,20 @@ pub fn cmd_rename_world(
     validate_instance_name(&instance_name)?;
     validate_world_name(&old_name)?;
     validate_world_name(&new_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::rename_world(
-        &config.instances_dir(),
-        &instance_name,
-        &old_name,
-        &new_name,
-    )
-    .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::rename_world(&instances_dir, &instance_name, &old_name, &new_name)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_copy_world(
+pub async fn cmd_copy_world(
     state: State<'_, AppState>,
     instance_name: String,
     world_name: String,
@@ -330,42 +397,57 @@ pub fn cmd_copy_world(
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
     validate_world_name(&new_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::copy_world(
-        &config.instances_dir(),
-        &instance_name,
-        &world_name,
-        &new_name,
-    )
-    .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::copy_world(&instances_dir, &instance_name, &world_name, &new_name)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_delete_world(
+pub async fn cmd_delete_world(
     state: State<'_, AppState>,
     instance_name: String,
     world_name: String,
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::delete_world(&config.instances_dir(), &instance_name, &world_name)
-        .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::delete_world(&instances_dir, &instance_name, &world_name)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_list_screenshots(
+pub async fn cmd_list_screenshots(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<Vec<instances::ScreenshotEntry>, String> {
     validate_instance_name(&instance_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::list_screenshots(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::list_screenshots(&instances_dir, &instance_name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_delete_screenshot(
+pub async fn cmd_delete_screenshot(
     state: State<'_, AppState>,
     instance_name: String,
     filename: String,
@@ -376,13 +458,20 @@ pub fn cmd_delete_screenshot(
         .and_then(|n| n.to_str())
         .ok_or("Invalid filename")?
         .to_string();
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::delete_screenshot(&config.instances_dir(), &instance_name, &safe_filename)
-        .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::delete_screenshot(&instances_dir, &instance_name, &safe_filename)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_read_screenshot(
+pub async fn cmd_read_screenshot(
     state: State<'_, AppState>,
     instance_name: String,
     filename: String,
@@ -393,13 +482,20 @@ pub fn cmd_read_screenshot(
         .and_then(|n| n.to_str())
         .ok_or("Invalid filename")?
         .to_string();
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::read_screenshot(&config.instances_dir(), &instance_name, &safe_filename)
-        .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::read_screenshot(&instances_dir, &instance_name, &safe_filename)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_list_packs(
+pub async fn cmd_list_packs(
     state: State<'_, AppState>,
     instance_name: String,
     pack_type: String,
@@ -408,13 +504,19 @@ pub fn cmd_list_packs(
     if !["mods", "resourcepacks", "shaderpacks", "config"].contains(&pack_type.as_str()) {
         return Err("Invalid pack_type".to_string());
     }
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::list_packs(&config.instances_dir(), &instance_name, &pack_type)
-        .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::list_packs(&instances_dir, &instance_name, &pack_type).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_get_pack_icon(
+pub async fn cmd_get_pack_icon(
     state: State<'_, AppState>,
     instance_name: String,
     pack_type: String,
@@ -429,14 +531,16 @@ pub fn cmd_get_pack_icon(
         .and_then(|n| n.to_str())
         .ok_or("Invalid filename")?
         .to_string();
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    instances::read_pack_icon(
-        &config.instances_dir(),
-        &instance_name,
-        &pack_type,
-        &safe_filename,
-    )
-    .map_err(|e| e.to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::read_pack_icon(&instances_dir, &instance_name, &pack_type, &safe_filename)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -568,51 +672,62 @@ pub fn cmd_open_instance_folder(
 }
 
 #[tauri::command]
-pub fn cmd_get_instance_dir(
+pub async fn cmd_get_instance_dir(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<String, String> {
     validate_instance_name(&instance_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
-    Ok(instance
-        .minecraft_dir(&config.instances_dir())
-        .to_string_lossy()
-        .to_string())
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let instance = instances::get_instance(&instances_dir, &instance_name)
+            .map_err(|e| e.to_string())?;
+        Ok(instance
+            .minecraft_dir(&instances_dir)
+            .to_string_lossy()
+            .to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_check_instance_installed(
+pub async fn cmd_check_instance_installed(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<bool, String> {
     validate_instance_name(&instance_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
+    let (instances_dir, versions_dir) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (config.instances_dir(), config.versions_dir())
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let instance =
+            instances::get_instance(&instances_dir, &instance_name).map_err(|e| e.to_string())?;
 
-    let version_jar = config
-        .versions_dir()
-        .join(&instance.mc_version)
-        .join("client.jar");
-    // Fallback: check for old {version}.jar
-    if !version_jar.exists() {
-        let old_jar = config
-            .versions_dir()
+        let version_jar = versions_dir
             .join(&instance.mc_version)
-            .join(format!("{}.jar", instance.mc_version));
-        if old_jar.exists() {
-            std::fs::rename(&old_jar, &version_jar).ok();
+            .join("client.jar");
+        // Fallback: check for old {version}.jar
+        if !version_jar.exists() {
+            let old_jar = versions_dir
+                .join(&instance.mc_version)
+                .join(format!("{}.jar", instance.mc_version));
+            if old_jar.exists() {
+                std::fs::rename(&old_jar, &version_jar).ok();
+            }
         }
-    }
 
-    let version_json = config
-        .versions_dir()
-        .join(&instance.mc_version)
-        .join(format!("{}.json", instance.mc_version));
+        let version_json = versions_dir
+            .join(&instance.mc_version)
+            .join(format!("{}.json", instance.mc_version));
 
-    Ok(version_jar.exists() && version_json.exists())
+        Ok(version_jar.exists() && version_json.exists())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]

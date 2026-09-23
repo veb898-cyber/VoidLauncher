@@ -670,7 +670,7 @@ pub(crate) fn read_packwiz_meta(content_dir: &Path, filename: &str) -> Option<Pa
 fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, String, String)> {
     let filename = pack_path.file_name()?.to_string_lossy().to_string();
     if let Some(val) = read_sidecar_meta(pack_path.parent()?, &filename) {
-        let provider = val["provider"].as_str().unwrap_or("").to_string();
+        let provider = normalize_provider(val["provider"].as_str().unwrap_or(""));
         let version = val["version_number"].as_str().unwrap_or("").to_string();
         let project_id = val["project_id"].as_str().unwrap_or("").to_string();
         let project_name = val["project_name"].as_str().unwrap_or("").to_string();
@@ -679,6 +679,18 @@ fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, Str
     // Fallback: Prism packwiz metadata (.pw.toml in .index/)
     let pw = read_packwiz_meta(pack_path.parent()?, &filename)?;
     Some((pw.provider, pw.version, pw.project_id, pw.name))
+}
+
+/// Normalize a raw provider string from sidecar/packwiz metadata to the
+/// display form used in the UI (mods and packs alike).
+pub(crate) fn normalize_provider(raw: &str) -> String {
+    match raw.to_lowercase().as_str() {
+        "modrinth" => "Modrinth".to_string(),
+        "curseforge" => "CurseForge".to_string(),
+        "local" => "Local".to_string(),
+        "atlauncher" => "ATLauncher".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Strip Minecraft color/formatting codes (§a, §l, §r, etc.) and any underscores used as spaces

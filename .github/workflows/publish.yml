@@ -58,8 +58,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAG: ${{ github.ref_name }}
         run: |
-          # -x: print every command before it runs (so CI log shows where it died)
-          set -euxo pipefail
+          # -e: exit on error; -u: fail on unset vars.
+          # Do NOT use -x here: bash -x expands and prints every command,
+          # including TAURI_SIGNING_PRIVATE_KEY / PASSWORD assignments —
+          # that would leak the production signing key into the public CI log.
+          set -euo pipefail
 
           TAG_NO_V="${TAG#v}"
           INSTALLER="VoidLauncher_${TAG_NO_V}_x64-setup.exe"
@@ -68,7 +71,6 @@ jobs:
           echo "Installer:     $INSTALLER"
           echo "OS:            $(uname -a)"
           echo "Secret length: ${#TAURI_SIGNING_PRIVATE_KEY}"
-          echo "Secret first 80 chars: ${TAURI_SIGNING_PRIVATE_KEY:0:80}"
 
           # ── 1. Normalize the secret to a base64 string the CLI expects ──
           #
@@ -102,10 +104,12 @@ jobs:
           else
             {
               echo "::error::TAURI_SIGNING_PRIVATE_KEY is neither base64-of-minisign-text nor raw minisign text."
-              echo "::error::First 200 chars: ${TAURI_SIGNING_PRIVATE_KEY:0:200}"
+              echo "::error::Do not paste key material here; check the GitHub secret format instead."
             } >&2
+            rm -f raw_secret.txt decoded.txt
             exit 1
           fi
+          rm -f raw_secret.txt decoded.txt
           echo "Key for CLI length: ${#KEY_FOR_CLI}"
 
           # ── 2. Fetch the freshly-uploaded installer from the release ──

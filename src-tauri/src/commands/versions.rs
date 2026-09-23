@@ -29,23 +29,28 @@ pub async fn cmd_get_version_info(url: String) -> Result<versions::VersionInfo, 
 // ==================== Java Commands ====================
 
 #[tauri::command]
-pub fn cmd_detect_java(state: State<'_, AppState>) -> Result<Vec<java::JavaInstallation>, String> {
-    let c = state.config.lock().map_err(|e| e.to_string())?;
-    let data_dir = c.data_dir.clone();
-    drop(c);
-    let mut installations = java::detect_java_installations();
-    installations.extend(
-        java_download::list_managed_java(&data_dir)
-            .into_iter()
-            .map(|m| java::JavaInstallation {
-                path: m.path,
-                version: m.version,
-                major_version: m.major_version,
-                is_64bit: m.is_64bit,
-                vendor: m.vendor,
-            }),
-    );
-    Ok(installations)
+pub async fn cmd_detect_java(state: State<'_, AppState>) -> Result<Vec<java::JavaInstallation>, String> {
+    let data_dir = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.data_dir.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut installations = java::detect_java_installations();
+        installations.extend(
+            java_download::list_managed_java(&data_dir)
+                .into_iter()
+                .map(|m| java::JavaInstallation {
+                    path: m.path,
+                    version: m.version,
+                    major_version: m.major_version,
+                    is_64bit: m.is_64bit,
+                    vendor: m.vendor,
+                }),
+        );
+        installations
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -71,22 +76,33 @@ pub async fn cmd_download_java(
 }
 
 #[tauri::command]
-pub fn cmd_list_managed_java(state: State<'_, AppState>) -> Vec<java_download::ManagedJavaRuntime> {
+pub async fn cmd_list_managed_java(
+    state: State<'_, AppState>,
+) -> Result<Vec<java_download::ManagedJavaRuntime>, String> {
     let data_dir = {
         let c = state.config.lock().map_err(|e| e.to_string());
         match c {
             Ok(cfg) => cfg.data_dir.clone(),
-            Err(_) => return Vec::new(),
+            Err(_) => return Ok(Vec::new()),
         }
     };
-    java_download::list_managed_java(&data_dir)
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        java_download::list_managed_java(&data_dir)
+    })
+    .await
+    .map_err(|e| e.to_string())?)
 }
 
 #[tauri::command]
-pub fn cmd_remove_managed_java(state: State<'_, AppState>, major_version: u32) -> Result<(), String> {
+pub async fn cmd_remove_managed_java(state: State<'_, AppState>, major_version: u32) -> Result<(), String> {
     let data_dir = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.data_dir.clone()
     };
-    java_download::remove_managed_java(major_version, &data_dir).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        java_download::remove_managed_java(major_version, &data_dir)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }

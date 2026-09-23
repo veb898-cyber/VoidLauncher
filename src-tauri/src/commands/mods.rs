@@ -459,25 +459,46 @@ pub async fn cmd_install_mod(
     project_name: Option<String>,
     version_number: Option<String>,
     provider: String,
+    subfolder: Option<String>,
 ) -> Result<String, String> {
     validate_instance_name(&instance_name)?;
 
-    let (mods_dir, safe_name, dest) = {
+    // Content subfolder: mods (default), resourcepacks, shaderpacks.
+    // Local drag-drop / file picker for packs must land in the right folder
+    // so list_packs finds the file and its sidecar.
+    const ALLOWED: &[&str] = &["mods", "resourcepacks", "shaderpacks"];
+    let safe_subfolder = subfolder
+        .unwrap_or_else(|| "mods".to_string())
+        .trim_matches('/')
+        .trim_matches('\\')
+        .to_string();
+    if !ALLOWED
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(&safe_subfolder))
+    {
+        return Err(format!("Subfolder '{}' is not allowed.", safe_subfolder));
+    }
+    let safe_subfolder = safe_subfolder.to_lowercase();
+
+    let (content_dir, safe_name, dest) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let instance = instances::get_instance(&config.instances_dir(), &instance_name)
             .map_err(|e| e.to_string())?;
-        let mods_dir = instance.mods_dir(&config.instances_dir());
+        let content_dir = instance
+            .minecraft_dir(&config.instances_dir())
+            .join(&safe_subfolder);
+        let _ = std::fs::create_dir_all(&content_dir);
         let safe_name = std::path::Path::new(&file_name)
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or("Invalid file name")?
             .to_string();
-        let dest = mods_dir.join(&safe_name);
-        (mods_dir, safe_name, dest)
+        let dest = content_dir.join(&safe_name);
+        (content_dir, safe_name, dest)
     };
 
     // Local file installation: the UI passes a `file://` URI in `download_url`
-    // and `provider: "local"`. Copy the file into the mods dir instead of
+    // and `provider: "local"`. Copy the file into the content dir instead of
     // downloading it — the HTTPS/host allowlist checks below only apply to
     // remote downloads.
     if provider == "local" {
@@ -490,6 +511,15 @@ pub async fn cmd_install_mod(
         }
         std::fs::copy(&local_path, &dest).map_err(|e| e.to_string())?;
         download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
+        // Sidecar so the Source column shows Local instead of a loader name
+        // from jar metadata (no project_id — nothing to update).
+        let sidecar = serde_json::json!({ "provider": "local" });
+        let sidecar_path = crate::instances::sidecar_meta_path(&content_dir, &safe_name);
+        if let Some(parent) = sidecar_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(sidecar_path, sidecar.to_string());
+        let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(&content_dir, &safe_name));
         return Ok(safe_name);
     }
 
@@ -521,12 +551,12 @@ pub async fn cmd_install_mod(
             "version_id": modrinth_version_id,
             "version_number": version_number,
         });
-        let sidecar_path = crate::instances::sidecar_meta_path(&mods_dir, &safe_name);
+        let sidecar_path = crate::instances::sidecar_meta_path(&content_dir, &safe_name);
         if let Some(parent) = sidecar_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(sidecar_path, sidecar.to_string());
-        let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(&mods_dir, &safe_name));
+        let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(&content_dir, &safe_name));
     }
 
     Ok(final_name)
@@ -643,80 +673,93 @@ pub async fn cmd_download_to_folder(
 }
 
 #[tauri::command]
-pub fn cmd_list_instance_mods(
+pub async fn cmd_list_instance_mods(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<Vec<ModMetadata>, String> {
     validate_instance_name(&instance_name)?;
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
-    let mods_dir = instance.mods_dir(&config.instances_dir());
-    if !mods_dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut mods = Vec::new();
-    let pw_index = crate::instances::load_packwiz_index(&mods_dir);
-    if let Ok(entries) = std::fs::read_dir(&mods_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            // Skip the voidlauncher sidecar files
-            if filename.ends_with(".voidlauncher.json") {
-                continue;
-            }
-            let is_jar = filename.ends_with(".jar");
-            let is_disabled = filename.ends_with(".jar.disabled");
-            if !(is_jar || is_disabled) {
-                continue;
-            }
-            let enabled = is_jar && !is_disabled;
-            let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            let meta = read_mod_meta_from_jar(&path);
-            let pw = pw_index.get(&filename);
-            let sidecar_project_id = read_mod_sidecar_slug(&mods_dir, &filename);
-            let project_id = sidecar_project_id
-                .clone()
-                .or_else(|| pw.filter(|p| !p.project_id.is_empty()).map(|p| p.project_id.clone()));
-            let (slug, slug_verified) = project_id.as_ref()
-                .map(|s| (Some(s.clone()), sidecar_project_id.is_some()))
-                .unwrap_or_else(|| (meta.slug, false));
-            let provider = read_mod_sidecar_provider(&mods_dir, &filename)
-                .map(|s| normalize_provider(&s))
-                .or_else(|| pw.filter(|p| !p.provider.is_empty()).map(|p| p.provider.clone()))
-                .unwrap_or_else(|| meta.provider.clone());
-            let name = pw
-                .filter(|p| !p.name.is_empty())
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| meta.name.clone());
-            let version = pw
-                .filter(|p| !p.version.is_empty())
-                .map(|p| p.version.clone())
-                .unwrap_or_else(|| meta.version.clone());
-            mods.push(ModMetadata {
-                filename,
-                name,
-                version,
-                provider,
-                enabled,
-                file_size,
-                icon: meta.icon,
-                slug,
-                project_id,
-                slug_verified,
-            });
+    let config = {
+        let guard = state.config.lock().map_err(|e| e.to_string())?;
+        guard.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
+            .map_err(|e| e.to_string())?;
+        let mods_dir = instance.mods_dir(&config.instances_dir());
+        if !mods_dir.exists() {
+            return Ok(Vec::new());
         }
-    }
-    mods.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(mods)
+        let mut mods = Vec::new();
+        let pw_index = crate::instances::load_packwiz_index(&mods_dir);
+        if let Ok(entries) = std::fs::read_dir(&mods_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if filename.ends_with(".voidlauncher.json") {
+                    continue;
+                }
+                let is_jar = filename.ends_with(".jar");
+                let is_disabled = filename.ends_with(".jar.disabled");
+                if !(is_jar || is_disabled) {
+                    continue;
+                }
+                let enabled = is_jar && !is_disabled;
+                let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let meta = read_mod_meta_from_jar(&path);
+                let pw = pw_index.get(&filename);
+                let sidecar_project_id = read_mod_sidecar_slug(&mods_dir, &filename);
+                let project_id = sidecar_project_id
+                    .clone()
+                    .or_else(|| {
+                        pw.filter(|p| !p.project_id.is_empty())
+                            .map(|p| p.project_id.clone())
+                    });
+                let (slug, slug_verified) = project_id
+                    .as_ref()
+                    .map(|s| (Some(s.clone()), sidecar_project_id.is_some()))
+                    .unwrap_or_else(|| (meta.slug, false));
+                let provider = read_mod_sidecar_provider(&mods_dir, &filename)
+                    .map(|s| crate::instances::normalize_provider(&s))
+                    .or_else(|| pw.filter(|p| !p.provider.is_empty()).map(|p| p.provider.clone()))
+                    // No sidecar / packwiz provenance: jar meta only knows the
+                    // loader (Fabric/Forge/...), not the download source — show
+                    // Local rather than a loader name in the Source column.
+                    .unwrap_or_else(|| "Local".to_string());
+                let name = pw
+                    .filter(|p| !p.name.is_empty())
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| meta.name.clone());
+                let version = pw
+                    .filter(|p| !p.version.is_empty())
+                    .map(|p| p.version.clone())
+                    .unwrap_or_else(|| meta.version.clone());
+                mods.push(ModMetadata {
+                    filename,
+                    name,
+                    version,
+                    provider,
+                    enabled,
+                    file_size,
+                    icon: meta.icon,
+                    slug,
+                    project_id,
+                    slug_verified,
+                });
+            }
+        }
+        mods.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(mods)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_remove_instance_mod(
+pub async fn cmd_remove_instance_mod(
     state: State<'_, AppState>,
     instance_name: String,
     filename: String,
@@ -727,29 +770,42 @@ pub fn cmd_remove_instance_mod(
         .and_then(|n| n.to_str())
         .ok_or("Invalid filename")?
         .to_string();
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
-    let mods_dir = instance.mods_dir(&config.instances_dir());
-    let mod_path = mods_dir.join(&safe_name);
-    if mod_path.exists() {
-        std::fs::remove_file(&mod_path).map_err(|e| e.to_string())?;
-    }
-    // Also remove sidecar metadata (both layouts)
-    crate::instances::remove_sidecar_meta(&mods_dir, &safe_name);
-    Ok(())
+    let config = {
+        let guard = state.config.lock().map_err(|e| e.to_string())?;
+        guard.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
+            .map_err(|e| e.to_string())?;
+        let mods_dir = instance.mods_dir(&config.instances_dir());
+        let mod_path = mods_dir.join(&safe_name);
+        if mod_path.exists() {
+            std::fs::remove_file(&mod_path).map_err(|e| e.to_string())?;
+        }
+        crate::instances::remove_sidecar_meta(&mods_dir, &safe_name);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn cmd_get_mod_metadata(
+pub async fn cmd_get_mod_metadata(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<Vec<ModMetadata>, String> {
     // Clone-and-release: the scan below can take a while on big mod folders;
     // holding the config lock through it would stall every other command
     // that needs it (instance lists, launch checks, ...).
-    let config = state.config.lock().map_err(|e| e.to_string())?.clone();
-    get_mod_metadata(&config, &instance_name).map_err(|e| e.to_string())
+    let config = {
+        let guard = state.config.lock().map_err(|e| e.to_string())?;
+        guard.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        get_mod_metadata(&config, &instance_name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Session-level metadata cache: path -> (mtime, size, parsed metadata).
@@ -935,13 +991,14 @@ fn build_mod_metadata(
     let (slug, slug_verified) = project_id.as_ref()
         .map(|s| (Some(s.clone()), sidecar.project_id.is_some()))
         .unwrap_or_else(|| (meta.slug, false));
-    // Provider priority: sidecar (modrinth/curseforge/local) > packwiz > JAR metadata
+    // Provider priority: sidecar (modrinth/curseforge/local) > packwiz > Local
+    // (jar meta is a loader name, not a download source).
     let provider = match sidecar.provider.as_deref() {
-        Some(s) => normalize_provider(s),
+        Some(s) => crate::instances::normalize_provider(s),
         None => pw
             .filter(|p| !p.provider.is_empty())
             .map(|p| p.provider.clone())
-            .unwrap_or_else(|| meta.provider.clone()),
+            .unwrap_or_else(|| "Local".to_string()),
     };
     // Name priority: JAR metadata (when it has a real name) >
     // sidecar project name > packwiz > filename. JAR parsing
@@ -1000,16 +1057,6 @@ fn build_mod_metadata(
         slug,
         project_id,
         slug_verified,
-    }
-}
-
-/// Normalize a raw provider string from sidecar/packwiz metadata.
-fn normalize_provider(raw: &str) -> String {
-    match raw.to_lowercase().as_str() {
-        "modrinth" => "Modrinth".to_string(),
-        "curseforge" => "CurseForge".to_string(),
-        "local" => "Local".to_string(),
-        other => other.to_string(),
     }
 }
 
@@ -1303,7 +1350,7 @@ async fn cmd_get_mod_icon_impl(
     if !curseforge_api_key.is_empty() {
         if let Some(mods_dir) = jar_path.parent() {
             if let Some(val) = crate::instances::read_sidecar_meta(mods_dir, &safe_filename) {
-                if val["provider"].as_str() == Some("curseforge") {
+                if val["provider"].as_str().map(|p| p.eq_ignore_ascii_case("curseforge")) == Some(true) {
                     if let Some(pid_str) = val["project_id"].as_str() {
                         if let Ok(pid) = pid_str.parse::<u64>() {
                             if let Ok(Some(icon)) =
@@ -1335,7 +1382,11 @@ async fn cmd_get_mod_icon_impl(
                 }
             }
         }
-        if provider.as_deref() == Some("Modrinth") {
+        if provider
+            .as_deref()
+            .map(|p| p.eq_ignore_ascii_case("modrinth"))
+            == Some(true)
+        {
             if let Some(pid) = pid {
                 if let Ok(project) = modrinth::get_project(&pid).await {
                     if let Some(icon_url) = project.icon_url {
