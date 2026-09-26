@@ -62,16 +62,20 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
   ];
 
   useEffect(() => {
-    if (!showMenu) return;
+    if (!showMenu && !showBannerPicker) return;
     const handler = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setShowMenu(false);
-        setShowBannerPicker(false);
-      }
+      const target = e.target as Node;
+      // Both refs are optional on purpose: the context menu unmounts while the
+      // banner picker is open, so a null ref must mean "not inside", never
+      // "give up and stay open".
+      if (menuRef.current?.contains(target)) return;
+      if (pickerRef.current?.contains(target)) return;
+      setShowMenu(false);
+      setShowBannerPicker(false);
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
-  }, [showMenu]);
+  }, [showMenu, showBannerPicker]);
 
   if (!instance) {
     return (
@@ -202,6 +206,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
         {/* Banner preset picker */}
         {showBannerPicker && createPortal(
           <div
+            onClick={() => { setShowBannerPicker(false); setShowMenu(false); }}
             style={{
               position: 'fixed',
               inset: 0,

@@ -49,7 +49,15 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
             className="sidebar__avatar"
             onClick={() => onNavigate('accounts')}
           >
-            <Avatar uuid={profile.id} name={profile.name} size={36} />
+            {/* The 2px border eats into the 36px box (border-box), so the head
+                must fill the 32px content box — otherwise it renders at 36px
+                and gets clipped, which reads as an over-zoomed avatar. */}
+            <Avatar
+              uuid={profile.id}
+              name={profile.name}
+              size={36}
+              style={{ width: '100%', height: '100%' }}
+            />
           </div>
         ) : (
           <Tooltip content={t('sidebar.login')}>

@@ -12,6 +12,7 @@ import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { useInstanceStore } from '../stores/instanceStore';
 import { addToast } from '../components/ui/Toast';
 import { useLogPlaque } from '../lib/uiLog';
+import { Segmented, type SegmentedOption } from '../components/ui/Segmented';
 
 interface VersionEntry {
   id: string;
@@ -50,6 +51,7 @@ interface CreateWizardProps {
 }
 
 type LoaderType = 'Vanilla' | 'Fabric' | 'Forge' | 'NeoForge';
+type VersionFilter = 'release' | 'snapshot' | 'all';
 
 const LOADER_PAGE_SIZE = 20;
 const SCROLL_LOAD_THRESHOLD_PX = 50;
@@ -65,7 +67,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
   const [versions, setVersions] = useState<VersionEntry[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [selectedVersion, setSelectedVersion] = useState('');
-  const [versionFilter, setVersionFilter] = useState<'release' | 'snapshot' | 'all'>('release');
+  const [versionFilter, setVersionFilter] = useState<VersionFilter>('release');
   const [searchQuery, setSearchQuery] = useState('');
 
   const [loaderType, setLoaderType] = useState<LoaderType>('Vanilla');
@@ -213,6 +215,19 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
     return true;
   });
 
+  // Rebuilt per render so the labels always follow the active language.
+  const versionFilterOptions: SegmentedOption<VersionFilter>[] = [
+    { value: 'all', label: t('create_instance.filter_all') },
+    { value: 'release', label: t('create_instance.filter_release') },
+    { value: 'snapshot', label: t('create_instance.filter_snapshot') },
+  ];
+  const loaderOptions: SegmentedOption<LoaderType>[] = [
+    { value: 'Vanilla', label: t('create_instance.loader_vanilla') },
+    { value: 'Fabric', label: t('create_instance.loader_fabric') },
+    { value: 'Forge', label: t('create_instance.loader_forge') },
+    { value: 'NeoForge', label: t('create_instance.loader_neoforge') },
+  ];
+
   const currentLoaderVersions = loaderVersions[loaderType] ?? [];
   const currentLoaderTotal = loaderVersionTotals[loaderType];
   const hasMoreLoaderVersions = currentLoaderTotal === null || currentLoaderVersions.length < currentLoaderTotal;
@@ -319,7 +334,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
       open={open}
       onClose={onClose}
       title={t('create_instance.title')}
-      maxWidth={800}
+      growWithContent
       footer={
         <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}>
           <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
@@ -384,7 +399,10 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
           {mode === 'new' ? (
             <>
               {/* MC Version + Loader in two columns */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-xl)' }}>
+              {/* minmax(0, …) instead of a bare 1fr: a plain `1fr` track is
+                  floored at the content's min-content width, so a wide
+                  segmented switcher used to push the grid past the dialog. */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 'var(--space-xl)' }}>
                 <div>
                   <label className="input-group__label" style={{ display: 'block', marginBottom: 'var(--space-sm)', fontWeight: 600, fontSize: 'var(--font-size-sm)' }}>
                     {t('create_instance.version_label')}
@@ -393,32 +411,34 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                     <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
                     <input className="input" type="text"
                       value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder={t('common.search')}
+                      aria-label={t('common.search')}
                       style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
                   </div>
-                  <div style={{ display: 'flex', gap: 4, marginBottom: 'var(--space-sm)' }}>
-                    {(['release', 'snapshot', 'all'] as const).map((f) => (
-                      <Button key={f} size="sm" variant={versionFilter === f ? 'primary' : 'ghost'}
-                        onClick={() => setVersionFilter(f)} style={{ fontSize: '11px', padding: '4px 8px' }}>
-                        {f === 'all' ? t('create_instance.filter_all') : f === 'release' ? t('create_instance.filter_release') : t('create_instance.filter_snapshot')}
-                      </Button>
-                    ))}
-                  </div>
-                  <div style={{ maxHeight: 200, overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
+                  <Segmented
+                    style={{ marginBottom: 'var(--space-sm)' }}
+                    options={versionFilterOptions}
+                    ariaLabel={t('create_instance.version_label')}
+                    value={versionFilter}
+                    onChange={setVersionFilter}
+                  />
+                  {/* Re-keyed on the filter so switching release/snapshot/all
+                      fades the new rows in instead of swapping them silently. */}
+                  <div key={versionFilter} className="animate-content-reveal version-list" style={{ maxHeight: 200, overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
                     {versionsLoading ? (
                       Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} height={32} style={{ marginBottom: 2 }} />)
                     ) : (
                       filteredVersions.map((v) => (
-                        <div key={v.id} onClick={() => handleVersionSelect(v.id)}
-                          style={{
-                            padding: '6px 10px', cursor: 'pointer', fontSize: 'var(--font-size-sm)',
-                            background: selectedVersion === v.id ? 'var(--primary)' : 'transparent',
-                            color: selectedVersion === v.id ? 'white' : 'var(--text-primary)',
-                            borderRadius: 'var(--radius-sm)',
-                            display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                          }}>
-                          <span>{v.id}</span>
-                          <span style={{ fontSize: 10, opacity: 0.6 }}>{v.type}</span>
-                        </div>
+                        <button
+                          key={v.id}
+                          type="button"
+                          className={`version-item${selectedVersion === v.id ? ' version-item--selected' : ''}`}
+                          aria-pressed={selectedVersion === v.id}
+                          onClick={() => handleVersionSelect(v.id)}
+                        >
+                          <span className="version-item__name">{v.id}</span>
+                          <span className="version-item__type">{v.type}</span>
+                        </button>
                       ))
                     )}
                   </div>
@@ -428,16 +448,17 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                   <label className="input-group__label" style={{ display: 'block', marginBottom: 'var(--space-sm)', fontWeight: 600, fontSize: 'var(--font-size-sm)' }}>
                     {t('create_instance.loader_label')}
                   </label>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 'var(--space-sm)' }}>
-                    {(['Vanilla', 'Fabric', 'Forge', 'NeoForge'] as const).map((l) => (
-                      <Button key={l} size="sm" variant={loaderType === l ? 'primary' : 'ghost'}
-                        onClick={() => handleLoaderChange(l)} style={{ fontSize: '11px' }}>
-                        {l === 'Vanilla' ? t('create_instance.loader_vanilla') : l === 'Fabric' ? t('create_instance.loader_fabric') : l === 'Forge' ? t('create_instance.loader_forge') : t('create_instance.loader_neoforge')}
-                      </Button>
-                    ))}
-                  </div>
+                  <Segmented
+                    block
+                    style={{ marginBottom: 'var(--space-sm)' }}
+                    options={loaderOptions}
+                    ariaLabel={t('create_instance.loader_label')}
+                    value={loaderType}
+                    onChange={handleLoaderChange}
+                  />
                   {loaderType !== 'Vanilla' && (
-                    <div ref={loaderListRef} onScroll={handleLoaderScroll}
+                    <div key={`${loaderType}-${selectedVersion}`} ref={loaderListRef} onScroll={handleLoaderScroll}
+                      className="animate-content-reveal version-list"
                       style={{ maxHeight: 168, overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
                       {loaderVersionsError ? (
                         <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
@@ -451,17 +472,16 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                       ) : (
                         <>
                           {currentLoaderVersions.map((lv) => (
-                            <div key={lv.version} onClick={() => setSelectedLoaderVersion(lv.version)}
-                              style={{
-                                padding: '6px 10px', cursor: 'pointer', fontSize: 'var(--font-size-sm)',
-                                background: selectedLoaderVersion === lv.version ? 'var(--primary)' : 'transparent',
-                                color: selectedLoaderVersion === lv.version ? 'white' : 'var(--text-primary)',
-                                borderRadius: 'var(--radius-sm)',
-                                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                              }}>
-                              <span>{lv.version}</span>
-                              {lv.stable && <span style={{ fontSize: 10, opacity: 0.6 }}>{t('create_instance.stable_badge')}</span>}
-                            </div>
+                            <button
+                              key={lv.version}
+                              type="button"
+                              className={`version-item${selectedLoaderVersion === lv.version ? ' version-item--selected' : ''}`}
+                              aria-pressed={selectedLoaderVersion === lv.version}
+                              onClick={() => setSelectedLoaderVersion(lv.version)}
+                            >
+                              <span className="version-item__name">{lv.version}</span>
+                              {lv.stable && <span className="version-item__type">{t('create_instance.stable_badge')}</span>}
+                            </button>
                           ))}
                           {loaderVersionsLoading && <Skeleton height={32} style={{ margin: '4px 8px' }} />}
                           {!loaderVersionsLoading && !hasMoreLoaderVersions && currentLoaderTotal !== null && currentLoaderTotal > 0 && (
@@ -571,7 +591,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                     </div>
                   </div>
 
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-sm)', fontSize: 'var(--font-size-sm)' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 'var(--space-sm)', fontSize: 'var(--font-size-sm)' }}>
                     {importMeta.mc_version && (
                       <>
                         <span style={{ color: 'var(--text-tertiary)' }}>{t('create_instance.meta_mc')}</span>

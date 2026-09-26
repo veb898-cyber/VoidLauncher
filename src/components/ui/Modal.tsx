@@ -23,9 +23,16 @@ interface ModalProps {
    * windows. Used by the instance editor whose settings fit on screen.
    */
   fitContent?: boolean;
+  /**
+   * `growWithContent` lets the dialog take exactly the width its content needs
+   * instead of a fixed one. Because the overlay centres the dialog, a wider
+   * dialog grows half to the left and half to the right, so nothing ever sticks
+   * out past the right edge of an otherwise fixed-width window.
+   */
+  growWithContent?: boolean;
 }
 
-export function Modal({ open, onClose, title, children, footer, maxWidth, bare, fitContent }: ModalProps) {
+export function Modal({ open, onClose, title, children, footer, maxWidth, bare, fitContent, growWithContent }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const wasOpen = useRef(false);
 
@@ -74,7 +81,7 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare, 
         aria-modal="true"
         aria-label={title || undefined}
         tabIndex={-1}
-        className={`modal animate-slide-up${fitContent ? ' modal--fit' : ''}`}
+        className={`modal animate-slide-up${fitContent ? ' modal--fit' : ''}${growWithContent ? ' modal--content' : ''}`}
         onClick={(e) => e.stopPropagation()}
         style={maxWidth ? { maxWidth } : undefined}
       >

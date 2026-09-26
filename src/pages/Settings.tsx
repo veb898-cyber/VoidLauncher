@@ -173,7 +173,7 @@ export function Settings() {
               onChange={(e) => updateConfig('java_path', e.target.value || null)}
               style={{ width: 250, fontSize: 'var(--font-size-xs)' }}
             />
-            <Button size="sm" variant="ghost" onClick={async () => {
+            <Button size="sm" variant="secondary" onClick={async () => {
               const selected = await openFileDialog({
                 title: t('settings.java_dialog_title'),
                 filters: [{ name: 'Java', extensions: ['exe'] }],
@@ -206,7 +206,7 @@ export function Settings() {
             <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>{t('settings.memory_unit')}</span>
             <Tooltip content={t('settings.memory_reset_tooltip')}>
               <button
-                className="btn btn--ghost btn--sm"
+                className="btn btn--secondary btn--sm"
                 onClick={async () => {
                   const totalMb = await detectSystemRam();
                   // Tiered: 4 / 6 / 8 GB depending on total RAM, snapped to 512 MB step
@@ -245,7 +245,7 @@ export function Settings() {
         <div style={{ marginTop: 'var(--space-lg)' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-md)' }}>
             <span style={{ fontWeight: 500 }}>{t('settings.java_detected_heading')}</span>
-            <button className="btn btn--ghost btn--sm" onClick={detectJava}>
+            <button className="btn btn--secondary btn--sm" onClick={detectJava}>
               {t('settings.java_refresh')}
             </button>
           </div>
@@ -389,7 +389,7 @@ export function Settings() {
                     {m.vendor} &bull; {m.is_64bit ? t('settings.java_64bit') : t('settings.java_32bit')}
                   </div>
                 </div>
-                <Button size="sm" variant="ghost" onClick={async () => {
+                <Button size="sm" variant="secondary" onClick={async () => {
                   try {
                     await invoke('cmd_remove_managed_java', { majorVersion: m.major_version });
                     addToast(t('settings.java_remove_success', { version: m.major_version.toString() }), 'success');
@@ -529,7 +529,7 @@ export function Settings() {
             </div>
           </div>
           <div className="settings-row__control">
-            <Button size="sm" variant="ghost" onClick={async () => {
+            <Button size="sm" variant="secondary" onClick={async () => {
               await invoke('cmd_open_folder', { path: localConfig.data_dir });
             }}>{t('settings.data_dir_open')}</Button>
           </div>
@@ -543,7 +543,7 @@ export function Settings() {
             </div>
           </div>
           <div className="settings-row__control">
-            <Button size="sm" variant="ghost" onClick={async () => {
+            <Button size="sm" variant="secondary" onClick={async () => {
               await invoke('cmd_open_folder', { path: `${localConfig.data_dir}/logs/game` });
             }}>{t('settings.game_logs_open')}</Button>
           </div>
@@ -559,7 +559,7 @@ export function Settings() {
           <div className="settings-row__control">
             <Button
               size="sm"
-              variant="ghost"
+              variant="secondary"
               disabled={clearingCache}
               onClick={async () => {
                 setClearingCache(true);
@@ -603,43 +603,42 @@ export function Settings() {
           </div>
         </div>
 
-        <div className="settings-row" style={{ opacity: localConfig.proxy_enabled ? 1 : 0.5 }}>
+        <div className="settings-row settings-row--stacked" style={{ opacity: localConfig.proxy_enabled ? 1 : 0.5 }}>
           <div className="settings-row__info">
-            <div className="settings-row__title">{t('settings.proxy_addr_title')}</div>
-            <div className="settings-row__desc">
-              {t('settings.proxy_addr_desc')}
-            </div>
+            <div className="settings-row__title">{t('settings.proxy_server_title')}</div>
           </div>
           <div className="settings-row__control">
-            <input
-              className="input"
-              type="text"
-              value={localConfig.proxy_addr}
-              disabled={!localConfig.proxy_enabled}
-              onChange={(e) => updateConfig('proxy_addr', e.target.value)}
-              style={{ width: 180 }}
-            />
-          </div>
-        </div>
-
-        <div className="settings-row" style={{ opacity: localConfig.proxy_enabled ? 1 : 0.5 }}>
-          <div className="settings-row__info">
-            <div className="settings-row__title">{t('settings.proxy_port_title')}</div>
-            <div className="settings-row__desc">
-              {t('settings.proxy_port_desc')}
+            <div className="field-group field-group--grow">
+              <label className="field-group__label" htmlFor="proxy-addr">
+                {t('settings.proxy_addr_title')}
+              </label>
+              <input
+                id="proxy-addr"
+                className="input"
+                type="text"
+                value={localConfig.proxy_addr}
+                disabled={!localConfig.proxy_enabled}
+                onChange={(e) => updateConfig('proxy_addr', e.target.value)}
+              />
+              <span className="field-group__hint">{t('settings.proxy_addr_desc')}</span>
             </div>
-          </div>
-          <div className="settings-row__control">
-            <input
-              className="input"
-              type="number"
-              min={1}
-              max={65535}
-              value={localConfig.proxy_port || ''}
-              disabled={!localConfig.proxy_enabled}
-              onChange={(e) => updateConfig('proxy_port', Math.max(1, Math.min(65535, Number(e.target.value) || 0)))}
-              style={{ width: 120 }}
-            />
+            <div className="field-group">
+              <label className="field-group__label" htmlFor="proxy-port">
+                {t('settings.proxy_port_title')}
+              </label>
+              <input
+                id="proxy-port"
+                className="input"
+                type="number"
+                min={1}
+                max={65535}
+                style={{ width: 120 }}
+                value={localConfig.proxy_port || ''}
+                disabled={!localConfig.proxy_enabled}
+                onChange={(e) => updateConfig('proxy_port', Math.max(1, Math.min(65535, Number(e.target.value) || 0)))}
+              />
+              <span className="field-group__hint">{t('settings.proxy_port_desc')}</span>
+            </div>
           </div>
         </div>
       </section>
@@ -875,7 +874,7 @@ function LatestVersionSection() {
               {t('settings.latest_version_check_btn')}
             </Button>
           )}
-          <Button size="sm" variant="ghost" onClick={refresh} disabled={loading}>
+          <Button size="sm" variant="secondary" onClick={refresh} disabled={loading}>
             {loading ? <LoadingSpinner size={14} /> : t('settings.latest_version_check_btn')}
           </Button>
         </div>

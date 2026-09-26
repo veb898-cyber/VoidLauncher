@@ -37,6 +37,10 @@
   --secondary: hsl(200, 100%, 60%);
   --gradient-primary: linear-gradient(135deg, var(--primary), var(--secondary));
   --gradient-primary-hover: linear-gradient(135deg, var(--primary-light), hsl(200, 100%, 70%));
+  /* Foreground that stays readable ON TOP of --primary. Themes whose primary
+     is a light hue (blueprint gold, ember amber) override it with dark ink,
+     so filled primary surfaces never end up as light-on-light. */
+  --primary-contrast: #ffffff;
 
   /* Accent */
   --accent: hsl(280, 100%, 70%);
@@ -199,6 +203,7 @@
 [data-theme="blueprint"] {
   /* Backgrounds */
   --bg-primary: #101214;
+  --primary-contrast: #101214;
   --bg-secondary: #15181A;
   --bg-tertiary: #1B1E20;
   --bg-elevated: #222629;
@@ -270,8 +275,8 @@
 }
 
 /* Dark text on the gold-tinted primary actions keeps contrast legible
-   without a light-on-light wash. */
-[data-theme="blueprint"] .btn--primary,
+   without a light-on-light wash. .btn--primary is already covered by the
+   --primary-contrast token, so only the gold-icon surfaces are listed. */
 [data-theme="blueprint"] .btn--play,
 [data-theme="blueprint"] .instance-card__play {
   color: #101214;
@@ -315,6 +320,7 @@
 [data-theme="ember"] {
   /* Warm near-black backgrounds with a brown undertone */
   --bg-primary: #121110;
+  --primary-contrast: #221A12;
   --bg-secondary: #171514;
   --bg-tertiary: #1D1B19;
   --bg-elevated: #24211E;
@@ -379,8 +385,8 @@
   --danger-bg-hover: rgba(196, 92, 84, 0.2);
 }
 
-/* Dark ink on the copper actions keeps contrast legible */
-[data-theme="ember"] .btn--primary,
+/* Dark ink on the copper actions keeps contrast legible (.btn--primary is
+   already covered by the --primary-contrast token) */
 [data-theme="ember"] .btn--play,
 [data-theme="ember"] .instance-card__play {
   color: #221A12;
@@ -722,6 +728,8 @@ a {
   position: relative;
   z-index: 1;
   min-height: 100%;
+  display: flex;
+  flex-direction: column;
 }
 
 .page__header {
@@ -800,7 +808,7 @@ a {
 
 .btn--primary {
   background: var(--gradient-primary);
-  color: white;
+  color: var(--primary-contrast);
   box-shadow: var(--glow-primary);
 }
 
@@ -867,6 +875,109 @@ a {
   cursor: not-allowed;
   transform: none !important;
   box-shadow: none !important;
+}
+
+/* ============================
+   Segmented Control
+   ============================ */
+
+.segmented {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 3px;
+  background: var(--surface-glass);
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-md);
+  /* Guard: an inline-flex row of nowrap labels would otherwise size itself to
+     max-content and spill past the container. `hidden` also clips the sliding
+     indicator, so its travel never adds horizontal overflow to the dialog. */
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.segmented--block {
+  display: flex;
+  width: 100%;
+}
+
+/* The moving highlight: travels to the picked option instead of blinking. */
+.segmented__indicator {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 0;
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  pointer-events: none;
+  transition: transform var(--transition-normal), width var(--transition-normal);
+  will-change: transform, width;
+}
+
+.segmented__option {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-xs);
+  min-width: 0;
+  /* Positioned so the label paints ABOVE the absolutely positioned sliding
+     indicator — otherwise the opaque highlight covers the active text. */
+  position: relative;
+  z-index: 1;
+  padding: var(--space-sm) var(--space-md);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.segmented__option:hover:not(:disabled):not(.segmented__option--active) {
+  background: var(--surface-glass-hover);
+  color: var(--text-primary);
+}
+
+.segmented__option:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+/* Filled: the single chosen value. The background is the sliding indicator,
+   so the option itself only carries the readable foreground. */
+.segmented__option--active {
+  color: var(--primary-contrast);
+  font-weight: 600;
+}
+
+/* Tinted: multi-select filters where several options can be on at once and a
+   row of loud filled pills would out-shout the log itself. */
+.segmented__option--on {
+  background: var(--primary-dim);
+  color: var(--primary);
+  font-weight: 600;
+}
+
+/* A pressed-off filter stays visible as a control but recedes, so "ERROR is
+   off" never looks like "ERROR is empty". */
+.segmented__option[aria-pressed="false"] {
+  color: var(--text-tertiary);
+}
+
+.segmented__option:disabled {
+  color: var(--text-disabled);
+  background: transparent;
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 /* Play Button (Special Hero Button) */
@@ -1449,6 +1560,17 @@ select option {
 /* Content-sized dialog: grows to its content instead of capping at 85vh with
    an internal scrollbar. Still caps at the viewport (minus breathing room)
    so short windows fall back to a scrollbar instead of clipping. */
+/* Content-sized dialog: the width follows the content (a four-option loader
+   switcher needs more room than a short form) and, since the overlay centres
+   the dialog, any growth is split 50/50 between both sides. `min-width` keeps
+   form-only modes from collapsing to a narrow strip, `max-width` still caps it
+   on narrow windows. */
+.modal--content {
+  width: fit-content;
+  min-width: min(560px, 90vw);
+  max-width: min(90vw, 800px);
+}
+
 .modal--fit {
   max-height: calc(100vh - 96px);
 }
@@ -1780,6 +1902,63 @@ select option {
 
 .settings-row__control {
   flex-shrink: 0;
+}
+
+/* Rows whose control is a small form (e.g. proxy host/port) read better with
+   the fields stacked under the label than pinned to the far edge, where
+   justify-content: space-between opens a huge dead gap. */
+.settings-row--stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-md);
+}
+
+.settings-row--stacked .settings-row__control {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-lg);
+  flex-wrap: wrap;
+}
+
+.field-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  min-width: 0;
+}
+
+.field-group--grow {
+  flex: 1 1 240px;
+}
+
+.field-group__label {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.field-group__hint {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+}
+
+/* ============================
+   Page stage (vertical distribution)
+   ============================ */
+
+/* Opt-in wrapper for pages whose content is naturally shorter than the
+   viewport. Auto block margins centre it while still degrading to a top-aligned,
+   scrollable layout when the content outgrows the window. */
+.page-stage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.page-stage > * {
+  margin-block: auto;
 }
 
 /* ============================
@@ -2141,9 +2320,18 @@ select option {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: var(--space-md) var(--space-lg);
+  gap: var(--space-sm);
+  width: 100%;
+  padding: var(--space-sm) var(--space-md);
+  border: none;
   border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--font-size-md);
+  text-align: left;
   cursor: pointer;
+  position: relative;
   transition: background var(--transition-fast);
 }
 
@@ -2151,12 +2339,60 @@ select option {
   background: var(--surface-glass-hover);
 }
 
+.version-item:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
 .version-item--selected {
   background: var(--accent-dim);
+  /* The version list can hold thousands of rows, so the pick is confirmed by
+     the row simply settling into its selected background — a travelling
+     indicator over that list would be noise, and a flash/ring reads as a
+     glitch rather than as feedback. */
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+/* Shared reveal for freshly built lists (versions of the game, versions of a
+   loader). Short, eased and shifted by only a few pixels so it registers as
+   "the list arrived" instead of a flicker. */
+@keyframes content-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-content-reveal {
+  animation: content-reveal 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* Left accent bar mirrors the sidebar's active treatment so the selected
+   version is unmistakable without a light-on-light text colour. */
+.version-item--selected::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2px;
+  height: 60%;
+  background: var(--accent);
+  border-radius: var(--radius-full);
 }
 
 .version-item__name {
   font-weight: 500;
+}
+
+/* Tertiary grey is unreadable on the selected accent background — lift it to
+   the secondary tone for the selected row only. */
+.version-item--selected .version-item__type {
+  color: var(--text-secondary);
 }
 
 .version-item__type {
@@ -2164,6 +2400,7 @@ select option {
   color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
+  flex-shrink: 0;
 }
 
 /* ============================
@@ -2188,6 +2425,84 @@ select option {
 .console__line--error { color: var(--error); }
 
 /* Logs page */
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.log-toolbar__spacer {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Search keeps its own magnifier/clear affordances so the terminal toolbar
+   stays one compact row instead of stacking three blocks. */
+.log-search {
+  position: relative;
+  /* Only ever shrinks (narrow windows); it never grows or shrinks with the
+     neighbours, so the toolbar keeps a stable layout. */
+  flex: 0 1 260px;
+  width: 260px;
+  min-width: 150px;
+}
+
+.log-search__input {
+  width: 100%;
+  height: 36px;
+  padding-left: 32px;
+  padding-right: 30px;
+  font-size: var(--font-size-sm);
+}
+
+/* Chromium draws its own clear affordance for type="search"; ours replaces it. */
+.log-search__input::-webkit-search-cancel-button,
+.log-search__input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.log-search__icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-tertiary);
+  pointer-events: none;
+  display: flex;
+}
+
+.log-search__clear {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.log-search__clear:hover {
+  background: var(--surface-glass-hover);
+  color: var(--text-primary);
+}
+
+.log-search__clear:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
 .log-container::-webkit-scrollbar {
   width: 6px;
 }
@@ -2525,8 +2840,13 @@ input[type="range"]:active::-moz-range-thumb {
   cursor: pointer;
   outline: none;
   transition: border-color 0.2s ease, background 0.2s ease;
-  min-width: 200px;
-  max-width: 420px;
+  /* Fixed width on purpose: the label shows the instance name, the start time
+     and a live-growing file size. A content-sized button changed width several
+     times per second, which reflowed the whole toolbar — the search box and the
+     level filters visibly jumped whenever a different run was picked. */
+  flex: 0 0 240px;
+  width: 240px;
+  min-width: 0;
   text-align: left;
 }
 

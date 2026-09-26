@@ -884,7 +884,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         <div style={{ padding: '6px var(--space-2xl)', borderTop: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
           <div style={{ position: 'relative', flex: 1, maxWidth: 300 }}>
             <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
-            <input className="input" type="text" value={search} onChange={(e) => setSearch(e.target.value)} style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
+            <input className="input" type="text" value={search} onChange={(e) => setSearch(e.target.value)}
+              placeholder={t('common.search')}
+              aria-label={t('common.search')}
+              style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
           </div>
           {hasSelection && (
             <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('common.items_selected', { n: selectedFilenames.size.toString() })}</span>

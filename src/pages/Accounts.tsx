@@ -138,16 +138,20 @@ export function Accounts() {
           <h1 className="page__title">{t('accounts.title')}</h1>
           <p className="page__subtitle">{t('accounts.subtitle')}</p>
         </div>
-        <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
-          <Button onClick={() => setShowOffline(true)}>{t('accounts.btn_add_offline')}</Button>
+        <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
+          {/* Three peer ways to add an account — same weight, so none of them
+              silently outranks the others. */}
+          <Button onClick={() => setShowOffline(true)} variant="secondary">{t('accounts.btn_add_offline')}</Button>
           <Button onClick={() => setShowElyby(true)} variant="secondary">{t('accounts.btn_add_elyby')}</Button>
-          <Button onClick={() => setShowMicrosoftLogin(true)} variant="primary">
+          <Button onClick={() => setShowMicrosoftLogin(true)} variant="secondary">
             {t('accounts.btn_add_microsoft')}
           </Button>
         </div>
       </div>
 
-      {/* Accounts list */}
+      {/* Accounts list — stays top-aligned: the list grows downwards as
+          accounts are added, so centring it would make the first card drift
+          on every change. */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
         {accounts.map((acc) => (
           <div key={acc.id} className={`glass-card account-card${acc.default ? ' account-card--active' : ''}`}

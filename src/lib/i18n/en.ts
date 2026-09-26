@@ -290,6 +290,7 @@ export const en = {
 
   'settings.section_network':          'Network',
   'settings.proxy_enabled_title':      'Use Proxy',
+  'settings.proxy_server_title':       'Proxy Server',
   'settings.proxy_enabled_desc':       'Route all launcher network traffic through a proxy server',
   'settings.proxy_addr_title':         'Proxy Address',
   'settings.proxy_addr_desc':          'Proxy host or IP (e.g. 127.0.0.1)',
@@ -455,7 +456,12 @@ export const en = {
   'terminal.title':                    'Terminal',
   'terminal.subtitle':                 'The live Minecraft console and launcher logs',
   'terminal.tab_launcher':             'Launcher Logs',
-  'terminal.tab_game':                 'Game Logs',
+  'terminal.tab_game':               'Game Logs',
+  'terminal.search_placeholder':     'Search log',
+  'terminal.search_clear':          'Clear search',
+  'terminal.filter_levels':         'Log levels',
+  'terminal.no_matches':            'Nothing matches the current search and filters',
+  'terminal.hidden_count':          '{count} more lines hidden',
   'logs.empty':                        'No logs yet',
 
   // ── Game Logs ────────────────────────────────────────────────
@@ -589,6 +595,18 @@ export const en = {
   'rooms.room_code_placeholder':       'XXXX-XXXX',
   'rooms.room_code_hint':              'The code looks like XXXX-XXXX.',
   'rooms.join_btn':                    'Join room',
+  'rooms.lobby_ready_title':           'Ready to play',
+  'rooms.lobby_ready_network':         'Tailscale',
+  'rooms.lobby_ready_account':         'Signed in as',
+  'rooms.lobby_ready_address':         'Your address on the network',
+  'rooms.lobby_ready_copy':            'Copy address',
+  'rooms.lobby_how_title':             'How to play together',
+  'rooms.lobby_step1_title':           'Create a room',
+  'rooms.lobby_step1_desc':            'The name is only for you — your friend will see the room code instead.',
+  'rooms.lobby_step2_title':           'Open the world',
+  'rooms.lobby_step2_desc':            'Launch an instance and open the world to LAN in Minecraft.',
+  'rooms.lobby_step3_title':           'Share the code',
+  'rooms.lobby_step3_desc':            'Send the room code to your friend — they enter it under “Join a room”.',
 
   // Host
   'rooms.host_title':                  'You are hosting',

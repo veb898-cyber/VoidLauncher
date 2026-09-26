@@ -524,6 +524,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
           <input className="input" type="text" value={query} onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+            placeholder={t('common.search')}
+            aria-label={t('common.search')}
             style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
         </div>
         <Button size="sm" onClick={handleSearch} disabled={loading} loading={loading}>{t('common.search')}</Button>

@@ -1,10 +1,14 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
 import { addToast } from '../components/ui/Toast';
+import {
+  LogToolbar, allLevelsOn, toLevelFilter,
+  type LevelFilterState, type LogLevelFilter,
+} from '../components/LogToolbar';
 
 interface GameLogSession {
   path: string;
@@ -21,6 +25,29 @@ const MAX_SHOWN_RUNS = 7;
 // the backend returns at most this many most-recent lines of the
 // unified session log, older ones are dropped.
 const MAX_DISPLAY_LINES = 100_000;
+
+/** Classify a raw log line into a severity bucket (module scope so the filter
+    memo can depend on it without re-creating it every render). */
+function getLineLevel(line: string): string {
+  const upper = line.toUpperCase();
+  if (/\[ERROR\]|\/ERROR\]/.test(line)) return 'error';
+  if (/\[WARN\]|\/WARN\]/.test(line)) return 'warn';
+  if (/\[DEBUG\]|\/DEBUG\]/.test(line)) return 'debug';
+  if (/\bEXCEPTION\b/.test(upper) || /\bFATAL\b/.test(upper)) return 'error';
+  if (/exit code [1-9]/.test(line) || /exit code \d{2,}/.test(line)) return 'error';
+  if (/FAILED/i.test(line) || /\bERROR\b/i.test(line)) return 'error';
+  if (/WARNING/i.test(line)) return 'warn';
+  return '';
+}
+
+function getLineColor(level: string): string {
+  switch (level) {
+    case 'error': return 'var(--color-danger)';
+    case 'warn': return 'var(--color-warning)';
+    case 'debug': return 'var(--text-tertiary)';
+    default: return 'var(--text-primary)';
+  }
+}
 
 export function GameLogs() {
   const t = useT();
@@ -144,7 +171,10 @@ export function GameLogs() {
     const el = runsBtnRef.current;
     if (!el) return;
     const r = el.getBoundingClientRect();
-    setRunsPos({ top: r.bottom + 6, left: Math.max(8, r.right - 360), width: 360 });
+    // Anchored to the button's LEFT edge, with the width clamped so the panel
+    // still never reaches past the right edge of the window.
+    const left = Math.max(8, r.left);
+    setRunsPos({ top: r.bottom + 6, left, width: Math.min(360, window.innerWidth - left - 8) });
     setRunsOpen(true);
   };
 
@@ -176,32 +206,43 @@ export function GameLogs() {
 
   // Chronological order (oldest → newest): render the file as-is, the view
   // auto-scrolls to the bottom. The backend already caps the tail.
-  const displayLines = content ? content.split('\n') : [];
+  const displayLines = useMemo(() => (content ? content.split('\n') : []), [content]);
 
-  const getLineLevel = (line: string): string => {
-    const upper = line.toUpperCase();
-    if (/\[ERROR\]|\/ERROR\]/.test(line)) return 'error';
-    if (/\[WARN\]|\/WARN\]/.test(line)) return 'warn';
-    if (/\[DEBUG\]|\/DEBUG\]/.test(line)) return 'debug';
-    if (/\bEXCEPTION\b/.test(upper) || /\bFATAL\b/.test(upper)) return 'error';
-    if (/exit code [1-9]/.test(line) || /exit code \d{2,}/.test(line)) return 'error';
-    if (/FAILED/i.test(line) || /\bERROR\b/i.test(line)) return 'error';
-    if (/WARNING/i.test(line)) return 'warn';
-    return '';
-  };
+  const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [levels, setLevels] = useState<LevelFilterState>(allLevelsOn);
 
-  const getLineColor = (level: string): string => {
-    switch (level) {
-      case 'error': return 'var(--color-danger)';
-      case 'warn': return 'var(--color-warning)';
-      case 'debug': return 'var(--text-tertiary)';
-      default: return 'var(--text-primary)';
-    }
+  // Re-classifying 100k lines on every keystroke would stutter, so the query
+  // trails the input slightly. Level toggles apply immediately.
+  useEffect(() => {
+    const id = window.setTimeout(() => setDebouncedQuery(query), 150);
+    return () => window.clearTimeout(id);
+  }, [query]);
+
+  const needle = debouncedQuery.trim().toLowerCase();
+  const filtering = needle !== '' || !levels.error || !levels.warn || !levels.info;
+
+  const visibleLines = useMemo(() => {
+    if (!filtering) return displayLines;
+    return displayLines.filter((line) => {
+      if (!levels[toLevelFilter(getLineLevel(line))]) return false;
+      return needle === '' || line.toLowerCase().includes(needle);
+    });
+  }, [displayLines, filtering, levels, needle]);
+
+  const toggleLevel = (level: LogLevelFilter) => {
+    setLevels((prev) => ({ ...prev, [level]: !prev[level] }));
   };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 'var(--space-md)' }}>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 'var(--space-sm)', flexShrink: 0, flexWrap: 'wrap' }}>
+      <LogToolbar
+        query={query}
+        onQueryChange={setQuery}
+        levels={levels}
+        onToggleLevel={toggleLevel}
+        leading={
+          <>
           {/* Recent runs picker: last launches of ANY instance, newest first */}
           <button
             ref={runsBtnRef}
@@ -226,7 +267,7 @@ export function GameLogs() {
           {runsOpen && runsPos && createPortal(
             <>
               <div className="game-logs-picker-overlay" onClick={() => setRunsOpen(false)} />
-              <div className="game-logs-picker-panel" style={{ top: runsPos.top, left: runsPos.left, minWidth: runsPos.width }}>
+              <div className="game-logs-picker-panel" style={{ top: runsPos.top, left: runsPos.left, width: runsPos.width }}>
                 <div className="game-logs-picker-header">
                   {t('game_logs.runs')}
                 </div>
@@ -256,27 +297,32 @@ export function GameLogs() {
             </>,
             document.body,
           )}
-
-          <button className="btn btn--ghost btn--sm" onClick={async () => {
-            try {
-              await navigator.clipboard.writeText(displayLines.join('\n'));
-              addToast(t('common.copied'), 'success');
-            } catch {
-              addToast(t('common.copy_failed'), 'error');
-            }
-          }}>
-            {t('common.copy_all')}
-          </button>
-          <button className="btn btn--ghost btn--sm" onClick={async () => {
-            try {
-              await invoke('cmd_open_game_logs_root');
-            } catch (e: any) {
-              console.error(String(e));
-            }
-          }}>
-            {t('game_logs.open_folder')}
-          </button>
-      </div>
+          </>
+        }
+        actions={
+          <>
+            <button className="btn btn--secondary btn--sm" onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(visibleLines.join('\n'));
+                addToast(t('common.copied'), 'success');
+              } catch {
+                addToast(t('common.copy_failed'), 'error');
+              }
+            }}>
+              {t('common.copy_all')}
+            </button>
+            <button className="btn btn--secondary btn--sm" onClick={async () => {
+              try {
+                await invoke('cmd_open_game_logs_root');
+              } catch (e: any) {
+                console.error(String(e));
+              }
+            }}>
+              {t('game_logs.open_folder')}
+            </button>
+          </>
+        }
+      />
 
       <div className="log-container" ref={logContainerRef} style={{
         flex: 1,
@@ -292,8 +338,12 @@ export function GameLogs() {
           <div style={{ color: 'var(--text-secondary)', textAlign: 'center', paddingTop: 'var(--space-2xl)' }}>
             {t('game_logs.no_latest')}
           </div>
+        ) : visibleLines.length === 0 ? (
+          <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-2xl)' }}>
+            {t('terminal.no_matches')}
+          </div>
         ) : (
-          displayLines.map((line, i) => {
+          visibleLines.map((line, i) => {
             const level = getLineLevel(line);
             return (
               <div key={i} className="log-line" style={{
@@ -313,6 +363,11 @@ export function GameLogs() {
               </div>
             );
           })
+        )}
+        {filtering && visibleLines.length > 0 && (
+          <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-sm)' }}>
+            {t('terminal.hidden_count', { count: String(displayLines.length - visibleLines.length) })}
+          </div>
         )}
       </div>
     </div>

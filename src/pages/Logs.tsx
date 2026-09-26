@@ -1,39 +1,75 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLogStore } from '../stores/logStore';
 import { useT } from '../lib/i18n';
 import { addToast } from '../components/ui/Toast';
+import {
+  LogToolbar, allLevelsOn, toLevelFilter,
+  type LevelFilterState, type LogLevelFilter,
+} from '../components/LogToolbar';
 
 export function LauncherLogs() {
   const t = useT();
   const { logs, clearLogs } = useLogStore();
   const bottomRef = useRef<HTMLDivElement>(null);
+  const [query, setQuery] = useState('');
+  const [levels, setLevels] = useState<LevelFilterState>(allLevelsOn);
 
   // Launcher activity only — game output lives in the "Игровые логи" tab
   // of the same Terminal page.
-  const launcherLogs = logs.filter((l) => l.source !== 'minecraft' && l.source !== 'launch');
+  const launcherLogs = useMemo(
+    () => logs.filter((l) => l.source !== 'minecraft' && l.source !== 'launch'),
+    [logs],
+  );
 
+  const visibleLogs = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return launcherLogs.filter((log) => {
+      if (!levels[toLevelFilter(log.level)]) return false;
+      if (!needle) return true;
+      return log.message.toLowerCase().includes(needle)
+        || log.source.toLowerCase().includes(needle)
+        || log.level.includes(needle);
+    });
+  }, [launcherLogs, levels, query]);
+
+  const toggleLevel = (level: LogLevelFilter) => {
+    setLevels((prev) => ({ ...prev, [level]: !prev[level] }));
+  };
+
+  // Follow the tail only while new lines arrive — filtering or searching must
+  // not yank the viewport back down.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [launcherLogs.length]);
 
+  const hasHiddenLines = visibleLogs.length !== launcherLogs.length;
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: 'var(--space-md)' }}>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 'var(--space-sm)', flexShrink: 0 }}>
-        <button className="btn btn--ghost btn--sm" onClick={async () => {
-          const text = launcherLogs.map(l => `[${l.timestamp}] [${l.source}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
-          try {
-            await navigator.clipboard.writeText(text);
-            addToast(t('common.copied'), 'success');
-          } catch {
-            addToast(t('common.copy_failed'), 'error');
-          }
-        }}>
-          {t('common.copy_all')}
-        </button>
-        <button className="btn btn--ghost btn--sm" onClick={clearLogs}>
-          {t('common.clear')}
-        </button>
-      </div>
+      <LogToolbar
+        query={query}
+        onQueryChange={setQuery}
+        levels={levels}
+        onToggleLevel={toggleLevel}
+        actions={
+          <>
+            <button className="btn btn--secondary btn--sm" onClick={async () => {
+              const text = visibleLogs.map(l => `[${l.timestamp}] [${l.source}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
+              try {
+                await navigator.clipboard.writeText(text);
+                addToast(t('common.copied'), 'success');
+              } catch {
+                addToast(t('common.copy_failed'), 'error');
+              }
+            }}>
+              {t('common.copy_all')}
+            </button>
+            <button className="btn btn--secondary btn--sm" onClick={clearLogs}>
+              {t('common.clear')}
+            </button>
+          </>
+        }
+      />
 
       <div className="log-container" style={{
         flex: 1,
@@ -45,12 +81,12 @@ export function LauncherLogs() {
         fontSize: 'var(--font-size-xs)',
         lineHeight: 1.6,
       }}>
-        {launcherLogs.length === 0 ? (
+        {visibleLogs.length === 0 ? (
           <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-2xl)' }}>
-            {t('logs.empty')}
+            {launcherLogs.length === 0 ? t('logs.empty') : t('terminal.no_matches')}
           </div>
         ) : (
-          launcherLogs.map((log) => (
+          visibleLogs.map((log) => (
             <div key={log.id} className={`log-line ${
               log.level === 'error' ? 'log-line--error' :
               log.level === 'warn' ? 'log-line--warn' :
@@ -79,6 +115,11 @@ export function LauncherLogs() {
               </span>
             </div>
           ))
+        )}
+        {hasHiddenLines && visibleLogs.length > 0 && (
+          <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-sm)' }}>
+            {t('terminal.hidden_count', { count: String(launcherLogs.length - visibleLogs.length) })}
+          </div>
         )}
         <div ref={bottomRef} />
       </div>
