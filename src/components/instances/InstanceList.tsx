@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck, Download } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
@@ -187,29 +188,38 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
         )}
       </div>
 
-      {/* Context Menu */}
-      {contextMenu && (
-        <div
-          className="ctx-menu"
-          style={{
-            left: Math.min(contextMenu.x, window.innerWidth - 200),
-            top: Math.min(contextMenu.y, window.innerHeight - 250),
-          }}
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          <ContextMenuItem icon={<Play size={14} fill="currentColor" />} label={t('instances.play')} disabled={isLaunching}
-            onClick={() => { launchGame(contextMenu.name); setContextMenu(null); }} />
-          <ContextMenuItem icon={<Settings size={14} />} label={t('instances.ctx_settings')}
-            onClick={() => { setEditorName(contextMenu.name); setContextMenu(null); }} />
-          <ContextMenuItem icon={<FolderOpen size={14} />} label={t('instances.ctx_open_folder')}
-            onClick={() => { openFolder(contextMenu.name); setContextMenu(null); }} />
-          <ContextMenuItem icon={<ShieldCheck size={14} />} label={t('instances.ctx_verify')}
-            onClick={() => { setVerifyName(contextMenu.name); setContextMenu(null); }} />
-          <ContextMenuItem icon={<Download size={14} />} label={t('instances.ctx_export')}
-            onClick={() => { handleExport(contextMenu.name); setContextMenu(null); }} />
-          <ContextMenuItem icon={<Trash2 size={14} />} label={t('common.delete')} danger
-            onClick={() => { setDeleteConfirmName(contextMenu.name); setContextMenu(null); }} />
-        </div>
+      {/* Context Menu — portaled to <body> so its backdrop root is the
+          document: the glass scrim blurs wallpaper, the instance list and
+          the right content pane alike (same reason CustomSelect portals). */}
+      {contextMenu && createPortal(
+        <>
+          {/* Full-viewport glass scrim: blurs + dims everything beneath the
+              menu so its text always reads over icons, tables and
+              wallpapers. Clicking it closes the menu. */}
+          <div className="ctx-menu-scrim" onMouseDown={() => setContextMenu(null)} />
+          <div
+            className="ctx-menu"
+            style={{
+              left: Math.min(contextMenu.x, window.innerWidth - 200),
+              top: Math.min(contextMenu.y, window.innerHeight - 250),
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <ContextMenuItem icon={<Play size={14} fill="currentColor" />} label={t('instances.play')} disabled={isLaunching}
+              onClick={() => { launchGame(contextMenu.name); setContextMenu(null); }} />
+            <ContextMenuItem icon={<Settings size={14} />} label={t('instances.ctx_settings')}
+              onClick={() => { setEditorName(contextMenu.name); setContextMenu(null); }} />
+            <ContextMenuItem icon={<FolderOpen size={14} />} label={t('instances.ctx_open_folder')}
+              onClick={() => { openFolder(contextMenu.name); setContextMenu(null); }} />
+            <ContextMenuItem icon={<ShieldCheck size={14} />} label={t('instances.ctx_verify')}
+              onClick={() => { setVerifyName(contextMenu.name); setContextMenu(null); }} />
+            <ContextMenuItem icon={<Download size={14} />} label={t('instances.ctx_export')}
+              onClick={() => { handleExport(contextMenu.name); setContextMenu(null); }} />
+            <ContextMenuItem icon={<Trash2 size={14} />} label={t('common.delete')} danger
+              onClick={() => { setDeleteConfirmName(contextMenu.name); setContextMenu(null); }} />
+          </div>
+        </>,
+        document.body
       )}
 
       {/* Verify / Repair modal */}

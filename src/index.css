@@ -3241,6 +3241,16 @@ input[type="range"]:active::-moz-range-thumb {
   from { opacity: 0; transform: scale(0.96) translateY(-4px); }
   to { opacity: 1; transform: scale(1) translateY(0); }
 }
+/* Full-viewport scrim behind the context menu. Invisible in base themes
+   (the menu is opaque there); the liquid-glass theme turns it into a
+   document-wide frosted layer so the menu reads over any content. Sits
+   below the menu (2000 / lg 2100) but above page content. */
+.ctx-menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 1950;
+  background: transparent;
+}
 .ctx-menu__item {
   display: flex;
   align-items: center;
@@ -3770,7 +3780,7 @@ input[type="range"]:active::-moz-range-thumb {
     --lg-depth-shadow: 0 6px 18px rgb(6, 8, 14, 0.5);
   }
 
-    [data-theme='lg'] :is(.titlebar, .sidebar, .modal, .custom-select__list, .ctx-menu, .toast, .tooltip-bubble,
+    [data-theme='lg'] :is(.titlebar, .sidebar, .modal, .custom-select__list, .ctx-menu, .ctx-menu-scrim, .toast, .tooltip-bubble,
       .instance-card, .modpack-card, .modpack-detail-panel, .modpacks-overlay__bar,
       .selection-bar, .game-logs-picker-panel, .floating-menu, .floating-menu .btn--ghost,
       .game-logs-picker-trigger,
@@ -3783,6 +3793,19 @@ input[type="range"]:active::-moz-range-thumb {
       backdrop-filter: none !important;
       -webkit-backdrop-filter: none !important;
     }
+    /* Without blur the scrim leans on opacity alone for the frosted
+       effect: darken more so menu text still separates from the page. */
+    [data-theme='lg'] .ctx-menu-scrim {
+      background: rgba(6, 8, 14, 0.55);
+    }
+    /* Catalog glass tiles fall back to solid fills (no blur). */
+    [data-theme='lg'] .content-catalog .content-list-row {
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+      background: var(--lg-fill);
+    }
+    [data-theme='lg'] .content-catalog .content-list-row--installed { background: hsl(152, 30%, 24%); }
+    [data-theme='lg'] .content-catalog .content-list-row--added { background: hsl(150, 35%, 22%); }
   }
 
   @supports not (backdrop-filter: blur(1px)) {
@@ -3796,7 +3819,7 @@ input[type="range"]:active::-moz-range-thumb {
     --lg-depth-shadow: none;
   }
 
-    [data-theme='lg'] :is(.titlebar, .sidebar, .modal, .custom-select__list, .ctx-menu, .toast, .tooltip-bubble,
+    [data-theme='lg'] :is(.titlebar, .sidebar, .modal, .custom-select__list, .ctx-menu, .ctx-menu-scrim, .toast, .tooltip-bubble,
       .instance-card, .modpack-card, .modpack-detail-panel, .modpacks-overlay__bar,
       .selection-bar, .game-logs-picker-panel, .floating-menu, .floating-menu .btn--ghost,
       .game-logs-picker-trigger,
@@ -3809,6 +3832,18 @@ input[type="range"]:active::-moz-range-thumb {
       backdrop-filter: none !important;
       -webkit-backdrop-filter: none !important;
     }
+    /* Same as the reduced-transparency case: no blur → rely on opacity. */
+    [data-theme='lg'] .ctx-menu-scrim {
+      background: rgba(6, 8, 14, 0.55);
+    }
+    /* Catalog glass tiles fall back to solid fills (no blur). */
+    [data-theme='lg'] .content-catalog .content-list-row {
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+      background: var(--lg-fill);
+    }
+    [data-theme='lg'] .content-catalog .content-list-row--installed { background: hsl(152, 30%, 24%); }
+    [data-theme='lg'] .content-catalog .content-list-row--added { background: hsl(150, 35%, 22%); }
   }
 
 /* ------------------------------------------------------------
@@ -4089,6 +4124,16 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
 
 [data-theme='lg'] .ctx-menu {
   z-index: var(--z-context-menu);
+}
+
+/* Liquid-glass scrim: a light frost over the whole viewport behind the
+   menu. The translucent fill dims sharp content (icons, tables) that a
+   backdrop-filter alone may not fully smother, while the blur turns the
+   wallpaper and page into frosted glass — so menu text always reads. */
+[data-theme='lg'] .ctx-menu-scrim {
+  background: rgba(6, 8, 14, 0.30);
+  backdrop-filter: blur(5px) saturate(1.05);
+  -webkit-backdrop-filter: blur(5px) saturate(1.05);
 }
 
 [data-theme='lg'] .toast-container {
@@ -4607,6 +4652,29 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
 [data-theme='lg'] .content-table-head {
   background: transparent;
   border-bottom-color: var(--lg-divider);
+}
+
+/* Content CATALOG (search results) — the owner asked (09.10.2026) for glass
+   tiles here: installable rows read as neutral glass, already-installed rows
+   get a distinct greener/lighter glass so state is legible at a glance. The
+   manager table (content-list-row--table, hundreds of rows) is intentionally
+   excluded — the flat-table note above still holds for that surface. */
+[data-theme='lg'] .content-catalog .content-list-row {
+  content-visibility: visible;
+  background: var(--lg-fill);
+  backdrop-filter: blur(14px) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(14px) saturate(var(--lg-sat));
+  box-shadow: var(--lg-rim-ring);
+}
+[data-theme='lg'] .content-catalog .content-list-row--installed {
+  background: hsla(152, 42%, 34%, 0.46);
+  box-shadow: var(--lg-rim-ring), inset 0 0 0 1px hsla(150, 55%, 50%, 0.22);
+}
+[data-theme='lg'] .content-catalog .content-list-row--added {
+  background: hsla(150, 55%, 40%, 0.52);
+}
+[data-theme='lg'] .content-catalog .content-list-row--selected {
+  background: var(--lg-tint);
 }
 
 /* --- Install overlay: same spotlight scrim as the modal, same glass

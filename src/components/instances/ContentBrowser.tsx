@@ -555,21 +555,22 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       {/* Split content */}
       <div style={{ display: 'flex', gap: 'var(--space-md)', flex: 1, overflow: 'hidden', padding: 'var(--space-sm) var(--space-xl)' }}>
         {/* Results list */}
-        <div style={{ flex: selected ? '0 0 38%' : '1', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div className="content-catalog" style={{ flex: selected ? '0 0 38%' : '1', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
           {loading && <ResultListSkeleton variant="row" rows={5} />}
           {!loading && sortHits(displayHits).length === 0 && (
             <EmptyState compact icon={<Package size={24} />} title={t('content.empty_results', { label: label.toLowerCase() })} />
           )}
           {sortHits(displayHits).map((hit) => {
             const added = isAdded(hit.project_id, hit.slug, hit.title);
+            const installed = isInstalled(hit.project_id, hit.slug, hit.title);
             return (
               <div key={hit.project_id}
-                className={`content-list-row${selected?.project_id === hit.project_id ? ' content-list-row--selected' : added ? ' content-list-row--added' : ''}`}
+                className={`content-list-row${selected?.project_id === hit.project_id ? ' content-list-row--selected' : ''}${added ? ' content-list-row--added' : ''}${installed ? ' content-list-row--installed' : ''}`}
                 onClick={() => handleSelect(hit)}
                 style={{
                   display: 'flex', gap: 'var(--space-sm)', padding: '8px 10px', cursor: 'pointer',
                   borderRadius: 'var(--radius-md)', border: '1px solid',
-                  borderColor: selected?.project_id === hit.project_id ? 'var(--primary)' : added ? 'var(--success)' : 'transparent',
+                  borderColor: selected?.project_id === hit.project_id ? 'var(--primary)' : added ? 'var(--success)' : installed ? 'hsla(150, 50%, 48%, 0.35)' : 'transparent',
                   transition: 'all 0.15s',
                 }}
               >
@@ -577,7 +578,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 600, fontSize: 'var(--font-size-sm)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6 }}>
                     {hit.title}
-                    {added && <Check size={12} color="var(--success)" />}
+                    {(added || installed) && <Check size={12} color="var(--success)" />}
                   </div>
                   <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {hit.description}
@@ -586,8 +587,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                     {hit.downloads != null && t('content.download_count', { n: formatDownloads(hit.downloads) })}
                   </div>
                 </div>
-                <Button size="sm" variant={isInstalled(hit.project_id, hit.slug, hit.title) ? 'ghost' : added ? 'ghost' : 'primary'} onClick={(e) => { e.stopPropagation(); isInstalled(hit.project_id, hit.slug, hit.title) ? undefined : added ? removeByProjectId(hit.project_id) : addLatest(hit); }} disabled={isInstalled(hit.project_id, hit.slug, hit.title) || addingId === hit.project_id} style={{ flexShrink: 0, alignSelf: 'center', color: isInstalled(hit.project_id, hit.slug, hit.title) ? 'var(--text-tertiary)' : added ? 'var(--color-danger)' : undefined }}>
-                  {addingId === hit.project_id ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : isInstalled(hit.project_id, hit.slug, hit.title) ? <><Check size={12} /> {t('content.already_installed')}</> : added ? <X size={12} /> : t('content.add_btn')}
+                <Button size="sm" variant={installed ? 'ghost' : added ? 'ghost' : 'primary'} onClick={(e) => { e.stopPropagation(); installed ? undefined : added ? removeByProjectId(hit.project_id) : addLatest(hit); }} disabled={installed || addingId === hit.project_id} style={{ flexShrink: 0, alignSelf: 'center', color: installed ? 'var(--text-tertiary)' : added ? 'var(--color-danger)' : undefined }}>
+                  {addingId === hit.project_id ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : installed ? <><Check size={12} /> {t('content.already_installed')}</> : added ? <X size={12} /> : t('content.add_btn')}
                 </Button>
               </div>
             );
