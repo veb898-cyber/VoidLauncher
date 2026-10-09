@@ -457,6 +457,8 @@ pub fn list_packs(instances_dir: &PathBuf, name: &str, pack_type: &str) -> Resul
     let packs_dir = instance.minecraft_dir(instances_dir).join(pack_type);
     let mut packs = Vec::new();
     if !packs_dir.exists() { return Ok(packs); }
+    // Roll back any file parked by an interrupted update before listing.
+    recover_stashed_content_files(&packs_dir);
     for entry in std::fs::read_dir(&packs_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -575,6 +577,138 @@ pub(crate) fn read_sidecar_meta(content_dir: &std::path::Path, filename: &str) -
 pub(crate) fn remove_sidecar_meta(content_dir: &std::path::Path, filename: &str) {
     let _ = std::fs::remove_file(sidecar_meta_path(content_dir, filename));
     let _ = std::fs::remove_file(legacy_sidecar_path(content_dir, filename));
+}
+
+/// Suffix for a content file parked aside while its replacement downloads.
+/// The parked name no longer ends in `.jar`/`.zip`, so game loaders and the
+/// launcher's own content listings ignore it until it is restored or removed.
+pub(crate) const STASH_SUFFIX: &str = ".voidlauncher-old";
+
+/// Park the old content file(s) of an update aside by renaming them — never
+/// deleting: if the replacement download fails, the old file must still be
+/// there. An update replaces the mod regardless of the exact on-disk name, so
+/// the exact old filename plus both `.jar`/`.zip` twins of its stem are
+/// parked (covers `.disabled` variants and same-stem leftovers).
+pub(crate) fn stash_old_content_files(
+    content_dir: &std::path::Path,
+    old_filename: &str,
+) -> std::result::Result<Vec<(PathBuf, PathBuf)>, String> {
+    // `old_filename` is untrusted frontend input: strip any path components
+    // so it can never escape the content directory.
+    let old = std::path::Path::new(old_filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .ok_or("Invalid old file name")?;
+    let base = content_stem(old);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for c in [
+        content_dir.join(old),
+        content_dir.join(format!("{}.jar", base)),
+        content_dir.join(format!("{}.zip", base)),
+    ] {
+        if !candidates.contains(&c) {
+            candidates.push(c);
+        }
+    }
+    let mut stashed = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let file_name = candidate
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("Invalid old file name")?;
+        let park = content_dir.join(format!("{}{}", file_name, STASH_SUFFIX));
+        // Drop a stale park left by an interrupted earlier update of the
+        // same file — the live file below is the one the user has right now.
+        let _ = std::fs::remove_file(&park);
+        match std::fs::rename(&candidate, &park) {
+            Ok(()) => stashed.push((candidate, park)),
+            Err(e) => {
+                // Put back anything already parked so a partial failure
+                // never strands files under the park name.
+                restore_stashed_files(&stashed);
+                return Err(format!(
+                    "Failed to park old file {}: {e}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Ok(stashed)
+}
+
+/// Put parked files back after a failed download so the user keeps the old
+/// content exactly where it was.
+pub(crate) fn restore_stashed_files(stashed: &[(PathBuf, PathBuf)]) {
+    for (orig, park) in stashed {
+        if !park.exists() {
+            continue;
+        }
+        // A bad replacement may already sit at the original name (the
+        // zip-magic check runs after the rename into place): drop it first.
+        if orig.exists() {
+            let _ = std::fs::remove_file(orig);
+        }
+        let _ = std::fs::rename(park, orig);
+    }
+}
+
+/// Delete parked files after the replacement has been verified.
+pub(crate) fn discard_stashed_files(stashed: &[(PathBuf, PathBuf)]) {
+    for (_, park) in stashed {
+        let _ = std::fs::remove_file(park);
+    }
+}
+
+/// Roll back content files left parked by an interrupted update.
+///
+/// A crash between "park the old file" and "download the replacement" would
+/// otherwise leave the mod invisible forever (a parked name is not loaded by
+/// the game and is skipped by the content listings). Called from the listings:
+/// if the original name is free the park is restored, if it is taken the park
+/// is stale and gets removed.
+pub(crate) fn recover_stashed_content_files(content_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(content_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let Some(base) = file_name.strip_suffix(STASH_SUFFIX) else {
+            continue;
+        };
+        if base.is_empty() {
+            continue;
+        }
+        let park = entry.path();
+        let orig = content_dir.join(base);
+        if orig.exists() {
+            let _ = std::fs::remove_file(&park);
+        } else {
+            let _ = std::fs::rename(&park, &orig);
+        }
+    }
+}
+
+/// After a successful content update, drop the sidecar of the replaced file
+/// when the new file has a different stem — otherwise it would describe a
+/// file that no longer exists.
+pub(crate) fn cleanup_old_sidecar_after_update(
+    content_dir: &std::path::Path,
+    old_filename: &str,
+    new_filename: &str,
+) {
+    let Some(old) = std::path::Path::new(old_filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+    else {
+        return;
+    };
+    if content_stem(old) != content_stem(new_filename) {
+        remove_sidecar_meta(content_dir, old);
+    }
 }
 
 /// Metadata extracted from a Prism Launcher packwiz `.pw.toml` file.
@@ -2091,5 +2225,156 @@ version = 'hIibTfxn'
         assert_eq!(extract_version_from_filename("Geophilic v3.6.mod.jar"), "3.6");
         assert_eq!(extract_version_from_filename("LessStructures-SpacingTweaks-1.20.1-2.1.56.zip"), "2.1.56");
         assert_eq!(extract_version_from_filename("Modded Omelet [120] [162].zip"), "");
+    }
+
+    // --- Transactional content update (park → download → swap / rollback) ---
+
+    #[test]
+    fn stash_parks_old_jar_and_restore_puts_it_back() {
+        let dir = temp_dir("stash_restore");
+        std::fs::write(dir.join("sodium-0.5.8.jar"), b"old-bytes").unwrap();
+
+        let stashed = stash_old_content_files(&dir, "sodium-0.5.8.jar").unwrap();
+        assert_eq!(stashed.len(), 1);
+        assert!(!dir.join("sodium-0.5.8.jar").exists(), "old file must be parked, not live");
+        assert!(dir.join("sodium-0.5.8.jar.voidlauncher-old").exists());
+
+        // Simulated failed download: no new file, rollback the park.
+        restore_stashed_files(&stashed);
+        assert!(dir.join("sodium-0.5.8.jar").exists(), "old file must survive a failed download");
+        assert_eq!(std::fs::read(dir.join("sodium-0.5.8.jar")).unwrap(), b"old-bytes");
+        assert!(!dir.join("sodium-0.5.8.jar.voidlauncher-old").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stash_parks_disabled_and_enabled_twins() {
+        let dir = temp_dir("stash_twins");
+        std::fs::write(dir.join("sodium.jar.disabled"), b"disabled").unwrap();
+        std::fs::write(dir.join("sodium.jar"), b"enabled").unwrap();
+
+        let stashed = stash_old_content_files(&dir, "sodium.jar.disabled").unwrap();
+        assert_eq!(stashed.len(), 2, "both the disabled file and its enabled twin must be parked");
+        assert!(!dir.join("sodium.jar.disabled").exists());
+        assert!(!dir.join("sodium.jar").exists());
+        assert!(dir.join("sodium.jar.disabled.voidlauncher-old").exists());
+        assert!(dir.join("sodium.jar.voidlauncher-old").exists());
+
+        discard_stashed_files(&stashed);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "discard removes both parks");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_name_update_replaces_old_file() {
+        let dir = temp_dir("stash_same_name");
+        std::fs::write(dir.join("sodium.jar"), b"old-bytes").unwrap();
+
+        let stashed = stash_old_content_files(&dir, "sodium.jar").unwrap();
+        assert_eq!(stashed.len(), 1);
+        // The name is free now: the "download" writes the replacement.
+        std::fs::write(dir.join("sodium.jar"), b"new-bytes").unwrap();
+        discard_stashed_files(&stashed);
+
+        assert_eq!(std::fs::read(dir.join("sodium.jar")).unwrap(), b"new-bytes");
+        assert!(!dir.join("sodium.jar.voidlauncher-old").exists(), "no leftovers after success");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_download_with_bad_replacement_rolls_back() {
+        let dir = temp_dir("stash_bad_replacement");
+        std::fs::write(dir.join("sodium-0.5.8.jar"), b"old-bytes").unwrap();
+
+        let stashed = stash_old_content_files(&dir, "sodium-0.5.8.jar").unwrap();
+        // Simulate a download that renamed into place but failed verification
+        // (zip-magic failure happens after the rename).
+        std::fs::write(dir.join("sodium-0.6.0.jar"), b"<html>error page</html>").unwrap();
+        let dest = dir.join("sodium-0.6.0.jar");
+        let _ = std::fs::remove_file(&dest);
+        restore_stashed_files(&stashed);
+
+        assert!(dir.join("sodium-0.5.8.jar").exists(), "old file restored");
+        assert!(!dest.exists(), "bad replacement dropped");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stash_sanitizes_traversal_and_rejects_dotdot() {
+        let dir = temp_dir("stash_traversal");
+        // A decoy outside the content dir that must never be touched.
+        let outside = dir.parent().unwrap().join(format!(
+            "voidlauncher_stash_outside_{}_evil.jar",
+            std::process::id()
+        ));
+        std::fs::write(&outside, b"outside").unwrap();
+
+        // Path components are stripped: only files inside `dir` are candidates.
+        let stashed = stash_old_content_files(&dir, "../evil.jar").unwrap();
+        assert!(stashed.is_empty(), "sanitized name must not resolve outside the dir");
+        assert!(outside.exists(), "decoy outside the content dir must be untouched");
+
+        assert!(stash_old_content_files(&dir, "..").is_err());
+        assert!(stash_old_content_files(&dir, ".").is_err());
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_restores_park_when_original_missing_and_drops_stale_park() {
+        let dir = temp_dir("stash_recover");
+        // Interrupted update: only the park survived → restore it.
+        std::fs::write(dir.join("sodium.jar.voidlauncher-old"), b"old-bytes").unwrap();
+        recover_stashed_content_files(&dir);
+        assert!(dir.join("sodium.jar").exists(), "park must be restored when original is missing");
+        assert!(!dir.join("sodium.jar.voidlauncher-old").exists());
+
+        // Completed update with a leftover park → drop the stale park.
+        std::fs::write(dir.join("sodium.jar"), b"new-bytes").unwrap();
+        std::fs::write(dir.join("sodium.jar.voidlauncher-old"), b"old-bytes").unwrap();
+        recover_stashed_content_files(&dir);
+        assert_eq!(std::fs::read(dir.join("sodium.jar")).unwrap(), b"new-bytes");
+        assert!(!dir.join("sodium.jar.voidlauncher-old").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_old_sidecar_only_on_stem_change() {
+        let dir = temp_dir("stash_sidecar");
+        std::fs::create_dir_all(dir.join(".index")).unwrap();
+        std::fs::write(dir.join(".index").join("sodium.voidlauncher.json"), b"{}").unwrap();
+        std::fs::write(dir.join(".index").join("sodium-0.5.8.voidlauncher.json"), b"{}").unwrap();
+        std::fs::write(dir.join(".index").join("sodium-0.6.0.voidlauncher.json"), b"{}").unwrap();
+
+        // Same stem (re-download under the same file name): keep the sidecar.
+        cleanup_old_sidecar_after_update(&dir, "sodium.jar", "sodium.jar");
+        assert!(
+            dir.join(".index").join("sodium.voidlauncher.json").exists(),
+            "same-stem sidecar must survive"
+        );
+
+        // Stem changed: the old sidecar would describe a file that is gone.
+        cleanup_old_sidecar_after_update(&dir, "sodium-0.5.8.jar", "sodium-0.6.0.jar");
+        assert!(
+            !dir.join(".index").join("sodium-0.5.8.voidlauncher.json").exists(),
+            "stale sidecar must be removed when the stem changes"
+        );
+        assert!(
+            dir.join(".index").join("sodium-0.6.0.voidlauncher.json").exists(),
+            "new sidecar must survive"
+        );
+        assert!(
+            dir.join(".index").join("sodium.voidlauncher.json").exists(),
+            "unrelated sidecar must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

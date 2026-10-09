@@ -618,37 +618,41 @@ pub async fn cmd_download_to_folder(
         let dest = dest_dir.join(&safe_name);
         (dest_dir, safe_name, dest)
     };
-    // If replacing an old file, delete it first so we don't end up with duplicates.
-    // `old_filename` is untrusted frontend input: strip any path components so
-    // it can never escape `dest_dir` (no traversal, no absolute paths).
-    if let Some(ref raw_old) = old_filename {
-        let old = std::path::Path::new(raw_old)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|n| !n.is_empty() && *n != "." && *n != "..")
-            .ok_or("Invalid old file name")?;
-        let old_stem = std::path::Path::new(old)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(old);
-        let old_base = if old_stem.ends_with(".jar") || old_stem.ends_with(".zip") {
-            old_stem.to_string()
-        } else {
-            old.to_string()
-        };
-        // Remove the main file (try both .jar and .zip extensions)
-        for ext in &[".jar", ".zip"] {
-            let candidate = dest_dir.join(format!("{}{}", old_base, ext));
-            let _ = std::fs::remove_file(&candidate);
+    // Park any old file aside (rename, never delete): the previous code
+    // deleted the old jar before the network transfer started, so a failed
+    // download left the user with no mod at all — and, due to a stem bug,
+    // usually did not even match the real filename, leaving duplicates.
+    // On failure the parked file is restored; on success it is removed
+    // together with its stale sidecar.
+    let stashed = match old_filename {
+        Some(ref raw) => crate::instances::stash_old_content_files(&dest_dir, raw)?,
+        None => Vec::new(),
+    };
+    let downloaded = async {
+        download::download_file(&download_url, &dest, &expected_sha1)
+            .await
+            .map_err(|e| e.to_string())?;
+        // When no SHA1 is available, at least verify the result is a real
+        // archive (JAR/ZIP magic) and not an HTML error page / bogus body.
+        if expected_sha1.is_empty()
+            && (safe_name.ends_with(".jar") || safe_name.ends_with(".zip"))
+        {
+            download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
         }
+        Ok::<(), String>(())
     }
-    download::download_file(&download_url, &dest, &expected_sha1)
-        .await
-        .map_err(|e| e.to_string())?;
-    // When no SHA1 is available, at least verify the result is a real
-    // archive (JAR/ZIP magic) and not an HTML error page / bogus body.
-    if expected_sha1.is_empty() && (safe_name.ends_with(".jar") || safe_name.ends_with(".zip")) {
-        download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
+    .await;
+    if let Err(e) = downloaded {
+        // The replacement is unusable: drop it (it may exist after a
+        // zip-magic failure) and put the old file back where it was.
+        let _ = std::fs::remove_file(&dest);
+        crate::instances::restore_stashed_files(&stashed);
+        return Err(e);
+    }
+    // Replacement verified — the parked old file is no longer needed.
+    crate::instances::discard_stashed_files(&stashed);
+    if let Some(ref raw_old) = old_filename {
+        crate::instances::cleanup_old_sidecar_after_update(&dest_dir, raw_old, &safe_name);
     }
 
     // Write sidecar metadata (`.index/` folder) so the installed file can be
@@ -689,6 +693,8 @@ pub async fn cmd_list_instance_mods(
         if !mods_dir.exists() {
             return Ok(Vec::new());
         }
+        // Roll back any file parked by an interrupted update before listing.
+        crate::instances::recover_stashed_content_files(&mods_dir);
         let mut mods = Vec::new();
         let pw_index = crate::instances::load_packwiz_index(&mods_dir);
         if let Ok(entries) = std::fs::read_dir(&mods_dir) {
