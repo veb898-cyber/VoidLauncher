@@ -12,7 +12,7 @@ import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { useInstanceStore } from '../stores/instanceStore';
 import { addToast } from '../components/ui/Toast';
 import { useLogPlaque } from '../lib/uiLog';
-import { Segmented, type SegmentedOption } from '../components/ui/Segmented';
+import { SlidingTabs, type SlidingTabDef } from '../components/ui/SlidingTabs';
 
 interface VersionEntry {
   id: string;
@@ -57,6 +57,7 @@ const LOADER_PAGE_SIZE = 20;
 const SCROLL_LOAD_THRESHOLD_PX = 50;
 
 type WizardMode = 'new' | 'import';
+type ModeTab = WizardMode | 'modpacks';
 
 export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpacks = false, onClearViaModpacks }: CreateWizardProps) {
   const { createInstance, installVersion, loadInstances } = useInstanceStore();
@@ -216,16 +217,16 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
   });
 
   // Rebuilt per render so the labels always follow the active language.
-  const versionFilterOptions: SegmentedOption<VersionFilter>[] = [
-    { value: 'all', label: t('create_instance.filter_all') },
-    { value: 'release', label: t('create_instance.filter_release') },
-    { value: 'snapshot', label: t('create_instance.filter_snapshot') },
+  const versionFilterOptions: SlidingTabDef<VersionFilter>[] = [
+    { id: 'all', label: t('create_instance.filter_all') },
+    { id: 'release', label: t('create_instance.filter_release') },
+    { id: 'snapshot', label: t('create_instance.filter_snapshot') },
   ];
-  const loaderOptions: SegmentedOption<LoaderType>[] = [
-    { value: 'Vanilla', label: t('create_instance.loader_vanilla') },
-    { value: 'Fabric', label: t('create_instance.loader_fabric') },
-    { value: 'Forge', label: t('create_instance.loader_forge') },
-    { value: 'NeoForge', label: t('create_instance.loader_neoforge') },
+  const loaderOptions: SlidingTabDef<LoaderType>[] = [
+    { id: 'Vanilla', label: t('create_instance.loader_vanilla') },
+    { id: 'Fabric', label: t('create_instance.loader_fabric') },
+    { id: 'Forge', label: t('create_instance.loader_forge') },
+    { id: 'NeoForge', label: t('create_instance.loader_neoforge') },
   ];
 
   const currentLoaderVersions = loaderVersions[loaderType] ?? [];
@@ -335,6 +336,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
       onClose={onClose}
       title={t('create_instance.title')}
       growWithContent
+      dense
       footer={
         <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}>
           <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
@@ -352,32 +354,28 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
     >
       {/* Mode selector sidebar + content */}
       <div style={{ display: 'flex', gap: 'var(--space-xl)', minHeight: 360 }}>
-        {/* Left sidebar — mode select */}
-        <div style={{
+        {/* Left sidebar — mode select: the same tab language as the terminal
+            and the modpack catalog (transparent labels, one frame that
+            physically slides down the column). */}
+        <div className="create-wizard__mode" style={{
           width: 140, flexShrink: 0,
-          display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)',
           borderRight: '1px solid var(--surface-border)', paddingRight: 'var(--space-lg)',
         }}>
-          <div
-            onClick={() => { setMode('new'); onClearViaModpacks?.(); }}
-            className={`create-wizard__mode-item${mode === 'new' && !viaModpacks ? ' create-wizard__mode-item--active' : ''}`}
-          >
-            <Plus size={16} /> {t('create_instance.mode_new')}
-          </div>
-
-          <div
-            onClick={() => onOpenModpacks?.()}
-            className={`create-wizard__mode-item${viaModpacks ? ' create-wizard__mode-item--active' : ''}`}
-          >
-            <Compass size={16} /> {t('modpacks.title')}
-          </div>
-
-          <div
-            onClick={() => { setMode('import'); onClearViaModpacks?.(); }}
-            className={`create-wizard__mode-item${mode === 'import' && !viaModpacks ? ' create-wizard__mode-item--active' : ''}`}
-          >
-            <Upload size={16} /> {t('create_instance.mode_import')}
-          </div>
+          <SlidingTabs<ModeTab>
+            orientation="vertical"
+            tabs={[
+              { id: 'new', label: <><Plus size={16} /> {t('create_instance.mode_new')}</> },
+              { id: 'modpacks', label: <><Compass size={16} /> {t('modpacks.title')}</> },
+              { id: 'import', label: <><Upload size={16} /> {t('create_instance.mode_import')}</> },
+            ]}
+            active={viaModpacks ? 'modpacks' : mode}
+            onChange={(id) => {
+              if (id === 'modpacks') onOpenModpacks?.();
+              else { setMode(id); onClearViaModpacks?.(); }
+            }}
+            ariaLabel={t('create_instance.title')}
+            style={{ gap: 'var(--space-sm)', marginBottom: 0 }}
+          />
         </div>
 
         {/* Right content area */}
@@ -399,32 +397,39 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
           {mode === 'new' ? (
             <>
               {/* MC Version + Loader in two columns */}
-              {/* minmax(0, …) instead of a bare 1fr: a plain `1fr` track is
-                  floored at the content's min-content width, so a wide
-                  segmented switcher used to push the grid past the dialog. */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 'var(--space-xl)' }}>
+              {/* minmax(0, 1fr) for the version column (floors below content
+                  min-width) and `auto` for the loader column: the switcher row
+                  keeps its natural width whatever the font metrics, and the
+                  version column absorbs the slack — a wide 4-loader row can no
+                  longer push "NeoForge" past the dialog edge. */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 'var(--space-xl)' }}>
                 <div>
                   <label className="input-group__label" style={{ display: 'block', marginBottom: 'var(--space-sm)', fontWeight: 600, fontSize: 'var(--font-size-sm)' }}>
                     {t('create_instance.version_label')}
                   </label>
                   <div style={{ position: 'relative', marginBottom: 'var(--space-sm)' }}>
-                    <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
+                    <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)', zIndex: 1, pointerEvents: 'none' }} />
                     <input className="input" type="text"
                       value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder={t('common.search')}
-                      aria-label={t('common.search')}
+                      placeholder={t('create_instance.version_search_placeholder')}
+                      aria-label={t('create_instance.version_search_placeholder')}
                       style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
                   </div>
-                  <Segmented
-                    style={{ marginBottom: 'var(--space-sm)' }}
-                    options={versionFilterOptions}
-                    ariaLabel={t('create_instance.version_label')}
-                    value={versionFilter}
+                  <SlidingTabs<VersionFilter>
+                    tabs={versionFilterOptions}
+                    active={versionFilter}
                     onChange={setVersionFilter}
+                    ariaLabel={t('create_instance.version_label')}
+                    className="wizard-switch"
+                    style={{ marginBottom: 'var(--space-sm)', borderBottom: 'none' }}
                   />
                   {/* Re-keyed on the filter so switching release/snapshot/all
-                      fades the new rows in instead of swapping them silently. */}
-                  <div key={versionFilter} className="animate-content-reveal version-list" style={{ maxHeight: 200, overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
+                      fades the new rows in instead of swapping them silently.
+                      maxHeight tracks the viewport: the dialog itself must
+                      never need scrolling (owner: «убери… листать это меню,
+                      просто сделай чтобы помещалось») — the list shrinks on
+                      short windows and scrolls only inside itself. */}
+                  <div key={versionFilter} className="animate-content-reveal version-list" style={{ maxHeight: 'min(200px, max(64px, calc(85vh - 447px)))', overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
                     {versionsLoading ? (
                       Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} height={32} style={{ marginBottom: 2 }} />)
                     ) : (
@@ -448,18 +453,18 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                   <label className="input-group__label" style={{ display: 'block', marginBottom: 'var(--space-sm)', fontWeight: 600, fontSize: 'var(--font-size-sm)' }}>
                     {t('create_instance.loader_label')}
                   </label>
-                  <Segmented
-                    block
-                    style={{ marginBottom: 'var(--space-sm)' }}
-                    options={loaderOptions}
-                    ariaLabel={t('create_instance.loader_label')}
-                    value={loaderType}
+                  <SlidingTabs<LoaderType>
+                    tabs={loaderOptions}
+                    active={loaderType}
                     onChange={handleLoaderChange}
+                    ariaLabel={t('create_instance.loader_label')}
+                    className="wizard-switch"
+                    style={{ marginBottom: 'var(--space-sm)', borderBottom: 'none' }}
                   />
                   {loaderType !== 'Vanilla' && (
                     <div key={`${loaderType}-${selectedVersion}`} ref={loaderListRef} onScroll={handleLoaderScroll}
                       className="animate-content-reveal version-list"
-                      style={{ maxHeight: 168, overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
+                      style={{ maxHeight: 'min(168px, max(56px, calc(85vh - 447px)))', overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
                       {loaderVersionsError ? (
                         <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
                           {t('create_instance.loader_versions_failed', { loader: loaderType })}

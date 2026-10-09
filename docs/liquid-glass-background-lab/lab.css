@@ -1,0 +1,1027 @@
+/* ---------------------------------------------------------------------------
+ * Liquid Glass background lab — styles.
+ *
+ * Self-contained. The material values below mirror the tokens the launcher
+ * currently uses for Liquid Glass, so what you judge here is what the app
+ * renders. Nothing in this file is imported by the app.
+ * ------------------------------------------------------------------------- */
+
+:root {
+  color-scheme: dark;
+
+  /* The launcher will use ONE glass material, `sheet`, on every glass surface,
+     so this is the only fill the dials drive. `--fill-shell` and
+     `--fill-float` are kept below as the historical values the earlier cards
+     were measured with — nothing renders from them any more. */
+  --fill-sheet: rgb(20, 24, 34, 0.78);
+  --fill-shell: rgb(22, 27, 38, 0.55);
+  --fill-float: rgb(22, 26, 36, 0.82);
+  /* iOS 27 recipe, chosen over ours in the Rim Duel card: a dark edge with a
+     bright specular on top. The old light rim on a dark fill was the reason
+     the material read as murkier than the reference. Deliberately NOT driven
+     by the dials: an edge is a specular, not a veil, and it has to survive a
+     fully clear fill. */
+  --rim: rgb(0, 0, 0, 0.28);
+  --rim-top: rgb(255, 255, 255, 0.34);
+  --divider: rgb(226, 236, 252, 0.14);
+  --tint: rgb(226, 236, 252, 0.16);
+  --depth: 0 10px 30px rgb(6, 8, 14, 0.38);
+
+  --blur-sheet: 20px;
+  --blur-shell: 14px;
+  --blur-float: 14px;
+  --sat-shell: 1.55;
+  --sat-sheet: 1.7;
+  --sat-float: 1.7;
+
+  --bg: #0a0c12;
+  --panel: #12151d;
+  --panel-2: #171b25;
+  --line: #232838;
+  --text: #eef1f7;
+  --text-dim: #98a0b4;
+  --text-faint: #6a7186;
+  --accent: #4d9bff;
+  --radius: 14px;
+
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --t-fast: 180ms;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 1680px;
+  margin: 0 auto;
+  padding: 28px 24px 72px;
+}
+
+/* -------------------------------------------------------------- header -- */
+
+.masthead {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px 32px;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding-bottom: 20px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.masthead h1 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.masthead p {
+  margin: 0;
+  max-width: 62ch;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+.masthead p code {
+  font-size: 12.5px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 13px;
+  border-radius: 9px;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease),
+              color var(--t-fast) var(--ease),
+              border-color var(--t-fast) var(--ease),
+              transform var(--t-fast) var(--ease);
+}
+
+.btn:hover { color: var(--text); border-color: #333a4e; background: #1c2130; }
+.btn:active { transform: scale(0.97); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn[aria-pressed="true"] {
+  color: #06111f;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.btn--sm { padding: 5px 10px; font-size: 12px; border-radius: 8px; }
+
+/* ---------------------------------------------------------------- intro -- */
+
+.intro {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+  margin: 22px 0 30px;
+}
+
+.intro section {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: 14px 16px;
+}
+
+.intro h2 {
+  margin: 0 0 7px;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.intro p { margin: 0; font-size: 13.5px; color: var(--text-dim); }
+.intro ul { margin: 0; padding-left: 18px; font-size: 13.5px; color: var(--text-dim); }
+.intro li { margin-bottom: 3px; }
+
+/* ----------------------------------------------------------------- grid -- */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 20px;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--panel);
+  overflow: hidden;
+  transition: border-color var(--t-fast) var(--ease);
+}
+
+.card:hover { border-color: #2e3548; }
+
+.card__head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 13px 16px 11px;
+}
+
+.card__num {
+  font: 600 11px/1 ui-monospace, Consolas, monospace;
+  color: var(--text-faint);
+  padding-top: 2px;
+}
+
+.card__name { font-size: 15px; font-weight: 620; letter-spacing: -0.005em; }
+.card__tag { font-size: 12.5px; color: var(--text-faint); margin-left: auto; text-align: right; }
+
+/* the canvas sits under the material sample */
+.stage {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  background: #04060c;
+  overflow: hidden;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.stage canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* A paused scene must stay fully judgeable, so the marker is a corner badge
+   and never a scrim over the background. */
+.stage__paused {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: none;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: rgb(6, 9, 16, 0.78);
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.card.is-paused .stage__paused { display: block; }
+
+/* ------------------------------------------------------- glass samples -- */
+/* The mock set is a fixed vocabulary of shapes, not a copy of the app UI:
+   a thin rail, a large panel with a text block, a small button and a round
+   control. Together they cover the ways a material can fail. */
+
+.mocks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.mock { position: absolute; color: #f2f4f7; }
+
+/* glass sidebar / rail — no blur, so rim and shadow carry the whole look */
+.mock--rail {
+  left: 10px;
+  top: 10px;
+  bottom: 10px;
+  width: 26px;
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 0;
+}
+
+.mock__pip {
+  width: 12px;
+  height: 12px;
+  border-radius: 4px;
+  border: 1px solid var(--divider);
+  background: var(--tint);
+}
+
+.mock__pip:first-child { background: rgb(77 155 255 / 0.28); border-color: rgb(77 155 255 / 0.45); }
+
+/* large glass panel, holds the text block */
+.mock--panel {
+  left: 46px;
+  right: 58px;
+  bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+}
+
+.mock__title { font-size: 12px; font-weight: 620; margin-bottom: 3px; }
+.mock__text { font-size: 11px; line-height: 1.45; color: #c8cfdd; margin-bottom: 8px; }
+.mock__chips { display: flex; flex-wrap: wrap; gap: 5px; }
+
+/* small glass button */
+.mock--btn {
+  top: 10px;
+  right: 10px;
+  padding: 5px 12px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+}
+
+/* round glass control */
+.mock--knob {
+  right: 10px;
+  bottom: 12px;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+}
+
+.mock__dot {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: rgb(77 155 255 / 0.75);
+  box-shadow: 0 0 0 2px rgb(255 255 255 / 0.22);
+}
+
+/* in the stress scene the probe row owns the top edge */
+.stage--probes .mock--btn { top: 62px; }
+.focus .stage--probes .mock--btn { top: 96px; }
+
+.chip {
+  font-size: 10.5px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--divider);
+  background: var(--tint);
+  color: #dfe4ee;
+  white-space: nowrap;
+}
+
+.chip--accent { background: rgb(77 155 255 / 0.22); border-color: rgb(77 155 255 / 0.4); color: #cfe3ff; }
+.chip--tiny { font-size: 9.5px; letter-spacing: 0.02em; }
+
+/* Every material variant shares the same rim recipe. The border stays
+   transparent rather than carrying --rim as well: the inset shadow already
+   draws the edge, and painting it twice made the outline twice as heavy as
+   the Rim Duel panel that was actually approved. It is left in place so the
+   box keeps its 1px size and nothing shifts. */
+.mock--rail,
+.mock--panel,
+.mock--btn,
+.mock--knob {
+  border: 1px solid transparent;
+}
+
+/* the four material variants under test */
+.glass--shell {
+  background: var(--fill-shell);
+  backdrop-filter: blur(var(--blur-shell)) saturate(var(--sat-shell));
+  -webkit-backdrop-filter: blur(var(--blur-shell)) saturate(var(--sat-shell));
+  box-shadow: inset 0 0 0 1px var(--rim), inset 0 1px 0 0 var(--rim-top);
+}
+
+.glass--sheet {
+  background: var(--fill-sheet);
+  -webkit-backdrop-filter: blur(var(--blur-sheet)) saturate(var(--sat-sheet));
+  backdrop-filter: blur(var(--blur-sheet)) saturate(var(--sat-sheet));
+  border: 1px solid var(--rim);
+  box-shadow: inset 0 1px 0 var(--rim-top), var(--depth);
+}
+
+.glass--float {
+  background: var(--fill-float);
+  backdrop-filter: blur(var(--blur-float)) saturate(var(--sat-float));
+  -webkit-backdrop-filter: blur(var(--blur-float)) saturate(var(--sat-float));
+  box-shadow: inset 0 0 0 1px var(--rim), inset 0 1px 0 0 var(--rim-top), var(--depth);
+}
+
+/* Tier 1: no blur at all, rim + shadow carry the whole look */
+.glass--tier1 {
+  background: rgb(30, 35, 46, 0.94);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: inset 0 0 0 1px var(--rim), inset 0 1px 0 0 var(--rim-top),
+              0 6px 18px rgb(6, 8, 14, 0.5);
+}
+
+/* ------------------------------------------------- diagnostic overlays ---
+   The five instrument cards. Each isolates one variable, so the boxes are
+   deliberately plain and identically sized: any difference between them is
+   the variable under test, not the layout. */
+
+.diag-defs { position: absolute; width: 0; height: 0; pointer-events: none; }
+
+.diag {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px;
+}
+
+.diag__col {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+}
+
+/* no base border anywhere: on the rim card the edge IS the thing under test */
+.diag__box {
+  flex: 1 1 auto;
+  border-radius: 12px;
+}
+
+.diag__cap {
+  font-size: 10px;
+  line-height: 1.25;
+  text-align: center;
+  color: #dfe4ee;
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.65);
+}
+
+.diag__note {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 8px;
+  font-size: 10px;
+  line-height: 1.3;
+  text-align: center;
+  color: #dfe4ee;
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.65);
+}
+
+/* ramp — one wide bar across the whole greyscale gradient */
+.diag--ramp,
+.diag--fringe { flex-direction: column; align-items: stretch; }
+.diag--ramp .diag__box { flex: 0 0 auto; height: 54%; }
+.diag--fringe .diag__box { flex: 0 0 auto; height: 46%; }
+
+.ramp__legend {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: #dfe4ee;
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.65);
+}
+
+/* tint — five identical boxes, only the fill alpha differs */
+.tint__box {
+  background: rgb(22 27 38 / var(--a, 0.30));
+  border: 1px solid rgb(255 255 255 / 0.12);
+  backdrop-filter: blur(14px) saturate(1.55);
+  -webkit-backdrop-filter: blur(14px) saturate(1.55);
+  transition: box-shadow var(--t-fast) var(--ease);
+}
+
+/* The ruler must stay put, so only the pointer moves: the box nearest the
+   current slider value is marked, which is what lets one card answer "where is
+   our level on this scale" without the scale itself shifting. */
+.diag__col.is-current .diag__cap { color: #fff; font-weight: 700; }
+.diag__col.is-current .tint__box { box-shadow: 0 0 0 2px var(--accent); }
+
+/* rim — identical fill and blur, only the edge recipe differs */
+.rim__ours {
+  box-shadow: inset 0 0 0 1px rgb(238 246 255 / 0.16), inset 0 1px 0 0 rgb(238 246 255 / 0.1);
+}
+.rim__ios {
+  box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.28), inset 0 1px 0 0 rgb(255 255 255 / 0.34);
+}
+
+/* lens — our blur next to a displacement-based approximation */
+.lens__ref {
+  backdrop-filter: url(#lglens) saturate(1.55);
+  -webkit-backdrop-filter: saturate(1.55);
+}
+.lens__ref.is-unsupported {
+  box-shadow: inset 0 0 0 1px rgb(255 138 138 / 0.6);
+}
+
+.focus .diag__cap { font-size: 12px; }
+.focus .ramp__legend,
+.focus .diag__note { font-size: 12px; }
+
+/* ----------------------------------------------- stress-test probe row -- */
+
+.probes {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.probe {
+  border-radius: 9px;
+  border: 1px solid var(--rim);
+  background: var(--fill-shell);
+  padding: 6px 7px;
+  color: #f2f4f7;
+  font-size: 9px;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.probe b { display: block; font-size: 9.5px; font-weight: 650; margin-bottom: 2px; }
+.probe span { color: #c8cfdd; }
+.probe--0  { backdrop-filter: none; -webkit-backdrop-filter: none; }
+.probe--8  { backdrop-filter: blur(8px) saturate(1.55); -webkit-backdrop-filter: blur(8px) saturate(1.55); }
+.probe--14 { backdrop-filter: blur(14px) saturate(1.55); -webkit-backdrop-filter: blur(14px) saturate(1.55); }
+.probe--20 { backdrop-filter: blur(20px) saturate(1.55); -webkit-backdrop-filter: blur(20px) saturate(1.55); }
+
+/* ------------------------------------------------------------ card foot -- */
+
+.card__foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 16px 13px;
+  border-top: 1px solid var(--line);
+}
+
+.tests {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+}
+
+.tests li {
+  font-size: 11px;
+  color: var(--text-faint);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+.card__actions { display: flex; gap: 6px; flex-shrink: 0; }
+
+.card__why {
+  margin: 0;
+  padding: 0 16px 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.card__tech {
+  margin: 0;
+  padding: 9px 16px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+/* -------------------------------------------------- sheet dials -------------
+   The launcher keeps one glass material, so the two numbers that are still
+   open get a dial each: the alpha of `sheet` and its blur radius. The readouts
+   are the plain values, with no conversion, because those numbers are what
+   goes straight into --fill-sheet and --blur-sheet in the app's LG theme. */
+
+.dials {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px 26px;
+}
+
+.dial {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 226px;
+  flex: 1 1 226px;
+  max-width: 340px;
+}
+
+.dial__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dial__label {
+  font-size: 12px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.dial__value {
+  font: 600 13px/1 ui-monospace, Consolas, monospace;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  transition: color var(--t-fast) var(--ease);
+}
+
+.dial__scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.dial__range {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 18px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.dial__range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #1a1f2b, #2d3549);
+}
+.dial__range::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #1a1f2b, #2d3549);
+}
+
+.dial__range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 15px;
+  height: 15px;
+  margin-top: -5.5px;
+  border-radius: 50%;
+  background: var(--text);
+  border: 1px solid rgb(0 0 0 / 0.4);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.5);
+  transition: background var(--t-fast) var(--ease),
+              transform var(--t-fast) var(--ease);
+}
+.dial__range::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--text);
+  border: 1px solid rgb(0 0 0 / 0.4);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.5);
+}
+.dial__range:hover::-webkit-slider-thumb { background: #fff; }
+.dial__range:hover::-moz-range-thumb { background: #fff; }
+.dial__range:active::-webkit-slider-thumb { transform: scale(1.12); }
+.dial__range:focus-visible { outline: none; }
+.dial__range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px rgb(77 155 255 / 0.5), 0 1px 4px rgb(0 0 0 / 0.5);
+}
+.dial__range:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px rgb(77 155 255 / 0.5), 0 1px 4px rgb(0 0 0 / 0.5);
+}
+.dial__range:disabled { cursor: not-allowed; opacity: 0.4; }
+
+/* --------------------------------------------------------- speed control -- */
+
+.speed {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--panel);
+}
+
+.speed .btn { border-color: transparent; background: transparent; }
+.speed .btn[aria-pressed="true"] {
+  color: #06111f;
+  background: var(--accent);
+}
+
+.speed-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 650;
+}
+
+/* ---------------------------------------------------------- focus view -- */
+
+.focus {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: none;
+  grid-template-rows: auto 1fr auto;
+  background: rgb(4 6 12 / 0.86);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  padding: 20px;
+  gap: 14px;
+}
+
+.focus.is-open { display: grid; }
+
+.focus__bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text);
+}
+
+.focus__id { min-width: 0; }
+.focus__bar h2 { margin: 0; font-size: 16px; font-weight: 620; }
+.focus__bar p { margin: 0; font-size: 13px; color: var(--text-dim); }
+.focus__bar .spacer { flex: 1; }
+
+.focus__why {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  max-width: 110ch;
+}
+
+.focus__stage {
+  position: relative;
+  border-radius: 18px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: #04060c;
+  min-height: 0;
+}
+
+.focus__stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+
+/* the mock set needs room to breathe in the large view */
+.focus .mock--rail { left: 24px; top: 24px; bottom: 24px; width: 40px; border-radius: 14px; gap: 12px; }
+.focus .mock__pip { width: 18px; height: 18px; border-radius: 6px; }
+.focus .mock--panel { left: 80px; right: 110px; bottom: 26px; padding: 18px 20px; border-radius: 16px; }
+.focus .mock__title { font-size: 16px; }
+.focus .mock__text { font-size: 13px; line-height: 1.5; margin-bottom: 12px; }
+.focus .mock--btn { top: 24px; right: 24px; padding: 9px 20px; font-size: 13px; border-radius: 12px; }
+.focus .mock--knob { right: 24px; bottom: 26px; width: 64px; height: 64px; }
+.focus .mock__dot { width: 22px; height: 22px; }
+.focus .chip { font-size: 11.5px; padding: 4px 10px; }
+.focus .probes { top: 22px; left: 22px; right: 22px; gap: 10px; }
+.focus .probe { padding: 10px; font-size: 11px; }
+.focus .probe b { font-size: 12px; }
+
+/* Fullscreen gives the scene the whole screen, but the controls must stay
+   reachable — hiding them would trap the viewer with no way out. Only the
+   text is dropped, and the buttons shrink into a floating corner group. */
+.focus:fullscreen {
+  padding: 0;
+  gap: 0;
+  background: #000;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  grid-template-rows: 1fr;
+}
+.focus:fullscreen .focus__bar {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 2;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--divider);
+  border-radius: 12px;
+  background: rgb(8 10 16 / 0.72);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.focus:fullscreen .focus__id,
+.focus:fullscreen .focus__why { display: none; }
+.focus:fullscreen .focus__stage { border: 0; border-radius: 0; }
+
+/* --------------------------------------------------------------- misc --- */
+
+.hint {
+  margin: 26px 0 0;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+body.no-samples .mocks,
+body.no-samples .probes { display: none; }
+
+@media (max-width: 720px) {
+  .wrap { padding: 20px 14px 56px; }
+  .grid { grid-template-columns: 1fr; }
+  .focus .mock--panel { right: 96px; }
+  .focus .mock--knob { width: 52px; height: 52px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition-duration: 1ms !important; }
+}
+
+/* ---------------------------------------------------------------------------
+ * Sheet on the launcher's own chrome.
+ *
+ * The decision is to keep one glass material, `sheet`, on every glass surface
+ * in the app. Six of the seven are small: a menu, a toast, a tooltip, a select
+ * list, a modal, a button. The other two — the titlebar and the sidebar — are
+ * the only glass in the app that covers a large area, and a full-height panel
+ * is where a dense fill and a wide blur stop being subtle and start looking
+ * heavy. They are what this card exists to judge.
+ *
+ * The geometry and the type sizes deliberately mirror the app, because the
+ * failure mode being tested is 11-13px text staying legible over moving
+ * content, not whether a rectangle looks pretty.
+ * ------------------------------------------------------------------------- */
+
+.diag--chrome { position: absolute; inset: 0; display: block; }
+
+.chrome__titlebar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 18%;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 11px;
+  z-index: 3;
+}
+
+.chrome__sidebar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 37%;
+  min-width: 116px;
+  max-width: 196px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 11px 7px 7px;
+  z-index: 2;
+  overflow: hidden;
+}
+
+.chrome__brand {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--mock-text);
+  padding: 0 7px 9px;
+  white-space: nowrap;
+}
+
+.chrome__item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--mock-text);
+  padding: 4px 7px;
+  border-radius: 7px;
+  white-space: nowrap;
+}
+
+.chrome__item::before {
+  content: "";
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: rgb(226, 236, 252, 0.32);
+}
+
+.chrome__item.is-active {
+  background: rgb(226, 236, 252, 0.16);
+  box-shadow: inset 0 0 0 1px rgb(226, 236, 252, 0.10);
+}
+
+.chrome__title {
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--mock-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chrome__chip {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--mock-text);
+  padding: 3px 8px;
+  border-radius: 7px;
+  background: rgb(20, 24, 34, 0.55);
+  box-shadow: inset 0 0 0 1px rgb(226, 236, 252, 0.16);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+ * Sheet parameter sweep.
+ *
+ * Both open numbers in one card: rows are blur, columns are alpha, so any pair
+ * can be read straight off instead of being dialled in and remembered. The
+ * cell matching the live dials is ringed, which is what makes this a decision
+ * instrument rather than a gallery of nine options.
+ * ------------------------------------------------------------------------- */
+
+.diag--sweep {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-auto-rows: 1fr;
+  gap: 2.4%;
+  padding: 3.2%;
+}
+
+.sweep__cell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 5px;
+  padding: 7px 8px;
+  border-radius: 11px;
+  /* each cell carries its own pair, so a grid and the live dials cannot drift
+     apart: the same numbers are being compared, not two different materials */
+  background: rgb(20, 24, 34, var(--sa, 0.78));
+  -webkit-backdrop-filter: blur(var(--sb, 20px)) saturate(1.7);
+  backdrop-filter: blur(var(--sb, 20px)) saturate(1.7);
+  border: 1px solid var(--rim);
+  box-shadow: inset 0 1px 0 var(--rim-top), var(--depth);
+  overflow: hidden;
+}
+
+.sweep__cell.is-live { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.sweep__lines { display: flex; flex-direction: column; gap: 3px; }
+
+.sweep__lines span {
+  height: 4px;
+  border-radius: 2px;
+  background: rgb(232, 238, 247, 0.55);
+}
+
+.sweep__lines span:nth-child(2) { width: 68%; background: rgb(232, 238, 247, 0.38); }
+.sweep__lines span:nth-child(3) { width: 44%; background: rgb(232, 238, 247, 0.26); }
+
+.sweep__cap {
+  font: 600 9.5px/1.25 ui-monospace, Consolas, monospace;
+  color: var(--mock-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.sweep__cap b { color: #fff; font-weight: 700; }
+
+.focus .chrome__brand,
+.focus .chrome__item,
+.focus .chrome__title { font-size: 14px; }
+.focus .chrome__chip { font-size: 12.5px; }
+.focus .chrome__item { padding: 6px 9px; }
+.focus .chrome__item::before { width: 13px; height: 13px; }
+.focus .sweep__cap { font-size: 12px; }
+.focus .sweep__lines span { height: 5px; }
+
+@media (max-width: 720px) {
+  .dials { gap: 14px 16px; }
+  .dial { min-width: 0; }
+}
+
+/* ---------------------------------------------------------------------------
+ * Increase Contrast.
+ *
+ * Apple pairs the transparency slider with this adaptation, so the lab can
+ * show the pairing. Everything geometric is left exactly as the slider put it —
+ * fill, blur and rim all stay where they were. Only the dimmed text is pushed
+ * to the far end, which is the whole point: it is a text adjustment, not a
+ * different material, and mixing the two up is how contrast gets "fixed" in a
+ * way that costs more than it gains.
+ * ------------------------------------------------------------------------- */
+
+body.is-high-contrast .mock__text,
+body.is-high-contrast .probe span,
+body.is-high-contrast .chip,
+body.is-high-contrast .chrome__brand,
+body.is-high-contrast .chrome__item,
+body.is-high-contrast .chrome__title,
+body.is-high-contrast .chrome__chip,
+body.is-high-contrast .sweep__cap { color: #fff; }
+
+/* ---------------------------------------------------------------------------
+ * Reduced transparency.
+ *
+ * The launcher honours this setting by making every LG surface opaque. That
+ * is the right behaviour in the app, but it would defeat the purpose of a
+ * diagnostic page whose entire job is judging translucency. So the lab keeps
+ * the materials translucent on purpose and says so out loud instead of
+ * silently showing something the user did not ask to see. The "Плотный" toggle
+ * opts into the app's behaviour on demand, so the difference can be seen
+ * instead of only described.
+ * ------------------------------------------------------------------------- */
+
+.rt-note { display: none; }
+
+@media (prefers-reduced-transparency: reduce) {
+  .rt-note {
+    display: block;
+    margin: 0 0 22px;
+    padding: 11px 14px;
+    border: 1px solid rgb(255 190 90 / 0.4);
+    border-radius: var(--radius);
+    background: rgb(255 190 90 / 0.1);
+    color: #ffdca6;
+    font-size: 13px;
+  }
+}

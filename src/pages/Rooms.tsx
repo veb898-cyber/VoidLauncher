@@ -60,7 +60,7 @@ export function Rooms() {
   }, [status, tsReady, loadStatus]);
 
   return (
-    <div className="page animate-fade-in" style={{ display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
+    <div className="page" style={{ display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
       <div
         className="page__header"
         style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 'var(--space-md)', flexWrap: 'wrap' }}

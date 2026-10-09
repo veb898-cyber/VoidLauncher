@@ -568,6 +568,9 @@ a {
   display: flex;
   flex: 1;
   overflow: hidden;
+  /* One opacity channel so the modpacks swap can fade the whole shell as a
+     single surface (see html[data-modpacks-open] below). */
+  transition: opacity var(--transition-normal);
 }
 
 /* ============================
@@ -1078,6 +1081,10 @@ select {
 }
 select.input option,
 select option {
+  /* Native option lists are painted by the OS, outside the page's compositing,
+     so this one cannot be a glass surface. It reads --surface-glass only
+     because that token is nearly opaque in this theme (0.86); it must not be
+     given a blur, which would have no effect here anyway. */
   background-color: var(--surface-glass);
   color: var(--text-primary);
 }
@@ -1124,7 +1131,10 @@ select option {
   left: 0;
   right: 0;
   top: calc(100% + 4px);
-  z-index: 1000;
+  /* React portals the open list to <body>: 1600 sits above every overlay
+     that can host a select (modal 1000, modpacks 1400, install 1500) and
+     below toasts (2000), context menus (2000) and tooltips (3000). */
+  z-index: 1600;
   margin: 0;
   padding: 4px;
   list-style: none;
@@ -1206,6 +1216,13 @@ select option {
 /* ============================
    Instance Card
    ============================ */
+
+/* Left column of the two-pane instances screen (HomeLayout): a list of
+   instances beside the detail pane. Owns its background so the Liquid Glass
+   block can replace it with the material; everything else stays inline. */
+.instance-list {
+  background: var(--bg-secondary);
+}
 
 .instance-grid {
   display: grid;
@@ -1508,7 +1525,7 @@ select option {
   align-items: center;
   justify-content: center;
   z-index: 1000;
-  animation: fadeIn var(--transition-fast) ease-out;
+  animation: fadeIn var(--transition-fast);
 }
 
 /* Variant for dialogs that should float over the page without
@@ -1532,7 +1549,7 @@ select option {
   max-height: 85vh;
   overflow-y: auto;
   box-shadow: var(--shadow-xl);
-  animation: slideUp var(--transition-normal) ease-out;
+  animation: slideUp var(--transition-normal);
 }
 
 .modal__header {
@@ -1575,38 +1592,20 @@ select option {
   max-height: calc(100vh - 96px);
 }
 
-/* Create-instance menu: the mode items get the same press/hover feedback as
-   the rest of the UI buttons (scale-down on press, tinted hover, soft
-   transition). The active item reads as "selected"/pressed like the other
-   primary controls. */
-.create-wizard__mode-item {
-  padding: var(--space-md) var(--space-lg);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  color: var(--text-secondary);
-  font-weight: 400;
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
-  font-size: var(--font-size-sm);
-  user-select: none;
-  transition: background var(--transition-fast), color var(--transition-fast), transform 80ms ease-out;
+/* Denser chrome for tall dialogs (the create wizard): header/body/footer
+   paddings trimmed so the dialog fits short windows without needing its own
+   scrollbar — the content shrinks instead of the dialog scrolling (owner:
+   «убери… листать это меню, просто сделай чтобы помещалось»). */
+.modal--dense .modal__header {
+  padding: var(--space-lg) var(--space-xl) var(--space-md);
 }
 
-.create-wizard__mode-item:hover {
-  background: var(--surface-glass-hover);
-  color: var(--text-primary);
+.modal--dense .modal__body {
+  padding: var(--space-md);
 }
 
-.create-wizard__mode-item:active {
-  transform: scale(0.96);
-}
-
-.create-wizard__mode-item--active,
-.create-wizard__mode-item--active:hover {
-  background: var(--primary-dim);
-  color: var(--primary);
-  font-weight: 600;
+.modal--dense .modal__footer {
+  padding: var(--space-md) var(--space-xl);
 }
 
 /* ============================
@@ -1626,7 +1625,7 @@ select option {
   background: var(--bg-primary);
   display: flex;
   flex-direction: column;
-  animation: fadeIn var(--transition-fast) ease-out;
+  animation: fadeIn var(--transition-fast);
 }
 
 .modpacks-overlay__bar {
@@ -1685,7 +1684,7 @@ select option {
   border: 1px solid var(--surface-border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
-  animation: slideInRight var(--transition-normal) ease-out;
+  animation: slideInRight var(--transition-normal);
   min-width: 300px;
   color: var(--text-primary);
   position: relative;
@@ -1729,6 +1728,7 @@ select option {
   gap: var(--space-xs);
   border-bottom: 1px solid var(--surface-border);
   margin-bottom: var(--space-xl);
+  position: relative;
 }
 
 .tab {
@@ -1752,37 +1752,61 @@ select option {
   color: var(--primary);
 }
 
-.tab--active::after {
-  content: '';
-  position: absolute;
-  bottom: -1px;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: var(--gradient-primary);
-  border-radius: var(--radius-full);
-  box-shadow: var(--glow-primary);
-}
-
-.btn--tab {
-  background: transparent;
-  color: var(--text-secondary);
-  padding: var(--space-sm) var(--space-lg);
-  border: 1px solid transparent;
-  border-radius: var(--radius-full);
+/* Compact density for the two switcher rows in the create dialog (mod loader
+   + version filter): the dialog width is capped, and at the default tab
+   padding the 4-loader row overflowed its column. Mirrors the old Segmented
+   density (8px/12px, 12px label) — the frame still slides the same way. */
+.wizard-switch .tab {
   font-size: var(--font-size-sm);
-  font-weight: 500;
+  padding: var(--space-sm) var(--space-md);
 }
 
-.btn--tab:hover {
-  background: var(--surface-glass);
-  color: var(--text-primary);
+/* One indicator per row, physically slid between the buttons by
+   SlidingTabs (it measures the active button and moves this box). The
+   per-tab underline that only scaled and the pill that popped in are both
+   gone: neither travels, so switching read as a box appearing "around the
+   new button" instead of the frame moving to it. */
+.tabs__indicator {
+  position: absolute;
+  left: 0;
+  bottom: -1px;
+  height: 2px;
+  width: var(--tab-size, 0px);
+  border-radius: var(--radius-full);
+  background: var(--gradient-primary);
+  box-shadow: var(--glow-primary);
+  pointer-events: none;
+  transform: translateX(var(--tab-offset, 0px));
+  transition: transform var(--transition-fast), width var(--transition-fast), height var(--transition-fast);
 }
 
-.btn--tab-active {
-  background: var(--surface-glass);
-  color: var(--primary);
-  border-color: var(--primary-dim);
+/* Vertical variant (create-menu modes): the same frame slides down the
+   column instead of across the row. Geometry still travels through
+   --tab-offset / --tab-size so every theme only restates the box. */
+.tabs--vertical {
+  flex-direction: column;
+  align-items: stretch;
+  border-bottom: none;
+  border-right: 1px solid var(--surface-border);
+  margin-bottom: 0;
+}
+
+.tabs--vertical .tab {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  width: 100%;
+  text-align: left;
+}
+
+.tabs--vertical .tabs__indicator {
+  top: 0;
+  bottom: auto;
+  left: 0;
+  right: auto;
+  width: 3px;
+  height: var(--tab-size, 0px);
+  transform: translateY(var(--tab-offset, 0px));
 }
 
 /* ============================
@@ -2016,6 +2040,14 @@ select option {
   box-shadow: var(--glow-primary);
 }
 
+/* A locked switch (e.g. the realistic-glass option while Liquid Glass is
+   off) stays legible as a control but visibly inert: placed after the
+   checked rule so the dim wins the specificity tie. */
+.toggle input:disabled + .toggle__slider {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .toggle input:checked + .toggle__slider::before {
   transform: translateY(-50%) translateX(22px);
   background: #ffffff;
@@ -2124,12 +2156,16 @@ select option {
   50% { box-shadow: var(--glow-primary-intense); }
 }
 
-.animate-fade-in {
-  animation: fadeIn var(--transition-normal) ease-out;
-}
-
+/* Tab and page switches carry NO content entrance animation on purpose: the
+   content is there the moment the switch happens, and the only motion is the
+   sliding pill of SlidingTabs. Fades are not an option for shells that hold
+   glass — an opacity < 1 ancestor becomes a backdrop root for its whole
+   duration (research mdn) and every glass descendant loses its material and
+   snaps on when the fade ends; a transform-only rise was the previous
+   compromise, but the owner read it as content "sliding out and popping in"
+   («странные выезды», «дерганно»). Clean instant swap, smooth frame — done. */
 .animate-slide-up {
-  animation: slideUp var(--transition-normal) ease-out;
+  animation: slideUp var(--transition-normal);
 }
 
 .animate-pulse {
@@ -2464,6 +2500,10 @@ select option {
   appearance: none;
 }
 
+/* z-index: the lg input carries a backdrop-filter, which paints the field as
+   an atomic z-index:0 unit that lands ABOVE these later-in-tree-positioned
+   children and hides them under the glass; the lift keeps icon and clear
+   crisp on top of the field in every theme. */
 .log-search__icon {
   position: absolute;
   left: 10px;
@@ -2472,6 +2512,7 @@ select option {
   color: var(--text-tertiary);
   pointer-events: none;
   display: flex;
+  z-index: 1;
 }
 
 .log-search__clear {
@@ -2491,6 +2532,7 @@ select option {
   color: var(--text-tertiary);
   cursor: pointer;
   transition: background var(--transition-fast), color var(--transition-fast);
+  z-index: 1;
 }
 
 .log-search__clear:hover {
@@ -3288,19 +3330,1302 @@ input[type="range"]:active::-moz-range-thumb {
 
 /* ============================
    Card entrance stagger
-   Applied individually with an inline delay (capped at ~9 items) so long
-   lists don't accumulate noticeable latency. Disabled for
-   prefers-reduced-motion via the block below.
+   Removed on purpose: per-row delay cascades made tab switches read as rows
+   popping in one by one (owner: «появляются, иногда дерганно»). Lists and
+   cards now appear as one piece; motion lives in the sliding tab pill.
+   Disabled for prefers-reduced-motion via the block below.
    ============================ */
 
-.stagger-in {
-  animation: fadeIn var(--transition-normal) ease-out both;
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .stagger-in { animation: none; }
   .skeleton { animation: none; }
   .icon-shine::after { animation: none; }
   .progress-fill::after { animation: none; }
   .spinner-snake__rot { animation-duration: 1.6s; }
+}
+
+/* ============================
+   Settings: Experimental appearance block
+   Theme-independent chrome for the separate Liquid Glass mode. Lives
+   outside the Liquid Glass block on purpose: the control has to be
+   reachable (and look intentional) in every appearance, including the
+   normal ones.
+   ============================ */
+
+.settings-row__note {
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+  margin-top: var(--space-xs);
+  max-width: 52ch;
+}
+
+.settings-row__note--locked {
+  color: var(--text-tertiary);
+}
+
+.settings-row__note--active {
+  color: var(--color-warning);
+}
+
+.experimental-block {
+  margin-top: var(--space-lg);
+  padding: var(--space-md) var(--space-lg) var(--space-sm);
+  border: 1px dashed var(--surface-border-hover);
+  border-radius: var(--radius-lg);
+  background: var(--surface-active);
+}
+
+.experimental-block__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.experimental-block__title {
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.experimental-block__desc {
+  font-size: var(--font-size-sm);
+  color: var(--text-tertiary);
+  margin-top: 2px;
+}
+
+.experimental-block .settings-row:last-child {
+  padding-bottom: var(--space-sm);
+}
+
+.experimental-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--space-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--color-warning);
+  background: hsla(40, 100%, 60%, 0.14);
+  border: 1px solid hsla(40, 100%, 60%, 0.3);
+  border-radius: var(--radius-full);
+  vertical-align: middle;
+}
+
+.experimental-badge--inline {
+  margin-left: var(--space-sm);
+}
+
+.custom-select--disabled .custom-select__trigger {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.custom-select--disabled .custom-select__trigger:hover {
+  background: var(--surface-glass);
+  border-color: var(--surface-border);
+}
+
+/* ============================
+   Liquid Glass — experimental appearance
+   ------------------------------------------------------------
+   NOT a theme. It is a separate material system that replaces the
+   normal theme instead of recolouring it, so the whole block is scoped to
+   one sentinel attribute value (`data-theme="lg"`, written by
+   `applyAppearance` in stores/themeStore.ts). No `[data-theme="dark"]`,
+   `[data-theme="blueprint"]` or `[data-theme="ember"]` rule matches while
+   it is applied — a theme palette cannot leak in, and nothing here can
+   blend into one.
+
+   MUST stay after every theme block in this file: `:root` and the theme
+   attribute selectors have the same specificity, so source order is what
+   lets this block win.
+
+   Stage order follows docs/liquid-glass-design-system.md §13.1:
+   0 substrate S-A · 1 tokens · 2 accessibility fallback · 3 sampling groups.
+   Every group shares ONE material (`--lg-fill` / `--lg-blur` / `--lg-sat`);
+   the groups stay separate only because what moves over each backdrop
+   differs, which is a sampling decision, not a material one.
+   ============================ */
+
+/* ------------------------------------------------------------
+   Stage 1 — tokens
+   A complete palette of its own (the module is not a preset of any
+   theme) plus the material tokens, the z-scale (decision D6) and the
+   legacy `--surface-glass*` aliases the existing components already use.
+   ------------------------------------------------------------ */
+
+[data-theme='lg'] {
+  /* S-A substrate sources */
+  --lg-substrate-base: hsl(228, 26%, 7%);
+  --lg-ambient: hsla(214, 100%, 66%, 0.18);
+  --lg-rail-top: hsla(214, 60%, 70%, 0.16);
+  --lg-rail-bottom: hsla(258, 45%, 45%, 0.09);
+
+    /* One material for every glass surface (titlebar, sidebar, menus, toasts,
+       tooltips, modals, cards). There is deliberately no shell/float/sheet
+       hierarchy in the mixing itself; the sampling groups below differ only in
+       what moves over them, and the surfaces differ in whether they also carry
+       a depth shadow - that is what carries the hierarchy, not the fill.
+
+       Values chosen against the real procedural backdrop, not against a test
+       pattern: sheet alpha sits at 0.68 (measured in the 0.66-0.74 range, see
+       PROJECT_NOTEBOOK), blur 22px is enough to erase detail without turning
+       the backdrop into soup, and saturate(1.18) tints the material without
+       pushing the violet/cyan backdrop into dirty colour smears - 1.7 did. */
+    --lg-blur: 22px;
+    --lg-sat: 1.18;
+
+    /* Material fill and edges */
+    --lg-fill: rgb(20, 24, 34, 0.68);
+    --lg-tint: rgb(226, 236, 252, 0.16);
+    --lg-tint-hover: rgb(226, 236, 252, 0.24);
+    /* One edge colour for every surface, outer hairline included: two near-white
+       border tokens with different values read as two different materials. */
+    --lg-rim: rgb(226, 236, 252, 0.11);
+    --lg-divider: rgb(226, 236, 252, 0.11);
+    --lg-specular: linear-gradient(180deg, rgb(255, 255, 255, 0.09) 0%, rgb(255, 255, 255, 0) 30%);
+    --lg-depth-shadow: 0 12px 32px rgb(4, 6, 12, 0.42);
+
+    /* The edge reading, in three parts:
+       - a 1px light at the very top (shine, 0.12 - was 0.18 and read as a
+         white line sitting on the panel);
+       - an inner hairline (0.055) so the border and the edge are both there
+         but neither is a frame;
+       - a soft dark pool along the bottom edge, which is what makes a flat
+         rectangle read as a piece of material with thickness. The -18px spread
+         shrinks it away entirely on small elements, so it never smudges them. */
+    --lg-rim-ring:
+      inset 0 1px 0 0 rgb(255, 255, 255, 0.12),
+      inset 0 0 0 1px rgb(255, 255, 255, 0.055);
+    --lg-inner-depth: inset 0 -16px 24px -18px rgb(4, 6, 12, 0.5);
+    /* The recessed reading, for wells that sit ON the wallpaper: a shadow
+       pooling along the top inner edge and a light hairline along the bottom
+       inner one - the inverse of the raised sheet, so a large surface reads
+       as cut into the material instead of resting on it. */
+    --lg-sunk:
+      inset 0 2px 8px -3px rgb(4, 6, 12, 0.6),
+      inset 0 -1px 0 0 rgb(226, 236, 252, 0.10);
+
+  /* Small controls do not get the blur, and this is a deliberate split rather
+     than an omission. Their backdrop is a few hundred square pixels of a slow
+     gradient, so blur(20px) there changes almost nothing you can see, while
+     costing a sampling group per control - and any control rendered inside a
+     glass modal would be glass stacked on glass, which the system forbids.
+     The fill carries the effect instead, a little more opaque than the shell
+     material so the wallpaper does not read as sharp through a small well. */
+  --lg-well: rgb(16, 20, 29, 0.86);
+  --lg-well-hover: rgb(226, 236, 252, 0.14);
+  /* Recessed well for lists that live INSIDE glass (the loader/version picker):
+     no blur, because it would be glass on glass; darker than --lg-well so it
+     reads as pressed into the sheet rather than floating on it. */
+  --lg-well-deep: rgb(10, 13, 20, 0.55);
+
+  /* Palette — its own, not derived from Neon/OLED/Blueprint/Ember */
+  --bg-primary: var(--lg-substrate-base);
+  --bg-secondary: hsl(228, 22%, 13%);
+  --bg-tertiary: hsl(228, 20%, 17%);
+  --bg-elevated: hsl(228, 18%, 21%);
+  --surface-elevated: var(--bg-elevated);
+
+  --primary: hsl(214, 100%, 66%);
+  --primary-dim: hsla(214, 100%, 66%, 0.14);
+  --primary-light: hsl(214, 100%, 76%);
+  --primary-dark: hsl(214, 100%, 52%);
+  --primary-contrast: #ffffff;
+  --secondary: hsl(190, 95%, 60%);
+  --gradient-primary: linear-gradient(135deg, var(--primary), var(--secondary));
+  --gradient-primary-hover: linear-gradient(135deg, var(--primary-light), hsl(190, 95%, 70%));
+  --accent: hsl(258, 90%, 72%);
+  --accent-dim: hsla(258, 90%, 72%, 0.16);
+
+  --glow-primary: 0 0 18px hsla(214, 100%, 66%, 0.22);
+  --glow-primary-intense: 0 0 26px hsla(214, 100%, 66%, 0.38), 0 0 52px hsla(214, 100%, 66%, 0.16);
+  --glow-secondary: 0 0 18px hsla(190, 95%, 60%, 0.22);
+  --glow-accent: 0 0 18px hsla(258, 90%, 72%, 0.22);
+
+  --text-primary: hsl(220, 25%, 96%);
+  --text-secondary: hsl(220, 14%, 68%);
+  --text-tertiary: hsl(220, 12%, 48%);
+  --text-disabled: hsl(220, 10%, 32%);
+
+  /* Legacy surface tokens kept working as aliases onto the material
+     tokens, so the ~40 existing components that reference them pick up
+     the Liquid Glass values without being touched.
+
+     --surface-glass points at the *well*, not at --lg-tint. It used to point
+     at the tint, which made every panel-sized consumer a light 16% film: a
+     pale patch sitting on the dark page, which is the one thing this theme is
+     not supposed to produce. Panels that are meant to be glass are promoted
+     explicitly, further down, where they also receive the blur. */
+  --surface-glass: var(--lg-well);
+  --surface-glass-hover: var(--lg-tint-hover);
+  --surface-glass-active: rgb(226, 236, 252, 0.32);
+  --surface-active: var(--lg-tint);
+  --surface-border: var(--lg-divider);
+  --surface-border-hover: var(--lg-rim);
+
+  --slider-shadow: 0 0 6px hsla(214, 100%, 66%, 0.3);
+  --slider-shadow-hover: 0 0 10px hsla(214, 100%, 66%, 0.45);
+
+  /* D6 — z-scale. The previous values were duplicated: the context menu
+     and the toast container both sat at 2000, so a toast could cover an
+     open menu. */
+  --z-substrate: 0;
+  --z-content: 1;
+  --z-rail: 50;
+  --z-chrome: 100;
+  --z-hit-catcher: 150;
+  --z-floating: 200;
+  --z-menu: 1000;
+  --z-scrim: 1100;
+  --z-sheet: 1400;
+  --z-toast: 2000;
+  --z-context-menu: 2100;
+  --z-tooltip: 3000;
+}
+
+/* ------------------------------------------------------------
+   Realistic liquid glass (opt-in: `data-lg-realistic`, off by default,
+   the iOS-style variant the owner asked for). Only the fill drops — the
+   material goes nearly clear so the backdrop and the content read through
+   the panels and the UI floats on top of the scene instead of resting on
+   a tinted plate. Blur, rim and depth stay: without them this stops being
+   glass and becomes a washed-out tint. Saturation rises a little because
+   a clear lens over colour carries more colour.
+
+   Specificity note: this selector is (0,2,0), one level above the plain
+   token block above — and so are the two fallback blocks further down
+   (reduced transparency, engines without backdrop-filter), matched with
+   `:is(...)`. Order then decides: the realistic values sit here, the
+   accessibility fallbacks later in the file, so asking the system for
+   opacity still wins even with realism enabled.
+   ------------------------------------------------------------ */
+[data-theme='lg'][data-lg-realistic='1'] {
+  --lg-fill: rgb(20, 24, 34, 0.30);
+  --lg-well: rgb(16, 20, 29, 0.60);
+  --lg-well-deep: rgb(10, 13, 20, 0.40);
+  --lg-sat: 1.34;
+}
+
+/* ------------------------------------------------------------
+   Stage 0 — substrate S-A
+   The field the glass actually refracts. Two sources only (D1): S1 is the
+   ambient glow migrated out of `.main-content::before` (it was declared
+   by the content layer it was supposed to sit behind, and only ever
+   reached the titlebar's right corner), S2 is a new vertical gradient
+   under the rail. Both are gradients on purpose — a flat fill cannot
+   produce a visible blur at any radius, so the substrate is the
+   mathematical precondition of the effect, not decoration.
+   ------------------------------------------------------------ */
+
+.lg-substrate {
+  display: none;
+}
+
+[data-theme='lg'] .lg-substrate {
+  display: block;
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-substrate);
+  pointer-events: none;
+  background: var(--lg-substrate-base);
+}
+
+/* Chosen animated backdrop. A child of the substrate so it covers the opaque
+   base rather than hiding behind it; the context is created with alpha off, so
+   nothing of the base shows through. The backing store is sized to the window
+   in CSS pixels and the element stretched to fit, so the canvas never needs
+   re-rasterising on resize — only a repaint. */
+.lg-wallpaper {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Lift the two light sources above the backdrop, so they keep layering their
+   gradient on top of whatever is painted underneath instead of under it. */
+[data-theme='lg'] .lg-substrate::before,
+[data-theme='lg'] .lg-substrate::after {
+  z-index: 1;
+}
+
+/* S1 — migrated ambient */
+[data-theme='lg'] .lg-substrate::before {
+  content: '';
+  position: absolute;
+  top: -200px;
+  right: -200px;
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(circle, var(--lg-ambient) 0%, transparent 70%);
+}
+
+/* S2 — vertical gradient under the rail.
+   Owner: the strip must show only on the instances tab ("Сборки") — on the
+   other tabs it reads as a light stain over the raw wallpaper. Hidden by
+   default; App.tsx mirrors the active page as html[data-page]. The modpacks
+   overlay reuses the instances page underneath it, so the strip is gated off
+   while it is open (owner: "светлая полоска слева... в модпаках, но её там
+   быть не должно" — HomeLayout mirrors the overlay as html[data-modpacks-open]). */
+[data-theme='lg'] .lg-substrate::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 280px;
+  display: none;
+  background: linear-gradient(180deg, var(--lg-rail-top) 0%, var(--lg-rail-bottom) 100%);
+}
+
+[data-theme='lg'][data-page='instances']:not([data-modpacks-open]) .lg-substrate::after {
+  display: block;
+}
+
+/* Two soft light fields drifting over the backdrop.
+   Why they exist: the procedural scenes paint a mostly dark, fairly even field,
+   and a 22px blur of an even field is still an even field - the glass then
+   reads as a dark flat panel, because there is nothing behind it for the blur
+   to smear and nothing for saturate() to pick up. These give the material two
+   slow-moving luminous patches to refract, on every backdrop setting including
+   "no wallpaper".
+
+   Cost: soft-stop radial gradients (no blur filter, no noise layer), moved only
+   by transform so the compositor never re-rasterises them; screen blend,
+   contained by the substrate's stacking context so nothing bleeds into the app.
+   Paused by `.app-frozen *` along with the rest of the chrome, and stopped
+   under prefers-reduced-motion. No grain: there is no banding problem here,
+   and visible noise would read as dirt on the glass. */
+[data-theme='lg'] .lg-glow {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+  mix-blend-mode: screen;
+}
+
+[data-theme='lg'] .lg-glow__orb {
+  position: absolute;
+  width: 72vmax;
+  height: 72vmax;
+  border-radius: 50%;
+  will-change: transform;
+  animation: lg-orb-drift 90s ease-in-out infinite alternate;
+}
+
+[data-theme='lg'] .lg-glow__orb--a {
+  top: -30%;
+  left: -18%;
+  background: radial-gradient(closest-side, hsla(214, 100%, 66%, 0.30) 0%, hsla(214, 100%, 66%, 0) 70%);
+}
+
+[data-theme='lg'] .lg-glow__orb--b {
+  right: -24%;
+  bottom: -34%;
+  background: radial-gradient(closest-side, hsla(186, 95%, 55%, 0.24) 0%, hsla(186, 95%, 55%, 0) 70%);
+  animation-duration: 130s;
+  animation-direction: alternate-reverse;
+}
+
+@keyframes lg-orb-drift {
+  from {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  to {
+    transform: translate3d(16vw, 12vh, 0) scale(1.18);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme='lg'] .lg-glow__orb {
+    animation: none;
+  }
+}
+
+/* ------------------------------------------------------------
+   Stage 2 — accessibility fallback
+   Tier 2 (above) is the target. Tier 1 drops the blur and raises the
+   fill to near-opaque, keeping the rim and the depth shadow: no blur
+   means no lensing, so the material has to read as a solid surface
+   instead. Tier 0 drops the material entirely.
+   ------------------------------------------------------------ */
+
+@media (prefers-reduced-transparency: reduce) {
+  /* `:is(...)` raises this to the realistic modifier's specificity so that
+     the accessibility fallback still wins on order (this block is later). */
+  :is([data-theme='lg'], [data-theme='lg'][data-lg-realistic='1']) {
+      --lg-fill: rgb(34, 39, 51, 0.97);
+      --lg-well: rgb(30, 35, 46, 0.97);
+      --lg-well-deep: rgb(24, 28, 38, 0.97);
+      --lg-tint: rgb(226, 236, 252, 0.10);
+    --lg-tint-hover: rgb(226, 236, 252, 0.16);
+    --lg-rim: rgb(238, 246, 255, 0.22);
+    --lg-specular: none;
+    --lg-depth-shadow: 0 6px 18px rgb(6, 8, 14, 0.5);
+  }
+
+    [data-theme='lg'] :is(.titlebar, .sidebar, .modal, .custom-select__list, .ctx-menu, .toast, .tooltip-bubble,
+      .instance-card, .modpack-card, .modpack-detail-panel, .modpacks-overlay__bar,
+      .selection-bar, .game-logs-picker-panel, .floating-menu, .floating-menu .btn--ghost,
+      .game-logs-picker-trigger,
+      .glass-card, .empty-state, .instance-list, .tabs__indicator,
+      .install-overlay__sheet, .content-detail-panel,
+      .settings-section, .log-container,
+      .content-manager__pane, .content-manager__pane .btn--ghost, .content-actions .btn--ghost,
+      .btn--secondary, .btn--danger, .segmented, .input, .search-bar,
+      .settings-save-fab) {
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+    }
+  }
+
+  @supports not (backdrop-filter: blur(1px)) {
+  :is([data-theme='lg'], [data-theme='lg'][data-lg-realistic='1']) {
+      --lg-fill: hsl(228, 20%, 16%);
+      --lg-well: hsl(228, 22%, 13%);
+      --lg-well-deep: hsl(228, 24%, 11%);
+      --lg-tint: rgb(226, 236, 252, 0.07);
+    --lg-rim: var(--lg-divider);
+    --lg-specular: none;
+    --lg-depth-shadow: none;
+  }
+
+    [data-theme='lg'] :is(.titlebar, .sidebar, .modal, .custom-select__list, .ctx-menu, .toast, .tooltip-bubble,
+      .instance-card, .modpack-card, .modpack-detail-panel, .modpacks-overlay__bar,
+      .selection-bar, .game-logs-picker-panel, .floating-menu, .floating-menu .btn--ghost,
+      .game-logs-picker-trigger,
+      .glass-card, .empty-state, .instance-list, .tabs__indicator,
+      .install-overlay__sheet, .content-detail-panel,
+      .settings-section, .log-container,
+      .content-manager__pane, .content-manager__pane .btn--ghost, .content-actions .btn--ghost,
+      .btn--secondary, .btn--danger, .segmented, .input, .search-bar,
+      .settings-save-fab) {
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
+    }
+  }
+
+/* ------------------------------------------------------------
+   Stage 3 — sampling groups
+   Group A: titlebar + sidebar. They sit outside the content scroller, so
+   their blur is sampled once and never invalidated by content scrolling.
+   Group B: surfaces that move over content (menus, toasts, tooltips) and
+   therefore each re-sample on their own.
+   Both groups use the same material values; only the sampling differs.
+   ------------------------------------------------------------ */
+
+/* ------------------------------------------------------------
+   The content area is deliberately NOT a material. Empty space must show the
+   backdrop raw: a fill plus blur(20px) here would sit between the wallpaper and
+   every element above it, absorbing the effect and leaving the glass surfaces
+   with a flat, already-blurred backdrop to sample - and it turns the wallpapers
+   into grey mush, which is what they are for. Blur belongs to the elements that
+   are made of glass, and nowhere else. (A dedicated `.lg-content-glass` layer
+   over the pane was built and then removed on the owner's order, 29.09.2026.)
+
+   S1 was *transferred* to the substrate, which exists to feed the shell (D1) -
+   the ambient must not be duplicated here. */
+[data-theme='lg'] .main-content {
+  background: transparent;
+}
+
+[data-theme='lg'] .main-content::before {
+  content: none;
+}
+
+/* No depth shadow here: both surfaces sit flush against a window edge
+   (titlebar top: 0, sidebar left: 0), so a drop shadow is cast inward onto
+   the content and reads as a smudge rather than depth. The rim defines the
+   edge; `--lg-depth-shadow` stays on the detached layers further down. */
+  [data-theme='lg'] .titlebar,
+  [data-theme='lg'] .sidebar {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    border-color: var(--lg-divider);
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth);
+  }
+
+[data-theme='lg'] .titlebar {
+  z-index: var(--z-chrome);
+  /* Specular: the light that grazes the top edge of the window. */
+  position: relative;
+}
+
+[data-theme='lg'] .titlebar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--lg-specular);
+  pointer-events: none;
+}
+
+[data-theme='lg'] .sidebar {
+  z-index: var(--z-rail);
+}
+
+/* ---------------------------------------------------------------------------
+   Which surfaces are glass, and which are not.
+
+   The rule the theme follows: a surface is glass when it is a thing the app
+   made - a rail, a card, a panel, a menu - and it is left alone when the pixels
+   belong to something the app did not make: artwork, icons, logos, and text
+   that has to stay crisp. Empty space is not a surface at all; it shows the
+   backdrop raw, so the wallpapers keep their purpose.
+
+   Promoted to the full material (fill + blur + rim). These sit on the raw
+   backdrop, so there is only the deliberate two-level stack where a surface
+   lives inside another (panes → rows, sections → nothing):
+
+      .instance-card          a build card on the home screen
+      .modpack-card           a row in the builds tab list
+      .modpack-detail-panel   the builds tab detail column
+      .modpacks-overlay__bar  the builds tab top bar
+      .selection-bar          the floating action bar above the content browser
+      .game-logs-picker-panel a floating picker over a page
+       .settings-section       a section of the settings page (owner pass:
+                               glassed, but keeps the sunken showcase reading
+                               - --lg-sunk + blur is the "cut glass" variant)
+       .log-container          the log tray (glassed, sunken)
+       .content-manager__pane the builds tab middle tray (owner pass
+                              05.10.2026, second correction: ONE glass surface;
+                              worlds/screenshots roots share the class so those
+                              sections carry the material too)
+
+   Deliberately NOT glass:
+
+      .instance-card__banner / __icon, .modpack-card__icon
+         Artwork. A blur across someone's pack icon or banner is the fastest way
+         to make the whole effect look cheap, and the icon is the one element
+         the eye reads as an identity rather than as chrome. They keep their own
+         opaque fills and are left sitting on the glass card.
+      .console, .md-content pre, .progress
+         Text and code. A blurred, animated backdrop under running text is a
+         legibility problem, not a feature, and a progress track has to read as
+         a track.
+       .settings-section .glass-card, .version-list,
+       .instance-list .empty-state
+          Wells: they live INSIDE an already-glassed surface (section, pane,
+          modal, column), so their blur would stack on blur with nothing behind
+          it left to refract - they carry the recessed reading instead.
+       .content-list-row (owner pass 05.10.2026, second correction):
+          A list is a table, not a stack of tiles - with a hundred mods each
+          carrying its own blur tile the screen read as noise ("просто куча
+          плашек со странным размытием"). Rows keep only the base zebra and
+          selection films on top of the pane's glass.
+       .content-actions (the builds tab install column):
+          Its edge and empty area stay raw over the backdrop; the buttons in
+          it are promoted below, so the column is chrome around glassed
+          controls rather than a second pane.
+      .settings-row, .experimental-block
+         They live inside a section. A second surface there would stack, so a
+         row is separated by its hover tint and the section's own edge.
+      Accent CTAs (.btn--primary / .btn--play), badges, toggles
+         (owner pass 3, 04.10.2026): the CTA's opaque accent gradient IS its
+         identity - making it clear would cost the one button that must be
+         found at a glance; a 16px badge pill has nothing to refract; toggles
+         were already transparent films. The controls that DID read as dark
+         chips against the clear panels - secondary/danger buttons, segmented,
+         inputs, search, the save chip - were promoted to the material on the
+         same pass ("сделать побольше всяких кнопок прозрачными, чтобы не
+         выбивались из фона"), see Stage 4; ghost buttons inside the builds
+         tray and install column joined them on the 05.10.2026 correction
+         pass.
+   --------------------------------------------------------------------------- */
+  [data-theme='lg'] :is(
+      .instance-card,
+      .modpack-card,
+      .modpack-detail-panel,
+      .modpacks-overlay__bar,
+      .selection-bar,
+      .game-logs-picker-panel
+    ) {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    border-color: var(--lg-divider);
+    /* Rim + inner depth + drop shadow: a card sits ON the backdrop rather than
+       flush with a window edge, so unlike the rail it needs the shadow to read
+       as a separate layer floating above the field. */
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+  }
+
+  /* Sections are the settings page's large surfaces: glassed on the owner
+     pass ("крупное — стекло"), but they keep the sunken showcase reading -
+     the sunk edge says "recessed", the blur says "material". Fill drops from
+     the 0.86 well to the 0.68 material so the backdrop reads through the
+     section instead of being buried. */
+  [data-theme='lg'] .settings-section {
+    padding: var(--space-lg);
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    border: 1px solid var(--lg-divider);
+    border-radius: var(--radius-lg);
+  }
+
+  /* The loader/version picker list floats inside a glass modal, where a fill
+     would stack glass on glass. It gets the recessed well instead. */
+  [data-theme='lg'] .version-list {
+    background: var(--lg-well-deep);
+    padding: var(--space-xs);
+    border-radius: var(--radius-md);
+  }
+
+  /* Shared rules that paint an opaque or light fill in the normal themes.
+     Restated here rather than edited at the source, so Neon / OLED / Blueprint /
+     Ember keep the behaviour they shipped with. */
+  [data-theme='lg'] .modpack-card:hover {
+    /* Tint, not --bg-tertiary: an opaque hover drops the card out of the
+       material for exactly as long as the pointer is over it. */
+    background: var(--surface-glass-hover);
+  }
+
+  [data-theme='lg'] .experimental-block {
+    /* Transparent: it only groups rows, and it lives inside a glass-welled
+       section. Filling it would put a second surface inside the first. */
+    background: transparent;
+  }
+
+  [data-theme='lg'] .instance-card:hover {
+    /* The normal hover replaces box-shadow outright, which would take the rim
+       off the glass for as long as the card is hovered. Rim + depth stay, the
+       accent glow goes on top of them. */
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow),
+      var(--shadow-lg), var(--glow-primary);
+  }
+
+  /* Bare text on the empty backdrop. With the backdrop raw behind it, white
+     text can pass over a bright animated patch; this is the cheapest fix that
+     does not cover the backdrop - a hairline dark halo, invisible on dark
+     ground and enough to hold the edge of a glyph over a moving highlight.
+     Applied at the content root so headings, subtitles and ghost buttons all
+     inherit it, and nothing outside the content pane is touched. */
+  [data-theme='lg'] .main-content {
+    text-shadow: 0 1px 2px rgb(0 0 0 / 0.5);
+  }
+
+/* The builds tab is a full-window overlay, so it has to be opened up by hand:
+   --bg-primary is the substrate base, which is opaque, and left alone it would
+   be the one tab that hides the backdrop completely. Transparent here: the
+   raw backdrop shows through it. */
+[data-theme='lg'] .modpacks-overlay {
+  background: transparent;
+}
+
+/* ...and the page behind it steps aside while the overlay is open: without
+   this the transparent overlay would read as the modpacks UI floating over
+   the builds tab (InstanceList/InstanceDetail show through). With the shell
+   hidden the raw wallpaper — the substrate the glass refracts — is the
+   backdrop the overlay actually sits on. Titlebar is outside .app-layout,
+   so it stays above; the overlay's own bar carries the back button.
+   The step-aside is ONE opacity fade of the whole shell (the create dialog
+   lives inside it and fades out together) — not a per-element pop — and
+   visibility lands only after the fade so nothing disappears early. */
+html[data-modpacks-open] .app-layout {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity var(--transition-normal), visibility 0s var(--transition-normal);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html[data-modpacks-open] .app-layout {
+    transition: none;
+  }
+}
+
+[data-theme='lg'] .sidebar {
+  z-index: var(--z-rail);
+}
+
+[data-theme='lg'] .sidebar__item--active {
+  background: var(--lg-tint);
+  box-shadow: var(--lg-rim-ring);
+}
+
+/* Recede state: while a game runs and the window is unfocused the shell
+   gets out of the way — opaque, no blur, no depth. */
+html[data-theme='lg'] body.app-frozen :is(.titlebar, .sidebar) {
+  background: var(--bg-secondary);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+}
+
+html[data-theme='lg'] body.app-frozen .titlebar::after {
+  display: none;
+}
+
+/* ------------------------------------------------------------
+   Stage 3, group B — surfaces that move over content
+   Every one of these moves over content, so each is its own sampling
+   group: exactly one re-samples, never the titlebar/sidebar group.
+   The open select list is portaled to <body> by CustomSelect.tsx —
+   an in-tree list would sample only its backdrop-filtered ancestor's
+   subtree (everything outside stays sharp) and sibling sections would
+   paint over it. As a body child its backdrop root is the document:
+   wallpaper, cards and text all blur behind it.
+   ------------------------------------------------------------ */
+
+  [data-theme='lg'] :is(.custom-select__list, .ctx-menu, .toast, .tooltip-bubble) {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    border-color: var(--lg-divider);
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+  }
+
+/* Tooltips are micro surfaces: they keep the compact radius instead of
+   adopting the floating-surface one. */
+[data-theme='lg'] :is(.custom-select__list, .ctx-menu, .toast) {
+  border-radius: var(--radius-lg);
+}
+
+[data-theme='lg'] .ctx-menu {
+  z-index: var(--z-context-menu);
+}
+
+[data-theme='lg'] .toast-container {
+  z-index: var(--z-toast);
+}
+
+[data-theme='lg'] .tooltip-bubble {
+  z-index: var(--z-tooltip);
+}
+
+[data-theme='lg'] .ctx-menu__item:hover:not(:disabled) {
+  background: var(--lg-tint);
+}
+
+/* ------------------------------------------------------------
+   Stage 3, group C — modal sheets
+   The scrim stays a fill with no backdrop-filter of its own: a scrim
+   that samples its own backdrop would sit behind a blurred sheet, and a
+   static fill makes the largest blur in the app the cheapest one.
+   ------------------------------------------------------------ */
+
+  [data-theme='lg'] .modal-overlay {
+    /* Radial spotlight, kept light: 0.22 at the centre to 0.32 at the edge.
+       The old 0.44-0.78 range was doing the sheet's job for it - it darkened
+       the backdrop so hard that the glass behind it had nothing left to show
+       and the dialog read as a panel floating on a black hole. The sheet now
+       carries itself on its own fill; the scrim only quiets the periphery so
+       the dialog separates. */
+    background: radial-gradient(128% 96% at 50% 42%,
+      rgb(6, 8, 13, 0.22) 0%,
+      rgb(4, 6, 11, 0.26) 46%,
+      rgb(2, 3, 6, 0.32) 100%);
+    z-index: var(--z-scrim);
+  }
+
+/* The bare variant is a deliberate "no scrim" case (Microsoft login card)
+   and must stay bare. */
+[data-theme='lg'] .modal-overlay--bare {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  animation: none;
+}
+
+  [data-theme='lg'] .modal {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    border-color: var(--lg-divider);
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+    position: relative;
+    z-index: var(--z-sheet);
+  }
+
+  /* Realistic glass, element part (token part sits at the top of the file).
+     Two adjustments that the clear fill alone would get wrong:
+
+     - The dialog keeps a denser floor than the panels. Modals carry forms
+       and full sentences over a page that may be as bright as the backdrop;
+       at panel transparency they are the first place text falls apart.
+       The floor is guarded by the two conditions under which the clear fill
+       is safe at all: reduced transparency (the system asked for opacity —
+       there the dialog falls back to the token and goes near-opaque) and
+       native backdrop-filter (without it there is no blur behind the dialog
+       either, and a translucent sheet over sharp content is unreadable).
+     - Text over the clearer material gets a slightly stronger halo — the
+       same hairline trick as the content root, with a soft second pass,
+       because the backdrop now reads through much more of what sits on it.
+       Specificity (0,3,0) beats the (0,2,0) rules above regardless of
+       position in the file. */
+  @media (prefers-reduced-transparency: no-preference) {
+    @supports (backdrop-filter: blur(1px)) {
+      [data-theme='lg'][data-lg-realistic='1'] .modal {
+        background: rgb(20, 24, 34, 0.45);
+      }
+    }
+  }
+
+  [data-theme='lg'][data-lg-realistic='1'] :is(.main-content, .sidebar, .titlebar) {
+    text-shadow: 0 1px 2px rgb(0 0 0 / 0.7), 0 0 10px rgb(0 0 0 / 0.3);
+  }
+
+/* ------------------------------------------------------------
+   Stage 3 — additions (29.09.2026): menus, plaques, page cards, chips
+
+   The same rule as above decides every line here: a surface is glass when
+   the app drew it and it sits on the raw backdrop; it is a well when it is
+   small, when it sits on something that is already opaque (a settings well,
+   a modal sheet), or when it lives inside glass. Nothing here stacks blur
+   on blur.
+
+   Group D — floating menus and the run-picker trigger. Same role as
+   .ctx-menu and .custom-select__list, which are already glass: a menu is
+   the archetypal app-drawn surface, and leaving one of them opaque gives
+   the app two materials for one job. The trigger sits in the log toolbar
+   over raw wallpaper, so its blur has something to refract.
+   ------------------------------------------------------------ */
+
+  [data-theme='lg'] :is(.floating-menu, .game-logs-picker-trigger) {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    border-color: var(--lg-divider);
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+  }
+
+/* The items inside (change banner / change icon) are ghost buttons: on the
+   glass panel their labels sat with no material under them — the owner asked
+   for the effect that works on text everywhere else. Each row gets the same
+   fill+blur the panel has; nested inside the menu the blur re-samples the
+   panel's own painted glass, so the text reads on a frosted row. */
+  [data-theme='lg'] .floating-menu .btn--ghost {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    box-shadow: var(--lg-rim-ring);
+  }
+
+  [data-theme='lg'] .floating-menu .btn--ghost:hover {
+    background: linear-gradient(var(--lg-tint-hover), var(--lg-tint-hover)), var(--lg-fill);
+  }
+
+/* Cards named glass: the Rooms panels, the Accounts card. Page-level, so
+   they sit directly on the backdrop. Hover keeps the material - the base
+   rule swaps the background to an opaque tone, which would take the glass
+   away exactly while the pointer is over the card. */
+  [data-theme='lg'] .glass-card {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    border-color: var(--lg-divider);
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+  }
+
+  [data-theme='lg'] .glass-card:hover {
+    background: var(--lg-fill);
+    border-color: var(--lg-rim);
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow),
+      var(--glow-primary);
+  }
+
+  [data-theme='lg'] .glass-card--selected,
+  [data-theme='lg'] .glass-card--selected:hover {
+    /* Accent ring, not a white film: selection has to read as "this one",
+       and the fill stays glass while it does. */
+    background: var(--lg-fill);
+    border-color: var(--primary) !important;
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow),
+      0 0 0 3px var(--primary-dim);
+  }
+
+/* Same class inside the settings well (Java/version pickers, account card,
+   about block): a second material inside the well would stack, and a blur
+   there would only sample an already flat fill. Recessed well instead. */
+  [data-theme='lg'] .settings-section .glass-card {
+    background: var(--lg-well-deep);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    box-shadow: none;
+    border-color: var(--lg-divider);
+  }
+
+/* The 260px instances column: a rail beside the rail, so it takes the rail
+   treatment (rim + inner depth, no drop shadow - it is flush against the
+   window top and bottom). Rows stay transparent and the icon tiles stay
+   wells; only the column itself is material. */
+  [data-theme='lg'] .instance-list {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth);
+  }
+
+/* Empty state: today it is an icon and two lines of text straight on the
+   wallpaper, which is the bare-text problem in its purest form. A plaque
+   gives that text the same ground every other surface has. */
+  [data-theme='lg'] .empty-state {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    border: 1px solid var(--lg-divider);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+  }
+
+/* The plaque inside the glass column sits on glass, so it drops to the
+   recessed well like every other surface that lives inside material. */
+  [data-theme='lg'] .instance-list .empty-state {
+    background: var(--lg-well-deep);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    box-shadow: none;
+  }
+
+/* The floating save FAB. Checked against its actual backdrop: in Settings
+   it hovers over the opaque settings wells, in the instance editor it
+   hovers over a modal sheet - never over raw wallpaper, so blur here would
+   be an expensive fill over flat colour. Chip with a rim and a shadow. */
+  [data-theme='lg'] .settings-save-fab {
+    padding: var(--space-xs);
+    background: var(--lg-well);
+    border: 1px solid var(--lg-divider);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--lg-rim-ring), var(--lg-depth-shadow);
+  }
+
+/* Chips without blur: small controls carry their material in the edge and
+   the tint, never in a radius too small for a blur to read. Applies
+   wherever the control sits - on wallpaper, inside a well, inside a sheet. */
+  [data-theme='lg'] :is(.btn--secondary, .segmented, .input) {
+    box-shadow: var(--lg-rim-ring);
+  }
+
+  [data-theme='lg'] .btn--ghost:hover {
+    box-shadow: var(--lg-rim-ring);
+  }
+
+/* The sliding indicator carries the glass: the pill itself travels between
+   the buttons with one backdrop root (the travel element never fades, so
+   the material is continuous) and the active label stays accent-coloured.
+   This replaces the static pill that popped in around the new tab. Active
+   tabs are the one small surface allowed to blur: there are one or two on a
+   screen, each large enough to show it. */
+  [data-theme='lg'] .tabs__indicator {
+    top: 4px;
+    bottom: 4px;
+    height: auto;
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    box-shadow: var(--lg-rim-ring);
+  }
+
+/* Vertical indicator in the create menu: the same glass pill, but it must
+   follow the button's measured height instead of the column's — top/bottom
+   offsets and the size both come from --tab-size / --tab-offset. */
+  [data-theme='lg'] .tabs--vertical .tabs__indicator {
+    left: 0;
+    right: 0;
+    width: auto;
+    top: 0;
+    bottom: auto;
+    height: calc(var(--tab-size, 0px) - 8px);
+    transform: translateY(calc(var(--tab-offset, 0px) + 4px));
+  }
+
+  /* Light frame inside dialogs: the same dark glass pill that reads light over
+     the bright page (terminal tab row) turns muddy navy over the dark modal
+     fill. A light tint film on dialog-scoped frames keeps the travel, blur and
+     rim but restores that light look on the dimmed backdrop. */
+  [data-theme='lg'] .modal .tabs__indicator {
+    background: rgba(255, 255, 255, 0.14);
+  }
+
+/* ------------------------------------------------------------
+   Stage 4 — buttons, wells, logs, install (29.09.2026)
+
+   Owner pass over the parts that still read as flat: the settings page,
+   the modpacks tab, and the buttons. The Stage 3 split is unchanged for
+   the small controls (raised glossy controls keep their accent core and
+   gain the full edge reading); the large surfaces - sections, trays, the
+   log panel, list rows - were then promoted to glass with a sunken edge on
+   the second owner pass ("крупное — стекло"). Empty space stays raw
+   backdrop. Third pass (04.10.2026, "сделать побольше всяких кнопок
+   прозрачными"): secondary/danger buttons, segmented, inputs, search and
+   the save chip now carry the material itself - fill + blur - so they stop
+   reading as dark chips against the clear panels; measured load left ample
+   headroom (0.1-0.5% CPU peak on the owner's rig).
+   ------------------------------------------------------------ */
+
+/* --- Base styles moved out of inline, so the lg block can reach them.
+       Normal themes keep the exact same rendering. --- */
+
+.log-container {
+  background: var(--bg-primary);
+}
+
+.progress-track {
+  height: 6px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+}
+
+.content-list-row {
+  background: var(--bg-secondary);
+}
+
+/* Table idiom (content manager): flush rows over the pane, zebra and
+   selection as classes - moved out of the component's inline styles so the
+   lg block can paint its material over them. Normal themes render the exact
+   values the inline styles used to set. */
+.content-list-row--table {
+  background: transparent;
+}
+
+.content-list-row--alt {
+  background: hsla(0, 0%, 100%, 0.02);
+}
+
+.content-list-row--selected {
+  background: var(--primary-dim);
+}
+
+.content-list-row--added {
+  background: hsla(150, 60%, 50%, 0.08);
+}
+
+.content-detail-panel {
+  background: var(--bg-secondary);
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-lg);
+}
+
+.content-table-head {
+  background: var(--bg-primary);
+}
+
+/* The install overlay used to be two inline style objects: a 0.7 scrim with
+   blur(12px) and an opaque sheet - both outside the lg material system.
+   Classed here; normal themes render exactly as before. */
+.install-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1500;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.install-overlay__sheet {
+  background: var(--bg-secondary);
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-3xl);
+  width: 90%;
+  max-width: 480px;
+  box-shadow: var(--shadow-xl);
+}
+
+/* --- Raised glossy controls: accent core stays, edge reading is added. --- */
+
+[data-theme='lg'] .btn--primary {
+  box-shadow: var(--glow-primary), var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+}
+
+[data-theme='lg'] .btn--primary:hover {
+  box-shadow: var(--glow-primary-intense), var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+}
+
+[data-theme='lg'] .btn--play {
+  box-shadow: var(--glow-primary-intense), var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+}
+
+[data-theme='lg'] .btn--secondary {
+  box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+}
+
+[data-theme='lg'] .btn--danger {
+  box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+}
+
+[data-theme='lg'] .toggle__slider {
+  box-shadow: var(--lg-rim-ring), var(--lg-depth-shadow);
+}
+
+[data-theme='lg'] .toggle input:checked + .toggle__slider {
+  box-shadow: var(--glow-primary), var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+}
+
+[data-theme='lg'] .experimental-badge {
+  box-shadow: var(--lg-rim-ring);
+}
+
+/* --- Owner pass 3 (04.10.2026): "сделать побольше всяких кнопок
+       прозрачными, чтобы не выбивались из фона". The secondary controls
+       were dark chips against clear panels; they now carry the material
+       itself (--lg-fill + blur), rim and depth unchanged, so in either
+       material mode they read as part of the same glass instead of a
+       sticker on top of it. Hover/press films layer OVER the fill (a film
+       cannot be a non-final background layer). Accent CTAs keep their
+       opaque gradient - see the taxonomy comment above. --- */
+
+[data-theme='lg'] :is(.btn--secondary, .btn--danger, .segmented, .input, .search-bar, .settings-save-fab) {
+  background: var(--lg-fill);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+}
+
+[data-theme='lg'] .btn--secondary:hover {
+  background: linear-gradient(var(--lg-tint-hover), var(--lg-tint-hover)), var(--lg-fill);
+}
+
+[data-theme='lg'] .btn--danger {
+  background: linear-gradient(var(--danger-bg), var(--danger-bg)), var(--lg-fill);
+}
+
+[data-theme='lg'] .btn--danger:hover {
+  background: linear-gradient(var(--danger-bg-hover), var(--danger-bg-hover)), var(--lg-fill);
+}
+
+/* --- Wells cut into the material: sections and their inner cards. --- */
+
+[data-theme='lg'] .settings-section {
+  box-shadow: var(--lg-sunk), var(--lg-depth-shadow);
+}
+
+[data-theme='lg'] .settings-section .glass-card {
+  box-shadow: var(--lg-sunk);
+}
+
+/* The search bar is the same well as .input and gets the same edge. The
+   focus rules restore the dim/danger rings that the unconditional lg
+   box-shadows would otherwise paint over (base rules are earlier in the
+   file, so specificity ties go to the lg block). */
+
+[data-theme='lg'] .search-bar {
+  box-shadow: var(--lg-rim-ring);
+}
+
+[data-theme='lg'] .search-bar:focus-within {
+  box-shadow: var(--lg-rim-ring), 0 0 0 3px var(--primary-dim);
+  border-color: var(--primary);
+}
+
+[data-theme='lg'] .input:focus {
+  box-shadow: var(--lg-rim-ring), 0 0 0 3px var(--primary-dim);
+}
+
+/* The catalog search field sits INSIDE the already-glassed .search-bar; the
+   generic .input rule above would paint a second glass pill inside the bar -
+   the dark inset the owner saw ("внутри обычной светлой кнопки... есть
+   маленькая темная"). The bar is the well: the field stays clear, the bar's
+   own edge frames it. Placed after the focus rules so it also wins the tie
+   on focus (the bar's :focus-within ring is the feedback, not a second ring). */
+[data-theme='lg'] .search-bar .input {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='lg'] :is(.input--error, .input--error:focus) {
+  box-shadow: var(--lg-rim-ring), 0 0 0 3px var(--danger-dim, rgba(244, 67, 54, 0.12));
+}
+
+/* --- The log tray. Owner pass: "крупное — стекло" overrode the earlier
+       "no blur under running text" rule - the tray is a large surface, the
+       fill drops to the material so the field reads through, and the sunk
+       edge keeps it cut into the pane rather than floating on it. --- */
+
+[data-theme='lg'] .log-container {
+  background: var(--lg-fill);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  border: 1px solid var(--lg-divider);
+  box-shadow: var(--lg-sunk);
+}
+
+/* --- Modpacks tab / content screens. --- */
+
+[data-theme='lg'] .progress-track {
+  background: var(--lg-well);
+}
+
+/* List rows are deliberately NOT glass (owner pass 05.10.2026, second
+   correction: "список модов... просто куча плашек со странным размытием"):
+   a hundred blur tiles stacked with 1px gaps read as noise, not material.
+   Rows stay flat on the pane's glass - the base zebra/selection films only
+   - so a long list reads as a table cut into the tray. */
+
+[data-theme='lg'] .content-detail-panel {
+  background: var(--lg-fill);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  border-color: var(--lg-divider);
+  box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+}
+
+/* Owner pass 05.10.2026, second correction: the big middle tray returns to
+   glass - it is ONE surface, and the worlds/screenshots sections carry the
+   same material now (their roots use this class), which is what the owner
+   asked for ("ты не добавил liquid glass эффект в раздел с мирами и
+   скриншотами"). Inside the tray everything stays flat: rows are a table on
+   glass, not a stack of tiles. The install column keeps its raw edge; only
+   its controls are glassed below. Sunk edge reads as the tray cut into the
+   frame rather than a sheet floating on the wallpaper. */
+
+[data-theme='lg'] .content-manager__pane {
+  background: var(--lg-fill);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  box-shadow: var(--lg-sunk);
+}
+
+/* The ghost controls in the tray and the install column get the material
+   ("добавить файл / проверить обновления / обновить / открыть папку — в
+   стиле liquid glass"): fill + blur + rim, the same treatment the floating
+   menu rows already carry (see the ghost note above the menu rules). */
+  [data-theme='lg'] :is(.content-manager__pane, .content-actions) .btn--ghost {
+    background: var(--lg-fill);
+    backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+    box-shadow: var(--lg-rim-ring);
+  }
+
+  [data-theme='lg'] :is(.content-manager__pane, .content-actions) .btn--ghost:hover {
+    background: linear-gradient(var(--lg-tint-hover), var(--lg-tint-hover)), var(--lg-fill);
+  }
+
+[data-theme='lg'] .content-table-head {
+  background: transparent;
+  border-bottom-color: var(--lg-divider);
+}
+
+/* --- Install overlay: same spotlight scrim as the modal, same glass
+       sheet. The base0.7 fill + blur(12px) was heavier than the sheet
+       and did the dialog's job for it. --- */
+
+[data-theme='lg'] .install-overlay {
+  background: radial-gradient(128% 96% at 50% 42%,
+    rgb(6, 8, 13, 0.22) 0%,
+    rgb(4, 6, 11, 0.26) 46%,
+    rgb(2, 3, 6, 0.32) 100%);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+[data-theme='lg'] .install-overlay__sheet {
+  background: var(--lg-fill);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  border-color: var(--lg-divider);
+  box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
 }

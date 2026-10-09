@@ -29,6 +29,7 @@ export function Home({ onNavigate }: HomeProps) {
   const selectInstance = useInstanceStore((s) => s.selectInstance);
 
   const [menuInstance, setMenuInstance] = useState<string | null>(null);
+  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [bannerPickerFor, setBannerPickerFor] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
@@ -40,10 +41,13 @@ export function Home({ onNavigate }: HomeProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Close icon menu on outside click
+  // Close icon menu on outside click. The icon itself is skipped: its own
+  // click toggles the menu, and closing on mousedown would leave a null state
+  // by the time the click arrives, so the icon would reopen it right away.
   useEffect(() => {
     if (!menuInstance) return;
     const handler = (e: MouseEvent) => {
+      if ((e.target as HTMLElement).closest?.('.instance-card__icon')) return;
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuInstance(null);
       }
@@ -132,7 +136,7 @@ export function Home({ onNavigate }: HomeProps) {
   };
 
   return (
-    <div className="page animate-fade-in" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xl)' }}>
+    <div className="page" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xl)' }}>
       {/* Top bar: greeting + quick play */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-lg)' }}>
         {defaultAccount?.account_type === 'Offline' ? (
@@ -223,11 +227,10 @@ export function Home({ onNavigate }: HomeProps) {
           </div>
         ) : (
           <div className="instance-grid">
-            {instances.map((inst, i) => (
+            {instances.map((inst) => (
               <div
                 key={inst.name}
-                className="instance-card stagger-in"
-                style={{ animationDelay: `${Math.min(i, 9) * 24}ms` }}
+                className="instance-card"
                 onClick={() => useBrowserGuardStore.getState().askLeave(() => {
                   selectInstance(inst.name);
                   onNavigate('instances');
@@ -277,6 +280,16 @@ export function Home({ onNavigate }: HomeProps) {
                   <div className="instance-card__icon icon-editable" style={{ position: 'relative', cursor: 'pointer' }}
                     onClick={(e) => {
                       e.stopPropagation();
+                      if (menuInstance !== inst.name) {
+                        // Capture the card's viewport rect: the menu is portaled
+                        // to <body> (a child of the glass card would sample only
+                        // the card's backdrop root and miss the card/text), so it
+                        // needs fixed coordinates kept identical to the old
+                        // absolute (top 148, left 16) placement inside the card.
+                        const card = (e.currentTarget as HTMLElement).closest('.instance-card') as HTMLElement | null;
+                        const r = card?.getBoundingClientRect();
+                        setMenuPos(r ? { top: r.top + 148, left: r.left + 16 } : null);
+                      }
                       setMenuInstance(menuInstance === inst.name ? null : inst.name);
                       setBannerPickerFor(null);
                     }}>
@@ -321,21 +334,19 @@ export function Home({ onNavigate }: HomeProps) {
                   </button>
                 </div>
 
-                {/* Icon context menu */}
-                {menuInstance === inst.name && !bannerPickerFor && (
+                {/* Icon context menu — shared floating-menu surface (lg: glass).
+                    Portaled to <body>: inside the glass card the menu would be
+                    trapped in the card's backdrop root and blur only the
+                    wallpaper, not the card, its text and everything beneath it. */}
+                {menuInstance === inst.name && !bannerPickerFor && createPortal(
                   <div
                     ref={menuRef}
+                    className="floating-menu"
                     style={{
-                      position: 'absolute',
-                      top: 148,
-                      left: 16,
+                      position: 'fixed',
+                      top: menuPos?.top ?? 148,
+                      left: menuPos?.left ?? 16,
                       zIndex: 100,
-                      background: 'var(--bg-elevated)',
-                      border: '1px solid var(--surface-border)',
-                      borderRadius: 'var(--radius-md)',
-                      boxShadow: 'var(--shadow-lg)',
-                      padding: 'var(--space-xs)',
-                      minWidth: 180,
                     }}
                     onClick={(e) => e.stopPropagation()}
                   >
@@ -355,7 +366,8 @@ export function Home({ onNavigate }: HomeProps) {
                       <Upload size={16} />
                       {t('home.change_icon')}
                     </button>
-                  </div>
+                  </div>,
+                  document.body
                 )}
 
                 {/* Banner preset picker */}
@@ -372,12 +384,8 @@ export function Home({ onNavigate }: HomeProps) {
                   >
                     <div
                       ref={pickerRef}
+                      className="floating-menu floating-menu--picker"
                       style={{
-                        background: 'var(--bg-elevated)',
-                        border: '1px solid var(--surface-border)',
-                        borderRadius: 'var(--radius-md)',
-                        boxShadow: 'var(--shadow-lg)',
-                        padding: 'var(--space-md)',
                         width: 300,
                         maxWidth: '90vw',
                       }}

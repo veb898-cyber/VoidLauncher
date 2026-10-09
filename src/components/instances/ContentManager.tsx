@@ -2,8 +2,9 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, X, AlertTriangle } from 'lucide-react';
+import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, AlertTriangle } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { Modal } from '../ui/Modal';
 import { Tooltip } from '../ui/Tooltip';
 import { addToast } from '../ui/Toast';
 import { ContentBrowser, type ContentType } from './ContentBrowser';
@@ -124,14 +125,13 @@ const ContentRow = memo(function ContentRow({
   const t = useT();
   return (
     <div
-      className="content-list-row"
+      className={`content-list-row content-list-row--table${idx % 2 === 1 ? ' content-list-row--alt' : ''}${isSelected ? ' content-list-row--selected' : ''}`}
       onClick={(e) => onRowClick(item.filename, e)}
       onContextMenu={(e) => { e.preventDefault(); onContext(e, item.filename); }}
       style={{
         display: 'grid', gridTemplateColumns: '28px 36px 1fr 1fr 80px 28px',
         padding: '4px var(--space-2xl)', alignItems: 'center', cursor: 'pointer',
         borderBottom: '1px solid var(--surface-border)',
-        background: isSelected ? 'var(--primary-dim)' : idx % 2 === 0 ? 'transparent' : 'hsla(0, 0%, 100%, 0.02)',
         opacity: item.enabled ? 1 : 0.45,
         transition: 'background 0.12s',
         minHeight: 36,
@@ -221,6 +221,14 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     mod: t('content.type_mod'),
     resourcepack: t('content.type_resourcepack'),
     shader: t('content.type_shader'),
+  };
+
+  // Field-level placeholders say what THIS section searches (owner pass:
+  // a bare "Поиск" does not tell mods from shaders).
+  const SEARCH_PLACEHOLDERS: Record<ContentType, string> = {
+    mod: t('content.search_placeholder_mod'),
+    resourcepack: t('content.search_placeholder_resourcepack'),
+    shader: t('content.search_placeholder_shader'),
   };
 
   const label = TYPE_LABELS[contentType];
@@ -817,7 +825,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   return (
     <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
       {/* Main table */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <div className="content-manager__pane" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {/* Header */}
         <div style={{ padding: 'var(--space-md) var(--space-2xl)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', borderBottom: '1px solid var(--surface-border)', flexShrink: 0 }}>
           <h2 style={{ fontSize: 'var(--font-size-lg)', fontWeight: 600, margin: 0, flex: 1 }}>
@@ -826,11 +834,11 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         </div>
 
         {/* Table header */}
-        <div style={{
+        <div className="content-table-head" style={{
                     display: 'grid', gridTemplateColumns: '28px 36px 1fr 1fr 80px 28px',
           padding: '6px var(--space-2xl)', borderBottom: '1px solid var(--surface-border)',
           fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--text-tertiary)',
-          background: 'var(--bg-primary)', flexShrink: 0,
+          flexShrink: 0,
         }}>
           <div style={{ textAlign: 'center' }}>{t('manager.column_on')}</div>
           <div></div>
@@ -883,10 +891,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         {/* Bottom bar */}
         <div style={{ padding: '6px var(--space-2xl)', borderTop: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
           <div style={{ position: 'relative', flex: 1, maxWidth: 300 }}>
-            <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
+            <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)', zIndex: 1, pointerEvents: 'none' }} />
             <input className="input" type="text" value={search} onChange={(e) => setSearch(e.target.value)}
-              placeholder={t('common.search')}
-              aria-label={t('common.search')}
+              placeholder={SEARCH_PLACEHOLDERS[contentType]}
+              aria-label={SEARCH_PLACEHOLDERS[contentType]}
               style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
           </div>
           {hasSelection && (
@@ -902,7 +910,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       </div>
 
       {/* Right actions panel */}
-      <div style={{ width: 200, flexShrink: 0, borderLeft: '1px solid var(--surface-border)', padding: 'var(--space-md)', display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
+      <div className="content-actions" style={{ width: 200, flexShrink: 0, borderLeft: '1px solid var(--surface-border)', padding: 'var(--space-md)', display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
         <Button size="sm" variant="secondary" onClick={() => setShowBrowser(true)} style={{ width: '100%', whiteSpace: 'normal' }}>
           <Download size={14} style={{ flexShrink: 0 }} /> {t('common.download')} {label.toLowerCase()}
         </Button>
@@ -963,51 +971,52 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         );
       })()}
 
-      {/* Update Dialog */}
-      {updates && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
-          <div style={{ padding: 'var(--space-xl)', maxWidth: 600, width: '90%', maxHeight: '70vh', display: 'flex', flexDirection: 'column', background: 'var(--bg-primary)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-lg)', boxShadow: '0 8px 32px rgba(0,0,0,0.4)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-md)' }}>
-              <h3 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700 }}>{t('manager.updates_title', { count: updates.length.toString() })}</h3>
-              <X size={16} style={{ cursor: 'pointer', color: 'var(--text-tertiary)' }} onClick={() => setUpdates(null)} />
-            </div>
-            <div style={{ flex: 1, overflowY: 'auto', marginBottom: 'var(--space-md)' }}>
-              {updates.map((u, i) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', padding: '8px 12px', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', marginBottom: 4 }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{u.name}</div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 2 }}>
-                      <span style={{ textDecoration: 'line-through', opacity: 0.6 }}>{u.oldVersion}</span>
-                      <ArrowRight size={10} color="var(--success)" />
-                      <span style={{ color: 'var(--success)', fontWeight: 500 }}>{u.newVersion}</span>
-                    </div>
-                  </div>
-                  <Button size="sm" onClick={() => handleApplyUpdate(u)} disabled={downloadingMods.has(u.filename)} style={{ flexShrink: 0 }}>
-                    {downloadingMods.has(u.filename) ? '...' : t('common.update')}
-                  </Button>
-                </div>
-              ))}
-            </div>
-            {updateProgress && (
-              <div style={{ marginBottom: 'var(--space-md)' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 4 }}>
-                  <span>{t('manager.updating_progress', { current: updateProgress.current.toString(), total: updateProgress.total.toString() })}</span>
-                  <span>{Math.round((updateProgress.current / updateProgress.total) * 100)}%</span>
-                </div>
-                <div style={{ height: 6, background: 'var(--bg-secondary)', borderRadius: 3, overflow: 'hidden' }}>
-                  <div style={{ height: '100%', width: `${(updateProgress.current / updateProgress.total) * 100}%`, background: 'var(--primary)', borderRadius: 3, transition: 'width 0.3s ease' }} />
+      {/* Update Dialog — shared modal (lg: scrim + glass sheet). Closing by
+          overlay/Escape behaves like the old header ✕; the footer cancel
+          stays disabled while the batch is running. */}
+      <Modal
+        open={!!updates}
+        onClose={() => setUpdates(null)}
+        title={updates ? t('manager.updates_title', { count: updates.length.toString() }) : ''}
+        maxWidth={600}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+            <Button variant="ghost" onClick={() => setUpdates(null)} disabled={!!updateProgress} style={{ opacity: updateProgress ? 0.5 : 1 }}>{t('common.cancel')}</Button>
+            <Button onClick={handleApplyAllUpdates} disabled={!!updateProgress}>
+              {updateProgress ? '...' : t('manager.update_all', { count: (updates?.length ?? 0).toString() })}
+            </Button>
+          </div>
+        }
+      >
+        <div style={{ overflowY: 'auto', marginBottom: 'var(--space-md)' }}>
+          {(updates ?? []).map((u, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', padding: '8px 12px', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', marginBottom: 4 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{u.name}</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 2 }}>
+                  <span style={{ textDecoration: 'line-through', opacity: 0.6 }}>{u.oldVersion}</span>
+                  <ArrowRight size={10} color="var(--success)" />
+                  <span style={{ color: 'var(--success)', fontWeight: 500 }}>{u.newVersion}</span>
                 </div>
               </div>
-            )}
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-              <Button variant="ghost" onClick={() => setUpdates(null)} disabled={!!updateProgress} style={{ opacity: updateProgress ? 0.5 : 1 }}>{t('common.cancel')}</Button>
-              <Button onClick={handleApplyAllUpdates} disabled={!!updateProgress}>
-                {updateProgress ? '...' : t('manager.update_all', { count: updates.length.toString() })}
+              <Button size="sm" onClick={() => handleApplyUpdate(u)} disabled={downloadingMods.has(u.filename)} style={{ flexShrink: 0 }}>
+                {downloadingMods.has(u.filename) ? '...' : t('common.update')}
               </Button>
             </div>
-          </div>
+          ))}
         </div>
-      )}
+        {updateProgress && (
+          <div style={{ marginBottom: 'var(--space-md)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 4 }}>
+              <span>{t('manager.updating_progress', { current: updateProgress.current.toString(), total: updateProgress.total.toString() })}</span>
+              <span>{Math.round((updateProgress.current / updateProgress.total) * 100)}%</span>
+            </div>
+            <div style={{ height: 6, background: 'var(--bg-secondary)', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${(updateProgress.current / updateProgress.total) * 100}%`, background: 'var(--primary)', borderRadius: 3, transition: 'width 0.3s ease' }} />
+            </div>
+          </div>
+        )}
+      </Modal>
     </div>
   );
 }

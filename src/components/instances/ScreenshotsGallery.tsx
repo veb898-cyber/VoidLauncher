@@ -19,7 +19,7 @@ interface Props {
 }
 
 /** Lazily load a screenshot's data URL once, when the tile scrolls into view. */
-function ScreenshotTile({ instanceName, filename, delay }: { instanceName: string; filename: string; delay: number }) {
+function ScreenshotTile({ instanceName, filename }: { instanceName: string; filename: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -42,7 +42,7 @@ function ScreenshotTile({ instanceName, filename, delay }: { instanceName: strin
   }, [instanceName, filename]);
 
   return (
-    <div ref={containerRef} className="instance-card__banner" style={{ height: 160, overflow: 'hidden', background: 'var(--bg-tertiary)', animationDelay: `${delay * 24}ms` }}>
+    <div ref={containerRef} className="instance-card__banner" style={{ height: 160, overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
       {src ? (
         <img
           src={src}
@@ -105,7 +105,7 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
   };
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    <div className="content-manager__pane" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <div style={{ padding: 'var(--space-md) var(--space-2xl)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', borderBottom: '1px solid var(--surface-border)', flexShrink: 0 }}>
         <h2 style={{ fontSize: 'var(--font-size-lg)', fontWeight: 600, margin: 0, flex: 1 }}>
           {t('screenshots.title')}
@@ -129,19 +129,16 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
           </div>
         ) : (
           <div className="instance-grid">
-            {screenshots.map((s, i) => {
+            {screenshots.map((s) => {
               return (
                 <div
                   key={s.filename}
-                  className="instance-card stagger-in"
-                  style={{
-                    animationDelay: `${Math.min(i, 9) * 24}ms`,
-                    cursor: 'pointer',
-                  }}
+                  className="instance-card"
+                  style={{ cursor: 'pointer' }}
                   onClick={() => openViewer(s.filename)}
                   onContextMenu={(e) => { e.preventDefault(); setDeleteTarget(s.filename); }}
                 >
-                  <ScreenshotTile instanceName={instanceName} filename={s.filename} delay={Math.min(i, 9)} />
+                  <ScreenshotTile instanceName={instanceName} filename={s.filename} />
                   <Tooltip content={t('common.delete')}>
                     <button
                       onClick={(e) => { e.stopPropagation(); setDeleteTarget(s.filename); }}

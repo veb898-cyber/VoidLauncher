@@ -5,6 +5,7 @@ import { useInstanceStore } from '../../stores/instanceStore';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { t } from '../../lib/i18n';
 import { Button } from '../ui/Button';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { EmptyState } from '../ui/EmptyState';
 import { ProgressBar } from '../ui/ProgressBar';
 import { InstanceEditor } from './InstanceEditor';
@@ -54,12 +55,12 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
 
   return (
     <div
+      className="instance-list"
       style={{
         width: 260,
         borderRight: '1px solid var(--surface-border)',
         display: 'flex',
         flexDirection: 'column',
-        background: 'var(--bg-secondary)',
         flexShrink: 0,
       }}
     >
@@ -86,14 +87,13 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
         {instances.length === 0 ? (
           <EmptyState compact icon={<Package size={24} />} title={t('instances.empty_title')} />
         ) : (
-          instances.map((instance, i) => {
+          instances.map((instance) => {
             const isInstalling = installingName === instance.name;
             const isSelected = selectedInstance === instance.name;
 
             return (
               <div
                 key={instance.name}
-                className="stagger-in"
                 onClick={() => useBrowserGuardStore.getState().askLeave(() => selectInstance(instance.name))}
                 onContextMenu={(e) => {
                   e.preventDefault();
@@ -110,7 +110,6 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
                   transition: 'background var(--transition-fast)',
                   marginBottom: 2,
                   opacity: isLaunching && !isSelected ? 0.6 : 1,
-                  animationDelay: `${Math.min(i, 9) * 24}ms`,
                 }}
                 onMouseEnter={(e) => {
                   if (!isSelected) e.currentTarget.style.background = 'var(--surface-glass-hover)';
@@ -198,19 +197,18 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
         />
       )}
 
-      {/* Delete Confirmation */}
-      {deleteConfirmName && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
-          <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }}>
-            <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('instance_detail.confirm_delete_title')}</h3>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('instance_detail.confirm_delete_text', { name: deleteConfirmName })}</p>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-              <Button variant="ghost" onClick={() => setDeleteConfirmName(null)}>{t('common.cancel')}</Button>
-              <Button onClick={() => { deleteInstance(deleteConfirmName); setDeleteConfirmName(null); }} style={{ background: 'var(--color-danger)', color: 'white' }}>{t('common.delete')}</Button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Delete Confirmation — shared confirm modal (lg: scrim + glass sheet) */}
+      <ConfirmDialog
+        open={!!deleteConfirmName}
+        title={t('instance_detail.confirm_delete_title')}
+        description={t('instance_detail.confirm_delete_text', { name: deleteConfirmName ?? '' })}
+        onConfirm={() => {
+          if (deleteConfirmName) deleteInstance(deleteConfirmName);
+          setDeleteConfirmName(null);
+        }}
+        onCancel={() => setDeleteConfirmName(null)}
+        confirmLabel={t('common.delete')}
+      />
     </div>
   );
 }

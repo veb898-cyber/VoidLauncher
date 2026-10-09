@@ -24,7 +24,7 @@ export function RoomSetupView({ status, progress, busy, onCheck }: RoomSetupView
   const waitingLogin = ts.installed && !ts.logged_in;
 
   return (
-    <div className="glass-card animate-slide-up" style={{ maxWidth: 720 }}>
+    <div className="glass-card animate-slide-up" style={{ maxWidth: 720, marginInline: 'auto' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', marginBottom: 'var(--space-lg)' }}>
         <ShieldCheck size={28} color="var(--primary)" />
         <h2 style={{ margin: 0, fontSize: 'var(--font-size-xl)' }}>{t('rooms.setup_title')}</h2>

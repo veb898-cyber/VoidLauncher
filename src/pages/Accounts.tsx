@@ -132,7 +132,7 @@ export function Accounts() {
   };
 
   return (
-    <div className="page animate-fade-in">
+    <div className="page">
       <div className="page__header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <h1 className="page__title">{t('accounts.title')}</h1>

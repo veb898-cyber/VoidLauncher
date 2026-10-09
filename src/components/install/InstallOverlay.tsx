@@ -23,30 +23,8 @@ export function InstallOverlay() {
   const totalMb = (progress.total_bytes / 1024 / 1024).toFixed(1);
 
   return (
-    <div
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0, 0, 0, 0.7)',
-        backdropFilter: 'blur(12px)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 1500,
-        animation: 'fadeIn 0.2s ease-out',
-      }}
-    >
-      <div
-        style={{
-          background: 'var(--bg-secondary)',
-          border: '1px solid var(--surface-border)',
-          borderRadius: 'var(--radius-xl)',
-          padding: 'var(--space-3xl)',
-          width: '90%',
-          maxWidth: 480,
-          boxShadow: 'var(--shadow-xl)',
-        }}
-      >
+    <div className="install-overlay">
+      <div className="install-overlay__sheet">
         <div
           style={{
             display: 'flex',

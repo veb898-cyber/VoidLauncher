@@ -74,7 +74,6 @@ export function LauncherLogs() {
       <div className="log-container" style={{
         flex: 1,
         overflowY: 'auto',
-        background: 'var(--bg-primary)',
         borderRadius: 'var(--radius-lg)',
         padding: 'var(--space-md)',
         fontFamily: 'var(--font-mono)',

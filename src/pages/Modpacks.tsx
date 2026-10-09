@@ -4,6 +4,7 @@ import { Search, Loader2, X, Check, Download, CirclePause, CirclePlay } from 'lu
 import { Button } from '../components/ui/Button';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ResultListSkeleton } from '../components/ui/ResultListSkeleton';
+import { SlidingTabs } from '../components/ui/SlidingTabs';
 import { useT } from '../lib/i18n';
 import { useModpacksStore, type ModpacksTab, type MrHit, type CfHit, type AtlPack } from '../stores/modpacksStore';
 import { formatBytes, formatDownloads } from '../lib/format';
@@ -108,9 +109,8 @@ export function Modpacks() {
     return `data:image/png;base64,${raw}`;
   };
 
-  const renderCard = (name: string, desc: string, icon: string | null, meta: string, onClick: () => void, keyId: string, isSelected: boolean, idx: number) => (
-    <div key={keyId} className={`modpack-card stagger-in ${isSelected ? 'modpack-card--selected' : ''}`} onClick={onClick} role="button" tabIndex={0}
-      style={{ animationDelay: `${Math.min(idx, 9) * 24}ms` }}
+  const renderCard = (name: string, desc: string, icon: string | null, meta: string, onClick: () => void, keyId: string, isSelected: boolean) => (
+    <div key={keyId} className={`modpack-card ${isSelected ? 'modpack-card--selected' : ''}`} onClick={onClick} role="button" tabIndex={0}
       onKeyDown={(e) => { if (e.key === 'Enter') onClick(); }}>
       <div className="modpack-card__icon modpack-card__icon--frame">
         <div className="modpack-card__icon-fallback-letter">{name.charAt(0).toUpperCase()}</div>
@@ -350,7 +350,7 @@ export function Modpacks() {
               <span>{paused ? t('modpacks.paused') : (progress ? progressLabel(progress.stage, progress.message) : t('modpacks.installing'))}</span>
               <span>{progress && progress.total > 0 ? `${Math.round((progress.current / progress.total) * 100)}%` : ''}</span>
             </div>
-            <div style={{ height: 6, background: 'var(--bg-tertiary)', borderRadius: 999, overflow: 'hidden' }}>
+            <div className="progress-track">
               <div className="progress-fill" style={{
                 height: '100%',
                 width: progress && progress.total > 0 ? `${Math.min(100, (progress.current / progress.total) * 100)}%` : '100%',
@@ -369,7 +369,7 @@ export function Modpacks() {
   };
 
   return (
-    <div className="page animate-fade-in">
+    <div className="page">
       <div className="page__header">
         <div>
           <h1 className="page__title">{t('modpacks.title')}</h1>
@@ -377,14 +377,18 @@ export function Modpacks() {
         </div>
       </div>
 
-      {/* Tabs */}
-      <div className="tabs" style={{ marginBottom: 'var(--space-md)' }}>
-        {(['modrinth', 'curseforge', 'atlauncher'] as ModpacksTab[]).map((tb) => (
-          <button key={tb} className={`tab ${tab === tb ? 'tab--active' : ''}`} onClick={() => store.switchTab(tb)}>
-            {t(`modpacks.tab_${tb}`)}
-          </button>
-        ))}
-      </div>
+      {/* Installers: tab row with one indicator that slides between the
+          buttons (owner directive: the frame must travel, not pop). */}
+      <SlidingTabs<ModpacksTab>
+        tabs={(['modrinth', 'curseforge', 'atlauncher'] as ModpacksTab[]).map((tb) => ({
+          id: tb,
+          label: t(`modpacks.tab_${tb}`),
+        }))}
+        active={tab}
+        onChange={(tb) => store.switchTab(tb)}
+        ariaLabel={t('modpacks.title')}
+        style={{ marginBottom: 'var(--space-md)' }}
+      />
 
       {/* Search */}
       <div className="search-bar" style={{ marginBottom: 'var(--space-md)' }}>
@@ -429,27 +433,25 @@ export function Modpacks() {
             <EmptyState icon={<Search size={28} />} title={t('modpacks.empty')} compact />
           )}
 
-          {tab === 'modrinth' && mrResults.map((h, i) => renderCard(
+          {tab === 'modrinth' && mrResults.map((h) => renderCard(
             h.title, h.description,
             h.icon_url,
             t('modpacks.downloads_count', { count: formatDownloads(h.downloads) }),
             () => store.selectMr(h),
             h.project_id,
             !!selected && 'project_id' in selected && (selected as MrHit).project_id === h.project_id,
-            i,
           ))}
 
-          {tab === 'curseforge' && cfResults.map((h, i) => renderCard(
+          {tab === 'curseforge' && cfResults.map((h) => renderCard(
             h.name, h.summary,
             h.logo?.thumbnailUrl || h.logo?.url || null,
             t('modpacks.downloads_count', { count: formatDownloads(h.downloadCount) }),
             () => store.selectCf(h),
             String(h.id),
             !!selected && 'downloadCount' in selected && (selected as CfHit).id === h.id,
-            i,
           ))}
 
-          {tab === 'atlauncher' && atlFiltered.map((p, i) => renderCard(
+          {tab === 'atlauncher' && atlFiltered.map((p) => renderCard(
             p.name,
             p.description ?? '',
             toIconSrc(p.icon),
@@ -457,7 +459,6 @@ export function Modpacks() {
             () => store.selectAtlPack(p),
             p.safeName,
             !!selected && 'safeName' in selected && (selected as AtlPack).safeName === p.safeName,
-            i,
           ))}
 
           {loadingMore && (

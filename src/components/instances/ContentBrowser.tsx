@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, Loader2, X, Check, Download } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { addToast } from '../ui/Toast';
 import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { EmptyState } from '../ui/EmptyState';
@@ -102,6 +103,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     mod: t('content.type_mod'),
     resourcepack: t('content.type_resourcepack'),
     shader: t('content.type_shader'),
+  };
+
+  // Same per-section wording as ContentManager: the field names what it
+  // searches, and the button is the action ("Найти"), not a repeat of it.
+  const SEARCH_PLACEHOLDERS: Record<ContentType, string> = {
+    mod: t('content.search_placeholder_mod'),
+    resourcepack: t('content.search_placeholder_resourcepack'),
+    shader: t('content.search_placeholder_shader'),
   };
 
   const label = TYPE_LABELS[contentType];
@@ -478,7 +487,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             <div style={{ marginBottom: 'var(--space-lg)' }}>
               <h3 style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, marginBottom: 'var(--space-sm)' }}>{t('content.mods_heading', { label, count: direct.length.toString() })}</h3>
               {direct.map((item, i) => (
-                <div key={i} className="content-list-row" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', marginBottom: 4 }}>
+                <div key={i} className="content-list-row" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', marginBottom: 4 }}>
                   <RemoteIcon url={item.iconUrl} letter={item.name.charAt(0)} size={28} radius={4} fontSize={11} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
@@ -493,7 +502,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             <div style={{ marginBottom: 'var(--space-lg)' }}>
               <h3 style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, marginBottom: 'var(--space-sm)', color: 'var(--warning)' }}>{t('content.deps_heading', { count: deps.length.toString() })}</h3>
               {deps.map((item, i) => (
-                <div key={i} className="content-list-row" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', background: 'var(--bg-secondary)', border: '1px solid hsla(35, 90%, 55%, 0.2)', marginBottom: 4 }}>
+                <div key={i} className="content-list-row" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', border: '1px solid hsla(35, 90%, 55%, 0.2)', marginBottom: 4 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
                     <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('content.dep_required_by', { parent: item.parentMod ?? '' })}</div>
@@ -521,14 +530,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       {/* Search + sort bar */}
       <div style={{ padding: 'var(--space-sm) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
         <div style={{ position: 'relative', flex: 1 }}>
-          <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)' }} />
+          <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)', zIndex: 1, pointerEvents: 'none' }} />
           <input className="input" type="text" value={query} onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-            placeholder={t('common.search')}
-            aria-label={t('common.search')}
+            placeholder={SEARCH_PLACEHOLDERS[contentType]}
+            aria-label={SEARCH_PLACEHOLDERS[contentType]}
             style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
         </div>
-        <Button size="sm" onClick={handleSearch} disabled={loading} loading={loading}>{t('common.search')}</Button>
+        <Button size="sm" onClick={handleSearch} disabled={loading} loading={loading}>{t('common.find')}</Button>
       </div>
 
       {/* Sort controls */}
@@ -551,19 +560,17 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           {!loading && sortHits(displayHits).length === 0 && (
             <EmptyState compact icon={<Package size={24} />} title={t('content.empty_results', { label: label.toLowerCase() })} />
           )}
-          {sortHits(displayHits).map((hit, i) => {
+          {sortHits(displayHits).map((hit) => {
             const added = isAdded(hit.project_id, hit.slug, hit.title);
             return (
               <div key={hit.project_id}
-                className="stagger-in content-list-row"
+                className={`content-list-row${selected?.project_id === hit.project_id ? ' content-list-row--selected' : added ? ' content-list-row--added' : ''}`}
                 onClick={() => handleSelect(hit)}
                 style={{
                   display: 'flex', gap: 'var(--space-sm)', padding: '8px 10px', cursor: 'pointer',
                   borderRadius: 'var(--radius-md)', border: '1px solid',
                   borderColor: selected?.project_id === hit.project_id ? 'var(--primary)' : added ? 'var(--success)' : 'transparent',
-                  background: selected?.project_id === hit.project_id ? 'var(--primary-dim)' : added ? 'hsla(150, 60%, 50%, 0.08)' : 'var(--bg-secondary)',
                   transition: 'all 0.15s',
-                  animationDelay: `${Math.min(i, 9) * 24}ms`,
                 }}
               >
                 <RemoteIcon url={hit.icon_url} letter={hit.title.charAt(0)} size={36} radius={6} fontSize={14} />
@@ -595,7 +602,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
 
         {/* Detail panel */}
         {selected && (
-          <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-md)', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-lg)', border: '1px solid var(--surface-border)' }}>
+          <div className="content-detail-panel" style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-md)' }}>
             {loadingDetail ? (
               <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><SnakeSpinner size={24} /></div>
             ) : (
@@ -709,18 +716,21 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         </div>
       )}
 
-      {/* Leave confirmation: back button would discard the selection */}
-      {showLeaveConfirm && createPortal(
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
-          <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }}>
-            <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('content.leave_confirm_title')}</h3>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('content.leave_confirm_text', { count: selectedItems.length.toString() })}</p>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-              <Button variant="ghost" onClick={() => setShowLeaveConfirm(false)}>{t('common.cancel')}</Button>
-              <Button onClick={() => { setShowLeaveConfirm(false); onClose(); }}>{t('common.leave')}</Button>
-            </div>
-          </div>
-        </div>,
+      {/* Leave confirmation: back button would discard the selection.
+          Shared confirm modal, portaled to the body so it is not clipped by
+          the browser pane's own scroll containers. */}
+      {createPortal(
+        <ConfirmDialog
+          open={showLeaveConfirm}
+          title={t('content.leave_confirm_title')}
+          description={t('content.leave_confirm_text', { count: selectedItems.length.toString() })}
+          onConfirm={() => {
+            setShowLeaveConfirm(false);
+            onClose();
+          }}
+          onCancel={() => setShowLeaveConfirm(false)}
+          confirmLabel={t('common.leave')}
+        />,
         document.body
       )}
     </div>

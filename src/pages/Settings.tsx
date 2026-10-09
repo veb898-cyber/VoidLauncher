@@ -15,6 +15,8 @@ import { getRecommendedMemoryMb, snapToMemoryStep } from '../lib/memory';
 import { useT, type Language } from '../lib/i18n';
 import { useLanguageStore } from '../stores/languageStore';
 import { useThemeStore, Theme } from '../stores/themeStore';
+import { useWallpaperStore } from '../stores/wallpaperStore';
+import type { WallpaperId } from '../lib/wallpapers';
 import { useFontStore, Font, ConsoleFont } from '../stores/fontStore';
 import { Avatar, OfflineAvatar } from '../lib/remoteImage';
 import { Tooltip } from '../components/ui/Tooltip';
@@ -42,6 +44,21 @@ export function Settings() {
   const language = useLanguageStore((s) => s.language);
   const theme = useThemeStore((s) => s.theme);
   const setTheme = useThemeStore((s) => s.setTheme);
+  const liquidGlass = useThemeStore((s) => s.liquidGlass);
+  const setLiquidGlass = useThemeStore((s) => s.setLiquidGlass);
+  const realisticGlass = useThemeStore((s) => s.realisticGlass);
+  const setRealisticGlass = useThemeStore((s) => s.setRealisticGlass);
+  const wallpaper = useWallpaperStore((s) => s.wallpaper);
+  const setWallpaper = useWallpaperStore((s) => s.setWallpaper);
+
+  // Name of the normal theme, so the Liquid Glass note can say which theme
+  // will come back instead of speaking about "the theme".
+  const themeLabel: Record<Theme, string> = {
+    standard: t('settings.theme_standard'),
+    blueprint: t('settings.theme_blueprint'),
+    ember: t('settings.theme_ember'),
+    dark: t('settings.theme_dark'),
+  };
   const font = useFontStore((s) => s.font);
   const consoleFont = useFontStore((s) => s.consoleFont);
   const config = useSettingsStore((s) => s.config);
@@ -126,7 +143,7 @@ export function Settings() {
 
   if (!localConfig) {
     return (
-      <div className="page animate-fade-in">
+      <div className="page">
         <div className="page__header">
           <h1 className="page__title">{t('settings.title')}</h1>
         </div>
@@ -136,7 +153,7 @@ export function Settings() {
   }
 
   return (
-    <div className="page animate-fade-in">
+    <div className="page">
       <div className="page__header">
         <h1 className="page__title">{t('settings.title')}</h1>
       </div>
@@ -170,6 +187,7 @@ export function Settings() {
               className="input"
               type="text"
               value={localConfig.java_path || ''}
+              placeholder={t('settings.java_path_placeholder')}
               onChange={(e) => updateConfig('java_path', e.target.value || null)}
               style={{ width: 250, fontSize: 'var(--font-size-xs)' }}
             />
@@ -482,18 +500,126 @@ export function Settings() {
             <div className="settings-row__desc">
               {t('settings.theme_desc')}
             </div>
+            {liquidGlass && (
+              <div className="settings-row__note settings-row__note--locked">
+                {t('settings.theme_locked')}
+              </div>
+            )}
           </div>
           <div className="settings-row__control" style={{ width: 220 }}>
             <CustomSelect
               value={theme}
+              disabled={liquidGlass}
               options={[
                 { value: 'standard', label: t('settings.theme_standard') },
                 { value: 'blueprint', label: t('settings.theme_blueprint') },
                 { value: 'ember', label: t('settings.theme_ember') },
                 { value: 'dark', label: t('settings.theme_dark') },
-              ]}
+              ].map((o) => ({ ...o, disabled: liquidGlass }))}
               onChange={(v) => setTheme(v as Theme)}
             />
+          </div>
+        </div>
+
+        {/* Liquid Glass is a separate experimental rendering mode, not a
+            colour preset of the theme above: while it is on, the normal
+            themes stay visible but locked, and the selected one is kept so
+            it can be restored on the way back. */}
+        <div className="experimental-block">
+          <div className="experimental-block__head">
+            <span className="experimental-block__title">{t('settings.exp_section_title')}</span>
+            <span className="experimental-badge">{t('common.experimental')}</span>
+          </div>
+          <div className="experimental-block__desc">{t('settings.exp_section_desc')}</div>
+          <div className="settings-row">
+            <div className="settings-row__info">
+              <div className="settings-row__title">
+                {t('settings.lg_title')}
+                <span className="experimental-badge experimental-badge--inline">
+                  {t('common.experimental')}
+                </span>
+              </div>
+              <div className="settings-row__desc">{t('settings.lg_desc')}</div>
+              {liquidGlass && (
+                <div className="settings-row__note settings-row__note--active">
+                  {t('settings.lg_active', { theme: themeLabel[theme] })}
+                </div>
+              )}
+            </div>
+            <div className="settings-row__control">
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={liquidGlass}
+                  onChange={(e) => setLiquidGlass(e.target.checked)}
+                />
+                <span className="toggle__slider" />
+              </label>
+            </div>
+          </div>
+          {/* The backdrop only exists under Liquid Glass, so it is disabled
+              rather than hidden in the other appearances: the choice is kept and
+              comes back when Liquid Glass is switched on again. */}
+          <div className="settings-row">
+            <div className="settings-row__info">
+              <div className="settings-row__title">
+                {t('settings.wallpaper_title')}
+                <span className="experimental-badge experimental-badge--inline">
+                  {t('common.experimental')}
+                </span>
+              </div>
+              <div className="settings-row__desc">{t('settings.wallpaper_desc')}</div>
+              {!liquidGlass && (
+                <div className="settings-row__note settings-row__note--locked">
+                  {t('settings.wallpaper_locked')}
+                </div>
+              )}
+            </div>
+            <div className="settings-row__control" style={{ width: 220 }}>
+              <CustomSelect<WallpaperId>
+                value={wallpaper}
+                disabled={!liquidGlass}
+                options={[
+                  { value: 'none', label: t('settings.wallpaper_none') },
+                  { value: 'waves', label: t('settings.wallpaper_waves') },
+                  { value: 'ribbons', label: t('settings.wallpaper_ribbons') },
+                  { value: 'mesh', label: t('settings.wallpaper_mesh') },
+                  { value: 'nebula', label: t('settings.wallpaper_nebula') },
+                ]}
+                onChange={setWallpaper}
+              />
+            </div>
+          </div>
+          {/* Realistic liquid glass (owner pass, iOS 27 reference): a much
+              clearer fill so the backdrop and content read through the panels.
+              Off by default; locked like the backdrop choice while Liquid Glass
+              is off, and the selection is kept for the next time it is on. */}
+          <div className="settings-row">
+            <div className="settings-row__info">
+              <div className="settings-row__title">
+                {t('settings.lg_realistic_title')}
+                <span className="experimental-badge experimental-badge--inline">
+                  {t('common.experimental')}
+                </span>
+              </div>
+              <div className="settings-row__desc">{t('settings.lg_realistic_desc')}</div>
+              {!liquidGlass && (
+                <div className="settings-row__note settings-row__note--locked">
+                  {t('settings.lg_realistic_locked')}
+                </div>
+              )}
+            </div>
+            <div className="settings-row__control">
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={realisticGlass}
+                  disabled={!liquidGlass}
+                  onChange={(e) => setRealisticGlass(e.target.checked)}
+                />
+                <span className="toggle__slider" />
+              </label>
+            </div>
           </div>
         </div>
       </section>

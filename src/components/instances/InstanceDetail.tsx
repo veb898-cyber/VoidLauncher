@@ -6,6 +6,8 @@ import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { Package, Settings, Palette, Image, Upload, Trash2, X } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
 import { Button } from '../ui/Button';
+import { SlidingTabs } from '../ui/SlidingTabs';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { Tooltip } from '../ui/Tooltip';
 import { addToast } from '../ui/Toast';
 import { InstanceEditor } from './InstanceEditor';
@@ -287,21 +289,22 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
         </div>
       </div>
 
-      {/* Tabs */}
-      <div style={{ padding: '0 var(--space-2xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-md)', flexShrink: 0 }}>
-        {TABS.map((tb) => (
-          <button
-            key={tb.id}
-            className={`btn btn--tab ${tab === tb.id ? 'btn--tab-active' : ''}`}
-            onClick={() => selectTab(tb.id)}
-          >
-            {tb.label}
-          </button>
-        ))}
+      {/* Tabs: one frame slides between the buttons — the same motion the
+          terminal filters and the modpack installers use. */}
+      <div style={{ padding: '0 var(--space-2xl)', borderBottom: '1px solid var(--surface-border)', flexShrink: 0 }}>
+        <SlidingTabs<Tab>
+          tabs={TABS}
+          active={tab}
+          onChange={selectTab}
+          ariaLabel={instance.name}
+          style={{ marginBottom: 0, borderBottom: 'none' }}
+        />
       </div>
 
-      {/* Tab content */}
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+      {/* Tab content: keyed by tab so each section starts fresh (search,
+          selection). No entrance animation on purpose — the content is there
+          the moment the switch happens; the only motion is the sliding pill. */}
+      <div key={tab} style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         {(tab === 'mods' || tab === 'resourcepacks' || tab === 'shaderpacks') && (
           <ContentManager
             key={`${instance.name}-${tab}`}
@@ -331,19 +334,18 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
         }}
       />
 
-      {/* Delete Confirmation */}
-      {showDeleteConfirm && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
-          <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }}>
-            <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('instance_detail.confirm_delete_title')}</h3>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('instance_detail.confirm_delete_text', { name: instance.name })}</p>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-              <Button variant="ghost" onClick={() => setShowDeleteConfirm(false)}>{t('common.cancel')}</Button>
-              <Button onClick={() => { deleteInstance(instance.name); setShowDeleteConfirm(false); }} style={{ background: 'var(--color-danger)', color: 'white' }}>{t('common.delete')}</Button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Delete Confirmation — shared confirm modal (lg: scrim + glass sheet) */}
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        title={t('instance_detail.confirm_delete_title')}
+        description={t('instance_detail.confirm_delete_text', { name: instance.name })}
+        onConfirm={() => {
+          deleteInstance(instance.name);
+          setShowDeleteConfirm(false);
+        }}
+        onCancel={() => setShowDeleteConfirm(false)}
+        confirmLabel={t('common.delete')}
+      />
     </div>
   );
 }

@@ -2,12 +2,14 @@ import { Suspense, lazy, useEffect, useState, useCallback } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { Titlebar } from './components/Titlebar';
 import { Sidebar } from './components/Sidebar';
+import LiquidGlassWallpaper from './components/LiquidGlassWallpaper';
 import { ToastContainer } from './components/ui/Toast';
 import { InstallOverlay } from './components/install/InstallOverlay';
 import { UpdaterModal } from './components/UpdaterModal';
 import { LoaderInstallModal } from './components/launch/LoaderInstallModal';
 import { JavaSetupModal } from './components/launch/JavaSetupModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { ConfirmDialog } from './components/ui/ConfirmDialog';
 import { useAuthStore } from './stores/authStore';
 import { useSettingsStore } from './stores/settingsStore';
 import { useAccountsStore } from './stores/accountsStore';
@@ -18,7 +20,6 @@ import { useFocusStore } from './stores/focusStore';
 import { useUpdater } from './hooks/useUpdater';
 import { useBrowserGuardStore } from './stores/browserGuardStore';
 import { useJavaDownloadStore } from './stores/javaDownloadStore';
-import { Button } from './components/ui/Button';
 import { useT } from './lib/i18n';
 
 const Home = lazy(() => import('./pages/Home').then(m => ({ default: m.Home })));
@@ -122,6 +123,12 @@ function App() {
     return () => { root.classList.remove('app-frozen'); };
   }, [isFrozen]);
 
+  // Mirror the active page for CSS: the Liquid Glass rail-light strip
+  // (.lg-substrate::after) is shown only on the instances tab.
+  useEffect(() => {
+    document.documentElement.dataset.page = activePage;
+  }, [activePage]);
+
   const renderPage = () => {
     switch (activePage) {
       case 'home':
@@ -145,6 +152,11 @@ function App() {
 
   return (
     <>
+      {/* Substrate for the experimental Liquid Glass appearance: the field the
+          glass surfaces actually refract, plus the chosen animated backdrop
+          painted into it. Out of flow (position: fixed) and invisible unless
+          Liquid Glass is applied, so the normal themes are untouched. */}
+      <LiquidGlassWallpaper />
       <Titlebar />
       <div className="app-layout">
         <Sidebar activePage={activePage} onNavigate={navigate} />
@@ -185,28 +197,20 @@ function App() {
       />
 
       {/* Leave guard: navigating away would discard the content browser
-          selection or unsaved settings changes. */}
-      {leaveRequest && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
-          <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }}>
-            {leaveUnsaved && leavePending === 0 ? (
-              <>
-                <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('content.leave_unsaved_title')}</h3>
-                <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('content.leave_unsaved_text')}</p>
-              </>
-            ) : (
-              <>
-                <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('content.leave_confirm_title')}</h3>
-                <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('content.leave_confirm_text', { count: leavePending.toString() })}</p>
-              </>
-            )}
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-              <Button variant="ghost" onClick={() => useBrowserGuardStore.getState().cancelLeave()}>{t('common.cancel')}</Button>
-              <Button onClick={() => useBrowserGuardStore.getState().resolveLeave()}>{t('common.leave')}</Button>
-            </div>
-          </div>
-        </div>
-      )}
+          selection or unsaved settings changes. Shared confirm modal —
+          in the Liquid Glass theme it renders as scrim + glass sheet. */}
+      <ConfirmDialog
+        open={!!leaveRequest}
+        title={leaveUnsaved && leavePending === 0 ? t('content.leave_unsaved_title') : t('content.leave_confirm_title')}
+        description={
+          leaveUnsaved && leavePending === 0
+            ? t('content.leave_unsaved_text')
+            : t('content.leave_confirm_text', { count: leavePending.toString() })
+        }
+        onConfirm={() => useBrowserGuardStore.getState().resolveLeave()}
+        onCancel={() => useBrowserGuardStore.getState().cancelLeave()}
+        confirmLabel={t('common.leave')}
+      />
     </>
   );
 }

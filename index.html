@@ -14,7 +14,18 @@
           var t = localStorage.getItem('voidlauncher-theme');
           // 'light' (OLED Light) support was removed; an older stored value
           // simply falls back to the default Neon theme (no data-theme attr).
-          if (t === 'dark' || t === 'blueprint' || t === 'ember') {
+          var known = (t === 'dark' || t === 'blueprint' || t === 'ember');
+          // Liquid Glass is a separate experimental mode, not a theme, so it
+          // gets its own sentinel value and replaces the theme instead of
+          // recolouring it. Must stay in sync with `applyAppearance` in
+          // src/stores/themeStore.ts — same rule, same sentinel ('lg').
+          // This runs before React so the first paint is already correct;
+          // the store re-applies the identical value once it loads.
+          var lg = localStorage.getItem('voidlauncher-liquid-glass') === '1';
+          if (lg) {
+            document.documentElement.setAttribute('data-theme', 'lg');
+            document.documentElement.style.colorScheme = 'dark';
+          } else if (known) {
             document.documentElement.setAttribute('data-theme', t);
             document.documentElement.style.colorScheme = 'dark';
           }
@@ -43,6 +54,7 @@
       body { background: hsl(230, 25%, 7%); margin: 0; }
       [data-theme="dark"] body, [data-theme="dark"] #splash { background: #000000; }
       [data-theme="ember"] body, [data-theme="ember"] #splash { background: #121110; }
+      [data-theme="lg"] body, [data-theme="lg"] #splash { background: hsl(228, 26%, 7%); }
       #splash {
         position: fixed; inset: 0; z-index: 9999;
         display: flex; flex-direction: column;

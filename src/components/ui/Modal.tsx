@@ -30,9 +30,15 @@ interface ModalProps {
    * out past the right edge of an otherwise fixed-width window.
    */
   growWithContent?: boolean;
+  /**
+   * `dense` trims the header/body/footer paddings. Used by tall dialogs (the
+   * create wizard) that must fit short windows without needing their own
+   * scrollbar — the content shrinks instead of the dialog scrolling.
+   */
+  dense?: boolean;
 }
 
-export function Modal({ open, onClose, title, children, footer, maxWidth, bare, fitContent, growWithContent }: ModalProps) {
+export function Modal({ open, onClose, title, children, footer, maxWidth, bare, fitContent, growWithContent, dense }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const wasOpen = useRef(false);
 
@@ -81,7 +87,7 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare, 
         aria-modal="true"
         aria-label={title || undefined}
         tabIndex={-1}
-        className={`modal animate-slide-up${fitContent ? ' modal--fit' : ''}${growWithContent ? ' modal--content' : ''}`}
+        className={`modal animate-slide-up${fitContent ? ' modal--fit' : ''}${growWithContent ? ' modal--content' : ''}${dense ? ' modal--dense' : ''}`}
         onClick={(e) => e.stopPropagation()}
         style={maxWidth ? { maxWidth } : undefined}
       >

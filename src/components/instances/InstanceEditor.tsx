@@ -6,6 +6,7 @@ import { Button } from '../ui/Button';
 import { Tooltip } from '../ui/Tooltip';
 import { Input } from '../ui/Input';
 import { Modal } from '../ui/Modal';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { Slider } from '../ui/Slider';
 import { addToast } from '../ui/Toast';
 import { CustomSelect, type SelectOption } from '../ui/CustomSelect';
@@ -274,20 +275,22 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
         </div>,
         document.body
       )}
-      {/* Unsaved-changes confirmation when closing via overlay / Escape */}
-      {confirmClose && createPortal(
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 12000 }}>
-          <div className="glass-card" style={{ padding: 'var(--space-xl)', maxWidth: 400, width: '90%' }}>
-            <h3 style={{ margin: '0 0 var(--space-md)' }}>{t('instance_editor.close_confirm_title')}</h3>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: 'var(--space-lg)' }}>{t('instance_editor.close_confirm_text')}</p>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-              <Button variant="ghost" onClick={() => setConfirmClose(false)}>{t('instance_editor.close_stay')}</Button>
-              <Button onClick={() => { setConfirmClose(false); onClose(); }} style={{ background: 'var(--color-danger)', color: 'white' }}>
-                {t('instance_editor.close_discard')}
-              </Button>
-            </div>
-          </div>
-        </div>,
+      {/* Unsaved-changes confirmation when closing via overlay / Escape.
+          Shared confirm modal, portaled to the body like the FAB so it is
+          never clipped by the editor sheet's own scroll container. */}
+      {createPortal(
+        <ConfirmDialog
+          open={confirmClose}
+          title={t('instance_editor.close_confirm_title')}
+          description={t('instance_editor.close_confirm_text')}
+          onConfirm={() => {
+            setConfirmClose(false);
+            onClose();
+          }}
+          onCancel={() => setConfirmClose(false)}
+          confirmLabel={t('instance_editor.close_discard')}
+          cancelLabel={t('instance_editor.close_stay')}
+        />,
         document.body
       )}
     </Modal>

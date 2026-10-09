@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liquid Glass — лаборатория фонов</title>
+<link rel="stylesheet" href="lab.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div>
+      <h1>Liquid Glass — лаборатория фонов</h1>
+      <p>
+        Изолированная визуальная лаборатория. Реальный substrate лаунчера почти чёрный и
+        статичный, поэтому blur, насыщенность, rim и адаптивный цвет на нём плохо читаются.
+        Здесь — семнадцать зацикленных процедурных сцен, которые специально созданы как тестовая
+        подложка. Структура материала теперь совпадает с приложением: стеклянные поверхности
+        используют один материал <code>sheet</code>, кромка тёмная с верхним бликом.
+        Открыты два числа — альфа и радиус размытия; оба вынесены на ползунки вверху.
+        Сейчас в теме лаунчера стоит <code>0.78</code> и <code>20px</code> — эти значения
+        проверены на модальном окне, но ещё не проверены на сайдбаре и заголовке,
+        где стекла гораздо больше.
+      </p>
+    </div>
+    <div class="controls">
+      <div class="dials">
+        <div class="dial">
+          <div class="dial__head">
+            <label class="dial__label" for="sheetAlpha">Альфа sheet</label>
+            <output class="dial__value" id="sheetAlphaValue" for="sheetAlpha">0.78</output>
+          </div>
+          <input class="dial__range" id="sheetAlpha" type="range"
+                 min="0.40" max="0.95" step="0.01" value="0.78"
+                 aria-describedby="alphaHint">
+          <div class="dial__scale" id="alphaHint"><span>жидко</span><span>плотно</span></div>
+        </div>
+        <div class="dial">
+          <div class="dial__head">
+            <label class="dial__label" for="sheetBlur">Blur sheet</label>
+            <output class="dial__value" id="sheetBlurValue" for="sheetBlur">20px</output>
+          </div>
+          <input class="dial__range" id="sheetBlur" type="range"
+                 min="6" max="34" step="1" value="20"
+                 aria-describedby="blurHint">
+          <div class="dial__scale" id="blurHint"><span>6</span><span>34</span></div>
+        </div>
+      </div>
+      <button class="btn" id="toggleContrast" type="button" aria-pressed="false"
+              title="Как материал выглядит при включённом «Увеличить контраст»">Контраст</button>
+      <button class="btn" id="toggleDense" type="button" aria-pressed="false"
+              title="Как лаунчер выглядит при включённом «Снижение прозрачности»">Плотный</button>
+      <div class="speed-label">Скорость</div>
+      <div class="speed" role="group" aria-label="Скорость анимации"></div>
+      <button class="btn" id="pauseAll" type="button" aria-pressed="false">Пауза для всех</button>
+      <button class="btn" id="toggleSamples" type="button" aria-pressed="false">Скрыть панели</button>
+    </div>
+  </header>
+
+  <div class="intro">
+    <section>
+      <h2>Как пользоваться</h2>
+      <ul>
+        <li>Откройте файл двойным щелчком — сборка и сервер не нужны.</li>
+        <li>Материал в лаунчере один — <b>sheet</b>. Он лежит на всех стеклянных
+          поверхностях сразу.</li>
+        <li><b>Альфа</b> и <b>Blur</b> — два открытых параметра этого материала.
+          Ползунки двигают <code>--fill-sheet</code> и <code>--blur-sheet</code>
+          во всех семнадцати сценах разом; цифры справа — готовые значения для
+          темы лаунчера.</li>
+        <li><b>Контраст</b> и <b>Плотный</b> — как материал выглядит при включённых
+          «Увеличить контраст» и «Снижение прозрачности».</li>
+        <li>В каждой карточке фон анимирован, поверх лежат пять mock-элементов стекла.</li>
+        <li><b>Фокус</b> разворачивает сцену на всё окно, <b>Во весь экран</b> — на весь экран.</li>
+        <li>«Скрыть панели» оставляет только фон.</li>
+        <li>Если система просит меньше движения — анимации стартуют на паузе и на медленной скорости.</li>
+      </ul>
+    </section>
+    <section>
+      <h2>Что проверять</h2>
+      <ul>
+        <li><b>Sheet Chrome</b> — заголовок и сайдбар в натуральную величину.
+          Это единственное стекло в лаунчере на большой площади, поэтому решает
+          оно всё: держит ли 0.78 / 20 px мелкий текст поверх движущегося контента.</li>
+        <li><b>Sheet Sweep</b> — сетка альфа × blur. Обведённая ячейка — текущие
+          значения ползунков.</li>
+        <li><b>Blur</b> — читается ли разница 0 / 8 / 14 / 20 px.</li>
+        <li><b>Saturation</b> — усиливает ли <code>saturate()</code> цвет или пересвечивает.</li>
+        <li><b>Rim</b> — видна ли кромка на светлом и на тёмном.</li>
+        <li><b>Контраст</b> — остаётся ли текст читаемым на обоих краях диапазона.</li>
+      </ul>
+    </section>
+    <section>
+      <h2>Что здесь специально</h2>
+      <p>
+        Это не галерея красивых обоев. Каждая сцена покрывает свой диапазон: Aurora и
+        Gradient Mesh — широкая яркость, Plasma и Smoke — средняя и фрактальная детализация,
+        Ribbons и Orbital — тонкие структуры и яркие акценты, Nebula — мелкие точки, а
+        Stress Test — максимальный контраст, насыщенные primaries и мелкий текст. Внутри
+        каждой сцены — rail, большая панель с текстом, маленькая кнопка и круглый control,
+        собранные из четырёх вариантов материала.
+      </p>
+      <p>
+        Последние пять сцен — не фоны, а измерительные приборы: шкала яркости, шкала
+        tint, светлая и тёмная кромка на одном фоне, предельный перепад и сравнение
+        обычного размытия с настоящим преломлением. У них своя разметка поверх
+        канваса с подписями фактических значений — смотрите на них, чтобы решить,
+        не слишком ли тёмный материал.
+      </p>
+    </section>
+  </div>
+
+  <p class="rt-note">
+    В системе включено «снижение прозрачности», поэтому в самом лаунчере все поверхности
+    Liquid Glass становятся непрозрачными. Здесь материал намеренно оставлен прозрачным —
+    иначе страница не могла бы выполнять свою задачу. Оценивайте его с оглядкой на то,
+    как он поведёт себя у вас в приложении: кнопка «Плотный» вверху воспроизводит
+    поведение лаунчера при этой настройке, чтобы разницу можно было увидеть, а не
+    только прочитать.
+  </p>
+
+  <div class="grid" id="grid"></div>
+
+  <p class="hint">
+    Ничего из этого не подключено к интерфейсу VoidLauncher. Только локальный HTML, CSS и
+    JavaScript: без видео, GIF, внешних файлов и библиотек.
+  </p>
+
+</div>
+
+<div class="focus" id="focus" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Фокус сцены">
+  <div class="focus__bar">
+    <div class="focus__id">
+      <h2 id="focusTitle"></h2>
+      <p id="focusNote"></p>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn" id="focusFull" type="button">Во весь экран</button>
+    <button class="btn" id="focusClose" type="button">Закрыть</button>
+  </div>
+  <div class="focus__stage" id="focusStage"></div>
+  <p class="focus__why" id="focusWhy"></p>
+</div>
+
+<pre id="selftest" hidden></pre>
+
+<script src="scenes.js"></script>
+<script src="lab.js"></script>
+</body>
+</html>

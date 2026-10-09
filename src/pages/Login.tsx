@@ -6,7 +6,7 @@ interface LoginProps {
 
 export function Login({ onNavigate }: LoginProps) {
   return (
-    <div className="login-page animate-fade-in">
+    <div className="login-page">
       <MicrosoftLoginCard onSuccess={() => onNavigate('home')} />
     </div>
   );
