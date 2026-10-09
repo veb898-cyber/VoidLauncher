@@ -1790,6 +1790,31 @@ fn add_minecraft_dir_to_zip(
     Ok(())
 }
 
+/// Zip the contents of `dir` under `prefix` (no leading slash). Root files sit
+/// at the archive root; subdirectories accumulate their path on recursion.
+fn add_dir_contents_to_zip(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    dir: &std::path::Path,
+    prefix: &str,
+    options: zip::write::SimpleFileOptions,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let zip_path = if prefix.is_empty() { name.clone() } else { format!("{}/{}", prefix, name) };
+        if path.is_dir() {
+            zip.add_directory(&zip_path, options)?;
+            add_dir_contents_to_zip(zip, &path, &zip_path, options)?;
+        } else {
+            zip.start_file(&zip_path, options)?;
+            let mut file = std::fs::File::open(&path)?;
+            std::io::copy(&mut file, zip)?;
+        }
+    }
+    Ok(())
+}
+
 // ── World operations ──────────────────────────────────────────────
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -1949,6 +1974,221 @@ pub fn read_world_icon(instances_dir: &PathBuf, instance_name: &str, world_name:
         .join("saves").join(world_name).join("icon.png");
     if !icon_path.exists() { return None; }
     read_image_as_base64(&icon_path)
+}
+
+/// Metadata describing one stored world backup archive.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BackupInfo {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub created_at: i64,
+}
+
+/// Where backups of a world's saves are stored: `<instance>/.backups/worlds/<world>/`.
+fn world_backups_dir(instances_dir: &PathBuf, instance_name: &str, world_name: &str) -> PathBuf {
+    instances_dir.join(instance_name).join(".backups").join("worlds").join(world_name)
+}
+
+/// Reject any backup filename that is not a plain `.zip` file name inside the
+/// backups directory (no traversal, separators, hidden files, or Windows ADS).
+fn validate_backup_filename(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 200
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains(':')
+        || name.contains('\0')
+        || name.contains("..")
+        || name.starts_with('.')
+        || !name.to_ascii_lowercase().ends_with(".zip")
+    {
+        return Err(LauncherError::Instance(format!("Invalid backup filename: '{}'", name)));
+    }
+    Ok(())
+}
+
+/// Zip a world save into `<instance>/.backups/worlds/<world>/<world>__<ts>.zip`
+/// and return the resulting archive's metadata.
+pub fn backup_world(
+    instances_dir: &PathBuf,
+    instance_name: &str,
+    world_name: &str,
+) -> Result<BackupInfo> {
+    use zip::write::SimpleFileOptions;
+    let instance = get_instance(instances_dir, instance_name)?;
+    let world_dir = instance.minecraft_dir(instances_dir).join("saves").join(world_name);
+    if !world_dir.is_dir() {
+        return Err(LauncherError::Instance(format!("World '{}' not found", world_name)));
+    }
+    let backups_dir = world_backups_dir(instances_dir, instance_name, world_name);
+    std::fs::create_dir_all(&backups_dir)?;
+    let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let mut out_path = backups_dir.join(format!("{}__{}.zip", world_name, ts));
+    // Two backups in the same second must not clobber each other.
+    if out_path.exists() {
+        out_path = backups_dir.join(format!("{}__{}_{}.zip", world_name, ts, std::process::id()));
+    }
+    let filename = out_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let file = std::fs::File::create(&out_path)?;
+    let mut zip_w = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    add_dir_contents_to_zip(&mut zip_w, &world_dir, "", options)?;
+    zip_w.finish()?;
+    let size_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!(target: "launcher", "Backed up world '{}' of '{}' to {:?}", world_name, instance_name, out_path);
+    Ok(BackupInfo {
+        filename,
+        size_bytes,
+        created_at: chrono::Local::now().timestamp(),
+    })
+}
+
+/// List a world's backups, newest first. Missing directory yields an empty list.
+pub fn list_world_backups(
+    instances_dir: &PathBuf,
+    instance_name: &str,
+    world_name: &str,
+) -> Result<Vec<BackupInfo>> {
+    let dir = world_backups_dir(instances_dir, instance_name, world_name);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let fname = entry.file_name().to_string_lossy().to_string();
+        if !fname.to_ascii_lowercase().ends_with(".zip") {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        let created_at = meta
+            .created()
+            .or_else(|_| meta.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        out.push(BackupInfo {
+            filename: fname,
+            size_bytes: meta.len(),
+            created_at,
+        });
+    }
+    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(out)
+}
+
+/// Restore a world from a backup archive. `mode` is `"replace"` (overwrite the
+/// existing world) or `"as_new"` (extract into a new world named `new_name`).
+pub fn restore_world(
+    instances_dir: &PathBuf,
+    instance_name: &str,
+    world_name: &str,
+    backup_filename: &str,
+    mode: &str,
+    new_name: Option<&str>,
+) -> Result<()> {
+    validate_backup_filename(backup_filename)?;
+    let instance = get_instance(instances_dir, instance_name)?;
+    let saves_dir = instance.minecraft_dir(instances_dir).join("saves");
+    let backup_path =
+        world_backups_dir(instances_dir, instance_name, world_name).join(backup_filename);
+    if !backup_path.is_file() {
+        return Err(LauncherError::Instance(format!("Backup '{}' not found", backup_filename)));
+    }
+
+    let target_world = match mode {
+        "replace" => world_name.to_string(),
+        "as_new" => {
+            let n = new_name.unwrap_or("").trim();
+            if n.is_empty()
+                || n.len() > 64
+                || n.contains('/')
+                || n.contains('\\')
+                || n.contains(':')
+                || n.contains('\0')
+                || n.contains("..")
+            {
+                return Err(LauncherError::Instance(format!("Invalid world name: '{}'", n)));
+            }
+            n.to_string()
+        }
+        _ => return Err(LauncherError::Instance(format!("Unknown restore mode: '{}'", mode))),
+    };
+
+    let target_dir = saves_dir.join(&target_world);
+    // Replace: drop the existing world first (the backup is already on disk).
+    if mode == "replace" && target_dir.exists() {
+        std::fs::remove_dir_all(&target_dir)?;
+    }
+    if target_dir.exists() {
+        return Err(LauncherError::Instance(format!(
+            "A world named '{}' already exists",
+            target_world
+        )));
+    }
+
+    // Extract with zip-slip protection (blocks traversal, separators, and
+    // absolute/Windows drive paths via a `starts_with` check on the join).
+    let file = std::fs::File::open(&backup_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| LauncherError::Instance(format!("Invalid backup archive: {}", e)))?;
+    std::fs::create_dir_all(&target_dir)?;
+    for i in 0..archive.len() {
+        let mut entry =
+            archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        if name.is_empty()
+            || name.contains('\0')
+            || name.contains(':')
+            || name.starts_with('/')
+            || name.split('/').any(|c| c == "..")
+        {
+            continue;
+        }
+        let out_path = target_dir.join(&name);
+        if !out_path.starts_with(&target_dir) {
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut entry, &mut out)?;
+    }
+    tracing::info!(
+        target: "launcher",
+        "Restored world '{}' of '{}' from '{}' (mode {}) as '{}'",
+        world_name, instance_name, backup_filename, mode, target_world
+    );
+    Ok(())
+}
+
+/// Delete one stored world backup archive.
+pub fn delete_world_backup(
+    instances_dir: &PathBuf,
+    instance_name: &str,
+    world_name: &str,
+    backup_filename: &str,
+) -> Result<()> {
+    validate_backup_filename(backup_filename)?;
+    let path =
+        world_backups_dir(instances_dir, instance_name, world_name).join(backup_filename);
+    if !path.is_file() {
+        return Err(LauncherError::Instance(format!("Backup '{}' not found", backup_filename)));
+    }
+    std::fs::remove_file(&path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2633,6 +2873,139 @@ version = 'hIibTfxn'
             dir.join(".index").join("sodium.voidlauncher.json").exists(),
             "unrelated sidecar must survive"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_world(instances_dir: &PathBuf, instance: &Instance, world: &str, marker: &str) {
+        let world_dir = instance.minecraft_dir(instances_dir).join("saves").join(world);
+        std::fs::create_dir_all(world_dir.join("region")).unwrap();
+        std::fs::write(world_dir.join("level.dat"), format!("level-{}", marker)).unwrap();
+        std::fs::write(world_dir.join("region").join("r.0.0.mca"), format!("region-{}", marker)).unwrap();
+    }
+
+    #[test]
+    fn backup_world_creates_archive_and_restore_replace_overwrites() {
+        let dir = temp_dir("world_backup");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("WorldPack", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_world(&instances_dir, &instance, "MyWorld", "v1");
+
+        let info = backup_world(&instances_dir, "WorldPack", "MyWorld").unwrap();
+        assert!(info.filename.starts_with("MyWorld__") && info.filename.ends_with(".zip"));
+        assert!(info.size_bytes > 0);
+
+        let list = list_world_backups(&instances_dir, "WorldPack", "MyWorld").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].filename, info.filename);
+
+        // Damage the live world, then restore by replacing it.
+        let world_dir = instance.minecraft_dir(&instances_dir).join("saves").join("MyWorld");
+        std::fs::write(world_dir.join("level.dat"), "level-corrupted").unwrap();
+        restore_world(&instances_dir, "WorldPack", "MyWorld", &info.filename, "replace", None).unwrap();
+        assert_eq!(std::fs::read_to_string(world_dir.join("level.dat")).unwrap(), "level-v1");
+        assert_eq!(
+            std::fs::read_to_string(world_dir.join("region").join("r.0.0.mca")).unwrap(),
+            "region-v1"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_world_as_new_creates_distinct_world() {
+        let dir = temp_dir("world_restore_new");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("NewWorldPack", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_world(&instances_dir, &instance, "Src", "orig");
+
+        let info = backup_world(&instances_dir, "NewWorldPack", "Src").unwrap();
+        restore_world(
+            &instances_dir, "NewWorldPack", "Src", &info.filename, "as_new", Some("Restored Copy"),
+        )
+        .unwrap();
+
+        let saves = instance.minecraft_dir(&instances_dir).join("saves");
+        assert_eq!(
+            std::fs::read_to_string(saves.join("Restored Copy").join("level.dat")).unwrap(),
+            "level-orig"
+        );
+        // The source world is untouched.
+        assert_eq!(std::fs::read_to_string(saves.join("Src").join("level.dat")).unwrap(), "level-orig");
+
+        // as_new onto an existing name must fail (no overwrite outside "replace").
+        assert!(
+            restore_world(
+                &instances_dir, "NewWorldPack", "Src", &info.filename, "as_new", Some("Src")
+            )
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn world_backup_filename_traversal_rejected() {
+        let dir = temp_dir("world_traversal");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("TravPack", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_world(&instances_dir, &instance, "W", "x");
+        let decoy = instance.dir(&instances_dir).join("decoy.txt");
+        std::fs::write(&decoy, b"keep").unwrap();
+
+        for evil in [
+            "../decoy.txt.zip",
+            "..\\decoy.txt.zip",
+            "C:/Windows/x.zip",
+            "/abs.zip",
+            "no-extension",
+            ".hidden.zip",
+            "sub/name.zip",
+        ] {
+            assert!(
+                restore_world(&instances_dir, "TravPack", "W", evil, "replace", None).is_err(),
+                "filename {:?} must be rejected",
+                evil
+            );
+            assert!(
+                delete_world_backup(&instances_dir, "TravPack", "W", evil).is_err(),
+                "delete filename {:?} must be rejected",
+                evil
+            );
+        }
+        assert!(decoy.exists(), "decoy must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_world_backups_sorts_newest_first_and_delete_removes() {
+        let dir = temp_dir("world_backup_list");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("ListPack", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_world(&instances_dir, &instance, "LW", "a");
+
+        // No backups yet → empty list, no error.
+        assert!(list_world_backups(&instances_dir, "ListPack", "LW").unwrap().is_empty());
+
+        let a = backup_world(&instances_dir, "ListPack", "LW").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let b = backup_world(&instances_dir, "ListPack", "LW").unwrap();
+        assert_ne!(a.filename, b.filename, "same-second backups must not collide");
+
+        let list = list_world_backups(&instances_dir, "ListPack", "LW").unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].created_at >= list[1].created_at, "newest first");
+
+        delete_world_backup(&instances_dir, "ListPack", "LW", &a.filename).unwrap();
+        let after = list_world_backups(&instances_dir, "ListPack", "LW").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].filename, b.filename);
+        assert!(delete_world_backup(&instances_dir, "ListPack", "LW", &a.filename).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Globe, FolderOpen, Pencil, Copy, Trash2, KeyRound, RefreshCw } from 'lucide-react';
+import { Globe, FolderOpen, Pencil, Copy, Trash2, KeyRound, RefreshCw, Archive, RotateCcw } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Tooltip } from '../ui/Tooltip';
 import { Modal } from '../ui/Modal';
@@ -18,6 +18,12 @@ interface SaveEntry {
   icon_data: string | null;
 }
 
+interface BackupInfo {
+  filename: string;
+  size_bytes: number;
+  created_at: number;
+}
+
 interface Props {
   instanceName: string;
   onOpenFolder: () => void;
@@ -31,6 +37,16 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
   const [copyTarget, setCopyTarget] = useState<SaveEntry | null>(null);
   const [copyValue, setCopyValue] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<SaveEntry | null>(null);
+  const [backuping, setBackuping] = useState<string | null>(null);
+  const [restoreTarget, setRestoreTarget] = useState<SaveEntry | null>(null);
+  const [backups, setBackups] = useState<BackupInfo[]>([]);
+  const [backupsLoading, setBackupsLoading] = useState(false);
+  const [selectedBackup, setSelectedBackup] = useState<BackupInfo | null>(null);
+  const [asNewOpen, setAsNewOpen] = useState(false);
+  const [asNewName, setAsNewName] = useState('');
+  const [replaceConfirm, setReplaceConfirm] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [deleteBackup, setDeleteBackup] = useState<BackupInfo | null>(null);
 
   const loadSaves = useCallback(async () => {
     setLoading(true);
@@ -109,6 +125,80 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
     }
   };
 
+  const handleBackup = async (save: SaveEntry) => {
+    setBackuping(save.name);
+    try {
+      await invoke('cmd_backup_world', { instanceName, worldName: save.name });
+      addToast(t('worlds.backup_toast', { name: save.name }), 'success');
+    } catch (e: any) {
+      addToast(t('worlds.backup_error', { error: e.toString() }), 'error');
+    }
+    setBackuping(null);
+  };
+
+  const loadBackups = useCallback(async (worldName: string) => {
+    setBackupsLoading(true);
+    try {
+      const b = await invoke<BackupInfo[]>('cmd_list_world_backups', { instanceName, worldName });
+      setBackups(b);
+      setSelectedBackup(b[0] ?? null);
+    } catch (e: any) {
+      addToast(t('worlds.action_error', { error: e.toString() }), 'error');
+    }
+    setBackupsLoading(false);
+  }, [instanceName]);
+
+  const openRestore = (save: SaveEntry) => {
+    setRestoreTarget(save);
+    setBackups([]);
+    setSelectedBackup(null);
+    setAsNewOpen(false);
+    setReplaceConfirm(false);
+    loadBackups(save.name);
+  };
+
+  const doRestore = async (mode: 'replace' | 'as_new', newName?: string) => {
+    if (!restoreTarget || !selectedBackup) return;
+    setRestoring(true);
+    try {
+      await invoke('cmd_restore_world', {
+        instanceName,
+        worldName: restoreTarget.name,
+        backupFilename: selectedBackup.filename,
+        mode,
+        newName: newName ?? null,
+      });
+      if (mode === 'replace') {
+        addToast(t('worlds.restore_toast'), 'success');
+      } else {
+        addToast(t('worlds.restore_as_new_toast', { name: newName ?? '' }), 'success');
+      }
+      setRestoreTarget(null);
+      setAsNewOpen(false);
+      setReplaceConfirm(false);
+      loadSaves();
+    } catch (e: any) {
+      addToast(t('worlds.restore_error', { error: e.toString() }), 'error');
+    }
+    setRestoring(false);
+  };
+
+  const handleDeleteBackup = async () => {
+    if (!restoreTarget || !deleteBackup) return;
+    try {
+      await invoke('cmd_delete_world_backup', {
+        instanceName,
+        worldName: restoreTarget.name,
+        backupFilename: deleteBackup.filename,
+      });
+      addToast(t('worlds.backup_delete_toast'), 'success');
+      setDeleteBackup(null);
+      loadBackups(restoreTarget.name);
+    } catch (e: any) {
+      addToast(t('worlds.action_error', { error: e.toString() }), 'error');
+    }
+  };
+
   return (
     <div className="content-manager__pane" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <div style={{ padding: 'var(--space-md) var(--space-2xl)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', borderBottom: '1px solid var(--surface-border)', flexShrink: 0 }}>
@@ -135,7 +225,7 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
         ) : (
           saves.map((save) => (
             <div key={save.name} style={{
-              display: 'grid', gridTemplateColumns: '1fr 120px 100px 80px',
+              display: 'grid', gridTemplateColumns: '1fr 110px 90px 170px',
               padding: '8px var(--space-2xl)', alignItems: 'center',
               borderBottom: '1px solid var(--surface-border)', gap: 'var(--space-sm)',
             }}>
@@ -155,6 +245,12 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
               <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)' }}>{gameModeLabel(save.game_mode)}</div>
               <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', textAlign: 'right' }}>{formatSize(save.size_bytes)}</div>
               <div style={{ display: 'flex', gap: 2, justifyContent: 'flex-end' }}>
+                <Tooltip content={t('worlds.backup')}>
+                  <button onClick={() => handleBackup(save)} disabled={backuping === save.name} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: backuping === save.name ? 'var(--accent)' : 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Archive size={14} /></button>
+                </Tooltip>
+                <Tooltip content={t('worlds.restore')}>
+                  <button onClick={() => openRestore(save)} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><RotateCcw size={14} /></button>
+                </Tooltip>
                 <Tooltip content={t('worlds.rename')}><button onClick={() => { setRenameTarget(save); setRenameValue(save.name); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Pencil size={14} /></button></Tooltip>
                 <Tooltip content={t('worlds.copy')}><button onClick={() => { setCopyTarget(save); setCopyValue(`${save.name} ${t('worlds.copy_suffix')}`); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Copy size={14} /></button></Tooltip>
                 <Tooltip content={t('worlds.delete')}><button onClick={() => setDeleteTarget(save)} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Trash2 size={14} /></button></Tooltip>
@@ -199,6 +295,80 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
           <Button variant="ghost" onClick={() => setDeleteTarget(null)}>{t('common.cancel')}</Button>
           <Button variant="danger" onClick={handleDelete}>{t('worlds.delete')}</Button>
+        </div>
+      </Modal>
+
+      {/* Restore backups modal */}
+      <Modal open={!!restoreTarget} onClose={() => setRestoreTarget(null)} title={restoreTarget ? t('worlds.restore_title', { name: restoreTarget.name }) : ''} maxWidth={520}>
+        {backupsLoading ? (
+          <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>
+        ) : backups.length === 0 ? (
+          <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-tertiary)' }}>
+            <Archive size={28} style={{ opacity: 0.3, marginBottom: 'var(--space-sm)' }} />
+            <div>{t('worlds.restore_empty')}</div>
+            <div style={{ fontSize: 'var(--font-size-sm)', marginTop: 4 }}>{t('worlds.restore_hint')}</div>
+          </div>
+        ) : (
+          <>
+            <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-sm)' }}>
+              {t('worlds.backups_count', { n: backups.length.toString() })}
+            </div>
+            <div style={{ maxHeight: 260, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {backups.map((b) => (
+                <div key={b.filename} onClick={() => setSelectedBackup(b)} style={{
+                  display: 'flex', alignItems: 'center', gap: 'var(--space-sm)',
+                  padding: '8px 10px', borderRadius: 'var(--radius-sm)', cursor: 'pointer',
+                  border: selectedBackup?.filename === b.filename ? '1px solid var(--accent)' : '1px solid var(--surface-border)',
+                  background: selectedBackup?.filename === b.filename ? 'var(--accent-dim, rgba(255,255,255,0.04))' : 'transparent',
+                  transition: 'border-color 160ms ease, background 160ms ease',
+                }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500 }}>{formatDate(b.created_at)}</div>
+                    <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{formatSize(b.size_bytes)}</div>
+                  </div>
+                  <Tooltip content={t('worlds.backup_delete')}>
+                    <button onClick={(e) => { e.stopPropagation(); setDeleteBackup(b); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Trash2 size={14} /></button>
+                  </Tooltip>
+                </div>
+              ))}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
+              <Button variant="ghost" onClick={() => setRestoreTarget(null)}>{t('common.cancel')}</Button>
+              <Button variant="ghost" disabled={!selectedBackup} onClick={() => { setAsNewName(`${restoreTarget?.name ?? ''} ${t('worlds.copy_suffix')}`.trim()); setAsNewOpen(true); }}>{t('worlds.restore_as_new')}</Button>
+              <Button variant="danger" disabled={!selectedBackup} onClick={() => setReplaceConfirm(true)}>{t('worlds.restore_replace')}</Button>
+            </div>
+          </>
+        )}
+      </Modal>
+
+      {/* Restore as new name modal */}
+      <Modal open={asNewOpen} onClose={() => setAsNewOpen(false)} title={t('worlds.restore_as_new')}>
+        <Input label={t('worlds.restore_as_new_label')} id="world-restore-asnew" value={asNewName} onChange={(e) => setAsNewName(e.target.value)} autoFocus />
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
+          <Button variant="ghost" onClick={() => setAsNewOpen(false)}>{t('common.cancel')}</Button>
+          <Button disabled={!asNewName.trim() || restoring} onClick={() => doRestore('as_new', asNewName.trim())}>{t('common.confirm')}</Button>
+        </div>
+      </Modal>
+
+      {/* Replace-world confirmation */}
+      <Modal open={replaceConfirm} onClose={() => setReplaceConfirm(false)} title={t('worlds.restore_replace')}>
+        <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
+          {t('worlds.restore_replace_confirm', { name: restoreTarget?.name ?? '' })}
+        </p>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
+          <Button variant="ghost" onClick={() => setReplaceConfirm(false)}>{t('common.cancel')}</Button>
+          <Button variant="danger" disabled={restoring} onClick={() => doRestore('replace')}>{t('worlds.restore_replace')}</Button>
+        </div>
+      </Modal>
+
+      {/* Delete backup confirmation */}
+      <Modal open={!!deleteBackup} onClose={() => setDeleteBackup(null)} title={t('worlds.backup_delete')}>
+        <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
+          {t('worlds.backup_delete_confirm', { filename: deleteBackup?.filename ?? '' })}
+        </p>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
+          <Button variant="ghost" onClick={() => setDeleteBackup(null)}>{t('common.cancel')}</Button>
+          <Button variant="danger" onClick={handleDeleteBackup}>{t('common.confirm')}</Button>
         </div>
       </Modal>
     </div>

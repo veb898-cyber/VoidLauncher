@@ -430,6 +430,97 @@ pub async fn cmd_delete_world(
 }
 
 #[tauri::command]
+pub async fn cmd_backup_world(
+    state: State<'_, AppState>,
+    instance_name: String,
+    world_name: String,
+) -> Result<instances::BackupInfo, String> {
+    validate_instance_name(&instance_name)?;
+    validate_world_name(&world_name)?;
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::backup_world(&instances_dir, &instance_name, &world_name)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cmd_list_world_backups(
+    state: State<'_, AppState>,
+    instance_name: String,
+    world_name: String,
+) -> Result<Vec<instances::BackupInfo>, String> {
+    validate_instance_name(&instance_name)?;
+    validate_world_name(&world_name)?;
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::list_world_backups(&instances_dir, &instance_name, &world_name)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cmd_restore_world(
+    state: State<'_, AppState>,
+    instance_name: String,
+    world_name: String,
+    backup_filename: String,
+    mode: String,
+    new_name: Option<String>,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    validate_world_name(&world_name)?;
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::restore_world(
+            &instances_dir,
+            &instance_name,
+            &world_name,
+            &backup_filename,
+            &mode,
+            new_name.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cmd_delete_world_backup(
+    state: State<'_, AppState>,
+    instance_name: String,
+    world_name: String,
+    backup_filename: String,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    validate_world_name(&world_name)?;
+    let instances_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.instances_dir()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::delete_world_backup(&instances_dir, &instance_name, &world_name, &backup_filename)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn cmd_list_screenshots(
     state: State<'_, AppState>,
     instance_name: String,
