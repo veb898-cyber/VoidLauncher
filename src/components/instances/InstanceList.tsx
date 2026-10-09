@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Plus, Package, Play, Settings, FolderOpen, Trash2 } from 'lucide-react';
+import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { t } from '../../lib/i18n';
@@ -9,6 +9,7 @@ import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { EmptyState } from '../ui/EmptyState';
 import { ProgressBar } from '../ui/ProgressBar';
 import { InstanceEditor } from './InstanceEditor';
+import { VerifyRepairModal } from './VerifyRepairModal';
 import { useEventStore } from '../../hooks/useGameEvents';
 
 interface InstanceListProps {
@@ -33,6 +34,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [deleteConfirmName, setDeleteConfirmName] = useState<string | null>(null);
   const [editorName, setEditorName] = useState<string | null>(null);
+  const [verifyName, setVerifyName] = useState<string | null>(null);
   const editorInstance = editorName ? instances.find((i) => i.name === editorName) ?? null : null;
 
   const installingName = installProgress?.instance_id || null;
@@ -172,7 +174,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           className="ctx-menu"
           style={{
             left: Math.min(contextMenu.x, window.innerWidth - 200),
-            top: Math.min(contextMenu.y, window.innerHeight - 170),
+            top: Math.min(contextMenu.y, window.innerHeight - 210),
           }}
           onMouseDown={(e) => e.stopPropagation()}
         >
@@ -182,9 +184,20 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
             onClick={() => { setEditorName(contextMenu.name); setContextMenu(null); }} />
           <ContextMenuItem icon={<FolderOpen size={14} />} label={t('instances.ctx_open_folder')}
             onClick={() => { openFolder(contextMenu.name); setContextMenu(null); }} />
+          <ContextMenuItem icon={<ShieldCheck size={14} />} label={t('instances.ctx_verify')}
+            onClick={() => { setVerifyName(contextMenu.name); setContextMenu(null); }} />
           <ContextMenuItem icon={<Trash2 size={14} />} label={t('common.delete')} danger
             onClick={() => { setDeleteConfirmName(contextMenu.name); setContextMenu(null); }} />
         </div>
+      )}
+
+      {/* Verify / Repair modal */}
+      {verifyName && (
+        <VerifyRepairModal
+          open
+          instanceName={verifyName}
+          onClose={() => setVerifyName(null)}
+        />
       )}
 
       {/* Instance Settings Editor (opened from the card context menu) */}

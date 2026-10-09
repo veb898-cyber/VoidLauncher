@@ -22,6 +22,7 @@ mod modrinth;
 mod playtime;
 mod rooms;
 mod versions;
+mod verify;
 
 #[cfg(test)]
 mod smoke_launch;
@@ -332,6 +333,8 @@ pub fn run() {
             commands::rooms::cmd_room_join_args,
             commands::rooms::cmd_room_quick_play_join_status,
             commands::rooms::cmd_room_open_admin_console,
+            commands::verify::cmd_verify_instance,
+            commands::verify::cmd_repair_instance,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {

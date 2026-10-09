@@ -296,7 +296,7 @@ pub fn maven_to_path(name: &str) -> String {
 
 /// Return the native classifier for the current OS (e.g. "natives-windows")
 /// by reading the library's `natives` map, or None if not applicable.
-fn native_classifier(lib: &Library) -> Option<String> {
+pub(crate) fn native_classifier(lib: &Library) -> Option<String> {
     let natives = lib.natives.as_ref()?;
     let os_map = natives.as_object()?;
     let os_key = match std::env::consts::OS {
