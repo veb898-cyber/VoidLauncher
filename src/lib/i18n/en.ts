@@ -133,6 +133,9 @@ export const en = {
   'instances.ctx_settings':            'Instance Settings',
   'instances.ctx_open_folder':         'Open Folder',
   'instances.ctx_verify':              'Verify Files',
+  'instances.ctx_export':              'Export (Prism)',
+  'instances.export_success':          'Instance "{name}" exported',
+  'instances.export_error':            'Export failed: {error}',
 
   // ── Verify / Repair ─────────────────────────────────────────
   'verify.title':                      'File Verification',

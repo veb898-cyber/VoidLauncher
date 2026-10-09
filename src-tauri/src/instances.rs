@@ -232,6 +232,9 @@ pub fn save_instance(instances_dir: &PathBuf, instance: &Instance, old_name: Opt
     // Write Prism-compatible instance.cfg
     write_prism_cfg(instance, instances_dir)?;
 
+    // Write Prism-compatible mmc-pack.json
+    write_mmc_pack_json(instance, instances_dir)?;
+
     // Write pack.png if instance has an icon
     if let Some(ref icon) = instance.icon {
         write_pack_png(instances_dir, &instance.name, icon);
@@ -1306,23 +1309,53 @@ pub fn update_last_played(instances_dir: &PathBuf, name: &str) -> Result<()> {
 /// Write a Prism/MultiMC-compatible instance.cfg from our Instance
 fn write_prism_cfg(instance: &Instance, instances_dir: &PathBuf) -> Result<()> {
     let cfg_path = instance.prism_cfg_file(instances_dir);
-    let last_launch = instance.last_played.as_ref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.timestamp())
-        .unwrap_or(0);
+    std::fs::write(&cfg_path, build_prism_cfg_content(instance))?;
+    Ok(())
+}
 
-    let mut lines = Vec::new();
-    lines.push("[General]".to_string());
-    lines.push(format!("name={}", instance.name));
-    lines.push(format!("iconKey={}", instance.name));
-    lines.push("notes=".to_string());
-    lines.push(format!("lastLaunchTime={}", last_launch));
-    lines.push(format!("totalTimePlayed={}", instance.play_time_seconds));
-    lines.push(String::new());
-    lines.push("[MultiMC]".to_string());
-    lines.push("autoCloseMinecraft=false".to_string());
+/// Build a Prism/MultiMC-compatible `mmc-pack.json` string from our Instance.
+/// This is what Prism (and MultiMC-derived launchers) read to determine the
+/// Minecraft version and mod loader of an instance.
+fn build_mmc_pack_json(instance: &Instance) -> Result<String> {
+    let mut components = Vec::new();
+    components.push(serde_json::json!({
+        "uid": "net.minecraft",
+        "version": instance.mc_version,
+        "important": true,
+    }));
+    match instance.loader {
+        LoaderType::Vanilla => {}
+        LoaderType::Fabric => {
+            components.push(serde_json::json!({
+                "uid": "net.fabricmc.fabric-loader",
+                "version": instance.loader_version.clone().unwrap_or_default(),
+            }));
+        }
+        LoaderType::Forge => {
+            components.push(serde_json::json!({
+                "uid": "net.minecraftforge",
+                "version": instance.loader_version.clone().unwrap_or_default(),
+            }));
+        }
+        LoaderType::NeoForge => {
+            components.push(serde_json::json!({
+                "uid": "net.neoforged",
+                "version": instance.loader_version.clone().unwrap_or_default(),
+            }));
+        }
+    }
+    let pack = serde_json::json!({
+        "components": components,
+        "formatVersion": 1,
+    });
+    Ok(serde_json::to_string_pretty(&pack)?)
+}
 
-    std::fs::write(&cfg_path, lines.join("\n"))?;
+/// Write Prism-compatible `mmc-pack.json` into the instance directory so the
+/// folder is browsable/importable by Prism-derived launchers at any time.
+fn write_mmc_pack_json(instance: &Instance, instances_dir: &PathBuf) -> Result<()> {
+    let path = instance.dir(instances_dir).join("mmc-pack.json");
+    std::fs::write(&path, build_mmc_pack_json(instance)?)?;
     Ok(())
 }
 
@@ -1393,17 +1426,18 @@ pub fn parse_prism_cfg(cfg_path: &std::path::Path) -> Option<Instance> {
 }
 
 /// Parse Prism/MultiMC `mmc-pack.json` (components) into our metadata.
-/// Returns (mc_version, loader, loader_version).
-fn parse_prism_mmc_pack(content: &str) -> (String, LoaderType, Option<String>) {
+/// Returns (mc_version, loader, loader_version). Quilt packs are rejected —
+/// Quilt is not supported by VoidLauncher.
+fn parse_prism_mmc_pack(content: &str) -> Result<(String, LoaderType, Option<String>)> {
     let mut mc_version = String::new();
     let mut loader = LoaderType::Vanilla;
     let mut loader_version: Option<String> = None;
 
     let Ok(pack) = serde_json::from_str::<serde_json::Value>(content) else {
-        return (mc_version, loader, loader_version);
+        return Ok((mc_version, loader, loader_version));
     };
     let Some(components) = pack["components"].as_array() else {
-        return (mc_version, loader, loader_version);
+        return Ok((mc_version, loader, loader_version));
     };
 
     for comp in components {
@@ -1418,9 +1452,15 @@ fn parse_prism_mmc_pack(content: &str) -> (String, LoaderType, Option<String>) {
                     mc_version = ver.to_string();
                 }
             }
-            "net.fabricmc.fabric-loader" | "org.quiltmc.quilt-loader" => {
+            "net.fabricmc.fabric-loader" => {
                 loader = LoaderType::Fabric;
                 loader_version = Some(ver.to_string());
+            }
+            "org.quiltmc.quilt-loader" => {
+                return Err(LauncherError::Instance(
+                    "This instance requires Quilt, which is not supported by VoidLauncher."
+                        .to_string(),
+                ));
             }
             "net.minecraftforge" => {
                 loader = LoaderType::Forge;
@@ -1434,7 +1474,7 @@ fn parse_prism_mmc_pack(content: &str) -> (String, LoaderType, Option<String>) {
         }
     }
 
-    (mc_version, loader, loader_version)
+    Ok((mc_version, loader, loader_version))
 }
 
 /// Import a Prism Launcher instance.zip into VoidLauncher instances dir.
@@ -1495,7 +1535,7 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
                     .unwrap_or("imported")
                     .to_string()
             });
-        let (mc_version, loader, loader_version) = parse_prism_mmc_pack(&pack_content);
+        let (mc_version, loader, loader_version) = parse_prism_mmc_pack(&pack_content)?;
         (name, mc_version, loader, loader_version)
     };
 
@@ -1623,7 +1663,22 @@ pub fn import_prism_pack(instances_dir: &PathBuf, zip_path: &str) -> Result<Inst
     Ok(instance)
 }
 
-/// Export an instance as a .zip archive (compatible with Prism/MultiMC format)
+/// Export an instance as a Prism/MultiMC-compatible .zip archive.
+///
+/// The archive layout matches what Prism Launcher produces and expects:
+/// ```text
+/// MyInstance/
+/// ├── instance.cfg
+/// ├── mmc-pack.json
+/// ├── pack.png          (when the instance has an icon)
+/// └── minecraft/        (game dir, no leading dot)
+///     ├── mods/
+///     ├── config/
+///     └── ...
+/// ```
+/// VoidLauncher-internal files (`instance.json`) and per-launch junk
+/// (logs, crash-reports, caches) are excluded. Files are streamed into the
+/// archive, so large saves do not load into memory.
 pub fn export_instance(instances_dir: &PathBuf, name: &str, output_path: &str) -> Result<()> {
     use zip::write::SimpleFileOptions;
 
@@ -1639,40 +1694,99 @@ pub fn export_instance(instances_dir: &PathBuf, name: &str, output_path: &str) -
     let options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
-    fn add_dir_to_zip(
-        zip: &mut zip::ZipWriter<std::fs::File>,
-        dir: &std::path::Path,
-        base_prefix: &str,
-        options: SimpleFileOptions,
-    ) -> Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            let zip_path = if base_prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", base_prefix, name)
-            };
+    // Prism metadata files, generated fresh from our Instance so the archive
+    // is always current even if on-disk copies are stale.
+    zip_w.start_file("instance.cfg", options)?;
+    let cfg_lines = build_prism_cfg_content(&instance);
+    std::io::Write::write_all(&mut zip_w, cfg_lines.as_bytes())?;
 
-            if path.is_dir() {
-                zip.add_directory(&zip_path, options)?;
-                add_dir_to_zip(zip, &path, &zip_path, options)?;
-            } else {
-                let mut file = std::fs::File::open(&path)?;
-                let mut buf = Vec::new();
-                file.read_to_end(&mut buf)?;
-                zip.start_file(&zip_path, options)?;
-                std::io::Write::write_all(zip, &buf)?;
-            }
-        }
-        Ok(())
+    zip_w.start_file("mmc-pack.json", options)?;
+    let mmc_pack = build_mmc_pack_json(&instance)?;
+    std::io::Write::write_all(&mut zip_w, mmc_pack.as_bytes())?;
+
+    // pack.png — prefer the in-memory icon, fall back to the on-disk copy
+    // written by save_instance.
+    let icon_bytes: Option<Vec<u8>> = instance
+        .icon
+        .as_ref()
+        .and_then(|icon| icon.split(";base64,").nth(1))
+        .and_then(base64_decode)
+        .or_else(|| std::fs::read(instance_dir.join("pack.png")).ok());
+    if let Some(bytes) = icon_bytes {
+        zip_w.start_file("pack.png", options)?;
+        std::io::Write::write_all(&mut zip_w, &bytes)?;
     }
 
-    add_dir_to_zip(&mut zip_w, &instance_dir, "", options)?;
+    // Game directory: our `.minecraft/` → Prism `minecraft/`.
+    let mc_dir = instance.minecraft_dir(instances_dir);
+    if mc_dir.exists() {
+        add_minecraft_dir_to_zip(&mut zip_w, &mc_dir, "minecraft", options)?;
+    }
+
     zip_w.finish()?;
 
     tracing::info!(target: "launcher", "Exported instance '{}' to {:?}", name, out_path);
+    Ok(())
+}
+
+/// Render the `[General]`/`[MultiMC]` body of a Prism instance.cfg as a
+/// string (shared by on-disk save and zip export).
+fn build_prism_cfg_content(instance: &Instance) -> String {
+    let last_launch = instance.last_played.as_ref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0);
+
+    let mut lines = Vec::new();
+    lines.push("[General]".to_string());
+    lines.push("ConfigVersion=1.3".to_string());
+    lines.push("InstanceType=OneSix".to_string());
+    lines.push(format!("name={}", instance.name));
+    lines.push(format!("iconKey={}", instance.name));
+    lines.push(format!("notes={}", instance.notes.replace('\n', "\\n")));
+    lines.push(format!("lastLaunchTime={}", last_launch));
+    lines.push(format!("totalTimePlayed={}", instance.play_time_seconds));
+    lines.push(String::new());
+    lines.push("[MultiMC]".to_string());
+    lines.push("autoCloseMinecraft=false".to_string());
+    lines.join("\n")
+}
+
+/// Stream a directory tree into the zip under `prefix/`, skipping launch
+/// junk (logs, crash-reports, caches) and `.voidlauncher-old` stash files
+/// left by transactional content updates. Files are copied in chunks, not
+/// buffered whole.
+fn add_minecraft_dir_to_zip(
+    zip: &mut zip::ZipWriter<std::fs::File>,
+    dir: &std::path::Path,
+    prefix: &str,
+    options: zip::write::SimpleFileOptions,
+) -> Result<()> {
+    fn is_junk(name: &str) -> bool {
+        name == "logs"
+            || name == "crash-reports"
+            || name == ".bobby"
+            || name == ".mixin.out"
+            || name.ends_with(".voidlauncher-old")
+    }
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_junk(&name) {
+            continue;
+        }
+        let zip_path = format!("{}/{}", prefix, name);
+        if path.is_dir() {
+            zip.add_directory(&zip_path, options)?;
+            add_minecraft_dir_to_zip(zip, &path, &zip_path, options)?;
+        } else {
+            zip.start_file(&zip_path, options)?;
+            let mut file = std::fs::File::open(&path)?;
+            std::io::copy(&mut file, zip)?;
+        }
+    }
     Ok(())
 }
 
@@ -2121,6 +2235,151 @@ version = 'hIibTfxn'
         assert_eq!(instance.mc_version, "");
         assert_eq!(instance.loader, LoaderType::Vanilla);
         assert!(instances_dir.join("Old Pack").join(".minecraft/mods/old.jar").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_instance(name: &str, mc: &str, loader: LoaderType, lv: Option<&str>) -> Instance {
+        Instance {
+            name: name.into(),
+            mc_version: mc.into(),
+            loader,
+            loader_version: lv.map(String::from),
+            loader_profile: None,
+            memory_mb: None,
+            jvm_args: None,
+            gc_preset: None,
+            java_path: None,
+            resolution: None,
+            icon: None,
+            banner: None,
+            created_at: Utc::now().to_rfc3339(),
+            last_played: None,
+            play_time_seconds: 0,
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn save_instance_writes_prism_metadata_files() {
+        let dir = temp_dir("save_meta");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("MetaPack", "1.21.1", LoaderType::NeoForge, Some("21.1.135"));
+        save_instance(&instances_dir, &instance, None).unwrap();
+
+        let root = instances_dir.join("MetaPack");
+        assert!(root.join("instance.cfg").exists());
+        assert!(root.join("mmc-pack.json").exists());
+
+        let pack: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("mmc-pack.json")).unwrap())
+                .unwrap();
+        let comps = pack["components"].as_array().unwrap();
+        assert_eq!(comps[0]["uid"], "net.minecraft");
+        assert_eq!(comps[0]["version"], "1.21.1");
+        assert_eq!(comps[1]["uid"], "net.neoforged");
+        assert_eq!(comps[1]["version"], "21.1.135");
+
+        let cfg = std::fs::read_to_string(root.join("instance.cfg")).unwrap();
+        assert!(cfg.contains("InstanceType=OneSix"), "cfg must mark modern instance: {}", cfg);
+        assert!(cfg.contains("name=MetaPack"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prism_export_writes_prism_layout() {
+        let dir = temp_dir("export_layout");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("ExportPack", "1.20.1", LoaderType::Fabric, Some("0.15.11"));
+        save_instance(&instances_dir, &instance, None).unwrap();
+
+        let mc_dir = instance.minecraft_dir(&instances_dir);
+        std::fs::create_dir_all(mc_dir.join("mods")).unwrap();
+        std::fs::write(mc_dir.join("mods/testmod.jar"), b"PK\x03\x04jar").unwrap();
+        std::fs::create_dir_all(mc_dir.join("logs")).unwrap();
+        std::fs::write(mc_dir.join("logs/latest.log"), b"junk").unwrap();
+        std::fs::create_dir_all(mc_dir.join("crash-reports")).unwrap();
+        std::fs::write(mc_dir.join("crash-reports/crash.txt"), b"junk").unwrap();
+
+        let out = dir.join("export.zip");
+        export_instance(&instances_dir, "ExportPack", out.to_str().unwrap()).unwrap();
+
+        let file = std::fs::File::open(&out).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+
+        assert!(names.contains(&"instance.cfg".to_string()), "{:?}", names);
+        assert!(names.contains(&"mmc-pack.json".to_string()), "{:?}", names);
+        assert!(
+            names.contains(&"minecraft/mods/testmod.jar".to_string()),
+            "game dir must be minecraft/ (no dot): {:?}",
+            names
+        );
+        assert!(!names.iter().any(|n| n.starts_with(".minecraft")), "no dotted dir: {:?}", names);
+        assert!(!names.iter().any(|n| n.contains("instance.json")), "internal metadata excluded: {:?}", names);
+        assert!(!names.iter().any(|n| n.contains("logs")), "logs excluded: {:?}", names);
+        assert!(!names.iter().any(|n| n.contains("crash-reports")), "crash reports excluded: {:?}", names);
+
+        let mut mmc = String::new();
+        archive.by_name("mmc-pack.json").unwrap().read_to_string(&mut mmc).unwrap();
+        let pack: serde_json::Value = serde_json::from_str(&mmc).unwrap();
+        assert_eq!(pack["formatVersion"], 1);
+        let comps = pack["components"].as_array().unwrap();
+        assert_eq!(comps[0]["uid"], "net.minecraft");
+        assert_eq!(comps[0]["important"], true);
+        assert_eq!(comps[1]["uid"], "net.fabricmc.fabric-loader");
+        assert_eq!(comps[1]["version"], "0.15.11");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prism_export_round_trip_preserves_instance() {
+        let dir = temp_dir("round_trip");
+        let src_dir = dir.join("src_instances");
+        let instance = test_instance("RoundTrip", "1.20.1", LoaderType::Forge, Some("47.2.0"));
+        save_instance(&src_dir, &instance, None).unwrap();
+        let mc_dir = instance.minecraft_dir(&src_dir);
+        std::fs::create_dir_all(mc_dir.join("mods")).unwrap();
+        std::fs::write(mc_dir.join("mods/sodium.jar"), b"PK\x03\x04jar").unwrap();
+
+        let out = dir.join("round.zip");
+        export_instance(&src_dir, "RoundTrip", out.to_str().unwrap()).unwrap();
+
+        let dst_dir = dir.join("dst_instances");
+        let imported = import_prism_pack(&dst_dir, out.to_str().unwrap()).unwrap();
+        assert_eq!(imported.name, "RoundTrip");
+        assert_eq!(imported.mc_version, "1.20.1");
+        assert_eq!(imported.loader, LoaderType::Forge);
+        assert_eq!(imported.loader_version.as_deref(), Some("47.2.0"));
+        assert!(dst_dir.join("RoundTrip/.minecraft/mods/sodium.jar").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prism_import_rejects_quilt_packs() {
+        let dir = temp_dir("quilt_reject");
+        let zip_path = dir.join("quilt.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_w = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip_w.start_file("instance.cfg", opts).unwrap();
+        zip_w.write_all(b"[General]\nname=Quilt Pack\n").unwrap();
+        zip_w.start_file("mmc-pack.json", opts).unwrap();
+        zip_w.write_all(
+            br#"{"components":[{"uid":"net.minecraft","version":"1.20.1"},{"uid":"org.quiltmc.quilt-loader","version":"0.20.2"}],"formatVersion":1}"#,
+        )
+        .unwrap();
+        zip_w.finish().unwrap();
+
+        let instances_dir = dir.join("instances");
+        let err = import_prism_pack(&instances_dir, zip_path.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("Quilt"), "error must name Quilt: {}", err);
+        assert!(!instances_dir.join("Quilt Pack").exists(), "no instance written on rejection");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

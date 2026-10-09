@@ -410,7 +410,7 @@ pub fn launch_minecraft(
     // Main class selection:
     //   - Vanilla: use VoidLauncherEntry wrapper to avoid module-system
     //     derivation errors (client.jar has classes in unnamed package).
-    //   - Forge/NeoForge/Fabric/Quilt: use the loader profile's main class
+    //   - Forge/NeoForge/Fabric: use the loader profile's main class
     //     directly. Its -p (module path) contains the bootstrap JARs and the
     //     real main class lives there — Class.forName from our entry point
     //     would NOT find it because it only searches the classpath.

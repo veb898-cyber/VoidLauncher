@@ -5,7 +5,7 @@
  *
  * Technical / untranslatable terms kept in English:
  *   Minecraft, Java, RAM, Xmx, Xms, G1GC, ZGC, JVM, Modrinth,
- *   CurseForge, Fabric, Quilt, Forge, NeoForge, Vanilla, LWJGL,
+ *   CurseForge, Fabric, Forge, NeoForge, Vanilla, LWJGL,
  *   Microsoft, Windows, NVIDIA, OpenGL, VoidLauncher, Tauri, React,
  *   C++ (OpenAL), Hypixel, Realms, Mojang, Mojang Studios.
  *   Variable tokens like {name}, {count}, {error} are kept verbatim.
@@ -137,6 +137,9 @@ export const ru: Record<string, string> = {
   'instances.ctx_settings':            'Настройки сборки',
   'instances.ctx_open_folder':         'Открыть папку',
   'instances.ctx_verify':              'Проверка файлов',
+  'instances.ctx_export':              'Экспорт (Prism)',
+  'instances.export_success':          'Сборка «{name}» экспортирована',
+  'instances.export_error':            'Ошибка экспорта: {error}',
 
   // ── Verify / Repair ─────────────────────────────────────────
   'verify.title':                      'Проверка файлов',

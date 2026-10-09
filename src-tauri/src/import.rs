@@ -819,15 +819,7 @@ pub(crate) async fn import_mrpack(
     // Detect loader from dependencies
     let deps = index["dependencies"].as_object().cloned().unwrap_or_default();
     let (loader, loader_version) = detect_mrpack_loader(&deps);
-    let ldr_type = match loader.as_deref() {
-        Some("neoforge") => LoaderType::NeoForge,
-        Some("forge") => LoaderType::Forge,
-        Some("fabric-loader") | Some("fabric") => LoaderType::Fabric,
-        // Quilt is not supported yet; report Fabric so the UI doesn't
-        // claim the pack is vanilla.
-        Some("quilt-loader") => LoaderType::Fabric,
-        _ => LoaderType::Vanilla,
-    };
+    let ldr_type = mrpack_loader_type(loader.as_deref())?;
 
     let now = chrono::Utc::now().to_rfc3339();
     let instance = Instance {
@@ -1191,6 +1183,23 @@ fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &s
     Ok(instance)
 }
 
+/// Map a detected mrpack loader key to our LoaderType. Quilt is rejected
+/// with a clear error — Quilt mods are not always Fabric-compatible, so a
+/// silent conversion would produce a broken instance.
+fn mrpack_loader_type(loader: Option<&str>) -> Result<LoaderType> {
+    Ok(match loader {
+        Some("neoforge") => LoaderType::NeoForge,
+        Some("forge") => LoaderType::Forge,
+        Some("fabric-loader") | Some("fabric") => LoaderType::Fabric,
+        Some("quilt-loader") => {
+            return Err(LauncherError::Instance(
+                "This pack requires Quilt, which is not supported by VoidLauncher.".to_string(),
+            ));
+        }
+        _ => LoaderType::Vanilla,
+    })
+}
+
 /// Deterministic loader detection from an mrpack manifest's dependencies
 /// object. Keys can be "fabric-loader", "forge", "neoforge", "quilt-loader"
 /// — and JSON key order is not guaranteed, so we probe known keys in
@@ -1267,6 +1276,28 @@ mod tests {
         let (l, v) = detect_mrpack_loader(&deps);
         assert_eq!(l, None);
         assert_eq!(v, None);
+    }
+
+    #[test]
+    fn mrpack_loader_type_maps_supported_loaders() {
+        assert_eq!(mrpack_loader_type(None).unwrap(), LoaderType::Vanilla);
+        assert_eq!(
+            mrpack_loader_type(Some("fabric-loader")).unwrap(),
+            LoaderType::Fabric
+        );
+        assert_eq!(mrpack_loader_type(Some("fabric")).unwrap(), LoaderType::Fabric);
+        assert_eq!(mrpack_loader_type(Some("forge")).unwrap(), LoaderType::Forge);
+        assert_eq!(mrpack_loader_type(Some("neoforge")).unwrap(), LoaderType::NeoForge);
+    }
+
+    #[test]
+    fn mrpack_loader_type_rejects_quilt() {
+        let err = mrpack_loader_type(Some("quilt-loader")).unwrap_err();
+        assert!(
+            err.to_string().contains("Quilt"),
+            "error must name Quilt: {}",
+            err
+        );
     }
 
     #[test]

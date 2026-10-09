@@ -112,7 +112,7 @@ struct PrismVersionEntry {
     /// What MC / mapping / dependency versions this loader build
     /// requires. For Forge/NeoForge, one entry has
     /// `uid == "net.minecraft"` and `equals == "<mc version>"`. For
-    /// Fabric/Quilt the only requirement is `net.fabricmc.intermediary`
+    /// Fabric the only requirement is `net.fabricmc.intermediary`
     /// (no `equals`) so the loader works for *every* MC version.
     #[serde(default)]
     requires: Vec<PrismRequire>,
@@ -122,7 +122,7 @@ struct PrismVersionEntry {
 struct PrismRequire {
     #[allow(dead_code)]
     uid: String,
-    /// Missing for Fabric/Quilt (they don't pin a specific MC version
+    /// Missing for Fabric (it doesn't pin a specific MC version
     /// here — the binding is in the intermediary mappings).
     #[serde(default)]
     equals: Option<String>,
@@ -265,7 +265,7 @@ fn page_from(
 /// mirror, optionally filtered to entries that target a specific
 /// Minecraft version.
 ///
-/// * `mc_version = None` → no MC filter (Fabric, Quilt).
+/// * `mc_version = None` → no MC filter (Fabric).
 /// * `mc_version = Some(mc)` → only entries whose `requires` array
 ///   contains `{uid: "net.minecraft", equals: mc}` (Forge,
 ///   NeoForge).

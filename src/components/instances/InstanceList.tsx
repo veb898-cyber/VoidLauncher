@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck } from 'lucide-react';
+import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck, Download } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { t } from '../../lib/i18n';
@@ -8,6 +8,7 @@ import { Button } from '../ui/Button';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { EmptyState } from '../ui/EmptyState';
 import { ProgressBar } from '../ui/ProgressBar';
+import { addToast } from '../ui/Toast';
 import { InstanceEditor } from './InstanceEditor';
 import { VerifyRepairModal } from './VerifyRepairModal';
 import { useEventStore } from '../../hooks/useGameEvents';
@@ -52,6 +53,24 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
       await invoke('cmd_open_instance_folder', { instanceName: name, subfolder: subfolder ?? null });
     } catch (e) {
       console.error('Failed to open instance folder:', e);
+    }
+  };
+
+  // Export the instance as a Prism-compatible .zip the user can import
+  // into Prism Launcher or share. The save dialog suggests `<name>.zip`.
+  const handleExport = async (name: string) => {
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const selected = await save({
+        defaultPath: `${name}.zip`,
+        filters: [{ name: 'Zip archive', extensions: ['zip'] }],
+      });
+      if (!selected) return;
+      const path = selected.toLowerCase().endsWith('.zip') ? selected : `${selected}.zip`;
+      await invoke('cmd_export_instance', { name, outputPath: path });
+      addToast(t('instances.export_success', { name }), 'success');
+    } catch (e: any) {
+      addToast(t('instances.export_error', { error: e.toString() }), 'error');
     }
   };
 
@@ -174,7 +193,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           className="ctx-menu"
           style={{
             left: Math.min(contextMenu.x, window.innerWidth - 200),
-            top: Math.min(contextMenu.y, window.innerHeight - 210),
+            top: Math.min(contextMenu.y, window.innerHeight - 250),
           }}
           onMouseDown={(e) => e.stopPropagation()}
         >
@@ -186,6 +205,8 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
             onClick={() => { openFolder(contextMenu.name); setContextMenu(null); }} />
           <ContextMenuItem icon={<ShieldCheck size={14} />} label={t('instances.ctx_verify')}
             onClick={() => { setVerifyName(contextMenu.name); setContextMenu(null); }} />
+          <ContextMenuItem icon={<Download size={14} />} label={t('instances.ctx_export')}
+            onClick={() => { handleExport(contextMenu.name); setContextMenu(null); }} />
           <ContextMenuItem icon={<Trash2 size={14} />} label={t('common.delete')} danger
             onClick={() => { setDeleteConfirmName(contextMenu.name); setContextMenu(null); }} />
         </div>
