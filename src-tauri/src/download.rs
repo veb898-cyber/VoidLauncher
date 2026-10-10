@@ -1282,4 +1282,97 @@ mod tests {
         assert!(!is_unsafe_archive_path("org/lwjgl/foo.dll"));
         assert!(!is_unsafe_archive_path("jdk-21/bin/java.exe"));
     }
+
+    // ── Download safety: validation, content-type, timeouts, mirrors ──
+
+    #[test]
+    fn sha1_verification_accepts_match_and_rejects_mismatch() {
+        let p = temp_file("sha_ok.bin", b"abc");
+        assert!(verify_sha1(&p, "a9993e364706816aba3e25717850c26c9cd0d89d").unwrap());
+        assert!(!verify_sha1(&p, "0000000000000000000000000000000000000000").unwrap());
+        assert_eq!(
+            hash_file_sha1(&p).unwrap(),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_download_rejects_sha1_mismatch() {
+        let p = temp_file("val_mismatch.bin", b"actual content");
+        let err = validate_download(&p, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap_err();
+        assert!(err.to_string().contains("SHA1 mismatch"), "got: {}", err);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_download_accepts_correct_sha1() {
+        let p = temp_file("val_ok.bin", b"abc");
+        assert!(validate_download(&p, "a9993e364706816aba3e25717850c26c9cd0d89d").is_ok());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_download_without_sha1_rejects_json_error_pages() {
+        let p = temp_file("val_json.bin", br#"{"error":"not found","status":404}"#);
+        let err = validate_download(&p, "").unwrap_err();
+        assert!(err.to_string().contains("JSON"), "got: {}", err);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn validate_download_without_sha1_accepts_binary_and_empty() {
+        let p = temp_file("val_bin.bin", &[0x50, 0x4b, 0x03, 0x04, 0x14, 0x00]);
+        assert!(validate_download(&p, "").is_ok());
+        let empty = temp_file("val_empty.bin", b"");
+        assert!(validate_download(&empty, "").is_ok());
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn content_type_rejects_only_error_pages() {
+        assert!(is_rejected_content_type("text/html; charset=utf-8"));
+        assert!(is_rejected_content_type("TEXT/PLAIN"));
+        assert!(is_rejected_content_type("application/json"));
+        assert!(is_rejected_content_type("application/problem+json; charset=utf-8"));
+        assert!(is_rejected_content_type("application/xml"));
+        assert!(is_rejected_content_type("application/xhtml+xml"));
+
+        assert!(!is_rejected_content_type("application/java-archive"));
+        assert!(!is_rejected_content_type("application/octet-stream"));
+        assert!(!is_rejected_content_type("application/zip"));
+        assert!(!is_rejected_content_type("image/png"));
+    }
+
+    #[test]
+    fn timeout_scales_with_size_and_stays_bounded() {
+        // Small/zero-size files get the 120 s floor.
+        assert_eq!(timeout_for_size(0), Duration::from_secs(120));
+        assert_eq!(timeout_for_size(1024), Duration::from_secs(120));
+        // ~512 KB/s + 60 s buffer, clamped to a 900 s ceiling.
+        assert_eq!(timeout_for_size(512_000 * 300), Duration::from_secs(360));
+        assert_eq!(timeout_for_size(512_000 * 10_000), Duration::from_secs(900));
+        assert_eq!(timeout_for_unknown_size(), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn mirror_alternates_knows_the_known_hosts() {
+        let neoforge =
+            "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml";
+        let alts = mirror_alternates(neoforge);
+        assert_eq!(alts.len(), 2);
+        assert!(alts[0].starts_with("https://bmclapi2.bangbang93.com/maven/"));
+        assert!(alts[1].starts_with("https://maven.creeperhost.net/"));
+        assert!(alts[0].ends_with("net/neoforged/neoforge/maven-metadata.xml"));
+
+        let lib = "https://libraries.minecraft.net/net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar";
+        let back = mirror_alternates(lib);
+        assert_eq!(back.len(), 1);
+        assert!(back[0].starts_with("https://maven.minecraftforge.net/"));
+
+        // Unknown hosts get no alternates (and no surprise network calls).
+        assert!(mirror_alternates("https://api.modrinth.com/v2/project/x").is_empty());
+        assert!(mirror_alternates("https://example.com/file.jar").is_empty());
+    }
 }

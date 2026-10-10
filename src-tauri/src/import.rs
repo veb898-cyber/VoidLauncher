@@ -1374,4 +1374,104 @@ mod tests {
         assert!(base.join("sub/file.txt").exists());
         std::fs::remove_dir_all(&base).ok();
     }
+
+    // ── Import format matrix: probe_modpack across pack formats ──
+
+    fn temp_probe_zip(name: &str, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+        use std::io::Write;
+        let path =
+            std::env::temp_dir().join(format!("vl_probe_{}_{}", std::process::id(), name));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (n, data) in entries {
+            zw.start_file(*n, opts).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn probe_rejects_non_zip_bytes() {
+        let p = std::env::temp_dir().join(format!("vl_probe_bad_{}.zip", std::process::id()));
+        std::fs::write(&p, b"this is definitely not a zip archive").unwrap();
+        let err = probe_modpack(p.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("Invalid archive"), "got: {}", err);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn probe_rejects_unrecognized_archive() {
+        let p = temp_probe_zip("unrecognized.zip", &[("readme.txt", b"hello".as_slice())]);
+        let err = probe_modpack(p.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("Unrecognized"), "got: {}", err);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn probe_reads_minimal_mrpack() {
+        let index = br#"{"name":"My Pack","summary":"test pack","dependencies":{"minecraft":"1.21.4","fabric-loader":"0.16.9"}}"#;
+        let p = temp_probe_zip(
+            "minimal.mrpack",
+            &[("modrinth.index.json", index.as_slice())],
+        );
+        let meta = probe_modpack(p.to_str().unwrap()).unwrap();
+        assert_eq!(meta.format, ModpackFormat::Modrinth);
+        assert_eq!(meta.name, "My Pack");
+        assert_eq!(meta.summary.as_deref(), Some("test pack"));
+        assert_eq!(meta.mc_version.as_deref(), Some("1.21.4"));
+        assert_eq!(meta.loader.as_deref(), Some("fabric-loader"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn probe_malformed_mrpack_index_falls_through_to_unrecognized() {
+        // A present-but-broken manifest must not crash or mislabel the pack:
+        // it should end in the same "unrecognized format" error as an empty zip.
+        let p = temp_probe_zip(
+            "malformed.mrpack",
+            &[("modrinth.index.json", b"{ this is not json".as_slice())],
+        );
+        let err = probe_modpack(p.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("Unrecognized"), "got: {}", err);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn probe_reads_prism_instance_cfg() {
+        let p = temp_probe_zip(
+            "prism.zip",
+            &[("instance.cfg", b"name=My Prism Pack\nnotes=hi".as_slice())],
+        );
+        let meta = probe_modpack(p.to_str().unwrap()).unwrap();
+        assert_eq!(meta.format, ModpackFormat::Prism);
+        assert_eq!(meta.name, "My Prism Pack");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn probe_reads_curseforge_manifest_with_loader() {
+        let manifest = br#"{"name":"CF Pack","minecraft":{"version":"1.20.1","modLoaders":[{"id":"fabric-0.15.11","primary":true}]}}"#;
+        let p = temp_probe_zip("cf.zip", &[("manifest.json", manifest.as_slice())]);
+        let meta = probe_modpack(p.to_str().unwrap()).unwrap();
+        assert_eq!(meta.format, ModpackFormat::CurseForge);
+        assert_eq!(meta.name, "CF Pack");
+        assert_eq!(meta.mc_version.as_deref(), Some("1.20.1"));
+        assert_eq!(meta.loader.as_deref(), Some("fabric"));
+        assert_eq!(meta.loader_version.as_deref(), Some("0.15.11"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn probe_reads_atlauncher_instance_json() {
+        let inst = br#"{"name":"AT Pack","minecraftVersion":"1.19.2"}"#;
+        let p = temp_probe_zip("atl.zip", &[("instance.json", inst.as_slice())]);
+        let meta = probe_modpack(p.to_str().unwrap()).unwrap();
+        assert_eq!(meta.format, ModpackFormat::ATLauncher);
+        assert_eq!(meta.name, "AT Pack");
+        assert_eq!(meta.mc_version.as_deref(), Some("1.19.2"));
+        let _ = std::fs::remove_file(&p);
+    }
 }
