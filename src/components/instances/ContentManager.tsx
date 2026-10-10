@@ -85,6 +85,10 @@ interface UpdateInfo {
   projectId: string;
   versionId: string;
   expectedSha1: string;
+  /** `modrinth` (default) or `curseforge` — decides the download path. */
+  provider: string;
+  /** CurseForge file id of the new file (id-chain download). */
+  fileId?: string | null;
 }
 
 interface Props {
@@ -248,7 +252,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     const cache = iconCache;
 
     // Build per-pack plans: track which keys are settled and which need a fetch.
-    type Plan = { filename: string; name: string; projectId: string | null; modrinthKey: string; localKey: string; hasModrinth: boolean; hasLocal: boolean; resolved: boolean };
+    type Plan = { filename: string; name: string; projectId: string | null; modrinthKey: string; localKey: string; hasModrinth: boolean; hasLocal: boolean; resolved: boolean; isCf: boolean };
     const plans = new Map<string, Plan>();
     for (const p of rawPacks) {
       if (!p.filename) continue;
@@ -256,11 +260,12 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       if (!projectId) {
         projectId = projectNameCache.current.get(p.name) || null;
       }
-      const modrinthKey = projectId ? `modrinth:${projectId}` : '';
+      const isCf = (p.provider || '').toLowerCase() === 'curseforge';
+      const modrinthKey = projectId ? (isCf ? `curseforge:${projectId}` : `modrinth:${projectId}`) : '';
       const localKey = `file:${p.filename}`;
       const hasModrinth = !!modrinthKey && cache.has(modrinthKey);
       const hasLocal = cache.has(localKey);
-      plans.set(p.filename, { filename: p.filename, name: p.name, projectId, modrinthKey, localKey, hasModrinth, hasLocal, resolved: false });
+      plans.set(p.filename, { filename: p.filename, name: p.name, projectId, modrinthKey, localKey, hasModrinth, hasLocal, resolved: false, isCf });
     }
 
     // Step 1: apply cached icons immediately
@@ -316,10 +321,21 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       }
     });
 
-    // Step 4: fetch Modrinth project info for plans that need it
+    // Step 4: fetch project info for plans that need it — CurseForge detail
+    // (logo) for CF packs, Modrinth project for the rest.
     const needModrinthFetch = Array.from(plans.values()).filter((p) => p.projectId && p.modrinthKey && !p.hasModrinth && !p.resolved);
     await runPool(needModrinthFetch, 6, async (plan) => {
       try {
+        if (plan.isCf) {
+          const resp = await invoke<{ logo?: { thumbnailUrl?: string | null; url?: string | null } | null }>('cmd_get_curseforge_mod_detail', { modId: Number(plan.projectId) });
+          const icon = resp?.logo?.thumbnailUrl || resp?.logo?.url;
+          if (icon) {
+            plan.hasModrinth = true;
+            plan.resolved = true;
+            cacheIcon(plan.modrinthKey, icon);
+          }
+          return;
+        }
         const project = await invoke<{ icon_url?: string | null }>('cmd_get_modrinth_project', { id: plan.projectId! });
         if (project?.icon_url) {
           plan.hasModrinth = true;
@@ -663,6 +679,8 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         projectId: r.project_id,
         versionId: r.version_id,
         expectedSha1: r.expected_sha1 || '',
+        provider: r.provider === 'curseforge' ? 'curseforge' : 'modrinth',
+        fileId: r.file_id ?? null,
       }));
       setCheckingUpdates(false);
       if (found.length > 0) {
@@ -688,9 +706,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         projectName: update.name || null,
         versionId: update.versionId,
         versionNumber: update.newVersion,
-        provider: 'modrinth',
+        provider: update.provider,
         oldFilename: update.oldFilename,
         expectedSha1: update.expectedSha1 || '',
+        fileId: update.fileId ?? null,
       });
       if (!silent) addToast(t('manager.updated_toast', { name: update.name, version: update.newVersion }), 'success');
       setUpdates((prev) => prev ? prev.filter((u) => u.name !== update.name) : null);
@@ -717,9 +736,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           projectName: u.name || null,
           versionId: u.versionId,
           versionNumber: u.newVersion,
-          provider: 'modrinth',
+          provider: u.provider,
           oldFilename: u.oldFilename,
           expectedSha1: u.expectedSha1 || '',
+          fileId: u.fileId ?? null,
         });
         successes.push(u.name);
       } catch (e: any) { errors.push({ name: u.name, error: e.toString() }); }
@@ -740,7 +760,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     if (item.icon && item.icon.startsWith('data:')) return item.icon;
     // Look up the persistent icon cache: prefer project_id key, fall back to filename
     if (item.project_id) {
-      const v = getIcon(`modrinth:${item.project_id}`);
+      const v = getIcon(`modrinth:${item.project_id}`) || getIcon(`curseforge:${item.project_id}`);
       if (v) return v;
     }
     const fileKey = `file:${item.filename}`;

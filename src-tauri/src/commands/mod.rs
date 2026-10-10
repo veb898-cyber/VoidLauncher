@@ -6,6 +6,7 @@
 //! beyond what a command necessarily orchestrates.
 
 pub mod auth;
+pub mod cfpack;
 pub mod content;
 pub mod instances;
 pub mod launcher;

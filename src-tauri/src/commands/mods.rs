@@ -84,6 +84,14 @@ pub struct ModUpdateResult {
     project_id: String,
     version_id: String,
     expected_sha1: String,
+    /// `modrinth` (default) or `curseforge` — which provider to query when
+    /// the frontend applies the update (CF files may need the id chain).
+    #[serde(default)]
+    provider: String,
+    /// CurseForge file id of the new version (CF updates are identified by
+    /// project id + file id, not by URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_id: Option<String>,
 }
 
 #[tauri::command]
@@ -101,6 +109,12 @@ pub async fn cmd_check_mod_updates(
         name: String,
         version: String,
         hash: Option<String>,
+        /// Sidecar identity: which provider installed the file and under
+        /// which ids. `unknown` files stay in the Modrinth hash pass (the
+        /// pre-CF-integration behaviour for sidecar-less drops).
+        provider: String,
+        project_id: Option<String>,
+        file_id: Option<String>,
     }
 
     let packs_dir = {
@@ -115,6 +129,13 @@ pub async fn cmd_check_mod_updates(
     }
 
     let is_mods = pack_type == "mods";
+    let content_type = if is_mods {
+        "mod"
+    } else if pack_type == "resourcepacks" {
+        "resourcepack"
+    } else {
+        "shader"
+    };
 
     let mut mod_files: Vec<ModFile> = Vec::new();
     let mut hash_to_mod: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -149,11 +170,16 @@ pub async fn cmd_check_mod_updates(
                 if !matches_loader { continue; }
 
                 let hash = download::hash_file_sha1(&path).ok();
+                let ic = content::InstalledContent::read(&packs_dir, &filename, content_type);
 
-                if let Some(ref h) = hash {
-                    let idx = mod_files.len();
-                    hash_to_mod.insert(h.clone(), idx);
-                    all_hashes.push(h.clone());
+                // CurseForge files update through the id chain, not the
+                // Modrinth hash index — keep them out of the hash pass.
+                if ic.provider != "curseforge" {
+                    if let Some(ref h) = hash {
+                        let idx = mod_files.len();
+                        hash_to_mod.insert(h.clone(), idx);
+                        all_hashes.push(h.clone());
+                    }
                 }
 
                 mod_files.push(ModFile {
@@ -161,6 +187,9 @@ pub async fn cmd_check_mod_updates(
                     name: meta.name,
                     version: meta.version,
                     hash,
+                    provider: ic.provider,
+                    project_id: ic.project_id,
+                    file_id: ic.file_id,
                 });
             } else {
                 // Resourcepacks / Shaderpacks: only .zip files (skip directories)
@@ -175,11 +204,14 @@ pub async fn cmd_check_mod_updates(
                     ), String::new()));
 
                 let hash = download::hash_file_sha1(&path).ok();
+                let ic = content::InstalledContent::read(&packs_dir, &filename, content_type);
 
-                if let Some(ref h) = hash {
-                    let idx = mod_files.len();
-                    hash_to_mod.insert(h.clone(), idx);
-                    all_hashes.push(h.clone());
+                if ic.provider != "curseforge" {
+                    if let Some(ref h) = hash {
+                        let idx = mod_files.len();
+                        hash_to_mod.insert(h.clone(), idx);
+                        all_hashes.push(h.clone());
+                    }
                 }
 
                 mod_files.push(ModFile {
@@ -187,64 +219,146 @@ pub async fn cmd_check_mod_updates(
                     name,
                     version,
                     hash,
+                    provider: ic.provider,
+                    project_id: ic.project_id,
+                    file_id: ic.file_id,
                 });
             }
         }
     }
 
-    if all_hashes.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Query Modrinth update API
-    // For mods: pass loader filter; for packs: no loader filter
-    let loaders = if is_mods {
-        loader.map(|l| vec![l.to_lowercase()])
-    } else {
-        None
-    };
-    let game_versions = mc_version.map(|v| vec![v]);
-
-    let response = modrinth::check_version_updates(
-        all_hashes,
-        "sha1",
-        loaders,
-        game_versions,
-    ).await.map_err(|e| e.to_string())?;
-
     let mut results = Vec::new();
 
-    for (hash_str, maybe_version) in &response {
-        let Some(version) = maybe_version else { continue; };
-        let Some(&idx) = hash_to_mod.get(hash_str) else { continue; };
-        let mod_file = &mod_files[idx];
-
-        let file = version.files.iter()
-            .find(|f| f.primary)
-            .or_else(|| version.files.first());
-        let Some(primary_file) = file else { continue; };
-
-        let installed_hash = mod_file.hash.as_deref().unwrap_or("");
-        let file_hash = primary_file.hashes.get("sha1")
-            .or_else(|| primary_file.hashes.get("sha512"))
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        if installed_hash == file_hash {
-            continue;
+    // ---- CurseForge pass: sidecar-identified CF files (item 24) ----
+    // Newest available file for this instance's (MC, loader); a differing
+    // file id with an identical sha1 (re-upload) is not an update.
+    let cf_indices: Vec<usize> = mod_files
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.provider == "curseforge" && m.project_id.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    if !cf_indices.is_empty() {
+        let cf_key = {
+            let config = state.config.lock().map_err(|e| e.to_string())?;
+            config.curseforge_api_key.clone()
+        };
+        for (n, &idx) in cf_indices.iter().enumerate() {
+            if n > 0 {
+                // CF rate limits are undocumented — pace the batch.
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            let m = &mod_files[idx];
+            let Ok(pid) = m.project_id.as_deref().unwrap_or("").parse::<u64>() else {
+                continue;
+            };
+            // Loader semantics only apply to mods; packs ignore loaders.
+            let cf_loader: Option<String> = if is_mods {
+                match loader.as_deref() {
+                    // "Vanilla" mods are not a CF loader — no safe match.
+                    None | Some("Vanilla") => continue,
+                    Some(l) => Some(l.to_string()),
+                }
+            } else {
+                None
+            };
+            let files = match curseforge::get_mod_files(
+                pid,
+                mc_version.as_deref(),
+                cf_loader.as_deref(),
+                0,
+                &cf_key,
+            )
+            .await
+            {
+                Ok(r) => r.data,
+                // A blip must never claim "no updates".
+                Err(_) => continue,
+            };
+            let Some(new_file) = files
+                .iter()
+                .find(|f| f.release_type == 1)
+                .or_else(|| files.first())
+            else {
+                continue;
+            };
+            let new_fid = new_file.id.to_string();
+            if m.file_id.as_deref() == Some(new_fid.as_str()) {
+                continue;
+            }
+            let new_sha1 = new_file.sha1_hash().unwrap_or("");
+            if !new_sha1.is_empty() && m.hash.as_deref() == Some(new_sha1) {
+                continue;
+            }
+            results.push(ModUpdateResult {
+                filename: m.filename.clone(),
+                name: m.name.clone(),
+                old_version: m.version.clone(),
+                new_version: new_file.display_name.clone(),
+                // Empty → the frontend downloads via the (project, file) chain.
+                download_url: new_file.download_url.clone().unwrap_or_default(),
+                new_filename: new_file.file_name.clone(),
+                project_id: pid.to_string(),
+                version_id: new_fid.clone(),
+                expected_sha1: new_sha1.to_string(),
+                provider: "curseforge".to_string(),
+                file_id: Some(new_fid),
+            });
         }
+    }
 
-        results.push(ModUpdateResult {
-            filename: mod_file.filename.clone(),
-            name: mod_file.name.clone(),
-            old_version: mod_file.version.clone(),
-            new_version: version.version_number.clone(),
-            download_url: primary_file.url.clone(),
-            new_filename: primary_file.filename.clone(),
-            project_id: version.project_id.clone(),
-            version_id: version.id.clone(),
-            expected_sha1: file_hash.to_string(),
-        });
+    // ---- Modrinth pass: hash-based lookup for everything else ----
+    if !all_hashes.is_empty() {
+        // Query Modrinth update API
+        // For mods: pass loader filter; for packs: no loader filter
+        let loaders = if is_mods {
+            loader.map(|l| vec![l.to_lowercase()])
+        } else {
+            None
+        };
+        let game_versions = mc_version.map(|v| vec![v]);
+
+        let response = modrinth::check_version_updates(
+            all_hashes,
+            "sha1",
+            loaders,
+            game_versions,
+        ).await.map_err(|e| e.to_string())?;
+
+        for (hash_str, maybe_version) in &response {
+            let Some(version) = maybe_version else { continue; };
+            let Some(&idx) = hash_to_mod.get(hash_str) else { continue; };
+            let mod_file = &mod_files[idx];
+
+            let file = version.files.iter()
+                .find(|f| f.primary)
+                .or_else(|| version.files.first());
+            let Some(primary_file) = file else { continue; };
+
+            let installed_hash = mod_file.hash.as_deref().unwrap_or("");
+            let file_hash = primary_file.hashes.get("sha1")
+                .or_else(|| primary_file.hashes.get("sha512"))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+
+            if installed_hash == file_hash {
+                continue;
+            }
+
+            results.push(ModUpdateResult {
+                filename: mod_file.filename.clone(),
+                name: mod_file.name.clone(),
+                old_version: mod_file.version.clone(),
+                new_version: version.version_number.clone(),
+                download_url: primary_file.url.clone(),
+                new_filename: primary_file.filename.clone(),
+                project_id: version.project_id.clone(),
+                version_id: version.id.clone(),
+                expected_sha1: file_hash.to_string(),
+                provider: "modrinth".to_string(),
+                file_id: None,
+            });
+        }
     }
 
     Ok(results)
@@ -322,6 +436,8 @@ pub async fn cmd_search_curseforge(
     query: String,
     mc_version: Option<String>,
     loader: Option<String>,
+    project_type: Option<String>,
+    index: Option<String>,
     offset: u32,
     limit: u32,
 ) -> Result<curseforge::CfSearchResponse, String> {
@@ -329,10 +445,14 @@ pub async fn cmd_search_curseforge(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.curseforge_api_key.clone()
     };
-    curseforge::search_mods(
+    let class_id = project_type.as_deref().and_then(curseforge::class_id_for_project_type);
+    curseforge::search_mods_filtered(
         &query,
         mc_version.as_deref(),
         loader.as_deref(),
+        class_id,
+        None,
+        index.as_deref(),
         offset,
         limit,
         &api_key,
@@ -347,14 +467,21 @@ pub async fn cmd_get_curseforge_files(
     mod_id: u64,
     mc_version: Option<String>,
     loader: Option<String>,
+    offset: Option<u32>,
 ) -> Result<curseforge::CfFilesResponse, String> {
     let api_key = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.curseforge_api_key.clone()
     };
-    curseforge::get_mod_files(mod_id, mc_version.as_deref(), loader.as_deref(), &api_key)
-        .await
-        .map_err(|e| e.to_string())
+    curseforge::get_mod_files(
+        mod_id,
+        mc_version.as_deref(),
+        loader.as_deref(),
+        offset.unwrap_or(0),
+        &api_key,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -589,14 +716,28 @@ pub async fn cmd_download_to_folder(
     file_id: Option<String>,
 ) -> Result<String, String> {
     validate_instance_name(&instance_name)?;
-    if !download_url.starts_with("https://") {
-        return Err("Download URL must be HTTPS.".to_string());
-    }
-    if !is_allowed_download_host(&download_url) {
-        return Err(format!(
-            "Download host is not in the allowlist: {}",
-            download_url
-        ));
+    // CurseForge chain mode: no direct URL in the plan — the backend
+    // resolves (project id, file id) → signed URL → CDN mirrors here. Only
+    // this mode may bypass the HTTPS/allowlist pre-checks (each candidate is
+    // still validated inside the download layer).
+    let numeric = |v: &Option<String>| {
+        v.as_deref()
+            .map_or(false, |s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+    };
+    let cf_native = download_url.is_empty()
+        && provider.eq_ignore_ascii_case("curseforge")
+        && numeric(&project_id)
+        && numeric(&file_id);
+    if !cf_native {
+        if !download_url.starts_with("https://") {
+            return Err("Download URL must be HTTPS.".to_string());
+        }
+        if !is_allowed_download_host(&download_url) {
+            return Err(format!(
+                "Download host is not in the allowlist: {}",
+                download_url
+            ));
+        }
     }
     // Whitelist allowed subfolders under the instance .minecraft dir.
     const ALLOWED: &[&str] = &["mods", "resourcepacks", "shaderpacks", "config"];
@@ -640,9 +781,21 @@ pub async fn cmd_download_to_folder(
         None => Vec::new(),
     };
     let downloaded = async {
-        download::download_file(&download_url, &dest, &expected_sha1)
-            .await
-            .map_err(|e| e.to_string())?;
+        if cf_native {
+            let pid = project_id.as_deref().unwrap_or("").parse::<u64>().unwrap_or(0);
+            let fid = file_id.as_deref().unwrap_or("").parse::<u64>().unwrap_or(0);
+            let key = {
+                let config = state.config.lock().map_err(|e| e.to_string())?;
+                config.curseforge_api_key.clone()
+            };
+            curseforge::download_cf_native(pid, fid, &safe_name, &expected_sha1, &dest, &key)
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            download::download_file(&download_url, &dest, &expected_sha1)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         // When no SHA1 is available, at least verify the result is a real
         // archive (JAR/ZIP magic) and not an HTML error page / bogus body.
         if expected_sha1.is_empty()

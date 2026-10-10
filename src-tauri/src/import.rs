@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::content;
 use crate::error::{LauncherError, Result};
 use crate::instances::{self, Instance, LoaderType};
 use crate::modrinth;
@@ -50,7 +51,7 @@ fn emit_progress(app: Option<&AppHandle>, stage: &str, current: usize, total: us
 }
 
 /// Reject zip slip: ".." components, absolute paths and drive prefixes.
-fn check_safe_relative(relative: &str) -> Result<()> {
+pub(crate) fn check_safe_relative(relative: &str) -> Result<()> {
     if relative.contains('\0') {
         return Err(LauncherError::Instance("Null byte in zip entry path".into()));
     }
@@ -88,7 +89,7 @@ fn check_safe_relative(relative: &str) -> Result<()> {
 /// Stream a zip entry to disk under `base`, verifying no path traversal.
 /// File-backed writer: large entries are copied in chunks instead of being
 /// buffered in memory (`std::io::copy`).
-fn write_extracted(base: &Path, entry_name: &str, reader: &mut dyn Read) -> Result<()> {
+pub(crate) fn write_extracted(base: &Path, entry_name: &str, reader: &mut dyn Read) -> Result<()> {
     check_safe_relative(entry_name)?;
     let target = base.join(entry_name);
     // Defense in depth: joined path must stay under base
@@ -120,7 +121,7 @@ fn normalize_zip_path(path: &str) -> String {
 /// tracked content folder (mods / resourcepacks / shaderpacks). Skips when a
 /// sidecar already exists (the index/manifest download may write a richer one
 /// with project_id, and it runs after overrides).
-fn write_override_sidecar(mc_dir: &Path, relative: &str, provider: &str) {
+pub(crate) fn write_override_sidecar(mc_dir: &Path, relative: &str, provider: &str) {
     let norm = normalize_zip_path(relative);
     let mut parts = norm.splitn(2, '/');
     let top = match parts.next() {
@@ -982,24 +983,33 @@ pub(crate) async fn import_curseforge_pack(
                             .await
                             .map_err(|e| e.to_string())?;
 
-                        // Sidecar
-                        let sidecar = serde_json::json!({
-                            "provider": "curseforge",
-                            "project_id": pid.to_string(),
-                            "project_name": cf_file.display_name,
-                            "version_id": null,
-                            // CurseForge has no separate version field; the
-                            // display name (e.g. "jei-1.20.1-forge-15.21.0.138")
-                            // is the closest thing to a real version and beats
-                            // the "${file.jarVersion}" placeholder many JARs
-                            // ship with.
-                            "version_number": cf_file.display_name,
-                        });
-                        let sidecar_name = format!("{}.voidlauncher.json",
-                            cf_file.file_name.trim_end_matches(".jar").trim_end_matches(".zip"));
-                        let index_dir = mods_dir.join(".index");
-                        let _ = std::fs::create_dir_all(&index_dir);
-                        let _ = std::fs::write(index_dir.join(sidecar_name), sidecar.to_string());
+                        // Sidecar: unified writer, with the CF file id and
+                        // the verified hash so update checks can compare
+                        // this file against the CF file list later.
+                        let pid_str = pid.to_string();
+                        let fid_str = fid.to_string();
+                        let display = cf_file.display_name.clone();
+                        let hash = cf_file.sha1_hash().map(|s| s.to_string());
+                        let _ = content::write_sidecar(
+                            &mods_dir,
+                            &cf_file.file_name,
+                            &content::SidecarWrite {
+                                provider: "curseforge",
+                                content_type: "mod",
+                                project_id: Some(&pid_str),
+                                project_name: Some(&display),
+                                version_id: None,
+                                // CurseForge has no separate version field;
+                                // the display name (e.g.
+                                // "jei-1.20.1-forge-15.21.0.138") is the
+                                // closest thing to a real version and beats
+                                // the "${file.jarVersion}" placeholder many
+                                // JARs ship with.
+                                version_number: Some(&display),
+                                file_id: Some(&fid_str),
+                                hash: hash.as_deref(),
+                            },
+                        );
 
                         Ok(())
                     }.await;

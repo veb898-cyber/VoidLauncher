@@ -488,7 +488,7 @@ fn validate_download(path: &std::path::Path, expected_sha1: &str) -> Result<()> 
 /// subsequent requests use a `Range` header so interrupted transfers
 /// continue from the last byte instead of restarting from zero (important
 /// on flaky connections). Servers that ignore `Range` simply restart.
-async fn download_to_part(
+pub(crate) async fn download_to_part(
     url: &str,
     path: &std::path::Path,
     expected_sha1: &str,

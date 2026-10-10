@@ -51,6 +51,13 @@ fn valid_id(id: &str) -> bool {
 /// NOT reported here — the resolver detects the missing node on its edge and
 /// reports it with full source context (and richer phase-1 reasons win the
 /// dedup because they are seeded first).
+///
+/// Both providers run through the same worklist: Modrinth versions use raw
+/// version ids, CurseForge entries use the structured key `cf:{project_id}`
+/// in the resolve queue and `cf:{project_id}:{file_id}` as a concrete version
+/// id (a CF file, not a Modrinth version — never passed to the Modrinth API).
+/// CurseForge dependency edges are always provider-pure, so a CF node's
+/// dependencies resolve against CF and vice versa.
 struct GraphFetcher {
     mc_version: Option<String>,
     loader: Option<String>,
@@ -62,11 +69,16 @@ struct GraphFetcher {
     projects: HashMap<String, (String, Option<String>)>,
     /// Project-only required edges still awaiting a version choice; filled in
     /// only when no node for the project exists (a pin elsewhere already
-    /// resolved it otherwise).
+    /// resolved it otherwise). CurseForge entries are keyed `cf:{pid}`.
     need_resolve: HashSet<String>,
     unresolved: Vec<UnresolvedItem>,
     attempted: HashSet<String>,
     queued: HashSet<String>,
+    /// CurseForge API key (empty when unconfigured — CF metadata calls then
+    /// fail soft and CDN-only downloads still work later).
+    cf_key: String,
+    /// `file_id` → file metadata fetched while resolving CF entries.
+    cf_files: HashMap<u64, crate::curseforge::CfFile>,
 }
 
 impl GraphFetcher {
@@ -75,6 +87,7 @@ impl GraphFetcher {
         mc_version: Option<String>,
         loader: Option<String>,
         installed_pids: HashSet<String>,
+        cf_key: String,
     ) -> Self {
         Self {
             mc_version,
@@ -87,17 +100,33 @@ impl GraphFetcher {
             unresolved: Vec::new(),
             attempted: HashSet::new(),
             queued: HashSet::new(),
+            cf_key,
+            cf_files: HashMap::new(),
         }
     }
 
-    async fn ensure_project(&mut self, pid: &str) {
+    async fn ensure_project(&mut self, pid: &str, cf: bool) {
         if self.projects.contains_key(pid) {
             return;
         }
-        let meta = match modrinth::get_project(pid).await {
-            Ok(p) => (p.title, p.icon_url),
-            // A dead project lookup must not sink the whole resolution.
-            Err(_) => (pid.to_string(), None),
+        let meta = if cf {
+            match crate::curseforge::get_mod(pid.parse().unwrap_or(0), &self.cf_key).await {
+                Ok(p) => {
+                    let url = p
+                        .logo
+                        .as_ref()
+                        .and_then(|l| l.best_url())
+                        .map(|u| u.to_string());
+                    (p.name, url)
+                }
+                Err(_) => (pid.to_string(), None),
+            }
+        } else {
+            match modrinth::get_project(pid).await {
+                Ok(p) => (p.title, p.icon_url),
+                // A dead project lookup must not sink the whole resolution.
+                Err(_) => (pid.to_string(), None),
+            }
         };
         self.projects.insert(pid.to_string(), meta);
     }
@@ -115,6 +144,100 @@ impl GraphFetcher {
         }
     }
 
+    /// Resolve one structured `cf:{project_id}:{file_id}` entry into a node.
+    /// Concrete CF files are known by id — only metadata needs fetching.
+    /// Root failures abort the resolution like Modrinth root failures do;
+    /// dependency failures are left for the resolver to report on the edge.
+    async fn process_cf_version(
+        &mut self,
+        vid: &str,
+        queue: &mut VecDeque<String>,
+    ) -> Result<(), String> {
+        let _ = queue;
+        let vid = vid.to_string();
+        let raw = &vid[3..];
+        let mut parts = raw.splitn(2, ':');
+        let (Some(pid_str), Some(fid_str)) = (parts.next(), parts.next()) else {
+            return Ok(());
+        };
+        let (Ok(pid), Ok(fid)) = (pid_str.parse::<u64>(), fid_str.parse::<u64>()) else {
+            return Ok(());
+        };
+        let is_root = self.roots.contains(&vid);
+        let file = match self.cf_files.get(&fid) {
+            Some(f) => Some(f.clone()),
+            None => match crate::curseforge::get_mod_file(pid, fid, &self.cf_key).await {
+                Ok(f) => {
+                    self.cf_files.insert(fid, f.clone());
+                    Some(f)
+                }
+                Err(e) => {
+                    if is_root {
+                        return Err(format!(
+                            "Failed to resolve CurseForge file {}: {}",
+                            vid, e
+                        ));
+                    }
+                    return Ok(());
+                }
+            },
+        };
+        let Some(cf_file) = file else { return Ok(()) };
+
+        self.ensure_project(pid_str, true).await;
+        let (name, icon) = self
+            .projects
+            .get(pid_str)
+            .cloned()
+            .unwrap_or_else(|| (pid_str.to_string(), None));
+
+        let plan_file = PlanFile {
+            // Empty: the CF chain (signed URL → CDN mirrors) is resolved at
+            // download time from (project_id, file_id).
+            url: String::new(),
+            filename: cf_file.file_name.clone(),
+            sha1: cf_file.sha1_hash().map(|s| s.to_string()),
+            file_id: Some(fid.to_string()),
+        };
+
+        let mut deps: Vec<DepEdge> = Vec::new();
+        for d in &cf_file.dependencies {
+            let Some(kind) = content::normalize_cf_dep_type(d.relation_type) else {
+                continue;
+            };
+            let dep_pid = d.mod_id.to_string();
+            if kind == DEP_REQUIRED && !self.installed_pids.contains(&dep_pid) {
+                // Choice deferred to the resolve cycle (newest CF file for
+                // this instance's MC/loader).
+                self.need_resolve.insert(format!("cf:{}", dep_pid));
+            } else if kind != DEP_REQUIRED {
+                // Titles for optional entries and conflict messages.
+                self.ensure_project(&dep_pid, true).await;
+            }
+            deps.push(DepEdge {
+                source_version_id: vid.clone(),
+                dep_type: kind.to_string(),
+                project_id: Some(dep_pid),
+                version_id: None,
+            });
+        }
+
+        self.nodes.insert(
+            vid.clone(),
+            VersionNode {
+                version_id: vid.clone(),
+                project_id: pid_str.to_string(),
+                name,
+                version_label: cf_file.display_name.clone(),
+                icon_url: icon,
+                file: plan_file,
+                deps,
+                provider: "curseforge".to_string(),
+            },
+        );
+        Ok(())
+    }
+
     async fn run(mut self, root_version_ids: &[String]) -> Result<GraphInput, String> {
         let mut queue: VecDeque<String> = VecDeque::new();
         for vid in root_version_ids {
@@ -124,6 +247,10 @@ impl GraphFetcher {
         loop {
             while let Some(vid) = queue.pop_front() {
                 if !self.attempted.insert(vid.clone()) {
+                    continue;
+                }
+                if vid.starts_with("cf:") {
+                    self.process_cf_version(&vid, &mut queue).await?;
                     continue;
                 }
                 let version = match modrinth::get_version_by_id(&vid).await {
@@ -146,6 +273,7 @@ impl GraphFetcher {
                         url: f.url.clone(),
                         filename: f.filename.clone(),
                         sha1: f.hashes.get("sha1").cloned(),
+                        file_id: None,
                     });
                 let Some(file) = file else {
                     if self.roots.contains(&vid) {
@@ -154,7 +282,7 @@ impl GraphFetcher {
                     continue;
                 };
 
-                self.ensure_project(&version.project_id).await;
+                self.ensure_project(&version.project_id, false).await;
                 let (name, icon) = self
                     .projects
                     .get(&version.project_id)
@@ -197,7 +325,7 @@ impl GraphFetcher {
                         DEP_OPTIONAL => {
                             if let Some(pid) = &d.project_id {
                                 // Title so the UI can name the optional entry.
-                                self.ensure_project(pid).await;
+                                self.ensure_project(pid, false).await;
                             }
                             deps.push(DepEdge {
                                 source_version_id: vid.clone(),
@@ -209,7 +337,7 @@ impl GraphFetcher {
                         _ => {
                             // incompatible: title for the conflict message.
                             if let Some(pid) = &d.project_id {
-                                self.ensure_project(pid).await;
+                                self.ensure_project(pid, false).await;
                             }
                             deps.push(DepEdge {
                                 source_version_id: vid.clone(),
@@ -231,6 +359,7 @@ impl GraphFetcher {
                         icon_url: icon,
                         file,
                         deps,
+                        provider: "modrinth".to_string(),
                     },
                 );
             }
@@ -243,10 +372,62 @@ impl GraphFetcher {
             let pending: Vec<String> = std::mem::take(&mut self.need_resolve)
                 .into_iter()
                 .collect();
-            for pid in pending {
+            for key in pending {
+                // `cf:{pid}` → CurseForge project, plain id → Modrinth.
+                let (pid, cf) = match key.strip_prefix("cf:") {
+                    Some(raw) => (raw.to_string(), true),
+                    None => (key.clone(), false),
+                };
                 if self.installed_pids.contains(&pid)
                     || self.nodes.values().any(|n| n.project_id == pid)
                 {
+                    continue;
+                }
+                if cf {
+                    let pid_num: u64 = match pid.parse() {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    match crate::curseforge::get_mod_files(
+                        pid_num,
+                        self.mc_version.as_deref(),
+                        self.loader.as_deref(),
+                        0,
+                        &self.cf_key,
+                    )
+                    .await
+                    {
+                        // The list comes sorted newest-first with unavailable
+                        // files filtered — take the newest release.
+                        Ok(resp) if !resp.data.is_empty() => {
+                            let file = resp.data[0].clone();
+                            self.cf_files.insert(file.id, file);
+                            let vid = format!("cf:{}:{}", pid, resp.data[0].id);
+                            self.enqueue(&mut queue, &vid);
+                        }
+                        Ok(_) => {
+                            self.ensure_project(&pid, true).await;
+                            let source = self.project_source_for(&pid);
+                            self.unresolved.push(UnresolvedItem {
+                                project_id: pid.clone(),
+                                project_name: self.project_name(&pid),
+                                source_project_id: source.0,
+                                source_name: source.1,
+                                reason: "no_compatible_version".to_string(),
+                            });
+                        }
+                        Err(_) => {
+                            self.ensure_project(&pid, true).await;
+                            let source = self.project_source_for(&pid);
+                            self.unresolved.push(UnresolvedItem {
+                                project_id: pid.clone(),
+                                project_name: self.project_name(&pid),
+                                source_project_id: source.0,
+                                source_name: source.1,
+                                reason: "unavailable".to_string(),
+                            });
+                        }
+                    }
                     continue;
                 }
                 match modrinth::get_versions(
@@ -263,7 +444,7 @@ impl GraphFetcher {
                     Ok(_) => {
                         // No version for this (MC, loader) — reported with a
                         // real project title for the warning panel.
-                        self.ensure_project(&pid).await;
+                        self.ensure_project(&pid, false).await;
                         let source = self.project_source_for(&pid);
                         self.unresolved.push(UnresolvedItem {
                             project_id: pid.clone(),
@@ -274,7 +455,7 @@ impl GraphFetcher {
                         });
                     }
                     Err(_) => {
-                        self.ensure_project(&pid).await;
+                        self.ensure_project(&pid, false).await;
                         let source = self.project_source_for(&pid);
                         self.unresolved.push(UnresolvedItem {
                             project_id: pid.clone(),
@@ -339,7 +520,20 @@ pub async fn cmd_resolve_dependencies(
         return Err("Too many selected versions".to_string());
     }
     for id in &root_version_ids {
-        if !valid_id(id) {
+        if let Some(raw) = id.strip_prefix("cf:") {
+            // Structured CF root: cf:{project_id}:{file_id}, both numeric.
+            let mut parts = raw.splitn(2, ':');
+            let (Some(pid), Some(fid)) = (parts.next(), parts.next()) else {
+                return Err("Invalid CurseForge version id".to_string());
+            };
+            if pid.is_empty()
+                || fid.is_empty()
+                || !pid.chars().all(|c| c.is_ascii_digit())
+                || !fid.chars().all(|c| c.is_ascii_digit())
+            {
+                return Err("Invalid CurseForge version id".to_string());
+            }
+        } else if !valid_id(id) {
             return Err("Invalid version id".to_string());
         }
     }
@@ -365,8 +559,18 @@ pub async fn cmd_resolve_dependencies(
         .iter()
         .map(|p| p.project_id.clone())
         .collect();
+    let cf_key = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.curseforge_api_key.clone()
+    };
 
-    let fetcher = GraphFetcher::new(&root_version_ids, mc_version, loader, installed_pids);
+    let fetcher = GraphFetcher::new(
+        &root_version_ids,
+        mc_version,
+        loader,
+        installed_pids,
+        cf_key,
+    );
     let graph = fetcher.run(&root_version_ids).await?;
     Ok(content::build_resolution(&graph, &installed_projects))
 }
@@ -380,10 +584,11 @@ pub struct CompatResult {
 }
 
 /// Batch compatibility classification (roadmap item 16): one call replaces
-/// the old per-mod 200 ms frontend polling loop. Only Modrinth-sourced files
-/// with a project id are queryable — everything else is reported as
-/// `unknown`. `filenames` restricts the batch to files not classified yet
-/// (incremental refresh); `None` classifies the whole content folder.
+/// the old per-mod 200 ms frontend polling loop. Files with a project id on
+/// a queryable provider (Modrinth, CurseForge) are classified against that
+/// provider — everything else is reported as `unknown`. `filenames` restricts
+/// the batch to files not classified yet (incremental refresh); `None`
+/// classifies the whole content folder.
 #[tauri::command]
 pub async fn cmd_check_content_compatibilities(
     state: State<'_, AppState>,
@@ -400,9 +605,16 @@ pub async fn cmd_check_content_compatibilities(
 
     let targets: Vec<InstalledContent> = content::list_installed(&dir, content_type)
         .into_iter()
-        .filter(|c| c.provider == "modrinth" && c.project_id.is_some())
+        .filter(|c| {
+            matches!(c.provider.as_str(), "modrinth" | "curseforge")
+                && c.project_id.is_some()
+        })
         .filter(|c| wanted.as_ref().map_or(true, |w| w.contains(&c.filename)))
         .collect();
+    let cf_key = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.curseforge_api_key.clone()
+    };
 
     let mut out = Vec::with_capacity(targets.len());
     for (i, item) in targets.iter().enumerate() {
@@ -410,11 +622,16 @@ pub async fn cmd_check_content_compatibilities(
             continue;
         };
         if i > 0 {
-            // Stay inside Modrinth's unauthenticated rate budget; this is the
-            // same cadence the old per-item frontend loop used.
+            // One shared budget: Modrinth's unauthenticated rate limit and
+            // the (undocumented) CF limit both tolerate this cadence; it is
+            // the same 200 ms the old per-item frontend loop used.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        let status = classify_one(pid, mc_version.as_deref(), loader.as_deref()).await;
+        let status = if item.provider == "curseforge" {
+            classify_cf_one(pid, mc_version.as_deref(), loader.as_deref(), &cf_key).await
+        } else {
+            classify_one(pid, mc_version.as_deref(), loader.as_deref()).await
+        };
         out.push(CompatResult {
             filename: item.filename.clone(),
             status: status.to_string(),
@@ -444,6 +661,39 @@ async fn classify_one(
         Some(l) if !l.is_empty() && !l.eq_ignore_ascii_case("vanilla") => {
             match modrinth::get_versions(project_id, None, loader).await {
                 Ok(v) => Some(v.len()),
+                Err(_) => return content::COMPAT_UNKNOWN,
+            }
+        }
+        _ => None,
+    };
+    content::classify_compat(true, strict, loader_only)
+}
+
+/// CurseForge half of [`classify_one`]: same states, CF file listing as the
+/// version source (newest-first, unavailable files already filtered). A
+/// missing/failed listing is `unknown` — a blip must never claim
+/// incompatibility.
+async fn classify_cf_one(
+    project_id: &str,
+    mc_version: Option<&str>,
+    loader: Option<&str>,
+    api_key: &str,
+) -> &'static str {
+    let Ok(pid) = project_id.parse::<u64>() else {
+        return content::COMPAT_UNKNOWN;
+    };
+    let strict = match crate::curseforge::get_mod_files(pid, mc_version, loader, 0, api_key).await
+    {
+        Ok(r) => r.data.len(),
+        Err(_) => return content::COMPAT_UNKNOWN,
+    };
+    if strict > 0 {
+        return content::classify_compat(true, strict, None);
+    }
+    let loader_only = match loader {
+        Some(l) if !l.is_empty() && !l.eq_ignore_ascii_case("vanilla") => {
+            match crate::curseforge::get_mod_files(pid, None, loader, 0, api_key).await {
+                Ok(r) => Some(r.data.len()),
                 Err(_) => return content::COMPAT_UNKNOWN,
             }
         }

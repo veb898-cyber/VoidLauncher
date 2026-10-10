@@ -128,6 +128,10 @@ pub struct CfFile {
     pub release_type: u32,
     #[serde(default)]
     pub hashes: Vec<CfHash>,
+    /// `false` marks deleted/broken files the API still lists; they must
+    /// never be offered as versions nor downloaded. Absent means available.
+    #[serde(rename = "isAvailable")]
+    pub is_available: Option<bool>,
 }
 
 impl CfFile {
@@ -161,6 +165,40 @@ pub fn loader_type_id(loader: &str) -> Option<u32> {
         "neoforge" => Some(6),
         _ => None,
     }
+}
+
+/// CurseForge classId for a VoidLauncher project type (verified against
+/// `GET /v1/categories?gameId=432`: mods=6, resourcepacks=12,
+/// shaders=6552, modpacks=4471). Unknown types return `None` — the search
+/// then spans all classes instead of silently forcing "mods".
+pub fn class_id_for_project_type(project_type: &str) -> Option<u32> {
+    match project_type.trim().to_ascii_lowercase().as_str() {
+        "mod" | "mods" => Some(6),
+        "resourcepack" | "resourcepacks" | "resource-pack" | "resource-packs" => Some(12),
+        "shader" | "shaders" | "shaderpack" | "shaderpacks" => Some(6552),
+        "modpack" | "modpacks" => Some(4471),
+        "world" | "worlds" => Some(17),
+        "datapack" | "datapacks" => Some(6945),
+        _ => None,
+    }
+}
+
+/// Map the frontend sort selection onto CF `sortField`/`sortOrder`:
+/// downloads → popularity (2) desc, newest/oldest → lastUpdated (3).
+/// `sortField=3 asc` works, so no last-page emulation is needed for CF.
+pub fn sort_field_for(index: Option<&str>) -> (u32, &'static str) {
+    match index.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("newest") => (3, "desc"),
+        Some("oldest") => (3, "asc"),
+        _ => (2, "desc"),
+    }
+}
+
+/// Newest-first ordering + availability filter shared by every file list:
+/// the raw API order is not guaranteed and deleted files must never surface.
+pub fn sort_files_newest_first(files: &mut Vec<CfFile>) {
+    files.retain(|f| f.is_available.unwrap_or(true));
+    files.sort_by(|a, b| b.file_date.cmp(&a.file_date));
 }
 
 async fn api_get<T: serde::de::DeserializeOwned>(url: &str, api_key: &str) -> Result<T> {
@@ -227,35 +265,27 @@ async fn api_get_once<T: serde::de::DeserializeOwned>(
     })?)
 }
 
-pub async fn search_mods(
-    query: &str,
-    mc_version: Option<&str>,
-    loader: Option<&str>,
-    offset: u32,
-    limit: u32,
-    api_key: &str,
-) -> Result<CfSearchResponse> {
-    search_mods_filtered(query, mc_version, loader, None, None, offset, limit, api_key).await
-}
-
-/// Search with optional classId (e.g. 4471 = modpacks) and categoryId filters.
+/// Search with optional classId (e.g. 4471 = modpacks), categoryId and
+/// sort (`index`: `downloads`/`newest`/`oldest`, see [`sort_field_for`]).
 pub async fn search_mods_filtered(
     query: &str,
     mc_version: Option<&str>,
     loader: Option<&str>,
     class_id: Option<u32>,
     category_id: Option<u32>,
+    index: Option<&str>,
     offset: u32,
     limit: u32,
     api_key: &str,
 ) -> Result<CfSearchResponse> {
+    let (sort_field, sort_order) = sort_field_for(index);
     let mut params = vec![
         format!("gameId={}", MINECRAFT_GAME_ID),
         format!("searchFilter={}", urlencoding::encode(query)),
         format!("pageSize={}", limit.min(50)),
         format!("index={}", offset),
-        "sortField=2".to_string(),
-        "sortOrder=desc".to_string(),
+        format!("sortField={}", sort_field),
+        format!("sortOrder={}", sort_order),
     ];
 
     if let Some(c) = class_id {
@@ -284,14 +314,19 @@ pub async fn get_mod(mod_id: u64, api_key: &str) -> Result<CfModDetail> {
     Ok(resp.data)
 }
 
+/// File list for a project, newest-first and with unavailable files
+/// filtered out (see [`sort_files_newest_first`]). `offset` pages the list
+/// for the version browser (the API caps `pageSize` at 50).
 pub async fn get_mod_files(
     mod_id: u64,
     mc_version: Option<&str>,
     loader: Option<&str>,
+    offset: u32,
     api_key: &str,
 ) -> Result<CfFilesResponse> {
     let mut params = vec![
         format!("pageSize={}", 50),
+        format!("index={}", offset),
     ];
 
     if let Some(v) = mc_version {
@@ -304,7 +339,9 @@ pub async fn get_mod_files(
     }
 
     let url = format!("{}/v1/mods/{}/files?{}", BASE_URL, mod_id, params.join("&"));
-    api_get(&url, api_key).await
+    let mut resp: CfFilesResponse = api_get(&url, api_key).await?;
+    sort_files_newest_first(&mut resp.data);
+    Ok(resp)
 }
 
 pub async fn get_mod_file(mod_id: u64, file_id: u64, api_key: &str) -> Result<CfFile> {
@@ -321,7 +358,7 @@ pub async fn get_mod_file_download_url(mod_id: u64, file_id: u64, api_key: &str)
     Ok(resp.data)
 }
 
-fn cf_cdn_urls(file_id: u64, file_name: &str) -> Vec<String> {
+pub(crate) fn cf_cdn_urls(file_id: u64, file_name: &str) -> Vec<String> {
     let prefix = file_id / 1000;
     let suffix = file_id % 1000;
     let encoded = urlencoding::encode(file_name);
@@ -349,23 +386,12 @@ pub async fn download_mod_file(
     api_key: &str,
     dest_path: &std::path::Path,
 ) -> Result<()> {
-    let mut urls: Vec<String> = Vec::new();
-
-    if let Ok(signed) = get_mod_file_download_url(mod_id, file_id, api_key).await {
-        if !signed.is_empty() {
-            urls.push(signed);
-        }
-    }
-
+    let mut urls = download_url_candidates(mod_id, file_id, &cf_file.file_name, api_key).await;
     if let Some(u) = cf_file.download_url.as_ref().filter(|u| !u.is_empty()) {
         if !urls.iter().any(|x| x == u) {
-            urls.push(u.clone());
-        }
-    }
-
-    for cdn in cf_cdn_urls(file_id, &cf_file.file_name) {
-        if !urls.iter().any(|x| x == &cdn) {
-            urls.push(cdn);
+            // Official API link — right after the signed URL, before the mirrors.
+            let at = if api_key.is_empty() { 0 } else { 1.min(urls.len()) };
+            urls.insert(at, u.clone());
         }
     }
 
@@ -390,6 +416,8 @@ pub async fn download_mod_file(
         .await
         {
             Ok(()) => return Ok(()),
+            // Pause stops the whole install — never fall to the next mirror.
+            Err(e @ crate::error::LauncherError::Paused) => return Err(e),
             Err(e) => last_err = e.to_string(),
         }
     }
@@ -397,6 +425,85 @@ pub async fn download_mod_file(
     Err(crate::error::LauncherError::Download(format!(
         "Failed to download {} ({}): {}",
         cf_file.display_name, cf_file.file_name, last_err
+    )))
+}
+
+/// Ordered download candidates for a CF file: the official signed URL
+/// first (needs an API key), then the CDN URL pattern derived from the
+/// file id. The CDN candidates never need a key, so the list is non-empty
+/// for any valid file even without configured credentials.
+pub async fn download_url_candidates(
+    mod_id: u64,
+    file_id: u64,
+    file_name: &str,
+    api_key: &str,
+) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    if !api_key.is_empty() {
+        if let Ok(signed) = get_mod_file_download_url(mod_id, file_id, api_key).await {
+            if signed.starts_with("https://") && !urls.contains(&signed) {
+                urls.push(signed);
+            }
+        }
+    }
+    for cdn in cf_cdn_urls(file_id, file_name) {
+        if !urls.contains(&cdn) {
+            urls.push(cdn);
+        }
+    }
+    urls
+}
+
+/// Download a CurseForge file from (project_id, file_id) without needing a
+/// direct URL up front — the plan for CF content carries an empty `url`,
+/// and this resolves the signed/CDN chain at download time. Candidates are
+/// tried in order; the resume `.part` of a failed candidate is deleted
+/// before the next host is tried so two different bodies never mix.
+pub async fn download_cf_native(
+    mod_id: u64,
+    file_id: u64,
+    file_name: &str,
+    expected_sha1: &str,
+    dest: &std::path::Path,
+    api_key: &str,
+) -> Result<()> {
+    // Already on disk with the wanted hash (interrupted-apply resume).
+    if dest.exists() && !expected_sha1.is_empty() && crate::download::verify_sha1(dest, expected_sha1)? {
+        return Ok(());
+    }
+    let candidates = download_url_candidates(mod_id, file_id, file_name, api_key).await;
+    if candidates.is_empty() {
+        return Err(crate::error::LauncherError::Download(format!(
+            "No download URL for CurseForge file {} ({})",
+            file_id, file_name
+        )));
+    }
+    let mut last_err = String::new();
+    for (i, url) in candidates.iter().enumerate() {
+        if i > 0 {
+            let mut part = dest.as_os_str().to_os_string();
+            part.push(".part");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(part));
+        }
+        match crate::download::download_to_part(
+            url,
+            dest,
+            expected_sha1,
+            None,
+            Some(crate::download::timeout_for_unknown_size()),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            // A paused install must stop immediately, not fall through to
+            // another mirror (the global pause flag applies to all of them).
+            Err(e @ crate::error::LauncherError::Paused) => return Err(e),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(crate::error::LauncherError::Download(format!(
+        "Failed to download {} ({}): {}",
+        file_name, file_id, last_err
     )))
 }
 
@@ -426,4 +533,82 @@ pub async fn popular_mods(
 
     let url = format!("{}/v1/mods/search?{}", BASE_URL, params.join("&"));
     api_get(&url, api_key).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cf_file(id: u64, name: &str, date: &str, available: Option<bool>) -> CfFile {
+        CfFile {
+            id,
+            display_name: name.to_string(),
+            file_name: format!("{}.jar", name),
+            download_url: None,
+            file_length: 1,
+            file_date: date.to_string(),
+            game_versions: vec![],
+            dependencies: vec![],
+            release_type: 1,
+            hashes: vec![],
+            is_available: available,
+        }
+    }
+
+    #[test]
+    fn class_id_for_project_type_matches_live_categories() {
+        assert_eq!(class_id_for_project_type("mod"), Some(6));
+        assert_eq!(class_id_for_project_type("Mods"), Some(6));
+        assert_eq!(class_id_for_project_type("resourcepack"), Some(12));
+        assert_eq!(class_id_for_project_type("shader"), Some(6552));
+        assert_eq!(class_id_for_project_type("modpack"), Some(4471));
+        assert_eq!(class_id_for_project_type("datapack"), Some(6945));
+        assert_eq!(class_id_for_project_type("world"), Some(17));
+        // Unknown → no classId filter (search all classes).
+        assert_eq!(class_id_for_project_type("bogus"), None);
+        assert_eq!(class_id_for_project_type(""), None);
+    }
+
+    #[test]
+    fn sort_field_for_frontend_index() {
+        assert_eq!(sort_field_for(None), (2, "desc"));
+        assert_eq!(sort_field_for(Some("downloads")), (2, "desc"));
+        assert_eq!(sort_field_for(Some("newest")), (3, "desc"));
+        assert_eq!(sort_field_for(Some("oldest")), (3, "asc"));
+        assert_eq!(sort_field_for(Some("unknown")), (2, "desc"));
+    }
+
+    #[test]
+    fn file_list_is_sorted_newest_first_and_drops_unavailable() {
+        let mut files = vec![
+            cf_file(1, "old", "2024-01-01T00:00:00Z", Some(true)),
+            cf_file(2, "broken", "2025-06-01T00:00:00Z", Some(false)),
+            cf_file(3, "new", "2025-01-01T00:00:00Z", None),
+            cf_file(4, "removed-no-flag", "2023-05-01T00:00:00Z", None),
+        ];
+        sort_files_newest_first(&mut files);
+        let ids: Vec<u64> = files.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![3, 1, 4]);
+    }
+
+    #[test]
+    fn cdn_urls_use_file_id_shards_and_encoding() {
+        let urls = cf_cdn_urls(1_234_567, "My Mod 1.0.jar");
+        assert!(urls[0].starts_with("https://edge.forgecdn.net/files/1234/567/"));
+        assert!(urls.iter().all(|u| u.contains("/files/1234/567/")));
+        assert_eq!(urls.iter().filter(|u| u.contains("mediafilez.forgecdn.net")).count(), 2);
+        // Spaces are percent-encoded in the second variant.
+        assert!(urls.iter().any(|u| u.contains("My%20Mod%201.0.jar")));
+    }
+
+    #[tokio::test]
+    async fn download_candidates_without_api_key_are_pure_cdn() {
+        let urls = download_url_candidates(42, 7, "mod.jar", "").await;
+        assert!(!urls.is_empty());
+        assert!(urls.iter().all(|u| u.starts_with("https://") && u.contains("forgecdn.net")));
+        // Deduplicated.
+        let mut dedup = urls.clone();
+        dedup.dedup();
+        assert_eq!(urls, dedup);
+    }
 }

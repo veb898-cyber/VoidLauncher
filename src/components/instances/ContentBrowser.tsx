@@ -13,7 +13,8 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
 import { RemoteIcon } from '../../lib/remoteImage';
-import { getProvider, type ProviderProject } from '../../lib/contentProviders';
+import { getProvider, type ProviderId, type ProviderProject } from '../../lib/contentProviders';
+import { useSettingsStore } from '../../stores/settingsStore';
 
 type Hit = ProviderProject;
 
@@ -24,13 +25,15 @@ export interface SelectedItem {
   filename: string;
   source: string;
   projectId: string;
-  /** Pinned Modrinth version id — feeds the dependency resolver and the
-   *  sidecar written at install time. */
+  /** Pinned version id — feeds the dependency resolver and the sidecar
+   *  written at install time. CurseForge ids are `cf:{project}:{file}`. */
   versionId?: string;
   versionName?: string;
   isDependency?: boolean;
   parentMod?: string;
   sha1?: string;
+  /** CurseForge file id — required for the id-chain download. */
+  fileId?: string;
 }
 
 /** Backend dependency-resolution payloads (cmd_resolve_dependencies). */
@@ -58,10 +61,12 @@ interface PlanEntry {
   name: string;
   version_label: string;
   icon_url?: string | null;
-  file: { url: string; filename: string; sha1?: string | null };
+  file: { url: string; filename: string; sha1?: string | null; file_id?: string | null };
   depth: number;
   required_by: string[];
   is_root: boolean;
+  /** `modrinth` / `curseforge` — set by the backend resolver. */
+  provider?: string;
 }
 interface Resolution {
   install: PlanEntry[];
@@ -71,7 +76,7 @@ interface Resolution {
   unresolved: UnresolvedDep[];
 }
 
-const provider = getProvider('modrinth');
+const PROVIDER_STORAGE_KEY = 'voidlauncher.contentProvider';
 
 export type ContentType = 'mod' | 'resourcepack' | 'shader';
 
@@ -113,9 +118,23 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     if (!loadingDetail) hydrateRemoteImages(mdBodyRef.current);
   }, [loadingDetail, modDetail]);
   const [versions, setVersions] = useState<any[]>([]);
+  // Catalog provider (Modrinth / CurseForge), persisted across sessions.
+  const [providerId, setProviderId] = useState<ProviderId>(() => {
+    const saved = localStorage.getItem(PROVIDER_STORAGE_KEY);
+    return saved === 'curseforge' ? 'curseforge' : 'modrinth';
+  });
+  const provider = getProvider(providerId);
+  const curseforgeApiKey = useSettingsStore((s) => s.config?.curseforge_api_key);
   const [sortMode, setSortMode] = useState<SortMode>('downloads');
   // Modrinth has no "oldest" index; we request newest and page backwards.
-  const sortIndex = sortMode === 'downloads' ? 'downloads' : 'newest';
+  // CurseForge does support ascending lastUpdated, so it pages normally.
+  const emulateOldest = providerId === 'modrinth' && sortMode === 'oldest';
+  const sortIndex =
+    providerId === 'curseforge'
+      ? sortMode
+      : sortMode === 'downloads'
+        ? 'downloads'
+        : 'newest';
   const [selectedItems, setSelectedItems] = useState<SelectedItem[]>([]);
   const [addingId, setAddingId] = useState<string | null>(null);
   const [subView, setSubView] = useState<'search' | 'confirm'>('search');
@@ -172,6 +191,32 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     }
   };
 
+  // Switching catalog: drop everything keyed by the old provider (ids,
+  // selections, resolved plan) and start a fresh popular list. The reload
+  // itself happens through loadPopular's own effect (providerId is a dep).
+  useEffect(() => {
+    localStorage.setItem(PROVIDER_STORAGE_KEY, providerId);
+    ++popularReqRef.current;
+    ++searchReqRef.current;
+    ++resolveReqRef.current;
+    setQuery('');
+    setResults([]);
+    setPopular([]);
+    setSelected(null);
+    setVersions([]);
+    setModDetail(null);
+    setSelectedItems([]);
+    setConflicts([]);
+    setUnresolved([]);
+    setResultsOffset(0);
+    setPopularOffset(0);
+    setHasMoreResults(true);
+    setHasMorePopular(true);
+    setSubView('search');
+    setLoading(false);
+    setLoadingMore(false);
+  }, [providerId]);
+
   // Sequence guards: a slow response from an outdated request (fast sort /
   // filter switching) must never overwrite fresher results.
   const popularReqRef = useRef(0);
@@ -187,7 +232,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       const base = { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
       let res = await provider.popular(base);
       if (reqId !== popularReqRef.current) return;
-      if (sortMode === 'oldest') {
+      if (emulateOldest) {
         const total = Math.max(res.total_hits ?? 0, 0);
         const lastOffset = Math.max(0, total - PAGE_SIZE);
         const page = lastOffset > 0
@@ -206,7 +251,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       }
     } catch { }
     if (reqId === popularReqRef.current) setLoading(false);
-  }, [contentType, mcVersion, loader, sortMode]);
+  }, [contentType, mcVersion, loader, sortIndex, emulateOldest, providerId]);
 
   const popularOffsetRef = useRef(0);
   popularOffsetRef.current = popularOffset;
@@ -220,13 +265,13 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       const res = await provider.popular({ projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
       if (reqId !== popularReqRef.current) { setLoadingMore(false); return; }
       const raw: Hit[] = res.hits || [];
-      const hits: Hit[] = sortMode === 'oldest' ? [...raw].reverse() : raw;
+      const hits: Hit[] = emulateOldest ? [...raw].reverse() : raw;
       setPopular((prev) => {
         const seen = new Set(prev.map((h) => h.project_id));
         const fresh = hits.filter((h) => !seen.has(h.project_id));
         return [...prev, ...fresh];
       });
-      if (sortMode === 'oldest') {
+      if (emulateOldest) {
         const next = offset - PAGE_SIZE;
         setPopularOffset(Math.max(0, next));
         setHasMorePopular(offset > 0);
@@ -236,7 +281,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       }
     } catch { }
     setLoadingMore(false);
-  }, [contentType, mcVersion, loader, hasMorePopular, loadingMore, sortMode]);
+  }, [contentType, mcVersion, loader, hasMorePopular, loadingMore, sortIndex, emulateOldest, providerId]);
 
   useEffect(() => { loadPopular(); }, [loadPopular]);
 
@@ -262,7 +307,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       const base = { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
       let res = await provider.search(query, base);
       if (reqId !== searchReqRef.current) return;
-      if (sortMode === 'oldest') {
+      if (emulateOldest) {
         const total = Math.max(res.total_hits ?? 0, 0);
         const lastOffset = Math.max(0, total - PAGE_SIZE);
         const page = lastOffset > 0
@@ -295,13 +340,13 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       const res = await provider.search(query, { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
       if (reqId !== searchReqRef.current) { setLoadingMore(false); return; }
       const raw: Hit[] = res.hits || [];
-      const hits: Hit[] = sortMode === 'oldest' ? [...raw].reverse() : raw;
+      const hits: Hit[] = emulateOldest ? [...raw].reverse() : raw;
       setResults((prev) => {
         const seen = new Set(prev.map((h) => h.project_id));
         const fresh = hits.filter((h) => !seen.has(h.project_id));
         return [...prev, ...fresh];
       });
-      if (sortMode === 'oldest') {
+      if (emulateOldest) {
         const next = offset - PAGE_SIZE;
         setResultsOffset(Math.max(0, next));
         setHasMoreResults(offset > 0);
@@ -311,7 +356,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       }
     } catch { }
     setLoadingMore(false);
-  }, [contentType, mcVersion, loader, query, hasMoreResults, loadingMore, sortMode]);
+  }, [contentType, mcVersion, loader, query, hasMoreResults, loadingMore, sortIndex, emulateOldest, providerId]);
 
   const prevSortModeRef = useRef(sortMode);
   useEffect(() => {
@@ -405,11 +450,12 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         iconUrl: p.icon_url ?? undefined,
         downloadUrl: p.file.url,
         filename: p.file.filename,
-        source: 'modrinth',
+        source: p.provider === 'curseforge' ? 'curseforge' : 'modrinth',
         projectId: p.project_id,
         versionId: p.version_id,
         versionName: p.version_label,
         sha1: p.file.sha1 ?? undefined,
+        fileId: p.file.file_id ?? undefined,
         isDependency: !p.is_root,
         parentMod: p.is_root ? undefined : (p.required_by[0] || undefined),
       })));
@@ -452,11 +498,12 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           iconUrl: hit.icon_url ?? undefined,
           downloadUrl: file.url,
           filename: file.filename,
-          source: 'modrinth',
+          source: providerId,
           projectId: hit.project_id,
           versionId: v.id,
           versionName: v.name || v.version_number,
           sha1: file.hashes?.sha1,
+          fileId: file.file_id,
         };
         const next = [...selectedItems, item];
         setSelectedItems(next);
@@ -496,6 +543,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           versionNumber: item.versionName || null,
           provider: item.source || 'modrinth',
           expectedSha1: item.sha1 || '',
+          fileId: item.fileId ?? null,
         });
         success++;
       } catch (e: any) { failed++; addToast(t('content.install_error', { name: item.name, error: e.toString() }), 'error'); }
@@ -522,7 +570,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
 
   const displayHits = results.length > 0 ? results : popular;
 
-  const renderMarkdown = (text: string): string => renderMarkdownToHtml(text);
+  const renderMarkdown = (text: string): string => renderMarkdownToHtml(text, providerId);
 
   const formatDownloads = (n?: number) => {
     if (n == null) return '';
@@ -643,7 +691,39 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
         </div>
         <Button size="sm" onClick={handleSearch} disabled={loading} loading={loading}>{t('common.find')}</Button>
+        {/* Catalog provider switch: one browser for both catalogs. */}
+        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }} role="group" aria-label={t('content.provider_label')}>
+          {(['modrinth', 'curseforge'] as const).map((pid) => (
+            <Button
+              key={pid}
+              size="sm"
+              variant={providerId === pid ? 'primary' : 'ghost'}
+              onClick={() => setProviderId(pid)}
+              style={{ fontSize: '11px', padding: '4px 8px' }}
+            >
+              {pid === 'modrinth' ? t('content.provider_modrinth') : t('content.provider_curseforge')}
+            </Button>
+          ))}
+        </div>
       </div>
+
+      {/* CurseForge without a configured key: search would just 401. */}
+      {providerId === 'curseforge' && !curseforgeApiKey && (
+        <div
+          style={{
+            margin: 'var(--space-xs) var(--space-xl) 0',
+            border: '1px solid var(--warning)',
+            background: 'hsla(35, 90%, 55%, 0.08)',
+            borderRadius: 'var(--radius-md)',
+            padding: '8px 12px',
+            fontSize: 'var(--font-size-xs)',
+            color: 'var(--warning)',
+            flexShrink: 0,
+          }}
+        >
+          {t('modpacks.curseforge_key_missing')}
+        </div>
+      )}
 
       {/* Sort controls */}
       <div style={{ display: 'flex', gap: 4, alignItems: 'center', padding: 'var(--space-xs) var(--space-xl)', flexShrink: 0 }}>
@@ -766,10 +846,11 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                               const item: SelectedItem = {
                                 name: selected.title, iconUrl: selected.icon_url ?? undefined,
                                 downloadUrl: file.url, filename: file.filename,
-                                source: 'modrinth', projectId: selected.project_id,
+                                source: providerId, projectId: selected.project_id,
                                 versionId: v.id,
                                 versionName: v.name || v.version_number,
                                 sha1: file.hashes?.sha1,
+                                fileId: file.file_id,
                               };
                               const next = [...selectedItems, item];
                               setSelectedItems(next);

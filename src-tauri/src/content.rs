@@ -212,6 +212,30 @@ pub fn normalize_dep_type(raw: &str) -> &'static str {
     }
 }
 
+/// Normalize a CurseForge `relationType` (numeric enum) to our dependency
+/// kinds. `None` means "skip the edge entirely": embedded (1), tool (4) and
+/// include (6) dependencies ship inside the pack or are build-time helpers,
+/// and unknown future values must never be auto-installed either.
+pub fn normalize_cf_dep_type(relation_type: u32) -> Option<&'static str> {
+    match relation_type {
+        2 => Some(DEP_REQUIRED),
+        3 => Some(DEP_OPTIONAL),
+        5 => Some(DEP_INCOMPATIBLE),
+        _ => None,
+    }
+}
+
+/// Normalize a project display name for cross-provider installed matching:
+/// lowercase, `-`/`_` treated as word breaks, whitespace collapsed. "JEI",
+/// "jei-1.20.1" style prefixes stay comparable to the provider's title.
+pub fn normalize_project_name(raw: &str) -> String {
+    raw.to_lowercase()
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The downloadable file of a planned version — everything the frontend
 /// needs to call `cmd_download_to_folder`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +244,11 @@ pub struct PlanFile {
     pub filename: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha1: Option<String>,
+    /// CurseForge file id: CF files have no direct HTTPS URL in the plan
+    /// (`url` is empty) — the backend resolves the signed/CDN chain from
+    /// (project_id, file_id) at download time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 /// One dependency edge of a fetched version.
@@ -251,6 +280,10 @@ pub struct VersionNode {
     pub file: PlanFile,
     #[serde(default)]
     pub deps: Vec<DepEdge>,
+    /// Origin provider: `""`/`modrinth` or `curseforge`. A node's dependency
+    /// edges inherit this provider (CF files only depend on CF projects).
+    #[serde(default)]
+    pub provider: String,
 }
 
 /// A required dependency phase 1 could not resolve to a version. Reported to
@@ -309,6 +342,10 @@ pub struct PlanItem {
     /// primary parent in the UI).
     pub required_by: Vec<String>,
     pub is_root: bool,
+    /// Origin provider (`modrinth`/`curseforge`); serialized as
+    /// `modrinth` when the graph predates the field.
+    #[serde(default)]
+    pub provider: String,
 }
 
 /// Why a dependency blocks installation.
@@ -392,6 +429,10 @@ pub fn build_resolution(input: &GraphInput, installed: &[InstalledProject]) -> R
 struct Walk<'a> {
     input: &'a GraphInput,
     installed: HashMap<String, &'a InstalledProject>,
+    /// Normalized project name → installed entry, for cross-provider
+    /// matching (a CF dependency satisfied by a Modrinth-installed mod and
+    /// vice versa: the ids differ, the display name usually does not).
+    installed_by_name: HashMap<String, &'a InstalledProject>,
     entered: HashMap<String, Entered>,
     sources: HashMap<String, Vec<String>>,
     order: Vec<String>,
@@ -411,6 +452,11 @@ impl<'a> Walk<'a> {
             installed: installed
                 .iter()
                 .map(|p| (p.project_id.clone(), p))
+                .collect(),
+            installed_by_name: installed
+                .iter()
+                .map(|p| (normalize_project_name(&p.name), p))
+                .filter(|(k, _)| !k.is_empty())
                 .collect(),
             entered: HashMap::new(),
             sources: HashMap::new(),
@@ -482,6 +528,16 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// The installed entry a required target matches: by project id first
+    /// (same provider), then by normalized display name (cross-provider).
+    fn installed_for(&self, pid: &str) -> Option<&'a InstalledProject> {
+        if let Some(inst) = self.installed.get(pid) {
+            return Some(inst);
+        }
+        let name = self.input.project_names.get(pid)?;
+        self.installed_by_name.get(&normalize_project_name(name)).copied()
+    }
+
     fn process_required(&mut self, dep: &DepEdge, source: &VersionNode) {
         let Some(pid) = dep.project_id.as_deref() else {
             return;
@@ -490,7 +546,7 @@ impl<'a> Walk<'a> {
         if pid == source.project_id {
             return;
         }
-        if let Some(inst) = self.installed.get(pid) {
+        if let Some(inst) = self.installed_for(pid) {
             self.skipped.entry(pid.to_string()).or_insert_with(|| SkippedItem {
                 project_id: pid.to_string(),
                 name: inst.name.clone(),
@@ -558,7 +614,7 @@ impl<'a> Walk<'a> {
             std::mem::take(&mut self.deferred_incompatible)
         {
             let planned = self.entered.get(&target_pid);
-            if planned.is_none() && !self.installed.contains_key(&target_pid) {
+            if planned.is_none() && self.installed_for(&target_pid).is_none() {
                 continue;
             }
             let name = match planned {
@@ -608,6 +664,11 @@ impl<'a> Walk<'a> {
                     depth: e.depth,
                     required_by: self.sources.get(pid).cloned().unwrap_or_default(),
                     is_root: root_pids.contains(pid),
+                    provider: if node.provider.is_empty() {
+                        "modrinth".to_string()
+                    } else {
+                        node.provider.clone()
+                    },
                 })
             })
             .collect();
@@ -896,8 +957,10 @@ mod tests {
                 url: format!("https://cdn.example/{}.jar", vid),
                 filename: format!("{}.jar", vid),
                 sha1: Some(format!("sha-{}", vid)),
+                file_id: None,
             },
             deps,
+            provider: String::new(),
         }
     }
 
@@ -1210,6 +1273,75 @@ mod tests {
         assert_eq!(normalize_dep_type("dontdepend"), DEP_INCOMPATIBLE);
         assert_eq!(normalize_dep_type("embedded"), DEP_EMBEDDED);
         assert_eq!(normalize_dep_type("future-kind"), DEP_OPTIONAL);
+    }
+
+    #[test]
+    fn curseforge_relation_type_normalization() {
+        assert_eq!(normalize_cf_dep_type(2), Some(DEP_REQUIRED));
+        assert_eq!(normalize_cf_dep_type(3), Some(DEP_OPTIONAL));
+        assert_eq!(normalize_cf_dep_type(5), Some(DEP_INCOMPATIBLE));
+        // Embedded / tool / include / unknown: never fetched.
+        assert_eq!(normalize_cf_dep_type(1), None);
+        assert_eq!(normalize_cf_dep_type(4), None);
+        assert_eq!(normalize_cf_dep_type(6), None);
+        assert_eq!(normalize_cf_dep_type(99), None);
+    }
+
+    #[test]
+    fn project_name_normalization_folds_case_and_separators() {
+        assert_eq!(normalize_project_name("Just Enough Items (JEI)"), "just enough items (jei)");
+        assert_eq!(normalize_project_name("JEI"), "jei");
+        assert_eq!(normalize_project_name("sodium_fabric"), "sodium fabric");
+        assert_eq!(normalize_project_name("  Multi   Space "), "multi space");
+        assert_eq!(normalize_project_name(""), "");
+    }
+
+    #[test]
+    fn installed_required_dependency_matches_by_name_across_providers() {
+        // The root requires project "42" (a CurseForge id) but the same
+        // mod is installed from Modrinth under slug "jei" — the display
+        // names agree, so the target must be skipped, not re-planned.
+        let required_42 = DepEdge {
+            source_version_id: "v-root".to_string(),
+            dep_type: DEP_REQUIRED.to_string(),
+            project_id: Some("42".to_string()),
+            version_id: None,
+        };
+        let mut g = graph(
+            vec![
+                node("v-root", "root", "Root Mod", "1.0", vec![required_42]),
+                node("cf:42:7", "42", "Just Enough Items (JEI)", "15.2", vec![]),
+            ],
+            &["v-root"],
+        );
+        g.project_names.insert("42".to_string(), "Just Enough Items (JEI)".to_string());
+        let res = build_resolution(
+            &g,
+            &[InstalledProject {
+                project_id: "jei".to_string(),
+                name: "Just Enough Items (JEI)".to_string(),
+                version_id: None,
+            }],
+        );
+        assert_eq!(plan_ids(&res), vec!["root"]);
+        assert_eq!(res.skipped.len(), 1);
+        assert_eq!(res.skipped[0].project_id, "42");
+        assert_eq!(res.skipped[0].name, "Just Enough Items (JEI)");
+    }
+
+    #[test]
+    fn plan_items_carry_provider_and_cf_file_id() {
+        let mut n = node("cf:9:1", "9", "CF Mod", "1.0", vec![]);
+        n.provider = "curseforge".to_string();
+        n.file.url = String::new();
+        n.file.file_id = Some("1".to_string());
+        let g = graph(vec![n], &["cf:9:1"]);
+        let res = build_resolution(&g, &[]);
+        assert_eq!(res.install.len(), 1);
+        let item = &res.install[0];
+        assert_eq!(item.provider, "curseforge");
+        assert_eq!(item.file.url, "");
+        assert_eq!(item.file.file_id.as_deref(), Some("1"));
     }
 
     #[test]

@@ -132,6 +132,7 @@ pub async fn cmd_search_curseforge_modpacks(
     query: String,
     mc_version: Option<String>,
     loader: Option<String>,
+    index: Option<String>,
     offset: u32,
     limit: u32,
 ) -> Result<curseforge::CfSearchResponse, String> {
@@ -145,6 +146,7 @@ pub async fn cmd_search_curseforge_modpacks(
         loader.as_deref(),
         Some(CF_MODPACK_CLASS_ID),
         None,
+        index.as_deref(),
         offset,
         limit,
         &api_key,
@@ -164,19 +166,9 @@ pub async fn cmd_get_curseforge_modpack_files(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.curseforge_api_key.clone()
     };
-    curseforge::get_mod_files(mod_id, mc_version.as_deref(), loader.as_deref(), &api_key)
+    curseforge::get_mod_files(mod_id, mc_version.as_deref(), loader.as_deref(), 0, &api_key)
         .await
         .map_err(|e| e.to_string())
-}
-
-/// Fallback CurseForge CDN URL: edge.forgecdn.net/files/{id/1000}/{id%1000}/{name}.
-fn forgecdn_fallback_url(file_id: u64, file_name: &str) -> String {
-    format!(
-        "https://edge.forgecdn.net/files/{}/{}/{}",
-        file_id / 1000,
-        file_id % 1000,
-        file_name
-    )
 }
 
 #[tauri::command]
@@ -199,31 +191,26 @@ pub async fn cmd_install_curseforge_modpack(
     let file = curseforge::get_mod_file(mod_id, file_id, &api_key)
         .await
         .map_err(|e| e.to_string())?;
-    let download_url = file
-        .download_url
-        .clone()
-        .unwrap_or_else(|| forgecdn_fallback_url(file_id, &file.file_name));
-    if !download_url.starts_with("https://") {
-        return Err("Download URL must be HTTPS.".to_string());
-    }
-    if !crate::is_allowed_download_host(&download_url) {
-        return Err(format!(
-            "Download host is not in the allowlist: {}",
-            download_url
-        ));
-    }
     let safe_instance = instance_name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect::<String>();
     let temp_path = std::env::temp_dir()
         .join(format!("voidlauncher-cf-{}-{}.zip", safe_instance, file_id));
-    let expected_sha1 = file.sha1_hash().unwrap_or("");
-    crate::download::download_file_sized(&download_url, &temp_path, expected_sha1, file.file_length)
+    curseforge::download_mod_file(mod_id, file_id, &file, &api_key, &temp_path)
         .await
         .map_err(|e| e.to_string())?;
 
-    let result = crate::import::import_curseforge_pack(
+    // Pack metadata for the update lock — read while the temp zip exists.
+    let (manifest, overrides) = match crate::cfpack::pack_zip_info(&temp_path) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
+
+    let instance = match crate::import::import_curseforge_pack(
         &instances_dir,
         &temp_path.to_string_lossy(),
         &instance_name,
@@ -231,9 +218,37 @@ pub async fn cmd_install_curseforge_modpack(
         &libraries_dir,
         Some(&app),
     )
-    .await;
+    .await
+    {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e.to_string());
+        }
+    };
+
+    // Track the pack so update/repair can find it later. Best-effort: a
+    // failed lock write leaves an untracked but fully usable instance.
+    let pack_name = match curseforge::get_mod(mod_id, &api_key).await {
+        Ok(p) => p.name,
+        Err(_) => file.file_name.clone(),
+    };
+    let lock = crate::cfpack::CfPackLock {
+        provider: "curseforge".to_string(),
+        pack_project_id: mod_id.to_string(),
+        pack_name,
+        file_id: file_id.to_string(),
+        file_name: file.file_name.clone(),
+        file_display_name: file.display_name.clone(),
+        installed_at: chrono::Utc::now().to_rfc3339(),
+        mc_version: instance.mc_version.clone(),
+        loader: crate::cfpack::loader_slug(&instance.loader).to_string(),
+        manifest,
+        overrides,
+    };
+    let _ = lock.write(&instances_dir.join(&instance_name));
     let _ = std::fs::remove_file(&temp_path);
-    result.map_err(|e| e.to_string())
+    Ok(instance)
 }
 
 // ==================== Modrinth ====================

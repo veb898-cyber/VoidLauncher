@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck, Download, Archive, RotateCcw, Copy } from 'lucide-react';
+import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck, Download, Archive, RotateCcw, Copy, RefreshCw } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { t } from '../../lib/i18n';
@@ -14,6 +14,7 @@ import { InstanceEditor } from './InstanceEditor';
 import { InstanceRestoreModal } from './InstanceRestoreModal';
 import { DuplicateInstanceModal } from './DuplicateInstanceModal';
 import { VerifyRepairModal } from './VerifyRepairModal';
+import { CfPackModal } from './CfPackModal';
 import { useEventStore } from '../../hooks/useGameEvents';
 
 interface InstanceListProps {
@@ -41,6 +42,8 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const [verifyName, setVerifyName] = useState<string | null>(null);
   const [restoreName, setRestoreName] = useState<string | null>(null);
   const [duplicateName, setDuplicateName] = useState<string | null>(null);
+  const [cfPackName, setCfPackName] = useState<string | null>(null);
+  const [hasCfPack, setHasCfPack] = useState(false);
   const [backupBusy, setBackupBusy] = useState<string | null>(null);
   const editorInstance = editorName ? instances.find((i) => i.name === editorName) ?? null : null;
 
@@ -140,6 +143,13 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setContextMenu({ x: e.clientX, y: e.clientY, name: instance.name });
+                  // Lazy probe: only right-click asks the backend whether this
+                  // instance carries a CurseForge pack lock (no cost for the
+                  // common non-CF case beyond one cheap file read).
+                  setHasCfPack(false);
+                  invoke<boolean | null>('cmd_get_curseforge_pack_lock', { instanceName: instance.name })
+                    .then((lock) => setHasCfPack(!!lock))
+                    .catch(() => setHasCfPack(false));
                 }}
                 style={{
                   display: 'flex',
@@ -234,6 +244,10 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
               onClick={() => { openFolder(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<ShieldCheck size={14} />} label={t('instances.ctx_verify')}
               onClick={() => { setVerifyName(contextMenu.name); setContextMenu(null); }} />
+            {hasCfPack && (
+              <ContextMenuItem icon={<RefreshCw size={14} />} label={t('instances.ctx_cf_pack')}
+                onClick={() => { setCfPackName(contextMenu.name); setContextMenu(null); }} />
+            )}
             <ContextMenuItem icon={<Archive size={14} />} label={t('instances.ctx_backup')} disabled={backupBusy === contextMenu.name}
               onClick={() => { handleBackup(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<RotateCcw size={14} />} label={t('instances.ctx_restore')} disabled={isLaunching}
@@ -253,6 +267,15 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           open
           instanceName={verifyName}
           onClose={() => setVerifyName(null)}
+        />
+      )}
+
+      {/* CurseForge pack update / repair (from the context menu) */}
+      {cfPackName && (
+        <CfPackModal
+          open
+          instanceName={cfPackName}
+          onClose={() => setCfPackName(null)}
         />
       )}
 
