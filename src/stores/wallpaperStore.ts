@@ -8,7 +8,10 @@ function getInitialWallpaper(): WallpaperId {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (isWallpaperId(stored)) return stored;
   } catch {}
-  return 'none';
+  // Fresh default: the liquid ribbons read best of the four (owner wave 26:
+  // «по дефолту должны стоять жидкие ленты»). An explicit choice — including
+  // "none" — is persisted above and always wins.
+  return 'ribbons';
 }
 
 interface WallpaperState {

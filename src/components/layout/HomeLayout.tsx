@@ -7,11 +7,14 @@ import { CreateInstanceWizard } from '../../pages/CreateInstanceWizard';
 import { Modpacks } from '../../pages/Modpacks';
 import { useT } from '../../lib/i18n';
 
-// Matches --transition-normal: the shell fades out as one surface while the
-// overlay fades in; the dialog unmounts only after that fade, so nothing in
-// the previous interface pops away piece by piece (owner: «исчезают… 1 за
-// одним а не все сразу плавно»).
-const SHELL_FADE_MS = 250;
+// Matches --transition-fast: the shell fades out as one surface while the
+// overlay fades in, and on the way back the overlay fades out while the
+// shell returns — the same 150ms crossfade in both directions, so the swap
+// reads as one quick movement (owner wave 26: «переход … выглядел быстрым
+// и не каким-то дерганным как сейчас»). The dialog unmounts only after the
+// fade, so nothing in the previous interface pops away piece by piece
+// (owner wave 11: «исчезают… 1 за одним а не все сразу плавно»).
+const SHELL_FADE_MS = 150;
 
 interface HomeLayoutProps {
   onNavigate: (page: string) => void;
@@ -24,7 +27,12 @@ export function HomeLayout({ onNavigate }: HomeLayoutProps) {
   // True while the create menu should highlight the modpacks item (the
   // catalog was just opened from it; the arrow returns to this menu).
   const [viaModpacks, setViaModpacks] = useState(false);
+  // Keeps the overlay mounted through its own fade-out on the way back: the
+  // shell starts returning the same frame, and the two fades cross instead
+  // of the catalog popping away in one frame (wave 26).
+  const [overlayClosing, setOverlayClosing] = useState(false);
   const shellFadeTimer = useRef<number | null>(null);
+  const overlayCloseTimer = useRef<number | null>(null);
 
   // "Модпаки" opens the catalog as a full-window overlay (the small menu has
   // no room for a grid). The wizard stays mounted for the duration of the
@@ -33,6 +41,13 @@ export function HomeLayout({ onNavigate }: HomeLayoutProps) {
   const openModpacks = () => {
     setViaModpacks(true);
     setShowModpacks(true);
+    if (overlayCloseTimer.current) {
+      // Reopened while the close fade was still running — the overlay never
+      // left, so cancel its unmount and drop the closing class.
+      window.clearTimeout(overlayCloseTimer.current);
+      overlayCloseTimer.current = null;
+    }
+    setOverlayClosing(false);
     if (shellFadeTimer.current) window.clearTimeout(shellFadeTimer.current);
     shellFadeTimer.current = window.setTimeout(() => {
       shellFadeTimer.current = null;
@@ -45,6 +60,12 @@ export function HomeLayout({ onNavigate }: HomeLayoutProps) {
       shellFadeTimer.current = null;
     }
     setShowModpacks(false);
+    setOverlayClosing(true);
+    if (overlayCloseTimer.current) window.clearTimeout(overlayCloseTimer.current);
+    overlayCloseTimer.current = window.setTimeout(() => {
+      overlayCloseTimer.current = null;
+      setOverlayClosing(false);
+    }, SHELL_FADE_MS);
     setShowCreate(true);
     // Don't keep «Модпаки» lit after the return: the wizard reopens fresh
     // (its reset() sets the mode to «Новая») — a stuck «Модпаки» pill read
@@ -84,9 +105,11 @@ export function HomeLayout({ onNavigate }: HomeLayoutProps) {
     return () => root.removeAttribute('data-modpacks-open');
   }, [showModpacks]);
 
-  // Drop the pending dialog unmount if the layout goes away mid-fade.
+  // Drop the pending dialog unmount and overlay fade-out if the layout goes
+  // away mid-fade.
   useEffect(() => () => {
     if (shellFadeTimer.current) window.clearTimeout(shellFadeTimer.current);
+    if (overlayCloseTimer.current) window.clearTimeout(overlayCloseTimer.current);
   }, []);
 
   return (
@@ -101,8 +124,8 @@ export function HomeLayout({ onNavigate }: HomeLayoutProps) {
         onClearViaModpacks={() => setViaModpacks(false)}
       />
 
-      {showModpacks && createPortal(
-        <div className="modpacks-overlay">
+      {(showModpacks || overlayClosing) && createPortal(
+        <div className={`modpacks-overlay${overlayClosing ? ' modpacks-overlay--closing' : ''}`}>
           <div className="modpacks-overlay__bar">
             <button className="btn btn--ghost" onClick={closeModpacks}>
               <ArrowLeft size={16} /> {t('common.back')}

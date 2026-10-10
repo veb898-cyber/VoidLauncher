@@ -626,7 +626,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           </Button>
         </div>
         {installing && (
-          <div style={{ margin: 'var(--space-md) var(--space-xl)', background: 'var(--surface-glass)', borderRadius: 'var(--radius-md)', padding: 'var(--space-md)' }}>
+          <div className="content-confirm__progress" style={{ margin: 'var(--space-md) var(--space-xl)', borderRadius: 'var(--radius-md)', padding: 'var(--space-md)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, fontSize: 'var(--font-size-sm)' }}><span>{t('common.installing')}</span><span>{downloadProgress}%</span></div>
             <div style={{ height: 4, background: 'var(--bg-tertiary)', borderRadius: 2, overflow: 'hidden' }}>
               <div style={{ height: '100%', width: `${downloadProgress}%`, background: 'var(--primary)', borderRadius: 2, transition: 'width 0.3s' }} />
@@ -689,6 +689,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
               <h3 style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, marginBottom: 'var(--space-sm)', color: 'var(--warning)' }}>{t('content.deps_heading', { count: deps.length.toString() })}</h3>
               {deps.map((item, i) => (
                 <div key={i} className="content-list-row content-list-row--dep" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', border: '1px solid hsla(35, 90%, 55%, 0.2)', marginBottom: 4 }}>
+                  <RemoteIcon url={item.iconUrl} letter={item.name.charAt(0)} size={28} radius={4} fontSize={11} />
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
                     <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('content.dep_required_by', { parent: item.parentMod ?? '' })}</div>

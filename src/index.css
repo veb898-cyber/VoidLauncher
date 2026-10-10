@@ -569,8 +569,10 @@ a {
   flex: 1;
   overflow: hidden;
   /* One opacity channel so the modpacks swap can fade the whole shell as a
-     single surface (see html[data-modpacks-open] below). */
-  transition: opacity var(--transition-normal);
+     single surface (see html[data-modpacks-open] below). Fast (150ms) so the
+     swap reads as one quick crossfade either way (owner wave 26: «выглядел
+     быстрым»). */
+  transition: opacity var(--transition-fast);
 }
 
 /* ============================
@@ -1626,6 +1628,17 @@ select option {
   display: flex;
   flex-direction: column;
   animation: fadeIn var(--transition-fast);
+}
+
+/* Closing half of the swap: instead of unmounting in one frame (which popped
+   the catalog away while the shell was still transparent behind it), the
+   overlay fades out over the same span the shell fades back in — the two
+   directions are now the same crossfade (owner wave 26: «переход … выглядел
+   быстрым и не каким-то дерганным»). Clicks pass through to the shell that
+   is already coming back. */
+.modpacks-overlay--closing {
+  animation: fadeOut var(--transition-fast);
+  pointer-events: none;
 }
 
 .modpacks-overlay__bar {
@@ -4087,17 +4100,34 @@ input[type="range"]:active::-moz-range-thumb {
    hidden the raw wallpaper — the substrate the glass refracts — is the
    backdrop the overlay actually sits on. Titlebar is outside .app-layout,
    so it stays above; the overlay's own bar carries the back button.
-   The step-aside is ONE opacity fade of the whole shell (the create dialog
-   lives inside it and fades out together) — not a per-element pop — and
-   visibility lands only after the fade so nothing disappears early. */
+   The step-aside is ONE opacity fade of the whole shell — not a per-element
+   pop — and visibility lands only after the fade so nothing disappears
+   early. The span matches the overlay's own fadeIn (150ms): both halves of
+   the swap move at the same speed, so either direction reads as one
+   crossfade (wave 26). */
 html[data-modpacks-open] .app-layout {
   opacity: 0;
   visibility: hidden;
-  transition: opacity var(--transition-normal), visibility 0s var(--transition-normal);
+  transition: opacity var(--transition-fast), visibility 0s var(--transition-fast);
+}
+
+/* The create dialog is portaled to <body> (849ef72), so it is no longer a
+   child of the shell and would sit at full opacity over the transparent
+   Liquid Glass overlay, popping away only when it unmounts after the fade.
+   Ride the same channel as the shell: fade it out in the same 150ms, dead
+   to input while the catalog owns the screen (wave 26). On the way back the
+   dialog remounts fresh after the attr is gone, so it never needs the
+   reverse transition. */
+html[data-modpacks-open] .modal-overlay {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--transition-fast), visibility 0s var(--transition-fast);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  html[data-modpacks-open] .app-layout {
+  html[data-modpacks-open] .app-layout,
+  html[data-modpacks-open] .modal-overlay {
     transition: none;
   }
 }
@@ -4409,6 +4439,16 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
     backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
     -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
     box-shadow: var(--lg-rim-ring);
+  }
+
+/* The catalog toolbar's tabs are compact (11px label, 4px padding ≈ 21px
+   tall), where the shared 4px inset leaves a pill covering only ~60% of the
+   button — it read flattened next to the terminal's tall tabs (~80%).
+   2px top/bottom restores that proportion (owner wave 26: «обводку активной
+   кнопки чуть увеличить снизу и сверху, как у кнопок в Терминале»). */
+  [data-theme='lg'] .catalog-switch .tabs__indicator {
+    top: 2px;
+    bottom: 2px;
   }
 
 /* Vertical indicator in the create menu: the same glass pill, but it must
@@ -4736,6 +4776,20 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
 [data-theme='lg'] .content-confirm .content-list-row--dep {
   background: hsla(28, 80%, 34%, 0.46);
   box-shadow: var(--lg-rim-ring), inset 0 0 0 1px hsla(35, 90%, 55%, 0.24);
+}
+
+/* The installing plaque above the list (it used to be a pure inline style):
+   normal themes keep the exact flat film it always had; on Liquid Glass it
+   gets the same material as the rows it reports on (owner wave 26: «плашка
+   установки модов … должна быть с эффектом liquid glass»). */
+.content-confirm__progress {
+  background: var(--surface-glass);
+}
+[data-theme='lg'] .content-confirm__progress {
+  background: var(--lg-fill);
+  backdrop-filter: blur(14px) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(14px) saturate(var(--lg-sat));
+  box-shadow: var(--lg-rim-ring);
 }
 
 /* --- Install overlay: same spotlight scrim as the modal, same glass

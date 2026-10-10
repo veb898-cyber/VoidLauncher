@@ -251,7 +251,10 @@ export function Accounts() {
 
       {/* Add Offline Modal */}
       <Modal open={showAddOffline} onClose={() => setShowOffline(false)} title={t('accounts.modal_offline_title')}>
-        <Input label={t('accounts.username_label')} id="offline-name" type="text" value={offlineName} onChange={(e) => setOfflineName(e.target.value)} autoFocus />
+        {/* autocomplete off + a stable distinct name mirrors the wizard's
+            name field: without it Chromium (WebView2) pops the «сохранённые
+            сведения» autofill dropdown over the nickname box (wave 26). */}
+        <Input label={t('accounts.username_label')} id="offline-name" name="offline-username-new" type="text" autoComplete="off" value={offlineName} onChange={(e) => setOfflineName(e.target.value)} autoFocus />
         {offlineNameError && (
           <div style={{ marginTop: 6, fontSize: 'var(--font-size-xs)', color: 'var(--color-error, #ff6b6b)' }}>
             {offlineNameError}
