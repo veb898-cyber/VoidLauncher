@@ -818,8 +818,8 @@ export const ru: Record<string, string> = {
   'diag.desc':                         'Проверяет систему, сеть и выбранную сборку на типовые проблемы. Ничего не изменяется и не скачивается.',
   'diag.run':                          'Запустить диагностику',
   'diag.running':                      'Выполняется...',
-  'diag.instance_scope':               'Сборка: {name}',
-  'diag.no_instance':                  'Выберите сборку, чтобы также проверить её файлы и Java',
+  'diag.instance_label':               'Сборка:',
+  'diag.instance_system_only':         'Только система (без сборки)',
 
   'diag.check_os':                     'Операционная система',
   'diag.check_cpu':                    'Процессор',

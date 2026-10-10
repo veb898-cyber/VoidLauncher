@@ -814,8 +814,8 @@ export const en = {
   'diag.desc':                         'Checks your system, network and the selected instance for common problems. Nothing is changed or downloaded.',
   'diag.run':                          'Run Diagnostics',
   'diag.running':                      'Running...',
-  'diag.instance_scope':               'Instance: {name}',
-  'diag.no_instance':                  'Select an instance to also check its files and Java',
+  'diag.instance_label':               'Instance:',
+  'diag.instance_system_only':         'System only (no instance)',
 
   'diag.check_os':                     'Operating System',
   'diag.check_cpu':                    'Processor',

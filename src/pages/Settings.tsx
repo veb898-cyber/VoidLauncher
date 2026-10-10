@@ -86,23 +86,48 @@ export function Settings() {
   const [javaError, setJavaError] = useState(false);
   const javaDownload = useJavaDownloadStore((s) => s.active);
   const selectedInstance = useInstanceStore((s) => s.selectedInstance);
+  const instances = useInstanceStore((s) => s.instances);
   const [diagReport, setDiagReport] = useState<DiagReport | null>(null);
   const [diagRunning, setDiagRunning] = useState(false);
   const [diagError, setDiagError] = useState<string | null>(null);
+  // Which build the diagnostics checks. Defaults to the build selected in
+  // the main window until the user picks another one here — the section used
+  // to follow the global selection only, with no way to choose by hand.
+  const [diagInstance, setDiagInstance] = useState<string | null>(selectedInstance);
+  const [diagInstanceTouched, setDiagInstanceTouched] = useState(false);
+
+  const instanceExists = useCallback(
+    (name: string | null): name is string =>
+      !!name && instances.some((i) => i.name === name),
+    [instances],
+  );
+
+  // Follow the global selection until the user picks a build in this
+  // section; a hand-picked build stays until it is deleted elsewhere.
+  useEffect(() => {
+    if (diagInstanceTouched) {
+      if (diagInstance && !instanceExists(diagInstance)) {
+        setDiagInstanceTouched(false);
+        setDiagInstance(instanceExists(selectedInstance) ? selectedInstance : null);
+      }
+    } else {
+      setDiagInstance(instanceExists(selectedInstance) ? selectedInstance : null);
+    }
+  }, [selectedInstance, instanceExists, diagInstanceTouched, diagInstance]);
 
   const runDiagnostics = useCallback(async () => {
     setDiagRunning(true);
     setDiagError(null);
     try {
       setDiagReport(await invoke<DiagReport>('cmd_run_diagnostics', {
-        instanceName: selectedInstance,
+        instanceName: instanceExists(diagInstance) ? diagInstance : null,
       }));
     } catch (e) {
       setDiagError(friendlyErrorMessage(e, t));
     } finally {
       setDiagRunning(false);
     }
-  }, [selectedInstance, t]);
+  }, [diagInstance, instanceExists, t]);
 
   const diagStatusIcon = (status: string) =>
     status === 'ok' ? <CheckCircle2 size={15} color="var(--color-success)" />
@@ -814,16 +839,29 @@ export function Settings() {
           <Button onClick={runDiagnostics} disabled={diagRunning}>
             {diagRunning ? t('diag.running') : t('diag.run')}
           </Button>
-          {selectedInstance && (
-            <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
-              {t('diag.instance_scope', { name: selectedInstance })}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', minWidth: 0 }}>
+            <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+              {t('diag.instance_label')}
             </span>
-          )}
-          {!selectedInstance && (
-            <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-tertiary)' }}>
-              {t('diag.no_instance')}
-            </span>
-          )}
+            <div style={{ width: 260 }}>
+              <CustomSelect
+                value={diagInstance ?? ''}
+                options={[
+                  ...instances.map((i) => ({
+                    value: i.name,
+                    label: i.name,
+                    description: `${i.mc_version} · ${i.loader}`,
+                  })),
+                  { value: '', label: t('diag.instance_system_only') },
+                ]}
+                onChange={(v) => {
+                  setDiagInstanceTouched(true);
+                  setDiagInstance(v || null);
+                }}
+                disabled={diagRunning}
+              />
+            </div>
+          </div>
         </div>
         {diagError && (
           <div style={{ color: 'var(--color-danger)', fontSize: 'var(--font-size-sm)', marginBottom: 'var(--space-md)' }}>
