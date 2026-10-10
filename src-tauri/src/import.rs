@@ -113,7 +113,7 @@ fn extract_entry(base: &Path, entry_name: &str, data: &[u8]) -> Result<()> {
     write_extracted(base, entry_name, &mut std::io::Cursor::new(data))
 }
 
-fn normalize_zip_path(path: &str) -> String {
+pub(crate) fn normalize_zip_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
@@ -174,7 +174,7 @@ pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Client-side import: skip files marked client=unsupported (server-only).
-fn mrpack_client_required(file_entry: &serde_json::Value) -> bool {
+pub(crate) fn mrpack_client_required(file_entry: &serde_json::Value) -> bool {
     match file_entry
         .get("env")
         .and_then(|e| e.get("client"))
@@ -321,11 +321,12 @@ fn mrpack_dest(mc_dir: &Path, path_str: &str) -> Result<PathBuf> {
     Ok(dest_path)
 }
 
-async fn install_mrpack_file(
+pub(crate) async fn install_mrpack_file(
     path_str: &str,
     file_entry: &serde_json::Value,
-    mc_dir: &Path,
+    mc_dir: &PathBuf,
     embedded: &Arc<HashMap<String, Vec<u8>>>,
+    with_sidecar: bool,
 ) -> Result<()> {
     let dest_path = mrpack_dest(mc_dir, path_str)?;
     if let Some(parent) = dest_path.parent() {
@@ -349,14 +350,18 @@ async fn install_mrpack_file(
                 )));
             }
         }
-        write_mrpack_sidecar(&dest_path, file_entry);
+        if with_sidecar {
+            write_mrpack_sidecar(&dest_path, file_entry);
+        }
         return Ok(());
     }
 
     if dest_path.exists() && !expected_sha1.is_empty() {
         let path_buf = dest_path.clone();
         if crate::download::verify_sha1(&path_buf, expected_sha1).unwrap_or(false) {
-            write_mrpack_sidecar(&dest_path, file_entry);
+            if with_sidecar {
+                write_mrpack_sidecar(&dest_path, file_entry);
+            }
             return Ok(());
         }
     }
@@ -375,7 +380,9 @@ async fn install_mrpack_file(
             .await
             .is_ok()
         {
-            write_mrpack_sidecar(&dest_path, file_entry);
+            if with_sidecar {
+                write_mrpack_sidecar(&dest_path, file_entry);
+            }
             return Ok(());
         }
     }
@@ -386,7 +393,7 @@ async fn install_mrpack_file(
     )))
 }
 
-fn extract_mrpack_override(entry_name: &str) -> Option<&str> {
+pub(crate) fn extract_mrpack_override(entry_name: &str) -> Option<&str> {
     for prefix in ["overrides/", "overrides-client/"] {
         if let Some(relative) = entry_name.strip_prefix(prefix) {
             return Some(relative);
@@ -761,7 +768,7 @@ pub(crate) async fn import_mrpack(
             tasks.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.ok();
                 let result =
-                    install_mrpack_file(&path_str, &file_entry, &mc_dir, &embedded).await;
+                    install_mrpack_file(&path_str, &file_entry, &mc_dir, &embedded, true).await;
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 match result {
                     Ok(()) => {
@@ -1196,7 +1203,7 @@ fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &s
 /// Map a detected mrpack loader key to our LoaderType. Quilt is rejected
 /// with a clear error — Quilt mods are not always Fabric-compatible, so a
 /// silent conversion would produce a broken instance.
-fn mrpack_loader_type(loader: Option<&str>) -> Result<LoaderType> {
+pub(crate) fn mrpack_loader_type(loader: Option<&str>) -> Result<LoaderType> {
     Ok(match loader {
         Some("neoforge") => LoaderType::NeoForge,
         Some("forge") => LoaderType::Forge,
@@ -1214,7 +1221,7 @@ fn mrpack_loader_type(loader: Option<&str>) -> Result<LoaderType> {
 /// object. Keys can be "fabric-loader", "forge", "neoforge", "quilt-loader"
 /// — and JSON key order is not guaranteed, so we probe known keys in
 /// priority order instead of taking the first non-minecraft key.
-fn detect_mrpack_loader(
+pub(crate) fn detect_mrpack_loader(
     deps: &serde_json::Map<String, serde_json::Value>,
 ) -> (Option<String>, Option<String>) {
     let loader = ["neoforge", "forge", "fabric-loader", "fabric", "quilt-loader"]
@@ -1349,6 +1356,7 @@ mod tests {
             &entry,
             &base,
             &embedded,
+            true,
         ));
         assert!(result.is_err());
         assert!(!base.parent().unwrap().join("evil.json").exists());

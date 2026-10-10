@@ -14,7 +14,7 @@ import { InstanceEditor } from './InstanceEditor';
 import { InstanceRestoreModal } from './InstanceRestoreModal';
 import { DuplicateInstanceModal } from './DuplicateInstanceModal';
 import { VerifyRepairModal } from './VerifyRepairModal';
-import { CfPackModal } from './CfPackModal';
+import { PackModal } from './PackModal';
 import { useEventStore } from '../../hooks/useGameEvents';
 
 interface InstanceListProps {
@@ -42,8 +42,8 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const [verifyName, setVerifyName] = useState<string | null>(null);
   const [restoreName, setRestoreName] = useState<string | null>(null);
   const [duplicateName, setDuplicateName] = useState<string | null>(null);
-  const [cfPackName, setCfPackName] = useState<string | null>(null);
-  const [hasCfPack, setHasCfPack] = useState(false);
+  const [packModalName, setPackModalName] = useState<string | null>(null);
+  const [hasPack, setHasPack] = useState(false);
   const [backupBusy, setBackupBusy] = useState<string | null>(null);
   const editorInstance = editorName ? instances.find((i) => i.name === editorName) ?? null : null;
 
@@ -144,12 +144,12 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
                   e.preventDefault();
                   setContextMenu({ x: e.clientX, y: e.clientY, name: instance.name });
                   // Lazy probe: only right-click asks the backend whether this
-                  // instance carries a CurseForge pack lock (no cost for the
-                  // common non-CF case beyond one cheap file read).
-                  setHasCfPack(false);
-                  invoke<boolean | null>('cmd_get_curseforge_pack_lock', { instanceName: instance.name })
-                    .then((lock) => setHasCfPack(!!lock))
-                    .catch(() => setHasCfPack(false));
+                  // instance carries a pack lock (no cost for the common
+                  // unpacked case beyond one cheap file read).
+                  setHasPack(false);
+                  invoke<boolean | null>('cmd_get_pack_lock', { instanceName: instance.name })
+                    .then((lock) => setHasPack(!!lock))
+                    .catch(() => setHasPack(false));
                 }}
                 style={{
                   display: 'flex',
@@ -244,9 +244,9 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
               onClick={() => { openFolder(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<ShieldCheck size={14} />} label={t('instances.ctx_verify')}
               onClick={() => { setVerifyName(contextMenu.name); setContextMenu(null); }} />
-            {hasCfPack && (
-              <ContextMenuItem icon={<RefreshCw size={14} />} label={t('instances.ctx_cf_pack')}
-                onClick={() => { setCfPackName(contextMenu.name); setContextMenu(null); }} />
+            {hasPack && (
+              <ContextMenuItem icon={<RefreshCw size={14} />} label={t('instances.ctx_pack')}
+                onClick={() => { setPackModalName(contextMenu.name); setContextMenu(null); }} />
             )}
             <ContextMenuItem icon={<Archive size={14} />} label={t('instances.ctx_backup')} disabled={backupBusy === contextMenu.name}
               onClick={() => { handleBackup(contextMenu.name); setContextMenu(null); }} />
@@ -270,12 +270,12 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
         />
       )}
 
-      {/* CurseForge pack update / repair (from the context menu) */}
-      {cfPackName && (
-        <CfPackModal
+      {/* Pack update / repair (from the context menu) */}
+      {packModalName && (
+        <PackModal
           open
-          instanceName={cfPackName}
-          onClose={() => setCfPackName(null)}
+          instanceName={packModalName}
+          onClose={() => setPackModalName(null)}
         />
       )}
 

@@ -1,7 +1,6 @@
 ﻿mod accounts;
 mod atlauncher;
 mod auth;
-mod cfpack;
 mod commands;
 mod config;
 mod content;
@@ -21,6 +20,7 @@ mod launch;
 mod logger;
 mod modloaders;
 mod modrinth;
+mod packlock;
 mod playtime;
 mod rooms;
 mod versions;
@@ -331,10 +331,10 @@ pub fn run() {
             commands::modpacks::cmd_search_curseforge_modpacks,
             commands::modpacks::cmd_get_curseforge_modpack_files,
             commands::modpacks::cmd_install_curseforge_modpack,
-            commands::cfpack::cmd_get_curseforge_pack_lock,
-            commands::cfpack::cmd_check_curseforge_modpack_update,
-            commands::cfpack::cmd_update_curseforge_modpack,
-            commands::cfpack::cmd_repair_curseforge_modpack,
+            commands::packlock::cmd_get_pack_lock,
+            commands::packlock::cmd_check_modpack_update,
+            commands::packlock::cmd_update_modpack,
+            commands::packlock::cmd_repair_modpack,
             commands::modpacks::cmd_search_modrinth_modpacks,
             commands::modpacks::cmd_get_modrinth_modpack_versions,
             commands::modpacks::cmd_install_modrinth_modpack,

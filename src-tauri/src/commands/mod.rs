@@ -6,13 +6,13 @@
 //! beyond what a command necessarily orchestrates.
 
 pub mod auth;
-pub mod cfpack;
 pub mod content;
 pub mod instances;
 pub mod launcher;
 pub mod misc;
 pub mod modpacks;
 pub mod mods;
+pub mod packlock;
 pub mod rooms;
 pub mod verify;
 pub mod versions;

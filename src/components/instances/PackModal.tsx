@@ -8,7 +8,7 @@ import { ProgressBar } from '../ui/ProgressBar';
 import { addToast } from '../ui/Toast';
 import { useT, type MessageKey } from '../../lib/i18n';
 
-interface CfPackLock {
+interface PackLock {
   provider: string;
   pack_project_id: string;
   pack_name: string;
@@ -20,7 +20,7 @@ interface CfPackLock {
   loader: string;
 }
 
-interface CfPackUpdateInfo {
+interface PackUpdateInfo {
   up_to_date: boolean;
   current_file_id: string;
   current_version: string;
@@ -29,7 +29,7 @@ interface CfPackUpdateInfo {
   latest_file_name: string | null;
 }
 
-interface CfPackUpdateReport {
+interface PackUpdateReport {
   mods_installed: number;
   mods_removed: number;
   overrides_written: number;
@@ -37,7 +37,7 @@ interface CfPackUpdateReport {
   new_version: string;
 }
 
-interface CfPackRepairReport {
+interface PackRepairReport {
   checked: number;
   restored: number;
   skipped: number;
@@ -52,12 +52,12 @@ interface ProgressPayload {
 }
 
 const STAGE_LABELS: Record<string, MessageKey> = {
-  'updating-pack': 'cfpack.stage_updating_pack',
-  'downloading-pack': 'cfpack.stage_downloading_pack',
-  'downloading-mods': 'cfpack.stage_downloading_mods',
-  'applying': 'cfpack.stage_applying',
-  'repairing': 'cfpack.stage_repairing',
-  'done': 'cfpack.stage_done',
+  'updating-pack': 'pack.stage_updating_pack',
+  'downloading-pack': 'pack.stage_downloading_pack',
+  'downloading-mods': 'pack.stage_downloading_mods',
+  'applying': 'pack.stage_applying',
+  'repairing': 'pack.stage_repairing',
+  'done': 'pack.stage_done',
 };
 
 interface Props {
@@ -66,12 +66,13 @@ interface Props {
   onClose: () => void;
 }
 
-/** Update / repair panel for instances installed from a CurseForge modpack
- *  (driven by the `<instance>/curseforge-pack.json` lock file). */
-export function CfPackModal({ open, instanceName, onClose }: Props) {
+/** Update / repair panel for instances installed from a modpack
+ *  (driven by the `<instance>/pack-lock.json` lock file — CurseForge and
+ *  Modrinth packs are both tracked). */
+export function PackModal({ open, instanceName, onClose }: Props) {
   const t = useT();
-  const [lock, setLock] = useState<CfPackLock | null>(null);
-  const [update, setUpdate] = useState<CfPackUpdateInfo | null>(null);
+  const [lock, setLock] = useState<PackLock | null>(null);
+  const [update, setUpdate] = useState<PackUpdateInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
@@ -82,11 +83,11 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
     setChecking(true);
     setCheckError(null);
     try {
-      const l = await invoke<CfPackLock | null>('cmd_get_curseforge_pack_lock', { instanceName });
+      const l = await invoke<PackLock | null>('cmd_get_pack_lock', { instanceName });
       setLock(l);
       if (l) {
         try {
-          setUpdate(await invoke<CfPackUpdateInfo>('cmd_check_curseforge_modpack_update', { instanceName }));
+          setUpdate(await invoke<PackUpdateInfo>('cmd_check_modpack_update', { instanceName }));
         } catch (e: any) {
           setUpdate(null);
           setCheckError(e.toString());
@@ -108,7 +109,7 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
     }
   }, [open, refresh]);
 
-  // Progress from cmd_update_curseforge_modpack / cmd_repair_curseforge_modpack.
+  // Progress from cmd_update_modpack / cmd_repair_modpack.
   useEffect(() => {
     if (!open) return;
     let unlisten: (() => void) | null = null;
@@ -132,7 +133,7 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
     try {
       await fn();
     } catch (e: any) {
-      addToast(t('cfpack.error', { error: e.toString() }), 'error');
+      addToast(t('pack.error', { error: e.toString() }), 'error');
     } finally {
       busyRef.current = false;
       setBusy(false);
@@ -142,9 +143,9 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
   };
 
   const handleUpdate = () => runBusy(async () => {
-    const rep = await invoke<CfPackUpdateReport>('cmd_update_curseforge_modpack', { instanceName });
+    const rep = await invoke<PackUpdateReport>('cmd_update_modpack', { instanceName });
     addToast(
-      t('cfpack.update_summary', {
+      t('pack.update_summary', {
         version: rep.new_version,
         installed: rep.mods_installed,
         removed: rep.mods_removed,
@@ -155,14 +156,14 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
   });
 
   const handleRepair = () => runBusy(async () => {
-    const rep = await invoke<CfPackRepairReport>('cmd_repair_curseforge_modpack', { instanceName });
+    const rep = await invoke<PackRepairReport>('cmd_repair_modpack', { instanceName });
     if (rep.failed.length > 0) {
       addToast(
-        t('cfpack.repair_partial', { restored: rep.restored, checked: rep.checked, files: rep.failed.join(', ') }),
+        t('pack.repair_partial', { restored: rep.restored, checked: rep.checked, files: rep.failed.join(', ') }),
         'error',
       );
     } else {
-      addToast(t('cfpack.repair_success', { restored: rep.restored, checked: rep.checked }), 'success');
+      addToast(t('pack.repair_success', { restored: rep.restored, checked: rep.checked }), 'success');
     }
   });
 
@@ -175,7 +176,7 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
     <Modal
       open={open}
       onClose={busy ? () => {} : onClose}
-      title={t('cfpack.title')}
+      title={t('pack.title')}
       maxWidth={520}
       footer={
         <div style={{ display: 'flex', gap: 'var(--space-md)', justifyContent: 'flex-end', width: '100%' }}>
@@ -187,13 +188,13 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
             onClick={handleRepair}
             disabled={busy || !lock || checking}
           >
-            {t('cfpack.btn_repair')}
+            {t('pack.btn_repair')}
           </Button>
           <Button
             onClick={handleUpdate}
             disabled={busy || !lock || checking || !update || update.up_to_date}
           >
-            {t('cfpack.btn_update')}
+            {t('pack.btn_update')}
           </Button>
         </div>
       }
@@ -203,12 +204,12 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
           {checking ? (
             <>
               <Loader2 size={16} className="animate-spin" />
-              <span style={{ fontSize: 'var(--font-size-sm)' }}>{t('cfpack.checking')}</span>
+              <span style={{ fontSize: 'var(--font-size-sm)' }}>{t('pack.checking')}</span>
             </>
           ) : (
             <>
               <Package size={16} />
-              <span style={{ fontSize: 'var(--font-size-sm)' }}>{t('cfpack.no_lock')}</span>
+              <span style={{ fontSize: 'var(--font-size-sm)' }}>{t('pack.no_lock')}</span>
             </>
           )}
         </div>
@@ -230,13 +231,13 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
           {/* Versions */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 'var(--font-size-sm)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 'var(--space-md)' }}>
-              <span style={{ color: 'var(--text-secondary)' }}>{t('cfpack.current_version')}</span>
+              <span style={{ color: 'var(--text-secondary)' }}>{t('pack.current_version')}</span>
               <span style={{ fontWeight: 500, textAlign: 'right', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {lock.file_display_name}
               </span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 'var(--space-md)' }}>
-              <span style={{ color: 'var(--text-secondary)' }}>{t('cfpack.latest_version')}</span>
+              <span style={{ color: 'var(--text-secondary)' }}>{t('pack.latest_version')}</span>
               <span style={{ fontWeight: 500, textAlign: 'right', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {checking ? '...' : (update?.latest_version ?? '-')}
               </span>
@@ -249,13 +250,13 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
               {update.up_to_date ? (
                 <>
                   <CheckCircle2 size={15} style={{ color: 'var(--success)' }} />
-                  <span style={{ color: 'var(--success)' }}>{t('cfpack.up_to_date')}</span>
+                  <span style={{ color: 'var(--success)' }}>{t('pack.up_to_date')}</span>
                 </>
               ) : (
                 <>
                   <RefreshCw size={14} style={{ color: 'var(--primary)' }} />
                   <span style={{ color: 'var(--primary)' }}>
-                    {t('cfpack.update_available', { version: update.latest_version ?? '' })}
+                    {t('pack.update_available', { version: update.latest_version ?? '' })}
                   </span>
                 </>
               )}
@@ -264,7 +265,7 @@ export function CfPackModal({ open, instanceName, onClose }: Props) {
           {checkError && (
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--space-sm)', fontSize: 'var(--font-size-xs)', color: 'var(--warning)' }}>
               <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 1 }} />
-              <span>{t('cfpack.check_error', { error: checkError })}</span>
+              <span>{t('pack.check_error', { error: checkError })}</span>
             </div>
           )}
 

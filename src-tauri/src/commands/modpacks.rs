@@ -202,7 +202,7 @@ pub async fn cmd_install_curseforge_modpack(
         .map_err(|e| e.to_string())?;
 
     // Pack metadata for the update lock — read while the temp zip exists.
-    let (manifest, overrides) = match crate::cfpack::pack_zip_info(&temp_path) {
+    let (manifest, overrides) = match crate::packlock::pack_zip_info(&temp_path) {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&temp_path);
@@ -233,7 +233,7 @@ pub async fn cmd_install_curseforge_modpack(
         Ok(p) => p.name,
         Err(_) => file.file_name.clone(),
     };
-    let lock = crate::cfpack::CfPackLock {
+    let lock = crate::packlock::PackLock {
         provider: "curseforge".to_string(),
         pack_project_id: mod_id.to_string(),
         pack_name,
@@ -242,7 +242,7 @@ pub async fn cmd_install_curseforge_modpack(
         file_display_name: file.display_name.clone(),
         installed_at: chrono::Utc::now().to_rfc3339(),
         mc_version: instance.mc_version.clone(),
-        loader: crate::cfpack::loader_slug(&instance.loader).to_string(),
+        loader: crate::packlock::loader_slug(&instance.loader).to_string(),
         manifest,
         overrides,
     };
@@ -325,6 +325,15 @@ pub async fn cmd_install_modrinth_modpack(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Pack metadata for the update lock — read while the temp zip exists.
+    let (manifest, overrides) = match crate::packlock::mrpack_zip_info(&temp_path) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
+
     let result = crate::import::import_mrpack(
         &instances_dir,
         &temp_path.to_string_lossy(),
@@ -332,6 +341,28 @@ pub async fn cmd_install_modrinth_modpack(
         Some(&app),
     )
     .await;
+    if let Ok(instance) = &result {
+        // Track the pack so update/repair can find it later. Best-effort: a
+        // failed lock write leaves an untracked but fully usable instance.
+        let pack_name = match modrinth::get_project(&version.project_id).await {
+            Ok(p) => p.title,
+            Err(_) => version.name.clone(),
+        };
+        let lock = crate::packlock::PackLock {
+            provider: "modrinth".to_string(),
+            pack_project_id: version.project_id.clone(),
+            pack_name,
+            file_id: version.id.clone(),
+            file_name: file.filename.clone(),
+            file_display_name: version.version_number.clone(),
+            installed_at: chrono::Utc::now().to_rfc3339(),
+            mc_version: instance.mc_version.clone(),
+            loader: crate::packlock::loader_slug(&instance.loader).to_string(),
+            manifest,
+            overrides,
+        };
+        let _ = lock.write(&instances_dir.join(&instance_name));
+    }
     let _ = std::fs::remove_file(&temp_path);
     result.map_err(|e| e.to_string())
 }
