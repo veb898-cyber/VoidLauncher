@@ -125,12 +125,13 @@ fn load_local_version_info(versions_dir: &PathBuf, mc_version: &str) -> Option<V
     serde_json::from_str(&contents).ok()
 }
 
-/// Scan user-managed content directories (mods, resource packs, shader packs)
-/// for files that are not valid ZIP/JAR archives. Read-only: never modifies.
-fn scan_content(instances_dir: &PathBuf, instance: &Instance) -> Vec<VerifyIssue> {
+/// Scan user-managed content directories for files that are not valid
+/// ZIP/JAR archives. Read-only: never modifies. `dirs` selects which of
+/// `mods` / `resourcepacks` / `shaderpacks` to inspect.
+fn scan_content(instances_dir: &PathBuf, instance: &Instance, dirs: &[&str]) -> Vec<VerifyIssue> {
     let mut issues = Vec::new();
     let mc_dir = instance.minecraft_dir(instances_dir);
-    for dir_name in ["mods", "resourcepacks", "shaderpacks"] {
+    for dir_name in dirs {
         let dir = mc_dir.join(dir_name);
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
@@ -172,9 +173,76 @@ fn check_library_file(
     }
 }
 
+/// Which parts of an instance a verification run inspects: everything,
+/// launcher-managed files only, or one user-content folder. Repair is always
+/// launcher-only regardless of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyScope {
+    All,
+    Launcher,
+    Mods,
+    Resourcepacks,
+    Shaderpacks,
+}
+
+impl VerifyScope {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "all" => Self::All,
+            "launcher" => Self::Launcher,
+            "mods" => Self::Mods,
+            "resourcepacks" => Self::Resourcepacks,
+            "shaderpacks" => Self::Shaderpacks,
+            other => return Err(format!("Unknown verify scope: {}", other)),
+        })
+    }
+
+    /// Content-only scopes: fast path that skips every launcher check.
+    fn content_only_dirs(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::Mods => Some(&["mods"]),
+            Self::Resourcepacks => Some(&["resourcepacks"]),
+            Self::Shaderpacks => Some(&["shaderpacks"]),
+            Self::All | Self::Launcher => None,
+        }
+    }
+}
+
+/// Report for a content-only scope: no launcher categories, nothing repairable.
+fn content_only_report(config: &AppConfig, instance: &Instance, dirs: &[&str]) -> VerifyReport {
+    let content_issues = scan_content(&config.instances_dir(), instance, dirs);
+    let content_issues_count = content_issues.len() as u32;
+    let categories = vec![VerifyCategory {
+        id: "content".to_string(),
+        checked: 0,
+        issue_count: content_issues_count,
+        issues: content_issues,
+    }];
+    VerifyReport {
+        categories,
+        repairable_count: 0,
+        content_issues: content_issues_count,
+        healthy: content_issues_count == 0,
+    }
+}
+
 /// Offline verification of a single instance against its locally stored
 /// version metadata. Never touches the network and never modifies files.
 pub fn verify_instance(config: &AppConfig, instance: &Instance) -> VerifyReport {
+    verify_instance_scoped(config, instance, VerifyScope::All)
+}
+
+/// Scoped variant of [`verify_instance`]: `Launcher` skips user content,
+/// content-only scopes (mods / resource packs / shader packs) skip every
+/// launcher check and cost only a directory scan.
+pub fn verify_instance_scoped(
+    config: &AppConfig,
+    instance: &Instance,
+    scope: VerifyScope,
+) -> VerifyReport {
+    if let Some(dirs) = scope.content_only_dirs() {
+        return content_only_report(config, instance, dirs);
+    }
     let versions_dir = config.versions_dir();
     let libraries_dir = config.libraries_dir();
     let instances_dir = config.instances_dir();
@@ -411,16 +479,19 @@ pub fn verify_instance(config: &AppConfig, instance: &Instance) -> VerifyReport 
     let java = java.build();
 
     // ── content (read-only) ─────────────────────────────────────
-    let content_issues = scan_content(&instances_dir, instance);
-    let content_issues_count = content_issues.len() as u32;
-    let content = VerifyCategory {
-        id: "content".to_string(),
-        checked: 0,
-        issue_count: content_issues_count,
-        issues: content_issues,
-    };
-
-    let categories = vec![metadata, minecraft, libraries, assets, loader, java, content];
+    let mut categories = vec![metadata, minecraft, libraries, assets, loader, java];
+    let mut content_issues_count = 0;
+    if scope == VerifyScope::All {
+        let content_issues =
+            scan_content(&instances_dir, instance, &["mods", "resourcepacks", "shaderpacks"]);
+        content_issues_count = content_issues.len() as u32;
+        categories.push(VerifyCategory {
+            id: "content".to_string(),
+            checked: 0,
+            issue_count: content_issues_count,
+            issues: content_issues,
+        });
+    }
     let repairable_count = categories
         .iter()
         .filter(|c| c.id != "content")
@@ -769,7 +840,9 @@ pub async fn repair_instance(
     }
 
     // ── 6. content is report-only ───────────────────────────────
-    summary.content_skipped = scan_content(&instances_dir, instance).len() as u32;
+    summary.content_skipped =
+        scan_content(&instances_dir, instance, &["mods", "resourcepacks", "shaderpacks"]).len()
+            as u32;
 
     emit("done", 100.0, "Repair complete");
     Ok(summary)
@@ -996,6 +1069,58 @@ mod tests {
             .count() as u32;
         assert_eq!(content_repairs, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_scope_launcher_skips_user_content() {
+        let dir = temp_dir("scope_launcher");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        let mods = instance.mods_dir(&config.instances_dir());
+        write_file_with_sha1(&mods.join("broken.jar"), b"<html>404</html>");
+
+        let report = verify_instance_scoped(&config, &instance, VerifyScope::Launcher);
+
+        assert!(report.categories.iter().all(|c| c.id != "content"));
+        assert_eq!(report.content_issues, 0);
+        // Launcher categories are still checked (metadata is missing here).
+        assert!(report.categories.iter().any(|c| c.id == "metadata"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_scope_mods_reports_content_only() {
+        let dir = temp_dir("scope_mods");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        let mc = instance.minecraft_dir(&config.instances_dir());
+        write_file_with_sha1(&mc.join("mods").join("broken.jar"), b"<html>404</html>");
+        write_file_with_sha1(&mc.join("resourcepacks").join("broken.zip"), b"<html>404</html>");
+
+        let report = verify_instance_scoped(&config, &instance, VerifyScope::Mods);
+
+        assert_eq!(report.categories.len(), 1, "no launcher categories in a content scope");
+        let content = cat(&report, "content");
+        assert_eq!(content.issue_count, 1, "resource packs stay outside the mods scope");
+        assert!(content.issues[0].path.starts_with("mods/"));
+        assert_eq!(report.repairable_count, 0, "content-only scope has nothing to repair");
+        assert!(!report.healthy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_scope_parse_accepts_names_and_rejects_unknown() {
+        assert_eq!(VerifyScope::parse("all").unwrap(), VerifyScope::All);
+        assert_eq!(VerifyScope::parse("Launcher").unwrap(), VerifyScope::Launcher);
+        assert_eq!(
+            VerifyScope::parse("resourcepacks").unwrap(),
+            VerifyScope::Resourcepacks
+        );
+        assert_eq!(
+            VerifyScope::parse("shaderpacks").unwrap(),
+            VerifyScope::Shaderpacks
+        );
+        assert!(VerifyScope::parse("everything").is_err());
     }
 
     #[test]

@@ -284,8 +284,28 @@ pub fn get_instance(instances_dir: &PathBuf, name: &str) -> Result<Instance> {
     )))
 }
 
-/// Duplicate an instance
-pub fn duplicate_instance(instances_dir: &PathBuf, name: &str, new_name: &str) -> Result<Instance> {
+/// What the user chose to leave out of a duplicate (roadmap: duplicate must
+/// show what it copies and let saves / screenshots / logs be excluded).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DuplicateExclusions {
+    pub saves: bool,
+    pub screenshots: bool,
+    /// Per-launch junk: `.minecraft/logs` and `.minecraft/crash-reports`.
+    pub logs: bool,
+}
+
+/// Duplicate an instance. Metadata, mods, configs, resource packs and
+/// shaders always travel to the copy; the source's backup history (`.backups`)
+/// and parked update stashes never do — they belong to the original, and a
+/// copy inheriting its backup list would offer restic restores of the wrong
+/// instance. `exclude` drops the user's optional picks (saves, screenshots,
+/// logs with crash reports).
+pub fn duplicate_instance(
+    instances_dir: &PathBuf,
+    name: &str,
+    new_name: &str,
+    exclude: DuplicateExclusions,
+) -> Result<Instance> {
     let src = instances_dir.join(name);
     let dst = instances_dir.join(new_name);
     if !src.exists() {
@@ -294,8 +314,7 @@ pub fn duplicate_instance(instances_dir: &PathBuf, name: &str, new_name: &str) -
     if dst.exists() {
         return Err(LauncherError::Instance(format!("Instance '{}' already exists", new_name)));
     }
-    // Copy entire directory recursively
-    copy_dir_recursive(&src, &dst)?;
+    copy_dir_filtered(&src, &dst, "", &|rel| duplicate_skip(rel, exclude))?;
     // Read and update the instance config
     let mut instance = get_instance(instances_dir, new_name)?;
     instance.name = new_name.to_string();
@@ -306,14 +325,58 @@ pub fn duplicate_instance(instances_dir: &PathBuf, name: &str, new_name: &str) -
     Ok(instance)
 }
 
+/// Paths (relative to the instance root, `/`-separated) a duplicate leaves
+/// behind. Directories matched here are not descended into at all.
+fn duplicate_skip(rel: &str, exclude: DuplicateExclusions) -> bool {
+    // Backup history and parked stashes always stay with the source.
+    if rel == ".backups" || rel.starts_with(".backups/") {
+        return true;
+    }
+    if rel.ends_with(".voidlauncher-old") {
+        return true;
+    }
+    let mc = rel.strip_prefix(".minecraft/").unwrap_or("");
+    if mc.is_empty() && rel != ".minecraft" {
+        // Top-level entry (metadata, icon, …) — never excluded.
+        return false;
+    }
+    let dir = mc.split('/').next().unwrap_or("");
+    match dir {
+        "saves" => exclude.saves,
+        "screenshots" => exclude.screenshots,
+        "logs" | "crash-reports" => exclude.logs,
+        _ => false,
+    }
+}
+
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    copy_dir_filtered(src, dst, "", &|_| false)
+}
+
+/// Recursive copy that asks `skip` about each entry's path relative to the
+/// copy root (`/`-separated). A skipped directory is not descended into.
+fn copy_dir_filtered(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    rel_prefix: &str,
+    skip: &dyn Fn(&str) -> bool,
+) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
-        let dst_path = dst.join(entry.file_name());
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel = if rel_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", rel_prefix, name)
+        };
+        if skip(&rel) {
+            continue;
+        }
+        let dst_path = dst.join(&name);
         if path.is_dir() {
-            copy_dir_recursive(&path, &dst_path)?;
+            copy_dir_filtered(&path, &dst_path, &rel, skip)?;
         } else {
             std::fs::copy(&path, &dst_path)?;
         }
@@ -3440,6 +3503,68 @@ version = 'hIibTfxn'
             let name = entry.unwrap().file_name().to_string_lossy().to_string();
             assert!(!name.starts_with(".void-restore-tmp"), "temp dir leaked: {}", name);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Duplicate ────────────────────────────────────────────────
+
+    #[test]
+    fn duplicate_instance_copies_everything_except_backup_history() {
+        let dir = temp_dir("dup_default");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("Src", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+        let backups = instances_dir.join("Src").join(".backups").join("instances");
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(backups.join("Src__old.zip"), b"zip-bytes").unwrap();
+
+        let copy =
+            duplicate_instance(&instances_dir, "Src", "Dst", DuplicateExclusions::default())
+                .unwrap();
+
+        assert_eq!(copy.name, "Dst");
+        assert_eq!(copy.play_time_seconds, 0);
+        assert!(copy.last_played.is_none());
+        let dst = instances_dir.join("Dst");
+        assert!(dst.join("instance.json").exists());
+        assert!(dst.join(".minecraft").join("mods").join("sodium.jar").exists());
+        assert!(dst.join(".minecraft").join("logs").join("latest.log").exists());
+        assert!(
+            !dst.join(".backups").exists(),
+            "source backup history must stay with the original"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_instance_excludes_picked_content() {
+        let dir = temp_dir("dup_exclude");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("Src", "1.21.1", LoaderType::Fabric, Some("0.16.0"));
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+        let mc = instance.minecraft_dir(&instances_dir);
+        std::fs::create_dir_all(mc.join("saves").join("World")).unwrap();
+        std::fs::write(mc.join("saves").join("World").join("level.dat"), b"lvl").unwrap();
+
+        let exclude = DuplicateExclusions {
+            saves: true,
+            screenshots: true,
+            logs: true,
+        };
+        duplicate_instance(&instances_dir, "Src", "Dst", exclude).unwrap();
+
+        let dst_mc = instances_dir.join("Dst").join(".minecraft");
+        // Metadata + mods always travel.
+        assert!(instances_dir.join("Dst").join("instance.json").exists());
+        assert!(dst_mc.join("mods").join("sodium.jar").exists());
+        assert!(!dst_mc.join("saves").exists(), "saves excluded");
+        assert!(!dst_mc.join("screenshots").exists(), "screenshots excluded");
+        assert!(!dst_mc.join("logs").exists(), "logs excluded");
+        assert!(!dst_mc.join("crash-reports").exists(), "crash reports follow logs");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

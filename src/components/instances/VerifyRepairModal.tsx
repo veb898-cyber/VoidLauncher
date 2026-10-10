@@ -5,6 +5,7 @@ import { CheckCircle2, AlertTriangle, Loader2, Wrench } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
+import { Segmented } from '../ui/Segmented';
 import { useT, type MessageKey } from '../../lib/i18n';
 
 interface VerifyIssue {
@@ -56,6 +57,17 @@ const KIND_LABELS: Record<string, MessageKey> = {
   invalid: 'verify.kind_invalid',
 };
 
+/** Which part of an instance to scan: everything, launcher files only, or one
+ * content folder. Matches `VerifyScope` in the backend. */
+type VerifyScope = 'all' | 'launcher' | 'mods' | 'resourcepacks' | 'shaderpacks';
+
+/** In a content-only scope the "content" category shows the folder it scanned. */
+const SCOPE_CONTENT_LABELS: Partial<Record<VerifyScope, MessageKey>> = {
+  mods: 'verify.scope_mods',
+  resourcepacks: 'verify.scope_resourcepacks',
+  shaderpacks: 'verify.scope_shaderpacks',
+};
+
 interface VerifyRepairModalProps {
   open: boolean;
   onClose: () => void;
@@ -67,6 +79,7 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
   const [report, setReport] = useState<VerifyReport | null>(null);
   const [checking, setChecking] = useState(false);
   const [repairing, setRepairing] = useState(false);
+  const [scope, setScope] = useState<VerifyScope>('all');
   const [progress, setProgress] = useState<RepairProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<RepairSummary | null>(null);
@@ -79,6 +92,7 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
     try {
       const result = await invoke<VerifyReport>('cmd_verify_instance', {
         instanceName,
+        scope,
       });
       setReport(result);
     } catch (e) {
@@ -87,7 +101,7 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
     } finally {
       setChecking(false);
     }
-  }, [instanceName]);
+  }, [instanceName, scope]);
 
   useEffect(() => {
     if (open) {
@@ -167,8 +181,27 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
         </div>
       }
     >
-      <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', marginBottom: 'var(--space-md)' }}>
+      <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', marginBottom: 'var(--space-sm)' }}>
         {t('verify.instance_label', { name: instanceName })}
+      </div>
+
+      {/* Scope: all / launcher files / one content folder. Changing it
+          re-runs the scan (runVerify depends on scope). Repair is always
+          launcher-managed, so a content-only scope has nothing to repair. */}
+      <div style={{ marginBottom: 'var(--space-md)' }}>
+        <Segmented
+          ariaLabel={t('verify.scope_label')}
+          block
+          value={scope}
+          onChange={setScope}
+          options={[
+            { value: 'all', label: t('verify.scope_all'), disabled: busy },
+            { value: 'launcher', label: t('verify.scope_launcher'), disabled: busy },
+            { value: 'mods', label: t('verify.scope_mods'), disabled: busy },
+            { value: 'resourcepacks', label: t('verify.scope_resourcepacks'), disabled: busy },
+            { value: 'shaderpacks', label: t('verify.scope_shaderpacks'), disabled: busy },
+          ]}
+        />
       </div>
 
       {checking && (
@@ -226,7 +259,8 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
 
           {/* Categories */}
           {report.categories.map((cat) => {
-            const labelKey = CAT_LABELS[cat.id];
+            const scopedContent = cat.id === 'content' ? SCOPE_CONTENT_LABELS[scope] : undefined;
+            const labelKey = scopedContent ?? CAT_LABELS[cat.id];
             if (!labelKey) return null;
             const hasIssues = cat.issue_count > 0;
             return (

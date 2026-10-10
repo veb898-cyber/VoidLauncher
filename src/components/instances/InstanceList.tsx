@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck, Download, Archive, RotateCcw } from 'lucide-react';
+import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck, Download, Archive, RotateCcw, Copy } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { t } from '../../lib/i18n';
@@ -12,6 +12,7 @@ import { ProgressBar } from '../ui/ProgressBar';
 import { addToast } from '../ui/Toast';
 import { InstanceEditor } from './InstanceEditor';
 import { InstanceRestoreModal } from './InstanceRestoreModal';
+import { DuplicateInstanceModal } from './DuplicateInstanceModal';
 import { VerifyRepairModal } from './VerifyRepairModal';
 import { useEventStore } from '../../hooks/useGameEvents';
 
@@ -39,6 +40,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const [editorName, setEditorName] = useState<string | null>(null);
   const [verifyName, setVerifyName] = useState<string | null>(null);
   const [restoreName, setRestoreName] = useState<string | null>(null);
+  const [duplicateName, setDuplicateName] = useState<string | null>(null);
   const [backupBusy, setBackupBusy] = useState<string | null>(null);
   const editorInstance = editorName ? instances.find((i) => i.name === editorName) ?? null : null;
 
@@ -218,7 +220,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
             className="ctx-menu"
             style={{
               left: Math.min(contextMenu.x, window.innerWidth - 200),
-              top: Math.min(contextMenu.y, window.innerHeight - 250),
+              top: Math.min(contextMenu.y, window.innerHeight - 340),
             }}
             onMouseDown={(e) => e.stopPropagation()}
           >
@@ -226,6 +228,8 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
               onClick={() => { launchGame(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<Settings size={14} />} label={t('instances.ctx_settings')}
               onClick={() => { setEditorName(contextMenu.name); setContextMenu(null); }} />
+            <ContextMenuItem icon={<Copy size={14} />} label={t('instances.ctx_duplicate')} disabled={isLaunching}
+              onClick={() => { setDuplicateName(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<FolderOpen size={14} />} label={t('instances.ctx_open_folder')}
               onClick={() => { openFolder(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<ShieldCheck size={14} />} label={t('instances.ctx_verify')}
@@ -258,6 +262,15 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           instanceName={restoreName}
           onClose={() => setRestoreName(null)}
           onRestored={() => useInstanceStore.getState().loadInstances()}
+        />
+      )}
+
+      {/* Duplicate instance (from the context menu) */}
+      {duplicateName && (
+        <DuplicateInstanceModal
+          instanceName={duplicateName}
+          onClose={() => setDuplicateName(null)}
+          onDuplicated={() => useInstanceStore.getState().loadInstances()}
         />
       )}
 

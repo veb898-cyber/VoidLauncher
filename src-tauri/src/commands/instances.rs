@@ -204,6 +204,9 @@ pub async fn cmd_duplicate_instance(
     state: State<'_, AppState>,
     name: String,
     new_name: String,
+    exclude_saves: Option<bool>,
+    exclude_screenshots: Option<bool>,
+    exclude_logs: Option<bool>,
 ) -> Result<instances::Instance, String> {
     validate_instance_name(&name)?;
     validate_instance_name(&new_name)?;
@@ -211,8 +214,14 @@ pub async fn cmd_duplicate_instance(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
     };
+    let exclude = instances::DuplicateExclusions {
+        saves: exclude_saves.unwrap_or(false),
+        screenshots: exclude_screenshots.unwrap_or(false),
+        logs: exclude_logs.unwrap_or(false),
+    };
     tauri::async_runtime::spawn_blocking(move || {
-        instances::duplicate_instance(&instances_dir, &name, &new_name).map_err(|e| e.to_string())
+        instances::duplicate_instance(&instances_dir, &name, &new_name, exclude)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

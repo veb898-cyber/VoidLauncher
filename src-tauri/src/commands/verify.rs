@@ -10,8 +10,11 @@ use tauri::{AppHandle, State};
 pub async fn cmd_verify_instance(
     state: State<'_, AppState>,
     instance_name: String,
+    scope: Option<String>,
 ) -> Result<verify::VerifyReport, String> {
     super::instances::validate_instance_name(&instance_name)?;
+    let scope = verify::VerifyScope::parse(scope.as_deref().unwrap_or("all"))
+        .map_err(|e| e.to_string())?;
     let (instances_dir, config) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         (config.instances_dir(), config.clone())
@@ -19,7 +22,7 @@ pub async fn cmd_verify_instance(
     tauri::async_runtime::spawn_blocking(move || {
         let instance =
             instances::get_instance(&instances_dir, &instance_name).map_err(|e| e.to_string())?;
-        Ok(verify::verify_instance(&config, &instance))
+        Ok(verify::verify_instance_scoped(&config, &instance, scope))
     })
     .await
     .map_err(|e| e.to_string())?
