@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, Loader2, X, Check, Download, AlertTriangle } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
+import { SlidingTabs } from '../ui/SlidingTabs';
 import { addToast } from '../ui/Toast';
 import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { EmptyState } from '../ui/EmptyState';
@@ -77,6 +78,10 @@ interface Resolution {
 }
 
 const PROVIDER_STORAGE_KEY = 'voidlauncher.contentProvider';
+
+/** A hung resolver must not block the confirm view forever: after this
+ *  budget the Install button unlocks with an error toast (owner wave 25). */
+const RESOLVE_TIMEOUT_MS = 60_000;
 
 export type ContentType = 'mod' | 'resourcepack' | 'shader';
 
@@ -156,6 +161,10 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const [conflicts, setConflicts] = useState<DepConflict[]>([]);
   const [unresolved, setUnresolved] = useState<UnresolvedDep[]>([]);
   const resolveReqRef = useRef(0);
+  // Dependency resolution in flight: Install stays disabled with a spinner
+  // until the graph arrives (owner wave 25 — the race used to let an install
+  // start before its dependencies were known).
+  const [resolving, setResolving] = useState(false);
 
   const TYPE_LABELS: Record<ContentType, string> = {
     mod: t('content.type_mod'),
@@ -208,6 +217,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setSelectedItems([]);
     setConflicts([]);
     setUnresolved([]);
+    setResolving(false);
     setResultsOffset(0);
     setPopularOffset(0);
     setHasMoreResults(true);
@@ -426,6 +436,9 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   // the ordered plan replaces the list (projects deduplicated, dependencies
   // flagged), while conflicts and unresolved warnings refresh for the confirm
   // view. A request-id guard drops stale responses from rapid add/remove.
+  // The call is raced against RESOLVE_TIMEOUT_MS (owner wave 25): a slow or
+  // hung resolver reports an error and unlocks Install instead of leaving the
+  // confirm view blocked forever.
   const applyResolution = async (items: SelectedItem[]) => {
     const roots = items
       .filter((m) => !m.isDependency && m.versionId)
@@ -434,16 +447,28 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     if (roots.length === 0) {
       setConflicts([]);
       setUnresolved([]);
+      setResolving(false);
       return;
     }
+    setResolving(true);
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const res = await invoke<Resolution>('cmd_resolve_dependencies', {
-        instanceName,
-        subfolder,
-        rootVersionIds: roots,
-        mcVersion: mcVersion ?? null,
-        loader: versionLoader,
-      });
+      const res = await Promise.race([
+        invoke<Resolution>('cmd_resolve_dependencies', {
+          instanceName,
+          subfolder,
+          rootVersionIds: roots,
+          mcVersion: mcVersion ?? null,
+          loader: versionLoader,
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error('resolve-timeout'));
+          }, RESOLVE_TIMEOUT_MS);
+        }),
+      ]);
       if (reqId !== resolveReqRef.current) return;
       setSelectedItems(res.install.map((p) => ({
         name: p.name,
@@ -462,10 +487,18 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       setConflicts(res.conflicts);
       setUnresolved(res.unresolved);
     } catch (e: any) {
-      // Keep the current selection; the user can retry by re-adding.
-      if (reqId === resolveReqRef.current) {
-        addToast(t('content.deps_resolve_error', { error: e.toString() }), 'error');
-      }
+      if (reqId !== resolveReqRef.current) return;
+      // Keep the current selection; the user can retry by re-adding. On
+      // timeout the plan may be incomplete, so say that explicitly.
+      addToast(
+        timedOut
+          ? t('content.deps_resolve_timeout')
+          : t('content.deps_resolve_error', { error: e.toString() }),
+        'error',
+      );
+    } finally {
+      clearTimeout(timer);
+      if (reqId === resolveReqRef.current) setResolving(false);
     }
   };
 
@@ -584,11 +617,11 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     const direct = selectedItems.filter((m) => !m.isDependency);
     const deps = selectedItems.filter((m) => m.isDependency);
     return (
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <div className="content-confirm" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <div style={{ padding: 'var(--space-md) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', flexShrink: 0 }}>
           <Button variant="ghost" size="sm" onClick={() => setSubView('search')}><ArrowLeft size={16} /> {t('common.back')}</Button>
           <h2 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700, flex: 1 }}>{t('content.confirm_heading', { label, count: selectedItems.length.toString() })}</h2>
-          <Button onClick={handleDownloadAll} disabled={installing || selectedItems.length === 0 || conflicts.length > 0} loading={installing}>
+          <Button onClick={handleDownloadAll} disabled={installing || resolving || selectedItems.length === 0 || conflicts.length > 0} loading={installing || resolving}>
             <Download size={14} /> {t('common.install')}
           </Button>
         </div>
@@ -655,7 +688,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             <div style={{ marginBottom: 'var(--space-lg)' }}>
               <h3 style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, marginBottom: 'var(--space-sm)', color: 'var(--warning)' }}>{t('content.deps_heading', { count: deps.length.toString() })}</h3>
               {deps.map((item, i) => (
-                <div key={i} className="content-list-row" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', border: '1px solid hsla(35, 90%, 55%, 0.2)', marginBottom: 4 }}>
+                <div key={i} className="content-list-row content-list-row--dep" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', border: '1px solid hsla(35, 90%, 55%, 0.2)', marginBottom: 4 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
                     <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('content.dep_required_by', { parent: item.parentMod ?? '' })}</div>
@@ -691,20 +724,20 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
         </div>
         <Button size="sm" onClick={handleSearch} disabled={loading} loading={loading}>{t('common.find')}</Button>
-        {/* Catalog provider switch: one browser for both catalogs. */}
-        <div style={{ display: 'flex', gap: 4, flexShrink: 0 }} role="group" aria-label={t('content.provider_label')}>
-          {(['modrinth', 'curseforge'] as const).map((pid) => (
-            <Button
-              key={pid}
-              size="sm"
-              variant={providerId === pid ? 'primary' : 'ghost'}
-              onClick={() => setProviderId(pid)}
-              style={{ fontSize: '11px', padding: '4px 8px' }}
-            >
-              {pid === 'modrinth' ? t('content.provider_modrinth') : t('content.provider_curseforge')}
-            </Button>
-          ))}
-        </div>
+        {/* Catalog provider switch: one browser for both catalogs. Same
+            sliding-tab idiom as the terminal's log switcher (owner wave 25):
+            the frame physically travels between the buttons. */}
+        <SlidingTabs<ProviderId>
+          tabs={[
+            { id: 'modrinth', label: t('content.provider_modrinth') },
+            { id: 'curseforge', label: t('content.provider_curseforge') },
+          ]}
+          active={providerId}
+          onChange={setProviderId}
+          ariaLabel={t('content.provider_label')}
+          className="catalog-switch"
+          style={{ flexShrink: 0, marginBottom: 0, borderBottom: 'none' }}
+        />
       </div>
 
       {/* CurseForge without a configured key: search would just 401. */}
@@ -725,16 +758,21 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         </div>
       )}
 
-      {/* Sort controls */}
+      {/* Sort controls — the same sliding frame as the provider switch */}
       <div style={{ display: 'flex', gap: 4, alignItems: 'center', padding: 'var(--space-xs) var(--space-xl)', flexShrink: 0 }}>
         <ArrowUpDown size={12} style={{ color: 'var(--text-tertiary)' }} />
-        {(['downloads', 'newest', 'oldest'] as const).map((mode) => (
-          <Button key={mode} size="sm" variant={sortMode === mode ? 'primary' : 'ghost'} onClick={() => setSortMode(mode)} style={{ fontSize: '11px', padding: '4px 8px' }}>
-            {mode === 'downloads' && <><Star size={10} /> {t('content.sort_downloads')}</>}
-            {mode === 'newest' && <><Calendar size={10} /> {t('content.sort_newest')}</>}
-            {mode === 'oldest' && <><Calendar size={10} /> {t('content.sort_oldest')}</>}
-          </Button>
-        ))}
+        <SlidingTabs<SortMode>
+          tabs={[
+            { id: 'downloads', label: <><Star size={10} /> {t('content.sort_downloads')}</> },
+            { id: 'newest', label: <><Calendar size={10} /> {t('content.sort_newest')}</> },
+            { id: 'oldest', label: <><Calendar size={10} /> {t('content.sort_oldest')}</> },
+          ]}
+          active={sortMode}
+          onChange={setSortMode}
+          ariaLabel={t('content.sort_label')}
+          className="catalog-switch"
+          style={{ marginBottom: 0, borderBottom: 'none' }}
+        />
       </div>
 
       {/* Split content */}

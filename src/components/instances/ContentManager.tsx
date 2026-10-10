@@ -7,6 +7,7 @@ import { Button } from '../ui/Button';
 import { Modal } from '../ui/Modal';
 import { Tooltip } from '../ui/Tooltip';
 import { addToast } from '../ui/Toast';
+import { logUiMessage } from '../../lib/uiLog';
 import { ContentBrowser, type ContentType } from './ContentBrowser';
 import { useFocusStore } from '../../stores/focusStore';
 import { useT } from '../../lib/i18n';
@@ -694,6 +695,30 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     }
   };
 
+  // Selective updates must not spray toasts across the screen (owner wave 25):
+  // successes stay quiet (the row leaves the dialog, the list refreshes),
+  // failures collect into ONE toast — count in brackets when several failed
+  // within the debounce window — while every detail goes to the launcher log.
+  const updateFailuresRef = useRef<{ name: string; error: string }[]>([]);
+  const updateFailureTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flushUpdateFailures = () => {
+    const failures = updateFailuresRef.current;
+    updateFailuresRef.current = [];
+    updateFailureTimerRef.current = null;
+    if (failures.length === 0) return;
+    if (failures.length === 1) {
+      addToast(t('manager.update_error', { name: failures[0].name, error: failures[0].error }), 'error');
+    } else {
+      addToast(t('manager.update_failed_many', { count: failures.length.toString() }), 'error');
+    }
+  };
+  const reportUpdateFailure = (name: string, error: string) => {
+    logUiMessage(t('manager.update_error', { name, error }), 'error', 'ui');
+    updateFailuresRef.current.push({ name, error });
+    if (updateFailureTimerRef.current != null) clearTimeout(updateFailureTimerRef.current);
+    updateFailureTimerRef.current = setTimeout(flushUpdateFailures, 900);
+  };
+
   const handleApplyUpdate = async (update: UpdateInfo, silent = false) => {
     setDownloadingMods((prev) => new Set(prev).add(update.filename));
     try {
@@ -711,10 +736,13 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         expectedSha1: update.expectedSha1 || '',
         fileId: update.fileId ?? null,
       });
-      if (!silent) addToast(t('manager.updated_toast', { name: update.name, version: update.newVersion }), 'success');
+      if (!silent) logUiMessage(t('manager.updated_toast', { name: update.name, version: update.newVersion }), 'info', 'ui');
       setUpdates((prev) => prev ? prev.filter((u) => u.name !== update.name) : null);
       loadItems();
-    } catch (e: any) { if (!silent) addToast(t('manager.update_error', { name: update.name, error: e.toString() }), 'error'); }
+    } catch (e: any) {
+      if (silent) logUiMessage(t('manager.update_error', { name: update.name, error: e.toString() }), 'error', 'ui');
+      else reportUpdateFailure(update.name, e.toString());
+    }
     setDownloadingMods((prev) => { const next = new Set(prev); next.delete(update.filename); return next; });
     return { name: update.name, success: true };
   };
@@ -751,8 +779,14 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     if (errors.length === 0) {
       addToast(t('manager.updated_all_success', { count: successes.length.toString() }), 'success');
     } else {
-      const errorMsg = errors.map((e) => `${e.name}: ${e.error}`).join('; ');
-      addToast((errors.length === total ? t('manager.updated_all_failed') : t('manager.updated_all_partial', { success: successes.length.toString(), failed: errors.length.toString() })) + ': ' + errorMsg, 'error');
+      // Keep the toast to one short line; the per-mod details belong in the
+      // log (owner wave 25 — a wall of error text covers the launcher).
+      for (const err of errors) {
+        logUiMessage(t('manager.update_error', { name: err.name, error: err.error }), 'error', 'ui');
+      }
+      addToast(errors.length === total
+        ? t('manager.updated_all_failed')
+        : t('manager.updated_all_partial', { success: successes.length.toString(), failed: errors.length.toString() }), 'error');
     }
   };
 

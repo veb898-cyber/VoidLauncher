@@ -1761,6 +1761,18 @@ select option {
   padding: var(--space-sm) var(--space-md);
 }
 
+/* Compact density for the content browser's two toolbar rows (catalog
+   provider switch in the search bar + sort filters): the bar packs an input
+   and buttons, and at the default tab padding the row would grow past its
+   neighbours. Labels keep an inline icon, hence the flex gap. */
+.catalog-switch .tab {
+  font-size: 11px;
+  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 /* One indicator per row, physically slid between the buttons by
    SlidingTabs (it measures the active button and moves this box). The
    per-tab underline that only scaled and the pill that popped in are both
@@ -4037,6 +4049,20 @@ input[type="range"]:active::-moz-range-thumb {
       var(--shadow-lg), var(--glow-primary);
   }
 
+  /* Banner artwork (owner wave 25): the placeholder and any picture must
+     read as solid art, never as frosted glass — at the base 0.3 opacity the
+     card's blur showed straight through the banner region
+     («placeholder-область сейчас со стеклом… сам баннер не должен иметь
+     эффекта стекла»). Full opacity seals the region; the default gradient is
+     remixed over the card fill so the placeholder keeps the dimmed tone the
+     other themes render. Only the rest of the card stays glass. */
+  [data-theme='lg'] .instance-card__banner {
+    opacity: 1;
+    background: linear-gradient(135deg,
+      color-mix(in srgb, var(--primary) 30%, var(--bg-secondary)),
+      color-mix(in srgb, var(--secondary) 30%, var(--bg-secondary)));
+  }
+
   /* Bare text on the empty backdrop. With the backdrop raw behind it, white
      text can pass over a bright animated patch; this is the cheapest fix that
      does not cover the backdrop - a hairline dark halo, invisible on dark
@@ -4166,6 +4192,12 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
       rgb(4, 6, 11, 0.26) 46%,
       rgb(2, 3, 6, 0.32) 100%);
     z-index: var(--z-scrim);
+    /* No scrim fade (owner wave 25): an opacity animation anywhere on the
+       overlay subtree makes it a backdrop root for the fade's duration, the
+       sheet's backdrop-filter stays dead and the material snaps on only at
+       the end — «liquid glass появляется с задержкой… нужно сразу». The
+       light dim appears at once; the sheet below still rises. */
+    animation: none;
   }
 
 /* The bare variant is a deliberate "no scrim" case (Microsoft login card)
@@ -4185,6 +4217,19 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
     box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
     position: relative;
     z-index: var(--z-sheet);
+  }
+
+  /* The sheet keeps the rise but loses the fade (owner wave 25): while the
+     sheet's own opacity is below 1 it forms a backdrop root, backdrop-filter
+     is dead for the whole slideUp and the glass appears only when the fade
+     ends. Transform-only entry shows the material on the very first frame. */
+  [data-theme='lg'] .modal.animate-slide-up {
+    animation: slideUpClear var(--transition-normal);
+  }
+
+  @keyframes slideUpClear {
+    from { transform: translateY(20px); }
+    to { transform: translateY(0); }
   }
 
   /* Realistic glass, element part (token part sits at the top of the file).
@@ -4674,6 +4719,23 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
 }
 [data-theme='lg'] .content-catalog .content-list-row--selected {
   background: var(--lg-tint);
+}
+
+/* Content CONFIRM view (owner wave 25): the chosen mods carry the same glass
+   as the catalog tiles they came from («карточки модов на странице
+   подтверждения должны иметь glass-эффект как в каталоге»), and dependency
+   tiles get a warm film — the orange analog of the catalog's green
+   installed rows («чуть оранжевые»). */
+[data-theme='lg'] .content-confirm .content-list-row {
+  content-visibility: visible;
+  background: var(--lg-fill);
+  backdrop-filter: blur(14px) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(14px) saturate(var(--lg-sat));
+  box-shadow: var(--lg-rim-ring);
+}
+[data-theme='lg'] .content-confirm .content-list-row--dep {
+  background: hsla(28, 80%, 34%, 0.46);
+  box-shadow: var(--lg-rim-ring), inset 0 0 0 1px hsla(35, 90%, 55%, 0.24);
 }
 
 /* --- Install overlay: same spotlight scrim as the modal, same glass
