@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck, Download } from 'lucide-react';
+import { Plus, Package, Play, Settings, FolderOpen, Trash2, ShieldCheck, Download, Archive, RotateCcw } from 'lucide-react';
 import { useInstanceStore } from '../../stores/instanceStore';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { t } from '../../lib/i18n';
@@ -11,6 +11,7 @@ import { EmptyState } from '../ui/EmptyState';
 import { ProgressBar } from '../ui/ProgressBar';
 import { addToast } from '../ui/Toast';
 import { InstanceEditor } from './InstanceEditor';
+import { InstanceRestoreModal } from './InstanceRestoreModal';
 import { VerifyRepairModal } from './VerifyRepairModal';
 import { useEventStore } from '../../hooks/useGameEvents';
 
@@ -37,6 +38,8 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const [deleteConfirmName, setDeleteConfirmName] = useState<string | null>(null);
   const [editorName, setEditorName] = useState<string | null>(null);
   const [verifyName, setVerifyName] = useState<string | null>(null);
+  const [restoreName, setRestoreName] = useState<string | null>(null);
+  const [backupBusy, setBackupBusy] = useState<string | null>(null);
   const editorInstance = editorName ? instances.find((i) => i.name === editorName) ?? null : null;
 
   const installingName = installProgress?.instance_id || null;
@@ -73,6 +76,21 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
     } catch (e: any) {
       addToast(t('instances.export_error', { error: e.toString() }), 'error');
     }
+  };
+
+  // Create a whole-instance backup (metadata + .minecraft; logs, crash
+  // reports, screenshots and previous backups are excluded). Instant — the
+  // archive is stored inside the instance, so a save dialog would be
+  // pointless.
+  const handleBackup = async (name: string) => {
+    setBackupBusy(name);
+    try {
+      await invoke('cmd_backup_instance', { name });
+      addToast(t('instances.backup_toast', { name }), 'success');
+    } catch (e: any) {
+      addToast(t('instances.backup_error', { error: e.toString() }), 'error');
+    }
+    setBackupBusy(null);
   };
 
   return (
@@ -212,6 +230,10 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
               onClick={() => { openFolder(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<ShieldCheck size={14} />} label={t('instances.ctx_verify')}
               onClick={() => { setVerifyName(contextMenu.name); setContextMenu(null); }} />
+            <ContextMenuItem icon={<Archive size={14} />} label={t('instances.ctx_backup')} disabled={backupBusy === contextMenu.name}
+              onClick={() => { handleBackup(contextMenu.name); setContextMenu(null); }} />
+            <ContextMenuItem icon={<RotateCcw size={14} />} label={t('instances.ctx_restore')} disabled={isLaunching}
+              onClick={() => { setRestoreName(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<Download size={14} />} label={t('instances.ctx_export')}
               onClick={() => { handleExport(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<Trash2 size={14} />} label={t('common.delete')} danger
@@ -227,6 +249,15 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           open
           instanceName={verifyName}
           onClose={() => setVerifyName(null)}
+        />
+      )}
+
+      {/* Instance restore (from the context menu) */}
+      {restoreName && (
+        <InstanceRestoreModal
+          instanceName={restoreName}
+          onClose={() => setRestoreName(null)}
+          onRestored={() => useInstanceStore.getState().loadInstances()}
         />
       )}
 

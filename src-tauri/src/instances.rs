@@ -1792,20 +1792,26 @@ fn add_minecraft_dir_to_zip(
 
 /// Zip the contents of `dir` under `prefix` (no leading slash). Root files sit
 /// at the archive root; subdirectories accumulate their path on recursion.
+/// Entries whose file name satisfies `skip` (and their whole subtree) are left
+/// out — backups use it to drop logs, screenshots, caches and themselves.
 fn add_dir_contents_to_zip(
     zip: &mut zip::ZipWriter<std::fs::File>,
     dir: &std::path::Path,
     prefix: &str,
     options: zip::write::SimpleFileOptions,
+    skip: &dyn Fn(&str) -> bool,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
+        if skip(&name) {
+            continue;
+        }
         let zip_path = if prefix.is_empty() { name.clone() } else { format!("{}/{}", prefix, name) };
         if path.is_dir() {
             zip.add_directory(&zip_path, options)?;
-            add_dir_contents_to_zip(zip, &path, &zip_path, options)?;
+            add_dir_contents_to_zip(zip, &path, &zip_path, options, skip)?;
         } else {
             zip.start_file(&zip_path, options)?;
             let mut file = std::fs::File::open(&path)?;
@@ -2035,7 +2041,7 @@ pub fn backup_world(
     let file = std::fs::File::create(&out_path)?;
     let mut zip_w = zip::ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    add_dir_contents_to_zip(&mut zip_w, &world_dir, "", options)?;
+    add_dir_contents_to_zip(&mut zip_w, &world_dir, "", options, &|_| false)?;
     zip_w.finish()?;
     let size_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
     tracing::info!(target: "launcher", "Backed up world '{}' of '{}' to {:?}", world_name, instance_name, out_path);
@@ -2046,18 +2052,14 @@ pub fn backup_world(
     })
 }
 
-/// List a world's backups, newest first. Missing directory yields an empty list.
-pub fn list_world_backups(
-    instances_dir: &PathBuf,
-    instance_name: &str,
-    world_name: &str,
-) -> Result<Vec<BackupInfo>> {
-    let dir = world_backups_dir(instances_dir, instance_name, world_name);
+/// List `*.zip` archives in a backup directory, newest first. A missing
+/// directory yields an empty list. Shared by world and instance backups.
+fn list_backup_dir(dir: &std::path::Path) -> Result<Vec<BackupInfo>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
+    for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
@@ -2083,6 +2085,15 @@ pub fn list_world_backups(
     }
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(out)
+}
+
+/// List a world's backups, newest first. Missing directory yields an empty list.
+pub fn list_world_backups(
+    instances_dir: &PathBuf,
+    instance_name: &str,
+    world_name: &str,
+) -> Result<Vec<BackupInfo>> {
+    list_backup_dir(&world_backups_dir(instances_dir, instance_name, world_name))
 }
 
 /// Restore a world from a backup archive. `mode` is `"replace"` (overwrite the
@@ -2137,35 +2148,7 @@ pub fn restore_world(
 
     // Extract with zip-slip protection (blocks traversal, separators, and
     // absolute/Windows drive paths via a `starts_with` check on the join).
-    let file = std::fs::File::open(&backup_path)?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| LauncherError::Instance(format!("Invalid backup archive: {}", e)))?;
-    std::fs::create_dir_all(&target_dir)?;
-    for i in 0..archive.len() {
-        let mut entry =
-            archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
-        if entry.is_dir() {
-            continue;
-        }
-        let name = entry.name().replace('\\', "/");
-        if name.is_empty()
-            || name.contains('\0')
-            || name.contains(':')
-            || name.starts_with('/')
-            || name.split('/').any(|c| c == "..")
-        {
-            continue;
-        }
-        let out_path = target_dir.join(&name);
-        if !out_path.starts_with(&target_dir) {
-            continue;
-        }
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut out = std::fs::File::create(&out_path)?;
-        std::io::copy(&mut entry, &mut out)?;
-    }
+    extract_zip_to_dir(&backup_path, &target_dir)?;
     tracing::info!(
         target: "launcher",
         "Restored world '{}' of '{}' from '{}' (mode {}) as '{}'",
@@ -2184,6 +2167,255 @@ pub fn delete_world_backup(
     validate_backup_filename(backup_filename)?;
     let path =
         world_backups_dir(instances_dir, instance_name, world_name).join(backup_filename);
+    if !path.is_file() {
+        return Err(LauncherError::Instance(format!("Backup '{}' not found", backup_filename)));
+    }
+    std::fs::remove_file(&path)?;
+    Ok(())
+}
+
+// ── Instance backup / restore ────────────────────────────────────
+
+/// Where per-instance backup archives live: `<instance>/.backups/instances/`.
+/// Inside the instance so backups travel with it, but never zipped into a
+/// backup of that same instance (see `instance_backup_skip`).
+fn instance_backups_dir(instances_dir: &PathBuf, instance_name: &str) -> PathBuf {
+    instances_dir.join(instance_name).join(".backups").join("instances")
+}
+
+/// What a whole-instance backup leaves out: per-launch logs, crash reports,
+/// screenshots and the backups themselves (a backup must not contain itself).
+/// Keeps archives small and avoids recursion into `.backups`.
+fn instance_backup_skip(name: &str) -> bool {
+    name == "logs"
+        || name == "crash-reports"
+        || name == "screenshots"
+        || name == ".backups"
+        || name.ends_with(".voidlauncher-old")
+}
+
+/// Extract a zip archive into `dest` with zip-slip protection: entries with
+/// NUL, `:` (drive letters / NTFS streams), leading `/` or `..` segments are
+/// skipped, and the final join must stay inside `dest`.
+fn extract_zip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| LauncherError::Instance(format!("Invalid backup archive: {}", e)))?;
+    std::fs::create_dir_all(dest)?;
+    for i in 0..archive.len() {
+        let mut entry =
+            archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        if name.is_empty()
+            || name.contains('\0')
+            || name.contains(':')
+            || name.starts_with('/')
+            || name.split('/').any(|c| c == "..")
+        {
+            continue;
+        }
+        let out_path = dest.join(&name);
+        if !out_path.starts_with(dest) {
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut entry, &mut out)?;
+    }
+    Ok(())
+}
+
+/// Zip an entire instance (metadata + `.minecraft`) into
+/// `<instance>/.backups/instances/<name>__<ts>.zip`. Logs, crash reports,
+/// screenshots and the `.backups` directory are excluded.
+pub fn backup_instance(instances_dir: &PathBuf, name: &str) -> Result<BackupInfo> {
+    use zip::write::SimpleFileOptions;
+    let instance = get_instance(instances_dir, name)?;
+    let inst_dir = instance.dir(instances_dir);
+    if !inst_dir.is_dir() {
+        return Err(LauncherError::Instance(format!("Instance '{}' not found", name)));
+    }
+    let backups_dir = instance_backups_dir(instances_dir, name);
+    std::fs::create_dir_all(&backups_dir)?;
+    let ts = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    let mut out_path = backups_dir.join(format!("{}__{}.zip", name, ts));
+    // Two backups in the same second must not clobber each other.
+    if out_path.exists() {
+        out_path = backups_dir.join(format!("{}__{}_{}.zip", name, ts, std::process::id()));
+    }
+    let filename = out_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let file = std::fs::File::create(&out_path)?;
+    let mut zip_w = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    add_dir_contents_to_zip(&mut zip_w, &inst_dir, "", options, &instance_backup_skip)?;
+    zip_w.finish()?;
+    let size_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!(target: "launcher", "Backed up instance '{}' to {:?}", name, out_path);
+    Ok(BackupInfo {
+        filename,
+        size_bytes,
+        created_at: chrono::Local::now().timestamp(),
+    })
+}
+
+/// List an instance's backups, newest first. Missing directory yields empty.
+pub fn list_instance_backups(
+    instances_dir: &PathBuf,
+    name: &str,
+) -> Result<Vec<BackupInfo>> {
+    list_backup_dir(&instance_backups_dir(instances_dir, name))
+}
+
+/// Restore an instance from a backup archive. `mode` is `"replace"` (rebuild
+/// the instance from the archive, preserving its `.backups` history) or
+/// `"as_new"` (extract into a new instance named `new_name`; the original is
+/// untouched). The archive is fully extracted to a temp directory first — only
+/// a valid instance archive (has `instance.json` or `instance.cfg`) swaps in,
+/// so a corrupt backup never destroys the existing instance.
+pub fn restore_instance(
+    instances_dir: &PathBuf,
+    name: &str,
+    backup_filename: &str,
+    mode: &str,
+    new_name: Option<&str>,
+) -> Result<()> {
+    validate_backup_filename(backup_filename)?;
+    // No `get_instance` here on purpose: restore must work even when the
+    // live instance's metadata is what got damaged.
+    let inst_dir = instances_dir.join(name);
+    let backup_path = instance_backups_dir(instances_dir, name).join(backup_filename);
+    if !inst_dir.is_dir() {
+        return Err(LauncherError::Instance(format!("Instance '{}' not found", name)));
+    }
+    if !backup_path.is_file() {
+        return Err(LauncherError::Instance(format!("Backup '{}' not found", backup_filename)));
+    }
+
+    let target_name = match mode {
+        "replace" => name.to_string(),
+        "as_new" => {
+            let n = new_name.unwrap_or("").trim();
+            if n.is_empty()
+                || n.len() > 64
+                || n.contains('/')
+                || n.contains('\\')
+                || n.contains(':')
+                || n.contains('\0')
+                || n.contains("..")
+            {
+                return Err(LauncherError::Instance(format!("Invalid instance name: '{}'", n)));
+            }
+            n.to_string()
+        }
+        _ => return Err(LauncherError::Instance(format!("Unknown restore mode: '{}'", mode))),
+    };
+    let target_dir = instances_dir.join(&target_name);
+    if mode == "as_new" && target_dir.exists() {
+        return Err(LauncherError::Instance(format!(
+            "An instance named '{}' already exists",
+            target_name
+        )));
+    }
+
+    // 1. Extract fully to a hidden sibling temp dir — failures here leave the
+    //    existing instance untouched. Dot-prefixed and lacking instance.json,
+    //    so `list_instances` ignores it even if a crash leaves it behind.
+    let pid = std::process::id();
+    let ts = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
+    let tmp = instances_dir.join(format!(".void-restore-tmp-{}_{}", pid, ts));
+    if tmp.exists() {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    if let Err(e) = extract_zip_to_dir(&backup_path, &tmp) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    if !tmp.join("instance.json").exists() && !tmp.join("instance.cfg").exists() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(LauncherError::Instance(
+            "Archive does not look like a VoidLauncher or Prism instance".into(),
+        ));
+    }
+
+    // 2. Swap it in.
+    if mode == "replace" {
+        // The archive never contains `.backups`, so preserve the live backup
+        // history across the swap — it holds the archive being restored.
+        let old_backups = inst_dir.join(".backups");
+        let preserved = instances_dir.join(format!(".void-backups-preserve-{}_{}", pid, ts));
+        let had_backups = old_backups.exists();
+        if had_backups {
+            std::fs::rename(&old_backups, &preserved)?;
+        }
+        let old_dir = instances_dir.join(format!(".void-old-{}_{}", pid, ts));
+        if let Err(e) = std::fs::rename(&inst_dir, &old_dir) {
+            if had_backups {
+                let _ = std::fs::rename(&preserved, &old_backups);
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, &target_dir) {
+            let _ = std::fs::rename(&old_dir, &inst_dir);
+            if had_backups {
+                let _ = std::fs::rename(&preserved, &inst_dir.join(".backups"));
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e.into());
+        }
+        if had_backups {
+            let new_backups = target_dir.join(".backups");
+            if new_backups.exists() {
+                // Extremely unlikely (a backup containing `.backups`), but
+                // keep both histories instead of losing one.
+                for entry in std::fs::read_dir(&preserved)? {
+                    let entry = entry?;
+                    let _ = std::fs::rename(entry.path(), new_backups.join(entry.file_name()));
+                }
+                let _ = std::fs::remove_dir_all(&preserved);
+            } else {
+                std::fs::rename(&preserved, &new_backups)?;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&old_dir);
+    } else {
+        if let Err(e) = std::fs::rename(&tmp, &target_dir) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e.into());
+        }
+        // Re-label the metadata: the archive stores the original instance
+        // name, and `Instance.dir()` derives the folder from that field —
+        // keeping it would make the copy address the original's folder.
+        if let Ok(mut restored) = get_instance(instances_dir, &target_name) {
+            restored.name = target_name.clone();
+            let _ = save_instance(instances_dir, &restored, None);
+        }
+    }
+
+    tracing::info!(
+        target: "launcher",
+        "Restored instance '{}' from '{}' (mode {}) as '{}'",
+        name, backup_filename, mode, target_name
+    );
+    Ok(())
+}
+
+/// Delete one stored instance backup archive.
+pub fn delete_instance_backup(
+    instances_dir: &PathBuf,
+    name: &str,
+    backup_filename: &str,
+) -> Result<()> {
+    validate_backup_filename(backup_filename)?;
+    let path = instance_backups_dir(instances_dir, name).join(backup_filename);
     if !path.is_file() {
         return Err(LauncherError::Instance(format!("Backup '{}' not found", backup_filename)));
     }
@@ -3006,6 +3238,208 @@ version = 'hIibTfxn'
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].filename, b.filename);
         assert!(delete_world_backup(&instances_dir, "ListPack", "LW", &a.filename).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Instance backup / restore ────────────────────────────────
+
+    fn make_instance_files(instances_dir: &PathBuf, instance: &Instance) {
+        let mc = instance.minecraft_dir(instances_dir);
+        std::fs::create_dir_all(mc.join("mods")).unwrap();
+        std::fs::write(mc.join("mods").join("sodium.jar"), b"jar-bytes").unwrap();
+        std::fs::create_dir_all(mc.join("logs")).unwrap();
+        std::fs::write(mc.join("logs").join("latest.log"), b"log").unwrap();
+        std::fs::create_dir_all(mc.join("screenshots")).unwrap();
+        std::fs::write(mc.join("screenshots").join("shot.png"), b"png").unwrap();
+        std::fs::create_dir_all(mc.join("crash-reports")).unwrap();
+        std::fs::write(mc.join("crash-reports").join("crash.txt"), b"crash").unwrap();
+    }
+
+    fn zip_entry_names(path: &std::path::Path) -> Vec<String> {
+        let file = std::fs::File::open(path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().replace('\\', "/"))
+            .collect()
+    }
+
+    #[test]
+    fn backup_instance_excludes_junk_and_lists() {
+        let dir = temp_dir("inst_backup");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("BackupMe", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+
+        let info = backup_instance(&instances_dir, "BackupMe").unwrap();
+        assert!(info.filename.starts_with("BackupMe__") && info.filename.ends_with(".zip"));
+        assert!(info.size_bytes > 0);
+
+        let zip_path = instances_dir
+            .join("BackupMe")
+            .join(".backups")
+            .join("instances")
+            .join(&info.filename);
+        let names = zip_entry_names(&zip_path);
+        assert!(names.iter().any(|n| n == "instance.json"), "{:?}", names);
+        assert!(names.iter().any(|n| n == "instance.cfg"), "{:?}", names);
+        assert!(names.iter().any(|n| n == ".minecraft/mods/sodium.jar"), "{:?}", names);
+        assert!(!names.iter().any(|n| n.contains("logs")), "logs leaked: {:?}", names);
+        assert!(!names.iter().any(|n| n.contains("screenshots")), "screenshots leaked: {:?}", names);
+        assert!(!names.iter().any(|n| n.contains("crash-reports")), "crash reports leaked: {:?}", names);
+        assert!(!names.iter().any(|n| n.contains(".backups")), "backups leaked into themselves: {:?}", names);
+
+        assert_eq!(list_instance_backups(&instances_dir, "BackupMe").unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_instance_replace_recovers_content_and_keeps_backup_history() {
+        let dir = temp_dir("inst_restore_replace");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("Victim", "1.21.1", LoaderType::Fabric, Some("0.16.0"));
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+
+        let info = backup_instance(&instances_dir, "Victim").unwrap();
+
+        // Corrupt: break the metadata AND delete the mod — restore must not
+        // require the damaged metadata to run.
+        let inst = instances_dir.join("Victim");
+        std::fs::remove_file(inst.join("instance.json")).unwrap();
+        std::fs::remove_file(inst.join(".minecraft").join("mods").join("sodium.jar")).unwrap();
+
+        restore_instance(&instances_dir, "Victim", &info.filename, "replace", None).unwrap();
+
+        assert!(inst.join("instance.json").exists(), "metadata restored");
+        assert_eq!(
+            std::fs::read(inst.join(".minecraft").join("mods").join("sodium.jar")).unwrap(),
+            b"jar-bytes",
+            "mod restored"
+        );
+        assert!(!inst.join(".minecraft").join("logs").exists(), "junk stays excluded");
+        // The swap must not lose the backup history that lives in `.backups`.
+        let list = list_instance_backups(&instances_dir, "Victim").unwrap();
+        assert_eq!(list.len(), 1, "backup history preserved across restore");
+        assert_eq!(list[0].filename, info.filename);
+        // And it still parses as a launchable instance.
+        assert_eq!(get_instance(&instances_dir, "Victim").unwrap().name, "Victim");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_instance_as_new_creates_second_instance() {
+        let dir = temp_dir("inst_restore_asnew");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("Original", "1.21.1", LoaderType::NeoForge, Some("21.1.135"));
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+
+        let info = backup_instance(&instances_dir, "Original").unwrap();
+        restore_instance(
+            &instances_dir,
+            "Original",
+            &info.filename,
+            "as_new",
+            Some("Restored Copy"),
+        )
+        .unwrap();
+
+        let restored = instances_dir.join("Restored Copy");
+        assert!(restored.join("instance.json").exists());
+        assert_eq!(
+            std::fs::read(restored.join(".minecraft").join("mods").join("sodium.jar")).unwrap(),
+            b"jar-bytes"
+        );
+        assert_eq!(get_instance(&instances_dir, "Restored Copy").unwrap().name, "Restored Copy");
+
+        // Original untouched, its backups stay with it; the copy has none.
+        assert!(instances_dir.join("Original").join("instance.json").exists());
+        assert_eq!(list_instance_backups(&instances_dir, "Original").unwrap().len(), 1);
+        assert_eq!(list_instance_backups(&instances_dir, "Restored Copy").unwrap().len(), 0);
+
+        // as_new onto an existing name must fail (no silent overwrite).
+        assert!(
+            restore_instance(&instances_dir, "Original", &info.filename, "as_new", Some("Restored Copy"))
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn instance_backup_filename_traversal_rejected() {
+        let dir = temp_dir("inst_backup_traversal");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("TravI", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+        let decoy = instance.dir(&instances_dir).join("decoy.txt");
+        std::fs::write(&decoy, b"keep").unwrap();
+
+        for evil in [
+            "../decoy.txt.zip",
+            "..\\decoy.txt.zip",
+            "C:/Windows/x.zip",
+            "/abs.zip",
+            "no-extension",
+            ".hidden.zip",
+            "sub/name.zip",
+        ] {
+            assert!(
+                restore_instance(&instances_dir, "TravI", evil, "replace", None).is_err(),
+                "restore filename {:?} must be rejected",
+                evil
+            );
+            assert!(
+                delete_instance_backup(&instances_dir, "TravI", evil).is_err(),
+                "delete filename {:?} must be rejected",
+                evil
+            );
+        }
+        assert!(decoy.exists(), "decoy must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_instance_rejects_archive_without_metadata_and_cleans_temp() {
+        let dir = temp_dir("inst_restore_invalid");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("Brokee", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+
+        // A zip that is not an instance (no instance.json / instance.cfg).
+        let backups = instances_dir.join("Brokee").join(".backups").join("instances");
+        std::fs::create_dir_all(&backups).unwrap();
+        let bad = backups.join("not-instance.zip");
+        let file = std::fs::File::create(&bad).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("junk.txt", opts).unwrap();
+        zw.write_all(b"hi").unwrap();
+        zw.finish().unwrap();
+
+        let mod_before =
+            std::fs::read(instances_dir.join("Brokee").join(".minecraft").join("mods").join("sodium.jar"))
+                .unwrap();
+        assert!(restore_instance(&instances_dir, "Brokee", "not-instance.zip", "replace", None).is_err());
+
+        // The live instance must be untouched and no temp dirs left behind.
+        assert!(instances_dir.join("Brokee").join("instance.json").exists());
+        assert_eq!(
+            std::fs::read(instances_dir.join("Brokee").join(".minecraft").join("mods").join("sodium.jar"))
+                .unwrap(),
+            mod_before
+        );
+        for entry in std::fs::read_dir(&instances_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(!name.starts_with(".void-restore-tmp"), "temp dir leaked: {}", name);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
