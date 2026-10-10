@@ -3,6 +3,7 @@ mod atlauncher;
 mod auth;
 mod commands;
 mod config;
+mod content;
 mod curseforge;
 mod download;
 mod entry;
@@ -262,6 +263,8 @@ pub fn run() {
             commands::mods::cmd_get_curseforge_mod_detail,
             commands::mods::cmd_get_modrinth_project_body,
             commands::mods::cmd_check_mod_updates,
+            commands::content::cmd_resolve_dependencies,
+            commands::content::cmd_check_content_compatibilities,
             commands::auth::cmd_list_accounts,
             commands::auth::cmd_add_offline_account,
             commands::auth::cmd_add_elyby_account,

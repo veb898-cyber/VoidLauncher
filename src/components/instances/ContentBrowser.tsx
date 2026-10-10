@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, Loader2, X, Check, Download } from 'lucide-react';
+import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, Loader2, X, Check, Download, AlertTriangle } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { addToast } from '../ui/Toast';
@@ -13,18 +13,9 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
 import { RemoteIcon } from '../../lib/remoteImage';
+import { getProvider, type ProviderProject } from '../../lib/contentProviders';
 
-interface Hit {
-  project_id: string;
-  title: string;
-  description: string;
-  icon_url: string | null;
-  project_type: string;
-  downloads: number;
-  slug: string;
-  author?: string;
-  date_published?: string;
-}
+type Hit = ProviderProject;
 
 export interface SelectedItem {
   name: string;
@@ -33,11 +24,54 @@ export interface SelectedItem {
   filename: string;
   source: string;
   projectId: string;
+  /** Pinned Modrinth version id — feeds the dependency resolver and the
+   *  sidecar written at install time. */
+  versionId?: string;
   versionName?: string;
   isDependency?: boolean;
   parentMod?: string;
   sha1?: string;
 }
+
+/** Backend dependency-resolution payloads (cmd_resolve_dependencies). */
+interface DepConflictReason {
+  source_project_id: string;
+  source_name: string;
+  requirement: string;
+  kind: string;
+}
+interface DepConflict {
+  project_id: string;
+  project_name: string;
+  reasons: DepConflictReason[];
+}
+interface UnresolvedDep {
+  project_id: string;
+  project_name: string;
+  source_project_id: string;
+  source_name: string;
+  reason: string;
+}
+interface PlanEntry {
+  project_id: string;
+  version_id: string;
+  name: string;
+  version_label: string;
+  icon_url?: string | null;
+  file: { url: string; filename: string; sha1?: string | null };
+  depth: number;
+  required_by: string[];
+  is_root: boolean;
+}
+interface Resolution {
+  install: PlanEntry[];
+  conflicts: DepConflict[];
+  optional: unknown[];
+  skipped: unknown[];
+  unresolved: UnresolvedDep[];
+}
+
+const provider = getProvider('modrinth');
 
 export type ContentType = 'mod' | 'resourcepack' | 'shader';
 
@@ -98,6 +132,11 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const PAGE_SIZE = 50;
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
   const setPending = useBrowserGuardStore((s) => s.setPending);
+  // Dependency-resolution output for the current selection: conflicts block
+  // installation, unresolved entries only warn (stage 3, roadmap items 14-15).
+  const [conflicts, setConflicts] = useState<DepConflict[]>([]);
+  const [unresolved, setUnresolved] = useState<UnresolvedDep[]>([]);
+  const resolveReqRef = useRef(0);
 
   const TYPE_LABELS: Record<ContentType, string> = {
     mod: t('content.type_mod'),
@@ -146,13 +185,13 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setHasMorePopular(true);
     try {
       const base = { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
-      let res = await invoke<any>('cmd_popular_modrinth', base);
+      let res = await provider.popular(base);
       if (reqId !== popularReqRef.current) return;
       if (sortMode === 'oldest') {
         const total = Math.max(res.total_hits ?? 0, 0);
         const lastOffset = Math.max(0, total - PAGE_SIZE);
         const page = lastOffset > 0
-          ? await invoke<any>('cmd_popular_modrinth', { ...base, offset: lastOffset })
+          ? await provider.popular({ ...base, offset: lastOffset })
           : res;
         if (reqId !== popularReqRef.current) return;
         const hits: Hit[] = [...((page.hits as Hit[]) || [])].reverse();
@@ -178,7 +217,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setLoadingMore(true);
     const offset = popularOffsetRef.current;
     try {
-      const res = await invoke<any>('cmd_popular_modrinth', { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
+      const res = await provider.popular({ projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
       if (reqId !== popularReqRef.current) { setLoadingMore(false); return; }
       const raw: Hit[] = res.hits || [];
       const hits: Hit[] = sortMode === 'oldest' ? [...raw].reverse() : raw;
@@ -221,13 +260,13 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setSelected(null);
     try {
       const base = { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
-      let res = await invoke<any>('cmd_search_modrinth', base);
+      let res = await provider.search(query, base);
       if (reqId !== searchReqRef.current) return;
       if (sortMode === 'oldest') {
         const total = Math.max(res.total_hits ?? 0, 0);
         const lastOffset = Math.max(0, total - PAGE_SIZE);
         const page = lastOffset > 0
-          ? await invoke<any>('cmd_search_modrinth', { ...base, offset: lastOffset })
+          ? await provider.search(query, { ...base, offset: lastOffset })
           : res;
         if (reqId !== searchReqRef.current) return;
         const hits: Hit[] = [...((page.hits as Hit[]) || [])].reverse();
@@ -253,7 +292,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setLoadingMore(true);
     const offset = resultsOffsetRef.current;
     try {
-      const res = await invoke<any>('cmd_search_modrinth', { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
+      const res = await provider.search(query, { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
       if (reqId !== searchReqRef.current) { setLoadingMore(false); return; }
       const raw: Hit[] = res.hits || [];
       const hits: Hit[] = sortMode === 'oldest' ? [...raw].reverse() : raw;
@@ -319,8 +358,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setVersionLimit(20);
     try {
       const [detail, vers] = await Promise.all([
-        invoke<any>('cmd_get_modrinth_project', { id: hit.project_id }),
-        invoke<any[]>('cmd_get_modrinth_versions', { projectId: hit.project_id, mcVersion: mcVersion ?? null, loader: versionLoader }),
+        provider.getProject(hit.project_id),
+        provider.getVersions(hit.project_id, mcVersion ?? null, versionLoader),
       ]);
       setModDetail(detail);
       setVersions(vers);
@@ -338,20 +377,75 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     || (slug ? (installedProjectIds?.has(normalizeSlug(slug)) ?? false) : false)
     || (title ? (installedProjectIds?.has(`name:${normalizeName(title)}`) ?? false) : false);
 
+  // Re-resolve the whole selection through the backend (stage 3, items 14-15):
+  // the ordered plan replaces the list (projects deduplicated, dependencies
+  // flagged), while conflicts and unresolved warnings refresh for the confirm
+  // view. A request-id guard drops stale responses from rapid add/remove.
+  const applyResolution = async (items: SelectedItem[]) => {
+    const roots = items
+      .filter((m) => !m.isDependency && m.versionId)
+      .map((m) => m.versionId as string);
+    const reqId = ++resolveReqRef.current;
+    if (roots.length === 0) {
+      setConflicts([]);
+      setUnresolved([]);
+      return;
+    }
+    try {
+      const res = await invoke<Resolution>('cmd_resolve_dependencies', {
+        instanceName,
+        subfolder,
+        rootVersionIds: roots,
+        mcVersion: mcVersion ?? null,
+        loader: versionLoader,
+      });
+      if (reqId !== resolveReqRef.current) return;
+      setSelectedItems(res.install.map((p) => ({
+        name: p.name,
+        iconUrl: p.icon_url ?? undefined,
+        downloadUrl: p.file.url,
+        filename: p.file.filename,
+        source: 'modrinth',
+        projectId: p.project_id,
+        versionId: p.version_id,
+        versionName: p.version_label,
+        sha1: p.file.sha1 ?? undefined,
+        isDependency: !p.is_root,
+        parentMod: p.is_root ? undefined : (p.required_by[0] || undefined),
+      })));
+      setConflicts(res.conflicts);
+      setUnresolved(res.unresolved);
+    } catch (e: any) {
+      // Keep the current selection; the user can retry by re-adding.
+      if (reqId === resolveReqRef.current) {
+        addToast(t('content.deps_resolve_error', { error: e.toString() }), 'error');
+      }
+    }
+  };
+
+  // When an item is removed by hand, drop the conflict/warning entries it
+  // caused instead of re-resolving the whole graph over the network.
+  const pruneResolution = (projectId: string) => {
+    setConflicts((prev) => prev
+      .map((c) => ({ ...c, reasons: c.reasons.filter((r) => r.source_project_id !== projectId) }))
+      .filter((c) => c.project_id !== projectId && c.reasons.length > 0));
+    setUnresolved((prev) => prev.filter((u) => u.source_project_id !== projectId));
+  };
+
   const addLatest = async (hit: Hit) => {
     if (selectedItems.some((m) => m.projectId === hit.project_id) || isInstalled(hit.project_id, hit.slug, hit.title)) {
       return;
     }
     setAddingId(hit.project_id);
     try {
-      const vers = await invoke<any[]>('cmd_get_modrinth_versions', { projectId: hit.project_id, mcVersion: mcVersion ?? null, loader: versionLoader });
+      const vers = await provider.getVersions(hit.project_id, mcVersion ?? null, versionLoader);
       if (vers.length === 0) {
         addToast(t('content.no_compatible_version'), 'warning');
         setAddingId(null);
         return;
       }
       const v = vers[0];
-      const file = v.files?.find((f: any) => f.primary) || v.files?.[0];
+      const file = v.files?.find((f) => f.primary) || v.files?.[0];
       if (file) {
         const item: SelectedItem = {
           name: hit.title,
@@ -360,51 +454,27 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           filename: file.filename,
           source: 'modrinth',
           projectId: hit.project_id,
+          versionId: v.id,
           versionName: v.name || v.version_number,
           sha1: file.hashes?.sha1,
         };
-        setSelectedItems((prev) => [...prev, item]);
-        if (contentType === 'mod') await resolveDependencies(hit, v);
+        const next = [...selectedItems, item];
+        setSelectedItems(next);
+        await applyResolution(next);
       }
     } catch (e: any) { addToast(t('content.add_error', { error: e.toString() }), 'error'); }
     setAddingId(null);
   };
 
-  const resolveDependencies = async (mod: Hit, version: any) => {
-    const deps = version.dependencies?.filter((d: any) => d.dependency_type === 'required');
-    if (!deps || deps.length === 0) return;
-    for (const dep of deps) {
-      const depId = dep.project_id;
-      if (!depId) continue;
-      if (selectedItems.some((m) => m.projectId === depId)) continue;
-      if (installedProjectIds?.has(depId)) continue;
-      try {
-        const depProject = await invoke<any>('cmd_get_modrinth_project', { id: depId });
-        // Also check by slug (matches fabric mod id for mods without sidecar)
-        if (depProject?.slug && installedProjectIds?.has(depProject.slug)) continue;
-        const depVers = await invoke<any[]>('cmd_get_modrinth_versions', { projectId: depId, mcVersion: mcVersion ?? null, loader: versionLoader });
-        if (depVers.length > 0) {
-          const f = depVers[0].files?.find((f: any) => f.primary) || depVers[0].files?.[0];
-          if (f) {
-            setSelectedItems((prev) => [...prev, {
-              name: depProject.title, iconUrl: depProject.icon_url,
-              downloadUrl: f.url, filename: f.filename,
-              source: 'modrinth', projectId: depId, versionName: depVers[0].name,
-              isDependency: true, parentMod: mod.title,
-              sha1: f.hashes?.sha1,
-            }]);
-          }
-        }
-      } catch { }
-    }
-  };
-
   const removeItem = (idx: number) => {
+    const removed = selectedItems[idx];
     setSelectedItems((prev) => prev.filter((_, i) => i !== idx));
+    if (removed) pruneResolution(removed.projectId);
   };
 
   const removeByProjectId = (projectId: string) => {
     setSelectedItems((prev) => prev.filter((m) => m.projectId !== projectId));
+    pruneResolution(projectId);
   };
 
   const handleDownloadAll = async () => {
@@ -422,7 +492,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           subfolder,
           projectId: item.projectId || null,
           projectName: item.name || null,
-          versionId: null,
+          versionId: item.versionId ?? null,
           versionNumber: item.versionName || null,
           provider: item.source || 'modrinth',
           expectedSha1: item.sha1 || '',
@@ -470,7 +540,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         <div style={{ padding: 'var(--space-md) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', flexShrink: 0 }}>
           <Button variant="ghost" size="sm" onClick={() => setSubView('search')}><ArrowLeft size={16} /> {t('common.back')}</Button>
           <h2 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700, flex: 1 }}>{t('content.confirm_heading', { label, count: selectedItems.length.toString() })}</h2>
-          <Button onClick={handleDownloadAll} disabled={installing || selectedItems.length === 0} loading={installing}>
+          <Button onClick={handleDownloadAll} disabled={installing || selectedItems.length === 0 || conflicts.length > 0} loading={installing}>
             <Download size={14} /> {t('common.install')}
           </Button>
         </div>
@@ -483,6 +553,41 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           </div>
         )}
         <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-md) var(--space-xl)' }}>
+          {/* Blocking conflict report (stage 3, item 15): installation is
+              disabled until the conflicting item leaves the selection. */}
+          {conflicts.length > 0 && (
+            <div style={{ marginBottom: 'var(--space-lg)', border: '1px solid var(--color-danger)', background: 'hsla(0, 85%, 60%, 0.08)', borderRadius: 'var(--radius-md)', padding: 'var(--space-md)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 'var(--font-size-sm)', color: 'var(--color-danger)', marginBottom: 6 }}>
+                <X size={14} /> {t('content.deps_conflict_heading')}
+              </div>
+              {conflicts.map((c) => (
+                <div key={c.project_id} style={{ marginBottom: 6 }}>
+                  <div style={{ fontWeight: 600, fontSize: 'var(--font-size-xs)' }}>{c.project_name || c.project_id}</div>
+                  {c.reasons.map((r, i) => (
+                    <div key={i} style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)' }}>
+                      {r.kind === 'incompatible'
+                        ? t('content.conflict_incompatible', { name: c.project_name || c.project_id, source: r.source_name })
+                        : t('content.conflict_version', { source: r.source_name, name: c.project_name || c.project_id, requirement: r.requirement })}
+                    </div>
+                  ))}
+                </div>
+              ))}
+              <div style={{ fontWeight: 600, fontSize: 'var(--font-size-xs)' }}>{t('content.deps_conflict_blocked')}</div>
+            </div>
+          )}
+          {/* Unresolved required dependencies: warn, but do not block. */}
+          {unresolved.length > 0 && (
+            <div style={{ marginBottom: 'var(--space-lg)', border: '1px solid var(--warning)', background: 'hsla(35, 90%, 55%, 0.08)', borderRadius: 'var(--radius-md)', padding: 'var(--space-md)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 'var(--font-size-sm)', color: 'var(--warning)', marginBottom: 6 }}>
+                <AlertTriangle size={14} /> {t('content.deps_unresolved_heading')}
+              </div>
+              {unresolved.map((u, i) => (
+                <div key={i} style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)' }}>
+                  {t('content.deps_unresolved', { source: u.source_name || '—', name: u.project_name || u.project_id })}
+                </div>
+              ))}
+            </div>
+          )}
           {direct.length > 0 && (
             <div style={{ marginBottom: 'var(--space-lg)' }}>
               <h3 style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, marginBottom: 'var(--space-sm)' }}>{t('content.mods_heading', { label, count: direct.length.toString() })}</h3>
@@ -662,11 +767,16 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                                 name: selected.title, iconUrl: selected.icon_url ?? undefined,
                                 downloadUrl: file.url, filename: file.filename,
                                 source: 'modrinth', projectId: selected.project_id,
+                                versionId: v.id,
                                 versionName: v.name || v.version_number,
                                 sha1: file.hashes?.sha1,
                               };
-                              setSelectedItems((prev) => [...prev, item]);
+                              const next = [...selectedItems, item];
+                              setSelectedItems(next);
                               addToast(t('content.added_toast', { name: selected.title }), 'success');
+                              // A pinned version goes through the same backend
+                              // resolution as "add latest" (item 14).
+                              applyResolution(next);
                             }
                           }}
                             style={{

@@ -464,6 +464,15 @@ export const ru: Record<string, string> = {
   'content.sort_downloads':            'Скачивания',
   'content.sort_newest':               'Новые',
   'content.sort_oldest':               'Старые',
+  'content.deps_resolve_error':        'Не удалось рассчитать зависимости: {error}',
+  'content.deps_conflict_heading':     'Конфликты зависимостей',
+  'content.deps_conflict_blocked':     'Установку продолжить нельзя, пока есть конфликты. Удалите конфликтующий пункт из выбора.',
+  'content.conflict_version':          '{source} требует {name} {requirement}',
+  'content.conflict_incompatible':     '{name} объявлен несовместимым с {source}',
+  'content.deps_unresolved_heading':   'Неразрешимые зависимости',
+  'content.deps_unresolved':           '{source}: нет совместимой версии {name}',
+  'content.compat_incompatible':       'Нет совместимой версии для {target}',
+  'content.compat_unverified':         'Совместимость с {target} не проверена',
 
   // ── Content Manager ─────────────────────────────────────────
   'manager.column_on':                 'Вкл',
@@ -492,9 +501,6 @@ export const ru: Record<string, string> = {
   'manager.updated_all_failed':        'Все обновления завершились ошибкой',
   'manager.updated_all_partial':       'Обновлено {success}/{failed} мод(ов) с ошибками',
   'manager.updating_progress':         'Обновление {current}/{total}',
-  'manager.compat_unknown':            'Не удалось определить версию мода или лоудер',
-  'manager.compat_maybe':              'Этот мод может не поддерживать Minecraft {version}',
-  'manager.compat_no':                 'Этот мод несовместим с {target}',
 
   // ── Packs Manager ───────────────────────────────────────────
   'packs.installed_count':             '{n} установлено',

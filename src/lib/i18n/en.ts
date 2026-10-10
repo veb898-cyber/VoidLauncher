@@ -460,6 +460,15 @@ export const en = {
   'content.sort_downloads':            'Downloads',
   'content.sort_newest':               'Newest',
   'content.sort_oldest':               'Oldest',
+  'content.deps_resolve_error':        'Failed to resolve dependencies: {error}',
+  'content.deps_conflict_heading':     'Dependency conflicts',
+  'content.deps_conflict_blocked':     'Installation cannot continue while conflicts exist. Remove the conflicting item from the selection.',
+  'content.conflict_version':          '{source} requires {name} {requirement}',
+  'content.conflict_incompatible':     '{name} is marked incompatible with {source}',
+  'content.deps_unresolved_heading':   'Unresolved dependencies',
+  'content.deps_unresolved':           '{source}: no compatible version of {name}',
+  'content.compat_incompatible':       'No compatible version for {target}',
+  'content.compat_unverified':         'Compatibility with {target} not verified',
 
   // ── Content Manager (installed mods/resourcepacks/shaderpacks) ──
   'manager.column_on':                 'ON',
@@ -488,9 +497,6 @@ export const en = {
   'manager.updated_all_failed':        'All updates failed',
   'manager.updated_all_partial':       'Updated {success}/{failed} mod(s) with errors',
   'manager.updating_progress':         'Updating {current}/{total}',
-  'manager.compat_unknown':            'Cannot determine mod version or loader',
-  'manager.compat_maybe':              'This mod may not support Minecraft {version}',
-  'manager.compat_no':                 'This mod is not compatible with {target}',
 
   // ── Packs Manager ───────────────────────────────────────────
   'packs.installed_count':             '{n} installed',

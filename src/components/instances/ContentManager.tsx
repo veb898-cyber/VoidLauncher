@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, AlertTriangle } from 'lucide-react';
+import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, AlertTriangle, X } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Modal } from '../ui/Modal';
 import { Tooltip } from '../ui/Tooltip';
@@ -12,6 +12,7 @@ import { useFocusStore } from '../../stores/focusStore';
 import { useT } from '../../lib/i18n';
 import { useIconCacheStore } from '../../stores/iconCacheStore';
 import { RemoteIcon } from '../../lib/remoteImage';
+import type { CompatState } from '../../lib/contentProviders';
 
 /// Strip a trailing version like "_v1.2.3", "-1.0", " v3.2" from a name
 function strip_version_suffix(name: string): string {
@@ -106,8 +107,8 @@ interface ContentRowProps {
   isSelected: boolean;
   iconSrc: string | null;
   iconsResolving: boolean;
-  hasCompatWarn: boolean;
-  mcVersion?: string | null;
+  /** Normalized compatibility state; only `incompatible`/`unverified` show a badge. */
+  compatState?: CompatState;
   compatTarget: string;
   onRowClick: (filename: string, e: React.MouseEvent) => void;
   onContext: (e: React.MouseEvent, filename: string) => void;
@@ -118,8 +119,8 @@ interface ContentRowProps {
 /// parent state change (selection, search, icon cache updates) caused visible
 /// UI jank; with memo only the actually-changed rows re-render.
 const ContentRow = memo(function ContentRow({
-  item, idx, isSelected, iconSrc, iconsResolving, hasCompatWarn,
-  mcVersion, compatTarget,
+  item, idx, isSelected, iconSrc, iconsResolving, compatState,
+  compatTarget,
   onRowClick, onContext, onToggle,
 }: ContentRowProps) {
   const t = useT();
@@ -163,26 +164,24 @@ const ContentRow = memo(function ContentRow({
         {item.provider || ''}
       </div>
       <div>
-        {hasCompatWarn && (() => {
-          // Build a localized warning string. The yellow
-          // "this mod may be incompatible" tooltip used to be
-          // hardcoded English, which broke the Russian UI.
-          const title =
-            !item.version && !item.provider
-              ? t('manager.compat_unknown')
-              : mcVersion && !item.version
-                ? t('manager.compat_maybe', { version: mcVersion })
-                : t('manager.compat_no', { target: compatTarget });
-          return (
-            <Tooltip content={title}>
-              <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }}>
-                <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
-                  <AlertTriangle size={12} />
-                </div>
+        {compatState === 'incompatible' && (
+          <Tooltip content={t('content.compat_incompatible', { target: compatTarget })}>
+            <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }}>
+              <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--color-danger)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-danger)' }}>
+                <X size={12} />
               </div>
-            </Tooltip>
-          );
-        })()}
+            </div>
+          </Tooltip>
+        )}
+        {compatState === 'unverified' && (
+          <Tooltip content={t('content.compat_unverified', { target: compatTarget })}>
+            <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }}>
+              <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
+                <AlertTriangle size={12} />
+              </div>
+            </div>
+          </Tooltip>
+        )}
       </div>
     </div>
   );
@@ -199,7 +198,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   // is also stable across `items` array reorders from re-loads.
   const [selectedFilenames, setSelectedFilenames] = useState<Set<string>>(new Set());
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; filename: string } | null>(null);
-  const [compatibility, setCompatibility] = useState<Record<string, boolean>>({});
+  const [compatibility, setCompatibility] = useState<Record<string, CompatState>>({});
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updates, setUpdates] = useState<UpdateInfo[] | null>(null);
   const [showBrowser, setShowBrowser] = useState(false);
@@ -413,7 +412,6 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     setSelectedFilenames(new Set());
     setSearch('');
     setCompatibility({});
-    checkedRef.current = new Set();
   }, [loadItems, mcVersion, loader]);
 
   // Watch the instance directory for external file changes; reload list on event.
@@ -453,55 +451,61 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     };
   }, [instanceName, subfolder, loadItems, isFrozen]);
 
-  const checkedRef = useRef<Set<string>>(new Set());
+  // Batch compatibility check (stage 3, item 16): one backend call classifies
+  // every not-yet-classified file into the normalized states, replacing the
+  // old per-mod 200 ms polling loop. `compatTick` retriggers after each batch
+  // (or failure) so files added later — or left behind by a cancelled run —
+  // get picked up, while a failed batch degrades to `unknown` instead of
+  // retrying in a loop.
+  const compatBusyRef = useRef(false);
+  const [compatTick, setCompatTick] = useState(0);
 
   useEffect(() => {
-    // Compatibility checking fires network requests every 200ms per mod.
-    // While the launcher is frozen, skip this entirely — the check resumes
-    // automatically when focus is restored (we just won't recompute for already-checked items).
+    // Network work: skipped while the launcher is frozen (game running,
+    // window unfocused); the reload-on-thaw cycle resumes the check.
     if (isFrozen) return;
     if (loading || contentType !== 'mod') return;
-    const visible = items.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()) || p.filename.toLowerCase().includes(search.toLowerCase()));
-    const toCheck = visible.filter((it) => it.slug && it.slug_verified && !checkedRef.current.has(it.filename));
-    if (toCheck.length === 0) return;
+    const missing = items
+      .filter((it) => it.slug && it.slug_verified && compatibility[it.filename] === undefined)
+      .map((it) => it.filename);
+    if (missing.length === 0 || compatBusyRef.current) return;
     let cancelled = false;
+    compatBusyRef.current = true;
     (async () => {
-      for (const item of toCheck) {
-        if (cancelled) break;
-        checkedRef.current.add(item.filename);
-        try {
-          // Strict query: instance's MC version + loader.
-          let vers = await invoke<any[]>('cmd_get_modrinth_versions', {
-            projectId: item.slug,
+      try {
+        const res = await invoke<Array<{ filename: string; status: CompatState }>>(
+          'cmd_check_content_compatibilities',
+          {
+            instanceName,
+            subfolder,
             mcVersion: mcVersion ?? null,
             loader: loader ?? null,
+            filenames: missing,
+          }
+        );
+        if (cancelled) return;
+        setCompatibility((prev) => {
+          const next = { ...prev };
+          for (const r of res) next[r.filename] = r.status;
+          // Files the backend skipped (no Modrinth identity) stay unknown.
+          for (const f of missing) if (next[f] === undefined) next[f] = 'unknown';
+          return next;
+        });
+      } catch {
+        if (!cancelled) {
+          setCompatibility((prev) => {
+            const next = { ...prev };
+            for (const f of missing) if (next[f] === undefined) next[f] = 'unknown';
+            return next;
           });
-          if (cancelled) break;
-          // Fallback: if the strict query returned nothing, the mod may still
-          // be compatible — the Modrinth project just lacks a version tagged
-          // for the exact MC version (e.g. instance is on 1.21.11 and the
-          // mod's tagged versions only cover 1.21.1). Re-query with just the
-          // loader; if the mod has *any* Fabric/Forge/… version we treat it
-          // as compatible, since the loader is the harder constraint.
-          if (vers.length === 0 && loader && loader !== 'Vanilla') {
-            vers = await invoke<any[]>('cmd_get_modrinth_versions', {
-              projectId: item.slug,
-              mcVersion: null,
-              loader,
-            });
-            if (cancelled) break;
-          }
-          if (vers.length === 0) {
-            setCompatibility((prev) => ({ ...prev, [item.filename]: true }));
-          }
-        } catch {
-          if (cancelled) break;
         }
-        await new Promise((r) => setTimeout(r, 200));
+      } finally {
+        compatBusyRef.current = false;
+        setCompatTick((tick) => tick + 1);
       }
     })();
     return () => { cancelled = true; };
-  }, [items, loading, contentType, mcVersion, loader, search, isFrozen]);
+  }, [items, loading, contentType, mcVersion, loader, instanceName, subfolder, isFrozen, compatibility, compatTick]);
 
   // When the launcher thaws (focus returns), the file watcher may have queued
   // changes that we ignored. Refresh the list once to pick up any external edits.
@@ -877,8 +881,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
                 isSelected={selectedFilenames.has(item.filename)}
                 iconSrc={getItemIcon(item)}
                 iconsResolving={iconsResolving}
-                hasCompatWarn={contentType === 'mod' && !!compatibility[item.filename]}
-                mcVersion={mcVersion}
+                compatState={contentType === 'mod' ? compatibility[item.filename] : undefined}
                 compatTarget={compatTarget}
                 onRowClick={handleRowClick}
                 onContext={handleRowContext}

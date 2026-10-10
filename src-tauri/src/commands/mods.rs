@@ -3,6 +3,7 @@
 
 use crate::commands::instances::validate_instance_name;
 use crate::config::AppConfig;
+use crate::content;
 use crate::curseforge;
 use crate::download;
 use crate::instances;
@@ -452,7 +453,7 @@ pub async fn cmd_install_mod(
     state: State<'_, AppState>,
     instance_name: String,
     modrinth_version_id: Option<String>,
-    #[allow(unused_variables)] curseforge_file_id: Option<i32>,
+    curseforge_file_id: Option<i32>,
     file_name: String,
     download_url: String,
     project_id: Option<String>,
@@ -511,15 +512,23 @@ pub async fn cmd_install_mod(
         }
         std::fs::copy(&local_path, &dest).map_err(|e| e.to_string())?;
         download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
-        // Sidecar so the Source column shows Local instead of a loader name
-        // from jar metadata (no project_id — nothing to update).
-        let sidecar = serde_json::json!({ "provider": "local" });
-        let sidecar_path = crate::instances::sidecar_meta_path(&content_dir, &safe_name);
-        if let Some(parent) = sidecar_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(sidecar_path, sidecar.to_string());
-        let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(&content_dir, &safe_name));
+        // Unified sidecar so the Source column shows Local instead of a
+        // loader name from jar metadata (no project — nothing to update).
+        let hash = download::hash_file_sha1(&dest).ok();
+        let _ = content::write_sidecar(
+            &content_dir,
+            &safe_name,
+            &content::SidecarWrite {
+                provider: "local",
+                content_type: content::content_type_for_dir(&safe_subfolder),
+                project_id: None,
+                project_name: None,
+                version_id: None,
+                version_number: None,
+                file_id: None,
+                hash: hash.as_deref(),
+            },
+        );
         return Ok(safe_name);
     }
 
@@ -541,23 +550,24 @@ pub async fn cmd_install_mod(
     download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
     let final_name = safe_name.clone();
 
-    // Write sidecar metadata (`.index/` folder, same layout as Prism) so the
-    // installed mod can be tracked back to its source.
-    if let Some(pid) = project_id.as_deref() {
-        let sidecar = serde_json::json!({
-            "provider": provider,
-            "project_id": pid,
-            "project_name": project_name,
-            "version_id": modrinth_version_id,
-            "version_number": version_number,
-        });
-        let sidecar_path = crate::instances::sidecar_meta_path(&content_dir, &safe_name);
-        if let Some(parent) = sidecar_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(sidecar_path, sidecar.to_string());
-        let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(&content_dir, &safe_name));
-    }
+    // Write unified sidecar metadata (`.index/` folder, same layout as
+    // Prism) so the installed file can be tracked back to its source,
+    // including hash/installed_at for later compatibility & update checks.
+    let hash = download::hash_file_sha1(&dest).ok();
+    let _ = content::write_sidecar(
+        &content_dir,
+        &safe_name,
+        &content::SidecarWrite {
+            provider: &provider,
+            content_type: content::content_type_for_dir(&safe_subfolder),
+            project_id: project_id.as_deref(),
+            project_name: project_name.as_deref(),
+            version_id: modrinth_version_id.as_deref(),
+            version_number: version_number.as_deref(),
+            file_id: curseforge_file_id.map(|id| id.to_string()).as_deref(),
+            hash: hash.as_deref(),
+        },
+    );
 
     Ok(final_name)
 }
@@ -576,6 +586,7 @@ pub async fn cmd_download_to_folder(
     provider: String,
     old_filename: Option<String>,
     expected_sha1: String,
+    file_id: Option<String>,
 ) -> Result<String, String> {
     validate_instance_name(&instance_name)?;
     if !download_url.starts_with("https://") {
@@ -655,23 +666,28 @@ pub async fn cmd_download_to_folder(
         crate::instances::cleanup_old_sidecar_after_update(&dest_dir, raw_old, &safe_name);
     }
 
-    // Write sidecar metadata (`.index/` folder) so the installed file can be
-    // tracked back to its source.
-    if let Some(pid) = project_id.as_deref() {
-        let sidecar = serde_json::json!({
-            "provider": provider,
-            "project_id": pid,
-            "project_name": project_name,
-            "version_id": version_id,
-            "version_number": version_number,
-        });
-        let sidecar_path = crate::instances::sidecar_meta_path(&dest_dir, &safe_name);
-        if let Some(parent) = sidecar_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(sidecar_path, sidecar.to_string());
-        let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(&dest_dir, &safe_name));
-    }
+    // Write unified sidecar metadata (`.index/` folder) so the installed file
+    // can be tracked back to its source. The verified SHA1 (or a freshly
+    // computed one when the API had none) feeds the hash-based update check.
+    let hash = if expected_sha1.is_empty() {
+        download::hash_file_sha1(&dest).ok()
+    } else {
+        Some(expected_sha1.clone())
+    };
+    let _ = content::write_sidecar(
+        &dest_dir,
+        &safe_name,
+        &content::SidecarWrite {
+            provider: &provider,
+            content_type: content::content_type_for_dir(safe_subfolder),
+            project_id: project_id.as_deref(),
+            project_name: project_name.as_deref(),
+            version_id: version_id.as_deref(),
+            version_number: version_number.as_deref(),
+            file_id: file_id.as_deref(),
+            hash: hash.as_deref(),
+        },
+    );
 
     Ok(safe_name)
 }
