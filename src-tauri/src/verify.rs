@@ -117,7 +117,7 @@ fn loader_type_str(loader: &LoaderType) -> &'static str {
     }
 }
 
-fn load_local_version_info(versions_dir: &PathBuf, mc_version: &str) -> Option<VersionInfo> {
+pub(crate) fn load_local_version_info(versions_dir: &PathBuf, mc_version: &str) -> Option<VersionInfo> {
     let path = versions_dir
         .join(mc_version)
         .join(format!("{}.json", mc_version));

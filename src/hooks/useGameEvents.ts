@@ -5,6 +5,8 @@ import { create } from 'zustand';
 import { useLogStore } from '../stores/logStore';
 import type { LogEntry } from '../stores/logStore';
 import { useFocusStore, adjustRunningCount } from '../stores/focusStore';
+import { t } from '../lib/i18n';
+import { CRASH_KEYS, type CrashAnalysis } from '../lib/diagnostics';
 
 interface InstallProgress {
   instance_id: string;
@@ -143,6 +145,20 @@ export function useGameEvents() {
           source: 'launch',
           message: `Minecraft exited unexpectedly with code ${p.exit_code}. Check the log panel for details.`,
         });
+        // Crash analyzer: classify the failure right after the process
+        // dies and summarize the likely cause in the log panel.
+        invoke<CrashAnalysis>('cmd_analyze_crash', { instanceName: p.instance_id })
+          .then((a) => {
+            if (a.source === 'none') return;
+            const entry = CRASH_KEYS[a.kind] ?? CRASH_KEYS.unknown;
+            const cause = t(entry.message, { culprit: a.culprit ?? '—' });
+            addLog({
+              level: 'warn',
+              source: 'launch',
+              message: t('diag.crash_summary', { cause }),
+            });
+          })
+          .catch(() => { /* analysis is best-effort */ });
       }
     }));
 

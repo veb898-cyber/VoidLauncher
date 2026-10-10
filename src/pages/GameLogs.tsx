@@ -2,9 +2,11 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { AlertTriangle, HelpCircle, XCircle, FileText, Copy } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
 import { addToast } from '../components/ui/Toast';
+import { CRASH_KEYS, VERDICT_KEYS, type CrashAnalysis } from '../lib/diagnostics';
 import {
   LogToolbar, allLevelsOn, toLevelFilter,
   type LevelFilterState, type LogLevelFilter,
@@ -69,6 +71,10 @@ export function GameLogs() {
   const [runsOpen, setRunsOpen] = useState(false);
   const [runsPos, setRunsPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const runsBtnRef = useRef<HTMLButtonElement>(null);
+
+  // Crash analysis for the instance of the shown session.
+  const [analysis, setAnalysis] = useState<{ instance: string; data: CrashAnalysis } | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
 
   // Chronological console: oldest lines at the TOP, fresh ones appended at
   // the BOTTOM (like Prism's console). The view follows the bottom while
@@ -204,6 +210,47 @@ export function GameLogs() {
   const shownSession =
     sessionsList.find((s) => s.path === selectedSessionPath) || sessionsList[0] || null;
 
+  const analyzeCrash = useCallback(async () => {
+    if (!shownSession) return;
+    const instance = shownSession.instance_name;
+    setAnalyzing(true);
+    try {
+      const data = await invoke<CrashAnalysis>('cmd_analyze_crash', { instanceName: instance });
+      if (data.source === 'none') {
+        setAnalysis(null);
+        addToast(t('game_logs.no_crash'), 'info');
+        return;
+      }
+      setAnalysis({ instance, data });
+    } catch (e) {
+      addToast(e instanceof Error ? e.message : String(e), 'error');
+    } finally {
+      setAnalyzing(false);
+    }
+  }, [shownSession, t]);
+
+  const analysisVisible =
+    analysis !== null && shownSession !== null && analysis.instance === shownSession.instance_name;
+
+  const copyAnalysis = async () => {
+    if (!analysis) return;
+    const entry = CRASH_KEYS[analysis.data.kind] ?? CRASH_KEYS.unknown;
+    const lines = [
+      t('diag.crash_heading'),
+      `${t('diag.verdict_label')}: ${VERDICT_KEYS[analysis.data.verdict] ? t(VERDICT_KEYS[analysis.data.verdict]) : analysis.data.verdict}`,
+      t(entry.message, { culprit: analysis.data.culprit ?? '—' }),
+      entry.hint ? t(entry.hint) : '',
+      analysis.data.detail,
+      analysis.data.report_path ?? '',
+    ].filter(Boolean);
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      addToast(t('common.copied'), 'success');
+    } catch {
+      addToast(t('common.copy_failed'), 'error');
+    }
+  };
+
   // Chronological order (oldest → newest): render the file as-is, the view
   // auto-scrolls to the bottom. The backend already caps the tail.
   const displayLines = useMemo(() => (content ? content.split('\n') : []), [content]);
@@ -301,6 +348,9 @@ export function GameLogs() {
         }
         actions={
           <>
+            <button className="btn btn--secondary btn--sm" onClick={analyzeCrash} disabled={!shownSession || analyzing}>
+              {analyzing ? t('game_logs.analyzing') : t('game_logs.analyze')}
+            </button>
             <button className="btn btn--secondary btn--sm" onClick={async () => {
               try {
                 await navigator.clipboard.writeText(visibleLines.join('\n'));
@@ -323,6 +373,87 @@ export function GameLogs() {
           </>
         }
       />
+
+      {/* Crash analysis panel (manual button or auto after a failed run) */}
+      {analysis && analysisVisible && (() => {
+        const a = analysis.data;
+        const entry = CRASH_KEYS[a.kind] ?? CRASH_KEYS.unknown;
+        const verdictKey = VERDICT_KEYS[a.verdict];
+        const verdictColor =
+          a.verdict === 'likely' ? 'var(--error, var(--color-danger))'
+          : a.verdict === 'possible' ? 'var(--warning, var(--color-warning))'
+          : 'var(--text-tertiary)';
+        const VerdictIcon =
+          a.verdict === 'unknown' ? HelpCircle
+          : a.verdict === 'possible' ? AlertTriangle
+          : XCircle;
+        return (
+          <div className="glass-card" style={{ padding: 'var(--space-md) var(--space-lg)', flexShrink: 0 }}>
+            <div style={{ display: 'flex', gap: 'var(--space-md)', alignItems: 'flex-start' }}>
+              <VerdictIcon size={18} color={verdictColor} style={{ flexShrink: 0, marginTop: 2 }} />
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap', marginBottom: 'var(--space-xs)' }}>
+                  <span style={{ fontWeight: 600 }}>{t('diag.crash_heading')}</span>
+                  <span style={{
+                    fontSize: 'var(--font-size-xs)', fontWeight: 600, color: verdictColor,
+                    border: `1px solid ${verdictColor}`, borderRadius: 'var(--radius-sm)',
+                    padding: '1px var(--space-sm)',
+                  }}>
+                    {verdictKey ? t(verdictKey) : a.verdict}
+                  </span>
+                  <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                    {a.source === 'crash-report' ? t('diag.source_crash_report') : t('diag.source_log')}
+                  </span>
+                </div>
+
+                <div style={{ fontSize: 'var(--font-size-sm)', marginBottom: entry.hint ? '2px' : 'var(--space-sm)' }}>
+                  {t(entry.message, { culprit: a.culprit ?? '—' })}
+                </div>
+                {entry.hint && (
+                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', marginBottom: 'var(--space-sm)' }}>
+                    {t(entry.hint)}
+                  </div>
+                )}
+
+                {a.detail && (
+                  <div style={{
+                    fontFamily: 'var(--font-mono)', fontSize: 'var(--font-size-xs)',
+                    color: 'var(--text-secondary)', background: 'var(--surface-glass)',
+                    border: '1px solid var(--surface-border)',
+                    borderRadius: 'var(--radius-sm)', padding: 'var(--space-sm)',
+                    whiteSpace: 'pre-wrap', wordBreak: 'break-word', marginBottom: 'var(--space-sm)',
+                    maxHeight: 160, overflowY: 'auto', userSelect: 'text',
+                  }}>
+                    {a.detail}
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
+                  {a.report_path && (
+                    <button className="btn btn--secondary btn--sm" onClick={async () => {
+                      try {
+                        await invoke('cmd_open_folder', { path: a.report_path });
+                      } catch (e) {
+                        addToast(e instanceof Error ? e.message : String(e), 'error');
+                      }
+                    }}>
+                      <FileText size={14} style={{ marginRight: 6 }} />
+                      {t('game_logs.open_report')}
+                    </button>
+                  )}
+                  <button className="btn btn--secondary btn--sm" onClick={copyAnalysis}>
+                    <Copy size={14} style={{ marginRight: 6 }} />
+                    {t('game_logs.copy_analysis')}
+                  </button>
+                  <button className="btn btn--ghost btn--sm" onClick={() => setAnalysis(null)}>
+                    {t('common.close')}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       <div className="log-container" ref={logContainerRef} style={{
         flex: 1,

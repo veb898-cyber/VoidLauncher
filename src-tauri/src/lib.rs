@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod content;
 mod curseforge;
+mod diagnostics;
 mod download;
 mod entry;
 mod error;
@@ -351,6 +352,8 @@ pub fn run() {
             commands::rooms::cmd_room_open_admin_console,
             commands::verify::cmd_verify_instance,
             commands::verify::cmd_repair_instance,
+            commands::diagnostics::cmd_run_diagnostics,
+            commands::diagnostics::cmd_analyze_crash,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {

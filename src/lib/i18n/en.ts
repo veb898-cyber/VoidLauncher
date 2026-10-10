@@ -393,6 +393,8 @@ export const en = {
   'settings.clear_cache_success':      'Cache cleared, freed {mb} MB',
   'settings.clear_cache_error':        'Failed to clear cache: {error}',
 
+  'settings.section_diagnostics':      'Diagnostics',
+
   'settings.section_about':            'About',
   'settings.about_name':               'VoidLauncher',
   'settings.about_version':            'v{version}',
@@ -589,6 +591,11 @@ export const en = {
   'game_logs.runs':                    'Launches',
   'game_logs.open_folder':             'Open Logs Folder',
   'game_logs.active':                  'Active',
+  'game_logs.analyze':                 'Crash Analysis',
+  'game_logs.analyzing':               'Analyzing...',
+  'game_logs.no_crash':                'No crash files found for this run',
+  'game_logs.open_report':             'Open Crash Report',
+  'game_logs.copy_analysis':           'Copy Analysis',
 
   // ── Loader Install ───────────────────────────────────────────
   'loader_install.title':              '{loader} Not Installed',
@@ -791,6 +798,86 @@ export const en = {
   'pack.stage_applying':               'Applying changes...',
   'pack.stage_repairing':              'Restoring files...',
   'pack.stage_done':                   'Done',
+
+  // ── Friendly error messages ─────────────────────────────────
+  'errors.network':                    'Network unavailable — check your internet connection or proxy settings',
+  'errors.access':                     'Access denied — a file or folder is locked by another program',
+  'errors.disk':                       'Not enough disk space on the drive',
+  'errors.main_class':                 'The game did not start: main class not found (broken installation)',
+  'errors.java_missing':               'Java is missing or unusable — check the Java settings',
+  'errors.already_running':            'The game is already running',
+
+  // ── Diagnostics ─────────────────────────────────────────────
+  'diag.desc':                         'Checks your system, network and the selected instance for common problems. Nothing is changed or downloaded.',
+  'diag.run':                          'Run Diagnostics',
+  'diag.running':                      'Running...',
+  'diag.instance_scope':               'Instance: {name}',
+  'diag.no_instance':                  'Select an instance to also check its files and Java',
+
+  'diag.check_os':                     'Operating System',
+  'diag.check_cpu':                    'Processor',
+  'diag.check_ram':                    'Memory',
+  'diag.check_gpu':                    'Graphics',
+  'diag.check_disk':                   'Free Disk Space',
+  'diag.check_java':                   'Java Versions',
+  'diag.check_network':                'Download Services',
+  'diag.check_launcher':               'Launcher Version',
+  'diag.check_instance':               'Instance',
+  'diag.check_files':                  'Instance Files',
+  'diag.files_breakdown':              'Files breakdown',
+  'diag.issues_heading':               'Detected problems',
+  'diag.no_issues':                    'No problems detected',
+
+  'diag.issue_disk_free':              'Only {free} GB of free disk space left',
+  'diag.issue_memory':                 'Allocated memory ({alloc} MB) exceeds system memory ({total} MB)',
+  'diag.issue_loader_missing':         'Mod loader {loader} is not installed for this instance',
+  'diag.issue_java_mismatch':          'Java {actual} is selected, but the game needs Java {required}',
+  'diag.issue_java_unusable':          'Configured Java is not working: {path}',
+  'diag.issue_java_missing':           'Java {required} is not installed',
+  'diag.issue_files':                  '{n} launcher files are missing or damaged',
+  'diag.issue_content':                '{n} mods or pack files are missing or damaged',
+  'diag.issue_network':                'Unreachable services: {failed}',
+
+  'diag.fix_disk_free':                'Free up disk space or change the game drive in settings.',
+  'diag.fix_memory':                   'Lower the memory allocation in launcher settings.',
+  'diag.fix_loader':                   'Install the loader from the instance page.',
+  'diag.fix_java_mismatch':            'Select the required Java version in settings.',
+  'diag.fix_java_unusable':            'Re-select or reinstall Java in settings.',
+  'diag.fix_java_missing':             'Install the required Java in settings.',
+  'diag.fix_files':                    'Use “Verify” on the instance page to restore files.',
+  'diag.fix_content':                  'Use “Verify” on the instance page, then reinstall missing mods.',
+  'diag.fix_network':                  'Check your internet connection or proxy settings.',
+
+  'diag.verdict_label':                'Verdict',
+  'diag.verdict_likely':               'Likely cause',
+  'diag.verdict_possible':             'Possible cause',
+  'diag.verdict_unknown':              'Cause unknown',
+
+  'diag.crash_heading':                'Crash Analysis',
+  'diag.crash_summary':                'Crash analysis: {cause}',
+  'diag.source_crash_report':          'from crash report',
+  'diag.source_log':                   'from game log',
+
+  'diag.crash_oom':                    'Out of memory — the game or a mod used all allocated RAM',
+  'diag.crash_java_version':           'Java version mismatch with the game',
+  'diag.crash_jvm_args':               'Invalid JVM arguments',
+  'diag.crash_launch_config':          'Invalid launch configuration',
+  'diag.crash_mod_crash':              'A mod crashed the game: {culprit}',
+  'diag.crash_missing_dependency':     'Missing mod dependency: {culprit}',
+  'diag.crash_missing_class':          'Missing class or broken mod file: {culprit}',
+  'diag.crash_mod_conflict':           'Mod conflict: {culprit}',
+  'diag.crash_graphics':               'Graphics driver problem (OpenGL/rendering)',
+  'diag.crash_unknown':                'The game crashed, but the exact cause could not be determined',
+
+  'diag.crash_hint_oom':               'Increase memory in settings or remove heavy mods.',
+  'diag.crash_hint_java':              'Install the Java version required by this game version.',
+  'diag.crash_hint_jvm':               'Reset custom JVM arguments in settings.',
+  'diag.crash_hint_launch':            'Recreate the instance or verify its files.',
+  'diag.crash_hint_mod':               'Update or remove the culprit mod.',
+  'diag.crash_hint_deps':              'Install the missing dependency or reinstall the mod.',
+  'diag.crash_hint_conflict':          'Remove one of the conflicting mods.',
+  'diag.crash_hint_graphics':          'Update your graphics driver.',
+  'diag.crash_hint_unknown':           'Read the crash report and the latest game log.',
 } as const;
 
 export type MessageKey = keyof typeof en;

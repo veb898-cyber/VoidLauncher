@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { logUiMessage } from '../lib/uiLog';
+import { t } from '../lib/i18n';
+import { friendlyErrorMessage } from '../lib/errors';
 import type { LoaderCheckResult } from '../components/launch/LoaderInstallModal';
 
 export interface LoaderLibrary {
@@ -83,9 +85,9 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       const instances = await invoke<Instance[]>('cmd_list_instances');
       set({ instances, isLoading: false });
     } catch (e: any) {
-      const msg = e.toString();
+      const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);
-      set({ error: msg, isLoading: false });
+      set({ error: msg });
     }
   },
 
@@ -146,7 +148,7 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       reportLaunchStatus(result);
       set({ isLaunching: false, launchStatus: result });
     } catch (e: any) {
-      const msg = e.toString();
+      const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);
       set({ isLaunching: false, launchStatus: null, error: msg });
     }
@@ -167,7 +169,7 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       set({ isLoading: false, launchStatus: null });
       return versionId;
     } catch (e: any) {
-      const msg = e.toString();
+      const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);
       set({ error: msg, isLoading: false, launchStatus: null });
       throw e;
