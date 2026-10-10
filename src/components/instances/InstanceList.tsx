@@ -188,14 +188,13 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
         )}
       </div>
 
-      {/* Context Menu — portaled to <body> so its backdrop root is the
-          document: the glass scrim blurs wallpaper, the instance list and
-          the right content pane alike (same reason CustomSelect portals). */}
+      {/* Context Menu — portaled to <body> so the menu and its scrim are
+      viewport-anchored (same reason CustomSelect portals). The scrim only
+      dims the page behind the menu — it never blurs (owner directive). */}
       {contextMenu && createPortal(
         <>
-          {/* Full-viewport glass scrim: blurs + dims everything beneath the
-              menu so its text always reads over icons, tables and
-              wallpapers. Clicking it closes the menu. */}
+          {/* Full-viewport scrim: light dim so menu text reads over icons,
+              tables and wallpapers. Clicking it closes the menu. */}
           <div className="ctx-menu-scrim" onMouseDown={() => setContextMenu(null)} />
           <div
             className="ctx-menu"

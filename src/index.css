@@ -3242,9 +3242,9 @@ input[type="range"]:active::-moz-range-thumb {
   to { opacity: 1; transform: scale(1) translateY(0); }
 }
 /* Full-viewport scrim behind the context menu. Invisible in base themes
-   (the menu is opaque there); the liquid-glass theme turns it into a
-   document-wide frosted layer so the menu reads over any content. Sits
-   below the menu (2000 / lg 2100) but above page content. */
+   (the menu is opaque there); the liquid-glass theme dims the page behind
+   the menu with a translucent fill (never a blur — see the lg rule below).
+   Sits below the menu (2000 / lg 2100) but above page content. */
 .ctx-menu-scrim {
   position: fixed;
   inset: 0;
@@ -3793,10 +3793,10 @@ input[type="range"]:active::-moz-range-thumb {
       backdrop-filter: none !important;
       -webkit-backdrop-filter: none !important;
     }
-    /* Without blur the scrim leans on opacity alone for the frosted
-       effect: darken more so menu text still separates from the page. */
+    /* Scrim never blurs (owner directive); tint stays identical in the
+       fallback so reduced-transparency users see the same page. */
     [data-theme='lg'] .ctx-menu-scrim {
-      background: rgba(6, 8, 14, 0.55);
+      background: rgba(6, 8, 14, 0.30);
     }
     /* Catalog glass tiles fall back to solid fills (no blur). */
     [data-theme='lg'] .content-catalog .content-list-row {
@@ -3832,9 +3832,10 @@ input[type="range"]:active::-moz-range-thumb {
       backdrop-filter: none !important;
       -webkit-backdrop-filter: none !important;
     }
-    /* Same as the reduced-transparency case: no blur → rely on opacity. */
+    /* Scrim never blurs (owner directive); tint stays identical in the
+       fallback so no-backdrop-filter users see the same page. */
     [data-theme='lg'] .ctx-menu-scrim {
-      background: rgba(6, 8, 14, 0.55);
+      background: rgba(6, 8, 14, 0.30);
     }
     /* Catalog glass tiles fall back to solid fills (no blur). */
     [data-theme='lg'] .content-catalog .content-list-row {
@@ -4126,14 +4127,12 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
   z-index: var(--z-context-menu);
 }
 
-/* Liquid-glass scrim: a light frost over the whole viewport behind the
-   menu. The translucent fill dims sharp content (icons, tables) that a
-   backdrop-filter alone may not fully smother, while the blur turns the
-   wallpaper and page into frosted glass — so menu text always reads. */
+/* Liquid-glass scrim: a light dim over the whole viewport behind the menu so
+   its text reads over any content. Deliberately NO backdrop blur — per the
+   owner, opening the instance context menu must not blur the page behind it;
+   only a translucent fill (the menu panel itself keeps its own glass). */
 [data-theme='lg'] .ctx-menu-scrim {
   background: rgba(6, 8, 14, 0.30);
-  backdrop-filter: blur(5px) saturate(1.05);
-  -webkit-backdrop-filter: blur(5px) saturate(1.05);
 }
 
 [data-theme='lg'] .toast-container {

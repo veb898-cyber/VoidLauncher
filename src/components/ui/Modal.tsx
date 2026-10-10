@@ -1,4 +1,5 @@
 import { type ReactNode, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 
 interface ModalProps {
   open: boolean;
@@ -76,7 +77,11 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare, 
 
   if (!open) return null;
 
-  return (
+  // Portaled to <body>: any ancestor with backdrop-filter/transform/filter
+  // (e.g. the instance list pane in the liquid-glass theme) would otherwise
+  // become the containing block for this fixed-position overlay and trap the
+  // dialog inside that pane instead of centering it on the window.
+  return createPortal(
     <div
       className={bare ? 'modal-overlay modal-overlay--bare' : 'modal-overlay'}
       onClick={onClose}
@@ -99,6 +104,7 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare, 
         <div className="modal__body">{children}</div>
         {footer && <div className="modal__footer">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
