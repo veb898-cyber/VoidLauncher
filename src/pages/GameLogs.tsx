@@ -2,10 +2,11 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { AlertTriangle, HelpCircle, XCircle, FileText, Copy } from 'lucide-react';
+import { AlertTriangle, HelpCircle, XCircle, FileText, Copy, FileSearch, FolderOpen, Loader2 } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
 import { addToast } from '../components/ui/Toast';
+import { Tooltip } from '../components/ui/Tooltip';
 import { CRASH_KEYS, VERDICT_KEYS, type CrashAnalysis } from '../lib/diagnostics';
 import {
   LogToolbar, allLevelsOn, toLevelFilter,
@@ -306,12 +307,6 @@ export function GameLogs() {
             <span className="game-logs-picker-trigger-instance">
               {shownSession ? shownSession.instance_name : ''}
             </span>
-            <span className="game-logs-picker-trigger-time">
-              {shownSession ? shownSession.started_at.slice(5, 16) : ''}
-            </span>
-            <span className="game-logs-picker-trigger-size">
-              {shownSession ? formatSize(shownSession.size_bytes) : ''}
-            </span>
             <svg className={`game-logs-picker-chevron${runsOpen ? ' game-logs-picker-chevron--open' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="6 9 12 15 18 9" />
             </svg>
@@ -354,28 +349,53 @@ export function GameLogs() {
         }
         actions={
           <>
-            <button className="btn btn--secondary btn--sm" onClick={analyzeCrash} disabled={!shownSession || analyzing}>
-              {analyzing ? t('game_logs.analyzing') : t('game_logs.analyze')}
-            </button>
-            <button className="btn btn--secondary btn--sm" onClick={async () => {
-              try {
-                await navigator.clipboard.writeText(visibleLines.join('\n'));
-                addToast(t('common.copied'), 'success');
-              } catch {
-                addToast(t('common.copy_failed'), 'error');
-              }
-            }}>
-              {t('common.copy_all')}
-            </button>
-            <button className="btn btn--secondary btn--sm" onClick={async () => {
-              try {
-                await invoke('cmd_open_game_logs_root');
-              } catch (e: any) {
-                console.error(String(e));
-              }
-            }}>
-              {t('game_logs.open_folder')}
-            </button>
+            {/* Icon-only action cluster: with the Russian labels the three
+                text buttons + search + filters + run picker overflow 1200px
+                and wrapped to a second row. Icons keep it one row; the label
+                lives in a tooltip + aria-label. */}
+            <Tooltip content={analyzing ? t('game_logs.analyzing') : t('game_logs.analyze')} side="bottom">
+              <button
+                className="btn btn--secondary btn--sm"
+                onClick={analyzeCrash}
+                disabled={!shownSession || analyzing}
+                aria-label={t('game_logs.analyze')}
+              >
+                {analyzing
+                  ? <Loader2 size={15} style={{ animation: 'spin 1s linear infinite' }} />
+                  : <FileSearch size={15} />}
+              </button>
+            </Tooltip>
+            <Tooltip content={t('common.copy_all')} side="bottom">
+              <button
+                className="btn btn--secondary btn--sm"
+                aria-label={t('common.copy_all')}
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(visibleLines.join('\n'));
+                    addToast(t('common.copied'), 'success');
+                  } catch {
+                    addToast(t('common.copy_failed'), 'error');
+                  }
+                }}
+              >
+                <Copy size={15} />
+              </button>
+            </Tooltip>
+            <Tooltip content={t('game_logs.open_folder')} side="bottom">
+              <button
+                className="btn btn--secondary btn--sm"
+                aria-label={t('game_logs.open_folder')}
+                onClick={async () => {
+                  try {
+                    await invoke('cmd_open_game_logs_root');
+                  } catch (e: any) {
+                    console.error(String(e));
+                  }
+                }}
+              >
+                <FolderOpen size={15} />
+              </button>
+            </Tooltip>
           </>
         }
       />

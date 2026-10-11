@@ -2493,7 +2493,10 @@ select option {
   display: flex;
   align-items: center;
   gap: var(--space-sm);
-  flex-wrap: wrap;
+  /* Never wrap: two rows of toolbar is what the owner called ugly. At the
+     900px minimum window the row still fits — search may shrink 220→130 and
+     the run picker 210→140 (their min-widths), which covers the deficit. */
+  flex-wrap: nowrap;
   flex-shrink: 0;
 }
 
@@ -2504,12 +2507,18 @@ select option {
 
 /* Action cluster (copy / open folder / crash analysis): one non-shrinking
    flex unit so the buttons wrap as a block instead of splitting one lonely
-   button onto its own line. */
+   button onto its own line. Tight horizontal padding: the cluster is icons
+   now, and the saved width keeps it on one row with search + filters +
+   run picker at 1200px. */
 .log-toolbar__actions {
   display: flex;
   align-items: center;
   gap: var(--space-sm);
   flex-shrink: 0;
+}
+.log-toolbar__actions .btn--sm {
+  padding-left: var(--space-md);
+  padding-right: var(--space-md);
 }
 
 /* Search keeps its own magnifier/clear affordances so the terminal toolbar
@@ -2922,15 +2931,16 @@ input[type="range"]:active::-moz-range-thumb {
   cursor: pointer;
   outline: none;
   transition: border-color 0.2s ease, background 0.2s ease;
-  /* Fixed width on purpose: the label shows the instance name, the start time
-     and a live-growing file size. A content-sized button changed width several
-     times per second, which reflowed the whole toolbar — the search box and the
-     level filters visibly jumped whenever a different run was picked.
-     Trimmed 240→210 so the whole toolbar fits one row at the default 1200px
-     window (see .log-search note). */
-  flex: 0 0 210px;
+  /* Fixed width on purpose: the instance name's length varies between runs,
+     so a content-sized button reflowed the whole toolbar (the search box and
+     the level filters visibly jumped) whenever a different run was picked.
+     210px shows most names in full and keeps the toolbar on one row at the
+     default 1200px window (see .log-search note); may shrink on narrower
+     windows but never below 140px. Time and size live in the dropdown rows
+     only — with them in the trigger the name got squeezed to one letter. */
+  flex: 0 1 210px;
   width: 210px;
-  min-width: 0;
+  min-width: 140px;
   text-align: left;
 }
 
@@ -2951,18 +2961,6 @@ input[type="range"]:active::-moz-range-thumb {
   font-family: var(--font-ui);
   flex: 1;
   min-width: 0;
-}
-
-.game-logs-picker-trigger-time {
-  color: var(--text-secondary);
-  white-space: nowrap;
-  font-size: var(--font-size-xs);
-}
-
-.game-logs-picker-trigger-size {
-  color: var(--text-tertiary);
-  white-space: nowrap;
-  font-size: var(--font-size-xs);
 }
 
 .game-logs-picker-dot {
@@ -3266,14 +3264,19 @@ input[type="range"]:active::-moz-range-thumb {
   padding: var(--space-md);
 }
 
-/* Bare variant: the 2-item icon menu (change banner / change icon) shows as
-   free-floating buttons with no panel around them — a frame around two rows
-   read as a dialog for a trivial choice. The rows carry their own material. */
+/* Bare variant: the 2-item icon menu (change banner / change icon). The two
+   rejected extremes: a bordered panel read as a dialog for a trivial choice,
+   free fully-rounded buttons read as two disconnected pills. This sits in
+   between — one soft elevated surface with no border line, rows rounded like
+   context-menu items (ctx-menu pattern). */
 .floating-menu--bare {
-  background: transparent;
+  background: var(--bg-elevated);
   border: none;
-  box-shadow: none;
-  padding: 0;
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-xs);
+}
+.floating-menu--bare .btn {
+  border-radius: calc(var(--radius-md) - 4px);
 }
 
 /* Instance card context menu (right click) */
@@ -4357,15 +4360,27 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
     background: linear-gradient(var(--lg-tint-hover), var(--lg-tint-hover)), var(--lg-fill);
   }
 
-/* Bare icon menu on glass: the two rows already are glass (rule above), so
-   the panel material is dropped to avoid double-framing them. Equal
-   specificity to the Group D rule, placed later so it wins. */
+/* Bare icon menu on glass: the panel keeps the glass material (Group D rule
+   above) so the menu still reads as one surface, only the border line is
+   dropped. The rows shed their own glass — each carrying a full glass pill
+   of its own, the pair read as two separate buttons (owner rejected);
+   rows tint on hover instead. Equal specificity to the row rules, placed
+   later so it wins. */
   [data-theme='lg'] .floating-menu--bare {
-    background: transparent;
     border-color: transparent;
-    box-shadow: none;
+    box-shadow: var(--lg-inner-depth), var(--lg-depth-shadow);
+  }
+
+  [data-theme='lg'] .floating-menu--bare .btn--ghost {
+    background: transparent;
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
+    box-shadow: none;
+  }
+
+  [data-theme='lg'] .floating-menu--bare .btn--ghost:hover {
+    background: var(--lg-tint-hover);
+    box-shadow: none;
   }
 
 /* Cards named glass: the Rooms panels, the Accounts card. Page-level, so

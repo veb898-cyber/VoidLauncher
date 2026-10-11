@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Copy, Trash2 } from 'lucide-react';
 import { useLogStore } from '../stores/logStore';
 import { useT } from '../lib/i18n';
 import { addToast } from '../components/ui/Toast';
+import { Tooltip } from '../components/ui/Tooltip';
 import {
   LogToolbar, allLevelsOn, toLevelFilter,
   type LevelFilterState, type LogLevelFilter,
@@ -53,20 +55,33 @@ export function LauncherLogs() {
         onToggleLevel={toggleLevel}
         actions={
           <>
-            <button className="btn btn--secondary btn--sm" onClick={async () => {
-              const text = visibleLogs.map(l => `[${l.timestamp}] [${l.source}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
-              try {
-                await navigator.clipboard.writeText(text);
-                addToast(t('common.copied'), 'success');
-              } catch {
-                addToast(t('common.copy_failed'), 'error');
-              }
-            }}>
-              {t('common.copy_all')}
-            </button>
-            <button className="btn btn--secondary btn--sm" onClick={clearLogs}>
-              {t('common.clear')}
-            </button>
+            {/* Icon-only for parity with the game-logs tab toolbar. */}
+            <Tooltip content={t('common.copy_all')} side="bottom">
+              <button
+                className="btn btn--secondary btn--sm"
+                aria-label={t('common.copy_all')}
+                onClick={async () => {
+                  const text = visibleLogs.map(l => `[${l.timestamp}] [${l.source}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
+                  try {
+                    await navigator.clipboard.writeText(text);
+                    addToast(t('common.copied'), 'success');
+                  } catch {
+                    addToast(t('common.copy_failed'), 'error');
+                  }
+                }}
+              >
+                <Copy size={15} />
+              </button>
+            </Tooltip>
+            <Tooltip content={t('common.clear')} side="bottom">
+              <button
+                className="btn btn--secondary btn--sm"
+                aria-label={t('common.clear')}
+                onClick={clearLogs}
+              >
+                <Trash2 size={15} />
+              </button>
+            </Tooltip>
           </>
         }
       />
