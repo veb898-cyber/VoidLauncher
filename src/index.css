@@ -525,6 +525,7 @@ a {
   height: 20px;
   display: block;
   flex-shrink: 0;
+  transform: translateY(-2px);
 }
 
 .titlebar__controls {
