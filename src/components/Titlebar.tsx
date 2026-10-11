@@ -1,5 +1,6 @@
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { t } from '../lib/i18n';
+import slimeIcon from '../assets/slime.png';
 
 export function Titlebar() {
   const appWindow = getCurrentWindow();
@@ -7,17 +8,7 @@ export function Titlebar() {
   return (
     <div className="titlebar">
       <div className="titlebar__logo">
-        <svg viewBox="0 0 24 24" fill="none" stroke="url(#grad)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-          <defs>
-            <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor="hsl(265, 100%, 65%)" />
-              <stop offset="100%" stopColor="hsl(200, 100%, 60%)" />
-            </linearGradient>
-          </defs>
-          <path d="M12 2L2 7l10 5 10-5-10-5z" />
-          <path d="M2 17l10 5 10-5" />
-          <path d="M2 12l10 5 10-5" />
-        </svg>
+        <img src={slimeIcon} alt="" className="titlebar__logo-icon" draggable={false} />
         {t('titlebar.logo')}
       </div>
 

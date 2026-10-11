@@ -520,9 +520,11 @@ a {
   background-clip: text;
 }
 
-.titlebar__logo svg {
-  width: 18px;
-  height: 18px;
+.titlebar__logo-icon {
+  width: 20px;
+  height: 20px;
+  display: block;
+  flex-shrink: 0;
 }
 
 .titlebar__controls {
