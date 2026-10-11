@@ -74,8 +74,15 @@ export function LogToolbar({ query, onQueryChange, levels, onToggleLevel, leadin
 
       {leading}
 
-      {actions && <div className="log-toolbar__spacer" />}
-      {actions}
+      {/* One flex unit: with three sibling buttons the row broke mid-group on
+          medium windows (the last button wrapped alone). Grouped, the whole
+          action cluster wraps together if space runs out. */}
+      {actions && (
+        <>
+          <div className="log-toolbar__spacer" />
+          <div className="log-toolbar__actions">{actions}</div>
+        </>
+      )}
     </div>
   );
 }

@@ -7,10 +7,12 @@
 //! the usual launch blockers (missing loader, Java mismatch, over-allocated
 //! memory, broken launcher files, invalid content archives).
 //!
-//! `analyze_crash` reads the newest crash report (or the tail of
-//! `latest.log` when there is none) and classifies the failure into a
-//! stable kind with a confidence verdict, so the UI can show a likely cause
-//! instead of a raw log.
+//! `analyze_crash` analyzes one specific run (identified by its launcher
+//! session log): reads the crash report written inside that run's time
+//! window (or the tail of the run's own log when there is none) and
+//! classifies the failure into a stable kind with a confidence verdict, so
+//! the UI can show a likely cause instead of a raw log. A clean exit with
+//! no artifacts reports `source: "clean"` instead of a false "crash".
 
 use crate::config::AppConfig;
 use crate::instances::{self, LoaderType};
@@ -747,7 +749,13 @@ fn read_tail(path: &Path, cap: u64) -> Option<String> {
 }
 
 /// Newest crash report in the instance (by mtime), `.txt` or `.txt.gz`.
-fn newest_crash_report(crash_dir: &Path) -> Option<PathBuf> {
+/// When `window` is given, only reports whose mtime falls inside it are
+/// considered — the window bounds the analysis to one specific run, so an
+/// old report from days ago can't be attributed to a fresh launch.
+fn newest_crash_report(
+    crash_dir: &Path,
+    window: Option<(std::time::SystemTime, std::time::SystemTime)>,
+) -> Option<PathBuf> {
     let entries = std::fs::read_dir(crash_dir).ok()?;
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in entries.flatten() {
@@ -757,6 +765,11 @@ fn newest_crash_report(crash_dir: &Path) -> Option<PathBuf> {
             continue;
         }
         let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        if let Some((from, to)) = window {
+            if mtime < from || mtime > to {
+                continue;
+            }
+        }
         if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
             best = Some((mtime, path));
         }
@@ -764,15 +777,70 @@ fn newest_crash_report(crash_dir: &Path) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// Analyze the most recent crash of an instance: newest crash report
-/// first, then the tail of `latest.log`. Classifies the failure into a
-/// stable kind + confidence so the UI can show a likely cause.
-pub fn analyze_crash(config: &AppConfig, instance_name: &str) -> Result<CrashAnalysis, String> {
+/// The exit line the last pipe-reader appends to the session log:
+/// "[INFO] [launch] Game exited with code N". Last occurrence wins (the
+/// final line is chronologically last).
+fn exit_code_from_session_log(text: &str) -> Option<i32> {
+    const NEEDLE: &str = "Game exited with code ";
+    let mut found = None;
+    let mut rest = text;
+    while let Some(pos) = rest.find(NEEDLE) {
+        let after = &rest[pos + NEEDLE.len()..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(code) = digits.parse::<i32>() {
+            found = Some(code);
+        }
+        rest = after;
+    }
+    found
+}
+
+/// Analyze a specific run of an instance. The run is identified by its
+/// launcher session log (`{safe}_{YYYYMMDD}_{HHMMSS}.log`): the filename
+/// carries the start time, the file mtime the end. Crash reports are only
+/// considered inside that window — otherwise a normal close after an old
+/// crash would surface a stale report as "cause unknown". The run's own
+/// unified log is classified before falling back to `latest.log` (which is
+/// only trustworthy when it belongs to the same run).
+///
+/// `session_path: None` resolves to the newest session of the instance
+/// (used by the auto-analysis right after exit, when the current-log path
+/// is already cleared).
+pub fn analyze_crash(
+    config: &AppConfig,
+    instance_name: &str,
+    session_path: Option<&str>,
+) -> Result<CrashAnalysis, String> {
     let instance =
         instances::get_instance(&config.instances_dir(), instance_name).map_err(|e| e.to_string())?;
     let mc_dir = instance.minecraft_dir(&config.instances_dir());
 
-    let report_path = newest_crash_report(&mc_dir.join("crash-reports"));
+    // Bound the analysis to one run when we can identify it.
+    let owned = match session_path {
+        Some(p) => PathBuf::from(p),
+        None => crate::game_logs::newest_session_for_instance(&config.data_dir, instance_name)
+            .unwrap_or_default(),
+    };
+    let session: Option<&Path> = if owned.as_os_str().is_empty() {
+        None
+    } else {
+        Some(&owned)
+    };
+
+    // Window for crash reports: [start − slack, end + slack]. The slack
+    // covers clock skew between the filename timestamp and the report's
+    // mtime, and reports written a moment after the session file's last
+    // append. Without a parseable start we still cap by the session mtime.
+    let window: Option<(std::time::SystemTime, std::time::SystemTime)> = session.and_then(|s| {
+        let mtime = std::fs::metadata(s).ok().and_then(|m| m.modified().ok())?;
+        let start = crate::game_logs::session_started_at(s)
+            .map(|t| t - std::time::Duration::from_secs(5))
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let end = mtime + std::time::Duration::from_secs(5);
+        Some((start, end))
+    });
+
+    let report_path = newest_crash_report(&mc_dir.join("crash-reports"), window);
 
     if let Some(path) = &report_path {
         if let Some(text) = read_report(path) {
@@ -799,18 +867,65 @@ pub fn analyze_crash(config: &AppConfig, instance_name: &str) -> Result<CrashAna
         }
     }
 
-    // No crash report — the log tail may still say what happened
-    // (e.g. early startup failures never reach a crash report).
-    if let Some(text) = read_tail(&mc_dir.join("logs").join("latest.log"), MAX_LOG_TAIL_BYTES) {
-        if let Some((rule, detail, culprit)) = classify_crash(&text) {
+    // No crash report for this run — classify the run's own unified log
+    // (full stdout/stderr stream; catches early startup failures that never
+    // reach a crash report).
+    let session_text = session.and_then(|s| read_tail(s, MAX_LOG_TAIL_BYTES));
+    if let Some(text) = &session_text {
+        if let Some((rule, detail, culprit)) = classify_crash(text) {
             return Ok(CrashAnalysis {
                 verdict: rule.verdict.to_string(),
                 kind: rule.kind.to_string(),
                 culprit,
                 detail,
-                source: "latest-log".into(),
+                source: "session-log".into(),
                 report_path: None,
             });
+        }
+    }
+
+    // The run ended with a clean exit code and left no crash artifacts in
+    // its window: say so plainly instead of "the game crashed" — the old
+    // behavior blamed a leftover report from an earlier run.
+    if let Some(text) = &session_text {
+        if exit_code_from_session_log(text) == Some(0) {
+            return Ok(CrashAnalysis {
+                verdict: "unknown".into(),
+                kind: "clean".into(),
+                culprit: None,
+                detail: String::new(),
+                source: "clean".into(),
+                report_path: None,
+            });
+        }
+    }
+
+    // Last resort: `latest.log` tail — only when it plausibly belongs to
+    // the analyzed run (mtime inside the window), else it's a newer run's
+    // file and would mislead.
+    let latest = mc_dir.join("logs").join("latest.log");
+    let latest_is_current = window
+        .map(|(from, to)| {
+            std::fs::metadata(&latest)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|m| m >= from && m <= to)
+                .unwrap_or(false)
+        })
+        // No window (foreign session name): keep the legacy behavior.
+        .unwrap_or(true);
+    if latest_is_current {
+        if let Some(text) = read_tail(&latest, MAX_LOG_TAIL_BYTES) {
+            if let Some((rule, detail, culprit)) = classify_crash(&text) {
+                return Ok(CrashAnalysis {
+                    verdict: rule.verdict.to_string(),
+                    kind: rule.kind.to_string(),
+                    culprit,
+                    detail,
+                    source: "latest-log".into(),
+                    report_path: None,
+                });
+            }
         }
     }
 
@@ -915,10 +1030,36 @@ mod tests {
     fn instance_without_crash_files_reports_none() {
         let dir = std::env::temp_dir().join(format!("vl_diag_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("crash-reports")).unwrap();
-        assert!(newest_crash_report(&dir.join("crash-reports")).is_none());
+        assert!(newest_crash_report(&dir.join("crash-reports"), None).is_none());
         std::fs::write(dir.join("crash-reports").join("crash-2026-01-01_00.00.00.txt"), b"boom").unwrap();
-        assert!(newest_crash_report(&dir.join("crash-reports")).is_some());
+        assert!(newest_crash_report(&dir.join("crash-reports"), None).is_some());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn crash_report_window_excludes_files_outside_the_run() {
+        let dir = std::env::temp_dir().join(format!("vl_diag_win_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("crash-reports")).unwrap();
+        let old = dir.join("crash-reports").join("crash-2020-01-01_00.00.00.txt");
+        std::fs::write(&old, b"old boom").unwrap();
+        // Window strictly after the file's mtime: the stale report must not
+        // be attributed to the fresh run.
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert!(newest_crash_report(&dir.join("crash-reports"), Some((after, after))).is_none());
+        // Unfiltered lookup still finds it.
+        assert!(newest_crash_report(&dir.join("crash-reports"), None).is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exit_code_is_parsed_from_the_final_session_line() {
+        let text = "launch lines...\n[INFO] [launch] Game exited with code 1\n";
+        assert_eq!(exit_code_from_session_log(text), Some(1));
+        assert_eq!(exit_code_from_session_log("Game exited with code 0"), Some(0));
+        assert_eq!(exit_code_from_session_log("no exit line here"), None);
+        // Last occurrence wins.
+        let text = "Game exited with code 1\n...\nGame exited with code 0\n";
+        assert_eq!(exit_code_from_session_log(text), Some(0));
     }
 
     #[test]

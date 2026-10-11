@@ -146,10 +146,11 @@ export function useGameEvents() {
           message: `Minecraft exited unexpectedly with code ${p.exit_code}. Check the log panel for details.`,
         });
         // Crash analyzer: classify the failure right after the process
-        // dies and summarize the likely cause in the log panel.
+        // dies and summarize the likely cause in the log panel. The
+        // backend resolves the newest session of this instance itself.
         invoke<CrashAnalysis>('cmd_analyze_crash', { instanceName: p.instance_id })
           .then((a) => {
-            if (a.source === 'none') return;
+            if (a.source === 'none' || a.source === 'clean') return;
             const entry = CRASH_KEYS[a.kind] ?? CRASH_KEYS.unknown;
             const cause = t(entry.message, { culprit: a.culprit ?? '—' });
             addLog({

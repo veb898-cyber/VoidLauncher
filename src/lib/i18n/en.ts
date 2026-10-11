@@ -356,14 +356,10 @@ export const en = {
   'settings.wallpaper_title':          'Backdrop',
   'settings.wallpaper_desc':           'The field the glass refracts. It is visible through the title bar and the sidebar, and behind dialogs.',
   'settings.wallpaper_locked':         'Unavailable while Liquid Glass is off. Your choice is kept and comes back when you switch it on.',
-  'settings.wallpaper_none':           'None (plain gradient)',
   'settings.wallpaper_waves':          'Chromatic Waves',
   'settings.wallpaper_ribbons':        'Liquid Ribbons',
   'settings.wallpaper_mesh':           'Gradient Mesh',
   'settings.wallpaper_nebula':         'Particle Nebula',
-  'settings.lg_realistic_title':       'Realistic glass (iOS style)',
-  'settings.lg_realistic_desc':        'Panels are nearly transparent: the backdrop and content read through them, with the glass only softening what is behind - like Liquid Glass in iOS. Off by default; text can be harder to read on very bright backdrops.',
-  'settings.lg_realistic_locked':      'Unavailable while Liquid Glass is off. Your choice is kept and comes back with the mode.',
   'common.experimental':              'Experimental',
 
 

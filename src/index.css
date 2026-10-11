@@ -2502,15 +2502,27 @@ select option {
   min-width: 0;
 }
 
+/* Action cluster (copy / open folder / crash analysis): one non-shrinking
+   flex unit so the buttons wrap as a block instead of splitting one lonely
+   button onto its own line. */
+.log-toolbar__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+}
+
 /* Search keeps its own magnifier/clear affordances so the terminal toolbar
    stays one compact row instead of stacking three blocks. */
 .log-search {
   position: relative;
   /* Only ever shrinks (narrow windows); it never grows or shrinks with the
-     neighbours, so the toolbar keeps a stable layout. */
-  flex: 0 1 260px;
-  width: 260px;
-  min-width: 150px;
+     neighbours, so the toolbar keeps a stable layout. Trimmed 260→220 so
+     search + filters + run picker + the three action buttons fit one row at
+     the default 1200px window. */
+  flex: 0 1 220px;
+  width: 220px;
+  min-width: 130px;
 }
 
 .log-search__input {
@@ -2913,9 +2925,11 @@ input[type="range"]:active::-moz-range-thumb {
   /* Fixed width on purpose: the label shows the instance name, the start time
      and a live-growing file size. A content-sized button changed width several
      times per second, which reflowed the whole toolbar — the search box and the
-     level filters visibly jumped whenever a different run was picked. */
-  flex: 0 0 240px;
-  width: 240px;
+     level filters visibly jumped whenever a different run was picked.
+     Trimmed 240→210 so the whole toolbar fits one row at the default 1200px
+     window (see .log-search note). */
+  flex: 0 0 210px;
+  width: 210px;
   min-width: 0;
   text-align: left;
 }
@@ -3250,6 +3264,16 @@ input[type="range"]:active::-moz-range-thumb {
 .floating-menu--picker {
   position: absolute;
   padding: var(--space-md);
+}
+
+/* Bare variant: the 2-item icon menu (change banner / change icon) shows as
+   free-floating buttons with no panel around them — a frame around two rows
+   read as a dialog for a trivial choice. The rows carry their own material. */
+.floating-menu--bare {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
 }
 
 /* Instance card context menu (right click) */
@@ -4331,6 +4355,17 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
 
   [data-theme='lg'] .floating-menu .btn--ghost:hover {
     background: linear-gradient(var(--lg-tint-hover), var(--lg-tint-hover)), var(--lg-fill);
+  }
+
+/* Bare icon menu on glass: the two rows already are glass (rule above), so
+   the panel material is dropped to avoid double-framing them. Equal
+   specificity to the Group D rule, placed later so it wins. */
+  [data-theme='lg'] .floating-menu--bare {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 
 /* Cards named glass: the Rooms panels, the Accounts card. Page-level, so

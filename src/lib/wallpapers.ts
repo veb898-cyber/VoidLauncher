@@ -24,10 +24,9 @@
 
 const TAU = Math.PI * 2;
 
-export type WallpaperId = 'none' | 'waves' | 'ribbons' | 'mesh' | 'nebula';
+export type WallpaperId = 'waves' | 'ribbons' | 'mesh' | 'nebula';
 
 export const WALLPAPER_IDS: readonly WallpaperId[] = [
-  'none',
   'waves',
   'ribbons',
   'mesh',
@@ -35,7 +34,7 @@ export const WALLPAPER_IDS: readonly WallpaperId[] = [
 ];
 
 /** Seconds for one full cycle. Must be a whole number of texture revolutions. */
-export const WALLPAPER_PERIOD: Record<Exclude<WallpaperId, 'none'>, number> = {
+export const WALLPAPER_PERIOD: Record<WallpaperId, number> = {
   waves: 40,
   ribbons: 38,
   mesh: 38,
@@ -530,7 +529,7 @@ function createNebula(): WallpaperScene {
 
 /* -------------------------------------------------------------------- index */
 
-const FACTORIES: Record<Exclude<WallpaperId, 'none'>, () => WallpaperScene> = {
+const FACTORIES: Record<WallpaperId, () => WallpaperScene> = {
   waves: createWaves,
   ribbons: createRibbons,
   mesh: createMesh,
@@ -541,16 +540,12 @@ export function isWallpaperId(value: unknown): value is WallpaperId {
   return typeof value === 'string' && (WALLPAPER_IDS as readonly string[]).includes(value);
 }
 
-export function isAnimatedWallpaper(id: WallpaperId): id is Exclude<WallpaperId, 'none'> {
-  return id !== 'none';
-}
-
 /** One shared instance per id: the scenes hold per-instance buffers that are
  *  fully rewritten each frame, so reuse is safe and avoids rebuilding the mesh
  *  field on every wallpaper change. */
-const cache = new Map<Exclude<WallpaperId, 'none'>, WallpaperScene>();
+const cache = new Map<WallpaperId, WallpaperScene>();
 
-export function getWallpaperScene(id: Exclude<WallpaperId, 'none'>): WallpaperScene {
+export function getWallpaperScene(id: WallpaperId): WallpaperScene {
   let scene = cache.get(id);
   if (!scene) {
     scene = FACTORIES[id]();

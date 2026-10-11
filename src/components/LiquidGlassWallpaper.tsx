@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import { useThemeStore } from '../stores/themeStore';
 import { useWallpaperStore } from '../stores/wallpaperStore';
 import { useFocusStore } from '../stores/focusStore';
-import { getWallpaperScene, isAnimatedWallpaper, WALLPAPER_PERIOD } from '../lib/wallpapers';
+import { getWallpaperScene, WALLPAPER_PERIOD } from '../lib/wallpapers';
 
 /**
  * Animated backdrop for the Liquid Glass appearance.
@@ -47,11 +47,11 @@ export default function LiquidGlassWallpaper() {
   const liquidGlass = useThemeStore((s) => s.liquidGlass);
   const wallpaper = useWallpaperStore((s) => s.wallpaper);
 
-  const active = liquidGlass && isAnimatedWallpaper(wallpaper);
+  const active = liquidGlass;
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !active || !isAnimatedWallpaper(wallpaper)) return;
+    if (!canvas || !active) return;
 
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;

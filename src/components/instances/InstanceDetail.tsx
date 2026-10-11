@@ -182,7 +182,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
         {showMenu && !showBannerPicker && (
           <div
             ref={menuRef}
-            className="floating-menu"
+            className="floating-menu floating-menu--bare"
             style={{ top: 52, left: 24 }}
             onClick={(e) => e.stopPropagation()}
           >

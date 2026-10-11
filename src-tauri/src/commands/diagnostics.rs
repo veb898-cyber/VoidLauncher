@@ -21,12 +21,16 @@ pub async fn cmd_run_diagnostics(
     Ok(diagnostics::run_diagnostics(config, instance_name).await)
 }
 
-/// Classify the most recent crash of an instance (crash report or log
-/// tail) into a likely cause with a confidence verdict. Read-only.
+/// Classify a specific run of an instance (crash report inside the run's
+/// time window, or the tail of the run's own session log) into a likely
+/// cause with a confidence verdict. `session_path` identifies the run; when
+/// omitted, the newest session of the instance is used (auto-analysis right
+/// after exit). Read-only.
 #[tauri::command]
 pub async fn cmd_analyze_crash(
     state: State<'_, AppState>,
     instance_name: String,
+    session_path: Option<String>,
 ) -> Result<CrashAnalysis, String> {
     super::instances::validate_instance_name(&instance_name)?;
     let config = {
@@ -34,7 +38,7 @@ pub async fn cmd_analyze_crash(
         config.clone()
     };
     tauri::async_runtime::spawn_blocking(move || {
-        diagnostics::analyze_crash(&config, &instance_name)
+        diagnostics::analyze_crash(&config, &instance_name, session_path.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?

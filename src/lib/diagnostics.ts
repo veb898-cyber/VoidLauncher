@@ -53,7 +53,11 @@ export interface CrashAnalysis {
   kind: string;
   culprit: string | null;
   detail: string;
-  source: 'crash-report' | 'latest-log' | 'none';
+  /**
+   * Where the verdict came from. `'clean'` = the analyzed run exited with
+   * code 0 and left no crash artifacts — NOT a crash at all.
+   */
+  source: 'crash-report' | 'session-log' | 'latest-log' | 'clean' | 'none';
   report_path: string | null;
 }
 

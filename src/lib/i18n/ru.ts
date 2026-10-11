@@ -360,14 +360,10 @@ export const ru: Record<string, string> = {
   'settings.wallpaper_title':          'Обои',
   'settings.wallpaper_desc':           'Подложка, которую преломляет стекло. Видна сквозь заголовок и сайдбар, а также за диалоговыми окнами.',
   'settings.wallpaper_locked':         'Недоступно, пока Liquid Glass выключен. Выбранные обои сохранятся и вернутся после включения.',
-  'settings.wallpaper_none':           'Нет (обычный градиент)',
   'settings.wallpaper_waves':          'Хроматические волны',
   'settings.wallpaper_ribbons':        'Жидкие ленты',
   'settings.wallpaper_mesh':           'Градиентная сетка',
   'settings.wallpaper_nebula':         'Туманность',
-  'settings.lg_realistic_title':       'Реалистичное стекло (как в iOS)',
-  'settings.lg_realistic_desc':        'Панели почти прозрачны: обои и содержимое читаются сквозь них — стекло лишь слегка размывает фон, как жидкое стекло в iOS. Выключено по умолчанию; на очень светлых участках обоев текст может читаться труднее.',
-  'settings.lg_realistic_locked':      'Недоступно, пока Liquid Glass выключен. Выбор сохранится и включится вместе с режимом.',
   'common.experimental':              'Экспериментально',
 
 

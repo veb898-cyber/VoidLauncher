@@ -244,7 +244,10 @@ export function Avatar({
     );
   }
 
-  const letterSvg = `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"><text x="${size / 2}" y="${size * 0.62}" text-anchor="middle" fill="%23999999" font-family="system-ui,-apple-system,sans-serif" font-weight="600" font-size="${size * 0.42}" dominant-baseline="central">${encodeURIComponent(letter)}</text></svg>`;
+  // dominant-baseline="central" puts the glyph's midline ON the y coordinate,
+  // so y = size/2 is the true vertical centre (y = 0.62·size with central
+  // baseline pushed the letter noticeably below the middle).
+  const letterSvg = `data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"><text x="${size / 2}" y="${size / 2}" text-anchor="middle" fill="%23999999" font-family="system-ui,-apple-system,sans-serif" font-weight="600" font-size="${size * 0.42}" dominant-baseline="central">${encodeURIComponent(letter)}</text></svg>`;
   return (
     <img
       src={letterSvg}

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -169,6 +169,64 @@ pub fn clear_current_log_path() {
     if let Ok(mut guard) = CURRENT_LOG_PATH.lock() {
         *guard = None;
     }
+}
+
+/// Parse the launch timestamp out of a session filename
+/// (`{safe_name}_{YYYYMMDD}_{HHMMSS}.log`) in the local zone. None when the
+/// name doesn't follow the scheme (raw tee files, hand-copied logs).
+pub fn session_started_at(path: &Path) -> Option<std::time::SystemTime> {
+    use chrono::TimeZone;
+    let stem = path.file_stem()?.to_str()?;
+    let mut parts = stem.rsplitn(3, '_');
+    let hms = parts.next()?;
+    let ymd = parts.next()?;
+    if ymd.len() != 8 || hms.len() != 6 {
+        return None;
+    }
+    let combined = format!("{}{}", ymd, hms);
+    let naive = chrono::NaiveDateTime::parse_from_str(&combined, "%Y%m%d%H%M%S").ok()?;
+    let local = chrono::Local.from_local_datetime(&naive).earliest()?;
+    Some(local.into())
+}
+
+/// Newest session log of a specific instance (by mtime). Used by the crash
+/// analyzer when it has no explicit session path — the auto-analysis after
+/// exit runs after `CURRENT_LOG_PATH` was already cleared, so the "current"
+/// path is gone by then.
+pub fn newest_session_for_instance(
+    data_dir: &PathBuf,
+    instance_name: &str,
+) -> Option<PathBuf> {
+    let dir = data_dir.join("logs").join("game");
+    let safe = sanitize_instance_name(instance_name);
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("log") {
+            continue;
+        }
+        // Skip the raw stdout/stderr tee copies (stem ends with .stdout /
+        // .stderr), mirroring the session-list filter.
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.ends_with(".stdout") || stem.ends_with(".stderr") {
+            continue;
+        }
+        // The name recovers the instance the same way the session list does:
+        // rsplit off the two timestamp segments, compare the remainder.
+        if stem.rsplitn(3, '_').last() != Some(safe.as_str()) {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Create a new game log file for this session and return its path
@@ -444,6 +502,35 @@ mod tests {
         assert_eq!(sanitize_instance_name("Better MC [FORGE] BMC4"), "Better_MC__FORGE__BMC4");
 
         clear_current_log_path();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The session filename carries the launch timestamp the crash
+    /// analyzer needs to bound its report window to one run.
+    #[test]
+    fn session_filename_parses_start_time_and_finds_newest_run() {
+        let dir = std::env::temp_dir().join(format!("vl_gamelogs_started_{}", std::process::id()));
+        let logs_dir = dir.join("logs").join("game");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        let old = logs_dir.join("Inst_20260101_120000.log");
+        let new = logs_dir.join("Inst_20260102_090000.log");
+        std::fs::write(&old, "a\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&new, "b\n").unwrap();
+        // Foreign names must not parse or be picked.
+        std::fs::write(logs_dir.join("Inst_20260102_090000.stdout.log"), "raw\n").unwrap();
+        std::fs::write(logs_dir.join("Other_20260103_100000.log"), "c\n").unwrap();
+
+        let start = session_started_at(&old).expect("filename should parse");
+        let start_dt: chrono::DateTime<chrono::Local> = start.into();
+        assert_eq!(start_dt.format("%Y%m%d_%H%M%S").to_string(), "20260101_120000");
+        assert!(session_started_at(logs_dir.join("nope.log").as_path()).is_none());
+
+        let newest = newest_session_for_instance(&dir, "Inst").expect("newest run");
+        assert_eq!(newest, new, "per-instance newest, tees excluded");
+        assert!(newest_session_for_instance(&dir, "Nope").is_none());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

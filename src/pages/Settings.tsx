@@ -53,8 +53,6 @@ export function Settings() {
   const setTheme = useThemeStore((s) => s.setTheme);
   const liquidGlass = useThemeStore((s) => s.liquidGlass);
   const setLiquidGlass = useThemeStore((s) => s.setLiquidGlass);
-  const realisticGlass = useThemeStore((s) => s.realisticGlass);
-  const setRealisticGlass = useThemeStore((s) => s.setRealisticGlass);
   const wallpaper = useWallpaperStore((s) => s.wallpaper);
   const setWallpaper = useWallpaperStore((s) => s.setWallpaper);
 
@@ -245,7 +243,7 @@ export function Settings() {
               value={localConfig.java_path || ''}
               placeholder={t('settings.java_path_placeholder')}
               onChange={(e) => updateConfig('java_path', e.target.value || null)}
-              style={{ width: 250, fontSize: 'var(--font-size-xs)' }}
+              style={{ width: 330, fontSize: 'var(--font-size-xs)' }}
             />
             <Button size="sm" variant="secondary" onClick={async () => {
               const selected = await openFileDialog({
@@ -636,7 +634,6 @@ export function Settings() {
                 value={wallpaper}
                 disabled={!liquidGlass}
                 options={[
-                  { value: 'none', label: t('settings.wallpaper_none') },
                   { value: 'waves', label: t('settings.wallpaper_waves') },
                   { value: 'ribbons', label: t('settings.wallpaper_ribbons') },
                   { value: 'mesh', label: t('settings.wallpaper_mesh') },
@@ -644,37 +641,6 @@ export function Settings() {
                 ]}
                 onChange={setWallpaper}
               />
-            </div>
-          </div>
-          {/* Realistic liquid glass (owner pass, iOS 27 reference): a much
-              clearer fill so the backdrop and content read through the panels.
-              Off by default; locked like the backdrop choice while Liquid Glass
-              is off, and the selection is kept for the next time it is on. */}
-          <div className="settings-row">
-            <div className="settings-row__info">
-              <div className="settings-row__title">
-                {t('settings.lg_realistic_title')}
-                <span className="experimental-badge experimental-badge--inline">
-                  {t('common.experimental')}
-                </span>
-              </div>
-              <div className="settings-row__desc">{t('settings.lg_realistic_desc')}</div>
-              {!liquidGlass && (
-                <div className="settings-row__note settings-row__note--locked">
-                  {t('settings.lg_realistic_locked')}
-                </div>
-              )}
-            </div>
-            <div className="settings-row__control">
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={realisticGlass}
-                  disabled={!liquidGlass}
-                  onChange={(e) => setRealisticGlass(e.target.checked)}
-                />
-                <span className="toggle__slider" />
-              </label>
             </div>
           </div>
         </div>

@@ -9,8 +9,9 @@ function getInitialWallpaper(): WallpaperId {
     if (isWallpaperId(stored)) return stored;
   } catch {}
   // Fresh default: the liquid ribbons read best of the four (owner wave 26:
-  // «по дефолту должны стоять жидкие ленты»). An explicit choice — including
-  // "none" — is persisted above and always wins.
+  // «по дефолту должны стоять жидкие ленты»). An explicit choice is persisted
+  // above and always wins; the old "none" value is no longer a valid id and
+  // falls through to this default.
   return 'ribbons';
 }
 

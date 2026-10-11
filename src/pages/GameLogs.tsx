@@ -215,8 +215,14 @@ export function GameLogs() {
     const instance = shownSession.instance_name;
     setAnalyzing(true);
     try {
-      const data = await invoke<CrashAnalysis>('cmd_analyze_crash', { instanceName: instance });
-      if (data.source === 'none') {
+      // Pass the session path so the backend analyzes THIS run (crash
+      // reports are filtered to its time window) — not "the newest crash
+      // ever", which could be from an older launch.
+      const data = await invoke<CrashAnalysis>('cmd_analyze_crash', {
+        instanceName: instance,
+        sessionPath: shownSession.path,
+      });
+      if (data.source === 'clean' || data.source === 'none') {
         setAnalysis(null);
         addToast(t('game_logs.no_crash'), 'info');
         return;

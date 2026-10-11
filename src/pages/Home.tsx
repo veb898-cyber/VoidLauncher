@@ -341,7 +341,7 @@ export function Home({ onNavigate }: HomeProps) {
                 {menuInstance === inst.name && !bannerPickerFor && createPortal(
                   <div
                     ref={menuRef}
-                    className="floating-menu"
+                    className="floating-menu floating-menu--bare"
                     style={{
                       position: 'fixed',
                       top: menuPos?.top ?? 148,

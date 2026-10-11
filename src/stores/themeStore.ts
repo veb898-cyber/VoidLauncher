@@ -4,7 +4,6 @@ export type Theme = 'standard' | 'dark' | 'blueprint' | 'ember';
 
 const THEME_STORAGE_KEY = 'voidlauncher-theme';
 const LG_STORAGE_KEY = 'voidlauncher-liquid-glass';
-const LG_REALISTIC_KEY = 'voidlauncher-lg-realistic';
 
 /**
  * Value written to `<html data-theme>` while Liquid Glass is active.
@@ -38,13 +37,6 @@ function getInitialLiquidGlass(): boolean {
   return false;
 }
 
-function getInitialRealisticGlass(): boolean {
-  try {
-    return localStorage.getItem(LG_REALISTIC_KEY) === '1';
-  } catch {}
-  return false;
-}
-
 /**
  * Single writer of the appearance attributes. Keeping this the only place
  * that touches `data-theme` is what makes the Liquid Glass / normal theme
@@ -52,11 +44,14 @@ function getInitialRealisticGlass(): boolean {
  *
  * `data-lg-realistic` is a modifier of the Liquid Glass material only: the
  * CSS that reads it is scoped to `[data-theme='lg']`, so the flag is inert
- * while Liquid Glass is off (same pattern as the wallpaper choice).
+ * while Liquid Glass is off (same pattern as the wallpaper choice). The
+ * realistic (iOS-style) material is the only Liquid Glass look now — the
+ * darker experimental panels were dropped on the owner's order, so the
+ * flag is always on while Liquid Glass is on.
  */
-function applyAppearance(theme: Theme, liquidGlass: boolean, realisticGlass: boolean) {
+function applyAppearance(theme: Theme, liquidGlass: boolean) {
   document.documentElement.setAttribute('data-theme', liquidGlass ? LG_APPEARANCE : theme);
-  document.documentElement.setAttribute('data-lg-realistic', realisticGlass ? '1' : '0');
+  document.documentElement.setAttribute('data-lg-realistic', '1');
   // Every current appearance, Liquid Glass included, is dark
   // (OLED Light was removed).
   document.documentElement.style.colorScheme = 'dark';
@@ -69,27 +64,18 @@ interface ThemeState {
   theme: Theme;
   /** Experimental Liquid Glass appearance. A separate mode, not a theme. */
   liquidGlass: boolean;
-  /**
-   * Realistic (iOS-style) variant of the Liquid Glass material: a much
-   * clearer fill so content and the backdrop read through the panels.
-   * Off by default; only rendered while `liquidGlass` is on.
-   */
-  realisticGlass: boolean;
   setTheme: (theme: Theme) => void;
   setLiquidGlass: (enabled: boolean) => void;
-  setRealisticGlass: (enabled: boolean) => void;
 }
 
 export const useThemeStore = create<ThemeState>((set, get) => {
   const initialTheme = getInitialTheme();
   const initialLiquidGlass = getInitialLiquidGlass();
-  const initialRealisticGlass = getInitialRealisticGlass();
-  applyAppearance(initialTheme, initialLiquidGlass, initialRealisticGlass);
+  applyAppearance(initialTheme, initialLiquidGlass);
 
   return {
     theme: initialTheme,
     liquidGlass: initialLiquidGlass,
-    realisticGlass: initialRealisticGlass,
 
     setTheme: (theme: Theme) => {
       // Locked while Liquid Glass is on: the normal theme cannot change
@@ -98,7 +84,7 @@ export const useThemeStore = create<ThemeState>((set, get) => {
       // control; this is the guard that holds even if something else calls it.
       if (get().liquidGlass) return;
       set({ theme });
-      applyAppearance(theme, false, get().realisticGlass);
+      applyAppearance(theme, false);
       try {
         localStorage.setItem(THEME_STORAGE_KEY, theme);
       } catch {}
@@ -108,20 +94,9 @@ export const useThemeStore = create<ThemeState>((set, get) => {
       // The stored normal theme is intentionally left untouched, so turning
       // Liquid Glass off brings back exactly what was selected before.
       set({ liquidGlass: enabled });
-      applyAppearance(get().theme, enabled, get().realisticGlass);
+      applyAppearance(get().theme, enabled);
       try {
         localStorage.setItem(LG_STORAGE_KEY, enabled ? '1' : '0');
-      } catch {}
-    },
-
-    setRealisticGlass: (enabled: boolean) => {
-      // Kept even while Liquid Glass is off (the UI locks the control then),
-      // exactly like the wallpaper choice: the setting comes back with the
-      // mode instead of being silently reset behind the user's back.
-      set({ realisticGlass: enabled });
-      applyAppearance(get().theme, get().liquidGlass, enabled);
-      try {
-        localStorage.setItem(LG_REALISTIC_KEY, enabled ? '1' : '0');
       } catch {}
     },
   };
