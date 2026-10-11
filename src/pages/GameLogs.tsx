@@ -307,6 +307,12 @@ export function GameLogs() {
             <span className="game-logs-picker-trigger-instance">
               {shownSession ? shownSession.instance_name : ''}
             </span>
+            <span className="game-logs-picker-trigger-time">
+              {shownSession ? shownSession.started_at.slice(5, 16) : ''}
+            </span>
+            <span className="game-logs-picker-trigger-size">
+              {shownSession ? formatSize(shownSession.size_bytes) : ''}
+            </span>
             <svg className={`game-logs-picker-chevron${runsOpen ? ' game-logs-picker-chevron--open' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="6 9 12 15 18 9" />
             </svg>

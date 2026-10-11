@@ -2931,16 +2931,17 @@ input[type="range"]:active::-moz-range-thumb {
   cursor: pointer;
   outline: none;
   transition: border-color 0.2s ease, background 0.2s ease;
-  /* Fixed width on purpose: the instance name's length varies between runs,
-     so a content-sized button reflowed the whole toolbar (the search box and
-     the level filters visibly jumped) whenever a different run was picked.
-     210px shows most names in full and keeps the toolbar on one row at the
-     default 1200px window (see .log-search note); may shrink on narrower
-     windows but never below 140px. Time and size live in the dropdown rows
-     only — with them in the trigger the name got squeezed to one letter. */
-  flex: 0 1 210px;
-  width: 210px;
-  min-width: 140px;
+  /* Fixed width on purpose: the label shows the instance name, the start time
+     and a live-growing file size. A content-sized button changed width several
+     times per second, which reflowed the whole toolbar — the search box and the
+     level filters visibly jumped whenever a different run was picked.
+     Widened 210→280 so name + time + size all fit at the default 1200px
+     window (the toolbar fits one row — see .log-search note); on narrower
+     windows only the name shrinks (ellipsis), time and size never compress.
+     May shrink but never below 180px. */
+  flex: 0 1 280px;
+  width: 280px;
+  min-width: 180px;
   text-align: left;
 }
 
@@ -2961,6 +2962,23 @@ input[type="range"]:active::-moz-range-thumb {
   font-family: var(--font-ui);
   flex: 1;
   min-width: 0;
+}
+
+/* Time and size carry fixed content (start time, byte size) — they must
+   never be compressed; when the button shrinks on a narrow window only the
+   instance name gives way (ellipsis). */
+.game-logs-picker-trigger-time {
+  color: var(--text-secondary);
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+  flex-shrink: 0;
+}
+
+.game-logs-picker-trigger-size {
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+  flex-shrink: 0;
 }
 
 .game-logs-picker-dot {
