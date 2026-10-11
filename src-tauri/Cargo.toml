@@ -1,6 +1,6 @@
 [package]
 name = "voidlauncher"
-version = "1.2.0"
+version = "1.2.1"
 description = "VoidLauncher — Custom Minecraft Launcher"
 authors = ["VoidLauncher"]
 license = "MIT"
