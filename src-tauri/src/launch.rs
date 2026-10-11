@@ -53,7 +53,7 @@ fn open_game_output_files(
     let header = format!(
         "VoidLauncher game stdout\nInstance: {}\nStarted: {}\n{}\n",
         instance_name,
-        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%d/%m/%Y %H:%M:%S"),
         "=".repeat(60),
     );
     if let Some(f) = &stdout_file {

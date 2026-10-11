@@ -244,7 +244,7 @@ pub fn create_game_log_file(data_dir: &PathBuf, instance_name: &str) -> Result<S
     let header = format!(
         "VoidLauncher Game Log\nInstance: {}\nStarted: {}\n{}\n",
         instance_name,
-        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%d/%m/%Y %H:%M:%S"),
         "=".repeat(60),
     );
     std::fs::write(&path, &header).map_err(|e| e.to_string())?;
@@ -308,7 +308,7 @@ pub fn list_game_log_sessions(data_dir: &PathBuf) -> Vec<GameLogSession> {
 
                     let started_at = if let Ok(modified) = meta.modified() {
                         let dt: chrono::DateTime<chrono::Local> = modified.into();
-                        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+                        dt.format("%d/%m/%Y %H:%M:%S").to_string()
                     } else {
                         String::new()
                     };

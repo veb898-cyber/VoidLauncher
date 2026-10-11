@@ -308,7 +308,9 @@ export function GameLogs() {
               {shownSession ? shownSession.instance_name : ''}
             </span>
             <span className="game-logs-picker-trigger-time">
-              {shownSession ? shownSession.started_at.slice(5, 16) : ''}
+              {/* started_at = "DD/MM/YYYY HH:MM:SS"; trigger shows the
+                  compact "DD/MM HH:MM" (same width as the old MM-DD form). */}
+              {shownSession ? `${shownSession.started_at.slice(0, 5)} ${shownSession.started_at.slice(11, 16)}` : ''}
             </span>
             <span className="game-logs-picker-trigger-size">
               {shownSession ? formatSize(shownSession.size_bytes) : ''}
