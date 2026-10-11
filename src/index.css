@@ -4292,7 +4292,12 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
     backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
     -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
     border-color: var(--lg-divider);
-    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+    /* No outer drop shadow: the scrim behind the sheet already separates it
+       from the page, and the depth shadow on top of that dark fill reads as
+       a thick black outline around the dialog. The rim-ring hairlines and
+       the inner depth pool stay — they carry the material edge without
+       framing the sheet in a dark halo. */
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth);
     position: relative;
     z-index: var(--z-sheet);
   }
