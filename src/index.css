@@ -2333,6 +2333,11 @@ select option {
   text-align: center;
 }
 
+.empty-state--dashed {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-lg);
+}
+
 .empty-state__icon {
   width: 64px;
   height: 64px;
@@ -4126,12 +4131,13 @@ input[type="range"]:active::-moz-range-thumb {
 
   /* Bare text on the empty backdrop. With the backdrop raw behind it, white
      text can pass over a bright animated patch; this is the cheapest fix that
-     does not cover the backdrop - a hairline dark halo, invisible on dark
-     ground and enough to hold the edge of a glyph over a moving highlight.
-     Applied at the content root so headings, subtitles and ghost buttons all
-     inherit it, and nothing outside the content pane is touched. */
-  [data-theme='lg'] .main-content {
-    text-shadow: 0 1px 2px rgb(0 0 0 / 0.5);
+     does not cover the backdrop - a dark halo, invisible on dark ground and
+     enough to hold the edge of a glyph over a moving highlight. Applied at
+     the content root so headings, subtitles and ghost buttons all inherit it,
+     and nothing outside the content pane is touched. The builds catalog
+     overlay is portaled outside the content pane, so it is listed here too. */
+  [data-theme='lg'] :is(.main-content, .modpacks-overlay) {
+    text-shadow: 0 1px 2px rgb(0 0 0 / 0.65), 0 0 8px rgb(0 0 0 / 0.35);
   }
 
 /* The builds tab is a full-window overlay, so it has to be opened up by hand:
@@ -4339,8 +4345,8 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
     }
   }
 
-  [data-theme='lg'][data-lg-realistic='1'] :is(.main-content, .sidebar, .titlebar) {
-    text-shadow: 0 1px 2px rgb(0 0 0 / 0.7), 0 0 10px rgb(0 0 0 / 0.3);
+  [data-theme='lg'][data-lg-realistic='1'] :is(.main-content, .sidebar, .titlebar, .modpacks-overlay) {
+    text-shadow: 0 1px 2px rgb(0 0 0 / 0.85), 0 0 6px rgb(0 0 0 / 0.45), 0 0 18px rgb(0 0 0 / 0.25);
   }
 
 /* ------------------------------------------------------------
