@@ -81,7 +81,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
 
   if (!instance) {
     return (
-      <div className="empty-state" style={{ flex: 1, color: 'var(--text-tertiary)', gap: 'var(--space-md)' }}>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', gap: 'var(--space-md)', padding: 'var(--space-3xl)' }}>
         <Package size={48} opacity={0.3} />
         <div style={{ fontSize: 'var(--font-size-lg)', fontWeight: 500 }}>{t('instance_detail.empty_heading')}</div>
         <div style={{ fontSize: 'var(--font-size-sm)' }}>{t('instance_detail.empty_desc')}</div>

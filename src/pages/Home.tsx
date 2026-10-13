@@ -203,10 +203,15 @@ export function Home({ onNavigate }: HomeProps) {
         )}
 
         {instances.length === 0 ? (
-          <div className="empty-state empty-state--dashed" style={{
+          <div style={{
             flex: 1,
+            display: 'flex', flexDirection: 'column',
+            alignItems: 'center', justifyContent: 'center',
             color: 'var(--text-tertiary)',
             gap: 'var(--space-md)',
+            padding: 'var(--space-3xl)',
+            borderRadius: 'var(--radius-lg)',
+            border: '1px dashed var(--border)',
           }}>
             <Package size={48} opacity={0.3} />
             <div style={{ fontSize: 'var(--font-size-lg)', fontWeight: 500 }}>{t('home.empty_title')}</div>
