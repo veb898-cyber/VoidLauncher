@@ -133,6 +133,21 @@
 }
 
 /* ============================
+   Liquid motion (Settings toggle, default ON)
+   `data-motion="liquid"` on <html> upgrades the two shared transition vars
+   to springy curves: everything that already transitions through them (tab
+   indicators, toggle knobs, cards, menus, ctx) picks up a soft overshoot
+   with no per-element changes. Elastic press for buttons lives here too.
+   Neutralised under prefers-reduced-motion via the guard at the end of the
+   file — the base curves above stay the fallback.
+   ============================ */
+
+[data-motion='liquid'] {
+  --transition-fast: 150ms cubic-bezier(0.34, 1.32, 0.64, 1);
+  --transition-normal: 250ms cubic-bezier(0.22, 1.3, 0.36, 1);
+}
+
+/* ============================
    OLED Dark Theme (pure black)
    ============================ */
 [data-theme="dark"] {
@@ -406,8 +421,8 @@
   background-size: 5px 5px;
 }
 
-/* Active sidebar item: thin copper line, no colored glow */
-[data-theme="ember"] .sidebar__item--active::before {
+/* Active sidebar accent: thin copper line, no colored glow */
+[data-theme="ember"] .sidebar__accent {
   background: var(--primary);
   box-shadow: none;
 }
@@ -588,6 +603,12 @@ a {
   transition-duration: 80ms;
 }
 
+/* Liquid motion: the press becomes an elastic dip — same 0.96 scale, but
+   the release rides the spring curve instead of snapping back flat. */
+[data-motion='liquid'] .btn:active:not(:disabled) {
+  transition: transform 120ms cubic-bezier(0.34, 1.45, 0.64, 1);
+}
+
 .btn:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
@@ -652,15 +673,21 @@ a {
   background: var(--accent-dim);
 }
 
-.sidebar__item--active::before {
-  content: '';
+/* One accent element measured by Sidebar (was a per-item ::before that
+   teleported between items with no travel): it slides on
+   --transition-normal, so the liquid curves make the line springy. Left is
+   set inline from the active item's measured offset. */
+.sidebar__accent {
   position: absolute;
-  left: -8px;
+  top: 0;
+  left: 0;
   width: 3px;
   height: 24px;
-  background: var(--gradient-primary);
   border-radius: var(--radius-full);
+  background: var(--gradient-primary);
   box-shadow: var(--glow-primary);
+  transition: transform var(--transition-normal);
+  pointer-events: none;
 }
 
 .sidebar__item svg {
@@ -2043,8 +2070,9 @@ select option {
   transition: background var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 
-.toggle__slider::before {
-  content: '';
+/* The knob is a real element (was ::before): the gooey option wraps it in a
+   liquid group, which needs an actual node to measure and mirror. */
+.toggle__knob {
   position: absolute;
   width: 20px;
   height: 20px;
@@ -2055,6 +2083,7 @@ select option {
   border-radius: 50%;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
   transition: transform var(--transition-normal), background var(--transition-fast);
+  pointer-events: none;
 }
 
 .toggle:hover .toggle__slider {
@@ -2076,7 +2105,7 @@ select option {
   cursor: not-allowed;
 }
 
-.toggle input:checked + .toggle__slider::before {
+.toggle input:checked + .toggle__slider .toggle__knob {
   transform: translateY(-50%) translateX(22px);
   background: #ffffff;
 }
@@ -4887,4 +4916,29 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
   -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
   border-color: var(--lg-divider);
   box-shadow: var(--lg-rim-ring), var(--lg-inner-depth), var(--lg-depth-shadow);
+}
+
+/* Liquid motion: the 2px underline travels at the normal pace (was fast) —
+   the spring curve carries it, and a 150ms fling of a thin line reads as a
+   snap, not as liquid. */
+[data-motion='liquid'] .tabs__indicator {
+  transition: transform var(--transition-normal), width var(--transition-normal), height var(--transition-normal);
+}
+
+/* ============================
+   Reduced motion
+   The OS preference always wins over the liquid setting: springy curves
+   collapse back to the base ones and the elastic press goes flat. Base
+   `:root` vars above are the fallback values restated here.
+   ============================ */
+
+@media (prefers-reduced-motion: reduce) {
+  [data-motion='liquid'] {
+    --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+    --transition-normal: 250ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  [data-motion='liquid'] .btn:active:not(:disabled) {
+    transition: transform 80ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
 }

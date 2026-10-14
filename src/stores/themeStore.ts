@@ -4,6 +4,8 @@ export type Theme = 'standard' | 'dark' | 'blueprint' | 'ember';
 
 const THEME_STORAGE_KEY = 'voidlauncher-theme';
 const LG_STORAGE_KEY = 'voidlauncher-liquid-glass';
+const MOTION_STORAGE_KEY = 'voidlauncher-liquid-motion';
+const GOOEY_STORAGE_KEY = 'voidlauncher-gooey';
 
 /**
  * Value written to `<html data-theme>` while Liquid Glass is active.
@@ -37,6 +39,22 @@ function getInitialLiquidGlass(): boolean {
   return false;
 }
 
+// Both motion options default to ON: absence of a stored value means the
+// fresh install (and every pre-existing user) gets the liquid feel.
+function getInitialLiquidMotion(): boolean {
+  try {
+    return localStorage.getItem(MOTION_STORAGE_KEY) !== '0';
+  } catch {}
+  return true;
+}
+
+function getInitialGooey(): boolean {
+  try {
+    return localStorage.getItem(GOOEY_STORAGE_KEY) !== '0';
+  } catch {}
+  return true;
+}
+
 /**
  * Single writer of the appearance attributes. Keeping this the only place
  * that touches `data-theme` is what makes the Liquid Glass / normal theme
@@ -57,6 +75,24 @@ function applyAppearance(theme: Theme, liquidGlass: boolean) {
   document.documentElement.style.colorScheme = 'dark';
 }
 
+/**
+ * Independent of the theme derivation: the motion flags only gate CSS blocks
+ * (`[data-motion='liquid']`) and React branches (gooey wrappers), so they get
+ * their own tiny writer instead of threading through applyAppearance.
+ */
+function applyMotionFlags(liquidMotion: boolean, gooey: boolean) {
+  if (liquidMotion) {
+    document.documentElement.setAttribute('data-motion', 'liquid');
+  } else {
+    document.documentElement.removeAttribute('data-motion');
+  }
+  if (gooey) {
+    document.documentElement.setAttribute('data-gooey', 'on');
+  } else {
+    document.documentElement.removeAttribute('data-gooey');
+  }
+}
+
 interface ThemeState {
   /** The normal theme. Always a valid `Theme`, never cleared and never
    *  overwritten by the Liquid Glass flag — it is what gets restored when
@@ -64,18 +100,29 @@ interface ThemeState {
   theme: Theme;
   /** Experimental Liquid Glass appearance. A separate mode, not a theme. */
   liquidGlass: boolean;
+  /** Springy transition curves + elastic press (CSS `[data-motion='liquid']`). */
+  liquidMotion: boolean;
+  /** Liquid trailing on sliding indicators (React gooey wrappers). */
+  gooey: boolean;
   setTheme: (theme: Theme) => void;
   setLiquidGlass: (enabled: boolean) => void;
+  setLiquidMotion: (enabled: boolean) => void;
+  setGooey: (enabled: boolean) => void;
 }
 
 export const useThemeStore = create<ThemeState>((set, get) => {
   const initialTheme = getInitialTheme();
   const initialLiquidGlass = getInitialLiquidGlass();
+  const initialLiquidMotion = getInitialLiquidMotion();
+  const initialGooey = getInitialGooey();
   applyAppearance(initialTheme, initialLiquidGlass);
+  applyMotionFlags(initialLiquidMotion, initialGooey);
 
   return {
     theme: initialTheme,
     liquidGlass: initialLiquidGlass,
+    liquidMotion: initialLiquidMotion,
+    gooey: initialGooey,
 
     setTheme: (theme: Theme) => {
       // Locked while Liquid Glass is on: the normal theme cannot change
@@ -97,6 +144,22 @@ export const useThemeStore = create<ThemeState>((set, get) => {
       applyAppearance(get().theme, enabled);
       try {
         localStorage.setItem(LG_STORAGE_KEY, enabled ? '1' : '0');
+      } catch {}
+    },
+
+    setLiquidMotion: (enabled: boolean) => {
+      set({ liquidMotion: enabled });
+      applyMotionFlags(enabled, get().gooey);
+      try {
+        localStorage.setItem(MOTION_STORAGE_KEY, enabled ? '1' : '0');
+      } catch {}
+    },
+
+    setGooey: (enabled: boolean) => {
+      set({ gooey: enabled });
+      applyMotionFlags(get().liquidMotion, enabled);
+      try {
+        localStorage.setItem(GOOEY_STORAGE_KEY, enabled ? '1' : '0');
       } catch {}
     },
   };

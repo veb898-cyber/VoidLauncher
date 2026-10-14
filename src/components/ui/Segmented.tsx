@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { Liquid } from 'liquid-gooey';
+import { useGooey } from '../../hooks/useGooey';
 export interface SegmentedOption<T extends string> {
   value: T;
   label: ReactNode;
@@ -55,6 +57,7 @@ export function Segmented<T extends string>({
   const optionRefs = useRef(new Map<string, HTMLButtonElement>());
   const [thumb, setThumb] = useState<Thumb | null>(null);
   const single = onChange != null && value != null;
+  const gooey = useGooey();
 
   const measure = useCallback(() => {
     if (!single) {
@@ -90,12 +93,27 @@ export function Segmented<T extends string>({
       role="group"
       aria-label={ariaLabel}
     >
-      {single && thumb && (
-        <span
-          className="segmented__indicator"
-          style={{ width: thumb.width, transform: `translateX(${thumb.left}px)` }}
-          aria-hidden
-        />
+      {single && thumb && gooey ? (
+        <Liquid
+          fill="var(--primary)"
+          style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}
+        >
+          <Liquid.Item effect="move">
+            <span
+              className="segmented__indicator"
+              style={{ width: thumb.width, transform: `translateX(${thumb.left}px)` }}
+              aria-hidden
+            />
+          </Liquid.Item>
+        </Liquid>
+      ) : (
+        single && thumb && (
+          <span
+            className="segmented__indicator"
+            style={{ width: thumb.width, transform: `translateX(${thumb.left}px)` }}
+            aria-hidden
+          />
+        )
       )}
       {options.map((opt) => {
         const isActive = single ? value === opt.value : !!pressed?.[opt.value];

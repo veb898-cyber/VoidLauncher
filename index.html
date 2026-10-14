@@ -29,6 +29,14 @@
             document.documentElement.setAttribute('data-theme', t);
             document.documentElement.style.colorScheme = 'dark';
           }
+          // Liquid motion defaults to ON (absence of key = on), same as the
+          // store in src/stores/themeStore.ts — must stay in sync.
+          if (localStorage.getItem('voidlauncher-liquid-motion') !== '0') {
+            document.documentElement.setAttribute('data-motion', 'liquid');
+          }
+          if (localStorage.getItem('voidlauncher-gooey') !== '0') {
+            document.documentElement.setAttribute('data-gooey', 'on');
+          }
           var f = localStorage.getItem('voidlauncher-font');
           var cf = localStorage.getItem('voidlauncher-console-font');
           // Legacy "inter" values are ignored (treated as default).

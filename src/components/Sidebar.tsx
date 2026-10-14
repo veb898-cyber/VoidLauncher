@@ -1,16 +1,27 @@
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Liquid } from 'liquid-gooey';
 import { useAuthStore } from '../stores/authStore';
 import { GameRunningBadge } from './launch/GameRunningBadge';
 import { Tooltip } from './ui/Tooltip';
 import { t } from '../lib/i18n';
 import { Avatar } from '../lib/remoteImage';
+import { useGooey } from '../hooks/useGooey';
 
 interface SidebarProps {
   activePage: string;
   onNavigate: (page: string) => void;
 }
 
+const ACCENT_HEIGHT = 24;
+
 export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const { profile, isLoggedIn } = useAuthStore();
+  const gooey = useGooey();
+  const sidebarRef = useRef<HTMLElement>(null);
+  const itemRefs = useRef(new Map<string, HTMLButtonElement>());
+  // Null until measured, so the accent mounts already at its place instead
+  // of sliding in from the top on first paint.
+  const [accent, setAccent] = useState<{ top: number; left: number } | null>(null);
 
   const navItems = [
     { id: 'home', icon: <HomeIcon />, label: t('sidebar.home') },
@@ -20,12 +31,71 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
     { id: 'terminal', icon: <TerminalIcon />, label: t('sidebar.terminal') },
   ];
 
+  // Rect-based on purpose: the accent is absolutely positioned in the
+  // sidebar's padding box, and the buttons sit in two different containers
+  // (nav + bottom) with the bottom one anchored — offsetTop quirks are not
+  // worth debugging when two rects give the same numbers directly. The
+  // -8px matches the old ::before (item's left edge, 8px outward).
+  const measure = useCallback(() => {
+    const sidebar = sidebarRef.current;
+    const btn = itemRefs.current.get(activePage);
+    if (!sidebar || !btn) {
+      setAccent(null);
+      return;
+    }
+    const s = sidebar.getBoundingClientRect();
+    const b = btn.getBoundingClientRect();
+    setAccent({
+      top: b.top - s.top + (b.height - ACCENT_HEIGHT) / 2,
+      left: b.left - s.left - 8,
+    });
+  }, [activePage]);
+
+  useLayoutEffect(measure, [measure]);
+
+  // Window resizes change the sidebar's height (it stretches full-height),
+  // which can shift the bottom-anchored settings button.
+  useEffect(() => {
+    const el = sidebarRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [measure]);
+
+  const itemRef = (id: string) => (el: HTMLButtonElement | null) => {
+    if (el) itemRefs.current.set(id, el);
+    else itemRefs.current.delete(id);
+  };
+
+  const accentStyle = accent
+    ? { transform: `translate(${accent.left}px, ${accent.top}px)` }
+    : undefined;
+
   return (
-    <nav className="sidebar">
+    <nav className="sidebar" ref={sidebarRef}>
+      {/* The sliding active-item accent (was a per-item ::before that
+          teleported). With gooey it rides a liquid group: the blob hides
+          under the crisp bar at rest and trails it while it travels. */}
+      {accent && gooey ? (
+        <Liquid
+          fill="var(--primary)"
+          blur={2.5}
+          style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}
+        >
+          <Liquid.Item effect="move">
+            <span className="sidebar__accent" style={accentStyle} aria-hidden />
+          </Liquid.Item>
+        </Liquid>
+      ) : (
+        accent && <span className="sidebar__accent" style={accentStyle} aria-hidden />
+      )}
+
       <div className="sidebar__nav">
         {navItems.map((item) => (
           <Tooltip key={item.id} content={item.label}>
             <button
+              ref={itemRef(item.id)}
               className={`sidebar__item ${activePage === item.id ? 'sidebar__item--active' : ''}`}
               onClick={() => onNavigate(item.id)}
             >
@@ -38,6 +108,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
       <div className="sidebar__bottom">
         <GameRunningBadge />
         <button
+          ref={itemRef('settings')}
           className={`sidebar__item ${activePage === 'settings' ? 'sidebar__item--active' : ''}`}
           onClick={() => onNavigate('settings')}
         >

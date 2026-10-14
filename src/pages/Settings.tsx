@@ -8,6 +8,7 @@ import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '../components/ui/Button';
+import { Toggle } from '../components/ui/Toggle';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { addToast } from '../components/ui/Toast';
 import { CustomSelect } from '../components/ui/CustomSelect';
@@ -53,6 +54,10 @@ export function Settings() {
   const setTheme = useThemeStore((s) => s.setTheme);
   const liquidGlass = useThemeStore((s) => s.liquidGlass);
   const setLiquidGlass = useThemeStore((s) => s.setLiquidGlass);
+  const liquidMotion = useThemeStore((s) => s.liquidMotion);
+  const setLiquidMotion = useThemeStore((s) => s.setLiquidMotion);
+  const gooey = useThemeStore((s) => s.gooey);
+  const setGooey = useThemeStore((s) => s.setGooey);
   const wallpaper = useWallpaperStore((s) => s.wallpaper);
   const setWallpaper = useWallpaperStore((s) => s.setWallpaper);
 
@@ -575,6 +580,28 @@ export function Settings() {
           </div>
         </div>
 
+        {/* Motion lives outside the theme system: the spring curves are a
+            CSS flag on <html>, the gooey trails are React wrappers — both
+            independent of Liquid Glass and of the colour theme. */}
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.motion_title')}</div>
+            <div className="settings-row__desc">{t('settings.motion_desc')}</div>
+          </div>
+          <div className="settings-row__control">
+            <Toggle checked={liquidMotion} onChange={setLiquidMotion} />
+          </div>
+        </div>
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.gooey_title')}</div>
+            <div className="settings-row__desc">{t('settings.gooey_desc')}</div>
+          </div>
+          <div className="settings-row__control">
+            <Toggle checked={gooey} onChange={setGooey} />
+          </div>
+        </div>
+
         {/* Liquid Glass is a separate experimental rendering mode, not a
             colour preset of the theme above: while it is on, the normal
             themes stay visible but locked, and the selected one is kept so
@@ -601,14 +628,7 @@ export function Settings() {
               )}
             </div>
             <div className="settings-row__control">
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={liquidGlass}
-                  onChange={(e) => setLiquidGlass(e.target.checked)}
-                />
-                <span className="toggle__slider" />
-              </label>
+              <Toggle checked={liquidGlass} onChange={setLiquidGlass} />
             </div>
           </div>
           {/* The backdrop only exists under Liquid Glass, so it is disabled
@@ -658,14 +678,10 @@ export function Settings() {
             </div>
           </div>
           <div className="settings-row__control">
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={localConfig.close_on_launch}
-                onChange={(e) => updateConfig('close_on_launch', e.target.checked)}
-              />
-              <span className="toggle__slider" />
-            </label>
+            <Toggle
+              checked={localConfig.close_on_launch}
+              onChange={(v) => updateConfig('close_on_launch', v)}
+            />
           </div>
         </div>
 
@@ -740,14 +756,10 @@ export function Settings() {
             </div>
           </div>
           <div className="settings-row__control">
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={localConfig.proxy_enabled}
-                onChange={(e) => updateConfig('proxy_enabled', e.target.checked)}
-              />
-              <span className="toggle__slider" />
-            </label>
+            <Toggle
+              checked={localConfig.proxy_enabled}
+              onChange={(v) => updateConfig('proxy_enabled', v)}
+            />
           </div>
         </div>
 

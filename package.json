@@ -17,6 +17,7 @@
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
     "dompurify": "^3.4.7",
+    "liquid-gooey": "^0.2.2",
     "lucide-react": "^1.16.0",
     "marked": "^18.0.4",
     "react": "^19.1.0",

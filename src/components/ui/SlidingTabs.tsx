@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { Liquid } from 'liquid-gooey';
+import { useGooey } from '../../hooks/useGooey';
+import { useThemeStore } from '../../stores/themeStore';
 
 export interface SlidingTabDef<T extends string> {
   id: T;
@@ -50,6 +53,12 @@ export function SlidingTabs<T extends string>({
   const wrapRef = useRef<HTMLDivElement>(null);
   const tabRefs = useRef(new Map<string, HTMLButtonElement>());
   const [thumb, setThumb] = useState<Thumb | null>(null);
+  const gooey = useGooey();
+  // Liquid Glass paints the indicator with its own backdrop-filter; a goo
+  // silhouette behind it would flatten the glass into an opaque blob. Base
+  // themes keep the crisp gradient line and get the liquid trail.
+  const liquidGlass = useThemeStore((s) => s.liquidGlass);
+  const liquid = gooey && !liquidGlass;
 
   const vertical = orientation === 'vertical';
 
@@ -83,15 +92,34 @@ export function SlidingTabs<T extends string>({
       role="tablist"
       aria-label={ariaLabel}
     >
-      {thumb && (
-        <span
-          className="tabs__indicator"
-          style={{
-            ['--tab-offset']: `${thumb.offset}px`,
-            ['--tab-size']: `${thumb.size}px`,
-          } as CSSProperties}
-          aria-hidden
-        />
+      {thumb && liquid ? (
+        <Liquid
+          fill="var(--primary)"
+          blur={2}
+          style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}
+        >
+          <Liquid.Item effect="move">
+            <span
+              className="tabs__indicator"
+              style={{
+                ['--tab-offset']: `${thumb.offset}px`,
+                ['--tab-size']: `${thumb.size}px`,
+              } as CSSProperties}
+              aria-hidden
+            />
+          </Liquid.Item>
+        </Liquid>
+      ) : (
+        thumb && (
+          <span
+            className="tabs__indicator"
+            style={{
+              ['--tab-offset']: `${thumb.offset}px`,
+              ['--tab-size']: `${thumb.size}px`,
+            } as CSSProperties}
+            aria-hidden
+          />
+        )
       )}
       {tabs.map((tb) => (
         <button

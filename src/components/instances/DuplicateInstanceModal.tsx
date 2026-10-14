@@ -4,6 +4,7 @@ import { Copy } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { Input } from '../ui/Input';
+import { Toggle } from '../ui/Toggle';
 import { addToast } from '../ui/Toast';
 import { t } from '../../lib/i18n';
 
@@ -67,10 +68,7 @@ export function DuplicateInstanceModal({ instanceName, onClose, onDuplicated }: 
       }}
     >
       <span>{label}</span>
-      <span className="toggle">
-        <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
-        <span className="toggle__slider" />
-      </span>
+      <Toggle as="span" checked={checked} onChange={onChange} />
     </label>
   );
 
