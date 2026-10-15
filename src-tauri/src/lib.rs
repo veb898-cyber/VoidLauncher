@@ -253,6 +253,7 @@ pub fn run() {
             commands::misc::cmd_get_launch_state,
             commands::instances::cmd_check_instance_installed,
             commands::misc::cmd_detect_system_ram,
+            commands::misc::cmd_get_installer_language,
             commands::mods::cmd_search_modrinth,
             commands::mods::cmd_search_curseforge,
             commands::mods::cmd_get_modrinth_versions,

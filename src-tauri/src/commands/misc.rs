@@ -392,6 +392,69 @@ pub async fn cmd_detect_system_ram() -> u64 {
     .unwrap_or(0)
 }
 
+/// UI language the user picked in the installer's language dialog. The NSIS
+/// script stores the choice as a numeric LANGID under the app's per-user key
+/// (`Installer Language`, written by our `NSIS_HOOK_POSTINSTALL` hook and
+/// cleared by the uninstaller). The frontend calls this exactly once on boot,
+/// before the first render, and applies the answer only while no language
+/// preference is persisted yet — an explicit choice made later in Settings
+/// always wins, because that choice is what gets persisted.
+#[tauri::command]
+pub fn cmd_get_installer_language() -> Option<String> {
+    installer_language()
+}
+
+/// `Some("en" | "ru")` for any English/Russian LANGID (the installer offers
+/// exactly those two languages), `None` when the dialog was never shown
+/// (portable run, silent install without a stored value) or the stored value
+/// is not a language we ship.
+fn lang_id_to_ui_language(lang_id: u32) -> Option<String> {
+    // The low ten bits are the primary language; the rest is the sublanguage
+    // (en-US 1033 and en-GB 2057 share 0x09, ru-RU 1049 shares 0x19).
+    match lang_id & 0x03FF {
+        0x09 => Some("en".to_string()), // LANG_ENGLISH
+        0x19 => Some("ru".to_string()), // LANG_RUSSIAN
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn installer_language() -> Option<String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = hkcu
+        .open_subkey(r"Software\voidlauncher\VoidLauncher")
+        .ok()?;
+    let raw: String = key.get_value("Installer Language").ok()?;
+    lang_id_to_ui_language(raw.trim().parse::<u32>().ok()?)
+}
+
+#[cfg(not(windows))]
+fn installer_language() -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+mod installer_language_tests {
+    use super::lang_id_to_ui_language;
+
+    #[test]
+    fn shipped_langids_map_to_shipped_locales() {
+        assert_eq!(lang_id_to_ui_language(1033).as_deref(), Some("en")); // en-US
+        assert_eq!(lang_id_to_ui_language(2057).as_deref(), Some("en")); // en-GB
+        assert_eq!(lang_id_to_ui_language(4105).as_deref(), Some("en")); // en-CA
+        assert_eq!(lang_id_to_ui_language(1049).as_deref(), Some("ru")); // ru-RU
+    }
+
+    #[test]
+    fn unshipped_and_garbage_values_are_ignored() {
+        assert_eq!(lang_id_to_ui_language(1031), None); // de-DE
+        assert_eq!(lang_id_to_ui_language(2052), None); // zh-CN
+        assert_eq!(lang_id_to_ui_language(0), None);
+    }
+}
+
 // ==================== Config Commands ====================
 
 #[tauri::command]

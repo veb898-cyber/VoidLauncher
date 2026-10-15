@@ -36,7 +36,20 @@ export function Toggle({ checked, onChange, disabled, as = 'label' }: ToggleProp
             fill="var(--text-primary)"
             style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}
           >
-            <Liquid.Item effect="move">
+            {/* Default move tuning splits the small knob at speed: the trail
+                droplet tears off behind it and the wobbling surface overshoots
+                the crisp circle (owner: «от круглого ползунка … отрываются
+                части»). Keep the liquid as a snug blurred coat instead. */}
+            <Liquid.Item
+              effect="move"
+              move={{
+                springiness: 0.9,
+                wobble: 0.1,
+                stretch: 0.1,
+                trail: 0,
+                advanced: { bend: 0, bendX: 0 },
+              }}
+            >
               <span className="toggle__knob" />
             </Liquid.Item>
           </Liquid>

@@ -76,14 +76,28 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
     <nav className="sidebar" ref={sidebarRef}>
       {/* The sliding active-item accent (was a per-item ::before that
           teleported). With gooey it rides a liquid group: the blob hides
-          under the crisp bar at rest and trails it while it travels. */}
+          under the crisp bar at rest and trails it while it travels.
+          The default move tuning reads badly on a thin 3×24 bar: the loose
+          trail droplet detaches and the bowed edges split the silhouette
+          into stray pieces (owner: «полоска … отделяется/копируется»), so
+          the surface follows the bar almost 1:1 with no tail — the gooey
+          look stays in the soft blurred edge, not in a runaway blob. */}
       {accent && gooey ? (
         <Liquid
           fill="var(--primary)"
           blur={2.5}
           style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}
         >
-          <Liquid.Item effect="move">
+          <Liquid.Item
+            effect="move"
+            move={{
+              springiness: 0.9,
+              wobble: 0.1,
+              stretch: 0.1,
+              trail: 0,
+              advanced: { bend: 0, bendX: 0 },
+            }}
+          >
             <span className="sidebar__accent" style={accentStyle} aria-hidden />
           </Liquid.Item>
         </Liquid>

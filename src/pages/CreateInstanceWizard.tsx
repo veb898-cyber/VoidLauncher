@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { t, getLanguage } from '../lib/i18n';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -98,6 +98,27 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
 
   const loaderListRef = useRef<HTMLDivElement>(null);
   const loaderVersionsLoadingRef = useRef(false);
+
+  // The dialog must occupy exactly the same frame in both modes (owner: «размер
+  // окна … должен быть одинаковый» — a jumping dialog reads as broken). While
+  // «Новая» is on screen this pin tracks the row's laid-out box (the versions
+  // list fills in asynchronously, so it is frozen on every layout change);
+  // «Импорт» then reuses the last frozen box as its minimum, which keeps the
+  // dialog from resizing when the mode switches.
+  const rowRef = useRef<HTMLDivElement>(null);
+  const pinnedSize = useRef<{ w: number; h: number } | null>(null);
+
+  useLayoutEffect(() => {
+    if (!open || mode !== 'new') return;
+    const el = rowRef.current;
+    if (!el) return;
+    const freeze = () => { pinnedSize.current = { w: el.offsetWidth, h: el.offsetHeight }; };
+    freeze();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(freeze);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [open, mode]);
 
   useEffect(() => {
     if (!open) return;
@@ -353,7 +374,12 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
       }
     >
       {/* Mode selector sidebar + content */}
-      <div style={{ display: 'flex', gap: 'var(--space-xl)', minHeight: 360 }}>
+      <div ref={rowRef} style={{
+        display: 'flex', gap: 'var(--space-xl)', minHeight: 360,
+        ...(mode === 'import' && pinnedSize.current
+          ? { minWidth: pinnedSize.current.w, minHeight: pinnedSize.current.h }
+          : null),
+      }}>
         {/* Left sidebar — mode select: the same tab language as the terminal
             and the modpack catalog (transparent labels, one frame that
             physically slides down the column). */}
