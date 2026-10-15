@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { headFromSkin } from './skinHead';
 
 // ---- Remote images via cmd_fetch_icon_url -----------------------------------
-// CDN images (mod icon, player-head avatars) are never handed to
+// CDN images (mod icon, thumbnails) are never handed to
 // <img src="https://..."> directly: the webview follows only the system proxy
 // with no proxy→direct fallback, so a single flaky host leaves every image
 // blank for some users. Each image is fetched through cmd_fetch_icon_url
 // (send_with_fallback: proxy → direct) and rendered as a data URL; session
 // RAM cache + retry cooldown keep re-renders cheap. The Rust side restricts
 // hosts to an allowlist so the renderer cannot use this as an SSRF proxy.
+// Player-head avatars use a separate pipeline (cmd_get_player_head), see
+// the Avatar section below.
 const remoteImageCache = new Map<string, string>();
 const remoteImageFailedAt = new Map<string, number>();
 const remoteImageInflight = new Set<string>();
@@ -191,8 +194,104 @@ export function RemoteImage({
 }
 
 // ---- Player-head avatar -------------------------------------------------------
-// Same remote pipeline as RemoteImage: shine while loading, deterministic
-// letter fallback only when the fetch fails (never a gray hole).
+// Heads go through cmd_get_player_head: the backend fetches the RAW SKIN
+// from Mojang (with Ely.by / mc-heads fallbacks) and caches it on disk per
+// uuid; the head is cropped here in the renderer. One cached head per uuid
+// is shared by every page (Home, Settings, Sidebar, Accounts), so the same
+// account can never show different faces on different screens. mc-heads'
+// /avatar endpoint is deliberately NOT used: it silently substitutes a
+// default Steve head when its own Mojang lookup fails.
+
+const playerHeadCache = new Map<string, string>();
+const playerHeadFailedAt = new Map<string, number>();
+const playerHeadInflight = new Set<string>();
+const playerHeadSubs = new Map<string, ((v: string | null) => void)[]>();
+const PLAYER_HEAD_RETRY_MS = 60_000;
+
+function requestPlayerHead(uuid: string) {
+  if (playerHeadInflight.has(uuid)) return;
+  const failedAt = playerHeadFailedAt.get(uuid);
+  if (failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS) {
+    setTimeout(() => {
+      (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(null));
+      playerHeadSubs.delete(uuid);
+    }, 0);
+    return;
+  }
+  playerHeadInflight.add(uuid);
+  invoke<string | null>('cmd_get_player_head', { uuid })
+    .then(async (skin) => {
+      const head = skin ? await headFromSkin(uuid, skin) : null;
+      if (head) {
+        playerHeadCache.set(uuid, head);
+        playerHeadFailedAt.delete(uuid);
+      } else {
+        playerHeadFailedAt.set(uuid, Date.now());
+      }
+      (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(head));
+    })
+    .catch(() => {
+      playerHeadFailedAt.set(uuid, Date.now());
+      (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(null));
+    })
+    .finally(() => {
+      playerHeadInflight.delete(uuid);
+      playerHeadSubs.delete(uuid);
+    });
+}
+
+function usePlayerHead(uuid: string | null | undefined): {
+  src: string | null;
+  status: 'ready' | 'loading' | 'failed';
+} {
+  const key = uuid ? uuid.replace(/-/g, '').toLowerCase() : null;
+  const [value, setValue] = useState<{ key: string; src: string | null } | null>(null);
+
+  useEffect(() => {
+    if (!key) return;
+
+    const cached = playerHeadCache.get(key);
+    if (cached) {
+      setValue({ key, src: cached });
+      return;
+    }
+
+    const failedAt = playerHeadFailedAt.get(key);
+    if (failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS) {
+      setValue({ key, src: null });
+      return;
+    }
+
+    let alive = true;
+    const subs = playerHeadSubs.get(key) ?? [];
+    subs.push((v) => {
+      if (alive) setValue({ key, src: v });
+    });
+    playerHeadSubs.set(key, subs);
+    requestPlayerHead(key);
+    return () => {
+      alive = false;
+    };
+  }, [key]);
+
+  if (!key) {
+    return { src: null, status: 'failed' };
+  }
+  const f = value && value.key === key ? value : null;
+  if (f) {
+    return f.src
+      ? { src: f.src, status: 'ready' }
+      : { src: null, status: 'failed' };
+  }
+  const cached = playerHeadCache.get(key);
+  if (cached) return { src: cached, status: 'ready' };
+  const failedAt = playerHeadFailedAt.get(key);
+  return {
+    src: null,
+    status:
+      failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS ? 'failed' : 'loading',
+  };
+}
 
 export function Avatar({
   uuid,
@@ -209,9 +308,8 @@ export function Avatar({
   className?: string;
   radius?: string;
 }) {
-  const url = `https://mc-heads.net/avatar/${uuid}/${size}`;
   const letter = (name?.trim().charAt(0) || '?').toUpperCase();
-  const { src, status, onError } = useRemoteImage(url);
+  const { src, status } = usePlayerHead(uuid);
 
   const containerStyle: React.CSSProperties = {
     width: size,
@@ -237,9 +335,8 @@ export function Avatar({
         src={src}
         alt={name}
         className={className}
-        style={{ ...containerStyle, borderRadius: radius, objectFit: 'cover' }}
+        style={{ ...containerStyle, borderRadius: radius, imageRendering: 'pixelated' }}
         loading="lazy"
-        onError={onError}
       />
     );
   }
