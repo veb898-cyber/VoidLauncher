@@ -1609,15 +1609,16 @@ select option {
 /* Content-sized dialog: grows to its content instead of capping at 85vh with
    an internal scrollbar. Still caps at the viewport (minus breathing room)
    so short windows fall back to a scrollbar instead of clipping. */
-/* Content-sized dialog: the width follows the content (a four-option loader
-   switcher needs more room than a short form) and, since the overlay centres
-   the dialog, any growth is split 50/50 between both sides. `min-width` keeps
-   form-only modes from collapsing to a narrow strip, `max-width` still caps it
-   on narrow windows. */
+/* Fixed-frame dialog (the create wizard): one stable width for the dialog's
+   whole lifetime, sized for the widest state — the four-loader switcher plus
+   long snapshot ids. A content-sized frame re-measured on every filter and
+   loader switch, so the dialog visibly resized while the user browsed
+   (owner: «неприятно видеть как постоянно меняется размер окна, пусть он
+   изначально будет достаточного размера, но не излишне большим»). Still
+   caps against the viewport so narrow windows keep their margins. */
 .modal--content {
-  width: fit-content;
-  min-width: min(560px, 90vw);
-  max-width: min(90vw, 800px);
+  width: min(92vw, 760px);
+  max-width: none;
 }
 
 .modal--fit {
@@ -2404,6 +2405,11 @@ select option {
 .version-list {
   max-height: 300px;
   overflow-y: auto;
+  /* Reserve the gutter even when the list fits: otherwise rows shift
+     sideways the moment a search narrows the list enough to drop the
+     scrollbar (the wizard's wells are fixed-height, so this only moves
+     the rows inside, never the dialog frame). */
+  scrollbar-gutter: stable;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -2480,6 +2486,13 @@ select option {
 
 .version-item__name {
   font-weight: 500;
+  /* Long ids ("3D Shareware v1.34", "1.7.10-10.13.4.1614-1.7.10") truncate
+     with an ellipsis instead of stretching the row: the wizard's fixed
+     columns and the fixed dialog frame must never be widened by content. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Tertiary grey is unreadable on the selected accent background — lift it to

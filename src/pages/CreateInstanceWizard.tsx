@@ -451,11 +451,13 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                   />
                   {/* Re-keyed on the filter so switching release/snapshot/all
                       fades the new rows in instead of swapping them silently.
-                      maxHeight tracks the viewport: the dialog itself must
-                      never need scrolling (owner: «убери… листать это меню,
-                      просто сделай чтобы помещалось») — the list shrinks on
-                      short windows and scrolls only inside itself. */}
-                  <div key={versionFilter} className="animate-content-reveal version-list" style={{ maxHeight: 'min(200px, max(64px, calc(85vh - 447px)))', overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
+                      The well has a fixed height (not maxHeight): the frame
+                      must not resize when the filter changes, the loader
+                      changes or the search narrows the list (owner:
+                      «неприятно видеть как постоянно меняется размер окна»).
+                      The height still tracks the viewport so short windows
+                      fit without the dialog itself needing to scroll. */}
+                  <div key={versionFilter} className="animate-content-reveal version-list" style={{ height: 'min(200px, max(64px, calc(85vh - 447px)))', overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
                     {versionsLoading ? (
                       Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} height={32} style={{ marginBottom: 2 }} />)
                     ) : (
@@ -465,6 +467,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                           type="button"
                           className={`version-item${selectedVersion === v.id ? ' version-item--selected' : ''}`}
                           aria-pressed={selectedVersion === v.id}
+                          title={v.id}
                           onClick={() => handleVersionSelect(v.id)}
                         >
                           <span className="version-item__name">{v.id}</span>
@@ -488,9 +491,14 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                     style={{ marginBottom: 'var(--space-sm)', borderBottom: 'none' }}
                   />
                   {loaderType !== 'Vanilla' && (
+                    /* Fixed-height well like the version list. `width: 0;
+                       min-width: 100%` keeps the well from contributing its
+                       intrinsic width to the `auto` grid column: the column
+                       stays sized by the switcher row, so long loader ids
+                       never widen it or squeeze the version column. */
                     <div key={`${loaderType}-${selectedVersion}`} ref={loaderListRef} onScroll={handleLoaderScroll}
                       className="animate-content-reveal version-list"
-                      style={{ maxHeight: 'min(168px, max(56px, calc(85vh - 447px)))', overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
+                      style={{ height: 'min(168px, max(56px, calc(85vh - 447px)))', width: 0, minWidth: '100%', overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
                       {loaderVersionsError ? (
                         <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
                           {t('create_instance.loader_versions_failed', { loader: loaderType })}
@@ -508,6 +516,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                               type="button"
                               className={`version-item${selectedLoaderVersion === lv.version ? ' version-item--selected' : ''}`}
                               aria-pressed={selectedLoaderVersion === lv.version}
+                              title={lv.version}
                               onClick={() => setSelectedLoaderVersion(lv.version)}
                             >
                               <span className="version-item__name">{lv.version}</span>
