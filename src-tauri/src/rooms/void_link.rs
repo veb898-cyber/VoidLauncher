@@ -172,13 +172,13 @@ pub async fn query_host_status(
         .no_proxy()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|e| crate::error::LauncherError::Network(e))?;
+        .map_err(crate::error::LauncherError::Network)?;
     let url = format!("http://{host_ip}:{port}/room/status?code={room_code}");
     let resp = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| crate::error::LauncherError::Network(e))?;
+        .map_err(crate::error::LauncherError::Network)?;
     if resp.status() != reqwest::StatusCode::OK {
         return Err(crate::error::LauncherError::Download(format!(
             "VoidLink: host returned {}",
@@ -207,22 +207,18 @@ pub async fn ensure_void_link_server(
     // Reconcile the current bridge OUTSIDE the await: no lock may be held
     // across `bind().await` (the Tauri command future must stay `Send`).
     {
-        let mut state = void_link_state()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut state = void_link_state().lock().unwrap_or_else(|e| e.into_inner());
         match state.as_mut() {
             Some(b) if b.ip == self_ip && !b.task.is_finished() => {
                 return Ok(());
             }
-            Some(b) => {
+            Some(b) if !b.task.is_finished() => {
                 // Stale bridge: bound to a previous IP, or the accept loop
                 // exited. Abort it so the old listener stops serving, then
                 // re-bind below.
-                if !b.task.is_finished() {
-                    b.task.abort();
-                }
+                b.task.abort();
             }
-            None => {}
+            _ => {}
         }
         *state = None;
     } // guard dropped here, before the await
@@ -245,9 +241,7 @@ pub async fn ensure_void_link_server(
     });
 
     // Own the bridge now that it is fully started.
-    let mut state = void_link_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut state = void_link_state().lock().unwrap_or_else(|e| e.into_inner());
     *state = Some(BridgeTask { ip: self_ip, task });
     Ok(())
 }
@@ -256,9 +250,7 @@ pub async fn ensure_void_link_server(
 /// room session; the next `ensure_void_link_server` binds a fresh listener on
 /// the current tailnet IP.
 pub fn stop_void_link_server() {
-    let mut state = void_link_state()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut state = void_link_state().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(b) = state.take() {
         if !b.task.is_finished() {
             b.task.abort();
@@ -308,8 +300,14 @@ mod tests {
 
     #[test]
     fn query_param_extracts_the_code() {
-        assert_eq!(query_param("code=ABCD-1234", "code").as_deref(), Some("ABCD-1234"));
-        assert_eq!(query_param("x=1&code=ABCD-1234&y=2", "code").as_deref(), Some("ABCD-1234"));
+        assert_eq!(
+            query_param("code=ABCD-1234", "code").as_deref(),
+            Some("ABCD-1234")
+        );
+        assert_eq!(
+            query_param("x=1&code=ABCD-1234&y=2", "code").as_deref(),
+            Some("ABCD-1234")
+        );
         assert_eq!(query_param("x=1", "code"), None);
         assert_eq!(query_param("", "code"), None);
     }

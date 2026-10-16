@@ -151,9 +151,9 @@ pub fn emit_log(app: &AppHandle, level: &str, source: &str, message: &str) {
     // doesn't lose the log line.
     match level {
         "error" => tracing::error!(target: "launcher", source = %source, "{}", message),
-        "warn"  => tracing::warn!(target: "launcher", source = %source, "{}", message),
+        "warn" => tracing::warn!(target: "launcher", source = %source, "{}", message),
         "debug" => tracing::debug!(target: "launcher", source = %source, "{}", message),
-        _       => tracing::info!(target: "launcher", source = %source, "{}", message),
+        _ => tracing::info!(target: "launcher", source = %source, "{}", message),
     }
 
     let _ = app.emit(
@@ -184,8 +184,8 @@ pub fn emit_log(app: &AppHandle, level: &str, source: &str, message: &str) {
 pub fn emit_launch_event(app: &AppHandle, level: &str, message: &str) {
     match level {
         "error" => tracing::error!(target: "launcher", source = "launch", "{}", message),
-        "warn"  => tracing::warn!(target: "launcher", source = "launch", "{}", message),
-        _       => tracing::info!(target: "launcher", source = "launch", "{}", message),
+        "warn" => tracing::warn!(target: "launcher", source = "launch", "{}", message),
+        _ => tracing::info!(target: "launcher", source = "launch", "{}", message),
     }
     let _ = app.emit(
         "log_message",

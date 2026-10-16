@@ -51,8 +51,7 @@ impl TailscaleManager {
         let exe = self
             .exe_path()
             .ok_or_else(|| LauncherError::Auth("Tailscale is not installed".into()))?;
-        let out = run_cli_output(&exe, &["status", "--json"])
-            .map_err(|e| LauncherError::Auth(e))?;
+        let out = run_cli_output(&exe, &["status", "--json"]).map_err(LauncherError::Auth)?;
         Self::parse_status(&out)
     }
 
@@ -63,20 +62,17 @@ impl TailscaleManager {
     /// (seen in real-world output) degrades gracefully instead of failing the
     /// status entirely and leaving the Rooms page stuck on setup.
     pub fn parse_status(json: &str) -> Result<TailscaleStatus> {
-        let root: serde_json::Value =
-            serde_json::from_str(json).map_err(LauncherError::Json)?;
+        let root: serde_json::Value = serde_json::from_str(json).map_err(LauncherError::Json)?;
         let field = |name: &str| root.get(name).cloned();
         Ok(TailscaleStatus {
             version: field("Version").and_then(|v| v.as_str().map(String::from)),
             backend_state: field("BackendState").and_then(|v| v.as_str().map(String::from)),
             auth_url: field("AuthURL").and_then(|v| v.as_str().map(String::from)),
-            current_tailnet: field("CurrentTailnet")
-                .and_then(|v| serde_json::from_value(v).ok()),
+            current_tailnet: field("CurrentTailnet").and_then(|v| serde_json::from_value(v).ok()),
             self_node: field("Self").and_then(|v| serde_json::from_value(v).ok()),
             peer: field("Peer"),
             user: field("User").and_then(|v| serde_json::from_value(v).ok()),
-            magic_dns_suffix: field("MagicDNSSuffix")
-                .and_then(|v| v.as_str().map(String::from)),
+            magic_dns_suffix: field("MagicDNSSuffix").and_then(|v| v.as_str().map(String::from)),
         })
     }
 
@@ -135,7 +131,11 @@ impl TailscaleManager {
     /// discovered peer, but the status UI needs a host to render
     /// port-found/endpoint state — this presents the machine itself.
     pub fn self_host_info(status: &TailscaleStatus) -> Option<HostInfo> {
-        status.self_node.as_ref().map(PeerInfo::from).map(|p| HostInfo::from_peer(&p))
+        status
+            .self_node
+            .as_ref()
+            .map(PeerInfo::from)
+            .map(|p| HostInfo::from_peer(&p))
     }
 
     /// Start the interactive login flow. Returns once `tailscale up` has
@@ -189,7 +189,7 @@ impl TailscaleManager {
         let client = crate::download::global_http_client()?;
         let body = crate::download::send_with_fallback(client.get(manifest_url))
             .await
-            .map_err(|e| LauncherError::Network(e))?
+            .map_err(LauncherError::Network)?
             .json::<serde_json::Value>()
             .await?;
 
@@ -216,10 +216,10 @@ impl TailscaleManager {
             progress(0.15, "Downloading installer");
             let bytes = crate::download::send_with_fallback(client.get(&msi_url))
                 .await
-                .map_err(|e| LauncherError::Network(e))?
+                .map_err(LauncherError::Network)?
                 .bytes()
                 .await
-                .map_err(|e| LauncherError::Network(e))?;
+                .map_err(LauncherError::Network)?;
             progress(0.7, "Saving installer");
             std::fs::write(&msi_path, &bytes)?;
         } else {
@@ -296,7 +296,13 @@ pub fn run_cli_output(exe: &Path, args: &[&str]) -> std::result::Result<String, 
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        Err(format!("{} exited {:?}: {}", exe.display(), out.status.code(), stderr.trim()).to_string())
+        Err(format!(
+            "{} exited {:?}: {}",
+            exe.display(),
+            out.status.code(),
+            stderr.trim()
+        )
+        .to_string())
     }
 }
 
@@ -386,7 +392,7 @@ async fn fetch_sha256(client: &reqwest::Client, msi_url: &str) -> Result<String>
     }
     let resp = crate::download::send_with_fallback(client.get(&sha_url))
         .await
-        .map_err(|e| LauncherError::Network(e))?;
+        .map_err(LauncherError::Network)?;
     if !resp.status().is_success() {
         return Err(LauncherError::Download(format!(
             "Failed to fetch Tailscale checksum (HTTP {}) from {}",
@@ -394,7 +400,7 @@ async fn fetch_sha256(client: &reqwest::Client, msi_url: &str) -> Result<String>
             sha_url
         )));
     }
-    let text = resp.text().await.map_err(|e| LauncherError::Network(e))?;
+    let text = resp.text().await.map_err(LauncherError::Network)?;
     parse_sha256(&text).ok_or_else(|| {
         LauncherError::Download(format!(
             "Malformed Tailscale SHA-256 from {}: {:?}",
@@ -440,8 +446,16 @@ pub fn sanitize_hostname(raw: &str) -> Result<String> {
         out = out.trim_end_matches('-').to_string();
     }
     if out.is_empty()
-        || out.chars().next().map(|c| !c.is_ascii_alphanumeric()).unwrap_or(true)
-        || out.chars().last().map(|c| !c.is_ascii_alphanumeric()).unwrap_or(true)
+        || out
+            .chars()
+            .next()
+            .map(|c| !c.is_ascii_alphanumeric())
+            .unwrap_or(true)
+        || out
+            .chars()
+            .last()
+            .map(|c| !c.is_ascii_alphanumeric())
+            .unwrap_or(true)
     {
         return Err(LauncherError::Auth("Invalid Tailscale hostname".into()));
     }
@@ -483,10 +497,11 @@ fn install_msi_silent(msi_path: &Path) -> Result<()> {
         // non-elevated process (typical: VoidLauncher not started as
         // administrator) the Tailscale per-machine MSI often fails with this
         // code, so give the user an actionable hint instead of a bare code.
-        Err(LauncherError::Launch(format!(
+        Err(LauncherError::Launch(
             "msiexec exited with code 1603 while installing Tailscale \
-             (installation requires administrator rights — run VoidLauncher as administrator)",
-        )))
+             (installation requires administrator rights — run VoidLauncher as administrator)"
+                .to_string(),
+        ))
     } else {
         Err(LauncherError::Launch(format!(
             "msiexec exited with code {} while installing Tailscale",
@@ -556,26 +571,26 @@ pub struct TailnetInfo {
 }
 
 /// A machine on the local tailnet (also used for the Self node).
-    ///
-    /// Only `node_key` is strictly required by real-world output; everything
-    /// else is optional. `NodeKey` is an identifier, never a connection
-    /// target — discovery resolves hosts by DNS name / tailnet IP — so a node
-    /// that omits it must not break the whole status document.
-    #[derive(Debug, Clone, Deserialize, Serialize)]
-    #[serde(rename_all = "PascalCase")]
-    pub struct PeerNode {
-        pub node_key: Option<String>,
-        pub host_name: Option<String>,
-        #[serde(rename = "DNSName")]
-        pub dns_name: Option<String>,
-        #[serde(rename = "TailscaleIPs")]
-        pub tailnet_ips: Option<Vec<String>>,
-        pub online: Option<bool>,
-        pub last_seen: Option<String>,
-        pub sharee_node: Option<bool>,
-        pub logged_in: Option<bool>,
-        pub user_id: Option<i64>,
-    }
+///
+/// Only `node_key` is strictly required by real-world output; everything
+/// else is optional. `NodeKey` is an identifier, never a connection
+/// target — discovery resolves hosts by DNS name / tailnet IP — so a node
+/// that omits it must not break the whole status document.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PeerNode {
+    pub node_key: Option<String>,
+    pub host_name: Option<String>,
+    #[serde(rename = "DNSName")]
+    pub dns_name: Option<String>,
+    #[serde(rename = "TailscaleIPs")]
+    pub tailnet_ips: Option<Vec<String>>,
+    pub online: Option<bool>,
+    pub last_seen: Option<String>,
+    pub sharee_node: Option<bool>,
+    pub logged_in: Option<bool>,
+    pub user_id: Option<i64>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -663,7 +678,10 @@ mod tests {
         assert_eq!(status.backend_state.as_deref(), Some("Running"));
         assert!(TailscaleManager::is_logged_in(&status));
         assert_eq!(TailscaleManager::auth_url(&status), None);
-        assert_eq!(TailscaleManager::self_ip(&status).as_deref(), Some("100.101.102.103"));
+        assert_eq!(
+            TailscaleManager::self_ip(&status).as_deref(),
+            Some("100.101.102.103")
+        );
         assert_eq!(
             TailscaleManager::magic_dns_suffix(&status).as_deref(),
             Some("tail3e2a10.ts.net")
@@ -849,7 +867,10 @@ mod tests {
     #[test]
     fn self_hostname_is_the_sanitized_machine_name() {
         let status = TailscaleManager::parse_status(STATUS_V2).unwrap();
-        assert_eq!(TailscaleManager::self_hostname(&status).as_deref(), Some("desktop-pc"));
+        assert_eq!(
+            TailscaleManager::self_hostname(&status).as_deref(),
+            Some("desktop-pc")
+        );
     }
 
     #[test]
@@ -935,7 +956,10 @@ mod tests {
         }
 
         let oversize = format!("tailscale-setup-{}-amd64.msi", "9".repeat(200));
-        assert!(validate_msi_filename(&oversize).is_err(), "must reject oversized name");
+        assert!(
+            validate_msi_filename(&oversize).is_err(),
+            "must reject oversized name"
+        );
 
         // An unsafe filename in the manifest is dropped, not returned.
         let body: serde_json::Value = serde_json::json!({
@@ -1002,7 +1026,11 @@ mod tests {
         let sha = fetch_sha256(&client, &url).await.expect("live sha256");
         assert_eq!(sha.len(), 64, "SHA-256 hex length for {}", url);
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
-        println!("[tailscale] live manifest -> {} (sha256 {}...)", url, &sha[..12]);
+        println!(
+            "[tailscale] live manifest -> {} (sha256 {}...)",
+            url,
+            &sha[..12]
+        );
     }
 
     /// Real-network, opt-in: a missing installer must surface a checksum

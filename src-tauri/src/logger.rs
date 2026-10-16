@@ -70,8 +70,8 @@ pub fn init(data_dir: &Path) {
         let subscriber = fmt::Subscriber::builder()
             .with_env_filter(filter)
             .with_writer(non_blocking)
-            .with_ansi(false)        // log file should be plain text
-            .with_target(true)       // include module path
+            .with_ansi(false) // log file should be plain text
+            .with_target(true) // include module path
             .with_thread_names(false)
             .with_level(true)
             .with_file(false)

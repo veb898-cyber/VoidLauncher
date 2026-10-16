@@ -56,7 +56,7 @@ fn validate_safe_folder_name(trimmed: &str, what: &str) -> Result<(), String> {
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
-    if RESERVED.iter().any(|r| *r == upper.as_str()) {
+    if RESERVED.contains(&upper.as_str()) {
         return Err(format!("'{}' is a reserved name.", trimmed));
     }
     // Allow any printable Unicode character (including Cyrillic, CJK, emoji)
@@ -67,17 +67,13 @@ fn validate_safe_folder_name(trimmed: &str, what: &str) -> Result<(), String> {
         if ch.is_control() {
             return Err(format!(
                 "{} contains a control character (U+{:04X}).",
-                what,
-                ch as u32
+                what, ch as u32
             ));
         }
         // Reject the few characters that are special on Windows filenames
         // even when escaped: < > : " | ? *
         if matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
-            return Err(format!(
-                "{} contains an invalid character: {:?}",
-                what, ch
-            ));
+            return Err(format!("{} contains an invalid character: {:?}", what, ch));
         }
     }
     Ok(())
@@ -91,7 +87,9 @@ pub(crate) fn validate_world_name(name: &str) -> Result<(), String> {
 // ==================== Instance Commands ====================
 
 #[tauri::command]
-pub async fn cmd_list_instances(state: State<'_, AppState>) -> Result<Vec<instances::Instance>, String> {
+pub async fn cmd_list_instances(
+    state: State<'_, AppState>,
+) -> Result<Vec<instances::Instance>, String> {
     let (instances_dir, data_dir) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         (config.instances_dir(), config.data_dir.clone())
@@ -135,7 +133,11 @@ pub async fn cmd_create_instance(
             default_memory_mb,
             &default_gc_preset,
             loader.clone(),
-            if loader == instances::LoaderType::Vanilla { None } else { loader_version },
+            if loader == instances::LoaderType::Vanilla {
+                None
+            } else {
+                loader_version
+            },
         );
         instances::create_instance(&instances_dir, &instance).map_err(|e| e.to_string())?;
         Ok(instance)
@@ -236,7 +238,7 @@ pub async fn cmd_import_prism_instance(
     if !zip.exists() || !zip.is_file() {
         return Err("Invalid zip path".to_string());
     }
-    if !zip.extension().map_or(false, |e| e == "zip") {
+    if zip.extension().is_none_or(|e| e != "zip") {
         return Err("File must be a .zip archive".to_string());
     }
     let instances_dir = {
@@ -522,8 +524,13 @@ pub async fn cmd_delete_world_backup(
         config.instances_dir()
     };
     tauri::async_runtime::spawn_blocking(move || {
-        instances::delete_world_backup(&instances_dir, &instance_name, &world_name, &backup_filename)
-            .map_err(|e| e.to_string())
+        instances::delete_world_backup(
+            &instances_dir,
+            &instance_name,
+            &world_name,
+            &backup_filename,
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -862,8 +869,8 @@ pub async fn cmd_get_instance_dir(
         config.instances_dir()
     };
     tauri::async_runtime::spawn_blocking(move || {
-        let instance = instances::get_instance(&instances_dir, &instance_name)
-            .map_err(|e| e.to_string())?;
+        let instance =
+            instances::get_instance(&instances_dir, &instance_name).map_err(|e| e.to_string())?;
         Ok(instance
             .minecraft_dir(&instances_dir)
             .to_string_lossy()
@@ -887,9 +894,7 @@ pub async fn cmd_check_instance_installed(
         let instance =
             instances::get_instance(&instances_dir, &instance_name).map_err(|e| e.to_string())?;
 
-        let version_jar = versions_dir
-            .join(&instance.mc_version)
-            .join("client.jar");
+        let version_jar = versions_dir.join(&instance.mc_version).join("client.jar");
         // Fallback: check for old {version}.jar
         if !version_jar.exists() {
             let old_jar = versions_dir

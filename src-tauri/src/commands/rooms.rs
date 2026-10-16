@@ -80,7 +80,7 @@ pub fn build_status(state: &State<'_, AppState>) -> RoomStatusPublic {
             if addr.is_empty() {
                 None
             } else {
-                Some(compose_endpoint(&addr, port))
+                Some(compose_endpoint(addr, port))
             }
         }
         _ => None,
@@ -117,20 +117,19 @@ pub async fn cmd_room_status(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RoomStatusPublic, String> {
-    if state.room_state.role() == RoomRole::Host {
-        if state.tailscale.is_installed() {
-            if let Ok(status) = state.tailscale.status() {
-                if TailscaleManager::is_logged_in(&status) {
-                    if let Some(ip) = TailscaleManager::self_ip(&status) {
-                        let _ = crate::rooms::void_link::ensure_void_link_server(
-                            ip,
-                            state.room_state.clone(),
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
+    let bridge_ip = if state.room_state.role() == RoomRole::Host && state.tailscale.is_installed() {
+        state
+            .tailscale
+            .status()
+            .ok()
+            .filter(TailscaleManager::is_logged_in)
+            .and_then(|status| TailscaleManager::self_ip(&status))
+    } else {
+        None
+    };
+    if let Some(ip) = bridge_ip {
+        let _ =
+            crate::rooms::void_link::ensure_void_link_server(ip, state.room_state.clone()).await;
     }
     let snap = build_status(&state);
     // Diagnostics: while Tailscale setup is stuck, surface the raw facts so
@@ -276,8 +275,8 @@ pub async fn cmd_room_create_host(
         }
     }
 
-    if let Err(e) = crate::rooms::void_link::ensure_void_link_server(self_ip, state.room_state.clone())
-        .await
+    if let Err(e) =
+        crate::rooms::void_link::ensure_void_link_server(self_ip, state.room_state.clone()).await
     {
         // The bridge failed to bind (e.g. port 48888 already in use): roll
         // the half-created room back so the launcher is not left in a Host
@@ -286,7 +285,11 @@ pub async fn cmd_room_create_host(
         return Err(e.to_string());
     }
 
-    events::emit_room_progress("ready", 1.0, "Room is ready — share the code with the guest.");
+    events::emit_room_progress(
+        "ready",
+        1.0,
+        "Room is ready — share the code with the guest.",
+    );
     Ok(build_status(&state))
 }
 
@@ -321,11 +324,7 @@ pub async fn cmd_room_join_guest(
     let data_dir = data_dir_of(&state);
     spawn_discovery_loop(app, room, data_dir);
 
-    events::emit_room_progress(
-        "discovering",
-        0.0,
-        "Looking for the host on the tailnet…",
-    );
+    events::emit_room_progress("discovering", 0.0, "Looking for the host on the tailnet…");
     Ok(build_status(&state))
 }
 
@@ -448,11 +447,7 @@ type DiscoverySnapshot = (Option<String>, bool, Option<u16>);
 
 /// Background task for the guest: poll the tailnet, resolve the host, read
 /// its Minecraft port over VoidLink, and notify the UI only on change.
-fn spawn_discovery_loop(
-    app: AppHandle,
-    room: Arc<RoomStateManager>,
-    data_dir: std::path::PathBuf,
-) {
+fn spawn_discovery_loop(app: AppHandle, room: Arc<RoomStateManager>, data_dir: std::path::PathBuf) {
     tokio::spawn(async move {
         let mut last: Option<DiscoverySnapshot> = None;
         loop {
@@ -493,12 +488,8 @@ async fn run_discovery_pass(
     let _ = room.set_host(Some(host.clone()));
     let mc_port = match host.ip() {
         Some(ip) if !code.is_empty() => {
-            match crate::rooms::void_link::query_host_status(
-                ip,
-                snapshot.void_link_port,
-                &code,
-            )
-            .await
+            match crate::rooms::void_link::query_host_status(ip, snapshot.void_link_port, &code)
+                .await
             {
                 Ok(st) => st.mc_port,
                 Err(_) => None,
@@ -538,7 +529,7 @@ async fn auto_login_and_open(app: &AppHandle, ts: &TailscaleManager) {
                         tracing::info!(target: "rooms", "Opened Tailscale login URL in the system browser");
                     } else {
                         events::emit_log(
-                            &app,
+                            app,
                             "warn",
                             "rooms",
                             "Could not open the Tailscale login URL automatically — use the Open login button.",
@@ -551,7 +542,7 @@ async fn auto_login_and_open(app: &AppHandle, ts: &TailscaleManager) {
         attempts += 1;
         if attempts >= 40 {
             events::emit_log(
-                &app,
+                app,
                 "warn",
                 "rooms",
                 "Tailscale login URL has not appeared yet — click 'Check connection' again.",
@@ -641,8 +632,9 @@ mod tests {
             role: RoomRole::Host,
             ..Default::default()
         };
-        assert!(
-            display_host_for(&room, Some(&TailscaleStatus {
+        assert!(display_host_for(
+            &room,
+            Some(&TailscaleStatus {
                 version: None,
                 backend_state: None,
                 auth_url: None,
@@ -651,8 +643,8 @@ mod tests {
                 peer: None,
                 user: None,
                 magic_dns_suffix: None,
-            }))
-            .is_none()
-        );
+            })
+        )
+        .is_none());
     }
 }

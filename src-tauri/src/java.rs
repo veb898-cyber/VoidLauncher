@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "windows")]
@@ -62,7 +62,11 @@ pub(crate) fn run_command_with_timeout(
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();
 
-    Ok(std::process::Output { status, stdout, stderr })
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Spawn a background thread that reads a piped stream to EOF and returns the
@@ -98,11 +102,11 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
     let mut checked_paths: Vec<PathBuf> = Vec::new();
 
     // Check common Java locations on Windows
-    let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
     let program_files_x86 =
         std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".into());
-    let local_app_data =
-        std::env::var("LOCALAPPDATA").unwrap_or_else(|_| String::new());
+    let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| String::new());
 
     let search_dirs = vec![
         format!("{}\\Java", program_files),
@@ -113,7 +117,10 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
         format!("{}\\Microsoft\\jdk", program_files),
         format!("{}\\BellSoft\\LibericaJDK", program_files),
         format!("{}\\Amazon Corretto", program_files),
-        format!("{}\\Packages\\Microsoft.4297127D64EC6_8wekyb3d8bbwe\\LocalCache\\Local\\runtime", local_app_data),
+        format!(
+            "{}\\Packages\\Microsoft.4297127D64EC6_8wekyb3d8bbwe\\LocalCache\\Local\\runtime",
+            local_app_data
+        ),
     ];
 
     for dir in &search_dirs {
@@ -167,13 +174,13 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
     }
 
     // Sort by major version descending
-    installations.sort_by(|a, b| b.major_version.cmp(&a.major_version));
+    installations.sort_by_key(|b| std::cmp::Reverse(b.major_version));
     installations
 }
 
 /// Probe a Java executable to get version info.
 /// Skips files smaller than 10KB (MSI stubs / broken installations).
-pub fn probe_java_by_path(path: &PathBuf) -> Option<JavaInstallation> {
+pub fn probe_java_by_path(path: &Path) -> Option<JavaInstallation> {
     // Skip tiny executables — real java.exe is 30KB+, MSI stubs are ~10-50KB
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() < 10_000 {
@@ -186,10 +193,7 @@ pub fn probe_java_by_path(path: &PathBuf) -> Option<JavaInstallation> {
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let output = match run_command_with_timeout(
-        &mut cmd,
-        std::time::Duration::from_secs(20),
-    ) {
+    let output = match run_command_with_timeout(&mut cmd, std::time::Duration::from_secs(20)) {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(target: "launcher", "Failed to run java -version at {:?}: {}", path, e);
@@ -224,7 +228,7 @@ pub fn probe_java_by_path(path: &PathBuf) -> Option<JavaInstallation> {
     let vendor = parse_vendor(&version_output);
 
     Some(JavaInstallation {
-        path: path.clone(),
+        path: path.to_path_buf(),
         version,
         major_version: major,
         is_64bit,

@@ -1,9 +1,10 @@
-use serde::{Deserialize, Serialize};
 use crate::content;
 use crate::error::{LauncherError, Result};
 use crate::instances::{self, Instance, LoaderType};
 use crate::modrinth;
 use crate::modrinth::ModrinthFile;
+use futures::future::join_all;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Semaphore;
-use futures::future::join_all;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum ModpackFormat {
@@ -39,25 +39,37 @@ pub struct ImportProgressPayload {
     pub message: String,
 }
 
-fn emit_progress(app: Option<&AppHandle>, stage: &str, current: usize, total: usize, message: &str) {
+fn emit_progress(
+    app: Option<&AppHandle>,
+    stage: &str,
+    current: usize,
+    total: usize,
+    message: &str,
+) {
     if let Some(app) = app {
-        let _ = app.emit("import-progress", ImportProgressPayload {
-            stage: stage.to_string(),
-            current,
-            total,
-            message: message.to_string(),
-        });
+        let _ = app.emit(
+            "import-progress",
+            ImportProgressPayload {
+                stage: stage.to_string(),
+                current,
+                total,
+                message: message.to_string(),
+            },
+        );
     }
 }
 
 /// Reject zip slip: ".." components, absolute paths and drive prefixes.
 pub(crate) fn check_safe_relative(relative: &str) -> Result<()> {
     if relative.contains('\0') {
-        return Err(LauncherError::Instance("Null byte in zip entry path".into()));
+        return Err(LauncherError::Instance(
+            "Null byte in zip entry path".into(),
+        ));
     }
     if Path::new(relative).is_absolute() {
         return Err(LauncherError::Instance(format!(
-            "Absolute path in zip entry: {}", relative
+            "Absolute path in zip entry: {}",
+            relative
         )));
     }
     let normalised = relative.replace('\\', "/");
@@ -65,20 +77,23 @@ pub(crate) fn check_safe_relative(relative: &str) -> Result<()> {
     // but still escape the base when joined.
     if normalised.starts_with('/') {
         return Err(LauncherError::Instance(format!(
-            "Rooted path in zip entry: {}", relative
+            "Rooted path in zip entry: {}",
+            relative
         )));
     }
     let mut first_component = true;
     for component in normalised.split('/') {
         if component == ".." {
             return Err(LauncherError::Instance(format!(
-                "Path traversal detected in zip entry: {}", relative
+                "Path traversal detected in zip entry: {}",
+                relative
             )));
         }
         // "C:foo" / "C:/foo" style drive-relative paths must not escape base.
         if first_component && component.contains(':') {
             return Err(LauncherError::Instance(format!(
-                "Drive prefix in zip entry: {}", relative
+                "Drive prefix in zip entry: {}",
+                relative
             )));
         }
         first_component = false;
@@ -96,7 +111,8 @@ pub(crate) fn write_extracted(base: &Path, entry_name: &str, reader: &mut dyn Re
     // (Path::join replaces base on absolute/drive-relative paths).
     if !target.starts_with(base) {
         return Err(LauncherError::Instance(format!(
-            "Zip entry escapes extraction directory: {}", entry_name
+            "Zip entry escapes extraction directory: {}",
+            entry_name
         )));
     }
     if let Some(parent) = target.parent() {
@@ -163,7 +179,9 @@ pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LauncherError::Instance(e.to_string()))?;
         let entry_name = entry.name().to_string();
         if entry.is_dir() {
             continue;
@@ -175,14 +193,13 @@ pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
 
 /// Client-side import: skip files marked client=unsupported (server-only).
 pub(crate) fn mrpack_client_required(file_entry: &serde_json::Value) -> bool {
-    match file_entry
-        .get("env")
-        .and_then(|e| e.get("client"))
-        .and_then(|c| c.as_str())
-    {
-        Some("unsupported") => false,
-        _ => true,
-    }
+    !matches!(
+        file_entry
+            .get("env")
+            .and_then(|e| e.get("client"))
+            .and_then(|c| c.as_str()),
+        Some("unsupported")
+    )
 }
 
 fn pick_modrinth_file<'a>(
@@ -274,13 +291,8 @@ async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> 
 }
 
 fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) {
-    let filename = dest_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    let stem = filename
-        .trim_end_matches(".jar")
-        .trim_end_matches(".zip");
+    let filename = dest_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let stem = filename.trim_end_matches(".jar").trim_end_matches(".zip");
     let sidecar = serde_json::json!({
         "provider": "modrinth",
         "project_id": file_entry["project_id"].as_str(),
@@ -292,7 +304,9 @@ fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) {
         "downloaded_from_mrpack": true,
     });
     if let Some(parent) = dest_path.parent() {
-        let sidecar_path = parent.join(".index").join(format!("{}.voidlauncher.json", stem));
+        let sidecar_path = parent
+            .join(".index")
+            .join(format!("{}.voidlauncher.json", stem));
         if let Some(index_dir) = sidecar_path.parent() {
             let _ = std::fs::create_dir_all(index_dir);
         }
@@ -306,7 +320,9 @@ fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) {
 /// escape the instance directory.
 fn mrpack_dest(mc_dir: &Path, path_str: &str) -> Result<PathBuf> {
     if path_str.is_empty() {
-        return Err(LauncherError::Instance("Missing path in mrpack file entry".into()));
+        return Err(LauncherError::Instance(
+            "Missing path in mrpack file entry".into(),
+        ));
     }
     check_safe_relative(path_str)?;
     let dest_path = mc_dir.join(path_str);
@@ -324,7 +340,7 @@ fn mrpack_dest(mc_dir: &Path, path_str: &str) -> Result<PathBuf> {
 pub(crate) async fn install_mrpack_file(
     path_str: &str,
     file_entry: &serde_json::Value,
-    mc_dir: &PathBuf,
+    mc_dir: &Path,
     embedded: &Arc<HashMap<String, Vec<u8>>>,
     with_sidecar: bool,
 ) -> Result<()> {
@@ -406,9 +422,8 @@ pub(crate) fn extract_mrpack_override(entry_name: &str) -> Option<&str> {
 pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
     // File-backed archive: no need to load potentially multi-hundred-MB packs
     // into memory just to read the manifest entries.
-    let file = std::fs::File::open(path).map_err(|e| {
-        LauncherError::Instance(format!("Cannot read file: {}", e))
-    })?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| LauncherError::Instance(format!("Cannot read file: {}", e)))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| LauncherError::Instance(format!("Invalid archive: {}", e)))?;
 
@@ -427,7 +442,8 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
                 }
             }
         }
-        let name = cfg.lines()
+        let name = cfg
+            .lines()
             .find_map(|l| l.trim().strip_prefix("name="))
             .unwrap_or("imported")
             .to_string();
@@ -455,8 +471,11 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         if let Ok(index) = serde_json::from_str::<serde_json::Value>(&index_str) {
             let name = index["name"].as_str().unwrap_or("imported").to_string();
             let summary = index["summary"].as_str().map(|s| s.to_string());
-            let mc_version = index["dependencies"]["minecraft"].as_str().map(|s| s.to_string());
-            let loader = index["dependencies"].as_object()
+            let mc_version = index["dependencies"]["minecraft"]
+                .as_str()
+                .map(|s| s.to_string());
+            let loader = index["dependencies"]
+                .as_object()
                 .and_then(|d| d.keys().find(|k| *k != "minecraft"))
                 .cloned();
             return Ok(ModpackMetadata {
@@ -484,7 +503,9 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str) {
             let name = manifest["name"].as_str().unwrap_or("imported").to_string();
             let summary = manifest["overrides"].as_str().map(|s| s.to_string());
-            let mc_version = manifest["minecraft"]["version"].as_str().map(|s| s.to_string());
+            let mc_version = manifest["minecraft"]["version"]
+                .as_str()
+                .map(|s| s.to_string());
             let loaders = manifest["minecraft"]["modLoaders"].as_array();
             let (loader, loader_version) = loaders
                 .and_then(|arr| arr.first())
@@ -518,10 +539,12 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         }
         if let Ok(inst) = serde_json::from_str::<serde_json::Value>(&inst_str) {
             let name = inst["name"].as_str().unwrap_or("imported").to_string();
-            let mc = inst["minecraftVersion"].as_str()
-                .or_else(|| inst["component"].as_array()
+            let mc = inst["minecraftVersion"].as_str().or_else(|| {
+                inst["component"]
+                    .as_array()
                     .and_then(|c| c.iter().find(|x| x["type"] == "minecraft"))
-                    .and_then(|x| x["version"].as_str()));
+                    .and_then(|x| x["version"].as_str())
+            });
             return Ok(ModpackMetadata {
                 format: ModpackFormat::ATLauncher,
                 name,
@@ -540,7 +563,7 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
 
 /// Import a modpack into the instances directory
 pub async fn import_modpack(
-    instances_dir: &PathBuf,
+    instances_dir: &Path,
     path: &str,
     instance_name: &str,
     curseforge_api_key: &str,
@@ -573,32 +596,38 @@ pub async fn import_modpack(
     };
 
     let instance = match format {
-        ModpackFormat::Prism => import_with_cleanup(
-            instances_dir,
-            instance_name,
-            || async { instances::import_prism_pack(instances_dir, path) },
-        )
-        .await?,
-        ModpackFormat::Modrinth => import_with_cleanup(
-            instances_dir,
-            instance_name,
-            || async { import_mrpack(instances_dir, path, instance_name, app).await },
-        )
-        .await?,
-        ModpackFormat::CurseForge => import_with_cleanup(
-            instances_dir,
-            instance_name,
-            || async {
-                import_curseforge_pack(instances_dir, path, instance_name, curseforge_api_key, libraries_dir, app).await
-            },
-        )
-        .await?,
-        ModpackFormat::ATLauncher => import_with_cleanup(
-            instances_dir,
-            instance_name,
-            || async { import_atlauncher_pack(instances_dir, path, instance_name) },
-        )
-        .await?,
+        ModpackFormat::Prism => {
+            import_with_cleanup(instances_dir, instance_name, || async {
+                instances::import_prism_pack(instances_dir, path)
+            })
+            .await?
+        }
+        ModpackFormat::Modrinth => {
+            import_with_cleanup(instances_dir, instance_name, || async {
+                import_mrpack(instances_dir, path, instance_name, app).await
+            })
+            .await?
+        }
+        ModpackFormat::CurseForge => {
+            import_with_cleanup(instances_dir, instance_name, || async {
+                import_curseforge_pack(
+                    instances_dir,
+                    path,
+                    instance_name,
+                    curseforge_api_key,
+                    libraries_dir,
+                    app,
+                )
+                .await
+            })
+            .await?
+        }
+        ModpackFormat::ATLauncher => {
+            import_with_cleanup(instances_dir, instance_name, || async {
+                import_atlauncher_pack(instances_dir, path, instance_name)
+            })
+            .await?
+        }
     };
 
     emit_progress(app, "done", 1, 1, "Import complete!");
@@ -612,7 +641,7 @@ pub async fn import_modpack(
 /// A directory is only removed when it did NOT exist before the import — a
 /// re-import over an existing instance must not wipe the previous good copy.
 async fn import_with_cleanup<F, Fut>(
-    instances_dir: &PathBuf,
+    instances_dir: &Path,
     instance_name: &str,
     importer: F,
 ) -> Result<Instance>
@@ -637,7 +666,7 @@ where
 
 /// Import a Modrinth .mrpack
 pub(crate) async fn import_mrpack(
-    instances_dir: &PathBuf,
+    instances_dir: &Path,
     path: &str,
     instance_name: &str,
     app: Option<&AppHandle>,
@@ -651,7 +680,9 @@ pub(crate) async fn import_mrpack(
     let mut index_str = String::new();
     let mut found = false;
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LauncherError::Instance(e.to_string()))?;
         if entry.name() == "modrinth.index.json" {
             entry.read_to_string(&mut index_str).ok();
             found = true;
@@ -659,11 +690,18 @@ pub(crate) async fn import_mrpack(
         }
     }
     if !found {
-        return Err(LauncherError::Instance("Missing modrinth.index.json".to_string()));
+        return Err(LauncherError::Instance(
+            "Missing modrinth.index.json".to_string(),
+        ));
     }
     let index: serde_json::Value = serde_json::from_str(&index_str)?;
-    let mc_version = index["dependencies"]["minecraft"].as_str()
-        .ok_or_else(|| LauncherError::Instance("Missing minecraft dependency in modrinth.index.json".to_string()))?
+    let mc_version = index["dependencies"]["minecraft"]
+        .as_str()
+        .ok_or_else(|| {
+            LauncherError::Instance(
+                "Missing minecraft dependency in modrinth.index.json".to_string(),
+            )
+        })?
         .to_string();
 
     let target_dir = instances_dir.join(instance_name);
@@ -678,7 +716,9 @@ pub(crate) async fn import_mrpack(
     let mut extracted_any = false;
     let mut embedded: HashMap<String, Vec<u8>> = HashMap::new();
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LauncherError::Instance(e.to_string()))?;
         let entry_name = entry.name().to_string();
 
         if entry_name == "modrinth.index.json" || entry_name.starts_with("overrides-server/") {
@@ -724,10 +764,7 @@ pub(crate) async fn import_mrpack(
 
     // Install files listed in modrinth.index.json (embedded, overrides, or download)
     let files = index["files"].as_array().cloned().unwrap_or_default();
-    let client_files: Vec<_> = files
-        .iter()
-        .filter(|f| mrpack_client_required(f))
-        .collect();
+    let client_files: Vec<_> = files.iter().filter(|f| mrpack_client_required(f)).collect();
     let total = client_files.len();
     let mod_count = client_files
         .iter()
@@ -825,7 +862,10 @@ pub(crate) async fn import_mrpack(
     }
 
     // Detect loader from dependencies
-    let deps = index["dependencies"].as_object().cloned().unwrap_or_default();
+    let deps = index["dependencies"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
     let (loader, loader_version) = detect_mrpack_loader(&deps);
     let ldr_type = mrpack_loader_type(loader.as_deref())?;
 
@@ -856,7 +896,7 @@ pub(crate) async fn import_mrpack(
 
 /// Import a CurseForge modpack
 pub(crate) async fn import_curseforge_pack(
-    instances_dir: &PathBuf,
+    instances_dir: &Path,
     path: &str,
     instance_name: &str,
     curseforge_api_key: &str,
@@ -872,7 +912,9 @@ pub(crate) async fn import_curseforge_pack(
     let mut manifest_str = String::new();
     let mut found = false;
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LauncherError::Instance(e.to_string()))?;
         if entry.name() == "manifest.json" {
             entry.read_to_string(&mut manifest_str).ok();
             found = true;
@@ -883,11 +925,15 @@ pub(crate) async fn import_curseforge_pack(
         return Err(LauncherError::Instance("Missing manifest.json".to_string()));
     }
     let manifest: serde_json::Value = serde_json::from_str(&manifest_str)?;
-    let mc_version = manifest["minecraft"]["version"].as_str()
-        .ok_or_else(|| LauncherError::Instance("Missing minecraft version in manifest.json".to_string()))?
+    let mc_version = manifest["minecraft"]["version"]
+        .as_str()
+        .ok_or_else(|| {
+            LauncherError::Instance("Missing minecraft version in manifest.json".to_string())
+        })?
         .to_string();
 
-    let (loader, loader_version) = manifest["minecraft"]["modLoaders"].as_array()
+    let (loader, loader_version) = manifest["minecraft"]["modLoaders"]
+        .as_array()
         .and_then(|arr| {
             arr.iter()
                 .find(|v| v["primary"].as_bool().unwrap_or(false))
@@ -916,13 +962,19 @@ pub(crate) async fn import_curseforge_pack(
 
     // Extract overrides/ with path traversal protection
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LauncherError::Instance(e.to_string()))?;
         let entry_name = entry.name().to_string();
 
-        if entry_name == "manifest.json" { continue; }
+        if entry_name == "manifest.json" {
+            continue;
+        }
 
         if let Some(relative) = entry_name.strip_prefix("overrides/") {
-            if relative.is_empty() { continue; }
+            if relative.is_empty() {
+                continue;
+            }
             check_safe_relative(relative)?;
 
             if entry.is_dir() {
@@ -947,7 +999,13 @@ pub(crate) async fn import_curseforge_pack(
         let mut skipped = 0usize;
 
         // Initial progress
-        emit_progress(app, "downloading-mods", 0, total, &format!("Preparing {} mods...", total));
+        emit_progress(
+            app,
+            "downloading-mods",
+            0,
+            total,
+            &format!("Preparing {} mods...", total),
+        );
 
         for file_entry in files {
             let project_id = file_entry["projectID"].as_u64();
@@ -1087,8 +1145,7 @@ pub(crate) async fn import_curseforge_pack(
             };
             let mut msg = format!(
                 "CurseForge import incomplete: {} installed, {} failed to download",
-                ok,
-                download_failed,
+                ok, download_failed,
             );
             if skipped > 0 {
                 msg.push_str(&format!(", {} skipped (missing IDs in manifest)", skipped));
@@ -1134,14 +1191,20 @@ pub(crate) async fn import_curseforge_pack(
 }
 
 /// Import an ATLauncher instance
-fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &str) -> Result<Instance> {
+fn import_atlauncher_pack(
+    instances_dir: &Path,
+    path: &str,
+    instance_name: &str,
+) -> Result<Instance> {
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
 
     // Read instance.json for metadata
     let mut inst_str = String::new();
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LauncherError::Instance(e.to_string()))?;
         if entry.name() == "instance.json" {
             entry.read_to_string(&mut inst_str).ok();
             break;
@@ -1150,10 +1213,14 @@ fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &s
 
     let mc_version;
     if let Ok(inst) = serde_json::from_str::<serde_json::Value>(&inst_str) {
-        mc_version = inst["minecraftVersion"].as_str()
-            .or_else(|| inst["component"].as_array()
-                .and_then(|c| c.iter().find(|x| x["type"] == "minecraft"))
-                .and_then(|x| x["version"].as_str()))
+        mc_version = inst["minecraftVersion"]
+            .as_str()
+            .or_else(|| {
+                inst["component"]
+                    .as_array()
+                    .and_then(|c| c.iter().find(|x| x["type"] == "minecraft"))
+                    .and_then(|x| x["version"].as_str())
+            })
             .unwrap_or("1.20.1")
             .to_string();
     } else {
@@ -1166,9 +1233,13 @@ fn import_atlauncher_pack(instances_dir: &PathBuf, path: &str, instance_name: &s
 
     // Extract all files with path traversal protection
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| LauncherError::Instance(e.to_string()))?;
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LauncherError::Instance(e.to_string()))?;
         let entry_name = entry.name().to_string();
-        if entry_name == "instance.json" || entry.is_dir() { continue; }
+        if entry_name == "instance.json" || entry.is_dir() {
+            continue;
+        }
         check_safe_relative(&entry_name)?;
 
         write_extracted(&mc_dir, &entry_name, &mut entry)?;
@@ -1224,10 +1295,16 @@ pub(crate) fn mrpack_loader_type(loader: Option<&str>) -> Result<LoaderType> {
 pub(crate) fn detect_mrpack_loader(
     deps: &serde_json::Map<String, serde_json::Value>,
 ) -> (Option<String>, Option<String>) {
-    let loader = ["neoforge", "forge", "fabric-loader", "fabric", "quilt-loader"]
-        .iter()
-        .find(|k| deps.contains_key(**k))
-        .map(|s| s.to_string());
+    let loader = [
+        "neoforge",
+        "forge",
+        "fabric-loader",
+        "fabric",
+        "quilt-loader",
+    ]
+    .iter()
+    .find(|k| deps.contains_key(**k))
+    .map(|s| s.to_string());
     let version = loader
         .as_ref()
         .and_then(|l| deps.get(l))
@@ -1302,9 +1379,18 @@ mod tests {
             mrpack_loader_type(Some("fabric-loader")).unwrap(),
             LoaderType::Fabric
         );
-        assert_eq!(mrpack_loader_type(Some("fabric")).unwrap(), LoaderType::Fabric);
-        assert_eq!(mrpack_loader_type(Some("forge")).unwrap(), LoaderType::Forge);
-        assert_eq!(mrpack_loader_type(Some("neoforge")).unwrap(), LoaderType::NeoForge);
+        assert_eq!(
+            mrpack_loader_type(Some("fabric")).unwrap(),
+            LoaderType::Fabric
+        );
+        assert_eq!(
+            mrpack_loader_type(Some("forge")).unwrap(),
+            LoaderType::Forge
+        );
+        assert_eq!(
+            mrpack_loader_type(Some("neoforge")).unwrap(),
+            LoaderType::NeoForge
+        );
     }
 
     #[test]
@@ -1379,8 +1465,7 @@ mod tests {
 
     fn temp_probe_zip(name: &str, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
         use std::io::Write;
-        let path =
-            std::env::temp_dir().join(format!("vl_probe_{}_{}", std::process::id(), name));
+        let path = std::env::temp_dir().join(format!("vl_probe_{}_{}", std::process::id(), name));
         let file = std::fs::File::create(&path).unwrap();
         let mut zw = zip::ZipWriter::new(file);
         let opts = zip::write::SimpleFileOptions::default()

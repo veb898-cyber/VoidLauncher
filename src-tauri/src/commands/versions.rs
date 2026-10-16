@@ -1,13 +1,12 @@
-﻿// ==================== Version Commands ====================
+// ==================== Version Commands ====================
 // Version manifest/info and Java management commands.
 
+use crate::is_allowed_download_host;
 use crate::java;
 use crate::java_download;
-use crate::is_allowed_download_host;
 use crate::versions;
 use crate::AppState;
 use tauri::{AppHandle, State};
-
 
 #[tauri::command]
 pub async fn cmd_get_versions() -> Result<versions::VersionManifest, String> {
@@ -29,7 +28,9 @@ pub async fn cmd_get_version_info(url: String) -> Result<versions::VersionInfo, 
 // ==================== Java Commands ====================
 
 #[tauri::command]
-pub async fn cmd_detect_java(state: State<'_, AppState>) -> Result<Vec<java::JavaInstallation>, String> {
+pub async fn cmd_detect_java(
+    state: State<'_, AppState>,
+) -> Result<Vec<java::JavaInstallation>, String> {
     let data_dir = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.data_dir.clone()
@@ -86,15 +87,16 @@ pub async fn cmd_list_managed_java(
             Err(_) => return Ok(Vec::new()),
         }
     };
-    Ok(tauri::async_runtime::spawn_blocking(move || {
-        java_download::list_managed_java(&data_dir)
-    })
-    .await
-    .map_err(|e| e.to_string())?)
+    tauri::async_runtime::spawn_blocking(move || java_download::list_managed_java(&data_dir))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn cmd_remove_managed_java(state: State<'_, AppState>, major_version: u32) -> Result<(), String> {
+pub async fn cmd_remove_managed_java(
+    state: State<'_, AppState>,
+    major_version: u32,
+) -> Result<(), String> {
     let data_dir = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.data_dir.clone()

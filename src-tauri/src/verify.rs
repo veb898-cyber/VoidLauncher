@@ -18,7 +18,7 @@ use crate::instances::{self, Instance, LoaderType};
 use crate::modloaders;
 use crate::versions::{self, VersionInfo};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
 /// Maximum number of individual issues listed per category in the report
@@ -117,7 +117,10 @@ fn loader_type_str(loader: &LoaderType) -> &'static str {
     }
 }
 
-pub(crate) fn load_local_version_info(versions_dir: &PathBuf, mc_version: &str) -> Option<VersionInfo> {
+pub(crate) fn load_local_version_info(
+    versions_dir: &Path,
+    mc_version: &str,
+) -> Option<VersionInfo> {
     let path = versions_dir
         .join(mc_version)
         .join(format!("{}.json", mc_version));
@@ -128,12 +131,14 @@ pub(crate) fn load_local_version_info(versions_dir: &PathBuf, mc_version: &str) 
 /// Scan user-managed content directories for files that are not valid
 /// ZIP/JAR archives. Read-only: never modifies. `dirs` selects which of
 /// `mods` / `resourcepacks` / `shaderpacks` to inspect.
-fn scan_content(instances_dir: &PathBuf, instance: &Instance, dirs: &[&str]) -> Vec<VerifyIssue> {
+fn scan_content(instances_dir: &Path, instance: &Instance, dirs: &[&str]) -> Vec<VerifyIssue> {
     let mut issues = Vec::new();
     let mc_dir = instance.minecraft_dir(instances_dir);
     for dir_name in dirs {
         let dir = mc_dir.join(dir_name);
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -159,12 +164,7 @@ fn scan_content(instances_dir: &PathBuf, instance: &Instance, dirs: &[&str]) -> 
     issues
 }
 
-fn check_library_file(
-    cat: &mut CategoryBuilder,
-    path: &PathBuf,
-    sha1: &str,
-    display: &str,
-) {
+fn check_library_file(cat: &mut CategoryBuilder, path: &Path, sha1: &str, display: &str) {
     cat.checked += 1;
     if !path.exists() {
         cat.add_issue(display, "missing", true);
@@ -228,6 +228,7 @@ fn content_only_report(config: &AppConfig, instance: &Instance, dirs: &[&str]) -
 
 /// Offline verification of a single instance against its locally stored
 /// version metadata. Never touches the network and never modifies files.
+#[cfg(test)]
 pub fn verify_instance(config: &AppConfig, instance: &Instance) -> VerifyReport {
     verify_instance_scoped(config, instance, VerifyScope::All)
 }
@@ -258,13 +259,19 @@ pub fn verify_instance_scoped(
         .join(format!("{}.json", instance.mc_version));
     if !version_json.exists() {
         metadata.add_issue(
-            format!("versions/{}/{}.json", instance.mc_version, instance.mc_version),
+            format!(
+                "versions/{}/{}.json",
+                instance.mc_version, instance.mc_version
+            ),
             "missing",
             true,
         );
     } else if version_info.is_none() {
         metadata.add_issue(
-            format!("versions/{}/{}.json", instance.mc_version, instance.mc_version),
+            format!(
+                "versions/{}/{}.json",
+                instance.mc_version, instance.mc_version
+            ),
             "corrupt",
             true,
         );
@@ -274,9 +281,7 @@ pub fn verify_instance_scoped(
     // ── minecraft (client JAR) ──────────────────────────────────
     let mut minecraft = CategoryBuilder::new("minecraft");
     minecraft.checked = 1;
-    let client_path = versions_dir
-        .join(&instance.mc_version)
-        .join("client.jar");
+    let client_path = versions_dir.join(&instance.mc_version).join("client.jar");
     let legacy_path = versions_dir
         .join(&instance.mc_version)
         .join(format!("{}.jar", instance.mc_version));
@@ -284,7 +289,8 @@ pub fn verify_instance_scoped(
     if client_path.exists() {
         if let Some(vi) = &version_info {
             let expected = vi.downloads.client.sha1.as_str();
-            if !expected.is_empty() && download::verify_sha1(&client_path, expected).ok() == Some(false)
+            if !expected.is_empty()
+                && download::verify_sha1(&client_path, expected).ok() == Some(false)
             {
                 minecraft.add_issue(&client_display, "corrupt", true);
             }
@@ -482,8 +488,11 @@ pub fn verify_instance_scoped(
     let mut categories = vec![metadata, minecraft, libraries, assets, loader, java];
     let mut content_issues_count = 0;
     if scope == VerifyScope::All {
-        let content_issues =
-            scan_content(&instances_dir, instance, &["mods", "resourcepacks", "shaderpacks"]);
+        let content_issues = scan_content(
+            &instances_dir,
+            instance,
+            &["mods", "resourcepacks", "shaderpacks"],
+        );
         content_issues_count = content_issues.len() as u32;
         categories.push(VerifyCategory {
             id: "content".to_string(),
@@ -511,15 +520,13 @@ pub fn verify_instance_scoped(
 /// verification, as `(url, path, sha1, size)` tuples for `download_file`.
 fn collect_repair_targets(
     version_info: &VersionInfo,
-    libraries_dir: &PathBuf,
-    versions_dir: &PathBuf,
+    libraries_dir: &Path,
+    versions_dir: &Path,
 ) -> Vec<(String, PathBuf, String, u64)> {
     let mut targets = Vec::new();
 
     // Client JAR (legacy `{mc}.jar` counts as present — renamed below).
-    let client_path = versions_dir
-        .join(&version_info.id)
-        .join("client.jar");
+    let client_path = versions_dir.join(&version_info.id).join("client.jar");
     let legacy_path = versions_dir
         .join(&version_info.id)
         .join(format!("{}.jar", version_info.id));
@@ -664,14 +671,20 @@ pub async fn repair_instance(
             let p = libraries_dir.join(&llib.path);
             let sha1 = llib.sha1.clone().unwrap_or_default();
             let ok = p.exists()
-                && (sha1.is_empty()
-                    || download::verify_sha1(&p, &sha1).ok() == Some(true));
+                && (sha1.is_empty() || download::verify_sha1(&p, &sha1).ok() == Some(true));
             if !ok {
                 if llib.url.is_empty() {
                     summary.failed += 1;
-                    summary.errors.push(format!("No download URL for {}", llib.path));
+                    summary
+                        .errors
+                        .push(format!("No download URL for {}", llib.path));
                 } else {
-                    targets.push((format!("{}{}", llib.url, llib.path), p, sha1, llib.size.unwrap_or(0)));
+                    targets.push((
+                        format!("{}{}", llib.url, llib.path),
+                        p,
+                        sha1,
+                        llib.size.unwrap_or(0),
+                    ));
                 }
             }
         }
@@ -745,9 +758,7 @@ pub async fn repair_instance(
         let missing_before = index
             .objects
             .values()
-            .filter(|o| {
-                o.hash.len() >= 2 && !objects_dir.join(&o.hash[..2]).join(&o.hash).exists()
-            })
+            .filter(|o| o.hash.len() >= 2 && !objects_dir.join(&o.hash[..2]).join(&o.hash).exists())
             .count();
         match download::download_assets(index, &assets_dir, |completed, total, _, _, _| {
             let frac = if total > 0 {
@@ -803,7 +814,9 @@ pub async fn repair_instance(
             }
             None => {
                 summary.failed += 1;
-                summary.errors.push("No loader version recorded for this instance".to_string());
+                summary
+                    .errors
+                    .push("No loader version recorded for this instance".to_string());
             }
         }
     }
@@ -840,9 +853,12 @@ pub async fn repair_instance(
     }
 
     // ── 6. content is report-only ───────────────────────────────
-    summary.content_skipped =
-        scan_content(&instances_dir, instance, &["mods", "resourcepacks", "shaderpacks"]).len()
-            as u32;
+    summary.content_skipped = scan_content(
+        &instances_dir,
+        instance,
+        &["mods", "resourcepacks", "shaderpacks"],
+    )
+    .len() as u32;
 
     emit("done", 100.0, "Repair complete");
     Ok(summary)
@@ -865,10 +881,11 @@ mod tests {
         dir
     }
 
-    fn test_config(data_dir: &PathBuf) -> AppConfig {
-        let mut config = AppConfig::default();
-        config.data_dir = data_dir.clone();
-        config
+    fn test_config(data_dir: &Path) -> AppConfig {
+        AppConfig {
+            data_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        }
     }
 
     fn test_instance(mc_version: &str) -> Instance {
@@ -916,7 +933,7 @@ mod tests {
         .unwrap();
     }
 
-    fn write_file_with_sha1(path: &PathBuf, bytes: &[u8]) {
+    fn write_file_with_sha1(path: &Path, bytes: &[u8]) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(bytes).unwrap();
@@ -931,7 +948,13 @@ mod tests {
         let dir = temp_dir("missing_jar");
         let config = test_config(&dir);
         let instance = test_instance("1.20.1");
-        write_version_json(&config, "1.20.1", ABC_SHA1, 3, "https://example.com/client.jar");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
 
         let report = verify_instance(&config, &instance);
 
@@ -948,7 +971,13 @@ mod tests {
         let dir = temp_dir("corrupt_jar");
         let config = test_config(&dir);
         let instance = test_instance("1.20.1");
-        write_version_json(&config, "1.20.1", ABC_SHA1, 3, "https://example.com/client.jar");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
         let client = config.versions_dir().join("1.20.1").join("client.jar");
         write_file_with_sha1(&client, b"not-abc");
 
@@ -966,7 +995,13 @@ mod tests {
         let dir = temp_dir("valid_jar");
         let config = test_config(&dir);
         let instance = test_instance("1.20.1");
-        write_version_json(&config, "1.20.1", ABC_SHA1, 3, "https://example.com/client.jar");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
         let client = config.versions_dir().join("1.20.1").join("client.jar");
         write_file_with_sha1(&client, b"abc");
 
@@ -999,7 +1034,13 @@ mod tests {
         let dir = temp_dir("no_index");
         let config = test_config(&dir);
         let instance = test_instance("1.20.1");
-        write_version_json(&config, "1.20.1", ABC_SHA1, 3, "https://example.com/client.jar");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
 
         let report = verify_instance(&config, &instance);
 
@@ -1015,7 +1056,13 @@ mod tests {
         let dir = temp_dir("missing_obj");
         let config = test_config(&dir);
         let instance = test_instance("1.20.1");
-        write_version_json(&config, "1.20.1", ABC_SHA1, 3, "https://example.com/client.jar");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
 
         let indexes = config.assets_dir().join("indexes");
         std::fs::create_dir_all(&indexes).unwrap();
@@ -1024,7 +1071,11 @@ mod tests {
                 "minecraft/sounds/test.ogg": { "hash": "aa".repeat(20), "size": 42 }
             }
         });
-        std::fs::write(indexes.join("5.json"), serde_json::to_string(&index).unwrap()).unwrap();
+        std::fs::write(
+            indexes.join("5.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
 
         let report = verify_instance(&config, &instance);
 
@@ -1040,7 +1091,13 @@ mod tests {
         let dir = temp_dir("bad_content");
         let config = test_config(&dir);
         let instance = test_instance("1.20.1");
-        write_version_json(&config, "1.20.1", ABC_SHA1, 3, "https://example.com/client.jar");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
         let client = config.versions_dir().join("1.20.1").join("client.jar");
         write_file_with_sha1(&client, b"abc");
         let indexes = config.assets_dir().join("indexes");
@@ -1062,11 +1119,7 @@ mod tests {
         assert!(content.issues[0].path.contains("broken.jar"));
         // Content issues are never counted as repairable (java may or may
         // not be present on the host, so only assert the content side).
-        let content_repairs: u32 = content
-            .issues
-            .iter()
-            .filter(|i| i.repairable)
-            .count() as u32;
+        let content_repairs: u32 = content.issues.iter().filter(|i| i.repairable).count() as u32;
         assert_eq!(content_repairs, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1095,15 +1148,28 @@ mod tests {
         let instance = test_instance("1.20.1");
         let mc = instance.minecraft_dir(&config.instances_dir());
         write_file_with_sha1(&mc.join("mods").join("broken.jar"), b"<html>404</html>");
-        write_file_with_sha1(&mc.join("resourcepacks").join("broken.zip"), b"<html>404</html>");
+        write_file_with_sha1(
+            &mc.join("resourcepacks").join("broken.zip"),
+            b"<html>404</html>",
+        );
 
         let report = verify_instance_scoped(&config, &instance, VerifyScope::Mods);
 
-        assert_eq!(report.categories.len(), 1, "no launcher categories in a content scope");
+        assert_eq!(
+            report.categories.len(),
+            1,
+            "no launcher categories in a content scope"
+        );
         let content = cat(&report, "content");
-        assert_eq!(content.issue_count, 1, "resource packs stay outside the mods scope");
+        assert_eq!(
+            content.issue_count, 1,
+            "resource packs stay outside the mods scope"
+        );
         assert!(content.issues[0].path.starts_with("mods/"));
-        assert_eq!(report.repairable_count, 0, "content-only scope has nothing to repair");
+        assert_eq!(
+            report.repairable_count, 0,
+            "content-only scope has nothing to repair"
+        );
         assert!(!report.healthy);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1111,7 +1177,10 @@ mod tests {
     #[test]
     fn verify_scope_parse_accepts_names_and_rejects_unknown() {
         assert_eq!(VerifyScope::parse("all").unwrap(), VerifyScope::All);
-        assert_eq!(VerifyScope::parse("Launcher").unwrap(), VerifyScope::Launcher);
+        assert_eq!(
+            VerifyScope::parse("Launcher").unwrap(),
+            VerifyScope::Launcher
+        );
         assert_eq!(
             VerifyScope::parse("resourcepacks").unwrap(),
             VerifyScope::Resourcepacks
@@ -1128,7 +1197,13 @@ mod tests {
         let dir = temp_dir("healthy");
         let config = test_config(&dir);
         let instance = test_instance("1.20.1");
-        write_version_json(&config, "1.20.1", ABC_SHA1, 3, "https://example.com/client.jar");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
         let client = config.versions_dir().join("1.20.1").join("client.jar");
         write_file_with_sha1(&client, b"abc");
 
@@ -1219,7 +1294,12 @@ mod tests {
             .map(|(_, p, _, _)| p.to_string_lossy().to_string())
             .collect();
 
-        assert_eq!(targets.len(), 2, "expected client + bad lib, got {:?}", paths);
+        assert_eq!(
+            targets.len(),
+            2,
+            "expected client + bad lib, got {:?}",
+            paths
+        );
         assert!(paths.iter().any(|p| p.contains("client.jar")));
         assert!(paths.iter().any(|p| p.contains("bad-1.0.jar")));
         assert!(!paths.iter().any(|p| p.contains("good-1.0.jar")));

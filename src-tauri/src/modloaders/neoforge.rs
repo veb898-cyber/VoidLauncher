@@ -1,7 +1,7 @@
-use serde::Deserialize;
+use super::{LoaderLibrary, LoaderProfile, LoaderVersionPage};
 use crate::error::{LauncherError, Result};
 use crate::versions::maven_to_path;
-use super::{LoaderVersionPage, LoaderProfile, LoaderLibrary};
+use serde::Deserialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
@@ -24,9 +24,15 @@ use tauri::Emitter;
 /// for modern NeoForge.
 fn neoforge_maven(mc_version: &str, neo_version: &str) -> (String, String) {
     if mc_version == "1.20.1" {
-        (format!("net/neoforged/forge"), format!("{}-{}", mc_version, neo_version))
+        (
+            "net/neoforged/forge".to_string(),
+            format!("{}-{}", mc_version, neo_version),
+        )
     } else {
-        (format!("net/neoforged/neoforge"), neo_version.to_string())
+        (
+            "net/neoforged/neoforge".to_string(),
+            neo_version.to_string(),
+        )
     }
 }
 
@@ -126,7 +132,10 @@ pub async fn get_profile(mc_version: &str, neo_version: &str) -> Result<LoaderPr
     // Try legacy standalone JSON first
     let profile_url = format!(
         "https://maven.neoforged.net/releases/{}/{}/{}-{}.json",
-        group_path, maven_version, group_path.rsplit('/').next().unwrap_or("neoforge"), maven_version
+        group_path,
+        maven_version,
+        group_path.rsplit('/').next().unwrap_or("neoforge"),
+        maven_version
     );
 
     if let Ok(resp) = crate::download::send_with_fallback(client.get(&profile_url)).await {
@@ -151,7 +160,10 @@ pub async fn get_profile(mc_version: &str, neo_version: &str) -> Result<LoaderPr
 /// The installer path is NOT deleted here: the processor pipeline in
 /// `install` needs the JAR (it carries `data/client.lzma` and the
 /// `install_profile.json` processor list).
-async fn download_installer(mc_version: &str, neo_version: &str) -> Result<(NeoForgeInstallProfile, PathBuf)> {
+async fn download_installer(
+    mc_version: &str,
+    neo_version: &str,
+) -> Result<(NeoForgeInstallProfile, PathBuf)> {
     let (group_path, maven_version) = neoforge_maven(mc_version, neo_version);
     let artifact = group_path.rsplit('/').next().unwrap_or("neoforge");
     let installer_url = format!(
@@ -162,8 +174,10 @@ async fn download_installer(mc_version: &str, neo_version: &str) -> Result<(NeoF
     tracing::info!(target: "launcher", "Fetching NeoForge installer JAR: {}", installer_url);
 
     // Use download_file with retries for reliable download
-    let installer_path = std::env::temp_dir()
-        .join(format!("neoforge-{}--{}-installer.jar", mc_version, neo_version));
+    let installer_path = std::env::temp_dir().join(format!(
+        "neoforge-{}--{}-installer.jar",
+        mc_version, neo_version
+    ));
     let mut last_err = String::new();
     for attempt in 1..=3u32 {
         match crate::download::download_file(&installer_url, &installer_path, "").await {
@@ -180,12 +194,14 @@ async fn download_installer(mc_version: &str, neo_version: &str) -> Result<(NeoF
 
     if !installer_path.exists() {
         return Err(LauncherError::ModLoader(format!(
-            "Failed to download NeoForge installer after 3 attempts: {}", last_err
+            "Failed to download NeoForge installer after 3 attempts: {}",
+            last_err
         )));
     }
 
-    let jar_bytes = std::fs::read(&installer_path)
-        .map_err(|e| LauncherError::ModLoader(format!("Failed to read NeoForge installer JAR: {}", e)))?;
+    let jar_bytes = std::fs::read(&installer_path).map_err(|e| {
+        LauncherError::ModLoader(format!("Failed to read NeoForge installer JAR: {}", e))
+    })?;
 
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&*jar_bytes))
         .map_err(|e| LauncherError::ModLoader(format!("Invalid NeoForge installer JAR: {}", e)))?;
@@ -195,17 +211,26 @@ async fn download_installer(mc_version: &str, neo_version: &str) -> Result<(NeoF
     for i in 0..archive.len() {
         if let Ok(mut entry) = archive.by_index(i) {
             if entry.name() == "install_profile.json" {
-                entry.read_to_string(&mut install_profile_str)
-                    .map_err(|e| LauncherError::ModLoader(format!("Failed to read install_profile.json: {}", e)))?;
+                entry
+                    .read_to_string(&mut install_profile_str)
+                    .map_err(|e| {
+                        LauncherError::ModLoader(format!(
+                            "Failed to read install_profile.json: {}",
+                            e
+                        ))
+                    })?;
             } else if entry.name() == "version.json" {
-                entry.read_to_string(&mut version_json_str)
-                    .map_err(|e| LauncherError::ModLoader(format!("Failed to read version.json: {}", e)))?;
+                entry.read_to_string(&mut version_json_str).map_err(|e| {
+                    LauncherError::ModLoader(format!("Failed to read version.json: {}", e))
+                })?;
             }
         }
     }
 
     if install_profile_str.is_empty() {
-        return Err(LauncherError::ModLoader("NeoForge installer JAR missing install_profile.json".into()));
+        return Err(LauncherError::ModLoader(
+            "NeoForge installer JAR missing install_profile.json".into(),
+        ));
     }
 
     // NeoForge installer JAR structure:
@@ -216,18 +241,23 @@ async fn download_installer(mc_version: &str, neo_version: &str) -> Result<(NeoF
 
     let profile: NeoForgeInstallProfile = if !version_json_str.is_empty() {
         // version.json is the actual version profile (same format as Minecraft version JSON)
-        serde_json::from_str(&version_json_str)
-            .map_err(|e| LauncherError::ModLoader(format!("Failed to parse NeoForge version.json: {}", e)))?
+        serde_json::from_str(&version_json_str).map_err(|e| {
+            LauncherError::ModLoader(format!("Failed to parse NeoForge version.json: {}", e))
+        })?
     } else {
         // Fallback: try install_profile.json directly
-        let parsed: serde_json::Value = serde_json::from_str(&install_profile_str)
-            .map_err(|e| LauncherError::ModLoader(format!("Failed to parse install_profile.json: {}", e)))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&install_profile_str).map_err(|e| {
+                LauncherError::ModLoader(format!("Failed to parse install_profile.json: {}", e))
+            })?;
         if let Some(version_info) = parsed.get("versionInfo") {
-            serde_json::from_value(version_info.clone())
-                .map_err(|e| LauncherError::ModLoader(format!("Failed to parse NeoForge versionInfo: {}", e)))?
+            serde_json::from_value(version_info.clone()).map_err(|e| {
+                LauncherError::ModLoader(format!("Failed to parse NeoForge versionInfo: {}", e))
+            })?
         } else {
-            serde_json::from_value(parsed)
-                .map_err(|e| LauncherError::ModLoader(format!("Failed to parse NeoForge install profile: {}", e)))?
+            serde_json::from_value(parsed).map_err(|e| {
+                LauncherError::ModLoader(format!("Failed to parse NeoForge install profile: {}", e))
+            })?
         }
     };
 
@@ -239,21 +269,39 @@ fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
     for lib in &profile.libraries {
         let (url, path) = if let Some(downloads) = &lib.downloads {
             if let Some(artifact) = &downloads.artifact {
-                let lib_path = artifact.path.clone().unwrap_or_else(|| maven_to_path(&lib.name));
-                let lib_url = artifact.url.clone().unwrap_or_else(|| {
-                    format!("https://maven.neoforged.net/{}", lib_path)
-                });
+                let lib_path = artifact
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| maven_to_path(&lib.name));
+                let lib_url = artifact
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| format!("https://maven.neoforged.net/{}", lib_path));
                 (lib_url, lib_path)
             } else {
                 let path = maven_to_path(&lib.name);
-                let base = lib.url.clone().unwrap_or_else(|| "https://maven.neoforged.net/".into());
-                let base = if base.ends_with('/') { base } else { format!("{}/", base) };
+                let base = lib
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| "https://maven.neoforged.net/".into());
+                let base = if base.ends_with('/') {
+                    base
+                } else {
+                    format!("{}/", base)
+                };
                 (format!("{}{}", base, path), path)
             }
         } else {
             let path = maven_to_path(&lib.name);
-            let base = lib.url.clone().unwrap_or_else(|| "https://maven.neoforged.net/".into());
-            let base = if base.ends_with('/') { base } else { format!("{}/", base) };
+            let base = lib
+                .url
+                .clone()
+                .unwrap_or_else(|| "https://maven.neoforged.net/".into());
+            let base = if base.ends_with('/') {
+                base
+            } else {
+                format!("{}/", base)
+            };
             (format!("{}{}", base, path), path)
         };
 
@@ -267,10 +315,14 @@ fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
     }
 
     let (game_args, jvm_args) = if let Some(args) = &profile.arguments {
-        let game = args.game.iter()
+        let game = args
+            .game
+            .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
-        let jvm = args.jvm.iter()
+        let jvm = args
+            .jvm
+            .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
         (game, jvm)
@@ -310,28 +362,39 @@ pub async fn install(
     // The installer also carries install_profile.json with the full
     // processor library list (70 libs for 21.1.248, vs 47 in version.json).
     let install_profile_str = {
-        let jar_bytes = std::fs::read(&installer_path)
-            .map_err(|e| LauncherError::ModLoader(format!("Failed to read NeoForge installer JAR: {}", e)))?;
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&*jar_bytes))
-            .map_err(|e| LauncherError::ModLoader(format!("Invalid NeoForge installer JAR: {}", e)))?;
+        let jar_bytes = std::fs::read(&installer_path).map_err(|e| {
+            LauncherError::ModLoader(format!("Failed to read NeoForge installer JAR: {}", e))
+        })?;
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&*jar_bytes)).map_err(|e| {
+            LauncherError::ModLoader(format!("Invalid NeoForge installer JAR: {}", e))
+        })?;
         let mut s = String::new();
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
                 if entry.name() == "install_profile.json" {
-                    entry.read_to_string(&mut s)
-                        .map_err(|e| LauncherError::ModLoader(format!("Failed to read install_profile.json: {}", e)))?;
+                    entry.read_to_string(&mut s).map_err(|e| {
+                        LauncherError::ModLoader(format!(
+                            "Failed to read install_profile.json: {}",
+                            e
+                        ))
+                    })?;
                 }
             }
         }
         if s.is_empty() {
-            return Err(LauncherError::ModLoader("NeoForge installer JAR missing install_profile.json".into()));
+            return Err(LauncherError::ModLoader(
+                "NeoForge installer JAR missing install_profile.json".into(),
+            ));
         }
         s
     };
-    let install_profile: serde_json::Value = serde_json::from_str(&install_profile_str)
-        .map_err(|e| LauncherError::ModLoader(format!("Failed to parse install_profile.json: {}", e)))?;
+    let install_profile: serde_json::Value =
+        serde_json::from_str(&install_profile_str).map_err(|e| {
+            LauncherError::ModLoader(format!("Failed to parse install_profile.json: {}", e))
+        })?;
 
-    let has_processors = install_profile.get("processors")
+    let has_processors = install_profile
+        .get("processors")
         .and_then(|p| p.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
@@ -342,10 +405,13 @@ pub async fn install(
         let lib_path = libraries_dir.join(&lib.path);
         if !lib_path.exists() {
             if let Some(app_handle) = app {
-                let _ = app_handle.emit("loader-install-progress", serde_json::json!({
-                    "stage": "downloading",
-                    "message": format!("Downloading {} ({}/{})", lib.name, i + 1, total),
-                }));
+                let _ = app_handle.emit(
+                    "loader-install-progress",
+                    serde_json::json!({
+                        "stage": "downloading",
+                        "message": format!("Downloading {} ({}/{})", lib.name, i + 1, total),
+                    }),
+                );
             }
             if let Err(e) = crate::download::download_file(&lib.url, &lib_path, "").await {
                 tracing::warn!(target: "launcher", "Failed to download NeoForge library {}: {}", lib.name, e);
@@ -369,7 +435,13 @@ pub async fn install(
                         "message": format!("Downloading processor libraries ({}/{})", i + 1, pl_total),
                     }));
                 }
-                if let Err(e) = super::forge::download_processor_lib(lib_val, libraries_dir, "https://maven.neoforged.net/").await {
+                if let Err(e) = super::forge::download_processor_lib(
+                    lib_val,
+                    libraries_dir,
+                    "https://maven.neoforged.net/",
+                )
+                .await
+                {
                     tracing::warn!(target: "launcher", "NeoForge processor library download warning: {}", e);
                 }
             }
@@ -390,26 +462,37 @@ pub async fn install(
         // client JAR the processors produce (plain loader-version dir for
         // modern NeoForge, e.g. 21.4.153, NOT 1.21.4-21.4.153 as Forge does;
         // for 1.20.1 it is the MC-prefixed gradle-style forge coordinate).
-        let client_path = libraries_dir.join(&group_path)
-            .join(&maven_version).join(format!("{}-{}-client.jar", artifact, maven_version));
+        let client_path = libraries_dir
+            .join(&group_path)
+            .join(&maven_version)
+            .join(format!("{}-{}-client.jar", artifact, maven_version));
 
         if !client_path.exists() {
             tracing::info!(target: "launcher", "NeoForge client JAR missing, running installer processors...");
 
             // Extract data files (client.lzma etc.) from the installer into
             // <libraries>/net/neoforged/neoforge/_data/<key>/<file>
-            let jar_bytes = std::fs::read(&installer_path)
-                .map_err(|e| LauncherError::ModLoader(format!("Failed to read NeoForge installer JAR: {}", e)))?;
-            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&*jar_bytes))
-                .map_err(|e| LauncherError::ModLoader(format!("Invalid NeoForge installer JAR: {}", e)))?;
+            let jar_bytes = std::fs::read(&installer_path).map_err(|e| {
+                LauncherError::ModLoader(format!("Failed to read NeoForge installer JAR: {}", e))
+            })?;
+            let mut archive =
+                zip::ZipArchive::new(std::io::Cursor::new(&*jar_bytes)).map_err(|e| {
+                    LauncherError::ModLoader(format!("Invalid NeoForge installer JAR: {}", e))
+                })?;
             if let Some(data_map) = install_profile.get("data").and_then(|d| d.as_object()) {
                 for (key, entry) in data_map {
                     let client_val = entry.get("client").and_then(|c| c.as_str()).unwrap_or("");
                     if client_val.starts_with('/') {
                         let jar_path = client_val.trim_start_matches('/');
-                        let fname = Path::new(jar_path).file_name().and_then(|n| n.to_str()).unwrap_or("data");
-                        let dest = libraries_dir.join(&data_base)
-                            .join("_data").join(&key.to_lowercase()).join(fname);
+                        let fname = Path::new(jar_path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("data");
+                        let dest = libraries_dir
+                            .join(&data_base)
+                            .join("_data")
+                            .join(key.to_lowercase())
+                            .join(fname);
                         if !dest.exists() {
                             if let Some(parent) = dest.parent() {
                                 std::fs::create_dir_all(parent).ok();
@@ -433,10 +516,14 @@ pub async fn install(
                 vd.join(format!("{}.jar", mc_version))
             };
             if !client_jar.exists() {
-                return Err(LauncherError::ModLoader(format!("Client JAR not found at {:?}", client_jar)));
+                return Err(LauncherError::ModLoader(format!(
+                    "Client JAR not found at {:?}",
+                    client_jar
+                )));
             }
 
-            let root_dir = versions_dir.parent()
+            let root_dir = versions_dir
+                .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| versions_dir.to_path_buf());
 
@@ -446,7 +533,7 @@ pub async fn install(
             let data_dir = libraries_dir
                 .parent()
                 .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::env::temp_dir());
+                .unwrap_or_else(std::env::temp_dir);
             if let Some(java_path) = super::forge::find_java_for(&data_dir, mc_version) {
                 tracing::info!(target: "launcher", "Running NeoForge processors with Java: {:?}", java_path);
                 // Long-lived subprocess pipeline (30-120s) — run on the
@@ -461,16 +548,16 @@ pub async fn install(
                 let root = root_dir.clone();
                 let data_base_owned = data_base.to_string();
                 match tokio::task::spawn_blocking(move || {
-                    super::forge::run_forge_processors(
-                        &profile,
-                        &installer,
-                        &java,
-                        &libs,
-                        &ver,
-                        &cjar,
-                        &root,
-                        &data_base_owned,
-                    )
+                    super::forge::run_forge_processors(super::forge::ForgeProcessorInputs {
+                        install_profile: &profile,
+                        installer_path: &installer,
+                        java_path: &java,
+                        libraries_dir: &libs,
+                        mc_version: &ver,
+                        client_jar: &cjar,
+                        root_dir: &root,
+                        data_base: &data_base_owned,
+                    })
                 })
                 .await
                 {
@@ -488,7 +575,7 @@ pub async fn install(
 
             if !client_path.exists() {
                 return Err(LauncherError::ModLoader(
-                    "NeoForge processors did not generate the client JAR".into()
+                    "NeoForge processors did not generate the client JAR".into(),
                 ));
             }
         } else {

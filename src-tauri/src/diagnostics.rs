@@ -256,7 +256,10 @@ fn collect_system(config: &AppConfig) -> SystemInfo {
 // ══════════════════════════ network reachability ══════════════════════════
 
 const NETWORK_HOSTS: &[(&str, &str)] = &[
-    ("mojang", "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"),
+    (
+        "mojang",
+        "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+    ),
     ("modrinth", "https://api.modrinth.com/v2/search?limit=1"),
     ("curseforge", "https://api.curseforge.com/"),
 ];
@@ -265,7 +268,10 @@ const NETWORK_HOSTS: &[(&str, &str)] = &[
 /// service is reachable; only transport errors/timeouts count as down.
 async fn check_network() -> (usize, Vec<String>) {
     let Ok(client) = crate::download::global_http_client() else {
-        return (0, NETWORK_HOSTS.iter().map(|(n, _)| n.to_string()).collect());
+        return (
+            0,
+            NETWORK_HOSTS.iter().map(|(n, _)| n.to_string()).collect(),
+        );
     };
     let probes = NETWORK_HOSTS.iter().map(|(name, url)| {
         let client = client.clone();
@@ -300,8 +306,8 @@ fn collect_instance(
     config: &AppConfig,
     instance_name: &str,
 ) -> Result<(DiagInstanceInfo, Vec<DiagIssue>, Option<VerifyReport>), String> {
-    let instance =
-        instances::get_instance(&config.instances_dir(), instance_name).map_err(|e| e.to_string())?;
+    let instance = instances::get_instance(&config.instances_dir(), instance_name)
+        .map_err(|e| e.to_string())?;
 
     let mut issues = Vec::new();
 
@@ -319,7 +325,10 @@ fn collect_instance(
         verify::load_local_version_info(&config.versions_dir(), &instance.mc_version)
     {
         let required = version_info.required_java_major();
-        let custom = instance.java_path.clone().or_else(|| config.java_path.clone());
+        let custom = instance
+            .java_path
+            .clone()
+            .or_else(|| config.java_path.clone());
         match custom {
             Some(path) => match crate::java::probe_java_by_path(&path) {
                 Some(install) => {
@@ -402,10 +411,7 @@ fn collect_instance(
 /// Gather the full diagnostics report. Instance checks run on a worker
 /// thread (the verify scan walks thousands of files); the network probes
 /// run concurrently with a 5 s per-host timeout.
-pub async fn run_diagnostics(
-    config: AppConfig,
-    instance_name: Option<String>,
-) -> DiagReport {
+pub async fn run_diagnostics(config: AppConfig, instance_name: Option<String>) -> DiagReport {
     let (sys, inst, network) = {
         let sys_config = config.clone();
         let inst_config = config.clone();
@@ -416,9 +422,13 @@ pub async fn run_diagnostics(
             None => None,
         });
         let net_task = check_network();
-        let (sys_res, inst_res, net_res) = futures::future::join3(sys_task, inst_task, net_task).await;
+        let (sys_res, inst_res, net_res) =
+            futures::future::join3(sys_task, inst_task, net_task).await;
         (
-            sys_res.unwrap_or_else(|_| SystemInfo { checks: Vec::new(), issues: Vec::new() }),
+            sys_res.unwrap_or_else(|_| SystemInfo {
+                checks: Vec::new(),
+                issues: Vec::new(),
+            }),
             inst_res.ok().flatten(),
             net_res,
         )
@@ -587,7 +597,11 @@ const RULES: &[Rule] = &[
     Rule {
         kind: "mod_conflict",
         verdict: "possible",
-        needles: &["nosuchmethoderror", "nosuchfielderror", "abstractmethoderror"],
+        needles: &[
+            "nosuchmethoderror",
+            "nosuchfielderror",
+            "abstractmethoderror",
+        ],
     },
     Rule {
         kind: "graphics",
@@ -677,7 +691,9 @@ fn extract_culprit(original: &str) -> Option<String> {
                 .unwrap_or(tail.len());
             let word = &tail[..end];
             cursor += end;
-            if word.is_empty() || word.eq_ignore_ascii_case("file") || word.eq_ignore_ascii_case("mod")
+            if word.is_empty()
+                || word.eq_ignore_ascii_case("file")
+                || word.eq_ignore_ascii_case("mod")
             {
                 continue;
             }
@@ -688,7 +704,8 @@ fn extract_culprit(original: &str) -> Option<String> {
     // A jar path on the failing line: "… mods/sodium.jar"
     for line in original.split('\n') {
         let line_low = line.to_ascii_lowercase();
-        if line_low.contains(".jar") && (line_low.contains("mods/") || line_low.contains("mods\\")) {
+        if line_low.contains(".jar") && (line_low.contains("mods/") || line_low.contains("mods\\"))
+        {
             let start = line_low.rfind(['/', '\\'])? + 1;
             let end = line_low[start..].find(".jar").map(|e| start + e + 4)?;
             let name = line[start..end].trim();
@@ -764,7 +781,10 @@ fn newest_crash_report(
         if !(name.ends_with(".txt") || name.ends_with(".txt.gz")) {
             continue;
         }
-        let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
         if let Some((from, to)) = window {
             if mtime < from || mtime > to {
                 continue;
@@ -811,8 +831,8 @@ pub fn analyze_crash(
     instance_name: &str,
     session_path: Option<&str>,
 ) -> Result<CrashAnalysis, String> {
-    let instance =
-        instances::get_instance(&config.instances_dir(), instance_name).map_err(|e| e.to_string())?;
+    let instance = instances::get_instance(&config.instances_dir(), instance_name)
+        .map_err(|e| e.to_string())?;
     let mc_dir = instance.minecraft_dir(&config.instances_dir());
 
     // Bound the analysis to one run when we can identify it.
@@ -974,7 +994,8 @@ mod tests {
 
     #[test]
     fn failed_loading_mod_extracts_quoted_name() {
-        let text = "net.minecraftforge.fml.loading.FMLLoader: Failed loading mod file 'create-1.20.1.jar'";
+        let text =
+            "net.minecraftforge.fml.loading.FMLLoader: Failed loading mod file 'create-1.20.1.jar'";
         let (kind, _, culprit) = classify(text).expect("fml should classify");
         assert_eq!(kind, "mod_crash");
         assert_eq!(culprit.as_deref(), Some("create-1.20.1.jar"));
@@ -1031,7 +1052,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vl_diag_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("crash-reports")).unwrap();
         assert!(newest_crash_report(&dir.join("crash-reports"), None).is_none());
-        std::fs::write(dir.join("crash-reports").join("crash-2026-01-01_00.00.00.txt"), b"boom").unwrap();
+        std::fs::write(
+            dir.join("crash-reports")
+                .join("crash-2026-01-01_00.00.00.txt"),
+            b"boom",
+        )
+        .unwrap();
         assert!(newest_crash_report(&dir.join("crash-reports"), None).is_some());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1040,7 +1066,9 @@ mod tests {
     fn crash_report_window_excludes_files_outside_the_run() {
         let dir = std::env::temp_dir().join(format!("vl_diag_win_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("crash-reports")).unwrap();
-        let old = dir.join("crash-reports").join("crash-2020-01-01_00.00.00.txt");
+        let old = dir
+            .join("crash-reports")
+            .join("crash-2020-01-01_00.00.00.txt");
         std::fs::write(&old, b"old boom").unwrap();
         // Window strictly after the file's mtime: the stale report must not
         // be attributed to the fresh run.
@@ -1055,7 +1083,10 @@ mod tests {
     fn exit_code_is_parsed_from_the_final_session_line() {
         let text = "launch lines...\n[INFO] [launch] Game exited with code 1\n";
         assert_eq!(exit_code_from_session_log(text), Some(1));
-        assert_eq!(exit_code_from_session_log("Game exited with code 0"), Some(0));
+        assert_eq!(
+            exit_code_from_session_log("Game exited with code 0"),
+            Some(0)
+        );
         assert_eq!(exit_code_from_session_log("no exit line here"), None);
         // Last occurrence wins.
         let text = "Game exited with code 1\n...\nGame exited with code 0\n";
@@ -1069,7 +1100,8 @@ mod tests {
         let path = dir.join("old.txt.gz");
         use std::io::Write;
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(b"java.lang.OutOfMemoryError: Java heap space").unwrap();
+        enc.write_all(b"java.lang.OutOfMemoryError: Java heap space")
+            .unwrap();
         let bytes = enc.finish().unwrap();
         std::fs::write(&path, bytes).unwrap();
         let text = read_report(&path).expect("gz read");

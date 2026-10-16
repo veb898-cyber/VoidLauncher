@@ -21,7 +21,13 @@ static CURRENT_LOG_PATH: Mutex<Option<String>> = Mutex::new(None);
 /// frontend can filter sessions by instance without guessing the scheme.
 pub fn sanitize_instance_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -97,7 +103,10 @@ fn finish_stream(shared: &Arc<OutputReaderShared>) {
     }
     if let Some(path) = &shared.session_path {
         let code = shared.exit_code.load(Ordering::SeqCst);
-        append_game_log_line(path, &format!("[INFO] [launch] Game exited with code {}", code));
+        append_game_log_line(
+            path,
+            &format!("[INFO] [launch] Game exited with code {}", code),
+        );
     }
 }
 
@@ -124,7 +133,11 @@ pub fn attach_output_readers(
     std::thread::Builder::new()
         .name("game-stdout".into())
         .spawn(move || {
-            pump_stream(stdout_pipe, raw_stdout_file.map(std::io::BufWriter::new), sh_out);
+            pump_stream(
+                stdout_pipe,
+                raw_stdout_file.map(std::io::BufWriter::new),
+                sh_out,
+            );
         })
         .ok();
 
@@ -132,7 +145,11 @@ pub fn attach_output_readers(
     std::thread::Builder::new()
         .name("game-stderr".into())
         .spawn(move || {
-            pump_stream(stderr_pipe, raw_stderr_file.map(std::io::BufWriter::new), sh_err);
+            pump_stream(
+                stderr_pipe,
+                raw_stderr_file.map(std::io::BufWriter::new),
+                sh_err,
+            );
         })
         .ok();
 }
@@ -193,10 +210,7 @@ pub fn session_started_at(path: &Path) -> Option<std::time::SystemTime> {
 /// analyzer when it has no explicit session path — the auto-analysis after
 /// exit runs after `CURRENT_LOG_PATH` was already cleared, so the "current"
 /// path is gone by then.
-pub fn newest_session_for_instance(
-    data_dir: &PathBuf,
-    instance_name: &str,
-) -> Option<PathBuf> {
+pub fn newest_session_for_instance(data_dir: &Path, instance_name: &str) -> Option<PathBuf> {
     let dir = data_dir.join("logs").join("game");
     let safe = sanitize_instance_name(instance_name);
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
@@ -230,7 +244,7 @@ pub fn newest_session_for_instance(
 }
 
 /// Create a new game log file for this session and return its path
-pub fn create_game_log_file(data_dir: &PathBuf, instance_name: &str) -> Result<String, String> {
+pub fn create_game_log_file(data_dir: &Path, instance_name: &str) -> Result<String, String> {
     let game_logs_dir = data_dir.join("logs").join("game");
     std::fs::create_dir_all(&game_logs_dir).map_err(|e| e.to_string())?;
 
@@ -268,7 +282,7 @@ pub fn append_game_log_line(log_path: &str, line: &str) {
 }
 
 /// List game log sessions (most recent first, max 7)
-pub fn list_game_log_sessions(data_dir: &PathBuf) -> Vec<GameLogSession> {
+pub fn list_game_log_sessions(data_dir: &Path) -> Vec<GameLogSession> {
     let game_logs_dir = data_dir.join("logs").join("game");
     if !game_logs_dir.exists() {
         return Vec::new();
@@ -395,7 +409,7 @@ fn read_tail_lossy(path: &str, max: usize) -> (String, bool) {
         // Record newlines newest-first (walk this block back-to-front).
         let piece = &buf[..len];
         for i in (0..len).rev() {
-            if boundaries.len() >= max + 1 {
+            if boundaries.len() > max {
                 break;
             }
             if piece[i] == b'\n' {
@@ -431,7 +445,7 @@ fn read_tail_lossy(path: &str, max: usize) -> (String, bool) {
     (String::from_utf8_lossy(&tail).to_string(), truncated)
 }
 
-pub fn delete_game_log(data_dir: &PathBuf, path: &str) -> Result<(), String> {
+pub fn delete_game_log(data_dir: &Path, path: &str) -> Result<(), String> {
     let safe_path = validate_log_path(data_dir, path)?;
     if safe_path == get_current_log_path().unwrap_or_default() {
         return Err("Cannot delete the currently active game log".to_string());
@@ -439,7 +453,7 @@ pub fn delete_game_log(data_dir: &PathBuf, path: &str) -> Result<(), String> {
     std::fs::remove_file(&safe_path).map_err(|e| format!("Failed to delete log: {}", e))
 }
 
-pub fn validate_log_path(data_dir: &PathBuf, path: &str) -> Result<String, String> {
+pub fn validate_log_path(data_dir: &Path, path: &str) -> Result<String, String> {
     let logs_dir = data_dir.join("logs").join("game");
     let logs_canon = logs_dir
         .canonicalize()
@@ -475,11 +489,7 @@ mod tests {
             // Ensure strictly increasing mtimes so the mtime sort is stable.
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        std::fs::write(
-            logs_dir.join("Inst_20260820_000005.stdout.log"),
-            "raw\n",
-        )
-        .unwrap();
+        std::fs::write(logs_dir.join("Inst_20260820_000005.stdout.log"), "raw\n").unwrap();
 
         // A "new launch" only creates a new file — nothing is removed.
         create_game_log_file(&dir, "Inst").unwrap();
@@ -488,7 +498,9 @@ mod tests {
         assert!(sessions.iter().all(|s| !s.path.ends_with(".stdout.log")));
         assert_eq!(sessions.len(), 10, "all runs kept, rotation disabled");
         for i in 1..=9u32 {
-            assert!(logs_dir.join(format!("Inst_20260820_0000{:02}.log", i)).exists());
+            assert!(logs_dir
+                .join(format!("Inst_20260820_0000{:02}.log", i))
+                .exists());
         }
         // Newest-first ordering for the UI (the fresh run is last created).
         let newest = std::path::Path::new(&sessions[0].path)
@@ -496,10 +508,17 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        assert!(newest.starts_with("Inst_2"), "fresh run listed first: {}", newest);
+        assert!(
+            newest.starts_with("Inst_2"),
+            "fresh run listed first: {}",
+            newest
+        );
 
         // Instance-name sanitization shared by creation and filtering.
-        assert_eq!(sanitize_instance_name("Better MC [FORGE] BMC4"), "Better_MC__FORGE__BMC4");
+        assert_eq!(
+            sanitize_instance_name("Better MC [FORGE] BMC4"),
+            "Better_MC__FORGE__BMC4"
+        );
 
         clear_current_log_path();
         std::fs::remove_dir_all(&dir).ok();
@@ -524,7 +543,10 @@ mod tests {
 
         let start = session_started_at(&old).expect("filename should parse");
         let start_dt: chrono::DateTime<chrono::Local> = start.into();
-        assert_eq!(start_dt.format("%Y%m%d_%H%M%S").to_string(), "20260101_120000");
+        assert_eq!(
+            start_dt.format("%Y%m%d_%H%M%S").to_string(),
+            "20260101_120000"
+        );
         assert!(session_started_at(logs_dir.join("nope.log").as_path()).is_none());
 
         let newest = newest_session_for_instance(&dir, "Inst").expect("newest run");

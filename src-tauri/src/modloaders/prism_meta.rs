@@ -149,9 +149,9 @@ fn is_prerelease(version: &str) -> bool {
 /// `Arc` clone (O(1)).
 async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
     {
-        let cache = index_cache().lock().map_err(|e| {
-            LauncherError::ModLoader(format!("Prism meta cache lock: {}", e))
-        })?;
+        let cache = index_cache()
+            .lock()
+            .map_err(|e| LauncherError::ModLoader(format!("Prism meta cache lock: {}", e)))?;
         if let Some(cached) = cache.get(uid).cloned() {
             return Ok(cached);
         }
@@ -162,18 +162,16 @@ async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
     // configured proxy can't reach this host (VPN proxies often whitelist
     // only some domains) — without it every loader list would silently
     // come back empty on such networks.
-    let resp_value = crate::download::send_with_fallback(
-        client.get(&url).timeout(REQUEST_TIMEOUT),
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!(
-            target: "launcher",
-            "Failed to fetch Prism meta index (uid={}): {}",
-            uid, e
-        );
-        e
-    })?;
+    let resp_value = crate::download::send_with_fallback(client.get(&url).timeout(REQUEST_TIMEOUT))
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "launcher",
+                "Failed to fetch Prism meta index (uid={}): {}",
+                uid, e
+            );
+            e
+        })?;
     let body = resp_value.text().await.map_err(|e| {
         tracing::error!(
             target: "launcher",
@@ -197,9 +195,10 @@ async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
         e
     })?;
     let entries = Arc::new(index.versions);
-    index_cache().lock().map_err(|e| {
-        LauncherError::ModLoader(format!("Prism meta cache lock: {}", e))
-    })?.insert(uid.to_string(), entries.clone());
+    index_cache()
+        .lock()
+        .map_err(|e| LauncherError::ModLoader(format!("Prism meta cache lock: {}", e)))?
+        .insert(uid.to_string(), entries.clone());
     Ok(entries)
 }
 
@@ -236,9 +235,10 @@ fn page_from(
         .iter()
         .filter(|entry| match mc_version {
             None => true,
-            Some(mc) => entry.requires.iter().any(|r| {
-                r.uid == "net.minecraft" && r.equals.as_deref() == Some(mc)
-            }),
+            Some(mc) => entry
+                .requires
+                .iter()
+                .any(|r| r.uid == "net.minecraft" && r.equals.as_deref() == Some(mc)),
         })
         .collect();
 
@@ -287,7 +287,12 @@ pub async fn fetch_loader_versions(
 ) -> Result<LoaderVersionPage> {
     let entries = match get_or_fetch_index(uid).await {
         Ok(e) => e,
-        Err(_) => return Ok(LoaderVersionPage { versions: Vec::new(), total: 0 }),
+        Err(_) => {
+            return Ok(LoaderVersionPage {
+                versions: Vec::new(),
+                total: 0,
+            })
+        }
     };
 
     let (page, total) = page_from(&entries, mc_version, offset, limit);
@@ -296,7 +301,10 @@ pub async fn fetch_loader_versions(
         "Prism meta index paged: uid={}, mc_version={:?}, offset={}, limit={}, returned={}, total={}",
         uid, mc_version, offset, limit, page.len(), total
     );
-    Ok(LoaderVersionPage { versions: page, total })
+    Ok(LoaderVersionPage {
+        versions: page,
+        total,
+    })
 }
 
 #[cfg(test)]
@@ -332,7 +340,7 @@ mod tests {
     }
 
     /// Some index entries carry a `type` field (e.g. `"snapshot"`) while
-/// Forge/NeoForge omit it. Make sure it deserializes fine.
+    /// Forge/NeoForge omit it. Make sure it deserializes fine.
     const SAMPLE_TYPE_FIELD: &str = r#"{
         "formatVersion": 1,
         "name": "Sample",
@@ -344,8 +352,8 @@ mod tests {
 
     #[test]
     fn parses_index_entry_with_type_field() {
-        let parsed: PrismIndex = serde_json::from_str(SAMPLE_TYPE_FIELD)
-            .expect("SAMPLE_TYPE_FIELD must parse");
+        let parsed: PrismIndex =
+            serde_json::from_str(SAMPLE_TYPE_FIELD).expect("SAMPLE_TYPE_FIELD must parse");
         assert_eq!(parsed.versions.len(), 1);
         assert_eq!(parsed.versions[0].version, "1.2.3-SNAPSHOT");
     }
@@ -363,8 +371,8 @@ mod tests {
 
     #[test]
     fn parses_fabric_index_without_equals() {
-        let parsed: PrismIndex = serde_json::from_str(SAMPLE_FABRIC)
-            .expect("SAMPLE_FABRIC must parse");
+        let parsed: PrismIndex =
+            serde_json::from_str(SAMPLE_FABRIC).expect("SAMPLE_FABRIC must parse");
         assert_eq!(parsed.versions.len(), 1);
         assert!(parsed.versions[0].recommended);
         assert!(parsed.versions[0].requires[0].equals.is_none());
@@ -470,8 +478,10 @@ mod tests {
     fn page_marks_recommended_as_stable() {
         let entries = parsed_versions();
         let (page, _) = page_from(&entries, Some("1.21.11"), 0, 20);
-        let by_v: std::collections::HashMap<&str, bool> =
-            page.iter().map(|v| (v.version.as_str(), v.stable)).collect();
+        let by_v: std::collections::HashMap<&str, bool> = page
+            .iter()
+            .map(|v| (v.version.as_str(), v.stable))
+            .collect();
         assert!(by_v["60.0.5"], "recommended → stable");
         // 61.x and 60.1.0 are not prerelease by our heuristic
         // (no -beta/-alpha/-rc/-snapshot/-pre/-dev substring) and

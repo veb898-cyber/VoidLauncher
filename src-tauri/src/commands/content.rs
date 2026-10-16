@@ -20,7 +20,11 @@ const ALLOWED_SUBFOLDERS: &[&str] = &["mods", "resourcepacks", "shaderpacks"];
 /// Resolve and validate the instance content directory for a command.
 /// Returns the directory and the normalized subfolder name. The config lock
 /// is dropped before returning, so callers may `.await` safely.
-fn content_dir(state: &AppState, instance_name: &str, subfolder: &str) -> Result<(PathBuf, String), String> {
+fn content_dir(
+    state: &AppState,
+    instance_name: &str,
+    subfolder: &str,
+) -> Result<(PathBuf, String), String> {
     validate_instance_name(instance_name)?;
     let sub = subfolder
         .trim_matches('/')
@@ -32,7 +36,10 @@ fn content_dir(state: &AppState, instance_name: &str, subfolder: &str) -> Result
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let instance = instances::get_instance(&config.instances_dir(), instance_name)
         .map_err(|e| e.to_string())?;
-    Ok((instance.minecraft_dir(&config.instances_dir()).join(&sub), sub))
+    Ok((
+        instance.minecraft_dir(&config.instances_dir()).join(&sub),
+        sub,
+    ))
 }
 
 /// Modrinth ids are short base58 strings; reject anything else so a crafted
@@ -40,7 +47,9 @@ fn content_dir(state: &AppState, instance_name: &str, subfolder: &str) -> Result
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 // ==================== Phase 1: the network worklist ====================
@@ -173,10 +182,7 @@ impl GraphFetcher {
                 }
                 Err(e) => {
                     if is_root {
-                        return Err(format!(
-                            "Failed to resolve CurseForge file {}: {}",
-                            vid, e
-                        ));
+                        return Err(format!("Failed to resolve CurseForge file {}: {}", vid, e));
                     }
                     return Ok(());
                 }
@@ -369,9 +375,7 @@ impl GraphFetcher {
             if self.need_resolve.is_empty() {
                 break;
             }
-            let pending: Vec<String> = std::mem::take(&mut self.need_resolve)
-                .into_iter()
-                .collect();
+            let pending: Vec<String> = std::mem::take(&mut self.need_resolve).into_iter().collect();
             for key in pending {
                 // `cf:{pid}` → CurseForge project, plain id → Modrinth.
                 let (pid, cf) = match key.strip_prefix("cf:") {
@@ -547,10 +551,7 @@ pub async fn cmd_resolve_dependencies(
         .filter_map(|c| {
             Some(InstalledProject {
                 project_id: c.project_id.clone()?,
-                name: c
-                    .project_name
-                    .clone()
-                    .unwrap_or_else(|| c.filename.clone()),
+                name: c.project_name.clone().unwrap_or_else(|| c.filename.clone()),
                 version_id: c.version_id.clone(),
             })
         })
@@ -600,16 +601,14 @@ pub async fn cmd_check_content_compatibilities(
 ) -> Result<Vec<CompatResult>, String> {
     let (dir, sub) = content_dir(&state, &instance_name, &subfolder)?;
     let content_type = content::content_type_for_dir(&sub);
-    let wanted: Option<HashSet<String>> =
-        filenames.map(|f| f.into_iter().take(4000).collect());
+    let wanted: Option<HashSet<String>> = filenames.map(|f| f.into_iter().take(4000).collect());
 
     let targets: Vec<InstalledContent> = content::list_installed(&dir, content_type)
         .into_iter()
         .filter(|c| {
-            matches!(c.provider.as_str(), "modrinth" | "curseforge")
-                && c.project_id.is_some()
+            matches!(c.provider.as_str(), "modrinth" | "curseforge") && c.project_id.is_some()
         })
-        .filter(|c| wanted.as_ref().map_or(true, |w| w.contains(&c.filename)))
+        .filter(|c| wanted.as_ref().is_none_or(|w| w.contains(&c.filename)))
         .collect();
     let cf_key = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -682,8 +681,7 @@ async fn classify_cf_one(
     let Ok(pid) = project_id.parse::<u64>() else {
         return content::COMPAT_UNKNOWN;
     };
-    let strict = match crate::curseforge::get_mod_files(pid, mc_version, loader, 0, api_key).await
-    {
+    let strict = match crate::curseforge::get_mod_files(pid, mc_version, loader, 0, api_key).await {
         Ok(r) => r.data.len(),
         Err(_) => return content::COMPAT_UNKNOWN,
     };

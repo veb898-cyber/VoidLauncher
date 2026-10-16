@@ -88,8 +88,11 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    let cleaned: Vec<u8> = input.bytes().filter(|b| *b != b'\n' && *b != b'\r').collect();
-    if cleaned.len() % 4 != 0 {
+    let cleaned: Vec<u8> = input
+        .bytes()
+        .filter(|b| *b != b'\n' && *b != b'\r')
+        .collect();
+    if !cleaned.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
@@ -142,7 +145,12 @@ fn skin_url_from_sessionserver(json: &serde_json::Value) -> Option<String> {
 /// Pull the ACTIVE skin URL out of api.minecraftservices.com /minecraft/profile.
 fn skin_url_from_minecraftservices(json: &serde_json::Value) -> Option<String> {
     let skins = json["skins"].as_array()?;
-    let pick = |v: &serde_json::Value| v["url"].as_str().map(str::to_string).filter(|u| !u.is_empty());
+    let pick = |v: &serde_json::Value| {
+        v["url"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|u| !u.is_empty())
+    };
     for s in skins {
         if s["state"].as_str() == Some("ACTIVE") {
             if let Some(url) = pick(s) {
@@ -171,7 +179,9 @@ async fn fetch_skin_capped(url: &str) -> Option<Vec<u8>> {
         return None;
     }
     let client = crate::download::global_http_client().ok()?;
-    let resp = crate::download::send_with_fallback(client.get(url)).await.ok()?;
+    let resp = crate::download::send_with_fallback(client.get(url))
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -182,7 +192,8 @@ async fn fetch_skin_capped(url: &str) -> Option<Vec<u8>> {
     }
     use futures::StreamExt;
     let mut remaining = MAX_SKIN_BYTES;
-    let mut buf: Vec<u8> = Vec::with_capacity(resp.content_length().unwrap_or(0).min(MAX_SKIN_BYTES) as usize);
+    let mut buf: Vec<u8> =
+        Vec::with_capacity(resp.content_length().unwrap_or(0).min(MAX_SKIN_BYTES) as usize);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.ok()?;
@@ -205,7 +216,9 @@ async fn fetch_skin_sessionserver(norm: &str) -> Option<Vec<u8>> {
         norm
     );
     let client = crate::download::global_http_client().ok()?;
-    let resp = crate::download::send_with_fallback(client.get(&url)).await.ok()?;
+    let resp = crate::download::send_with_fallback(client.get(&url))
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -250,10 +263,7 @@ async fn fetch_skin_mcheads(norm: &str) -> Option<Vec<u8>> {
     fetch_skin_capped(&format!("https://mc-heads.net/skin/{}", norm)).await
 }
 
-async fn fetch_skin_fresh(
-    norm: &str,
-    account: Option<&AccountEntry>,
-) -> Option<Vec<u8>> {
+async fn fetch_skin_fresh(norm: &str, account: Option<&AccountEntry>) -> Option<Vec<u8>> {
     let is_ely = account.is_some_and(|a| a.account_type == AccountType::ElyBy);
     if is_ely {
         if let Some(bytes) = fetch_skin_elyby(norm).await {
@@ -274,10 +284,7 @@ async fn fetch_skin_fresh(
 }
 
 /// Return the account entry whose stored uuid matches the given one.
-fn find_account_by_uuid<'a>(
-    accounts: &'a [AccountEntry],
-    norm: &str,
-) -> Option<&'a AccountEntry> {
+fn find_account_by_uuid<'a>(accounts: &'a [AccountEntry], norm: &str) -> Option<&'a AccountEntry> {
     accounts.iter().find(|a| {
         a.uuid
             .as_deref()

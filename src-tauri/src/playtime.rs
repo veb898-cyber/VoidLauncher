@@ -20,7 +20,9 @@ pub type PlaytimeMap = HashMap<String, PlaytimeEntry>;
 /// Load the playtime map from `data_dir/playtime.json`. Returns empty map on any error.
 pub fn load_playtime(data_dir: &Path) -> PlaytimeMap {
     let path = data_dir.join("playtime.json");
-    let Ok(contents) = fs::read_to_string(&path) else { return HashMap::new(); };
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
     serde_json::from_str(&contents).unwrap_or_default()
 }
 
@@ -69,7 +71,9 @@ pub fn format_playtime_in(minutes: u64, lang: PlaytimeLang) -> String {
         out.push_str(plural_hours(h, lang));
     }
     if m > 0 {
-        if h > 0 { out.push(' '); }
+        if h > 0 {
+            out.push(' ');
+        }
         out.push_str(&m.to_string());
         out.push(' ');
         out.push_str(plural_minutes(m, lang));
@@ -89,26 +93,46 @@ pub fn format_playtime(minutes: u64) -> String {
 
 fn plural_hours(n: u64, lang: PlaytimeLang) -> &'static str {
     match lang {
-        PlaytimeLang::En => if n == 1 { "hour" } else { "hours" },
+        PlaytimeLang::En => {
+            if n == 1 {
+                "hour"
+            } else {
+                "hours"
+            }
+        }
         PlaytimeLang::Ru => {
             let mod10 = n % 10;
             let mod100 = n % 100;
-            if mod10 == 1 && mod100 != 11 { "час" }
-            else if (2..=4).contains(&mod10) && !(12..=14).contains(&mod100) { "часа" }
-            else { "часов" }
+            if mod10 == 1 && mod100 != 11 {
+                "час"
+            } else if (2..=4).contains(&mod10) && !(12..=14).contains(&mod100) {
+                "часа"
+            } else {
+                "часов"
+            }
         }
     }
 }
 
 fn plural_minutes(n: u64, lang: PlaytimeLang) -> &'static str {
     match lang {
-        PlaytimeLang::En => if n == 1 { "minute" } else { "minutes" },
+        PlaytimeLang::En => {
+            if n == 1 {
+                "minute"
+            } else {
+                "minutes"
+            }
+        }
         PlaytimeLang::Ru => {
             let mod10 = n % 10;
             let mod100 = n % 100;
-            if mod10 == 1 && mod100 != 11 { "минуту" }
-            else if (2..=4).contains(&mod10) && !(12..=14).contains(&mod100) { "минуты" }
-            else { "минут" }
+            if mod10 == 1 && mod100 != 11 {
+                "минуту"
+            } else if (2..=4).contains(&mod10) && !(12..=14).contains(&mod100) {
+                "минуты"
+            } else {
+                "минут"
+            }
         }
     }
 }
@@ -130,7 +154,7 @@ impl ActiveSession {
     /// Returns the number of whole minutes elapsed since `last_flush` (without committing).
     pub fn unpaid_minutes(&self, now: Instant) -> u64 {
         let elapsed = now.duration_since(self.last_flush);
-        (elapsed.as_secs() / 60) as u64
+        elapsed.as_secs() / 60
     }
 
     /// Compute the remaining unpaid seconds (sub-minute remainder) since `last_flush`.
@@ -155,7 +179,9 @@ impl ActiveSession {
 
 /// Helper to update the playtime map and persist it (used by the timer + close handler).
 pub fn add_minutes_and_save(data_dir: &Path, instance_name: &str, delta_minutes: u64) {
-    if delta_minutes == 0 { return; }
+    if delta_minutes == 0 {
+        return;
+    }
     let mut map = load_playtime(data_dir);
     let entry = map.entry(instance_name.to_string()).or_default();
     entry.minutes = entry.minutes.saturating_add(delta_minutes);
@@ -244,8 +270,14 @@ mod tests {
         assert_eq!(format_playtime_in(61, PlaytimeLang::Ru), "1 час 1 минуту");
         assert_eq!(format_playtime_in(90, PlaytimeLang::Ru), "1 час 30 минут");
         assert_eq!(format_playtime_in(125, PlaytimeLang::Ru), "2 часа 5 минут");
-        assert_eq!(format_playtime_in(3630, PlaytimeLang::Ru), "60 часов 30 минут");
-        assert_eq!(format_playtime_in(3661, PlaytimeLang::Ru), "61 час 1 минуту");
+        assert_eq!(
+            format_playtime_in(3630, PlaytimeLang::Ru),
+            "60 часов 30 минут"
+        );
+        assert_eq!(
+            format_playtime_in(3661, PlaytimeLang::Ru),
+            "61 час 1 минуту"
+        );
     }
 
     #[test]
@@ -261,10 +293,22 @@ mod tests {
     fn format_en_with_hours() {
         assert_eq!(format_playtime_in(60, PlaytimeLang::En), "1 hour");
         assert_eq!(format_playtime_in(61, PlaytimeLang::En), "1 hour 1 minute");
-        assert_eq!(format_playtime_in(90, PlaytimeLang::En), "1 hour 30 minutes");
-        assert_eq!(format_playtime_in(125, PlaytimeLang::En), "2 hours 5 minutes");
-        assert_eq!(format_playtime_in(3630, PlaytimeLang::En), "60 hours 30 minutes");
-        assert_eq!(format_playtime_in(3661, PlaytimeLang::En), "61 hours 1 minute");
+        assert_eq!(
+            format_playtime_in(90, PlaytimeLang::En),
+            "1 hour 30 minutes"
+        );
+        assert_eq!(
+            format_playtime_in(125, PlaytimeLang::En),
+            "2 hours 5 minutes"
+        );
+        assert_eq!(
+            format_playtime_in(3630, PlaytimeLang::En),
+            "60 hours 30 minutes"
+        );
+        assert_eq!(
+            format_playtime_in(3661, PlaytimeLang::En),
+            "61 hours 1 minute"
+        );
     }
 
     #[test]
@@ -327,8 +371,7 @@ mod tests {
         let start = Instant::now();
         let from = |name: &str| -> ActiveSession {
             // 1 full minute already elapsed for these.
-            let s = fake_session(name, start - std::time::Duration::from_secs(60));
-            s
+            fake_session(name, start - std::time::Duration::from_secs(60))
         };
         let mut map = HashMap::new();
         map.insert("X".to_string(), from("X"));

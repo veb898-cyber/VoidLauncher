@@ -14,8 +14,7 @@ pub const ATL_INDEX_URL: &str =
     "https://download.nodecdn.net/containers/atl/launcher/json/packsnew.json";
 /// Pack icons are served as static files keyed by the pack's safe name
 /// (lowercased); the packs index itself carries no icon field.
-pub const ATL_IMAGES_BASE: &str =
-    "https://download.nodecdn.net/containers/atl/launcher/images";
+pub const ATL_IMAGES_BASE: &str = "https://download.nodecdn.net/containers/atl/launcher/images";
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct AtPackVersion {
@@ -242,14 +241,14 @@ pub async fn fetch_packs() -> Result<Vec<AtPack>> {
             }
             Err(e) => last_err = Some(LauncherError::Network(e)),
         }
-        if attempt < ATL_RETRY_DELAYS_MS.len() {
+        if let Some(&delay_ms) = ATL_RETRY_DELAYS_MS.get(attempt) {
             crate::events::emit_fetch_retry(
                 "atlauncher",
                 attempt + 2,
                 ATL_RETRY_DELAYS_MS.len() + 1,
                 "Retrying ATLauncher packs index",
             );
-            tokio::time::sleep(std::time::Duration::from_millis(ATL_RETRY_DELAYS_MS[attempt])).await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
     }
     if let Some(cached) = read_packs_from_disk() {
@@ -275,18 +274,14 @@ fn with_icon_urls(mut packs: Vec<AtPack>) -> Vec<AtPack> {
 pub async fn fetch_version_detail(safe_name: &str, version: &str) -> Result<AtPackVersionDetail> {
     let url = format!(
         "{}packs/{}/versions/{}/Configs.json",
-        ATL_DOWNLOAD_BASE,
-        safe_name,
-        version
+        ATL_DOWNLOAD_BASE, safe_name, version
     );
     crate::download::ensure_proxy_resolved().await;
     let client = crate::download::global_http_client()?;
     let mut last_err = None;
     for attempt in 0..=ATL_RETRY_DELAYS_MS.len() {
         match crate::download::send_with_fallback(
-            client
-                .get(&url)
-                .timeout(std::time::Duration::from_secs(20)),
+            client.get(&url).timeout(std::time::Duration::from_secs(20)),
         )
         .await
         {
@@ -306,14 +301,14 @@ pub async fn fetch_version_detail(safe_name: &str, version: &str) -> Result<AtPa
             }
             Err(e) => last_err = Some(LauncherError::Network(e)),
         }
-        if attempt < ATL_RETRY_DELAYS_MS.len() {
+        if let Some(&delay_ms) = ATL_RETRY_DELAYS_MS.get(attempt) {
             crate::events::emit_fetch_retry(
                 "atlauncher",
                 attempt + 2,
                 ATL_RETRY_DELAYS_MS.len() + 1,
                 "Retrying ATLauncher pack info",
             );
-            tokio::time::sleep(std::time::Duration::from_millis(ATL_RETRY_DELAYS_MS[attempt])).await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
     }
     Err(last_err.unwrap_or_else(|| {
@@ -348,14 +343,23 @@ pub struct ModpackProgressPayload {
     pub message: String,
 }
 
-fn emit_progress(app: Option<&AppHandle>, stage: &str, current: usize, total: usize, message: &str) {
+fn emit_progress(
+    app: Option<&AppHandle>,
+    stage: &str,
+    current: usize,
+    total: usize,
+    message: &str,
+) {
     if let Some(app) = app {
-        let _ = app.emit("import-progress", ModpackProgressPayload {
-            stage: stage.to_string(),
-            current,
-            total,
-            message: message.to_string(),
-        });
+        let _ = app.emit(
+            "import-progress",
+            ModpackProgressPayload {
+                stage: stage.to_string(),
+                current,
+                total,
+                message: message.to_string(),
+            },
+        );
     }
 }
 
@@ -382,10 +386,7 @@ fn mod_dest_dir(type_: &str) -> Option<&'static str> {
 }
 
 fn write_atl_sidecar(dest: &Path, name: &str, version: Option<&str>) {
-    let filename = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(name);
+    let filename = dest.file_name().and_then(|n| n.to_str()).unwrap_or(name);
     // Sidecar lives next to the content file (mods/, resourcepacks/,
     // shaderpacks/) so list_packs / list_mods can find it — not always in mods/.
     let content_dir = dest.parent().unwrap_or_else(|| Path::new("."));
@@ -410,11 +411,7 @@ fn verify_md5(path: &Path, expected: &str) -> bool {
     hash == expected.to_lowercase()
 }
 
-async fn download_atl_mod(
-    m: &AtMod,
-    dest: &Path,
-    client: &reqwest::Client,
-) -> Result<()> {
+async fn download_atl_mod(m: &AtMod, dest: &Path, client: &reqwest::Client) -> Result<()> {
     let url = match m.download.as_str() {
         "server" => m
             .url
@@ -459,7 +456,10 @@ async fn download_atl_mod(
     if let Some(md5) = &m.md5 {
         if !md5.is_empty() && !verify_md5(dest, md5) {
             let _ = std::fs::remove_file(dest);
-            return Err(LauncherError::Download(format!("MD5 mismatch for {}", m.name)));
+            return Err(LauncherError::Download(format!(
+                "MD5 mismatch for {}",
+                m.name
+            )));
         }
     }
     Ok(())
@@ -467,7 +467,7 @@ async fn download_atl_mod(
 
 /// Install an ATLauncher pack by id + version into a new instance.
 pub async fn install_atlauncher_pack(
-    instances_dir: &PathBuf,
+    instances_dir: &Path,
     libraries_dir: &Path,
     versions_dir: &Path,
     pack_id: u64,
@@ -477,13 +477,18 @@ pub async fn install_atlauncher_pack(
 ) -> Result<Instance> {
     emit_progress(app, "indexing", 0, 1, "Fetching pack index...");
     let packs = fetch_packs().await?;
-    let pack = packs
-        .iter()
-        .find(|p| p.id == pack_id)
-        .ok_or_else(|| LauncherError::Instance(format!("Pack {} not found in ATLauncher index", pack_id)))?;
+    let pack = packs.iter().find(|p| p.id == pack_id).ok_or_else(|| {
+        LauncherError::Instance(format!("Pack {} not found in ATLauncher index", pack_id))
+    })?;
     let safe_name = pack.safe_name();
 
-    emit_progress(app, "reading", 0, 1, &format!("Reading {} {}...", pack.name, version));
+    emit_progress(
+        app,
+        "reading",
+        0,
+        1,
+        &format!("Reading {} {}...", pack.name, version),
+    );
     let detail = fetch_version_detail(&safe_name, version).await?;
 
     let loader_type = detail
@@ -513,7 +518,9 @@ pub async fn install_atlauncher_pack(
         loader: loader_enum.clone().unwrap_or(LoaderType::Vanilla),
         loader_version: loader_version.clone(),
         loader_profile: None,
-        memory_mb: Some(crate::config::recommended_memory_mb(crate::config::detect_total_ram_mb())),
+        memory_mb: Some(crate::config::recommended_memory_mb(
+            crate::config::detect_total_ram_mb(),
+        )),
         jvm_args: None,
         gc_preset: Some("standard".to_string()),
         java_path: None,
@@ -523,7 +530,10 @@ pub async fn install_atlauncher_pack(
         created_at: chrono::Utc::now().to_rfc3339(),
         last_played: None,
         play_time_seconds: 0,
-        notes: format!("Installed from ATLauncher pack '{}' (v{})", pack.name, version),
+        notes: format!(
+            "Installed from ATLauncher pack '{}' (v{})",
+            pack.name, version
+        ),
     };
 
     // Install the mod loader (if any) so the pack runs immediately.
@@ -542,7 +552,7 @@ pub async fn install_atlauncher_pack(
                 lv,
                 libraries_dir,
                 versions_dir,
-                app.clone(),
+                app,
             )
             .await
             {
@@ -573,9 +583,7 @@ pub async fn install_atlauncher_pack(
                 let zip_path = target_dir.join(".tmp-configs.zip");
                 let configs_url = format!(
                     "{}packs/{}/versions/{}/Configs.zip",
-                    ATL_DOWNLOAD_BASE,
-                    safe_name,
-                    version
+                    ATL_DOWNLOAD_BASE, safe_name, version
                 );
                 let dl = match configs.filesize {
                     Some(size) if size > 0 => {
@@ -607,11 +615,20 @@ pub async fn install_atlauncher_pack(
             m.client
                 && !m.hidden
                 && m.download != "browser"
-                && !matches!(m.type_.to_lowercase().as_str(), "forge" | "neoforge" | "fabric")
+                && !matches!(
+                    m.type_.to_lowercase().as_str(),
+                    "forge" | "neoforge" | "fabric"
+                )
         })
         .collect();
     let total = client_mods.len();
-    emit_progress(app, "downloading-mods", 0, total, &format!("Preparing {} mods...", total));
+    emit_progress(
+        app,
+        "downloading-mods",
+        0,
+        total,
+        &format!("Preparing {} mods...", total),
+    );
 
     let semaphore = Arc::new(Semaphore::new(4));
     let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -775,10 +792,21 @@ mod tests {
         assert_eq!(detail.minecraft, "1.21.1");
         assert_eq!(detail.loader.as_ref().unwrap().type_, "neoforge");
         assert_eq!(
-            detail.loader.as_ref().unwrap().metadata.as_ref().unwrap().version.as_deref(),
+            detail
+                .loader
+                .as_ref()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .version
+                .as_deref(),
             Some("21.1.83")
         );
-        assert_eq!(detail.configs.as_ref().unwrap().sha1.as_deref(), Some("abc123"));
+        assert_eq!(
+            detail.configs.as_ref().unwrap().sha1.as_deref(),
+            Some("abc123")
+        );
         assert_eq!(detail.mods.len(), 1);
         let m = &detail.mods[0];
         assert_eq!(m.name, "Example Mod");
@@ -800,7 +828,15 @@ mod tests {
         let detail: AtPackVersionDetail = serde_json::from_str(json).unwrap();
         assert_eq!(detail.loader.as_ref().unwrap().type_, "fabric");
         assert_eq!(
-            detail.loader.as_ref().unwrap().metadata.as_ref().unwrap().loader.as_deref(),
+            detail
+                .loader
+                .as_ref()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .loader
+                .as_deref(),
             Some("0.18.4")
         );
     }

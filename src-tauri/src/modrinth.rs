@@ -1,8 +1,12 @@
-use serde::{Deserialize, Serialize};
 use crate::error::Result;
+use serde::{Deserialize, Serialize};
 
 const BASE_URL: &str = "https://api.modrinth.com/v2";
-const USER_AGENT: &str = concat!("VoidLauncher/", env!("CARGO_PKG_VERSION"), " (github.com/voidlauncher)");
+const USER_AGENT: &str = concat!(
+    "VoidLauncher/",
+    env!("CARGO_PKG_VERSION"),
+    " (github.com/voidlauncher)"
+);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModrinthSearchResult {
@@ -161,10 +165,16 @@ pub async fn get_versions(
 ) -> Result<Vec<ModrinthVersion>> {
     let mut params = Vec::new();
     if let Some(v) = mc_version {
-        params.push(format!("game_versions={}", urlencoding::encode(&format!(r#"["{}"]"#, v))));
+        params.push(format!(
+            "game_versions={}",
+            urlencoding::encode(&format!(r#"["{}"]"#, v))
+        ));
     }
     if let Some(l) = loader {
-        params.push(format!("loaders={}", urlencoding::encode(&format!(r#"["{}"]"#, l.to_lowercase()))));
+        params.push(format!(
+            "loaders={}",
+            urlencoding::encode(&format!(r#"["{}"]"#, l.to_lowercase()))
+        ));
     }
 
     let query = if params.is_empty() {
@@ -229,20 +239,22 @@ pub async fn check_version_updates(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(crate::error::LauncherError::Download(
-            format!("Modrinth update API error ({}): {}", status, text)
-        ));
+        return Err(crate::error::LauncherError::Download(format!(
+            "Modrinth update API error ({}): {}",
+            status, text
+        )));
     }
     let text = response.text().await.map_err(|e| {
         crate::error::LauncherError::Download(format!("Failed to read update response: {}", e))
     })?;
-    serde_json::from_str::<std::collections::HashMap<String, Option<ModrinthVersion>>>(&text).map_err(|e| {
-        crate::error::LauncherError::Download(format!(
-            "Failed to decode update response: {}. Body preview: {}",
-            e,
-            &text.chars().take(500).collect::<String>()
-        ))
-    })
+    serde_json::from_str::<std::collections::HashMap<String, Option<ModrinthVersion>>>(&text)
+        .map_err(|e| {
+            crate::error::LauncherError::Download(format!(
+                "Failed to decode update response: {}. Body preview: {}",
+                e,
+                &text.chars().take(500).collect::<String>()
+            ))
+        })
 }
 
 pub async fn popular_mods(

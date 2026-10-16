@@ -97,10 +97,10 @@ pub fn resolve_host_for_room(peers: &[PeerInfo], room_id: Option<&str>) -> Optio
 
     // 1. Explicit hostname hint match.
     if let Some(prefix) = &hint_prefix {
-        if let Some(peer) = peers
-            .iter()
-            .find(|p| p.dns_name.to_ascii_lowercase().starts_with(prefix) || p.host_name.to_ascii_lowercase().starts_with(prefix))
-        {
+        if let Some(peer) = peers.iter().find(|p| {
+            p.dns_name.to_ascii_lowercase().starts_with(prefix)
+                || p.host_name.to_ascii_lowercase().starts_with(prefix)
+        }) {
             return Some(HostInfo::from_peer(peer));
         }
     }
@@ -182,8 +182,20 @@ mod tests {
     #[test]
     fn hostname_hint_wins_even_with_other_online_peers() {
         let peers = vec![
-            node("android", "android-phone", "android-phone.tail1234.ts.net.", Some("100.1.0.2"), true),
-            shared_node("host", "abcd-1234-host", "abcd-1234-host.tail1234.ts.net.", Some("100.1.0.1"), true),
+            node(
+                "android",
+                "android-phone",
+                "android-phone.tail1234.ts.net.",
+                Some("100.1.0.2"),
+                true,
+            ),
+            shared_node(
+                "host",
+                "abcd-1234-host",
+                "abcd-1234-host.tail1234.ts.net.",
+                Some("100.1.0.1"),
+                true,
+            ),
         ];
         let peers = peers_from_status(&status_with(peers));
         let host = resolve_host_for_room(&peers, Some("ABCD-1234")).unwrap();
@@ -194,8 +206,20 @@ mod tests {
     #[test]
     fn single_online_peer_fallback() {
         let peers = vec![
-            node("android", "android-phone", "android.tail1234.ts.net.", None, false),
-            shared_node("host", "gaming-pc", "gaming-pc.tail1234.ts.net.", Some("100.1.0.9"), true),
+            node(
+                "android",
+                "android-phone",
+                "android.tail1234.ts.net.",
+                None,
+                false,
+            ),
+            shared_node(
+                "host",
+                "gaming-pc",
+                "gaming-pc.tail1234.ts.net.",
+                Some("100.1.0.9"),
+                true,
+            ),
         ];
         let peers = peers_from_status(&status_with(peers));
         let host = resolve_host_for_room(&peers, None).unwrap();
@@ -226,7 +250,13 @@ mod tests {
         // taken as the host).
         let p = PeerNode {
             sharee_node: None,
-            ..node("host", "gaming-pc", "gaming-pc.tail1234.ts.net.", Some("100.1.0.9"), true)
+            ..node(
+                "host",
+                "gaming-pc",
+                "gaming-pc.tail1234.ts.net.",
+                Some("100.1.0.9"),
+                true,
+            )
         };
         let peers = peers_from_status(&status_with(vec![p]));
         let host = resolve_host_for_room(&peers, None).unwrap();
@@ -238,7 +268,12 @@ mod tests {
         // Regression: a real status document can contain a peer without
         // `NodeKey`; it must remain eligible for host resolution (key is an
         // identifier, the DNS name / IP carry the connectivity data).
-        let peers = vec![keyless_node("gaming-pc", "abcd-1234-host.tail1234.ts.net.", Some("100.1.0.9"), true)];
+        let peers = vec![keyless_node(
+            "gaming-pc",
+            "abcd-1234-host.tail1234.ts.net.",
+            Some("100.1.0.9"),
+            true,
+        )];
         let peers = peers_from_status(&status_with(peers));
         let host = resolve_host_for_room(&peers, Some("ABCD-1234")).unwrap();
         assert_eq!(host.host_name, "gaming-pc");
@@ -261,7 +296,13 @@ mod tests {
 
     #[test]
     fn hint_is_case_insensitive_and_works_without_room_id() {
-        let peers = vec![node("h", "Hz-Pc", "AB12-CD34-HOST.tail.ts.net.", Some("100.1.0.5"), false)];
+        let peers = vec![node(
+            "h",
+            "Hz-Pc",
+            "AB12-CD34-HOST.tail.ts.net.",
+            Some("100.1.0.5"),
+            false,
+        )];
         let peers = peers_from_status(&status_with(peers));
         // A room id that doesn't match the hint and no single online peer → none.
         assert!(resolve_host_for_room(&peers, Some("ZZZZ-9999")).is_none());
@@ -272,7 +313,13 @@ mod tests {
 
     #[test]
     fn host_info_dns_trims_trailing_dot() {
-        let peers = vec![shared_node("h", "h", "h.tail1234.ts.net.", Some("100.1.0.5"), true)];
+        let peers = vec![shared_node(
+            "h",
+            "h",
+            "h.tail1234.ts.net.",
+            Some("100.1.0.5"),
+            true,
+        )];
         let peers = peers_from_status(&status_with(peers));
         let host = resolve_host_for_room(&peers, None).unwrap();
         assert_eq!(host.dns(), Some("h.tail1234.ts.net"));

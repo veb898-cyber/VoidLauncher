@@ -1,6 +1,6 @@
 use crate::error::{LauncherError, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -62,11 +62,14 @@ struct AdoptiumPackage {
 const ADOPTIUM_API: &str = "https://api.adoptium.net/v3";
 const MANAGED_JAVA_DIR: &str = "java";
 
+type ClientSlot = OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>>;
+type JavaListSlot = OnceLock<Mutex<Option<(Instant, Vec<AvailableJavaVersion>)>>>;
+
 /// HTTP client without auto-decompression — prevents "error decoding response body"
 /// when the server sends brotli/deflate despite us not requesting it.
 /// Rebuilt automatically when the proxy setting changes.
 fn download_client() -> reqwest::Result<reqwest::Client> {
-    static CLIENT: OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>> = OnceLock::new();
+    static CLIENT: ClientSlot = OnceLock::new();
     let proxy = crate::download::resolved_proxy_url(crate::download::active_proxy_raw());
     let mut slot = CLIENT
         .get_or_init(|| Mutex::new(None))
@@ -108,7 +111,7 @@ struct AdoptiumReleasesInfo {
 /// In-memory cache so reopening settings does not re-hit the API (like Prism Launcher)
 const JAVA_LIST_CACHE_TTL: Duration = Duration::from_secs(600);
 
-static JAVA_LIST_CACHE: OnceLock<Mutex<Option<(Instant, Vec<AvailableJavaVersion>)>>> = OnceLock::new();
+static JAVA_LIST_CACHE: JavaListSlot = OnceLock::new();
 
 fn java_list_cache() -> &'static Mutex<Option<(Instant, Vec<AvailableJavaVersion>)>> {
     JAVA_LIST_CACHE.get_or_init(|| Mutex::new(None))
@@ -152,13 +155,15 @@ pub async fn list_available_java_versions() -> Result<Vec<AvailableJavaVersion>>
         )
         .await;
         let releases = match result {
-            Ok(Ok(resp)) if resp.status().is_success() => match resp.json::<AdoptiumReleasesInfo>().await {
-                Ok(info) => Some(info.available_releases),
-                Err(e) => {
-                    tracing::warn!(target: "launcher", "Failed to parse Adoptium releases info: {}", e);
-                    None
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                match resp.json::<AdoptiumReleasesInfo>().await {
+                    Ok(info) => Some(info.available_releases),
+                    Err(e) => {
+                        tracing::warn!(target: "launcher", "Failed to parse Adoptium releases info: {}", e);
+                        None
+                    }
                 }
-            },
+            }
             Ok(Ok(resp)) => {
                 tracing::warn!(target: "launcher", "Adoptium releases info returned HTTP {}", resp.status());
                 None
@@ -201,14 +206,15 @@ pub async fn list_available_java_versions() -> Result<Vec<AvailableJavaVersion>>
 
     *java_list_cache()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((Instant::now(), versions.clone()));
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((Instant::now(), versions.clone()));
     Ok(versions)
 }
 
 /// Download and install a Java runtime by major version
 pub async fn download_java_runtime(
     major_version: u32,
-    data_dir: &PathBuf,
+    data_dir: &Path,
     app: &AppHandle,
 ) -> Result<ManagedJavaRuntime> {
     let java_dir = data_dir.join(MANAGED_JAVA_DIR);
@@ -216,12 +222,15 @@ pub async fn download_java_runtime(
     let extract_marker = runtime_dir.join(".extracted");
 
     let emit_progress = |percent: f64, stage: &str, message: &str| {
-        let _ = app.emit("java_download_progress", JavaDownloadProgress {
-            major_version,
-            percent,
-            stage: stage.to_string(),
-            message: message.to_string(),
-        });
+        let _ = app.emit(
+            "java_download_progress",
+            JavaDownloadProgress {
+                major_version,
+                percent,
+                stage: stage.to_string(),
+                message: message.to_string(),
+            },
+        );
     };
 
     tracing::info!(target: "launcher", "Starting download of Java {} runtime", major_version);
@@ -331,12 +340,22 @@ pub async fn download_java_runtime(
         .iter()
         .find(|b| b.os_name == "windows" && b.architecture == "x64" && b.image_type == "jdk")
         .ok_or_else(|| {
-            LauncherError::Download(format!("No Windows x64 JDK package for Java {}", major_version))
+            LauncherError::Download(format!(
+                "No Windows x64 JDK package for Java {}",
+                major_version
+            ))
         })?;
 
-    let pkg = binary.package.as_ref().or(binary.installer.as_ref()).ok_or_else(|| {
-        LauncherError::Download(format!("No Windows x64 JDK package for Java {}", major_version))
-    })?;
+    let pkg = binary
+        .package
+        .as_ref()
+        .or(binary.installer.as_ref())
+        .ok_or_else(|| {
+            LauncherError::Download(format!(
+                "No Windows x64 JDK package for Java {}",
+                major_version
+            ))
+        })?;
 
     // Integrity metadata: the digest Adoptium publishes for the exact archive
     // referenced by `pkg.link` (SHA-256 hex). Verified against the downloaded
@@ -350,10 +369,12 @@ pub async fn download_java_runtime(
     // Phase 2: Download
     emit_progress(10.0, "downloading", &format!("Downloading {}...", pkg_name));
 
-    let response = crate::download::send_with_fallback(client.get(&pkg_link)).await.map_err(|e| {
-        tracing::error!(target: "launcher", "Failed to download Java {}: {}", major_version, e);
-        LauncherError::Download(format!("Failed to download Java: {}", e))
-    })?;
+    let response = crate::download::send_with_fallback(client.get(&pkg_link))
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "launcher", "Failed to download Java {}: {}", major_version, e);
+            LauncherError::Download(format!("Failed to download Java: {}", e))
+        })?;
 
     let status = response.status();
     let total_size = response.content_length().unwrap_or(0);
@@ -361,7 +382,10 @@ pub async fn download_java_runtime(
     tracing::info!(target: "launcher", "Java {} download response: status={}, total_size={}", major_version, status, total_size);
 
     if !status.is_success() {
-        let msg = format!("Java {} download failed with HTTP {}", major_version, status);
+        let msg = format!(
+            "Java {} download failed with HTTP {}",
+            major_version, status
+        );
         tracing::error!(target: "launcher", "{}", msg);
         return Err(LauncherError::Download(msg));
     }
@@ -369,8 +393,9 @@ pub async fn download_java_runtime(
     // Stream download to disk
     {
         use futures::StreamExt;
-        let mut file = std::fs::File::create(&archive_path)
-            .map_err(|e| LauncherError::Download(format!("Failed to create archive file: {}", e)))?;
+        let mut file = std::fs::File::create(&archive_path).map_err(|e| {
+            LauncherError::Download(format!("Failed to create archive file: {}", e))
+        })?;
         let mut stream = response.bytes_stream();
         let mut downloaded: u64 = 0;
         // No-data timeout: if the server goes silent for 30s (no chunk at
@@ -388,7 +413,11 @@ pub async fn download_java_runtime(
                         let pct = 10.0 + (downloaded as f64 / total_size as f64) * 70.0;
                         let mb_done = downloaded as f64 / (1024.0 * 1024.0);
                         let mb_total = total_size as f64 / (1024.0 * 1024.0);
-                        emit_progress(pct, "downloading", &format!("{:.1}/{:.1} MB", mb_done, mb_total));
+                        emit_progress(
+                            pct,
+                            "downloading",
+                            &format!("{:.1}/{:.1} MB", mb_done, mb_total),
+                        );
                     }
                 }
                 Ok(None) => break,
@@ -408,9 +437,8 @@ pub async fn download_java_runtime(
     {
         let mut header = [0u8; 4];
         use std::io::Read;
-        let mut f = std::fs::File::open(&archive_path).map_err(|e| {
-            LauncherError::Download(format!("Cannot open downloaded file: {}", e))
-        })?;
+        let mut f = std::fs::File::open(&archive_path)
+            .map_err(|e| LauncherError::Download(format!("Cannot open downloaded file: {}", e)))?;
         f.read_exact(&mut header).ok();
         if header != [0x50, 0x4b, 0x03, 0x04] {
             // Not a ZIP file — likely an MSI installer
@@ -422,20 +450,17 @@ pub async fn download_java_runtime(
         }
     }
 
-    verify_archive_checksum(&archive_path, expected_checksum.as_deref()).map_err(|e| {
+    verify_archive_checksum(&archive_path, expected_checksum.as_deref()).inspect_err(|_| {
         let _ = std::fs::remove_file(&archive_path);
-        e
     })?;
 
     emit_progress(85.0, "extracting", "Extracting archive...");
 
     let archive_clone = archive_path.clone();
     let runtime_clone = runtime_dir.clone();
-    tokio::task::spawn_blocking(move || {
-        extract_archive(&archive_clone, &runtime_clone)
-    })
-    .await
-    .map_err(|e| LauncherError::Download(format!("Extraction task failed: {}", e)))??;
+    tokio::task::spawn_blocking(move || extract_archive(&archive_clone, &runtime_clone))
+        .await
+        .map_err(|e| LauncherError::Download(format!("Extraction task failed: {}", e)))??;
 
     let _ = std::fs::remove_file(&archive_path);
 
@@ -465,7 +490,7 @@ pub async fn download_java_runtime(
 }
 
 /// List already-downloaded Java runtimes
-pub fn list_managed_java(data_dir: &PathBuf) -> Vec<ManagedJavaRuntime> {
+pub fn list_managed_java(data_dir: &Path) -> Vec<ManagedJavaRuntime> {
     let java_dir = data_dir.join(MANAGED_JAVA_DIR);
     if !java_dir.exists() {
         return Vec::new();
@@ -499,7 +524,7 @@ pub fn list_managed_java(data_dir: &PathBuf) -> Vec<ManagedJavaRuntime> {
 }
 
 /// Remove a managed Java runtime
-pub fn remove_managed_java(major_version: u32, data_dir: &PathBuf) -> Result<()> {
+pub fn remove_managed_java(major_version: u32, data_dir: &Path) -> Result<()> {
     let dir = data_dir
         .join(MANAGED_JAVA_DIR)
         .join(format!("jdk-{}", major_version));
@@ -510,7 +535,7 @@ pub fn remove_managed_java(major_version: u32, data_dir: &PathBuf) -> Result<()>
     Ok(())
 }
 
-fn find_java_in_dir(dir: &PathBuf) -> Option<PathBuf> {
+fn find_java_in_dir(dir: &Path) -> Option<PathBuf> {
     let direct = dir.join("bin").join("java.exe");
     if direct.exists() {
         return Some(direct);
@@ -530,7 +555,7 @@ fn find_java_in_dir(dir: &PathBuf) -> Option<PathBuf> {
     None
 }
 
-fn extract_archive(archive_path: &PathBuf, dest_dir: &PathBuf) -> Result<()> {
+fn extract_archive(archive_path: &Path, dest_dir: &Path) -> Result<()> {
     let file = std::fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| LauncherError::Download(format!("Invalid archive: {}", e)))?;
@@ -683,14 +708,16 @@ mod tests {
     fn checksum_skips_when_missing_or_unrecognized_format() {
         let file = unique("skip");
         let content = [0u8; 4096];
-        std::fs::write(&file, &content).unwrap();
+        std::fs::write(&file, content).unwrap();
 
         assert!(verify_archive_checksum(&file, None).is_ok());
         assert!(verify_archive_checksum(&file, Some("")).is_ok());
         assert!(verify_archive_checksum(&file, Some("   ")).is_ok());
         // Not a 64-char hex digest (e.g. sha512 or an unexpected scheme) — tolerate.
         assert!(verify_archive_checksum(&file, Some("deadbeef")).is_ok());
-        assert!(verify_archive_checksum(&file, Some("0123456789abcdef".repeat(8).as_str())).is_ok());
+        assert!(
+            verify_archive_checksum(&file, Some("0123456789abcdef".repeat(8).as_str())).is_ok()
+        );
 
         let _ = std::fs::remove_file(&file);
     }

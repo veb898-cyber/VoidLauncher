@@ -141,14 +141,16 @@ pub async fn cmd_search_curseforge_modpacks(
         config.curseforge_api_key.clone()
     };
     curseforge::search_mods_filtered(
-        &query,
-        mc_version.as_deref(),
-        loader.as_deref(),
-        Some(CF_MODPACK_CLASS_ID),
-        None,
-        index.as_deref(),
-        offset,
-        limit,
+        &curseforge::CfSearchQuery {
+            query: &query,
+            mc_version: mc_version.as_deref(),
+            loader: loader.as_deref(),
+            class_id: Some(CF_MODPACK_CLASS_ID),
+            category_id: None,
+            index: index.as_deref(),
+            offset,
+            limit,
+        },
         &api_key,
     )
     .await
@@ -166,9 +168,15 @@ pub async fn cmd_get_curseforge_modpack_files(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.curseforge_api_key.clone()
     };
-    curseforge::get_mod_files(mod_id, mc_version.as_deref(), loader.as_deref(), 0, &api_key)
-        .await
-        .map_err(|e| e.to_string())
+    curseforge::get_mod_files(
+        mod_id,
+        mc_version.as_deref(),
+        loader.as_deref(),
+        0,
+        &api_key,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -195,8 +203,8 @@ pub async fn cmd_install_curseforge_modpack(
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect::<String>();
-    let temp_path = std::env::temp_dir()
-        .join(format!("voidlauncher-cf-{}-{}.zip", safe_instance, file_id));
+    let temp_path =
+        std::env::temp_dir().join(format!("voidlauncher-cf-{}-{}.zip", safe_instance, file_id));
     curseforge::download_mod_file(mod_id, file_id, &file, &api_key, &temp_path)
         .await
         .map_err(|e| e.to_string())?;
@@ -318,8 +326,10 @@ pub async fn cmd_install_modrinth_modpack(
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect::<String>();
-    let temp_path = std::env::temp_dir()
-        .join(format!("voidlauncher-mr-{}-{}.mrpack", safe_instance, version_id));
+    let temp_path = std::env::temp_dir().join(format!(
+        "voidlauncher-mr-{}-{}.mrpack",
+        safe_instance, version_id
+    ));
     let expected_sha1 = file.hashes.get("sha1").map(|s| s.as_str()).unwrap_or("");
     crate::download::download_file_sized(&file.url, &temp_path, expected_sha1, file.size)
         .await

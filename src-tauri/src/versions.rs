@@ -1,6 +1,6 @@
+use crate::error::{LauncherError, Result};
 use serde::{Deserialize, Serialize};
-use crate::error::{Result, LauncherError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Version manifest from Mojang
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -254,7 +254,11 @@ pub fn should_include_library(lib: &Library) -> bool {
                     None => true,
                 };
                 let arch_matches = match &os_rule.arch {
-                    Some(arch) => arch == current_arch || (arch == "x86" && (current_arch == "x86" || current_arch == "x86_64")),
+                    Some(arch) => {
+                        arch == current_arch
+                            || (arch == "x86"
+                                && (current_arch == "x86" || current_arch == "x86_64"))
+                    }
                     None => true,
                 };
                 os_matches && arch_matches
@@ -311,7 +315,11 @@ pub(crate) fn native_classifier(lib: &Library) -> Option<String> {
 }
 
 /// Build classpath from version info libraries, including native classifier JARs.
-pub fn build_classpath(version_info: &VersionInfo, libraries_dir: &PathBuf, client_jar: &PathBuf) -> String {
+pub fn build_classpath(
+    version_info: &VersionInfo,
+    libraries_dir: &Path,
+    client_jar: &Path,
+) -> String {
     let mut classpath_entries: Vec<String> = Vec::new();
 
     for lib in &version_info.libraries {
@@ -409,12 +417,12 @@ fn argument_rule_allows(entry: &serde_json::Value, has_custom_resolution: bool) 
 }
 
 /// Expand a `value` field (string or array of strings) into the argument list.
-fn expand_argument_value(value: &serde_json::Value, has_custom_resolution: bool, out: &mut Vec<String>) {
+fn expand_argument_value(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::String(s) => out.push(s.clone()),
         serde_json::Value::Array(items) => {
             for item in items {
-                expand_argument_value(item, has_custom_resolution, out);
+                expand_argument_value(item, out);
             }
         }
         _ => {}
@@ -430,7 +438,7 @@ fn evaluate_arguments(args: &[serde_json::Value], has_custom_resolution: bool) -
             out.push(s.to_string());
         } else if arg.is_object() && argument_rule_allows(arg, has_custom_resolution) {
             if let Some(value) = arg.get("value") {
-                expand_argument_value(value, has_custom_resolution, &mut out);
+                expand_argument_value(value, &mut out);
             }
         }
     }
@@ -499,16 +507,14 @@ pub fn get_jvm_arguments(version_info: &VersionInfo) -> Vec<String> {
 /// classifier JARs (e.g. lwjgl natives for the current platform).
 pub fn collect_downloads(
     version_info: &VersionInfo,
-    libraries_dir: &PathBuf,
-    versions_dir: &PathBuf,
+    libraries_dir: &Path,
+    versions_dir: &Path,
 ) -> Vec<(String, PathBuf, String, u64)> {
     // Returns: (url, local_path, sha1, size)
     let mut files = Vec::new();
 
     // Client JAR
-    let client_path = versions_dir
-        .join(&version_info.id)
-        .join("client.jar");
+    let client_path = versions_dir.join(&version_info.id).join("client.jar");
     files.push((
         version_info.downloads.client.url.clone(),
         client_path,
@@ -547,12 +553,7 @@ pub fn collect_downloads(
                         ) {
                             let native_path = libraries_dir.join(path);
                             if !native_path.exists() {
-                                files.push((
-                                    url.to_string(),
-                                    native_path,
-                                    sha1.to_string(),
-                                    size,
-                                ));
+                                files.push((url.to_string(), native_path, sha1.to_string(), size));
                             }
                         }
                     }
@@ -576,7 +577,7 @@ pub fn collect_downloads(
 }
 
 /// Load a saved asset index (e.g. `indexes/legacy.json`) from disk
-pub fn load_asset_index(path: &PathBuf) -> Result<AssetIndexData> {
+pub fn load_asset_index(path: &Path) -> Result<AssetIndexData> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| LauncherError::Version(format!("Failed to read asset index: {}", e)))?;
 
@@ -591,7 +592,7 @@ pub fn load_asset_index(path: &PathBuf) -> Result<AssetIndexData> {
 /// native-JAR support.
 pub async fn ensure_native_libraries(
     version_info: &VersionInfo,
-    libraries_dir: &PathBuf,
+    libraries_dir: &Path,
 ) -> Result<()> {
     let mut missing: Vec<(String, PathBuf, String)> = Vec::new();
 
@@ -606,7 +607,10 @@ pub async fn ensure_native_libraries(
                         if let (Some(url), Some(path), sha1) = (
                             native_artifact.get("url").and_then(|u| u.as_str()),
                             native_artifact.get("path").and_then(|p| p.as_str()),
-                            native_artifact.get("sha1").and_then(|s| s.as_str()).unwrap_or(""),
+                            native_artifact
+                                .get("sha1")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or(""),
                         ) {
                             let native_path = libraries_dir.join(path);
                             if !native_path.exists() {
@@ -628,9 +632,11 @@ pub async fn ensure_native_libraries(
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        crate::download::download_file(url, path, sha1).await.map_err(|e| {
-            LauncherError::Version(format!("Failed to download native library {}: {}", url, e))
-        })?;
+        crate::download::download_file(url, path, sha1)
+            .await
+            .map_err(|e| {
+                LauncherError::Version(format!("Failed to download native library {}: {}", url, e))
+            })?;
     }
 
     Ok(())
@@ -640,7 +646,7 @@ pub async fn ensure_native_libraries(
 /// the natives directory so they can be found via -Djava.library.path.
 /// This mirrors the official launcher behavior and also covers old LWJGL
 /// versions that do not load natives from the classpath.
-pub fn extract_natives(version_info: &VersionInfo, libraries_dir: &PathBuf, natives_dir: &PathBuf) {
+pub fn extract_natives(version_info: &VersionInfo, libraries_dir: &Path, natives_dir: &Path) {
     use std::io::Read;
 
     std::fs::create_dir_all(natives_dir).ok();
@@ -658,11 +664,17 @@ pub fn extract_natives(version_info: &VersionInfo, libraries_dir: &PathBuf, nati
                             if !jar_path.exists() {
                                 continue;
                             }
-                            let Ok(bytes) = std::fs::read(&jar_path) else { continue };
+                            let Ok(bytes) = std::fs::read(&jar_path) else {
+                                continue;
+                            };
                             let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-                            else { continue };
+                            else {
+                                continue;
+                            };
                             for i in 0..archive.len() {
-                                let Ok(mut entry) = archive.by_index(i) else { continue };
+                                let Ok(mut entry) = archive.by_index(i) else {
+                                    continue;
+                                };
                                 let name = entry.name().replace('\\', "/");
                                 if name.starts_with("META-INF/") || name.ends_with('/') {
                                     continue;
@@ -763,7 +775,10 @@ mod tests {
         // mismatched natives crash with EXCEPTION_ACCESS_VIOLATION.
         let rules = Some(vec![Rule {
             action: "allow".to_string(),
-            os: Some(OsRule { name: Some("osx".to_string()), arch: None }),
+            os: Some(OsRule {
+                name: Some("osx".to_string()),
+                arch: None,
+            }),
         }]);
         assert!(!should_include_library(&lib_with_rules(rules)));
     }
@@ -772,10 +787,16 @@ mod tests {
     #[test]
     fn cross_platform_library_is_included_on_non_macos() {
         let rules = Some(vec![
-            Rule { action: "allow".to_string(), os: None },
+            Rule {
+                action: "allow".to_string(),
+                os: None,
+            },
             Rule {
                 action: "disallow".to_string(),
-                os: Some(OsRule { name: Some("osx".to_string()), arch: None }),
+                os: Some(OsRule {
+                    name: Some("osx".to_string()),
+                    arch: None,
+                }),
             },
         ]);
         assert!(should_include_library(&lib_with_rules(rules)));
@@ -799,10 +820,21 @@ mod tests {
     #[test]
     fn arguments_strings_pass_through() {
         let args = serde_json::json!([
-            "--username", "${auth_player_name}", "--version", "${version_name}"
+            "--username",
+            "${auth_player_name}",
+            "--version",
+            "${version_name}"
         ]);
         let out = evaluate_arguments(args.as_array().unwrap(), false);
-        assert_eq!(out, vec!["--username", "${auth_player_name}", "--version", "${version_name}"]);
+        assert_eq!(
+            out,
+            vec![
+                "--username",
+                "${auth_player_name}",
+                "--version",
+                "${version_name}"
+            ]
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -830,14 +862,29 @@ mod tests {
         assert!(out.is_empty());
         // Feature enabled → array expands
         let out = evaluate_arguments(args.as_array().unwrap(), true);
-        assert_eq!(out, vec!["--width", "${resolution_width}", "--height", "${resolution_height}"]);
+        assert_eq!(
+            out,
+            vec![
+                "--width",
+                "${resolution_width}",
+                "--height",
+                "${resolution_height}"
+            ]
+        );
     }
 
     #[test]
     fn legacy_arguments_split_respects_quotes() {
         let out = split_mc_arguments(r#"--username ${auth_player_name} --demo --foo "some value""#);
-        assert_eq!(out, vec![
-            "--username", "${auth_player_name}", "--demo", "--foo", "some value"
-        ]);
+        assert_eq!(
+            out,
+            vec![
+                "--username",
+                "${auth_player_name}",
+                "--demo",
+                "--foo",
+                "some value"
+            ]
+        );
     }
 }

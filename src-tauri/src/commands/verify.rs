@@ -13,8 +13,8 @@ pub async fn cmd_verify_instance(
     scope: Option<String>,
 ) -> Result<verify::VerifyReport, String> {
     super::instances::validate_instance_name(&instance_name)?;
-    let scope = verify::VerifyScope::parse(scope.as_deref().unwrap_or("all"))
-        .map_err(|e| e.to_string())?;
+    let scope =
+        verify::VerifyScope::parse(scope.as_deref().unwrap_or("all")).map_err(|e| e.to_string())?;
     let (instances_dir, config) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         (config.instances_dir(), config.clone())
@@ -39,8 +39,8 @@ pub async fn cmd_repair_instance(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.clone()
     };
-    let instance =
-        instances::get_instance(&config.instances_dir(), &instance_name).map_err(|e| e.to_string())?;
+    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
+        .map_err(|e| e.to_string())?;
     verify::repair_instance(&app, &config, &instance)
         .await
         .map_err(|e| e.to_string())

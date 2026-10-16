@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::error::Result;
+use serde::{Deserialize, Serialize};
 
 const BASE_URL: &str = "https://api.curseforge.com";
 const MINECRAFT_GAME_ID: u32 = 432;
@@ -257,27 +257,42 @@ async fn api_get_once<T: serde::de::DeserializeOwned>(
         )));
     }
     let text = response.text().await?;
-    Ok(serde_json::from_str::<T>(&text).map_err(|e| {
+    serde_json::from_str::<T>(&text).map_err(|e| {
         crate::error::LauncherError::Download(format!(
             "Failed to decode CurseForge response: {}",
             e
         ))
-    })?)
+    })
 }
 
-/// Search with optional classId (e.g. 4471 = modpacks), categoryId and
-/// sort (`index`: `downloads`/`newest`/`oldest`, see [`sort_field_for`]).
+/// Filter set for [`search_mods_filtered`]. `index` selects the sort order
+/// (`downloads`/`newest`/`oldest`, see [`sort_field_for`]).
+pub struct CfSearchQuery<'a> {
+    pub query: &'a str,
+    pub mc_version: Option<&'a str>,
+    pub loader: Option<&'a str>,
+    pub class_id: Option<u32>,
+    pub category_id: Option<u32>,
+    pub index: Option<&'a str>,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+/// Search with optional classId (e.g. 4471 = modpacks), categoryId and sort.
 pub async fn search_mods_filtered(
-    query: &str,
-    mc_version: Option<&str>,
-    loader: Option<&str>,
-    class_id: Option<u32>,
-    category_id: Option<u32>,
-    index: Option<&str>,
-    offset: u32,
-    limit: u32,
+    query: &CfSearchQuery<'_>,
     api_key: &str,
 ) -> Result<CfSearchResponse> {
+    let CfSearchQuery {
+        query,
+        mc_version,
+        loader,
+        class_id,
+        category_id,
+        index,
+        offset,
+        limit,
+    } = *query;
     let (sort_field, sort_order) = sort_field_for(index);
     let mut params = vec![
         format!("gameId={}", MINECRAFT_GAME_ID),
@@ -324,10 +339,7 @@ pub async fn get_mod_files(
     offset: u32,
     api_key: &str,
 ) -> Result<CfFilesResponse> {
-    let mut params = vec![
-        format!("pageSize={}", 50),
-        format!("index={}", offset),
-    ];
+    let mut params = vec![format!("pageSize={}", 50), format!("index={}", offset)];
 
     if let Some(v) = mc_version {
         params.push(format!("gameVersion={}", urlencoding::encode(v)));
@@ -353,7 +365,10 @@ pub async fn get_mod_file(mod_id: u64, file_id: u64, api_key: &str) -> Result<Cf
 /// Official signed download URL from the CurseForge API (most reliable).
 /// Single fast attempt — on failure the installer falls back to CDN URLs.
 pub async fn get_mod_file_download_url(mod_id: u64, file_id: u64, api_key: &str) -> Result<String> {
-    let url = format!("{}/v1/mods/{}/files/{}/download-url", BASE_URL, mod_id, file_id);
+    let url = format!(
+        "{}/v1/mods/{}/files/{}/download-url",
+        BASE_URL, mod_id, file_id
+    );
     let resp: CfDataResponse<String> = api_get_once(&url, api_key, 8).await?;
     Ok(resp.data)
 }
@@ -363,7 +378,11 @@ pub(crate) fn cf_cdn_urls(file_id: u64, file_name: &str) -> Vec<String> {
     let suffix = file_id % 1000;
     let encoded = urlencoding::encode(file_name);
     let mut urls = Vec::new();
-    for host in ["edge.forgecdn.net", "mediafilez.forgecdn.net", "media.forgecdn.net"] {
+    for host in [
+        "edge.forgecdn.net",
+        "mediafilez.forgecdn.net",
+        "media.forgecdn.net",
+    ] {
         urls.push(format!(
             "https://{}/files/{}/{}/{}",
             host, prefix, suffix, file_name
@@ -390,7 +409,11 @@ pub async fn download_mod_file(
     if let Some(u) = cf_file.download_url.as_ref().filter(|u| !u.is_empty()) {
         if !urls.iter().any(|x| x == u) {
             // Official API link — right after the signed URL, before the mirrors.
-            let at = if api_key.is_empty() { 0 } else { 1.min(urls.len()) };
+            let at = if api_key.is_empty() {
+                0
+            } else {
+                1.min(urls.len())
+            };
             urls.insert(at, u.clone());
         }
     }
@@ -468,7 +491,10 @@ pub async fn download_cf_native(
     api_key: &str,
 ) -> Result<()> {
     // Already on disk with the wanted hash (interrupted-apply resume).
-    if dest.exists() && !expected_sha1.is_empty() && crate::download::verify_sha1(dest, expected_sha1)? {
+    if dest.exists()
+        && !expected_sha1.is_empty()
+        && crate::download::verify_sha1(dest, expected_sha1)?
+    {
         return Ok(());
     }
     let candidates = download_url_candidates(mod_id, file_id, file_name, api_key).await;
@@ -596,7 +622,12 @@ mod tests {
         let urls = cf_cdn_urls(1_234_567, "My Mod 1.0.jar");
         assert!(urls[0].starts_with("https://edge.forgecdn.net/files/1234/567/"));
         assert!(urls.iter().all(|u| u.contains("/files/1234/567/")));
-        assert_eq!(urls.iter().filter(|u| u.contains("mediafilez.forgecdn.net")).count(), 2);
+        assert_eq!(
+            urls.iter()
+                .filter(|u| u.contains("mediafilez.forgecdn.net"))
+                .count(),
+            2
+        );
         // Spaces are percent-encoded in the second variant.
         assert!(urls.iter().any(|u| u.contains("My%20Mod%201.0.jar")));
     }
@@ -605,7 +636,9 @@ mod tests {
     async fn download_candidates_without_api_key_are_pure_cdn() {
         let urls = download_url_candidates(42, 7, "mod.jar", "").await;
         assert!(!urls.is_empty());
-        assert!(urls.iter().all(|u| u.starts_with("https://") && u.contains("forgecdn.net")));
+        assert!(urls
+            .iter()
+            .all(|u| u.starts_with("https://") && u.contains("forgecdn.net")));
         // Deduplicated.
         let mut dedup = urls.clone();
         dedup.dedup();

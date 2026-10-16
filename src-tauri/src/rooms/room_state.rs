@@ -213,7 +213,8 @@ impl RoomStateManager {
 
     pub fn set_host(&self, host: Option<HostInfo>) -> crate::error::Result<()> {
         let mut row = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if row.host.as_ref().map(|h| h.node_key.as_str()) == host.as_ref().map(|h| h.node_key.as_str())
+        if row.host.as_ref().map(|h| h.node_key.as_str())
+            == host.as_ref().map(|h| h.node_key.as_str())
         {
             return Ok(());
         }
@@ -256,7 +257,9 @@ fn resolve_persisted(dir: &Path) -> Option<RoomStateRow> {
 /// dash. Accepted with either case and optional surrounding whitespace.
 pub fn valid_room_id(id: &str) -> bool {
     let bytes = id.as_bytes();
-    bytes.len() == 9 && bytes[4] == b'-' && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    bytes.len() == 9
+        && bytes[4] == b'-'
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 #[cfg(test)]
@@ -276,12 +279,14 @@ mod tests {
                     c,
                     id
                 );
-                assert!(!matches!(c, 'I' | 'O' | '0' | '1'), "lookalike {} in {}", c, id);
+                assert!(
+                    !matches!(c, 'I' | 'O' | '0' | '1'),
+                    "lookalike {} in {}",
+                    c,
+                    id
+                );
             }
-            let prefix = CODE_ALPHABET
-                .iter()
-                .map(|b| *b as char)
-                .collect::<String>();
+            let prefix = CODE_ALPHABET.iter().map(|b| *b as char).collect::<String>();
             for c in id.chars().filter(|c| *c != '-') {
                 assert!(prefix.contains(c), "char {} not in alphabet", c);
             }
@@ -328,8 +333,14 @@ mod tests {
         assert_eq!(row.role, RoomRole::Host);
         assert_eq!(row.room_name.as_deref(), Some("Вечерняя игра"));
         // The advertised port never survives a restart (stale-port policy).
-        assert_eq!(row.minecraft_port, None, "stale port must be cleared on restore");
-        assert_eq!(row.host.as_ref().map(|h| h.node_key.as_str()), Some("node-key-1"));
+        assert_eq!(
+            row.minecraft_port, None,
+            "stale port must be cleared on restore"
+        );
+        assert_eq!(
+            row.host.as_ref().map(|h| h.node_key.as_str()),
+            Some("node-key-1")
+        );
         // The pre-room hostname survives so a later `leave` can restore it.
         assert_eq!(row.previous_hostname.as_deref(), Some("gaming-pc"));
 
@@ -339,7 +350,10 @@ mod tests {
         assert_eq!(row.role, RoomRole::None);
         assert!(row.room_id.is_none());
         assert!(row.host.is_none());
-        assert!(row.previous_hostname.is_none(), "hint origin cleared on leave");
+        assert!(
+            row.previous_hostname.is_none(),
+            "hint origin cleared on leave"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -402,7 +416,11 @@ mod tests {
         mgr.set_minecraft_port(None).unwrap();
 
         let reloaded = RoomStateManager::new(&dir);
-        assert_eq!(reloaded.snapshot().minecraft_port, None, "cleared port must persist");
+        assert_eq!(
+            reloaded.snapshot().minecraft_port,
+            None,
+            "cleared port must persist"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

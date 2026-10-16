@@ -41,11 +41,8 @@ pub fn detect_java_major(java_path: &Path) -> Option<u32> {
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let output = crate::java::run_command_with_timeout(
-        &mut cmd,
-        std::time::Duration::from_secs(20),
-    )
-    .ok()?;
+    let output =
+        crate::java::run_command_with_timeout(&mut cmd, std::time::Duration::from_secs(20)).ok()?;
     // `java -version` writes to stderr
     let combined = if !output.stderr.is_empty() {
         String::from_utf8_lossy(&output.stderr).to_string()
@@ -62,10 +59,16 @@ pub fn detect_java_major(java_path: &Path) -> Option<u32> {
 ///   java version "21.0.1" 2023-10-17      -> 21
 fn parse_java_major(output: &str) -> u32 {
     for line in output.lines() {
-        if !line.contains("version") { continue; }
-        let Some(start) = line.find('"') else { continue; };
+        if !line.contains("version") {
+            continue;
+        }
+        let Some(start) = line.find('"') else {
+            continue;
+        };
         let rest = &line[start + 1..];
-        let Some(end) = rest.find('"') else { continue; };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
         let version = &rest[..end];
         let parts: Vec<&str> = version.split('.').collect();
         if let Some(first) = parts.first() {
@@ -235,10 +238,13 @@ pub fn strip_gc_selection_flags(args: &[String]) -> Vec<String> {
     for arg in args {
         // Match `-XX:+UseXxx` and `-XX:-UseXxx` (case-sensitive, matching
         // the canonical flag form HotSpot itself accepts).
-        if let Some(rest) = arg.strip_prefix("-XX:").or_else(|| arg.strip_prefix("-xx:")) {
+        if let Some(rest) = arg
+            .strip_prefix("-XX:")
+            .or_else(|| arg.strip_prefix("-xx:"))
+        {
             if rest.len() >= 2 {
                 let (sign, name) = rest.split_at(1);
-                if (sign == "+" || sign == "-") && SELECTORS.iter().any(|s| *s == name) {
+                if (sign == "+" || sign == "-") && SELECTORS.contains(&name) {
                     continue;
                 }
             }
@@ -254,8 +260,14 @@ mod tests {
 
     #[test]
     fn parse_modern_jdk() {
-        assert_eq!(parse_java_major(r#"openjdk version "17.0.9" 2023-10-17"#), 17);
-        assert_eq!(parse_java_major(r#"openjdk version "21.0.1" 2023-10-17"#), 21);
+        assert_eq!(
+            parse_java_major(r#"openjdk version "17.0.9" 2023-10-17"#),
+            17
+        );
+        assert_eq!(
+            parse_java_major(r#"openjdk version "21.0.1" 2023-10-17"#),
+            21
+        );
     }
 
     #[test]
@@ -265,7 +277,10 @@ mod tests {
 
     #[test]
     fn parse_oracle() {
-        assert_eq!(parse_java_major(r#"java version "21.0.1" 2023-10-17 LTS"#), 21);
+        assert_eq!(
+            parse_java_major(r#"java version "21.0.1" 2023-10-17 LTS"#),
+            21
+        );
     }
 
     #[test]
@@ -353,7 +368,11 @@ mod tests {
             "-XX:+UseEpsilonGC",
         ]);
         let out = strip_gc_selection_flags(&input);
-        assert!(out.is_empty(), "all GC selectors should be removed, got: {:?}", out);
+        assert!(
+            out.is_empty(),
+            "all GC selectors should be removed, got: {:?}",
+            out
+        );
     }
 
     #[test]

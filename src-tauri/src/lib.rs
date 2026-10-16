@@ -1,4 +1,4 @@
-﻿mod accounts;
+mod accounts;
 mod atlauncher;
 mod auth;
 mod commands;
@@ -24,8 +24,8 @@ mod modrinth;
 mod packlock;
 mod playtime;
 mod rooms;
-mod versions;
 mod verify;
+mod versions;
 
 #[cfg(test)]
 mod smoke_launch;
@@ -74,7 +74,7 @@ pub(crate) fn is_allowed_download_host(url: &str) -> bool {
     }
     let after_scheme = &url[8..];
     let host_end = after_scheme
-        .find(|c: char| c == '/' || c == ':' || c == '?' || c == '#')
+        .find(['/', ':', '?', '#'])
         .unwrap_or(after_scheme.len());
     let host = after_scheme[..host_end].to_ascii_lowercase();
     if host.is_empty() {
@@ -82,8 +82,6 @@ pub(crate) fn is_allowed_download_host(url: &str) -> bool {
     }
     download::is_host_allowed(&host)
 }
-
-
 
 // ==================== App Builder ====================
 
@@ -93,10 +91,7 @@ pub fn run() {
     let orig_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let msg = format!("{}", info);
-        let _ = std::fs::write(
-            std::env::temp_dir().join("voidlauncher_panic.txt"),
-            &msg,
-        );
+        let _ = std::fs::write(std::env::temp_dir().join("voidlauncher_panic.txt"), &msg);
         if let Some(d) = dirs::data_dir() {
             let _ = std::fs::write(d.join("VoidLauncher").join("panic.log"), &msg);
         }
@@ -179,13 +174,11 @@ pub fn run() {
                     }
                 }
             }
-            Some(_) => {
-                if auth_state.profile.is_some() {
-                    tracing::info!(target: "launcher", "Default account is not a Microsoft one; hiding Microsoft session from UI");
-                    auth_state = auth::AuthState::default();
-                }
+            Some(_) if auth_state.profile.is_some() => {
+                tracing::info!(target: "launcher", "Default account is not a Microsoft one; hiding Microsoft session from UI");
+                auth_state = auth::AuthState::default();
             }
-            None => {}
+            _ => {}
         }
     }
 

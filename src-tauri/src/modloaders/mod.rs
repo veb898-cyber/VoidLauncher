@@ -4,8 +4,8 @@ pub mod forge;
 pub mod neoforge;
 mod prism_meta;
 
-use serde::{Deserialize, Serialize};
 use crate::error::Result;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Information about a mod loader version
@@ -90,7 +90,9 @@ pub async fn install_loader(
     match loader {
         "Fabric" => fabric::install(mc_version, loader_version, libraries_dir).await,
         "Forge" => forge::install(mc_version, loader_version, libraries_dir, versions_dir).await,
-        "NeoForge" => neoforge::install(mc_version, loader_version, libraries_dir, versions_dir, app).await,
+        "NeoForge" => {
+            neoforge::install(mc_version, loader_version, libraries_dir, versions_dir, app).await
+        }
         _ => Err(crate::error::LauncherError::ModLoader(format!(
             "Unknown loader: {}",
             loader
@@ -139,14 +141,17 @@ async fn ensure_client_jar(
     if missing.is_empty() {
         return Ok(());
     }
-    crate::download::download_files(missing, |completed, total, _bytes_done, _bytes_total, _msg| {
-        tracing::info!(
-            target: "launcher",
-            "Vanilla client download {}/{}",
-            completed,
-            total
-        );
-    })
+    crate::download::download_files(
+        missing,
+        |completed, total, _bytes_done, _bytes_total, _msg| {
+            tracing::info!(
+                target: "launcher",
+                "Vanilla client download {}/{}",
+                completed,
+                total
+            );
+        },
+    )
     .await?;
     Ok(())
 }

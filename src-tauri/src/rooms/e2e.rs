@@ -11,6 +11,7 @@
 //!   * Tailscale install / login / real tailnet transport;
 //!   * peer discovery against a live `tailscale status`;
 //!   * two-machine joining, or Minecraft actually connecting.
+//!
 //! Those require a second machine and an authenticated Tailscale account and
 //! are tracked as BLOCKED in the E2E report.
 //!
@@ -26,8 +27,8 @@ use super::peer_discovery::{peers_from_status, resolve_host_for_room};
 use super::room_state::{valid_room_id, RoomRole, RoomStateManager};
 use super::tailscale::{PeerNode, TailscaleStatus};
 use super::void_link::{
-    bind_addr, ensure_void_link_server, query_host_status, stop_void_link_server,
-    void_link_server, VOID_LINK_PORT,
+    bind_addr, ensure_void_link_server, query_host_status, stop_void_link_server, void_link_server,
+    VOID_LINK_PORT,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -48,7 +49,9 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 /// listener. A tiny TOCTOU window with the real bind in the code under test
 /// is acceptable for a local harness.
 async fn pick_free_port() -> u16 {
-    let l = tokio::net::TcpListener::bind((HOST_IP, 0)).await.expect("bind ephemeral");
+    let l = tokio::net::TcpListener::bind((HOST_IP, 0))
+        .await
+        .expect("bind ephemeral");
     let port = l.local_addr().expect("local addr").port();
     drop(l);
     port
@@ -59,7 +62,10 @@ async fn raw_http(port: u16, request: &str) -> (u16, String) {
     let mut stream = tokio::net::TcpStream::connect((HOST_IP, port))
         .await
         .expect("connect to bridge");
-    stream.write_all(request.as_bytes()).await.expect("write request");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.ok();
     let text = String::from_utf8_lossy(&buf).into_owned();
@@ -108,12 +114,17 @@ async fn room_control_plane_lifecycle_over_loopback() {
         Some("100.101.102.103:48888".to_string()),
         "bridge bind address"
     );
-    assert!(bind_addr("not-an-ip", VOID_LINK_PORT).is_none(), "invalid ip rejected");
+    assert!(
+        bind_addr("not-an-ip", VOID_LINK_PORT).is_none(),
+        "invalid ip rejected"
+    );
 
     // ---------- 1. HOST: create room ----------
     let host_dir = temp_dir("host");
     let host = Arc::new(RoomStateManager::new(&host_dir));
-    let row = host.create_room(Some("E2E room".into())).expect("create_room");
+    let row = host
+        .create_room(Some("E2E room".into()))
+        .expect("create_room");
     assert_eq!(row.role, RoomRole::Host, "role after create");
     let code = row.room_id.clone().expect("room id");
     assert!(valid_room_id(&code), "generated code shape: {}", code);
@@ -191,14 +202,22 @@ async fn room_control_plane_lifecycle_over_loopback() {
     let reread = query_host_status(HOST_IP, port, &code2)
         .await
         .expect("query re-created room");
-    assert_eq!(reread.mc_port, Some(45679), "re-created room serves new port");
+    assert_eq!(
+        reread.mc_port,
+        Some(45679),
+        "re-created room serves new port"
+    );
     println!("[e2e] re-create {} -> bridge serves mc_port=45679", code2);
 
     // ---------- 9. Persistence across a simulated app restart ----------
     let reloaded = RoomStateManager::new(&host_dir);
     let snap = reloaded.snapshot();
     assert_eq!(snap.role, RoomRole::Host, "role survives restart");
-    assert_eq!(snap.room_id.as_deref(), Some(code2.as_str()), "room id survives restart");
+    assert_eq!(
+        snap.room_id.as_deref(),
+        Some(code2.as_str()),
+        "room id survives restart"
+    );
     // The advertised LAN port belongs to the world that was open before the
     // restart; it must NOT be advertised again (stale-port policy), and the
     // cleared value is written back to disk.
@@ -212,12 +231,20 @@ async fn room_control_plane_lifecycle_over_loopback() {
     let resolved = resolve_host_for_room(&peers, Some(&code2)).expect("resolve host by hint");
     assert_eq!(resolved.ip(), Some("100.64.0.10"), "resolved host ip");
     let expected_dns = format!("{}-host.tailnet.ts.net", code2.to_ascii_lowercase());
-    assert_eq!(resolved.dns(), Some(expected_dns.as_str()), "resolved host dns");
+    assert_eq!(
+        resolved.dns(),
+        Some(expected_dns.as_str()),
+        "resolved host dns"
+    );
     println!("[e2e] discovery: hostname hint resolved peer");
 
     // ---------- 11. MC port parsing + version-aware join args ----------
     let log = "[12:00:00] [Server thread/INFO]: Local game hosted on port 45565";
-    assert_eq!(LanLogDiscovery.detect_mc_port(log), Some(45565), "LAN port from log");
+    assert_eq!(
+        LanLogDiscovery.detect_mc_port(log),
+        Some(45565),
+        "LAN port from log"
+    );
     assert_eq!(
         LanLogDiscovery.build_join_args("1.12.2", "100.64.0.10", 45565),
         Some(vec![
@@ -279,14 +306,18 @@ async fn void_link_bridge_tracks_room_and_rebinds() {
     ensure_void_link_server(HOST_IP.into(), state.clone())
         .await
         .expect("first bind");
-    let q = query_host_status(HOST_IP, port_a, &code).await.expect("bridge serves");
+    let q = query_host_status(HOST_IP, port_a, &code)
+        .await
+        .expect("bridge serves");
     assert_eq!(q.room_id, code, "first bind answers");
 
     // Same IP again → idempotent reuse, the live handler keeps answering.
     ensure_void_link_server(HOST_IP.into(), state.clone())
         .await
         .expect("idempotent same ip");
-    let q2 = query_host_status(HOST_IP, port_a, &code).await.expect("still serves");
+    let q2 = query_host_status(HOST_IP, port_a, &code)
+        .await
+        .expect("still serves");
     assert_eq!(q2.room_id, code, "idempotent call must not kill the bridge");
 
     // IP change → the old listener is aborted and a fresh one answers on the
@@ -300,7 +331,9 @@ async fn void_link_bridge_tracks_room_and_rebinds() {
         query_host_status(HOST_IP, port_a, &code).await.is_err(),
         "old listener must be aborted on IP change"
     );
-    let q3 = query_host_status("127.0.0.2", port_b, &code).await.expect("new bridge serves");
+    let q3 = query_host_status("127.0.0.2", port_b, &code)
+        .await
+        .expect("new bridge serves");
     assert_eq!(q3.room_id, code, "rebound bridge answers");
 
     // Leave → the bridge never outlives the room session.

@@ -8,7 +8,11 @@ use crate::AppState;
 use tauri::{AppHandle, State};
 
 #[tauri::command]
-pub async fn cmd_rename_file(state: State<'_, AppState>, from: String, to: String) -> Result<(), String> {
+pub async fn cmd_rename_file(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<(), String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let instances_dir = config.instances_dir();
     let from_path = std::path::Path::new(&from);
@@ -108,9 +112,7 @@ pub async fn cmd_read_image_file(path: String) -> Result<Vec<u8>, String> {
 /// authority edge cases that a URL parser might normalise differently.
 fn extract_host(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1)?;
-    let end = rest
-        .find(|c: char| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..end];
     // Strip userinfo if present.
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
@@ -119,11 +121,19 @@ fn extract_host(url: &str) -> Option<String> {
     if host_port.starts_with('[') {
         let close = host_port.find(']')?;
         let host = &host_port[1..close];
-        if host.is_empty() { None } else { Some(host.to_string()) }
+        if host.is_empty() {
+            None
+        } else {
+            Some(host.to_string())
+        }
     } else {
         // IPv4 / hostname, possibly with a port.
         let host = host_port.split(':').next()?;
-        if host.is_empty() { None } else { Some(host.to_string()) }
+        if host.is_empty() {
+            None
+        } else {
+            Some(host.to_string())
+        }
     }
 }
 
@@ -152,9 +162,13 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
 
     match ip {
         std::net::IpAddr::V4(v4) => {
-            !(v4.is_loopback() || v4.is_private() || v4.is_link_local()
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
                 || is_v4_reserved(&v4)
-                || v4.is_broadcast() || v4.is_multicast() || v4.is_unspecified())
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_unspecified())
         }
         std::net::IpAddr::V6(v6) => {
             let seg = v6.segments();
@@ -165,8 +179,13 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
             // routable to the public internet nor something we should fetch.
             let documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
             let teredo = seg[0] == 0x2001 && seg[1] == 0x0000;
-            !(v6.is_loopback() || v6.is_multicast() || v6.is_unspecified()
-                || unique_local || link_local || documentation || teredo)
+            !(v6.is_loopback()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                || unique_local
+                || link_local
+                || documentation
+                || teredo)
         }
     }
 }
@@ -181,14 +200,15 @@ fn is_v4_reserved(v4: &std::net::Ipv4Addr) -> bool {
     let o = v4.octets();
     match o[0] {
         192 => {
-            (o[1] == 0 && o[2] == 0)        // 192.0.0.0/24
-                || (o[1] == 0 && o[2] == 2) // 192.0.2.0/24 documentation
+            o[1] == 0 && (o[2] == 0 || o[2] == 2) // 192.0.0.0/24 + 192.0.2.0/24 documentation
         }
-        198 => (o[1] == 18 || o[1] == 19)   // 198.18.0.0/15 benchmarking
+        198 => {
+            (o[1] == 18 || o[1] == 19)   // 198.18.0.0/15 benchmarking
             || (o[1] == 51 && o[2] == 100)  // 198.51.100.0/24 documentation
-            || (o[1] == 0 && o[2] == 0),    // 198.0.0.0 reserved block (198.0.0.0/8 partly)
-        203 => o[1] == 0 && o[2] == 113,    // 203.0.113.0/24 documentation
-        240..=255 => true,                  // 240.0.0.0/4 reserved
+            || (o[1] == 0 && o[2] == 0)
+        } // 198.0.0.0 reserved block (198.0.0.0/8 partly)
+        203 => o[1] == 0 && o[2] == 113, // 203.0.113.0/24 documentation
+        240..=255 => true,               // 240.0.0.0/4 reserved
         _ => false,
     }
 }
@@ -229,14 +249,10 @@ pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String>
         return Err("Only https URLs are allowed".into());
     }
 
-    let check_url = url.clone();
-    for hop in 0..4 {
-        match host_is_public(&check_url).await {
-            Ok(true) => break,
-            Ok(false) => return Err("Refusing to fetch from a private address".into()),
-            Err(_) if hop > 0 => break, // final hop unreachable: accept earlier verdicts
-            Err(e) => return Err(e),
-        }
+    match host_is_public(&url).await {
+        Ok(true) => {}
+        Ok(false) => return Err("Refusing to fetch from a private address".into()),
+        Err(e) => return Err(e),
     }
 
     let client = crate::download::global_http_client().map_err(|e| e.to_string())?;
@@ -249,9 +265,8 @@ pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String>
     // Re-check the FINAL url after redirects (redirect target could be private).
     let final_url = resp.url().to_string();
     if final_url != url {
-        match host_is_public(&final_url).await {
-            Ok(false) => return Err("Refusing to fetch from a private address".into()),
-            _ => {}
+        if let Ok(false) = host_is_public(&final_url).await {
+            return Err("Refusing to fetch from a private address".into());
         }
     }
     if let Some(len) = resp.content_length() {
@@ -276,7 +291,12 @@ pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String>
     } else if bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml") {
         "image/svg+xml"
     } else {
-        match url.split('?').next().and_then(|p| p.rsplit('.').next()).unwrap_or("") {
+        match url
+            .split('?')
+            .next()
+            .and_then(|p| p.rsplit('.').next())
+            .unwrap_or("")
+        {
             "png" => "image/png",
             "jpg" | "jpeg" => "image/jpeg",
             "gif" => "image/gif",
@@ -301,7 +321,9 @@ pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
         "https://raw.githubusercontent.com/veb898-cyber/VoidLauncher/main/latest.json";
     let client = crate::download::global_http_client().map_err(|e| e.to_string())?;
     let resp = crate::download::send_with_fallback(
-        client.get(LATEST_JSON_URL).timeout(std::time::Duration::from_secs(15)),
+        client
+            .get(LATEST_JSON_URL)
+            .timeout(std::time::Duration::from_secs(15)),
     )
     .await
     .map_err(|e| format!("Update check failed: {}", e))?;
@@ -315,16 +337,12 @@ pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
     Ok(v)
 }
 
-
 // ==================== Launch State Commands ====================
 
 /// Return the names of all instances whose game processes are currently running.
 #[tauri::command]
 pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let running = state
-        .running_instances
-        .lock()
-        .map_err(|e| e.to_string())?;
+    let running = state.running_instances.lock().map_err(|e| e.to_string())?;
     Ok(running.clone())
 }
 
@@ -376,7 +394,6 @@ fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
     }
     Ok(total)
 }
-
 
 // ==================== System Commands ====================
 
@@ -484,7 +501,10 @@ pub fn cmd_save_config(
 /// does not exist yet it is created first so it can be canonicalized.
 ///
 /// Returns the canonical, contained target path.
-fn resolve_open_folder_path(base: &std::path::Path, target: &std::path::Path) -> Result<std::path::PathBuf, String> {
+fn resolve_open_folder_path(
+    base: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     if !target.exists() {
         std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
     }
@@ -508,7 +528,11 @@ fn resolve_open_folder_path(base: &std::path::Path, target: &std::path::Path) ->
 /// other launcher subfolder). This prevents the renderer from opening or
 /// creating arbitrary system directories.
 #[tauri::command]
-pub fn cmd_open_folder(state: State<'_, AppState>, app: AppHandle, path: String) -> Result<(), String> {
+pub fn cmd_open_folder(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    path: String,
+) -> Result<(), String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let data_dir = config.data_dir.clone();
     drop(config);
@@ -527,24 +551,18 @@ mod open_folder_tests {
 
     #[test]
     fn allows_child_of_base() {
-        let tmp = std::env::temp_dir().join(format!(
-            "void-open-test-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("void-open-test-{}", std::process::id()));
         let base = tmp.join("data");
         let child = base.join("logs").join("game");
         std::fs::create_dir_all(&child).unwrap();
         let got = resolve_open_folder_path(&base, &child).unwrap();
-        assert!(got.starts_with(&base.canonicalize().unwrap()));
+        assert!(got.starts_with(base.canonicalize().unwrap()));
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn allows_base_itself() {
-        let tmp = std::env::temp_dir().join(format!(
-            "void-open-test-base-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("void-open-test-base-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let got = resolve_open_folder_path(&tmp, &tmp).unwrap();
         assert_eq!(got, tmp.canonicalize().unwrap());
@@ -553,10 +571,7 @@ mod open_folder_tests {
 
     #[test]
     fn rejects_path_outside_base() {
-        let tmp = std::env::temp_dir().join(format!(
-            "void-open-test-out-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("void-open-test-out-{}", std::process::id()));
         let base = tmp.join("data");
         let outside = tmp.join("other");
         std::fs::create_dir_all(&base).unwrap();
@@ -567,10 +582,7 @@ mod open_folder_tests {
 
     #[test]
     fn rejects_traversal_attempt() {
-        let tmp = std::env::temp_dir().join(format!(
-            "void-open-test-trav-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("void-open-test-trav-{}", std::process::id()));
         let base = tmp.join("data").join("sub");
         std::fs::create_dir_all(&base).unwrap();
         let escape = base.join("..").join("..").join("other");
@@ -581,15 +593,13 @@ mod open_folder_tests {
 
     #[test]
     fn creates_missing_folder_and_contains_it() {
-        let tmp = std::env::temp_dir().join(format!(
-            "void-open-test-create-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("void-open-test-create-{}", std::process::id()));
         let base = tmp.join("data");
         let missing = base.join("logs").join("game");
         let got = resolve_open_folder_path(&base, &missing).unwrap();
         assert!(got.is_dir());
-        assert!(got.starts_with(&base.canonicalize().unwrap()));
+        assert!(got.starts_with(base.canonicalize().unwrap()));
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
@@ -611,36 +621,60 @@ mod ssrf_tests {
 
     #[test]
     fn extract_host_plain_hostname() {
-        assert_eq!(extract_host("https://cdn.example.com/img.png"), Some("cdn.example.com".into()));
+        assert_eq!(
+            extract_host("https://cdn.example.com/img.png"),
+            Some("cdn.example.com".into())
+        );
     }
 
     #[test]
     fn extract_host_with_port() {
-        assert_eq!(extract_host("https://cdn.example.com:8443/img.png"), Some("cdn.example.com".into()));
+        assert_eq!(
+            extract_host("https://cdn.example.com:8443/img.png"),
+            Some("cdn.example.com".into())
+        );
     }
 
     #[test]
     fn extract_host_ipv4() {
-        assert_eq!(extract_host("https://127.0.0.1/x"), Some("127.0.0.1".into()));
-        assert_eq!(extract_host("https://192.168.1.5:80/x"), Some("192.168.1.5".into()));
+        assert_eq!(
+            extract_host("https://127.0.0.1/x"),
+            Some("127.0.0.1".into())
+        );
+        assert_eq!(
+            extract_host("https://192.168.1.5:80/x"),
+            Some("192.168.1.5".into())
+        );
     }
 
     #[test]
     fn extract_host_ipv6_literal() {
         assert_eq!(extract_host("https://[::1]/x"), Some("::1".into()));
-        assert_eq!(extract_host("https://[2001:db8::1]/x"), Some("2001:db8::1".into()));
+        assert_eq!(
+            extract_host("https://[2001:db8::1]/x"),
+            Some("2001:db8::1".into())
+        );
     }
 
     #[test]
     fn extract_host_ipv6_literal_with_port() {
         assert_eq!(extract_host("https://[::1]:8080/x"), Some("::1".into()));
-        assert_eq!(extract_host("https://[fe80::1]:8443/x"), Some("fe80::1".into()));
+        assert_eq!(
+            extract_host("https://[fe80::1]:8443/x"),
+            Some("fe80::1".into())
+        );
     }
 
     #[test]
     fn extract_host_strips_userinfo() {
-        assert_eq!(extract_host("https://user@example.com/x"), Some("example.com".into()));
-        assert_eq!(extract_host("https://a:b@127.0.0.1/x"), Some("127.0.0.1".into()));
+        assert_eq!(
+            extract_host("https://user@example.com/x"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            extract_host("https://a:b@127.0.0.1/x"),
+            Some("127.0.0.1".into())
+        );
     }
 
     #[test]
@@ -741,7 +775,7 @@ mod ssrf_tests {
 
     #[test]
     fn public_ipv6_is_public() {
-        assert!(is_public_ip(v6("2606:4700:4700::64")));       // Cloudflare
+        assert!(is_public_ip(v6("2606:4700:4700::64"))); // Cloudflare
         assert!(is_public_ip(v6("2a00:1450:4001:812::200e"))); // Google
         assert!(is_public_ip(v6("2001:4860:4860::8888")));
     }

@@ -119,10 +119,18 @@ pub fn parse_quick_play_confirmation(text: &str) -> Option<QuickJoinInfo> {
         if entry.get("type").and_then(|t| t.as_str()) != Some("multiplayer") {
             continue;
         }
-        if entry.get("id").and_then(|i| i.as_str()).map(str::is_empty).unwrap_or(true) {
+        if entry
+            .get("id")
+            .and_then(|i| i.as_str())
+            .map(str::is_empty)
+            .unwrap_or(true)
+        {
             continue;
         }
-        let name = entry.get("name").and_then(|n| n.as_str()).map(str::to_string);
+        let name = entry
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(str::to_string);
         return Some(QuickJoinInfo { name });
     }
     None
@@ -247,10 +255,13 @@ mod tests {
         }
         // Quick play puts the port inline in the address (unlike legacy).
         let args = LanLogDiscovery.build_join_args("1.21.4", "host.tail.ts.net.", 45565);
-        assert_eq!(args, Some(vec![
-            "--quickPlayMultiplayer".to_string(),
-            "host.tail.ts.net:45565".to_string(),
-        ]));
+        assert_eq!(
+            args,
+            Some(vec![
+                "--quickPlayMultiplayer".to_string(),
+                "host.tail.ts.net:45565".to_string(),
+            ])
+        );
     }
 
     #[test]
@@ -273,7 +284,12 @@ mod tests {
           }
         ]"#;
         let info = parse_quick_play_confirmation(log);
-        assert_eq!(info, Some(QuickJoinInfo { name: Some("Host's World".to_string()) }));
+        assert_eq!(
+            info,
+            Some(QuickJoinInfo {
+                name: Some("Host's World".to_string())
+            })
+        );
 
         // A log without a multiplayer entry (e.g. only single-player) is not
         // a join confirmation.

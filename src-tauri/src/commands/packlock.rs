@@ -38,8 +38,8 @@ struct PackCtx {
 fn pack_ctx(state: &AppState, instance_name: &str) -> Result<PackCtx, String> {
     validate_instance_name(instance_name)?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
-    let instance =
-        instances::get_instance(&config.instances_dir(), instance_name).map_err(|e| e.to_string())?;
+    let instance = instances::get_instance(&config.instances_dir(), instance_name)
+        .map_err(|e| e.to_string())?;
     let instance_dir = instance.dir(&config.instances_dir());
     let mc_dir = instance.minecraft_dir(&config.instances_dir());
     Ok(PackCtx {
@@ -211,11 +211,7 @@ fn cleanup_files(staging: &Path, temp_zip: &Path) {
 ///
 /// The target path is declared by the pack manifest, so the pack owns it: a
 /// fresh install would overwrite that file too.
-fn park_target(
-    rb: &mut ApplyRollback,
-    parent: &Path,
-    name: &str,
-) -> Result<(), String> {
+fn park_target(rb: &mut ApplyRollback, parent: &Path, name: &str) -> Result<(), String> {
     let disabled = format!("{}.disabled", name);
     let plain_exists = parent.join(name).is_file();
     let disabled_exists = parent.join(&disabled).is_file();
@@ -223,7 +219,11 @@ fn park_target(
         return Ok(());
     }
     rb.snapshot_sidecar(parent, name);
-    let target = if disabled_exists { disabled } else { name.to_string() };
+    let target = if disabled_exists {
+        disabled
+    } else {
+        name.to_string()
+    };
     let stashed = instances::stash_old_content_files(parent, &target).map_err(|e| e.to_string())?;
     rb.stashes.extend(stashed);
     Ok(())
@@ -367,7 +367,13 @@ async fn update_curseforge(
         return Err("The pack is already up to date.".to_string());
     }
 
-    emit(app, "downloading-pack", 0, 1, "Downloading new pack version...");
+    emit(
+        app,
+        "downloading-pack",
+        0,
+        1,
+        "Downloading new pack version...",
+    );
     let file = curseforge::get_mod_file(pack_pid, latest.id, &ctx.api_key)
         .await
         .map_err(|e| format!("CurseForge file info failed: {}", e))?;
@@ -377,8 +383,10 @@ async fn update_curseforge(
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    let temp_zip = std::env::temp_dir()
-        .join(format!("voidlauncher-cfpack-{}-{}.zip", safe_instance, latest.id));
+    let temp_zip = std::env::temp_dir().join(format!(
+        "voidlauncher-cfpack-{}-{}.zip",
+        safe_instance, latest.id
+    ));
     if let Err(e) =
         curseforge::download_mod_file(pack_pid, latest.id, &file, &ctx.api_key, &temp_zip).await
     {
@@ -432,7 +440,12 @@ async fn update_curseforge(
 
     // ---- Phase 1: stage every changed mod beside the instance ----
     let mut staged_mods: Vec<(PackFileRef, CfFile)> = Vec::new();
-    let targets: Vec<PackFileRef> = diff.added.iter().chain(diff.updated.iter()).cloned().collect();
+    let targets: Vec<PackFileRef> = diff
+        .added
+        .iter()
+        .chain(diff.updated.iter())
+        .cloned()
+        .collect();
     let total = targets.len();
     for (i, r) in targets.iter().enumerate() {
         emit(
@@ -455,19 +468,14 @@ async fn update_curseforge(
             let dest = stage_mods.join(&cf_file.file_name);
             curseforge::download_mod_file(pid, fid, &cf_file, &ctx.api_key, &dest)
                 .await
-                .map_err(|e| {
-                    format!("Download of {} failed: {}", cf_file.file_name, e)
-                })?;
+                .map_err(|e| format!("Download of {} failed: {}", cf_file.file_name, e))?;
             staged_mods.push((r.clone(), cf_file));
             Ok(())
         }
         .await;
         if let Err(e) = stage_result {
             cleanup_files(&staging, &temp_zip);
-            return Err(format!(
-                "Staging failed, instance untouched: {}",
-                e
-            ));
+            return Err(format!("Staging failed, instance untouched: {}", e));
         }
     }
 
@@ -475,8 +483,8 @@ async fn update_curseforge(
     let stage_result: Result<(), String> = (|| {
         let file = std::fs::File::open(&temp_zip)
             .map_err(|e| format!("Cannot reopen pack archive: {}", e))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| format!("Cannot read pack archive: {}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
         for i in 0..archive.len() {
             let mut entry = archive
                 .by_index(i)
@@ -501,7 +509,10 @@ async fn update_curseforge(
     })();
     if let Err(e) = stage_result {
         cleanup_files(&staging, &temp_zip);
-        return Err(format!("Staging overrides failed, instance untouched: {}", e));
+        return Err(format!(
+            "Staging overrides failed, instance untouched: {}",
+            e
+        ));
     }
 
     // ---- Phase 3: apply (sync — all network work is done) ----
@@ -518,15 +529,13 @@ async fn update_curseforge(
         // move the staged replacement in, rewrite the sidecar.
         for (r, cf_file) in &staged_mods {
             let old = installed.iter().find(|i| {
-                i.provider == "curseforge"
-                    && i.project_id.as_deref() == Some(r.project_id.as_str())
+                i.provider == "curseforge" && i.project_id.as_deref() == Some(r.project_id.as_str())
             });
             rb.snapshot_sidecar(&ctx.mods_dir, &cf_file.file_name);
             if let Some(old) = old {
                 rb.snapshot_sidecar(&ctx.mods_dir, &old.filename);
-                let stashed =
-                    instances::stash_old_content_files(&ctx.mods_dir, &old.filename)
-                        .map_err(|e| e.to_string())?;
+                let stashed = instances::stash_old_content_files(&ctx.mods_dir, &old.filename)
+                    .map_err(|e| e.to_string())?;
                 rb.stashes.extend(stashed);
             }
             let staged_path = stage_mods.join(&cf_file.file_name);
@@ -553,7 +562,10 @@ async fn update_curseforge(
                     hash: hash.as_deref(),
                 },
             ) {
-                return Err(format!("Cannot write metadata for {}: {}", cf_file.file_name, e));
+                return Err(format!(
+                    "Cannot write metadata for {}: {}",
+                    cf_file.file_name, e
+                ));
             }
             if let Some(old) = old {
                 instances::cleanup_old_sidecar_after_update(
@@ -575,9 +587,8 @@ async fn update_curseforge(
             });
             let Some(old) = old else { continue };
             rb.snapshot_sidecar(&ctx.mods_dir, &old.filename);
-            let stashed =
-                instances::stash_old_content_files(&ctx.mods_dir, &old.filename)
-                    .map_err(|e| e.to_string())?;
+            let stashed = instances::stash_old_content_files(&ctx.mods_dir, &old.filename)
+                .map_err(|e| e.to_string())?;
             rb.stashes.extend(stashed);
             mods_removed += 1;
         }
@@ -593,7 +604,9 @@ async fn update_curseforge(
                 continue;
             }
             let dest = ctx.mc_dir.join(rel);
-            let Some(parent) = dest.parent() else { continue };
+            let Some(parent) = dest.parent() else {
+                continue;
+            };
             if let Some(name) = dest.file_name().and_then(|n| n.to_str()) {
                 rb.snapshot_sidecar(parent, name);
                 if dest.exists() {
@@ -633,13 +646,15 @@ async fn update_curseforge(
             if !dest.exists() {
                 continue;
             }
-            let Some(parent) = dest.parent() else { continue };
+            let Some(parent) = dest.parent() else {
+                continue;
+            };
             let Some(name) = dest.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             rb.snapshot_sidecar(parent, name);
-            let stashed = instances::stash_old_content_files(parent, name)
-                .map_err(|e| e.to_string())?;
+            let stashed =
+                instances::stash_old_content_files(parent, name).map_err(|e| e.to_string())?;
             rb.stashes.extend(stashed);
             overrides_removed += 1;
         }
@@ -667,7 +682,10 @@ async fn update_curseforge(
     };
     if let Err(e) = new_lock.write(&ctx.instance_dir) {
         rb.rollback(&staging, &temp_zip);
-        return Err(format!("Cannot save pack metadata, update rolled back: {}", e));
+        return Err(format!(
+            "Cannot save pack metadata, update rolled back: {}",
+            e
+        ));
     }
 
     instances::discard_stashed_files(&rb.stashes);
@@ -757,7 +775,9 @@ async fn repair_curseforge(
         .await;
         match restored {
             Ok(()) => report.restored += 1,
-            Err(e) => report.failed.push(format!("{}: {}", cf_display_hint(pid_str), e)),
+            Err(e) => report
+                .failed
+                .push(format!("{}: {}", cf_display_hint(pid_str), e)),
         }
     }
 
@@ -793,10 +813,8 @@ async fn repair_curseforge(
                 return Ok(report);
             }
         };
-        let temp_zip = std::env::temp_dir().join(format!(
-            "voidlauncher-cfpack-repair-{}.zip",
-            pack_id
-        ));
+        let temp_zip =
+            std::env::temp_dir().join(format!("voidlauncher-cfpack-repair-{}.zip", pack_id));
         if let Err(e) =
             curseforge::download_mod_file(pack_id, file_id, &file, &ctx.api_key, &temp_zip).await
         {
@@ -809,8 +827,8 @@ async fn repair_curseforge(
         let extract: Result<(), String> = (|| {
             let f = std::fs::File::open(&temp_zip)
                 .map_err(|e| format!("Cannot open pack archive: {}", e))?;
-            let mut archive = zip::ZipArchive::new(f)
-                .map_err(|e| format!("Cannot read pack archive: {}", e))?;
+            let mut archive =
+                zip::ZipArchive::new(f).map_err(|e| format!("Cannot read pack archive: {}", e))?;
             for i in 0..archive.len() {
                 let mut entry = archive
                     .by_index(i)
@@ -819,10 +837,7 @@ async fn repair_curseforge(
                 let Some(rel) = name.strip_prefix("overrides/") else {
                     continue;
                 };
-                if rel.is_empty()
-                    || entry.is_dir()
-                    || !missing.iter().any(|m| m == rel)
-                {
+                if rel.is_empty() || entry.is_dir() || !missing.iter().any(|m| m == rel) {
                     continue;
                 }
                 check_safe_relative(rel).map_err(|e| e.to_string())?;
@@ -835,7 +850,9 @@ async fn repair_curseforge(
         })();
         let _ = std::fs::remove_file(&temp_zip);
         if let Err(e) = extract {
-            report.failed.push(format!("Overrides restore failed: {}", e));
+            report
+                .failed
+                .push(format!("Overrides restore failed: {}", e));
         }
     }
 
@@ -854,8 +871,8 @@ fn cf_display_hint(pid: &str) -> String {
 /// path — the same embedded payload the importer holds in memory during a
 /// fresh install. Staging reuses it so embedded files need no network.
 fn read_embedded_files(zip_path: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
-    let file = std::fs::File::open(zip_path)
-        .map_err(|e| format!("Cannot open pack archive: {}", e))?;
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
     let mut out: HashMap<String, Vec<u8>> = HashMap::new();
@@ -911,15 +928,23 @@ async fn update_modrinth(
         ));
     }
 
-    emit(app, "downloading-pack", 0, 1, "Downloading new pack version...");
+    emit(
+        app,
+        "downloading-pack",
+        0,
+        1,
+        "Downloading new pack version...",
+    );
     let safe_instance: String = ctx
         .instance
         .name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    let temp_zip = std::env::temp_dir()
-        .join(format!("voidlauncher-mrpack-{}-{}.mrpack", safe_instance, latest.id));
+    let temp_zip = std::env::temp_dir().join(format!(
+        "voidlauncher-mrpack-{}-{}.mrpack",
+        safe_instance, latest.id
+    ));
     let sha1 = file.hashes.get("sha1").map(|s| s.as_str()).unwrap_or("");
     if let Err(e) =
         crate::download::download_file_sized(&file.url, &temp_zip, sha1, file.size).await
@@ -939,7 +964,9 @@ async fn update_modrinth(
 
     // The pack's target Minecraft/loader must match this instance — a bump
     // means a new instance, not an in-place migration (same rule as CF).
-    let new_mc = new_manifest["dependencies"]["minecraft"].as_str().unwrap_or("");
+    let new_mc = new_manifest["dependencies"]["minecraft"]
+        .as_str()
+        .unwrap_or("");
     if new_mc != ctx.instance.mc_version {
         cleanup_files(&staging, &temp_zip);
         return Err(format!(
@@ -947,10 +974,13 @@ async fn update_modrinth(
             new_mc, ctx.instance.mc_version
         ));
     }
-    let deps = new_manifest["dependencies"].as_object().cloned().unwrap_or_default();
+    let deps = new_manifest["dependencies"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
     let (loader_key, _) = crate::import::detect_mrpack_loader(&deps);
-    let new_loader_type = crate::import::mrpack_loader_type(loader_key.as_deref())
-        .map_err(|e| e.to_string())?;
+    let new_loader_type =
+        crate::import::mrpack_loader_type(loader_key.as_deref()).map_err(|e| e.to_string())?;
     let new_loader = packlock::loader_slug(&new_loader_type);
     let inst_loader = packlock::loader_slug(&ctx.instance.loader);
     if new_loader != inst_loader {
@@ -1016,8 +1046,8 @@ async fn update_modrinth(
     let stage_result: Result<(), String> = (|| {
         let file = std::fs::File::open(&temp_zip)
             .map_err(|e| format!("Cannot reopen pack archive: {}", e))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| format!("Cannot read pack archive: {}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
         for i in 0..archive.len() {
             let mut entry = archive
                 .by_index(i)
@@ -1042,7 +1072,10 @@ async fn update_modrinth(
     })();
     if let Err(e) = stage_result {
         cleanup_files(&staging, &temp_zip);
-        return Err(format!("Staging overrides failed, instance untouched: {}", e));
+        return Err(format!(
+            "Staging overrides failed, instance untouched: {}",
+            e
+        ));
     }
 
     // ---- Phase 3: apply (sync — all network work is done) ----
@@ -1090,10 +1123,9 @@ async fn update_modrinth(
             }
 
             let dest = ctx.mc_dir.join(&new_path);
-            if let (Some(parent), Some(name)) = (
-                dest.parent(),
-                dest.file_name().and_then(|n| n.to_str()),
-            ) {
+            if let (Some(parent), Some(name)) =
+                (dest.parent(), dest.file_name().and_then(|n| n.to_str()))
+            {
                 park_target(&mut rb, parent, name)?;
             }
 
@@ -1113,10 +1145,9 @@ async fn update_modrinth(
             }
             rb.moved.push(dest.clone());
 
-            if let (Some(parent), Some(name)) = (
-                dest.parent(),
-                dest.file_name().and_then(|n| n.to_str()),
-            ) {
+            if let (Some(parent), Some(name)) =
+                (dest.parent(), dest.file_name().and_then(|n| n.to_str()))
+            {
                 let hash = packlock::mrpack_entry_sha1(new_entry);
                 let pid_default = r.project_id.clone();
                 let pid_str = new_entry["project_id"]
@@ -1149,9 +1180,7 @@ async fn update_modrinth(
                             Path::new(&old_path).file_name().and_then(|n| n.to_str())
                         {
                             if old_name != name {
-                                instances::cleanup_old_sidecar_after_update(
-                                    parent, old_name, name,
-                                );
+                                instances::cleanup_old_sidecar_after_update(parent, old_name, name);
                             }
                         }
                     }
@@ -1198,7 +1227,9 @@ async fn update_modrinth(
                 continue;
             }
             let dest = ctx.mc_dir.join(rel);
-            let Some(parent) = dest.parent() else { continue };
+            let Some(parent) = dest.parent() else {
+                continue;
+            };
             if let Some(name) = dest.file_name().and_then(|n| n.to_str()) {
                 rb.snapshot_sidecar(parent, name);
                 if dest.exists() {
@@ -1237,13 +1268,15 @@ async fn update_modrinth(
             if !dest.exists() {
                 continue;
             }
-            let Some(parent) = dest.parent() else { continue };
+            let Some(parent) = dest.parent() else {
+                continue;
+            };
             let Some(name) = dest.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             rb.snapshot_sidecar(parent, name);
-            let stashed = instances::stash_old_content_files(parent, name)
-                .map_err(|e| e.to_string())?;
+            let stashed =
+                instances::stash_old_content_files(parent, name).map_err(|e| e.to_string())?;
             rb.stashes.extend(stashed);
             overrides_removed += 1;
         }
@@ -1271,7 +1304,10 @@ async fn update_modrinth(
     };
     if let Err(e) = new_lock.write(&ctx.instance_dir) {
         rb.rollback(&staging, &temp_zip);
-        return Err(format!("Cannot save pack metadata, update rolled back: {}", e));
+        return Err(format!(
+            "Cannot save pack metadata, update rolled back: {}",
+            e
+        ));
     }
 
     instances::discard_stashed_files(&rb.stashes);
@@ -1336,9 +1372,7 @@ async fn repair_modrinth(
             .await
         {
             Ok(()) => report.restored += 1,
-            Err(e) => report
-                .failed
-                .push(format!("{}: {}", key, e)),
+            Err(e) => report.failed.push(format!("{}: {}", key, e)),
         }
     }
 
@@ -1372,9 +1406,7 @@ async fn repair_modrinth(
             .find(|f| f.primary)
             .or_else(|| version.files.first());
         let Some(file) = file else {
-            report
-                .failed
-                .push("Pack version has no files".to_string());
+            report.failed.push("Pack version has no files".to_string());
             return Ok(report);
         };
         if !file.url.starts_with("https://") || !crate::is_allowed_download_host(&file.url) {
@@ -1383,8 +1415,10 @@ async fn repair_modrinth(
                 .push("Pack file URL is not allowed".to_string());
             return Ok(report);
         }
-        let temp_zip = std::env::temp_dir()
-            .join(format!("voidlauncher-mrpack-repair-{}.mrpack", lock.file_id));
+        let temp_zip = std::env::temp_dir().join(format!(
+            "voidlauncher-mrpack-repair-{}.mrpack",
+            lock.file_id
+        ));
         let sha1 = file.hashes.get("sha1").map(|s| s.as_str()).unwrap_or("");
         if let Err(e) =
             crate::download::download_file_sized(&file.url, &temp_zip, sha1, file.size).await
@@ -1398,8 +1432,8 @@ async fn repair_modrinth(
         let extract: Result<(), String> = (|| {
             let f = std::fs::File::open(&temp_zip)
                 .map_err(|e| format!("Cannot open pack archive: {}", e))?;
-            let mut archive = zip::ZipArchive::new(f)
-                .map_err(|e| format!("Cannot read pack archive: {}", e))?;
+            let mut archive =
+                zip::ZipArchive::new(f).map_err(|e| format!("Cannot read pack archive: {}", e))?;
             for i in 0..archive.len() {
                 let mut entry = archive
                     .by_index(i)
@@ -1421,7 +1455,9 @@ async fn repair_modrinth(
         })();
         let _ = std::fs::remove_file(&temp_zip);
         if let Err(e) = extract {
-            report.failed.push(format!("Overrides restore failed: {}", e));
+            report
+                .failed
+                .push(format!("Overrides restore failed: {}", e));
         }
     }
 

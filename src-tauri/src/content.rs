@@ -516,13 +516,16 @@ impl<'a> Walk<'a> {
             _ => {
                 // incompatible (embedded edges are dropped before the graph)
                 let target = dep.project_id.clone().or_else(|| {
-                    dep.version_id.as_deref().and_then(|vid| {
-                        self.input.nodes.get(vid).map(|n| n.project_id.clone())
-                    })
+                    dep.version_id
+                        .as_deref()
+                        .and_then(|vid| self.input.nodes.get(vid).map(|n| n.project_id.clone()))
                 });
                 if let Some(pid) = target {
-                    self.deferred_incompatible
-                        .push((pid, source.project_id.clone(), source.name.clone()));
+                    self.deferred_incompatible.push((
+                        pid,
+                        source.project_id.clone(),
+                        source.name.clone(),
+                    ));
                 }
             }
         }
@@ -535,7 +538,9 @@ impl<'a> Walk<'a> {
             return Some(inst);
         }
         let name = self.input.project_names.get(pid)?;
-        self.installed_by_name.get(&normalize_project_name(name)).copied()
+        self.installed_by_name
+            .get(&normalize_project_name(name))
+            .copied()
     }
 
     fn process_required(&mut self, dep: &DepEdge, source: &VersionNode) {
@@ -547,10 +552,12 @@ impl<'a> Walk<'a> {
             return;
         }
         if let Some(inst) = self.installed_for(pid) {
-            self.skipped.entry(pid.to_string()).or_insert_with(|| SkippedItem {
-                project_id: pid.to_string(),
-                name: inst.name.clone(),
-            });
+            self.skipped
+                .entry(pid.to_string())
+                .or_insert_with(|| SkippedItem {
+                    project_id: pid.to_string(),
+                    name: inst.name.clone(),
+                });
             return;
         }
         match dep.version_id.as_deref() {
@@ -610,8 +617,7 @@ impl<'a> Walk<'a> {
     }
 
     fn finish_incompatible(&mut self) {
-        for (target_pid, source_pid, source_name) in
-            std::mem::take(&mut self.deferred_incompatible)
+        for (target_pid, source_pid, source_name) in std::mem::take(&mut self.deferred_incompatible)
         {
             let planned = self.entered.get(&target_pid);
             if planned.is_none() && self.installed_for(&target_pid).is_none() {
@@ -761,13 +767,14 @@ impl<'a> Walk<'a> {
     }
 
     fn add_conflict(&mut self, pid: &str, name: &str, reason: ConflictReason) {
-        let entry = self.conflicts.entry(pid.to_string()).or_insert_with(|| {
-            Conflict {
+        let entry = self
+            .conflicts
+            .entry(pid.to_string())
+            .or_insert_with(|| Conflict {
                 project_id: pid.to_string(),
                 project_name: name.to_string(),
                 reasons: Vec::new(),
-            }
-        });
+            });
         if entry.project_name == entry.project_id && name != pid {
             entry.project_name = name.to_string();
         }
@@ -801,7 +808,11 @@ pub const COMPAT_UNKNOWN: &str = "unknown";
 ///   this function exists to replace.
 /// - `strict == 0`, no loader-only matches → `incompatible`.
 /// - `has_metadata == false` → `unknown` (no provider identity to query).
-pub fn classify_compat(has_metadata: bool, strict: usize, loader_only: Option<usize>) -> &'static str {
+pub fn classify_compat(
+    has_metadata: bool,
+    strict: usize,
+    loader_only: Option<usize>,
+) -> &'static str {
     if !has_metadata {
         return COMPAT_UNKNOWN;
     }
@@ -898,7 +909,11 @@ mod tests {
         let got = InstalledContent::read(&mods, "old.zip", "resourcepack");
         assert_eq!(got.provider, "unknown");
         assert_eq!(got.project_id.as_deref(), Some("p1"));
-        assert_eq!(got.hash.as_deref(), Some("abc"), "legacy sha1 key maps to hash");
+        assert_eq!(
+            got.hash.as_deref(),
+            Some("abc"),
+            "legacy sha1 key maps to hash"
+        );
 
         // Disabled state comes from the filename, not the sidecar.
         std::fs::write(mods.join(".index").join("off.voidlauncher.json"), "{}").unwrap();
@@ -984,7 +999,10 @@ mod tests {
 
     fn graph(nodes: Vec<VersionNode>, roots: &[&str]) -> GraphInput {
         GraphInput {
-            nodes: nodes.into_iter().map(|n| (n.version_id.clone(), n)).collect(),
+            nodes: nodes
+                .into_iter()
+                .map(|n| (n.version_id.clone(), n))
+                .collect(),
             roots: roots.iter().map(|s| s.to_string()).collect(),
             unresolved: Vec::new(),
             project_names: HashMap::new(),
@@ -1008,7 +1026,13 @@ mod tests {
         // A → B → C: post-order must install C, then B, then A.
         let g = graph(
             vec![
-                node("va", "a", "Alpha", "1.0.0", vec![req("va", "b", Some("vb"))]),
+                node(
+                    "va",
+                    "a",
+                    "Alpha",
+                    "1.0.0",
+                    vec![req("va", "b", Some("vb"))],
+                ),
                 node("vb", "b", "Beta", "2.0.0", vec![req("vb", "c", Some("vc"))]),
                 node("vc", "c", "Gamma", "3.0.0", vec![]),
             ],
@@ -1235,10 +1259,8 @@ mod tests {
 
         // C is resolvable now: its stale warning must disappear, the
         // unrelated warning survives, and the duplicate collapses.
-        g.nodes.insert(
-            "c1".to_string(),
-            node("c1", "c", "Cache", "1.0", vec![]),
-        );
+        g.nodes
+            .insert("c1".to_string(), node("c1", "c", "Cache", "1.0", vec![]));
         let res = build_resolution(&g, &[]);
         assert_eq!(res.unresolved.len(), 1);
         assert_eq!(res.unresolved[0].project_id, "y");
@@ -1289,7 +1311,10 @@ mod tests {
 
     #[test]
     fn project_name_normalization_folds_case_and_separators() {
-        assert_eq!(normalize_project_name("Just Enough Items (JEI)"), "just enough items (jei)");
+        assert_eq!(
+            normalize_project_name("Just Enough Items (JEI)"),
+            "just enough items (jei)"
+        );
         assert_eq!(normalize_project_name("JEI"), "jei");
         assert_eq!(normalize_project_name("sodium_fabric"), "sodium fabric");
         assert_eq!(normalize_project_name("  Multi   Space "), "multi space");
@@ -1314,7 +1339,8 @@ mod tests {
             ],
             &["v-root"],
         );
-        g.project_names.insert("42".to_string(), "Just Enough Items (JEI)".to_string());
+        g.project_names
+            .insert("42".to_string(), "Just Enough Items (JEI)".to_string());
         let res = build_resolution(
             &g,
             &[InstalledProject {

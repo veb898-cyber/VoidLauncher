@@ -1,7 +1,5 @@
-use serde::{Deserialize, Serialize};
-use tracing;
-use hex;
 use crate::error::{LauncherError, Result};
+use serde::{Deserialize, Serialize};
 
 /// Microsoft OAuth2 token response
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -40,11 +38,10 @@ pub struct AuthState {
     pub profile: Option<MinecraftProfile>,
     #[serde(default)]
     pub timestamp: u64,
-    
+
     /// Whether this is an offline mode token (cached credentials)
     pub offline_mode: bool,
 }
-
 
 /// Authenticate with Microsoft OAuth2 Device Code Flow
 /// This flow is simpler and doesn't require a redirect server
@@ -75,10 +72,7 @@ pub async fn start_device_code_flow(client_id: &str) -> Result<serde_json::Value
 }
 
 /// Poll for device code authorization completion
-pub async fn poll_device_code(
-    client_id: &str,
-    device_code: &str,
-) -> Result<MicrosoftToken> {
+pub async fn poll_device_code(client_id: &str, device_code: &str) -> Result<MicrosoftToken> {
     let client = crate::download::global_http_client()?;
     let resp = crate::download::send_with_fallback(
         client
@@ -164,7 +158,10 @@ pub async fn refresh_microsoft_token(
             .to_string(),
         // Microsoft does not always rotate the refresh_token on refresh; an
         // absent field must NOT clobber the stored session (see ensure_ms_session).
-        refresh_token: resp["refresh_token"].as_str().unwrap_or_default().to_string(),
+        refresh_token: resp["refresh_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         expires_in: now + resp["expires_in"].as_u64().unwrap_or(3600),
     })
 }
@@ -342,7 +339,9 @@ pub async fn get_profile(mc_token: &str) -> Result<MinecraftProfile> {
 }
 
 /// Full authentication flow: Microsoft → Xbox → XSTS → Minecraft
-pub async fn full_auth_flow(ms_token: &MicrosoftToken) -> Result<(MinecraftToken, MinecraftProfile)> {
+pub async fn full_auth_flow(
+    ms_token: &MicrosoftToken,
+) -> Result<(MinecraftToken, MinecraftProfile)> {
     tracing::info!(target: "launcher", "Starting full auth flow");
     let xbox = get_xbox_token(&ms_token.access_token).await?;
     let xsts = get_xsts_token(&xbox.token).await?;
@@ -367,8 +366,7 @@ pub async fn full_auth_flow(ms_token: &MicrosoftToken) -> Result<(MinecraftToken
 /// is migrated into the vault and then deleted.
 pub fn save_auth_state(_path: &std::path::Path, state: &AuthState) -> Result<()> {
     let json = serde_json::to_string(state)?;
-    crate::accounts::store_auth_state_blob(&json)
-        .map_err(LauncherError::Auth)
+    crate::accounts::store_auth_state_blob(&json).map_err(LauncherError::Auth)
 }
 
 /// Remove the Microsoft auth state from the OS vault and delete the legacy
@@ -396,7 +394,7 @@ pub fn can_launch_offline(path: &std::path::Path) -> bool {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            
+
             // Token is valid if not expired (with 5 minute buffer)
             if now < token.expires_in.saturating_sub(300) {
                 return true;
@@ -414,7 +412,7 @@ pub fn get_offline_credentials(path: &std::path::Path) -> Option<(String, String
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            
+
             // Check if token is still valid (not expired)
             if now < token.expires_in.saturating_sub(300) {
                 return Some((profile.name.clone(), profile.id.clone()));
@@ -508,7 +506,11 @@ pub async fn elyby_login(username: &str, password: &str) -> Result<(String, Stri
 }
 
 /// Change skin for Microsoft account
-pub async fn change_microsoft_skin(mc_token: &str, skin_path: &std::path::Path, variant: &str) -> Result<()> {
+pub async fn change_microsoft_skin(
+    mc_token: &str,
+    skin_path: &std::path::Path,
+    variant: &str,
+) -> Result<()> {
     let client = crate::download::global_http_client()?;
     let skin_data = std::fs::read(skin_path)?;
 
@@ -529,14 +531,20 @@ pub async fn change_microsoft_skin(mc_token: &str, skin_path: &std::path::Path, 
         client
             .post("https://api.minecraftservices.com/minecraft/profile/skins")
             .header("Authorization", format!("Bearer {}", mc_token))
-            .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
             .body(body),
     )
     .await?;
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(LauncherError::Auth(format!("Failed to change skin: {}", text)));
+        return Err(LauncherError::Auth(format!(
+            "Failed to change skin: {}",
+            text
+        )));
     }
 
     Ok(())

@@ -1,9 +1,9 @@
-use serde::Deserialize;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 use crate::error::{LauncherError, Result};
 use crate::modloaders::{LoaderLibrary, LoaderProfile, LoaderVersionPage};
 use crate::versions::maven_to_path;
+use serde::Deserialize;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Fabric Meta API response for loader versions
 #[derive(Debug, Deserialize)]
@@ -62,7 +62,8 @@ struct FabricArguments {
 static FABRIC_VERSIONS_CACHE: OnceLock<Mutex<Option<Vec<FabricLoaderVersion>>>> = OnceLock::new();
 
 /// Supported Minecraft versions, cached for 10 minutes.
-static SUPPORTED_VERSIONS_CACHE: OnceLock<Mutex<Option<(Instant, Vec<String>)>>> = OnceLock::new();
+type SupportedVersionsSlot = OnceLock<Mutex<Option<(Instant, Vec<String>)>>>;
+static SUPPORTED_VERSIONS_CACHE: SupportedVersionsSlot = OnceLock::new();
 const SUPPORTED_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// Minecraft versions officially supported by Fabric (`/v2/versions/game`).
@@ -70,7 +71,9 @@ const SUPPORTED_CACHE_TTL: Duration = Duration::from_secs(600);
 pub async fn supported_versions() -> Result<Vec<String>> {
     {
         let cache = SUPPORTED_VERSIONS_CACHE.get_or_init(|| Mutex::new(None));
-        let guard = cache.lock().map_err(|e| LauncherError::ModLoader(e.to_string()))?;
+        let guard = cache
+            .lock()
+            .map_err(|e| LauncherError::ModLoader(e.to_string()))?;
         if let Some((fetched_at, versions)) = guard.as_ref() {
             if fetched_at.elapsed() < SUPPORTED_CACHE_TTL {
                 return Ok(versions.clone());
@@ -85,10 +88,14 @@ pub async fn supported_versions() -> Result<Vec<String>> {
     .map_err(|e| LauncherError::ModLoader(format!("Failed to fetch Fabric game versions: {}", e)))?
     .json()
     .await
-    .map_err(|e| LauncherError::ModLoader(format!("Failed to parse Fabric game versions: {}", e)))?;
+    .map_err(|e| {
+        LauncherError::ModLoader(format!("Failed to parse Fabric game versions: {}", e))
+    })?;
     let list: Vec<String> = versions.into_iter().map(|v| v.version).collect();
     let cache = SUPPORTED_VERSIONS_CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().map_err(|e| LauncherError::ModLoader(e.to_string()))?;
+    let mut guard = cache
+        .lock()
+        .map_err(|e| LauncherError::ModLoader(e.to_string()))?;
     *guard = Some((Instant::now(), list.clone()));
     Ok(list)
 }
@@ -106,7 +113,10 @@ pub async fn get_loader_versions_for(
     limit: usize,
 ) -> Result<LoaderVersionPage> {
     if !is_supported(mc_version).await? {
-        return Ok(LoaderVersionPage { versions: Vec::new(), total: 0 });
+        return Ok(LoaderVersionPage {
+            versions: Vec::new(),
+            total: 0,
+        });
     }
     get_loader_versions(offset, limit).await
 }
@@ -132,57 +142,72 @@ pub async fn get_loader_versions(offset: usize, limit: usize) -> Result<LoaderVe
 
     // Fetch if not cached
     {
-        let guard = cache.lock().map_err(|e| LauncherError::ModLoader(e.to_string()))?;
+        let guard = cache
+            .lock()
+            .map_err(|e| LauncherError::ModLoader(e.to_string()))?;
         if guard.is_some() {
             let all = guard.as_ref().unwrap();
             let total = all.len();
-            let page: Vec<_> = all.iter().skip(offset).take(limit).map(|v| {
-                super::LoaderVersion {
+            let page: Vec<_> = all
+                .iter()
+                .skip(offset)
+                .take(limit)
+                .map(|v| super::LoaderVersion {
                     version: v.version.clone(),
                     stable: v.stable,
-                }
-            }).collect();
-            return Ok(LoaderVersionPage { versions: page, total });
+                })
+                .collect();
+            return Ok(LoaderVersionPage {
+                versions: page,
+                total,
+            });
         }
     }
 
     // Fetch from Fabric official API
     let client = crate::download::global_http_client()?;
-    let versions: Vec<FabricLoaderVersion> =
-        crate::download::send_with_fallback(
-            client.get("https://meta.fabricmc.net/v2/versions/loader"),
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(target: "launcher", "Failed to fetch Fabric loader versions: {}", e);
-            LauncherError::ModLoader(e.to_string())
-        })?
-        .json()
-        .await
-        .map_err(|e| {
-            tracing::error!(target: "launcher", "Failed to parse Fabric loader versions: {}", e);
-            LauncherError::ModLoader(e.to_string())
-        })?;
+    let versions: Vec<FabricLoaderVersion> = crate::download::send_with_fallback(
+        client.get("https://meta.fabricmc.net/v2/versions/loader"),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to fetch Fabric loader versions: {}", e);
+        LauncherError::ModLoader(e.to_string())
+    })?
+    .json()
+    .await
+    .map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to parse Fabric loader versions: {}", e);
+        LauncherError::ModLoader(e.to_string())
+    })?;
 
     // Sort newest-first by semver
     let mut sorted = versions;
     sorted.sort_by(|a, b| compare_versions(&b.version, &a.version));
 
     let total = sorted.len();
-    let page: Vec<_> = sorted.iter().skip(offset).take(limit).map(|v| {
-        super::LoaderVersion {
+    let page: Vec<_> = sorted
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|v| super::LoaderVersion {
             version: v.version.clone(),
             stable: v.stable,
-        }
-    }).collect();
+        })
+        .collect();
 
     // Cache the full sorted list
     {
-        let mut guard = cache.lock().map_err(|e| LauncherError::ModLoader(e.to_string()))?;
+        let mut guard = cache
+            .lock()
+            .map_err(|e| LauncherError::ModLoader(e.to_string()))?;
         *guard = Some(sorted);
     }
 
-    Ok(LoaderVersionPage { versions: page, total })
+    Ok(LoaderVersionPage {
+        versions: page,
+        total,
+    })
 }
 
 /// Fetch game versions supported by Fabric
@@ -215,14 +240,10 @@ pub async fn get_profile(mc_version: &str, loader_version: &str) -> Result<Loade
 
     let profile: FabricProfile = crate::download::send_with_fallback(client.get(&url))
         .await
-        .map_err(|e| {
-            LauncherError::ModLoader(format!("Failed to fetch Fabric profile: {}", e))
-        })?
+        .map_err(|e| LauncherError::ModLoader(format!("Failed to fetch Fabric profile: {}", e)))?
         .json()
         .await
-        .map_err(|e| {
-            LauncherError::ModLoader(format!("Failed to parse Fabric profile: {}", e))
-        })?;
+        .map_err(|e| LauncherError::ModLoader(format!("Failed to parse Fabric profile: {}", e)))?;
 
     let libraries = profile
         .libraries

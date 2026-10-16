@@ -22,9 +22,10 @@ pub(crate) fn public_account_entries(config: &AppConfig) -> Vec<accounts::Public
         .map(|a| {
             let mut p = accounts::PublicAccountEntry::from(a.clone());
             if !p.has_ms_session {
-                if let (Some(profile), Some(uuid)) =
-                    (global.as_ref().and_then(|g| g.profile.clone()), a.uuid.as_deref())
-                {
+                if let (Some(profile), Some(uuid)) = (
+                    global.as_ref().and_then(|g| g.profile.clone()),
+                    a.uuid.as_deref(),
+                ) {
                     if profile.id == uuid {
                         p.has_ms_session = true;
                     }
@@ -92,7 +93,8 @@ pub async fn cmd_poll_login(
     // and make the freshly signed-in account the active one.
     {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        let entry = accounts::upsert_microsoft_account(&config.data_dir, &profile.name, &profile.id)?;
+        let entry =
+            accounts::upsert_microsoft_account(&config.data_dir, &profile.name, &profile.id)?;
         // A failed vault write here would leave the account entry without
         // credentials (launch would demand a re-login), so retry once.
         if let Err(e) = accounts::store_ms_session(&entry.id, &new_auth) {
@@ -231,9 +233,10 @@ pub(crate) async fn ensure_ms_session(
     };
 
     // Refresh expired tokens: Microsoft -> Xbox -> XSTS -> Minecraft.
-    if let (Some(mc_token), Some(ms_token)) =
-        (session.minecraft_token.clone(), session.microsoft_token.clone())
-    {
+    if let (Some(mc_token), Some(ms_token)) = (
+        session.minecraft_token.clone(),
+        session.microsoft_token.clone(),
+    ) {
         if auth::is_token_expired(&mc_token) && !ms_token.refresh_token.is_empty() {
             tracing::info!(target: "launcher", "Refreshing Microsoft token for account '{}'", account.name);
             match auth::refresh_microsoft_token(&client_id, &ms_token.refresh_token).await {
@@ -356,7 +359,10 @@ pub async fn cmd_add_elyby_account(
         .map_err(|e| e.to_string())?;
     let entry = accounts::AccountEntry::new_elyby(&name, &uuid);
     let accounts = accounts::add_account(&data_dir, entry)?;
-    let account_id = accounts.last().map(|a| a.id.clone()).ok_or("Account not saved")?;
+    let account_id = accounts
+        .last()
+        .map(|a| a.id.clone())
+        .ok_or("Account not saved")?;
     accounts::store_elyby_token(&account_id, &access_token).map_err(|e| e.to_string())?;
     let config = state.config.lock().map_err(|e| e.to_string())?;
     Ok(public_account_entries(&config))

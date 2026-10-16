@@ -1,4 +1,4 @@
-﻿// ==================== Launcher Commands ====================
+// ==================== Launcher Commands ====================
 // Version installation, game launch, mod loader installation,
 // playtime tracking, and game-log commands.
 
@@ -13,9 +13,9 @@ use crate::launch;
 use crate::modloaders;
 use crate::playtime;
 use crate::versions;
-use crate::{accounts, i18n};
 use crate::AppState;
-use std::path::PathBuf;
+use crate::{accounts, i18n};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -91,24 +91,27 @@ pub async fn cmd_install_version(
         &format!("Downloading {} libraries...", files.len()),
     );
     send_progress(10.0, "libraries", "Downloading libraries...");
-    download::download_files(files, move |completed, total, bytes_done, bytes_total, _msg| {
-        let frac = if bytes_total > 0 {
-            bytes_done as f64 / bytes_total as f64
-        } else if total > 0 {
-            completed as f64 / total as f64
-        } else {
-            1.0
-        };
-        let pct = 10.0 + frac * 60.0;
-        progress_tx_clone.send(InstallProgressPayload {
-            instance_id: instance_id_clone.clone(),
-            percent: pct,
-            downloaded_bytes: bytes_done,
-            total_bytes: bytes_total,
-            stage: "libraries".to_string(),
-            message: format!("Downloading libraries ({}/{})", completed, total),
-        });
-    })
+    download::download_files(
+        files,
+        move |completed, total, bytes_done, bytes_total, _msg| {
+            let frac = if bytes_total > 0 {
+                bytes_done as f64 / bytes_total as f64
+            } else if total > 0 {
+                completed as f64 / total as f64
+            } else {
+                1.0
+            };
+            let pct = 10.0 + frac * 60.0;
+            progress_tx_clone.send(InstallProgressPayload {
+                instance_id: instance_id_clone.clone(),
+                percent: pct,
+                downloaded_bytes: bytes_done,
+                total_bytes: bytes_total,
+                stage: "libraries".to_string(),
+                message: format!("Downloading libraries ({}/{})", completed, total),
+            });
+        },
+    )
     .await
     .map_err(|e| e.to_string())?;
 
@@ -180,7 +183,7 @@ pub async fn cmd_install_version(
 /// Ensure suitable Java is available. If missing, download it automatically.
 async fn ensure_java_for_launch(
     app: &AppHandle,
-    data_dir: &PathBuf,
+    data_dir: &Path,
     version_info: &versions::VersionInfo,
     _instance_name: &str,
 ) -> Result<(), String> {
@@ -191,7 +194,10 @@ async fn ensure_java_for_launch(
     // obfuscated client.jar contains classes in the unnamed package, which
     // causes java.lang.module.FindException.
     let installations = launch::find_all_java_installations(data_dir);
-    if installations.iter().any(|j| j.major_version == required_major) {
+    if installations
+        .iter()
+        .any(|j| j.major_version == required_major)
+    {
         return Ok(());
     }
 
@@ -199,7 +205,10 @@ async fn ensure_java_for_launch(
         app,
         "info",
         "launch",
-        &format!("Java {} required but not found locally. Downloading...", required_major),
+        &format!(
+            "Java {} required but not found locally. Downloading...",
+            required_major
+        ),
     );
 
     java_download::download_java_runtime(required_major, data_dir, app)
@@ -269,8 +278,8 @@ pub async fn cmd_launch_game(
         .cloned();
 
     let Some(account) = default_account else {
-        let msg = "No account available to launch the game. Please add an account first."
-            .to_string();
+        let msg =
+            "No account available to launch the game. Please add an account first.".to_string();
         events::emit_log(&app, "error", "launch", &msg);
         return Err(msg);
     };
@@ -311,7 +320,11 @@ pub async fn cmd_launch_game(
                     );
                     String::new()
                 });
-            (token, account.uuid.clone().unwrap_or_default(), account.name.clone())
+            (
+                token,
+                account.uuid.clone().unwrap_or_default(),
+                account.name.clone(),
+            )
         }
         accounts::AccountType::Microsoft => {
             match super::auth::ensure_ms_session(state.inner(), &account).await {
@@ -323,10 +336,7 @@ pub async fn cmd_launch_game(
                             &app,
                             "info",
                             "launch",
-                            &format!(
-                                "Online mode: launching as '{}' (Microsoft)",
-                                profile.name
-                            ),
+                            &format!("Online mode: launching as '{}' (Microsoft)", profile.name),
                         );
                         (
                             mc_token.access_token.clone(),
@@ -452,7 +462,10 @@ pub async fn cmd_launch_game(
     let version_info = match versions::fetch_version_info(&version_url).await {
         Ok(v) => v,
         Err(e) => {
-            let msg = format!("Failed to fetch version info for {}: {}", instance.mc_version, e);
+            let msg = format!(
+                "Failed to fetch version info for {}: {}",
+                instance.mc_version, e
+            );
             events::emit_log(&app, "error", "launch", &msg);
             return Err(msg);
         }
@@ -481,10 +494,7 @@ pub async fn cmd_launch_game(
             &app,
             "info",
             "launch",
-            &format!(
-                "Downloading {} missing version file(s)...",
-                missing.len()
-            ),
+            &format!("Downloading {} missing version file(s)...", missing.len()),
         );
         download::download_files(missing, |completed, total, bytes_done, bytes_total, _msg| {
             tracing::info!(target: "launcher", "Version file download {}/{} ({} / {} bytes)", completed, total, bytes_done, bytes_total);
@@ -528,8 +538,7 @@ pub async fn cmd_launch_game(
         if let Some(parent) = index_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let index_json =
-            serde_json::to_string_pretty(&asset_index).map_err(|e| e.to_string())?;
+        let index_json = serde_json::to_string_pretty(&asset_index).map_err(|e| e.to_string())?;
         std::fs::write(&index_path, index_json).map_err(|e| e.to_string())?;
         events::emit_log(
             &app,
@@ -555,8 +564,13 @@ pub async fn cmd_launch_game(
     if instance.loader == instances::LoaderType::Forge {
         if let Some(ref loader_ver) = instance.loader_version {
             if let Err(e) = modloaders::forge::ensure_processor_jars(
-                &instance.mc_version, loader_ver, &config.libraries_dir(), &config.versions_dir(),
-            ).await {
+                &instance.mc_version,
+                loader_ver,
+                &config.libraries_dir(),
+                &config.versions_dir(),
+            )
+            .await
+            {
                 tracing::warn!(target: "launcher", "Processor JAR check failed (continuing anyway): {}", e);
             }
             // Refresh the launch profile from the installer. This picks up
@@ -577,19 +591,23 @@ pub async fn cmd_launch_game(
 
     // Ensure LWJGL native JARs are present (self-heal for installs that
     // predate native-classifier downloads)
-    if let Err(e) = versions::ensure_native_libraries(
-        &version_info, &config.libraries_dir(),
-    ).await {
+    if let Err(e) = versions::ensure_native_libraries(&version_info, &config.libraries_dir()).await
+    {
         tracing::warn!(target: "launcher", "Native library check failed (continuing anyway): {}", e);
     }
 
     // Ensure virtual/legacy assets exist for old versions (1.6.x and
     // older need them as --assetsDir; 1.7.x/1.8.x use them as fallback).
-    let index_path = config.assets_dir().join("indexes").join(format!("{}.json", version_info.assets));
+    let index_path = config
+        .assets_dir()
+        .join("indexes")
+        .join(format!("{}.json", version_info.assets));
     if index_path.exists() {
         if let Ok(asset_index) = versions::load_asset_index(&index_path) {
             if let Err(e) = download::ensure_virtual_assets(
-                &version_info.assets, &asset_index, &config.assets_dir(),
+                &version_info.assets,
+                &asset_index,
+                &config.assets_dir(),
             ) {
                 tracing::warn!(target: "launcher", "Virtual assets check failed (continuing anyway): {}", e);
             }
@@ -606,11 +624,12 @@ pub async fn cmd_launch_game(
         &config,
         &instance,
         &version_info,
-        &access_token,
-        &uuid,
-        &username,
-        server_address.as_deref(),
-        server_port,
+        &launch::LaunchAuth {
+            access_token: &access_token,
+            uuid: &uuid,
+            username: &username,
+        },
+        server_address.as_deref().map(|h| (h, server_port)),
     )
     .map_err(|e| {
         events::emit_log(&app, "error", "launch", &format!("Launch failed: {}", e));
@@ -684,7 +703,8 @@ pub async fn cmd_launch_game(
             // If the game process has exited, commit the tail and stop the timer.
             let exited = {
                 if let Ok(mut guard) = child_for_timer.lock() {
-                    guard.as_mut()
+                    guard
+                        .as_mut()
                         .map(|c| c.try_wait().ok().flatten().is_some())
                         .unwrap_or(true)
                 } else {
@@ -695,9 +715,11 @@ pub async fn cmd_launch_game(
                 // Process exited — commit any final sub-minute tail via the helper.
                 let now = Instant::now();
                 let app_state = app_for_timer.state::<AppState>();
-                if let Some((name, delta)) =
-                    playtime::take_keyed_session(&app_state.active_sessions, &instance_for_timer, now)
-                {
+                if let Some((name, delta)) = playtime::take_keyed_session(
+                    &app_state.active_sessions,
+                    &instance_for_timer,
+                    now,
+                ) {
                     if delta > 0 {
                         playtime::add_minutes_and_save(&data_dir_for_timer, &name, delta);
                     }
@@ -842,12 +864,16 @@ fn ensure_loader_mc_match(
     mc_version: &str,
 ) -> Result<(), String> {
     if instance.mc_version != mc_version {
-        return Err(i18n::tr(lang, "loader_version_mismatch", &[
-            ("loader", loader_name),
-            ("instance_name", &instance.name),
-            ("instance_version", &instance.mc_version),
-            ("loader_version", &mc_version),
-        ]));
+        return Err(i18n::tr(
+            lang,
+            "loader_version_mismatch",
+            &[
+                ("loader", loader_name),
+                ("instance_name", &instance.name),
+                ("instance_version", &instance.mc_version),
+                ("loader_version", mc_version),
+            ],
+        ));
     }
     Ok(())
 }
@@ -871,7 +897,13 @@ pub async fn cmd_install_fabric(
     };
     let profile = modloaders::fabric::install(&mc_version, &loader_version, &libraries_dir)
         .await
-        .map_err(|e| i18n::tr(lang, "loader_install_failed", &[("loader", "Fabric"), ("error", &e.to_string())]))?;
+        .map_err(|e| {
+            i18n::tr(
+                lang,
+                "loader_install_failed",
+                &[("loader", "Fabric"), ("error", &e.to_string())],
+            )
+        })?;
 
     // Save loader profile to instance
     let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -880,7 +912,8 @@ pub async fn cmd_install_fabric(
     instance.loader = instances::LoaderType::Fabric;
     instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None).map_err(|e| e.to_string())?;
+    instances::save_instance(&config.instances_dir(), &instance, None)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -901,9 +934,16 @@ pub async fn cmd_install_forge(
         ensure_loader_mc_match(lang, "Forge", &instance, &mc_version)?;
         (config.libraries_dir(), config.versions_dir())
     };
-    let profile = modloaders::forge::install(&mc_version, &loader_version, &libraries_dir, &versions_dir)
-        .await
-        .map_err(|e| i18n::tr(lang, "loader_install_failed", &[("loader", "Forge"), ("error", &e.to_string())]))?;
+    let profile =
+        modloaders::forge::install(&mc_version, &loader_version, &libraries_dir, &versions_dir)
+            .await
+            .map_err(|e| {
+                i18n::tr(
+                    lang,
+                    "loader_install_failed",
+                    &[("loader", "Forge"), ("error", &e.to_string())],
+                )
+            })?;
 
     // Save loader profile to instance
     let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -912,7 +952,8 @@ pub async fn cmd_install_forge(
     instance.loader = instances::LoaderType::Forge;
     instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None).map_err(|e| e.to_string())?;
+    instances::save_instance(&config.instances_dir(), &instance, None)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -933,9 +974,21 @@ pub async fn cmd_install_neoforge(
         ensure_loader_mc_match(lang, "NeoForge", &instance, &mc_version)?;
         (config.libraries_dir(), config.versions_dir())
     };
-    let profile = modloaders::neoforge::install(&mc_version, &loader_version, &libraries_dir, &versions_dir, None)
-        .await
-        .map_err(|e| i18n::tr(lang, "loader_install_failed", &[("loader", "NeoForge"), ("error", &e.to_string())]))?;
+    let profile = modloaders::neoforge::install(
+        &mc_version,
+        &loader_version,
+        &libraries_dir,
+        &versions_dir,
+        None,
+    )
+    .await
+    .map_err(|e| {
+        i18n::tr(
+            lang,
+            "loader_install_failed",
+            &[("loader", "NeoForge"), ("error", &e.to_string())],
+        )
+    })?;
 
     // Save loader profile to instance
     let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -944,7 +997,8 @@ pub async fn cmd_install_neoforge(
     instance.loader = instances::LoaderType::NeoForge;
     instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None).map_err(|e| e.to_string())?;
+    instances::save_instance(&config.instances_dir(), &instance, None)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -967,8 +1021,8 @@ pub async fn cmd_check_instance_loader(
         config.instances_dir()
     };
     tauri::async_runtime::spawn_blocking(move || {
-        let instance = instances::get_instance(&instances_dir, &instance_name)
-            .map_err(|e| e.to_string())?;
+        let instance =
+            instances::get_instance(&instances_dir, &instance_name).map_err(|e| e.to_string())?;
         let loader_type = match instance.loader {
             instances::LoaderType::Vanilla => "Vanilla",
             instances::LoaderType::Fabric => "Fabric",
@@ -976,8 +1030,8 @@ pub async fn cmd_check_instance_loader(
             instances::LoaderType::NeoForge => "NeoForge",
         }
         .to_string();
-        let needs_install = instance.loader != instances::LoaderType::Vanilla
-            && instance.loader_profile.is_none();
+        let needs_install =
+            instance.loader != instances::LoaderType::Vanilla && instance.loader_profile.is_none();
         Ok(LoaderCheckResult {
             needs_install,
             loader_type,
@@ -1026,11 +1080,15 @@ pub async fn cmd_install_instance_loader(
         )
     };
 
-    let installing_msg = i18n::tr(lang, "installing_loader", &[
-        ("loader", &loader_type),
-        ("version", &loader_version),
-        ("mc", &mc_version),
-    ]);
+    let installing_msg = i18n::tr(
+        lang,
+        "installing_loader",
+        &[
+            ("loader", &loader_type),
+            ("version", &loader_version),
+            ("mc", &mc_version),
+        ],
+    );
     let _ = app.emit(
         "loader-install-progress",
         serde_json::json!({ "stage": "start", "message": installing_msg }),
@@ -1051,10 +1109,11 @@ pub async fn cmd_install_instance_loader(
     )
     .await
     .map_err(|e| {
-        let msg = i18n::tr(lang, "loader_install_failed", &[
-            ("loader", &loader_type),
-            ("error", &e.to_string()),
-        ]);
+        let msg = i18n::tr(
+            lang,
+            "loader_install_failed",
+            &[("loader", &loader_type), ("error", &e.to_string())],
+        );
         let _ = app.emit(
             "loader-install-progress",
             serde_json::json!({
@@ -1070,11 +1129,10 @@ pub async fn cmd_install_instance_loader(
     let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
         .map_err(|e| e.to_string())?;
     instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None).map_err(|e| e.to_string())?;
+    instances::save_instance(&config.instances_dir(), &instance, None)
+        .map_err(|e| e.to_string())?;
 
-    let msg_done = i18n::tr(lang, "loader_install_success", &[
-        ("loader", &loader_type),
-    ]);
+    let msg_done = i18n::tr(lang, "loader_install_success", &[("loader", &loader_type)]);
     let _ = app.emit(
         "loader-install-progress",
         serde_json::json!({
@@ -1084,7 +1142,10 @@ pub async fn cmd_install_instance_loader(
     );
 
     // Launcher logs stay English regardless of the UI language.
-    let msg_saved = format!("{} {} installed for {}", loader_type, loader_version, instance_name);
+    let msg_saved = format!(
+        "{} {} installed for {}",
+        loader_type, loader_version, instance_name
+    );
     events::emit_log(&app, "info", "loader", &msg_saved);
     Ok(())
 }
@@ -1124,7 +1185,7 @@ pub async fn cmd_list_game_logs(
             Err(_) => return Ok(Vec::new()),
         }
     };
-    Ok(tauri::async_runtime::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         let mut sessions = game_logs::list_game_log_sessions(&data_dir);
         // Optional per-instance filter (frontend passes the raw instance name;
         // matching uses the same filename-sanitization scheme as creation).
@@ -1135,7 +1196,7 @@ pub async fn cmd_list_game_logs(
         sessions
     })
     .await
-    .map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1194,7 +1255,10 @@ pub fn cmd_open_instance_logs_folder(
 /// manager. Used by the Game Logs page, which is no longer tied to a
 /// specific instance.
 #[tauri::command]
-pub fn cmd_open_game_logs_root(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn cmd_open_game_logs_root(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.data_dir.join("logs").join("game")
@@ -1226,10 +1290,7 @@ pub fn cmd_format_playtime(minutes: u64, language: Option<String>) -> String {
 /// minutes and clears that session). Called manually from the frontend
 /// (e.g., when the user closes a running game).
 #[tauri::command]
-pub fn cmd_flush_playtime(
-    state: State<'_, AppState>,
-    instance_name: String,
-) -> Result<(), String> {
+pub fn cmd_flush_playtime(state: State<'_, AppState>, instance_name: String) -> Result<(), String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
     let now = Instant::now();
     if let Some((name, delta)) =

@@ -126,10 +126,7 @@ impl PackDiff {
 
 /// Diff two identity → version maps: added / updated (same identity, new
 /// version) / removed / unchanged. Shared by both pack formats.
-pub fn diff_keyed_maps(
-    old: &BTreeMap<String, String>,
-    new: &BTreeMap<String, String>,
-) -> PackDiff {
+pub fn diff_keyed_maps(old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) -> PackDiff {
     let mut diff = PackDiff::default();
     for (key, new_ver) in new {
         match old.get(key) {
@@ -167,8 +164,7 @@ pub fn manifest_files(manifest: &serde_json::Value) -> BTreeMap<String, String> 
         return out;
     };
     for entry in files {
-        let (Some(pid), Some(fid)) = (entry["projectID"].as_u64(), entry["fileID"].as_u64())
-        else {
+        let (Some(pid), Some(fid)) = (entry["projectID"].as_u64(), entry["fileID"].as_u64()) else {
             continue;
         };
         out.insert(pid.to_string(), fid.to_string());
@@ -227,9 +223,7 @@ pub fn mrpack_entry_sha1(entry: &serde_json::Value) -> Option<String> {
 /// Map an `modrinth.index.json` manifest to `identity → entry`, keeping only
 /// the files a client install actually writes (server-only entries are
 /// never on disk, so they must not participate in diffs or repairs).
-pub fn mrpack_manifest_map(
-    manifest: &serde_json::Value,
-) -> BTreeMap<String, serde_json::Value> {
+pub fn mrpack_manifest_map(manifest: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
     let mut out = BTreeMap::new();
     let Some(files) = manifest["files"].as_array() else {
         return out;
@@ -270,8 +264,8 @@ pub fn content_type_for_rel(rel: &str) -> &'static str {
 /// `.minecraft`) from an installed CF pack zip — called while the temp
 /// download still exists, before import removes it.
 pub fn pack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String>), String> {
-    let file = std::fs::File::open(zip_path)
-        .map_err(|e| format!("Cannot open pack archive: {}", e))?;
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
 
@@ -310,8 +304,8 @@ pub fn pack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String>)
 /// `.minecraft`, both `overrides/` and `overrides-client/`) from an mrpack
 /// zip — the exact set the importer extracts.
 pub fn mrpack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String>), String> {
-    let file = std::fs::File::open(zip_path)
-        .map_err(|e| format!("Cannot open pack archive: {}", e))?;
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
 
@@ -340,8 +334,8 @@ pub fn mrpack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String
     if index_str.is_empty() {
         return Err("Pack archive has no modrinth.index.json".to_string());
     }
-    let index: serde_json::Value =
-        serde_json::from_str(&index_str).map_err(|e| format!("Invalid modrinth.index.json: {}", e))?;
+    let index: serde_json::Value = serde_json::from_str(&index_str)
+        .map_err(|e| format!("Invalid modrinth.index.json: {}", e))?;
     overrides.sort();
     overrides.dedup();
     Ok((index, overrides))
@@ -556,7 +550,10 @@ mod tests {
     #[test]
     fn loader_slugs_round_trip() {
         assert_eq!(loader_slug(&crate::instances::LoaderType::Fabric), "fabric");
-        assert_eq!(loader_slug(&crate::instances::LoaderType::NeoForge), "neoforge");
+        assert_eq!(
+            loader_slug(&crate::instances::LoaderType::NeoForge),
+            "neoforge"
+        );
         assert_eq!(loader_slug(&crate::instances::LoaderType::Vanilla), "");
         let m = manifest(&[]);
         assert_eq!(manifest_loader_slug(&m), "forge");
@@ -611,21 +608,26 @@ mod tests {
             zw.write_all(idx.as_bytes()).unwrap();
             zw.start_file("overrides/config/a.toml", opts).unwrap();
             zw.write_all(b"a").unwrap();
-            zw.start_file("overrides-client/config/client.toml", opts).unwrap();
+            zw.start_file("overrides-client/config/client.toml", opts)
+                .unwrap();
             zw.write_all(b"c").unwrap();
-            zw.start_file("overrides-server/config/server.toml", opts).unwrap();
+            zw.start_file("overrides-server/config/server.toml", opts)
+                .unwrap();
             zw.write_all(b"s").unwrap();
             zw.start_file("overrides/", opts).unwrap();
             zw.finish().unwrap();
         }
         let (idx, overrides) = mrpack_zip_info(&zip_path).unwrap();
         assert_eq!(
-            mrpack_manifest_map(&idx).get("p1").map(|e| mrpack_entry_path(e)),
+            mrpack_manifest_map(&idx).get("p1").map(mrpack_entry_path),
             Some("mods/a.jar".to_string())
         );
         assert_eq!(
             overrides,
-            vec!["config/a.toml".to_string(), "config/client.toml".to_string()]
+            vec![
+                "config/a.toml".to_string(),
+                "config/client.toml".to_string()
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -658,7 +660,8 @@ mod tests {
 
     #[test]
     fn legacy_lock_is_read_and_migrated_on_write() {
-        let dir = std::env::temp_dir().join(format!("pack-lock-legacy-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pack-lock-legacy-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let lock = PackLock {
             provider: "curseforge".into(),

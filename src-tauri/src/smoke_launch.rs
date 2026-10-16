@@ -95,7 +95,7 @@ fn java_dir(data_dir: &Path) -> PathBuf {
 }
 
 fn check_java_availability(data_dir: &Path, required_major: u32) -> bool {
-    let installations = launch::find_all_java_installations(&data_dir.to_path_buf());
+    let installations = launch::find_all_java_installations(data_dir);
     crate::java::get_recommended_java(Some(required_major), &installations).is_some()
 }
 
@@ -128,11 +128,7 @@ async fn ensure_java(data_dir: &Path, major: u32) -> Result<(), String> {
         .await
         .map_err(|e| format!("Java {} download failed: {}", major, e))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "Java {} download: HTTP {}",
-            major,
-            resp.status()
-        ));
+        return Err(format!("Java {} download: HTTP {}", major, resp.status()));
     }
     let bytes = resp
         .bytes()
@@ -148,8 +144,7 @@ async fn ensure_java(data_dir: &Path, major: u32) -> Result<(), String> {
     }
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
 
-    let file =
-        std::fs::File::open(&tmp_zip).map_err(|e| format!("open zip: {}", e))?;
+    let file = std::fs::File::open(&tmp_zip).map_err(|e| format!("open zip: {}", e))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("zip: {}", e))?;
     for i in 0..archive.len() {
         let mut entry = archive
@@ -212,7 +207,12 @@ async fn install_loader_for(
         .iter()
         .filter(|v| v.stable)
         .map(|v| v.version.clone())
-        .chain(page.versions.iter().filter(|v| !v.stable).map(|v| v.version.clone()))
+        .chain(
+            page.versions
+                .iter()
+                .filter(|v| !v.stable)
+                .map(|v| v.version.clone()),
+        )
         .collect();
 
     let mut last_err = "no versions returned".to_string();
@@ -226,7 +226,10 @@ async fn install_loader_for(
             }
         }
     }
-    Err(format!("all {} versions failed. last: {}", loader, last_err))
+    Err(format!(
+        "all {} versions failed. last: {}",
+        loader, last_err
+    ))
 }
 
 async fn install_version(config: &AppConfig, mc: &str) -> Result<versions::VersionInfo, String> {
@@ -247,14 +250,19 @@ async fn install_version(config: &AppConfig, mc: &str) -> Result<versions::Versi
     let files = versions::collect_downloads(&vi, &config.libraries_dir(), &config.versions_dir());
     if !files.is_empty() {
         report_line(&format!("downloading {} files for {}...", files.len(), mc));
-        download::download_files(files, |_, _, _, _, _| {}).await.map_err(|e| e.to_string())?;
+        download::download_files(files, |_, _, _, _, _| {})
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     versions::ensure_native_libraries(&vi, &config.libraries_dir())
         .await
         .map_err(|e| format!("natives {}: {}", mc, e))?;
 
-    let idx_path = config.assets_dir().join("indexes").join(format!("{}.json", vi.assets));
+    let idx_path = config
+        .assets_dir()
+        .join("indexes")
+        .join(format!("{}.json", vi.assets));
     if !idx_path.exists() {
         let asset_index = versions::fetch_asset_index(&vi.asset_index.url)
             .await
@@ -305,17 +313,24 @@ fn newest_tee(dir: &std::path::Path, suffix: &str) -> Vec<u8> {
     if let Ok(rd) = std::fs::read_dir(&logs_dir) {
         for e in rd.flatten() {
             let p = e.path();
-            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if !name.ends_with(suffix) {
                 continue;
             }
-            let mtime = p.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            let mtime = p
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
             if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
                 best = Some((mtime, p));
             }
         }
     }
-    best.map(|(_, p)| std::fs::read(&p).unwrap_or_default()).unwrap_or_default()
+    best.map(|(_, p)| std::fs::read(&p).unwrap_or_default())
+        .unwrap_or_default()
 }
 
 type Verdict = Result<String, String>;
@@ -324,24 +339,25 @@ fn pass(detail: &str) -> Verdict {
     Ok(detail.to_string())
 }
 
-async fn run_combo(
-    config: &AppConfig,
-    data_dir: &Path,
-    mc: &str,
-    loader: &str,
-) -> Verdict {
+async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) -> Verdict {
     let combo_name = format!("{}-{}", mc, loader);
     let instances_dir = config.instances_dir();
 
     // Resume: skip combos that already passed in this data dir.
-    let pass_marker = data_dir.join("combo-pass").join(format!("{}.pass", combo_name));
+    let pass_marker = data_dir
+        .join("combo-pass")
+        .join(format!("{}.pass", combo_name));
     if pass_marker.exists() {
         return pass("PASS (cached from previous run)");
     }
 
     // Optional SMOKE_FILTER="1.16.5-Forge,1.18.2-Forge" to run a subset.
     if let Ok(filter) = std::env::var("SMOKE_FILTER") {
-        let allowed: Vec<&str> = filter.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let allowed: Vec<&str> = filter
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         if !allowed.is_empty() && !allowed.iter().any(|f| combo_name.contains(f)) {
             return pass("SKIP (filtered out)");
         }
@@ -380,7 +396,8 @@ async fn run_combo(
 
     // 2. Create instance
     let mut instance = if skip_install && inst_dir.exists() {
-        instances::get_instance(&instances_dir, &name).map_err(|e| format!("reuse instance: {}", e))?
+        instances::get_instance(&instances_dir, &name)
+            .map_err(|e| format!("reuse instance: {}", e))?
     } else {
         let inst = Instance::new(&name, mc, 4096, "g1gc", loader_type(loader), None);
         instances::create_instance(&instances_dir, &inst)
@@ -406,7 +423,15 @@ async fn run_combo(
 
     let start = Instant::now();
     let mut child = match launch::launch_minecraft(
-        config, &instance, &vi, token, uuid, username, None, None,
+        config,
+        &instance,
+        &vi,
+        &launch::LaunchAuth {
+            access_token: token,
+            uuid,
+            username,
+        },
+        None,
     ) {
         Ok(c) => c,
         Err(e) => return Err(format!("launch spawn error: {}", e)),
@@ -420,10 +445,12 @@ async fn run_combo(
 
     loop {
         if start.elapsed() > COMBO_TIMEOUT {
-            let _ = kill_tree(child.id());
+            kill_tree(child.id());
             return Err(format!(
                 "TIMEOUT {}s (main_marker={}, loader_marker={})",
-                COMBO_TIMEOUT.as_secs(), saw_main, saw_loader
+                COMBO_TIMEOUT.as_secs(),
+                saw_main,
+                saw_loader
             ));
         }
 
@@ -451,14 +478,25 @@ async fn run_combo(
             // printed after mod loading completes); the loader-specific
             // marker above is informational only.
             if saw_main {
-                let _ = kill_tree(child.id());
-                report_line(&format!("{}: PASS after {:.0}s", combo_name, start.elapsed().as_secs_f32()));
+                kill_tree(child.id());
+                report_line(&format!(
+                    "{}: PASS after {:.0}s",
+                    combo_name,
+                    start.elapsed().as_secs_f32()
+                ));
                 if let Ok(Some(status)) = child.try_wait() {
-                    report_line(&format!("{}: child exit code after kill: {}", combo_name, status.code().unwrap_or(-1)));
+                    report_line(&format!(
+                        "{}: child exit code after kill: {}",
+                        combo_name,
+                        status.code().unwrap_or(-1)
+                    ));
                 }
                 std::fs::create_dir_all(pass_marker.parent().unwrap()).ok();
                 let _ = std::fs::write(&pass_marker, b"1");
-                return pass(&format!("launch+markers in {:.0}s", start.elapsed().as_secs_f32()));
+                return pass(&format!(
+                    "launch+markers in {:.0}s",
+                    start.elapsed().as_secs_f32()
+                ));
             }
         }
 
@@ -467,18 +505,24 @@ async fn run_combo(
             // main reached; give it a grace period for loader bootstrap
         } else if let Ok(rd) = std::fs::read_dir(&crash_dir) {
             for e in rd.flatten() {
-                if e.file_name().to_string_lossy().as_ref().to_ascii_lowercase().ends_with(".txt") {
+                if e.file_name()
+                    .to_string_lossy()
+                    .as_ref()
+                    .to_ascii_lowercase()
+                    .ends_with(".txt")
+                {
                     let content = std::fs::read_to_string(e.path())
                         .unwrap_or_default()
                         .lines()
                         .take(12)
                         .collect::<Vec<_>>()
                         .join("\n");
-                    let _ = kill_tree(child.id());
+                    kill_tree(child.id());
                     return Err(format!(
                         "CRASH REPORT present: {}",
                         e.file_name().to_string_lossy()
-                    ) + "\n" + &content);
+                    ) + "\n"
+                        + &content);
                 }
             }
         }
@@ -486,21 +530,25 @@ async fn run_combo(
         // Process exit?
         if let Ok(Some(status)) = child.try_wait() {
             let code = status.code().unwrap_or(-1);
-            let _ = kill_tree(child.id());
+            kill_tree(child.id());
             // The launcher owns the pipes now (unified session logging);
             // fall back to the raw tee files for diagnostics.
-            let out = newest_tee(&data_dir, ".stdout.log");
-            let err = newest_tee(&data_dir, ".stderr.log");
+            let out = newest_tee(data_dir, ".stdout.log");
+            let err = newest_tee(data_dir, ".stderr.log");
             if let Ok(p) = std::env::var("SMOKE_STDERR_FILE") {
                 std::fs::write(&p, &err).ok();
                 std::fs::write(format!("{}.stdout", p), &out).ok();
             }
             return Err(format!(
                 "game exited early (code {}); main={}, loader={}\nstdout tail: {}\nstderr tail: {}",
-                code, saw_main, saw_loader,
+                code,
+                saw_main,
+                saw_loader,
                 pipe_tail(&out, 1500),
                 pipe_tail(&err, 1500)
-            ).trim_end().to_string());
+            )
+            .trim_end()
+            .to_string());
         }
 
         std::thread::sleep(POLL_STEP);
@@ -512,7 +560,9 @@ async fn run_combo(
 fn smoke_all() {
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("launcher=trace".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("launcher=trace".parse().unwrap()),
+        )
         .with_test_writer()
         .try_init();
 
@@ -534,7 +584,10 @@ fn smoke_all() {
         let _ = std::fs::remove_file(results_path());
 
         report_line(&format!("SMOKE DATA DIR: {}", data_dir.display()));
-        report_line(&format!("Java present: {}", launch::find_all_java_installations(&data_dir).len()));
+        report_line(&format!(
+            "Java present: {}",
+            launch::find_all_java_installations(&data_dir).len()
+        ));
 
         let mut results: Vec<(&'static str, &'static str, Verdict)> = Vec::new();
         for (mc, loader) in COMBOS {
@@ -557,15 +610,29 @@ fn smoke_all() {
                 }
                 Err(e) => {
                     failed += 1;
-                    report_line(&format!("  FAIL  {} {}  ->  {}", mc, loader, e.lines().next().unwrap_or("")));
+                    report_line(&format!(
+                        "  FAIL  {} {}  ->  {}",
+                        mc,
+                        loader,
+                        e.lines().next().unwrap_or("")
+                    ));
                 }
             }
         }
-        report_line(&format!("TOTAL: {} combos, {} passed, {} failed", results.len(), passed, failed));
+        report_line(&format!(
+            "TOTAL: {} combos, {} passed, {} failed",
+            results.len(),
+            passed,
+            failed
+        ));
 
         if failed > 0 {
             // fail the test so CI/dev notices
-            panic!("{} combos failed (see {} and result lines above)", failed, results_path().display());
+            panic!(
+                "{} combos failed (see {} and result lines above)",
+                failed,
+                results_path().display()
+            );
         }
     });
 }

@@ -88,7 +88,11 @@ impl Default for AppConfig {
         // ZGC is the default on machines with >= 24 GB RAM (heap >= 8 GB):
         // low pause times win over G1GC there, and `build_jvm_args` still
         // falls back to G1GC if Java < 17 or the heap is too small.
-        let gc_default = if total_ram >= 24 * 1024 { "zgc" } else { "g1gc" };
+        let gc_default = if total_ram >= 24 * 1024 {
+            "zgc"
+        } else {
+            "g1gc"
+        };
         tracing::info!(
             target: "config",
             "First launch: detected {} MB RAM, defaulting to {} MB, GC preset {}",
@@ -126,7 +130,8 @@ impl Default for AppConfig {
             // CurseForge public API key taken from Prism Launcher's open-source
             // defaults — NOT a secret, safe to ship in the repo (CF treats it
             // as an identifier, not a credential).
-            curseforge_api_key: "$2a$10$wuAJuNZuted3NORVmpgUC.m8sI.pv1tOPKZyBgLFGjxFp/br0lZCC".into(),
+            curseforge_api_key: "$2a$10$wuAJuNZuted3NORVmpgUC.m8sI.pv1tOPKZyBgLFGjxFp/br0lZCC"
+                .into(),
         }
     }
 }
@@ -166,6 +171,7 @@ impl AppConfig {
     ///   * ZGC preset with less than 8 GB of heap → G1GC (ZGC requires
     ///     8+ GB; on 6 GB it stalled the client during pack/server loads);
     ///   * legacy server-style `default_jvm_args` → slim preset-neutral set.
+    ///
     /// Returns true when something changed (caller should persist).
     fn migrate(&mut self) -> bool {
         let mut changed = false;

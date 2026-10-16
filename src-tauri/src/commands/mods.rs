@@ -7,9 +7,9 @@ use crate::content;
 use crate::curseforge;
 use crate::download;
 use crate::instances;
+use crate::is_allowed_download_host;
 use crate::modrinth;
 use crate::AppState;
-use crate::is_allowed_download_host;
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -121,7 +121,9 @@ pub async fn cmd_check_mod_updates(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let instance = instances::get_instance(&config.instances_dir(), &instance_name)
             .map_err(|e| e.to_string())?;
-        instance.minecraft_dir(&config.instances_dir()).join(&pack_type)
+        instance
+            .minecraft_dir(&config.instances_dir())
+            .join(&pack_type)
     };
 
     if !packs_dir.exists() {
@@ -138,17 +140,20 @@ pub async fn cmd_check_mod_updates(
     };
 
     let mut mod_files: Vec<ModFile> = Vec::new();
-    let mut hash_to_mod: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut hash_to_mod: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut all_hashes: Vec<String> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(&packs_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let filename = path.file_name()
+            let filename = path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            if filename.starts_with('.') || filename.ends_with(".voidlauncher.json")
+            if filename.starts_with('.')
+                || filename.ends_with(".voidlauncher.json")
                 || filename.ends_with(".pw.toml")
             {
                 continue;
@@ -157,7 +162,9 @@ pub async fn cmd_check_mod_updates(
             if is_mods {
                 // Mods: only .jar files, with loader filtering
                 let is_jar = filename.ends_with(".jar") || filename.ends_with(".jar.disabled");
-                if !is_jar { continue; }
+                if !is_jar {
+                    continue;
+                }
 
                 let meta = read_mod_meta_from_jar(&path);
                 let matches_loader = match loader.as_deref() {
@@ -167,7 +174,9 @@ pub async fn cmd_check_mod_updates(
                     Some("Vanilla") => false,
                     _ => true,
                 };
-                if !matches_loader { continue; }
+                if !matches_loader {
+                    continue;
+                }
 
                 let hash = download::hash_file_sha1(&path).ok();
                 let ic = content::InstalledContent::read(&packs_dir, &filename, content_type);
@@ -194,14 +203,21 @@ pub async fn cmd_check_mod_updates(
             } else {
                 // Resourcepacks / Shaderpacks: only .zip files (skip directories)
                 let is_zip = filename.ends_with(".zip") || filename.ends_with(".zip.disabled");
-                if !is_zip { continue; }
+                if !is_zip {
+                    continue;
+                }
 
-                let (name, version) = read_pack_name_and_version(&path)
-                    .unwrap_or_else(|| (instances::strip_minecraft_color_codes(
-                        std::path::Path::new(&filename).file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(&filename)
-                    ), String::new()));
+                let (name, version) = read_pack_name_and_version(&path).unwrap_or_else(|| {
+                    (
+                        instances::strip_minecraft_color_codes(
+                            std::path::Path::new(&filename)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(&filename),
+                        ),
+                        String::new(),
+                    )
+                });
 
                 let hash = download::hash_file_sha1(&path).ok();
                 let ic = content::InstalledContent::read(&packs_dir, &filename, content_type);
@@ -318,25 +334,32 @@ pub async fn cmd_check_mod_updates(
         };
         let game_versions = mc_version.map(|v| vec![v]);
 
-        let response = modrinth::check_version_updates(
-            all_hashes,
-            "sha1",
-            loaders,
-            game_versions,
-        ).await.map_err(|e| e.to_string())?;
+        let response = modrinth::check_version_updates(all_hashes, "sha1", loaders, game_versions)
+            .await
+            .map_err(|e| e.to_string())?;
 
         for (hash_str, maybe_version) in &response {
-            let Some(version) = maybe_version else { continue; };
-            let Some(&idx) = hash_to_mod.get(hash_str) else { continue; };
+            let Some(version) = maybe_version else {
+                continue;
+            };
+            let Some(&idx) = hash_to_mod.get(hash_str) else {
+                continue;
+            };
             let mod_file = &mod_files[idx];
 
-            let file = version.files.iter()
+            let file = version
+                .files
+                .iter()
                 .find(|f| f.primary)
                 .or_else(|| version.files.first());
-            let Some(primary_file) = file else { continue; };
+            let Some(primary_file) = file else {
+                continue;
+            };
 
             let installed_hash = mod_file.hash.as_deref().unwrap_or("");
-            let file_hash = primary_file.hashes.get("sha1")
+            let file_hash = primary_file
+                .hashes
+                .get("sha1")
                 .or_else(|| primary_file.hashes.get("sha512"))
                 .map(|s| s.as_str())
                 .unwrap_or("");
@@ -387,17 +410,27 @@ fn read_pack_name_and_version(path: &std::path::Path) -> Option<(String, String)
     if let Ok(file) = std::fs::File::open(path) {
         if let Ok(mut archive) = zip::ZipArchive::new(file) {
             if let Ok(mcmeta_file) = archive.by_name("pack.mcmeta") {
-                let bytes: Vec<u8> = mcmeta_file.bytes().filter_map(|b| b.ok()).collect();
+                let bytes: Vec<u8> = std::io::BufReader::new(mcmeta_file)
+                    .bytes()
+                    .filter_map(|b| b.ok())
+                    .collect();
                 if let Ok(content) = String::from_utf8(bytes) {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(name) = json["pack"].as_object()
+                        if let Some(name) = json["pack"]
+                            .as_object()
                             .and_then(|p| p.get("description"))
                             .and_then(|d| d.as_str())
-                            .or_else(|| json["pack"].as_object()
-                                .and_then(|p| p.get("name"))
-                                .and_then(|n| n.as_str()))
+                            .or_else(|| {
+                                json["pack"]
+                                    .as_object()
+                                    .and_then(|p| p.get("name"))
+                                    .and_then(|n| n.as_str())
+                            })
                         {
-                            return Some((instances::strip_minecraft_color_codes(name), String::new()));
+                            return Some((
+                                instances::strip_minecraft_color_codes(name),
+                                String::new(),
+                            ));
                         }
                     }
                 }
@@ -431,6 +464,7 @@ pub async fn cmd_popular_modrinth(
 // ==================== CurseForge API ====================
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_search_curseforge(
     state: State<'_, AppState>,
     query: String,
@@ -445,16 +479,20 @@ pub async fn cmd_search_curseforge(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.curseforge_api_key.clone()
     };
-    let class_id = project_type.as_deref().and_then(curseforge::class_id_for_project_type);
+    let class_id = project_type
+        .as_deref()
+        .and_then(curseforge::class_id_for_project_type);
     curseforge::search_mods_filtered(
-        &query,
-        mc_version.as_deref(),
-        loader.as_deref(),
-        class_id,
-        None,
-        index.as_deref(),
-        offset,
-        limit,
+        &curseforge::CfSearchQuery {
+            query: &query,
+            mc_version: mc_version.as_deref(),
+            loader: loader.as_deref(),
+            class_id,
+            category_id: None,
+            index: index.as_deref(),
+            offset,
+            limit,
+        },
         &api_key,
     )
     .await
@@ -576,6 +614,7 @@ fn local_path_from_uri(uri: &str) -> Result<std::path::PathBuf, String> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_install_mod(
     state: State<'_, AppState>,
     instance_name: String,
@@ -632,10 +671,7 @@ pub async fn cmd_install_mod(
     if provider == "local" {
         let local_path = local_path_from_uri(&download_url)?;
         if !local_path.is_file() {
-            return Err(format!(
-                "Local file not found: {}",
-                local_path.display()
-            ));
+            return Err(format!("Local file not found: {}", local_path.display()));
         }
         std::fs::copy(&local_path, &dest).map_err(|e| e.to_string())?;
         download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
@@ -700,6 +736,7 @@ pub async fn cmd_install_mod(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_download_to_folder(
     state: State<'_, AppState>,
     instance_name: String,
@@ -722,7 +759,7 @@ pub async fn cmd_download_to_folder(
     // still validated inside the download layer).
     let numeric = |v: &Option<String>| {
         v.as_deref()
-            .map_or(false, |s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
     };
     let cf_native = download_url.is_empty()
         && provider.eq_ignore_ascii_case("curseforge")
@@ -782,7 +819,11 @@ pub async fn cmd_download_to_folder(
     };
     let downloaded = async {
         if cf_native {
-            let pid = project_id.as_deref().unwrap_or("").parse::<u64>().unwrap_or(0);
+            let pid = project_id
+                .as_deref()
+                .unwrap_or("")
+                .parse::<u64>()
+                .unwrap_or(0);
             let fid = file_id.as_deref().unwrap_or("").parse::<u64>().unwrap_or(0);
             let key = {
                 let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -798,8 +839,7 @@ pub async fn cmd_download_to_folder(
         }
         // When no SHA1 is available, at least verify the result is a real
         // archive (JAR/ZIP magic) and not an HTML error page / bogus body.
-        if expected_sha1.is_empty()
-            && (safe_name.ends_with(".jar") || safe_name.ends_with(".zip"))
+        if expected_sha1.is_empty() && (safe_name.ends_with(".jar") || safe_name.ends_with(".zip"))
         {
             download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
         }
@@ -887,19 +927,20 @@ pub async fn cmd_list_instance_mods(
                 let meta = read_mod_meta_from_jar(&path);
                 let pw = pw_index.get(&filename);
                 let sidecar_project_id = read_mod_sidecar_slug(&mods_dir, &filename);
-                let project_id = sidecar_project_id
-                    .clone()
-                    .or_else(|| {
-                        pw.filter(|p| !p.project_id.is_empty())
-                            .map(|p| p.project_id.clone())
-                    });
+                let project_id = sidecar_project_id.clone().or_else(|| {
+                    pw.filter(|p| !p.project_id.is_empty())
+                        .map(|p| p.project_id.clone())
+                });
                 let (slug, slug_verified) = project_id
                     .as_ref()
                     .map(|s| (Some(s.clone()), sidecar_project_id.is_some()))
                     .unwrap_or_else(|| (meta.slug, false));
                 let provider = read_mod_sidecar_provider(&mods_dir, &filename)
                     .map(|s| crate::instances::normalize_provider(&s))
-                    .or_else(|| pw.filter(|p| !p.provider.is_empty()).map(|p| p.provider.clone()))
+                    .or_else(|| {
+                        pw.filter(|p| !p.provider.is_empty())
+                            .map(|p| p.provider.clone())
+                    })
                     // No sidecar / packwiz provenance: jar meta only knows the
                     // loader (Fabric/Forge/...), not the download source — show
                     // Local rather than a loader name in the Source column.
@@ -1020,7 +1061,10 @@ pub(crate) fn get_mod_metadata(
     if let Ok(entries) = std::fs::read_dir(&mods_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(filename) = path.file_name().and_then(|n| n.to_str()).map(str::to_string)
+            let Some(filename) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
             else {
                 continue;
             };
@@ -1033,10 +1077,7 @@ pub(crate) fn get_mod_metadata(
                 continue;
             }
             let (mtime, size) = match std::fs::metadata(&path) {
-                Ok(m) => (
-                    m.modified().unwrap_or(std::time::UNIX_EPOCH),
-                    m.len(),
-                ),
+                Ok(m) => (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len()),
                 Err(_) => (std::time::UNIX_EPOCH, 0),
             };
             files.push(ModFileEntry {
@@ -1099,15 +1140,14 @@ pub(crate) fn get_mod_metadata(
                         slice
                             .iter()
                             .enumerate()
-                            .map(|(k, f)| (start + k, build_mod_metadata(mods_dir_ref, pw_index, f)))
+                            .map(|(k, f)| {
+                                (start + k, build_mod_metadata(mods_dir_ref, pw_index, f))
+                            })
                             .collect::<Vec<_>>()
                     })
                 })
                 .collect();
-            handles
-                .into_iter()
-                .filter_map(|h| h.join().ok())
-                .collect()
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
         })
     } else {
         vec![fresh
@@ -1159,11 +1199,12 @@ fn build_mod_metadata(
     let pw = pw_index.get(filename);
     // Single sidecar read for all fields.
     let sidecar = read_sidecar_fields(mods_dir, filename);
-    let project_id = sidecar
-        .project_id
-        .clone()
-        .or_else(|| pw.filter(|p| !p.project_id.is_empty()).map(|p| p.project_id.clone()));
-    let (slug, slug_verified) = project_id.as_ref()
+    let project_id = sidecar.project_id.clone().or_else(|| {
+        pw.filter(|p| !p.project_id.is_empty())
+            .map(|p| p.project_id.clone())
+    });
+    let (slug, slug_verified) = project_id
+        .as_ref()
         .map(|s| (Some(s.clone()), sidecar.project_id.is_some()))
         .unwrap_or_else(|| (meta.slug, false));
     // Provider priority: sidecar (modrinth/curseforge/local) > packwiz > Local
@@ -1202,7 +1243,10 @@ fn build_mod_metadata(
     let mut version = sidecar
         .version_number
         .filter(|v| !v.is_empty())
-        .or_else(|| pw.filter(|p| !p.version.is_empty()).map(|p| p.version.clone()))
+        .or_else(|| {
+            pw.filter(|p| !p.version.is_empty())
+                .map(|p| p.version.clone())
+        })
         .unwrap_or_else(|| sanitize_version(&meta.version));
     // No real version anywhere — extract one from the file name
     // (works for JARs with version-less metadata like "${file.jarVersion}").
@@ -1253,10 +1297,7 @@ fn read_mod_sidecar_provider(mods_dir: &std::path::Path, filename: &str) -> Opti
 /// "Unknown", ...) so the UI never shows them as real versions.
 fn sanitize_version(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.contains("${")
-        || trimmed.eq_ignore_ascii_case("unknown")
-    {
+    if trimmed.is_empty() || trimmed.contains("${") || trimmed.eq_ignore_ascii_case("unknown") {
         String::new()
     } else {
         trimmed.to_string()
@@ -1306,7 +1347,7 @@ fn fallback_meta_from_filename(path: &std::path::Path) -> ModMetaResult {
         if potential_version
             .chars()
             .next()
-            .map_or(false, |c| c.is_ascii_digit())
+            .is_some_and(|c| c.is_ascii_digit())
         {
             fallback_name[..dash_pos].to_string()
         } else {
@@ -1443,8 +1484,7 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
 fn strip_toml_comment(val: &str) -> &str {
     let mut in_single = false;
     let mut in_double = false;
-    let mut chars = val.char_indices();
-    while let Some((i, c)) = chars.next() {
+    for (i, c) in val.char_indices() {
         match c {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
@@ -1459,7 +1499,7 @@ fn extract_toml_field(content: &str, field: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with(field) && trimmed.contains('=') {
-            let raw = trimmed.splitn(2, '=').nth(1)?.trim();
+            let raw = trimmed.split_once('=')?.1.trim();
             let raw = strip_toml_comment(raw);
             let val = raw.trim().trim_matches('"').trim_matches('\'');
             if val.starts_with('{') {
@@ -1525,7 +1565,11 @@ async fn cmd_get_mod_icon_impl(
     if !curseforge_api_key.is_empty() {
         if let Some(mods_dir) = jar_path.parent() {
             if let Some(val) = crate::instances::read_sidecar_meta(mods_dir, &safe_filename) {
-                if val["provider"].as_str().map(|p| p.eq_ignore_ascii_case("curseforge")) == Some(true) {
+                if val["provider"]
+                    .as_str()
+                    .map(|p| p.eq_ignore_ascii_case("curseforge"))
+                    == Some(true)
+                {
                     if let Some(pid_str) = val["project_id"].as_str() {
                         if let Ok(pid) = pid_str.parse::<u64>() {
                             if let Ok(Some(icon)) =
@@ -1610,10 +1654,11 @@ async fn fetch_curseforge_mod_icon(
 
     const MAX_LOGO_BYTES: u64 = 3 * 1024 * 1024;
     let client = crate::download::global_http_client()?;
-    let bytes = match fetch_remote_image_capped(&client, thumbnail_url.as_str(), MAX_LOGO_BYTES).await {
-        Some(b) if !b.is_empty() => b,
-        _ => return Ok(None),
-    };
+    let bytes =
+        match fetch_remote_image_capped(&client, thumbnail_url.as_str(), MAX_LOGO_BYTES).await {
+            Some(b) if !b.is_empty() => b,
+            _ => return Ok(None),
+        };
 
     let b64 = base64_encode(&bytes);
     let mime = if thumbnail_url.ends_with(".jpg") || thumbnail_url.ends_with(".jpeg") {
@@ -1633,9 +1678,15 @@ async fn fetch_remote_icon(url: &str) -> Option<String> {
         Err(_) => return None,
     };
     let bytes = fetch_remote_image_capped(&client, url, MAX_ICON_BYTES).await?;
-    if bytes.is_empty() { return None; }
+    if bytes.is_empty() {
+        return None;
+    }
     let b64 = base64_encode(&bytes);
-    let mime = if url.ends_with(".jpg") || url.ends_with(".jpeg") { "image/jpeg" } else { "image/png" };
+    let mime = if url.ends_with(".jpg") || url.ends_with(".jpeg") {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
     Some(format!("data:{};base64,{}", mime, b64))
 }
 
@@ -1643,7 +1694,11 @@ async fn fetch_remote_icon(url: &str) -> Option<String> {
 /// RAM and then base64-expanded (×4/3) for the renderer, so a malicious or
 /// broken host could otherwise force the launcher to allocate arbitrarily
 /// much memory. Fetch with a strict byte cap; anything larger is ignored.
-async fn fetch_remote_image_capped<S: reqwest::IntoUrl>(client: &reqwest::Client, url: S, max_bytes: u64) -> Option<Vec<u8>> {
+async fn fetch_remote_image_capped<S: reqwest::IntoUrl>(
+    client: &reqwest::Client,
+    url: S,
+    max_bytes: u64,
+) -> Option<Vec<u8>> {
     let resp = crate::download::send_with_fallback(client.get(url))
         .await
         .ok()?;
@@ -1768,7 +1823,9 @@ fn extract_icon_from_jar(
         if let Ok(entry) = archive.by_index(i) {
             let name = entry.name().to_string();
             let lower = name.to_lowercase();
-            if (lower.ends_with("icon.png") || lower.ends_with("logo.png") || lower.ends_with("pack.png"))
+            if (lower.ends_with("icon.png")
+                || lower.ends_with("logo.png")
+                || lower.ends_with("pack.png"))
                 && !lower.contains("META-INF")
             {
                 let mut buf = Vec::new();
@@ -1791,7 +1848,7 @@ pub(crate) fn base64_encode_pub(data: &[u8]) -> String {
 
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };

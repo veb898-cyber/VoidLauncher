@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use tracing;
 
 /// Service name used for every Windows Credential Manager entry.
 /// Credentials are stored in the OS vault (DPAPI-protected, tied to the
@@ -67,8 +66,8 @@ pub struct PublicAccountEntry {
 
 impl From<AccountEntry> for PublicAccountEntry {
     fn from(a: AccountEntry) -> Self {
-        let has_ms_session = a.account_type == AccountType::Microsoft
-            && load_ms_session(&a.id).is_some();
+        let has_ms_session =
+            a.account_type == AccountType::Microsoft && load_ms_session(&a.id).is_some();
         Self {
             id: a.id,
             name: a.name,
@@ -135,7 +134,7 @@ fn chunk_key(user: &str, index: usize) -> String {
 /// (possibly empty) so a written marker entry exists even for blank values.
 fn split_into_chunks(value: &str) -> Vec<String> {
     let chars: Vec<char> = value.chars().collect();
-    let chunk_count = ((chars.len() + VAULT_CHUNK_CHARS - 1) / VAULT_CHUNK_CHARS).max(1);
+    let chunk_count = chars.len().div_ceil(VAULT_CHUNK_CHARS).max(1);
     (0..chunk_count)
         .map(|i| {
             let start = i * VAULT_CHUNK_CHARS;
@@ -325,7 +324,10 @@ fn parse_legacy_accounts(content: &str) -> Option<Vec<LegacyAccountEntry>> {
     serde_json::from_slice(&bytes).ok()
 }
 
-pub fn save_accounts(accounts_dir: &std::path::Path, accounts: &[AccountEntry]) -> Result<(), String> {
+pub fn save_accounts(
+    accounts_dir: &std::path::Path,
+    accounts: &[AccountEntry],
+) -> Result<(), String> {
     let path = accounts_dir.join("accounts.json");
     if let Err(e) = std::fs::create_dir_all(accounts_dir) {
         tracing::warn!(target: "launcher", "Failed to create accounts directory: {}", e);
@@ -347,7 +349,10 @@ pub fn save_accounts(accounts_dir: &std::path::Path, accounts: &[AccountEntry]) 
     Ok(())
 }
 
-pub fn add_account(accounts_dir: &std::path::Path, entry: AccountEntry) -> Result<Vec<AccountEntry>, String> {
+pub fn add_account(
+    accounts_dir: &std::path::Path,
+    entry: AccountEntry,
+) -> Result<Vec<AccountEntry>, String> {
     tracing::info!(target: "launcher", "Adding {:?} account: {}", entry.account_type, entry.name);
     let mut accounts = list_accounts(accounts_dir);
     accounts.push(entry);
@@ -355,7 +360,10 @@ pub fn add_account(accounts_dir: &std::path::Path, entry: AccountEntry) -> Resul
     Ok(accounts)
 }
 
-pub fn remove_account(accounts_dir: &std::path::Path, id: &str) -> Result<Vec<AccountEntry>, String> {
+pub fn remove_account(
+    accounts_dir: &std::path::Path,
+    id: &str,
+) -> Result<Vec<AccountEntry>, String> {
     tracing::info!(target: "launcher", "Removing account with id: {}", id);
     delete_account_tokens(id);
     let mut accounts = list_accounts(accounts_dir);
@@ -366,10 +374,16 @@ pub fn remove_account(accounts_dir: &std::path::Path, id: &str) -> Result<Vec<Ac
 
 /// Update or insert a Microsoft account entry (matches by account_type + uuid)
 /// and return the stored entry (its `id` keys the per-account vault slots).
-pub fn upsert_microsoft_account(accounts_dir: &std::path::Path, name: &str, uuid: &str) -> Result<AccountEntry, String> {
+pub fn upsert_microsoft_account(
+    accounts_dir: &std::path::Path,
+    name: &str,
+    uuid: &str,
+) -> Result<AccountEntry, String> {
     let mut accounts = list_accounts(accounts_dir);
     // Look for existing Microsoft account with same UUID
-    let existing_idx = accounts.iter().position(|a| a.account_type == AccountType::Microsoft && a.uuid.as_deref() == Some(uuid));
+    let existing_idx = accounts
+        .iter()
+        .position(|a| a.account_type == AccountType::Microsoft && a.uuid.as_deref() == Some(uuid));
     let entry = match existing_idx {
         Some(idx) => {
             accounts[idx].name = name.to_string();
@@ -391,7 +405,10 @@ pub fn upsert_microsoft_account(accounts_dir: &std::path::Path, name: &str, uuid
     Ok(entry)
 }
 
-pub fn set_default_account(accounts_dir: &std::path::Path, id: &str) -> Result<Vec<AccountEntry>, String> {
+pub fn set_default_account(
+    accounts_dir: &std::path::Path,
+    id: &str,
+) -> Result<Vec<AccountEntry>, String> {
     tracing::info!(target: "launcher", "Setting default account to id: {}", id);
     let mut accounts = list_accounts(accounts_dir);
     for a in &mut accounts {
@@ -436,7 +453,7 @@ mod tests {
         let json = r#"[{"id":"a1","name":"Steve","account_type":"Offline","uuid":"u1"}]"#;
         let legacy = parse_legacy_accounts(json).expect("current format must parse");
         assert_eq!(legacy[0].elyby_token, None);
-        assert_eq!(legacy[0].default, false);
+        assert!(!legacy[0].default);
     }
 
     #[test]
@@ -466,7 +483,9 @@ mod tests {
         let long: String = "abcdefgh".repeat(1024); // 8192 chars
         let chunks = split_into_chunks(&long);
         assert_eq!(chunks.len(), 8);
-        assert!(chunks.iter().all(|c| c.chars().count() <= VAULT_CHUNK_CHARS));
+        assert!(chunks
+            .iter()
+            .all(|c| c.chars().count() <= VAULT_CHUNK_CHARS));
         assert_eq!(chunks.concat(), long);
 
         // Empty value still produces a marker chunk.
@@ -482,12 +501,18 @@ mod tests {
         assert!(first.default, "first ever account becomes the default");
 
         let second = upsert_microsoft_account(&dir, "Alex", "uuid-alex").expect("second upsert");
-        assert!(!second.default, "a second account must not steal the default flag");
+        assert!(
+            !second.default,
+            "a second account must not steal the default flag"
+        );
         assert_ne!(first.id, second.id, "distinct accounts need distinct ids");
 
         // Re-login of an existing account keeps its id and default state.
         let again = upsert_microsoft_account(&dir, "Stevie", "uuid-steve").expect("re-upsert");
-        assert_eq!(again.id, first.id, "same uuid must map to the same account entry");
+        assert_eq!(
+            again.id, first.id,
+            "same uuid must map to the same account entry"
+        );
         assert_eq!(again.name, "Stevie");
 
         let list = list_accounts(&dir);

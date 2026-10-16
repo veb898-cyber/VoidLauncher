@@ -1,10 +1,10 @@
-use crate::error::{LauncherError, Result};
 use crate::config::AppConfig;
+use crate::error::{LauncherError, Result};
 use crate::instances::Instance;
-use crate::versions::{VersionInfo, build_classpath, get_game_arguments, get_jvm_arguments};
 use crate::java::{detect_java_installations, get_recommended_java, JavaInstallation};
 use crate::jvm::{build_jvm_args, detect_java_major, strip_gc_selection_flags, GcPreset};
-use std::path::PathBuf;
+use crate::versions::{build_classpath, get_game_arguments, get_jvm_arguments, VersionInfo};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -27,9 +27,8 @@ fn open_game_output_files(
     use std::io::Write;
 
     let game_logs_dir = data_dir.join("logs").join("game");
-    std::fs::create_dir_all(&game_logs_dir).map_err(|e| {
-        LauncherError::Launch(format!("Failed to create game logs dir: {}", e))
-    })?;
+    std::fs::create_dir_all(&game_logs_dir)
+        .map_err(|e| LauncherError::Launch(format!("Failed to create game logs dir: {}", e)))?;
 
     let now = chrono::Local::now();
     let timestamp = now.format("%Y%m%d_%H%M%S");
@@ -39,7 +38,11 @@ fn open_game_output_files(
     let stderr_path = format!("{}.stderr.log", base.display());
 
     let open_raw = |path: &str, label: &str| -> Option<std::fs::File> {
-        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             Ok(f) => Some(f),
             Err(e) => {
                 tracing::warn!(target: "launcher", "Raw {} tee unavailable ({}): {}", label, path, e);
@@ -69,20 +72,24 @@ fn open_game_output_files(
     Ok((stdout_file, stderr_file))
 }
 
+/// Account credentials handed to the launched game process.
+pub struct LaunchAuth<'a> {
+    pub access_token: &'a str,
+    pub uuid: &'a str,
+    pub username: &'a str,
+}
+
 /// Launch Minecraft for a given instance
 pub fn launch_minecraft(
     config: &AppConfig,
     instance: &Instance,
     version_info: &VersionInfo,
-    access_token: &str,
-    uuid: &str,
-    username: &str,
-    server_address: Option<&str>,
-    server_port: Option<u16>,
+    auth: &LaunchAuth,
+    server: Option<(&str, Option<u16>)>,
 ) -> Result<std::process::Child> {
     tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
     tracing::info!(target: "launcher", "MC version: {}", instance.mc_version);
-    tracing::info!(target: "launcher", "Username: {}", username);
+    tracing::info!(target: "launcher", "Username: {}", auth.username);
 
     // 1. Determine Java path
     tracing::info!(target: "launcher", "Detecting Java installation...");
@@ -138,7 +145,8 @@ pub fn launch_minecraft(
     // whose artifact (group:artifact) is provided by a loader library that
     // actually exists on disk (loader wins, as before — dedup by path
     // couldn't handle the same artifact under different versions).
-    let mut skip_vanilla_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut skip_vanilla_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     if let Some(profile) = &instance.loader_profile {
         let loader_artifacts: std::collections::HashSet<String> = profile
             .libraries
@@ -151,9 +159,12 @@ pub fn launch_minecraft(
                 if !crate::versions::should_include_library(lib) {
                     continue;
                 }
-                let Some(key) = artifact_key(&lib.name) else { continue };
+                let Some(key) = artifact_key(&lib.name) else {
+                    continue;
+                };
                 if loader_artifacts.contains(&key) {
-                    if let Some(artifact) = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref()) {
+                    if let Some(artifact) = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref())
+                    {
                         let p = config.libraries_dir().join(&artifact.path);
                         if p.exists() {
                             skip_vanilla_paths.insert(p.to_string_lossy().to_string());
@@ -173,7 +184,9 @@ pub fn launch_minecraft(
     // Add loader libraries first (highest priority)
     for entry in &loader_cp_entries {
         if added_libs.insert(entry.clone()) {
-            if !classpath.is_empty() { classpath.push(';'); }
+            if !classpath.is_empty() {
+                classpath.push(';');
+            }
             classpath.push_str(entry);
         }
     }
@@ -185,7 +198,9 @@ pub fn launch_minecraft(
             continue;
         }
         if added_libs.insert(entry.to_string()) {
-            if !classpath.is_empty() { classpath.push(';'); }
+            if !classpath.is_empty() {
+                classpath.push(';');
+            }
             classpath.push_str(entry);
         }
     }
@@ -196,7 +211,10 @@ pub fn launch_minecraft(
     // replace client.jar. Since processor JARs are NOT in the loader profile's
     // library list (they're discovered by MinecraftLocator / the production
     // client provider at runtime), we check the filesystem for them.
-    if matches!(instance.loader, crate::instances::LoaderType::Forge | crate::instances::LoaderType::NeoForge) {
+    if matches!(
+        instance.loader,
+        crate::instances::LoaderType::Forge | crate::instances::LoaderType::NeoForge
+    ) {
         let client_jar_str = client_jar.to_string_lossy().to_string();
         // Check if THIS version's processor-generated SRG JAR exists
         // (libraries/net/minecraft/client/<mcp-version>/client-<mcp-version>-srg.jar).
@@ -204,7 +222,11 @@ pub fn launch_minecraft(
         // (e.g. 1.8.9) has no processor JARs and still needs client.jar on the
         // classpath, while a global scan would see SRG JARs from other
         // versions (1.14+/1.19+) and wrongly strip client.jar from old ones.
-        let client_base = config.libraries_dir().join("net").join("minecraft").join("client");
+        let client_base = config
+            .libraries_dir()
+            .join("net")
+            .join("minecraft")
+            .join("client");
         let prefix = format!("client-{}-", instance.mc_version);
         let has_srg = if client_base.is_dir() {
             std::fs::read_dir(&client_base)
@@ -239,8 +261,8 @@ pub fn launch_minecraft(
             let old_len = classpath.len();
             if classpath.starts_with(&client_jar_str) {
                 let after = classpath.trim_start_matches(&client_jar_str);
-                if after.starts_with(';') {
-                    classpath = after[1..].to_string();
+                if let Some(stripped) = after.strip_prefix(';') {
+                    classpath = stripped.to_string();
                 } else {
                     classpath = after.to_string();
                 }
@@ -262,10 +284,7 @@ pub fn launch_minecraft(
     // OUTSIDE the obfuscated client.jar we avoid
     //   java.lang.module.InvalidModuleDescriptorException
     // caused by Mojang's classes in the unnamed (default) package.
-    let entry_dir = config
-        .versions_dir()
-        .join(&version_info.id)
-        .join("entry");
+    let entry_dir = config.versions_dir().join(&version_info.id).join("entry");
     std::fs::create_dir_all(&entry_dir).ok();
     let entry_jar = entry_dir.join("VoidLauncherEntry.jar");
     // Always overwrite to ensure embedded bytes match (old JAR from previous
@@ -301,16 +320,17 @@ pub fn launch_minecraft(
     // that were written before the strip logic existed.
     if let Some(custom) = &instance.jvm_args {
         let stripped = strip_gc_selection_flags(custom);
-        for a in stripped { args.push(a); }
+        for a in stripped {
+            args.push(a);
+        }
     } else {
         let stripped = strip_gc_selection_flags(&config.default_jvm_args);
-        for a in stripped { args.push(a); }
+        for a in stripped {
+            args.push(a);
+        }
     }
 
-    let natives_dir = config
-        .versions_dir()
-        .join(&version_info.id)
-        .join("natives");
+    let natives_dir = config.versions_dir().join(&version_info.id).join("natives");
     std::fs::create_dir_all(&natives_dir)?;
 
     // Extract native libraries (DLLs) from native classifier JARs into the
@@ -374,10 +394,14 @@ pub fn launch_minecraft(
     // See `jvm::strip_gc_selection_flags` for the full list.
     let version_jvm_args = get_jvm_arguments(version_info);
     tracing::debug!(target: "launcher", "Version manifest JVM args ({} total):", version_jvm_args.len());
-    for a in &version_jvm_args { tracing::debug!(target: "launcher", "  raw: {}", a); }
+    for a in &version_jvm_args {
+        tracing::debug!(target: "launcher", "  raw: {}", a);
+    }
     let version_jvm_args = strip_gc_selection_flags(&version_jvm_args);
     tracing::debug!(target: "launcher", "After GC-strip ({} remaining):", version_jvm_args.len());
-    for a in &version_jvm_args { tracing::debug!(target: "launcher", "  kept: {}", a); }
+    for a in &version_jvm_args {
+        tracing::debug!(target: "launcher", "  kept: {}", a);
+    }
     for arg in &version_jvm_args {
         if arg == "-cp" || arg == "${classpath}" {
             continue;
@@ -448,7 +472,7 @@ pub fn launch_minecraft(
 
     // Old session format (1.6.x): --session <token>:<uuid>:<username>.
     // "0" is the conventional offline token.
-    let auth_session = format!("0:{}:{}", uuid, username);
+    let auth_session = format!("0:{}:{}", auth.uuid, auth.username);
 
     // For legacy loaders (MC <= 1.12.2 Forge), the loader
     // profile carries the FULL game argument list in its
@@ -470,15 +494,14 @@ pub fn launch_minecraft(
     };
 
     let substitute_args = |arg: &str| -> String {
-        arg
-            .replace("${auth_player_name}", username)
+        arg.replace("${auth_player_name}", auth.username)
             .replace("${version_name}", &version_info.id)
             .replace("${game_directory}", &game_dir.to_string_lossy())
             .replace("${assets_root}", &assets_dir.to_string_lossy())
             .replace("${game_assets}", &game_assets_dir.to_string_lossy())
             .replace("${assets_index_name}", &version_info.assets)
-            .replace("${auth_uuid}", uuid)
-            .replace("${auth_access_token}", access_token)
+            .replace("${auth_uuid}", auth.uuid)
+            .replace("${auth_access_token}", auth.access_token)
             .replace("${auth_session}", &auth_session)
             .replace("${user_type}", "msa")
             .replace("${version_type}", &version_info.version_type)
@@ -526,14 +549,12 @@ pub fn launch_minecraft(
     // `--quickPlayMultiplayer <host>:<port>` plus `--quickPlayPath` — the
     // client writes a machine-readable join-log there on a successful
     // connection, which the launcher uses to confirm the auto-join.
-    if let (Some(host), Some(port)) = (
-        server_address.filter(|h| !h.trim().is_empty()),
-        server_port,
-    ) {
+    if let Some((host, Some(port))) = server.filter(|(h, _)| !h.trim().is_empty()) {
         let connector = crate::rooms::minecraft_connector::MinecraftConnector::default();
-        let join_args = connector
-            .discovery()
-            .build_join_args(&instance.mc_version, host.trim(), port);
+        let join_args =
+            connector
+                .discovery()
+                .build_join_args(&instance.mc_version, host.trim(), port);
         if let Some(mut join_args) = join_args {
             // For Quick Play, also hand the client the log file to write so
             // the join can be verified (path derived from the active session).
@@ -557,17 +578,23 @@ pub fn launch_minecraft(
     tracing::info!(target: "launcher", "Final args count: {}", args.len());
     tracing::debug!(target: "launcher", "Game dir: {:?}", game_dir);
     tracing::debug!(target: "launcher", "argv:");
-    let sanitized: Vec<String> = args.iter().enumerate().map(|(i, a)| {
-        if a == "--accessToken" || a == "--authAccessToken" {
-            args.get(i + 1).map(|_| {
-                format!("{} ***", a)
-            }).unwrap_or_else(|| a.clone())
-        } else if i > 0 && (args[i - 1] == "--accessToken" || args[i - 1] == "--authAccessToken") {
-            "***".to_string()
-        } else {
-            a.clone()
-        }
-    }).collect::<Vec<_>>();
+    let sanitized: Vec<String> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if a == "--accessToken" || a == "--authAccessToken" {
+                args.get(i + 1)
+                    .map(|_| format!("{} ***", a))
+                    .unwrap_or_else(|| a.clone())
+            } else if i > 0
+                && (args[i - 1] == "--accessToken" || args[i - 1] == "--authAccessToken")
+            {
+                "***".to_string()
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>();
     for (i, a) in sanitized.iter().enumerate() {
         tracing::info!(target: "launcher", "  [{}] {}", i, a);
     }
@@ -621,7 +648,7 @@ pub fn launch_minecraft(
 }
 
 /// Find all available Java installations (system + managed)
-pub fn find_all_java_installations(data_dir: &PathBuf) -> Vec<JavaInstallation> {
+pub fn find_all_java_installations(data_dir: &Path) -> Vec<JavaInstallation> {
     let mut installations = detect_java_installations();
     installations.extend(
         crate::java_download::list_managed_java(data_dir)
