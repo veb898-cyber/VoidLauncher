@@ -29,14 +29,11 @@
             document.documentElement.setAttribute('data-theme', t);
             document.documentElement.style.colorScheme = 'dark';
           }
-          // Liquid motion defaults to ON (absence of key = on), same as the
-          // store in src/stores/themeStore.ts — must stay in sync.
-          if (localStorage.getItem('voidlauncher-liquid-motion') !== '0') {
-            document.documentElement.setAttribute('data-motion', 'liquid');
-          }
-          if (localStorage.getItem('voidlauncher-gooey') !== '0') {
-            document.documentElement.setAttribute('data-gooey', 'on');
-          }
+          // Liquid motion and the gooey trails are always on (no longer user
+          // settings); prefers-reduced-motion is honoured by the CSS media
+          // blocks and by useGooey in React. Must stay in sync with
+          // src/stores/themeStore.ts.
+          document.documentElement.setAttribute('data-motion', 'liquid');
           var f = localStorage.getItem('voidlauncher-font');
           var cf = localStorage.getItem('voidlauncher-console-font');
           // Legacy "inter" values are ignored (treated as default).

@@ -352,11 +352,6 @@ export const ru: Record<string, string> = {
   'settings.theme_ember':             'Ember',
   'settings.theme_locked':            'Недоступно, пока включён Liquid Glass. Ваша тема сохранена и вернётся после выключения Liquid Glass.',
 
-  'settings.motion_title':            'Жидкие анимации',
-  'settings.motion_desc':             'Пружинные переходы, скользкие плашки и мягкий отскок кнопок при нажатии',
-  'settings.gooey_title':             'Жидкий эффект (gooey)',
-  'settings.gooey_desc':              'Индикаторы и акценты тянут за собой жидкий след при движении',
-
   'settings.exp_section_title':       'Экспериментальное оформление',
   'settings.exp_section_desc':        'Отдельные режимы отрисовки. Это не цветовые пресеты темы выше.',
   'settings.lg_title':                'Liquid Glass',

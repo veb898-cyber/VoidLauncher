@@ -348,11 +348,6 @@ export const en = {
   'settings.theme_ember':             'Ember',
   'settings.theme_locked':            'Unavailable while Liquid Glass is on. Your theme is kept and comes back when you switch Liquid Glass off.',
 
-  'settings.motion_title':            'Liquid motion',
-  'settings.motion_desc':             'Springy transitions, sliding highlights and a soft bounce when buttons are pressed',
-  'settings.gooey_title':             'Gooey effect',
-  'settings.gooey_desc':              'Indicators and accents drag a liquid trail as they move',
-
   'settings.exp_section_title':       'Experimental appearance',
   'settings.exp_section_desc':        'Separate rendering modes. These are not colour presets of the theme above.',
   'settings.lg_title':                'Liquid Glass',

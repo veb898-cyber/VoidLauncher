@@ -1,13 +1,11 @@
 import { useEffect, useState } from 'react';
-import { useThemeStore } from '../stores/themeStore';
 
 /**
- * Gooey setting + OS reduced-motion preference: the user's toggle decides,
- * but prefers-reduced-motion always wins — the liquid trails are real
- * animation, not a curve swap CSS could neutralise.
+ * Gooey trails are always on — they are no longer a user setting. The OS
+ * reduced-motion preference still wins: the liquid trails are real animation,
+ * not a curve swap CSS could neutralise.
  */
 export function useGooey(): boolean {
-  const gooey = useThemeStore((s) => s.gooey);
   const [reduced, setReduced] = useState(() =>
     typeof window !== 'undefined' &&
     window.matchMedia('(prefers-reduced-motion: reduce)').matches,
@@ -20,5 +18,5 @@ export function useGooey(): boolean {
     return () => mq.removeEventListener('change', onChange);
   }, []);
 
-  return gooey && !reduced;
+  return !reduced;
 }
