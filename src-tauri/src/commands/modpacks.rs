@@ -102,29 +102,31 @@ pub async fn cmd_install_atlauncher_modpack(
 ) -> Result<crate::instances::Instance, String> {
     let _pause_scope = crate::download::PausableInstallScope::begin();
     validate_instance_name(&instance_name)?;
-    let (instances_dir, libraries_dir, versions_dir) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        (
-            config.instances_dir().clone(),
-            config.libraries_dir(),
-            config.versions_dir(),
-        )
+    let config = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.clone()
     };
     // Check before any network work — a same-named instance would be
     // overwritten by the importer.
-    crate::import::ensure_instance_target_free(&instances_dir, &instance_name)
+    crate::import::ensure_instance_target_free(&config.instances_dir(), &instance_name)
         .map_err(|e| e.to_string())?;
-    atlauncher::install_atlauncher_pack(
-        &instances_dir,
-        &libraries_dir,
-        &versions_dir,
+    let instance = atlauncher::install_atlauncher_pack(
+        &config.instances_dir(),
+        &config.libraries_dir(),
+        &config.versions_dir(),
         pack_id,
         &version,
         &instance_name,
         Some(&app),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    // Download the loader profile, game files and assets right away, so the
+    // first launch does not have to fetch them while the player waits.
+    crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
+    crate::import::emit_progress(Some(&app), "done", 1, 1, "Install complete!");
+    Ok(instance)
 }
 
 // ==================== CurseForge ====================
@@ -267,6 +269,15 @@ pub async fn cmd_install_curseforge_modpack(
     };
     let _ = lock.write(&instances_dir.join(&instance_name));
     let _ = std::fs::remove_file(&temp_path);
+
+    // Download the loader profile, game files and assets right away, so the
+    // first launch does not have to fetch them while the player waits.
+    let config = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.clone()
+    };
+    crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
+    crate::import::emit_progress(Some(&app), "done", 1, 1, "Install complete!");
     Ok(instance)
 }
 
@@ -312,10 +323,11 @@ pub async fn cmd_install_modrinth_modpack(
 ) -> Result<crate::instances::Instance, String> {
     let _pause_scope = crate::download::PausableInstallScope::begin();
     validate_instance_name(&instance_name)?;
-    let instances_dir = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        config.instances_dir().clone()
+    let config = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.clone()
     };
+    let instances_dir = config.instances_dir();
     crate::import::ensure_instance_target_free(&instances_dir, &instance_name)
         .map_err(|e| e.to_string())?;
     let version = modrinth::get_version_by_id(&version_id)
@@ -358,40 +370,49 @@ pub async fn cmd_install_modrinth_modpack(
         }
     };
 
-    let result = crate::import::import_mrpack(
+    let instance = match crate::import::import_mrpack(
         &instances_dir,
         &temp_path.to_string_lossy(),
         &instance_name,
         Some(&app),
     )
-    .await;
-    if result.is_err() {
-        // The importer does not clean up after itself; the target was
-        // verified fresh above, so removing it cannot hit user data.
-        let _ = std::fs::remove_dir_all(instances_dir.join(&instance_name));
-    }
-    if let Ok(instance) = &result {
-        // Track the pack so update/repair can find it later. Best-effort: a
-        // failed lock write leaves an untracked but fully usable instance.
-        let pack_name = match modrinth::get_project(&version.project_id).await {
-            Ok(p) => p.title,
-            Err(_) => version.name.clone(),
-        };
-        let lock = crate::packlock::PackLock {
-            provider: "modrinth".to_string(),
-            pack_project_id: version.project_id.clone(),
-            pack_name,
-            file_id: version.id.clone(),
-            file_name: file.filename.clone(),
-            file_display_name: version.version_number.clone(),
-            installed_at: chrono::Utc::now().to_rfc3339(),
-            mc_version: instance.mc_version.clone(),
-            loader: crate::packlock::loader_slug(&instance.loader).to_string(),
-            manifest,
-            overrides,
-        };
-        let _ = lock.write(&instances_dir.join(&instance_name));
-    }
+    .await
+    {
+        Ok(i) => i,
+        Err(e) => {
+            // The importer does not clean up after itself; the target was
+            // verified fresh above, so removing it cannot hit user data.
+            let _ = std::fs::remove_dir_all(instances_dir.join(&instance_name));
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e.to_string());
+        }
+    };
+
+    // Track the pack so update/repair can find it later. Best-effort: a
+    // failed lock write leaves an untracked but fully usable instance.
+    let pack_name = match modrinth::get_project(&version.project_id).await {
+        Ok(p) => p.title,
+        Err(_) => version.name.clone(),
+    };
+    let lock = crate::packlock::PackLock {
+        provider: "modrinth".to_string(),
+        pack_project_id: version.project_id.clone(),
+        pack_name,
+        file_id: version.id.clone(),
+        file_name: file.filename.clone(),
+        file_display_name: version.version_number.clone(),
+        installed_at: chrono::Utc::now().to_rfc3339(),
+        mc_version: instance.mc_version.clone(),
+        loader: crate::packlock::loader_slug(&instance.loader).to_string(),
+        manifest,
+        overrides,
+    };
+    let _ = lock.write(&instances_dir.join(&instance_name));
     let _ = std::fs::remove_file(&temp_path);
-    result.map_err(|e| e.to_string())
+
+    // Download the loader profile, game files and assets right away, so the
+    // first launch does not have to fetch them while the player waits.
+    crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
+    crate::import::emit_progress(Some(&app), "done", 1, 1, "Install complete!");
+    Ok(instance)
 }

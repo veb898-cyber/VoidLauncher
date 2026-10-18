@@ -759,7 +759,9 @@ let client = crate::download::global_http_client()
     }
 
     instances::save_instance(instances_dir, &instance, None)?;
-    emit_progress(app, "done", 1, 1, "Install complete!");
+    // The terminal "done" event is emitted by the command layer after
+    // `prepare_instance_files` — the progress UI stays live until game files
+    // and assets are downloaded too.
     tracing::info!(target: "launcher", "Installed ATLauncher pack '{}' as '{}'", pack.name, instance_name);
     Ok(instance)
 }

@@ -655,12 +655,7 @@ export const ru: Record<string, string> = {
   'game_logs.copy_analysis':           'Копировать анализ',
 
   // ── Loader Install ───────────────────────────────────────────
-  'loader_install.title':              '{loader} не установлен',
-  'loader_install.description':        'Для этой сборки требуется {loader} {version} для Minecraft {mc}. Установить сейчас?',
-  'loader_install.install_btn':        'Установить {loader}',
   'loader_install.installing':         'Установка {loader}...',
-  'loader_install.retry':              'Повторить',
-  'loader_install.done':               '{loader} успешно установлен!',
 
   // ── Loader Version Update ────────────────────────────────────
   'loader_update.title':               'Смена версии {loader}',
@@ -747,6 +742,9 @@ export const ru: Record<string, string> = {
   'modpacks.progress_reading':         'Чтение данных модпака...',
   'modpacks.progress_installing':      'Установка {text}',
   'modpacks.progress_downloading_mods':'Скачивание модов: {current}/{total}',
+  'modpacks.progress_manifest':        'Получение данных о версии...',
+  'modpacks.progress_game_files':      'Скачивание файлов игры: {current}/{total}',
+  'modpacks.progress_assets':          'Скачивание ресурсов: {current}/{total}',
 
   // ── Rooms ───────────────────────────────────────────────────
   'sidebar.rooms':                     'Сетевая игра',

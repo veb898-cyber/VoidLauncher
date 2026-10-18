@@ -1138,46 +1138,6 @@ pub async fn cmd_install_neoforge(
     Ok(())
 }
 
-#[derive(serde::Serialize)]
-pub struct LoaderCheckResult {
-    needs_install: bool,
-    loader_type: String,
-    loader_version: String,
-    mc_version: String,
-}
-
-#[tauri::command]
-pub async fn cmd_check_instance_loader(
-    state: State<'_, AppState>,
-    instance_name: String,
-) -> Result<LoaderCheckResult, String> {
-    let instances_dir = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        config.instances_dir()
-    };
-    tauri::async_runtime::spawn_blocking(move || {
-        let instance =
-            instances::get_instance(&instances_dir, &instance_name).map_err(|e| e.to_string())?;
-        let loader_type = match instance.loader {
-            instances::LoaderType::Vanilla => "Vanilla",
-            instances::LoaderType::Fabric => "Fabric",
-            instances::LoaderType::Forge => "Forge",
-            instances::LoaderType::NeoForge => "NeoForge",
-        }
-        .to_string();
-        let needs_install =
-            instance.loader != instances::LoaderType::Vanilla && instance.loader_profile.is_none();
-        Ok(LoaderCheckResult {
-            needs_install,
-            loader_type,
-            loader_version: instance.loader_version.clone().unwrap_or_default(),
-            mc_version: instance.mc_version.clone(),
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 /// Install the mod loader for an instance, emitting progress events.
 #[tauri::command]
 pub async fn cmd_install_instance_loader(

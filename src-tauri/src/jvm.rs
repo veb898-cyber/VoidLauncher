@@ -188,9 +188,12 @@ pub fn build_jvm_args(
             args.push("-XX:+UseZGC".into());
             // Generational ZGC (JEP 439) exists since Java 21 and removes most
             // of ZGC's overhead on young-object-heavy workloads like Minecraft.
-            // On Java 17-20 the flag is unknown and would abort the JVM, so it
-            // is only added for Java >= 21.
-            if java_major >= 21 {
+            // On Java 17-20 the flag is unknown and would abort the JVM. On
+            // Java 23 it was deprecated and on Java 24 removed (JEP 474 made
+            // generational mode the default) — there it only prints
+            // "Ignoring option ZGenerational; support was removed" on every
+            // launch. Add it for Java 21-22 only.
+            if (21..=22).contains(&java_major) {
                 args.push("-XX:+ZGenerational".into());
             }
         }
@@ -252,6 +255,25 @@ pub fn strip_gc_selection_flags(args: &[String]) -> Vec<String> {
         out.push(arg.clone());
     }
     out
+}
+
+/// Remove flags that are invalid or obsolete on the detected Java version
+/// from a fully assembled argument list. Unlike `build_jvm_args` (which only
+/// sees the preset), this runs over everything: custom user args, loader
+/// profile args and version-manifest args alike.
+///
+/// * `-XX:+G1UnlockCommercialFeatures` — never existed in any HotSpot
+///   version; old Forge profiles shipped it incorrectly and newer JVMs abort
+///   on unknown `-XX` options. Always removed.
+/// * `-XX:[+-]ZGenerational` — deprecated in Java 23 and removed in Java 24
+///   (JEP 474 made generational mode the default), where passing it only
+///   prints "Ignoring option ZGenerational; support was removed". Removed for
+///   Java >= 23.
+pub fn strip_removed_jvm_flags(args: &mut Vec<String>, java_major: u32) {
+    args.retain(|a| a != "-XX:+G1UnlockCommercialFeatures");
+    if java_major >= 23 {
+        args.retain(|a| a != "-XX:+ZGenerational" && a != "-XX:-ZGenerational");
+    }
 }
 
 #[cfg(test)]
@@ -324,10 +346,52 @@ mod tests {
         let (args, eff) = build_jvm_args(GcPreset::ModernZgc, 8192, 21);
         assert_eq!(eff, GcPreset::ModernZgc);
         assert!(args.contains(&"-XX:+UseZGC".to_string()));
-        // Generational ZGC (JEP 439) applies on Java 21+
+        // Generational ZGC (JEP 439) applies on Java 21-22
         assert!(args.contains(&"-XX:+ZGenerational".to_string()));
         // ZGC is production since JDK 15 — no experimental unlock needed
         assert!(!args.contains(&"-XX:+UnlockExperimentalVMOptions".to_string()));
+    }
+
+    #[test]
+    fn zgc_java_23_and_newer_omit_generational_flag() {
+        // `-XX:+ZGenerational` is deprecated in Java 23 and removed in Java 24
+        // (JEP 474) — there it only prints "Ignoring option ZGenerational;
+        // support was removed" on every launch, so it must not be added.
+        for major in [23u32, 24, 25] {
+            let (args, eff) = build_jvm_args(GcPreset::ModernZgc, 8192, major);
+            assert_eq!(eff, GcPreset::ModernZgc);
+            assert!(args.contains(&"-XX:+UseZGC".to_string()));
+            assert!(
+                !args.contains(&"-XX:+ZGenerational".to_string()),
+                "Java {} must not get -XX:+ZGenerational",
+                major
+            );
+        }
+    }
+
+    #[test]
+    fn strip_removed_jvm_flags_drops_zgenerational_on_java_23_plus() {
+        let mut args = s(&["-XX:+ZGenerational", "-Xmx4G"]);
+        strip_removed_jvm_flags(&mut args, 23);
+        assert_eq!(args, s(&["-Xmx4G"]));
+
+        let mut args = s(&["-XX:-ZGenerational", "-Xmx4G"]);
+        strip_removed_jvm_flags(&mut args, 24);
+        assert_eq!(args, s(&["-Xmx4G"]));
+
+        // Java 21/22 still accept the flag — it must survive.
+        let mut args = s(&["-XX:+ZGenerational"]);
+        strip_removed_jvm_flags(&mut args, 22);
+        assert_eq!(args, s(&["-XX:+ZGenerational"]));
+    }
+
+    #[test]
+    fn strip_removed_jvm_flags_always_drops_g1_unlock() {
+        // `-XX:+G1UnlockCommercialFeatures` never existed in any Java
+        // version; old Forge profiles ship it and newer JVMs abort on it.
+        let mut args = s(&["-XX:+G1UnlockCommercialFeatures", "-Xmx4G"]);
+        strip_removed_jvm_flags(&mut args, 17);
+        assert_eq!(args, s(&["-Xmx4G"]));
     }
 
     #[test]

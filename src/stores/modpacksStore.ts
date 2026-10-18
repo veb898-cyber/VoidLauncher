@@ -445,10 +445,10 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
   onFetchRetry: (payload) => set({ fetchRetry: payload }),
   onFileProgress: (payload) => set({ fileProgress: payload }),
   onImportProgress: (payload) => {
+    // Just track progress: the install command now runs past the pack
+    // unpacking (loader profile + game files + assets), and `runInstall`
+    // finalizes `installing` when the whole command resolves.
     set({ progress: payload, fileProgress: null });
-    if (payload.stage === 'done') {
-      set({ installing: false, progress: null, fileProgress: null, pendingInstall: null });
-    }
   },
 resetInstall: () => set({ installing: false, progress: null, fileProgress: null, pendingInstall: null, paused: false }),
 }));

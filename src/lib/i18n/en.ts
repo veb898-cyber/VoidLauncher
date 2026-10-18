@@ -651,12 +651,7 @@ export const en = {
   'game_logs.copy_analysis':           'Copy Analysis',
 
   // ── Loader Install ───────────────────────────────────────────
-  'loader_install.title':              '{loader} Not Installed',
-  'loader_install.description':        'This instance requires {loader} {version} for Minecraft {mc}. Would you like to install it now?',
-  'loader_install.install_btn':        'Install {loader}',
   'loader_install.installing':         'Installing {loader}...',
-  'loader_install.retry':              'Retry',
-  'loader_install.done':               '{loader} installed successfully!',
 
   // ── Loader Version Update ────────────────────────────────────
   'loader_update.title':               'Change {loader} version',
@@ -743,6 +738,9 @@ export const en = {
   'modpacks.progress_reading':         'Reading pack data...',
   'modpacks.progress_installing':      'Installing {text}',
   'modpacks.progress_downloading_mods':'Downloading mods: {current}/{total}',
+  'modpacks.progress_manifest':        'Fetching version info...',
+  'modpacks.progress_game_files':      'Downloading game files: {current}/{total}',
+  'modpacks.progress_assets':          'Downloading assets: {current}/{total}',
 
   // ── Rooms ───────────────────────────────────────────────────
   'sidebar.rooms':                     'Multiplayer',

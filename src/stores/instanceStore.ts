@@ -3,7 +3,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { logUiMessage } from '../lib/uiLog';
 import { t } from '../lib/i18n';
 import { friendlyErrorMessage } from '../lib/errors';
-import type { LoaderCheckResult } from '../components/launch/LoaderInstallModal';
 
 export interface LoaderLibrary {
   name: string;
@@ -47,25 +46,14 @@ interface InstanceState {
   error: string | null;
   isLaunching: boolean;
   launchStatus: string | null;
-  /** Pending loader install: instance name + check result. If the launch
-   *  started from a saved server, the auto-join target is kept so the launch
-   *  resumes with it after the loader is installed. */
-  pendingLoaderInstall: {
-    instanceName: string;
-    check: LoaderCheckResult;
-    serverAddress?: string;
-    serverPort?: number;
-  } | null;
 
   loadInstances: () => Promise<void>;
   createInstance: (name: string, mcVersion: string, loader?: string, loaderVersion?: string) => Promise<void>;
   deleteInstance: (name: string) => Promise<void>;
   selectInstance: (name: string | null) => void;
-  /** Launches the instance. Resolves `true` when the launch was accepted;
-   *  `false` when it failed (error is set) or is waiting for the user to
-   *  install the loader (pendingLoaderInstall is set). */
+  /** Launches the instance. Resolves `true` when the launch was accepted,
+   *  `false` when it failed (error is set). */
   launchGame: (instanceName: string, serverAddress?: string, serverPort?: number) => Promise<boolean>;
-  dismissLoaderInstall: () => void;
   installVersion: (versionUrl: string, instanceId?: string) => Promise<string>;
   checkInstalled: (instanceName: string) => Promise<boolean>;
   saveInstance: (instance: Instance) => Promise<void>;
@@ -95,7 +83,6 @@ export const useInstanceStore = create<InstanceState>((set) => ({
   error: null,
   isLaunching: false,
   launchStatus: null,
-  pendingLoaderInstall: null,
 
   loadInstances: async () => {
     set({ isLoading: true });
@@ -142,28 +129,12 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     launchingInstances.add(instanceName);
 
     // Clear a stale error so callers can reliably tell this launch's outcome
-    // apart from an earlier failure.
-    set({ isLaunching: true, launchStatus: 'Checking instance...', error: null });
-    reportLaunchStatus('Checking instance...');
+    // apart from an earlier failure. The backend installs a missing mod
+    // loader on the fly (no pre-launch prompt), so we go straight to launch.
+    set({ isLaunching: true, launchStatus: 'Launching...', error: null });
+    reportLaunchStatus('Launching...');
 
     try {
-      try {
-        // Check if loader needs to be installed
-        const check = await invoke<LoaderCheckResult>('cmd_check_instance_loader', { instanceName });
-        if (check.needs_install) {
-          set({
-            isLaunching: false,
-            launchStatus: null,
-            pendingLoaderInstall: { instanceName, check, serverAddress, serverPort },
-          });
-          return false;
-        }
-      } catch {
-        // If check fails, try launching anyway (will get an error from backend if truly missing)
-      }
-
-      set({ launchStatus: 'Launching...' });
-      reportLaunchStatus('Launching...');
       // The window is NOT minimized here. It gets minimized only when the
       // `game_started` event arrives from the backend (see useGameEvents),
       // i.e. when the Minecraft process is actually running.
@@ -183,10 +154,6 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     } finally {
       launchingInstances.delete(instanceName);
     }
-  },
-
-  dismissLoaderInstall: () => {
-    set({ pendingLoaderInstall: null });
   },
 
   installVersion: async (versionUrl: string, instanceId?: string) => {

@@ -326,24 +326,26 @@ pub async fn cmd_import_modpack(
     if !std::path::PathBuf::from(&path).exists() {
         return Err("File not found".to_string());
     }
-    let (instances_dir, curseforge_api_key, libraries_dir) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        (
-            config.instances_dir().clone(),
-            config.curseforge_api_key.clone(),
-            config.libraries_dir(),
-        )
+    let config = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.clone()
     };
-    crate::import::import_modpack(
-        &instances_dir,
+    let instance = crate::import::import_modpack(
+        &config.instances_dir(),
         &path,
         &instance_name,
-        &curseforge_api_key,
-        &libraries_dir,
+        &config.curseforge_api_key,
+        &config.libraries_dir(),
         Some(&app),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    // Download the loader profile, game files and assets right away, so the
+    // first launch does not have to fetch them while the player waits.
+    crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
+    crate::import::emit_progress(Some(&app), "done", 1, 1, "Import complete!");
+    Ok(instance)
 }
 
 #[tauri::command]

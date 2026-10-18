@@ -1,8 +1,12 @@
+use crate::config::AppConfig;
 use crate::content;
+use crate::download;
 use crate::error::{LauncherError, Result};
 use crate::instances::{self, Instance, LoaderType};
+use crate::modloaders;
 use crate::modrinth;
 use crate::modrinth::ModrinthFile;
+use crate::versions;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,7 +43,7 @@ pub struct ImportProgressPayload {
     pub message: String,
 }
 
-fn emit_progress(
+pub(crate) fn emit_progress(
     app: Option<&AppHandle>,
     stage: &str,
     current: usize,
@@ -737,8 +741,298 @@ pub async fn import_modpack(
         }
     };
 
-    emit_progress(app, "done", 1, 1, "Import complete!");
+    // No terminal "done" event here: the command layer runs
+    // `prepare_instance_files` (loader profile + game files + assets) first
+    // and only then emits "done", so the progress UI stays live until the
+    // instance is actually ready for its first launch.
     Ok(instance)
+}
+
+/// Download everything an instance needs for its first launch: the mod-loader
+/// profile (when the import/install left it unset), the vanilla version files
+/// (client JAR, libraries, natives) and the asset index + assets.
+///
+/// Called right after a pack import/install so the first launch does not have
+/// to fetch hundreds of files while the player waits. Best-effort by design:
+/// every step logs and swallows its error — the instance itself is already
+/// fully imported, and the launch path self-heals anything still missing.
+pub async fn prepare_instance_files(
+    app: Option<&AppHandle>,
+    config: &AppConfig,
+    instance: &Instance,
+) {
+    prepare_loader(app, config, instance).await;
+    prepare_version_and_assets(app, config, instance).await;
+}
+
+/// Install the mod loader when the instance declares one but has no profile
+/// saved yet (every importer stores `loader_profile: None` — the profile is
+/// built from the loader's metadata service, not from the pack archive).
+async fn prepare_loader(app: Option<&AppHandle>, config: &AppConfig, instance: &Instance) {
+    if instance.loader == LoaderType::Vanilla || instance.loader_profile.is_some() {
+        return;
+    }
+    let loader_str = match instance.loader {
+        LoaderType::Fabric => "Fabric",
+        LoaderType::Forge => "Forge",
+        LoaderType::NeoForge => "NeoForge",
+        LoaderType::Vanilla => return,
+    };
+    let Some(loader_version) = instance.loader_version.clone().filter(|v| !v.is_empty()) else {
+        tracing::warn!(
+            target: "launcher",
+            "{} loader of '{}' has no version set; skipping loader install",
+            loader_str, instance.name
+        );
+        return;
+    };
+    emit_progress(
+        app,
+        "loader",
+        0,
+        1,
+        &format!("Installing {} {}...", loader_str, loader_version),
+    );
+    match modloaders::install_loader(
+        loader_str,
+        &instance.mc_version,
+        &loader_version,
+        &config.libraries_dir(),
+        &config.versions_dir(),
+        app,
+    )
+    .await
+    {
+        Ok(profile) => {
+            let mut updated = instance.clone();
+            updated.loader_profile = Some(profile);
+            if let Err(e) = instances::save_instance(&config.instances_dir(), &updated, None) {
+                tracing::warn!(
+                    target: "launcher",
+                    "Failed to save {} profile for '{}': {}",
+                    loader_str, instance.name, e
+                );
+            }
+            emit_progress(
+                app,
+                "loader",
+                1,
+                1,
+                &format!("{} {} installed", loader_str, loader_version),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "launcher",
+                "Failed to install {} {} for '{}': {} (the launch will retry)",
+                loader_str, loader_version, instance.name, e
+            );
+        }
+    }
+}
+
+/// Fetch the version manifest for the instance's Minecraft version and
+/// download the missing version files + assets, writing the version JSON the
+/// launch path expects (same layout `cmd_install_version` produces).
+async fn prepare_version_and_assets(
+    app: Option<&AppHandle>,
+    config: &AppConfig,
+    instance: &Instance,
+) {
+    emit_progress(app, "manifest", 0, 1, "Fetching version info...");
+    let manifest = match versions::fetch_version_manifest().await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                target: "launcher",
+                "Failed to fetch version manifest for '{}': {} (the launch will retry)",
+                instance.name, e
+            );
+            return;
+        }
+    };
+    let Some(version_url) = manifest
+        .versions
+        .iter()
+        .find(|v| v.id == instance.mc_version)
+        .map(|v| v.url.clone())
+    else {
+        tracing::warn!(
+            target: "launcher",
+            "Version {} of '{}' not found in manifest; skipping file download",
+            instance.mc_version, instance.name
+        );
+        return;
+    };
+    if !crate::is_allowed_download_host(&version_url) {
+        tracing::warn!(
+            target: "launcher",
+            "Version URL for {} is not in the download allowlist; skipping",
+            instance.mc_version
+        );
+        return;
+    }
+    let version_info = match versions::fetch_version_info(&version_url).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "launcher",
+                "Failed to fetch version info for {}: {} (the launch will retry)",
+                instance.mc_version, e
+            );
+            return;
+        }
+    };
+    // Remote metadata names are used as file/directory names below.
+    if check_safe_file_name(&version_info.id).is_err() || check_safe_file_name(&version_info.assets).is_err()
+    {
+        tracing::warn!(
+            target: "launcher",
+            "Version metadata for {} contains unsafe names; skipping file download",
+            instance.mc_version
+        );
+        return;
+    }
+
+    // Version files: client JAR, libraries, natives — only the missing ones.
+    let missing = versions::collect_downloads(
+        &version_info,
+        &config.libraries_dir(),
+        &config.versions_dir(),
+    )
+    .into_iter()
+    .filter(|(_, path, _, _)| !path.exists())
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let total = missing.len();
+        emit_progress(
+            app,
+            "files",
+            0,
+            total,
+            &format!("Downloading {} game file(s)...", total),
+        );
+        if let Err(e) = download::download_files(
+            missing,
+            |completed, total, _bytes_done, _bytes_total, _msg| {
+                emit_progress(
+                    app,
+                    "files",
+                    completed,
+                    total,
+                    &format!("Downloading game files ({}/{})", completed, total),
+                );
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "launcher",
+                "Game file download for '{}' failed: {} (the launch will retry)",
+                instance.name, e
+            );
+            return;
+        }
+    }
+
+    // Version JSON — the launch path reads this file to build the command.
+    let version_dir = config.versions_dir().join(&version_info.id);
+    if let Err(e) = std::fs::create_dir_all(&version_dir) {
+        tracing::warn!(target: "launcher", "Failed to create version dir for '{}': {}", instance.name, e);
+        return;
+    }
+    let version_json_path = version_dir.join(format!("{}.json", version_info.id));
+    if !version_json_path.exists() {
+        match serde_json::to_string_pretty(&version_info) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&version_json_path, json) {
+                    tracing::warn!(target: "launcher", "Failed to write version JSON for '{}': {}", instance.name, e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "launcher", "Failed to serialize version JSON for '{}': {}", instance.name, e);
+            }
+        }
+    }
+
+    // Asset index + assets (skipped wholesale when the index is on disk —
+    // same coarse check the launch self-heal uses).
+    let index_path = config
+        .assets_dir()
+        .join("indexes")
+        .join(format!("{}.json", version_info.assets));
+    if index_path.exists() {
+        return;
+    }
+    emit_progress(app, "assets", 0, 1, "Downloading asset index...");
+    if !crate::is_allowed_download_host(&version_info.asset_index.url) {
+        tracing::warn!(
+            target: "launcher",
+            "Asset index URL for {} is not in the download allowlist; skipping",
+            instance.mc_version
+        );
+        return;
+    }
+    let asset_index = match versions::fetch_asset_index(&version_info.asset_index.url).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(
+                target: "launcher",
+                "Failed to fetch asset index for {}: {} (the launch will retry)",
+                instance.mc_version, e
+            );
+            return;
+        }
+    };
+    if let Some(parent) = index_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(target: "launcher", "Failed to create asset index dir for '{}': {}", instance.name, e);
+            return;
+        }
+    }
+    match serde_json::to_string_pretty(&asset_index) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&index_path, json) {
+                tracing::warn!(target: "launcher", "Failed to write asset index for '{}': {}", instance.name, e);
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(target: "launcher", "Failed to serialize asset index for '{}': {}", instance.name, e);
+            return;
+        }
+    }
+    if let Err(e) = download::download_assets(
+        &asset_index,
+        &config.assets_dir(),
+        |completed, total, _bytes_done, _bytes_total, _msg| {
+            emit_progress(
+                app,
+                "assets",
+                completed,
+                total,
+                &format!("Downloading assets ({}/{})", completed, total),
+            );
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "launcher",
+            "Asset download for '{}' failed: {} (the launch will retry)",
+            instance.name, e
+        );
+        return;
+    }
+    // Virtual/legacy mirror for old versions (1.8 and older) — same step the
+    // version installer performs.
+    if let Err(e) = download::ensure_virtual_assets(
+        &version_info.assets,
+        &asset_index,
+        &config.assets_dir(),
+    ) {
+        tracing::warn!(target: "launcher", "Failed to mirror virtual assets for '{}': {}", instance.name, e);
+    }
 }
 
 /// Refuse to import/install into an ALREADY EXISTING instance directory.

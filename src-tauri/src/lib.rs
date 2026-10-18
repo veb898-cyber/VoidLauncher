@@ -240,7 +240,6 @@ pub fn run() {
             commands::launcher::cmd_install_fabric,
             commands::launcher::cmd_install_forge,
             commands::launcher::cmd_install_neoforge,
-            commands::launcher::cmd_check_instance_loader,
             commands::launcher::cmd_install_instance_loader,
             commands::launcher::cmd_update_instance_loader,
             commands::misc::cmd_get_config,

@@ -202,6 +202,13 @@ export function Modpacks() {
     if (stage === 'indexing') return t('modpacks.progress_indexing');
     if (stage === 'extracting') return t('modpacks.progress_extracting');
     if (stage === 'reading') return t('modpacks.progress_reading');
+    if (stage === 'manifest') return t('modpacks.progress_manifest');
+    if (stage === 'files' || stage === 'assets') {
+      return t(stage === 'files' ? 'modpacks.progress_game_files' : 'modpacks.progress_assets', {
+        current: String(progress?.current ?? 0),
+        total: String(progress?.total ?? 0),
+      });
+    }
     if (stage === 'loader') {
       if (msg.startsWith('Installing ')) return t('modpacks.progress_installing', { text: msg.slice(11) });
       return msg;

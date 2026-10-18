@@ -6,7 +6,6 @@ import LiquidGlassWallpaper from './components/LiquidGlassWallpaper';
 import { ToastContainer } from './components/ui/Toast';
 import { InstallOverlay } from './components/install/InstallOverlay';
 import { UpdaterModal } from './components/UpdaterModal';
-import { LoaderInstallModal } from './components/launch/LoaderInstallModal';
 import { JavaSetupModal } from './components/launch/JavaSetupModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ConfirmDialog } from './components/ui/ConfirmDialog';
@@ -40,16 +39,6 @@ function App() {
   const { loadConfig } = useSettingsStore();
   const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const isFrozen = useFocusStore((s) => s.isFrozen);
-  const pendingLoaderInstall = useInstanceStore((s) => s.pendingLoaderInstall);
-  const dismissLoaderInstall = useInstanceStore((s) => s.dismissLoaderInstall);
-  const launchGame = useInstanceStore((s) => s.launchGame);
-
-  const handleLoaderInstalled = useCallback(() => {
-    if (!pendingLoaderInstall) return;
-    const { instanceName, serverAddress, serverPort } = pendingLoaderInstall;
-    dismissLoaderInstall();
-    launchGame(instanceName, serverAddress, serverPort);
-  }, [pendingLoaderInstall, dismissLoaderInstall, launchGame]);
 
   const [javaSetupVisible, setJavaSetupVisible] = useState(false);
   const leavePending = useBrowserGuardStore((s) => s.pending);
@@ -185,14 +174,6 @@ function App() {
         onDismissCheckError={updater.dismissCheckError}
       />
       <ToastContainer />
-      {pendingLoaderInstall && (
-        <LoaderInstallModal
-          open={true}
-          onClose={dismissLoaderInstall}
-          onInstalled={handleLoaderInstalled}
-          instanceName={pendingLoaderInstall.instanceName}
-        />
-      )}
       <JavaSetupModal
         open={javaSetupVisible}
         onClose={() => setJavaSetupVisible(false)}

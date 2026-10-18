@@ -2,7 +2,9 @@ use crate::config::AppConfig;
 use crate::error::{LauncherError, Result};
 use crate::instances::Instance;
 use crate::java::{detect_java_installations, JavaInstallation};
-use crate::jvm::{build_jvm_args, detect_java_major, strip_gc_selection_flags, GcPreset};
+use crate::jvm::{
+    build_jvm_args, detect_java_major, strip_gc_selection_flags, strip_removed_jvm_flags, GcPreset,
+};
 use crate::versions::{build_classpath, get_game_arguments, get_jvm_arguments, VersionInfo};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -437,9 +439,13 @@ pub fn launch_minecraft(
         args.push(processed);
     }
 
-    // Remove obsolete flag that crashes the JVM (never existed in any Java
-    // version — old Forge profiles shipped it incorrectly).
-    args.retain(|a| a != "-XX:+G1UnlockCommercialFeatures");
+    // Remove obsolete/invalid-on-this-Java flags from everything assembled
+    // above (custom args, loader profile args, version-manifest args):
+    // `-XX:+G1UnlockCommercialFeatures` never existed in any Java version
+    // (old Forge profiles shipped it incorrectly), and `-XX:[+-]ZGenerational`
+    // was removed in Java 23+/24 (JEP 474) where it only prints an
+    // "Ignoring option" warning on every launch.
+    strip_removed_jvm_flags(&mut args, java_major);
 
     // Add classpath
     args.push("-cp".to_string());
