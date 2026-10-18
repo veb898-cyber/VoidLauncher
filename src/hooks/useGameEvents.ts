@@ -61,6 +61,7 @@ export function useGameEvents() {
   const { setInstallProgress, setRunningGameId, seedRunningGameIds } = useEventStore();
   const addLog = useLogStore((s) => s.addLog);
   const setWindowFocused = useFocusStore((s) => s.setWindowFocused);
+  const setMinimized = useFocusStore((s) => s.setMinimized);
 
   useEffect(() => {
     // Race-safe event subscription. `listen()` is async — the returned
@@ -171,10 +172,38 @@ export function useGameEvents() {
 
     // Window focus tracking via Tauri events.
     // These fire on the webview window when OS focus or visibility changes.
-    register(listen('tauri://focus', () => setWindowFocused(true)));
+    // Focus additionally RESYNCS the running-game set from the backend: a
+    // lost `game_started`/`launch_complete` event (crashed game, killed
+    // process, missed emit during suspend) would otherwise leave a "Running"
+    // badge stuck forever. The backend reconciles persisted pid files with
+    // the live process table, so it is always the source of truth.
+    const resyncRunningState = async () => {
+      try {
+        const ids = await invoke<string[]>('cmd_get_launch_state');
+        if (!cancelled) {
+          seedRunningGameIds(ids);
+          useFocusStore.getState().setRunningCount(ids.length);
+        }
+      } catch { /* ignore */ }
+    };
+    register(listen('tauri://focus', () => {
+      setWindowFocused(true);
+      void resyncRunningState();
+    }));
     register(listen('tauri://blur', () => setWindowFocused(false)));
-    register(listen('tauri://minimize', () => setWindowFocused(false)));
-    register(listen('tauri://restore', () => setWindowFocused(true)));
+
+    // Minimize/restore are not exposed as their own Tauri events on Windows,
+    // but both emit `tauri://resize` (the minimized window lands off-screen
+    // at -32000). Ask the window itself instead of guessing from geometry.
+    const syncMinimized = async () => {
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const minimized = await getCurrentWindow().isMinimized();
+        if (!cancelled) setMinimized(minimized);
+      } catch { /* ignore */ }
+    };
+    register(listen('tauri://resize', () => { void syncMinimized(); }));
+    void syncMinimized();
 
     return () => {
       cancelled = true;
@@ -188,7 +217,7 @@ export function useGameEvents() {
         try { fn(); } catch { /* ignore */ }
       }
     };
-  }, [setInstallProgress, setRunningGameId, seedRunningGameIds, addLog, setWindowFocused]);
+  }, [setInstallProgress, setRunningGameId, seedRunningGameIds, addLog, setWindowFocused, setMinimized]);
 }
 
 export function emitFrontendLog(level: string, source: string, message: string) {

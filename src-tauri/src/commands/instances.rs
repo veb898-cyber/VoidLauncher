@@ -84,6 +84,36 @@ pub(crate) fn validate_world_name(name: &str) -> Result<(), String> {
     validate_safe_folder_name(name.trim(), "World name")
 }
 
+/// Refuse whole-instance file operations while the game is running: the
+/// live process holds `session.lock` and region files open, so copying,
+/// deleting or restoring its files can produce corrupt backups/worlds — or
+/// delete the directory out from under a running game. Checks both the
+/// in-memory list and the persisted pid files (a game orphaned by a
+/// launcher restart is still running).
+fn ensure_instance_not_running(state: &AppState, instance_name: &str) -> Result<(), String> {
+    let in_memory = state
+        .running_instances
+        .lock()
+        .map(|r| r.iter().any(|n| n == instance_name))
+        .unwrap_or(false);
+    let on_disk = state
+        .config
+        .lock()
+        .map(|c| {
+            crate::running_state::scan_live_games(&c.data_dir)
+                .iter()
+                .any(|g| g.instance == instance_name)
+        })
+        .unwrap_or(false);
+    if in_memory || on_disk {
+        return Err(format!(
+            "Instance '{}' is currently running. Close the game first, then try again.",
+            instance_name
+        ));
+    }
+    Ok(())
+}
+
 // ==================== Instance Commands ====================
 
 #[tauri::command]
@@ -149,6 +179,7 @@ pub async fn cmd_create_instance(
 #[tauri::command]
 pub async fn cmd_delete_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
     validate_instance_name(&name)?;
+    ensure_instance_not_running(state.inner(), &name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -212,6 +243,8 @@ pub async fn cmd_duplicate_instance(
 ) -> Result<instances::Instance, String> {
     validate_instance_name(&name)?;
     validate_instance_name(&new_name)?;
+    ensure_instance_not_running(state.inner(), &name)?;
+    ensure_instance_not_running(state.inner(), &new_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -386,6 +419,7 @@ pub async fn cmd_rename_world(
     validate_instance_name(&instance_name)?;
     validate_world_name(&old_name)?;
     validate_world_name(&new_name)?;
+    ensure_instance_not_running(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -408,6 +442,7 @@ pub async fn cmd_copy_world(
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
     validate_world_name(&new_name)?;
+    ensure_instance_not_running(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -428,6 +463,7 @@ pub async fn cmd_delete_world(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
+    ensure_instance_not_running(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -448,6 +484,7 @@ pub async fn cmd_backup_world(
 ) -> Result<instances::BackupInfo, String> {
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
+    ensure_instance_not_running(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -491,6 +528,7 @@ pub async fn cmd_restore_world(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
+    ensure_instance_not_running(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -542,6 +580,7 @@ pub async fn cmd_backup_instance(
     name: String,
 ) -> Result<instances::BackupInfo, String> {
     validate_instance_name(&name)?;
+    ensure_instance_not_running(state.inner(), &name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -579,6 +618,7 @@ pub async fn cmd_restore_instance(
     new_name: Option<String>,
 ) -> Result<(), String> {
     validate_instance_name(&name)?;
+    ensure_instance_not_running(state.inner(), &name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()

@@ -6,6 +6,7 @@ import { Tooltip } from '../ui/Tooltip';
 import { Modal } from '../ui/Modal';
 import { addToast } from '../ui/Toast';
 import { t } from '../../lib/i18n';
+import { useThemeStore } from '../../stores/themeStore';
 
 interface ScreenshotEntry {
   filename: string;
@@ -65,6 +66,7 @@ function ScreenshotTile({ instanceName, filename }: { instanceName: string; file
 }
 
 export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
+  const liquidGlass = useThemeStore((s) => s.liquidGlass);
   const [screenshots, setScreenshots] = useState<ScreenshotEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [viewer, setViewer] = useState<string | null>(null);
@@ -105,7 +107,12 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
   };
 
   return (
-    <div className="content-manager__pane" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    /* The tiles already are the home-screen build cards (same `.instance-card`
+       material), so under Liquid Glass they only need to sit on the backdrop
+       directly — the section tray behind them goes away (owner: «сделай
+       карточки... как в главной вкладке. но при этом не переделывай их.
+       заднее стекло убери»). Normal themes are untouched. */
+    <div className={`content-manager__pane${liquidGlass ? ' content-manager__pane--glassless' : ''}`} style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <div style={{ padding: 'var(--space-md) var(--space-2xl)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', borderBottom: '1px solid var(--surface-border)', flexShrink: 0 }}>
         <h2 style={{ fontSize: 'var(--font-size-lg)', fontWeight: 600, margin: 0, flex: 1 }}>
           {t('screenshots.title')}
@@ -113,8 +120,8 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
             {t('screenshots.count', { n: screenshots.length.toString() })}
           </span>
         </h2>
-        <Button size="sm" variant="ghost" onClick={loadScreenshots}>
-          <RefreshCw size={14} /> {t('common.refresh')}
+        <Button size="sm" variant="ghost" onClick={loadScreenshots} disabled={loading}>
+          <RefreshCw size={14} className={loading ? 'icon-spin' : undefined} /> {t('common.refresh')}
         </Button>
       </div>
 
@@ -122,8 +129,8 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
         {loading ? (
           <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>
         ) : screenshots.length === 0 ? (
-          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>
-            <Camera size={32} style={{ opacity: 0.3, marginBottom: 'var(--space-sm)' }} />
+          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>
+            <Camera size={32} style={{ opacity: 0.5, marginBottom: 'var(--space-sm)' }} />
             <div>{t('screenshots.empty')}</div>
             <div style={{ fontSize: 'var(--font-size-sm)', marginTop: 4 }}>{t('screenshots.hint')}</div>
           </div>

@@ -17,11 +17,12 @@ import { useT, type Language } from '../lib/i18n';
 import { useLanguageStore } from '../stores/languageStore';
 import { useThemeStore, Theme } from '../stores/themeStore';
 import { useWallpaperStore } from '../stores/wallpaperStore';
+import { useContentViewStore } from '../stores/contentViewStore';
 import type { WallpaperId } from '../lib/wallpapers';
 import { useFontStore, Font, ConsoleFont } from '../stores/fontStore';
-import { Avatar, OfflineAvatar } from '../lib/remoteImage';
+import { Avatar } from '../lib/remoteImage';
 import { Tooltip } from '../components/ui/Tooltip';
-import { CheckCircle2, AlertTriangle, XCircle, Circle } from 'lucide-react';
+import { CheckCircle2, AlertTriangle, XCircle, Circle, RefreshCw } from 'lucide-react';
 import { useInstanceStore } from '../stores/instanceStore';
 import {
   CHECK_LABELS, ISSUE_KEYS, VERIFY_CATEGORY_LABELS,
@@ -56,6 +57,8 @@ export function Settings() {
   const setLiquidGlass = useThemeStore((s) => s.setLiquidGlass);
   const wallpaper = useWallpaperStore((s) => s.wallpaper);
   const setWallpaper = useWallpaperStore((s) => s.setWallpaper);
+  const contentCards = useContentViewStore((s) => s.cards);
+  const setContentCards = useContentViewStore((s) => s.setCards);
 
   // Name of the normal theme, so the Liquid Glass note can say which theme
   // will come back instead of speaking about "the theme".
@@ -83,6 +86,7 @@ export function Settings() {
   const [managedJava, setManagedJava] = useState<ManagedJavaRuntime[]>([]);
   const [checkingJava, setCheckingJava] = useState(false);
   const [javaError, setJavaError] = useState(false);
+  const [javaRefreshing, setJavaRefreshing] = useState(false);
   const javaDownload = useJavaDownloadStore((s) => s.active);
   const selectedInstance = useInstanceStore((s) => s.selectedInstance);
   const instances = useInstanceStore((s) => s.instances);
@@ -318,9 +322,22 @@ export function Settings() {
         <div style={{ marginTop: 'var(--space-lg)' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 'var(--space-md)' }}>
             <span style={{ fontWeight: 500 }}>{t('settings.java_detected_heading')}</span>
-            <button className="btn btn--secondary btn--sm" onClick={detectJava}>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={async () => {
+                setJavaRefreshing(true);
+                try {
+                  await detectJava();
+                } finally {
+                  setJavaRefreshing(false);
+                }
+              }}
+              disabled={javaRefreshing}
+            >
+              <RefreshCw size={14} className={javaRefreshing ? 'icon-spin' : undefined} />
               {t('settings.java_refresh')}
-            </button>
+            </Button>
           </div>
           {javaInstallations.length === 0 ? (
             <div className="glass-card" style={{ padding: 'var(--space-lg)', textAlign: 'center', color: 'var(--text-secondary)' }}>
@@ -595,6 +612,7 @@ export function Settings() {
                 </span>
               </div>
               <div className="settings-row__desc">{t('settings.lg_desc')}</div>
+              <div className="settings-row__note">{t('settings.lg_perf_note')}</div>
               {liquidGlass && (
                 <div className="settings-row__note settings-row__note--active">
                   {t('settings.lg_active', { theme: themeLabel[theme] })}
@@ -635,6 +653,29 @@ export function Settings() {
                 ]}
                 onChange={setWallpaper}
               />
+            </div>
+          </div>
+          {/* The card lists only exist under Liquid Glass (the normal themes
+              keep the original section layouts), so the choice is disabled
+              rather than hidden while Liquid Glass is off — same reading as
+              the backdrop row above. Default on. */}
+          <div className="settings-row">
+            <div className="settings-row__info">
+              <div className="settings-row__title">
+                {t('settings.content_cards_title')}
+                <span className="experimental-badge experimental-badge--inline">
+                  {t('common.experimental')}
+                </span>
+              </div>
+              <div className="settings-row__desc">{t('settings.content_cards_desc')}</div>
+              {!liquidGlass && (
+                <div className="settings-row__note settings-row__note--locked">
+                  {t('settings.content_cards_locked')}
+                </div>
+              )}
+            </div>
+            <div className="settings-row__control">
+              <Toggle checked={contentCards} onChange={setContentCards} disabled={!liquidGlass} />
             </div>
           </div>
         </div>
@@ -1000,11 +1041,7 @@ function AccountCard({
     <div className="glass-card" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xl)', padding: 'var(--space-xl)' }}>
       {hasAccount ? (
         <>
-          {defaultAccountType === 'Offline' ? (
-            <OfflineAvatar size={48} />
-          ) : (
-            <Avatar uuid={avatarUuid ?? ''} name={activeName ?? ''} size={48} />
-          )}
+          <Avatar uuid={avatarUuid ?? ''} name={activeName ?? ''} size={48} />
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 600, fontSize: 'var(--font-size-lg)' }}>{activeName}</div>
             <div style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
@@ -1141,7 +1178,8 @@ function LatestVersionSection() {
             </Button>
           )}
           <Button size="sm" variant="secondary" onClick={refresh} disabled={loading}>
-            {loading ? <LoadingSpinner size={14} /> : t('settings.latest_version_check_btn')}
+            <RefreshCw size={14} className={loading ? 'icon-spin' : undefined} />
+            {t('settings.latest_version_check_btn')}
           </Button>
         </div>
       </div>

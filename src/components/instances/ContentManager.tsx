@@ -12,6 +12,8 @@ import { ContentBrowser, type ContentType } from './ContentBrowser';
 import { useFocusStore } from '../../stores/focusStore';
 import { useT } from '../../lib/i18n';
 import { useIconCacheStore } from '../../stores/iconCacheStore';
+import { useThemeStore } from '../../stores/themeStore';
+import { useContentViewStore } from '../../stores/contentViewStore';
 import { RemoteIcon } from '../../lib/remoteImage';
 import type { CompatState } from '../../lib/contentProviders';
 
@@ -120,6 +122,35 @@ interface ContentRowProps {
   onToggle: (item: ContentItem) => void;
 }
 
+/// Compatibility mark shared by the table row and the card row: only
+/// `incompatible`/`unverified` render, with the explanatory tooltip.
+function CompatBadge({ state, target }: { state?: CompatState; target: string }) {
+  const t = useT();
+  if (state === 'incompatible') {
+    return (
+      <Tooltip content={t('content.compat_incompatible', { target })}>
+        <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }}>
+          <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--color-danger)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-danger)' }}>
+            <X size={12} />
+          </div>
+        </div>
+      </Tooltip>
+    );
+  }
+  if (state === 'unverified') {
+    return (
+      <Tooltip content={t('content.compat_unverified', { target })}>
+        <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }}>
+          <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
+            <AlertTriangle size={12} />
+          </div>
+        </div>
+      </Tooltip>
+    );
+  }
+  return null;
+}
+
 /// Memoized table row. With ~250 mods, re-rendering the whole table on every
 /// parent state change (selection, search, icon cache updates) caused visible
 /// UI jank; with memo only the actually-changed rows re-render.
@@ -128,7 +159,6 @@ const ContentRow = memo(function ContentRow({
   compatTarget,
   onRowClick, onContext, onToggle,
 }: ContentRowProps) {
-  const t = useT();
   return (
     <div
       className={`content-list-row content-list-row--table${idx % 2 === 1 ? ' content-list-row--alt' : ''}${isSelected ? ' content-list-row--selected' : ''}`}
@@ -169,25 +199,65 @@ const ContentRow = memo(function ContentRow({
         {item.provider || ''}
       </div>
       <div>
-        {compatState === 'incompatible' && (
-          <Tooltip content={t('content.compat_incompatible', { target: compatTarget })}>
-            <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }}>
-              <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--color-danger)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--color-danger)' }}>
-                <X size={12} />
-              </div>
-            </div>
-          </Tooltip>
-        )}
-        {compatState === 'unverified' && (
-          <Tooltip content={t('content.compat_unverified', { target: compatTarget })}>
-            <div style={{ position: 'relative', display: 'inline-flex', cursor: 'help' }}>
-              <div style={{ width: 20, height: 20, borderRadius: '50%', border: '2px solid var(--warning)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--warning)' }}>
-                <AlertTriangle size={12} />
-              </div>
-            </div>
-          </Tooltip>
-        )}
+        <CompatBadge state={compatState} target={compatTarget} />
       </div>
+    </div>
+  );
+});
+
+/// Card form of a list entry — the owner's «новый интерфейс» for the mods /
+/// resource packs / shaders sections (settings toggle, default on): one card
+/// per entry instead of a table row. The row inside the card keeps the old
+/// table reading — name left, version in the middle, source right — on a
+/// single tall line (icon height rules the card), and the gaps between cards
+/// stay at 4px so even long lists don't stretch too far.
+const ContentCardRow = memo(function ContentCardRow({
+  item, isSelected, iconSrc, iconsResolving, compatState,
+  compatTarget,
+  onRowClick, onContext, onToggle,
+}: Omit<ContentRowProps, 'idx'>) {
+  return (
+    <div
+      className={`glass-card${isSelected ? ' glass-card--selected' : ''}`}
+      onClick={(e) => onRowClick(item.filename, e)}
+      onContextMenu={(e) => { e.preventDefault(); onContext(e, item.filename); }}
+      style={{
+        display: 'flex', alignItems: 'center', gap: 'var(--space-sm)',
+        padding: '8px var(--space-lg)', cursor: 'pointer',
+        opacity: item.enabled ? 1 : 0.45,
+        transition: 'background 0.12s',
+      }}
+    >
+      <div onClick={(e) => { e.stopPropagation(); onToggle(item); }}
+        style={{ width: 16, height: 16, borderRadius: 3, cursor: 'pointer', border: '1.5px solid ' + (!item.enabled ? 'var(--text-tertiary)' : 'var(--primary)'), background: !item.enabled ? 'transparent' : 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s', flexShrink: 0 }}>
+        {item.enabled && <Check size={10} color="white" strokeWidth={3} />}
+      </div>
+      <div style={{ display: 'flex', flexShrink: 0 }}>
+        <RemoteIcon
+          url={iconSrc}
+          letter={item.name.charAt(0)}
+          size={28}
+          radius={4}
+          fontSize={10}
+          pending={iconsResolving && !iconSrc}
+        />
+      </div>
+      <div style={{ flex: 1, minWidth: 0, display: 'grid', gridTemplateColumns: '1fr 1fr 80px', gap: 'var(--space-sm)', alignItems: 'center' }}>
+        <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {item.name}
+        </div>
+        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {item.version}
+        </div>
+        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {item.provider || ''}
+        </div>
+      </div>
+      {compatState && (
+        <div style={{ flexShrink: 0 }}>
+          <CompatBadge state={compatState} target={compatTarget} />
+        </div>
+      )}
     </div>
   );
 });
@@ -214,6 +284,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   // is unfocused AND a game is running — this is the "frozen" state. State and UI
   // remain mounted; only the network/CPU work is suspended.
   const isFrozen = useFocusStore((s) => s.isFrozen);
+
+  // Card list mode: Liquid Glass material + the settings toggle (default on).
+  // Normal themes keep the table, so the flag alone never switches the view.
+  const cardsView = useThemeStore((s) => s.liquidGlass) && useContentViewStore((s) => s.cards);
 
   // Global icon cache (session memory only, like Prism: survives remounts,
   // re-extracted from the archives after an app restart)
@@ -883,7 +957,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   return (
     <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
       {/* Main table */}
-      <div className="content-manager__pane" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <div className={`content-manager__pane${cardsView ? ' content-manager__pane--glassless' : ''}`} style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {/* Header */}
         <div style={{ padding: 'var(--space-md) var(--space-2xl)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', borderBottom: '1px solid var(--surface-border)', flexShrink: 0 }}>
           <h2 style={{ fontSize: 'var(--font-size-lg)', fontWeight: 600, margin: 0, flex: 1 }}>
@@ -891,7 +965,8 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           </h2>
         </div>
 
-        {/* Table header */}
+        {/* Table header — column labels have no meaning for the card list */}
+        {!cardsView && (
         <div className="content-table-head" style={{
                     display: 'grid', gridTemplateColumns: '28px 36px 1fr 1fr 80px 28px',
           padding: '6px var(--space-2xl)', borderBottom: '1px solid var(--surface-border)',
@@ -905,10 +980,22 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           <div>{t('manager.column_provider')}</div>
           <div></div>
         </div>
+        )}
 
         {/* Table body */}
         <div style={{ flex: 1, overflowY: 'auto', ...(dragOver ? { background: 'var(--primary-dim)', border: '2px dashed var(--primary)' } : {}) }}>
           {loading ? (
+            cardsView ? (
+              <div className="glass-row-list" style={{ padding: 'var(--space-sm) var(--space-lg)', display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)' }}>
+                {[1, 2, 3, 4, 5, 6].map((i) => (
+                  <div key={i} className="glass-card" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px var(--space-lg)' }}>
+                    <div style={{ width: 16, height: 16, borderRadius: 3, background: 'var(--surface-glass)', flexShrink: 0 }} />
+                    <div style={{ width: 28, height: 28, borderRadius: 4, background: 'var(--surface-glass)', flexShrink: 0 }} />
+                    <div style={{ width: '40%', height: 14, borderRadius: 4, background: 'var(--surface-glass)' }} />
+                  </div>
+                ))}
+              </div>
+            ) : (
             <div style={{ padding: 'var(--space-md) var(--space-2xl)' }}>
               {[1, 2, 3, 4, 5].map((i) => (
                 <div key={i} style={{ display: 'grid', gridTemplateColumns: '28px 36px 1fr 1fr 80px 28px', padding: '7px var(--space-2xl)', alignItems: 'center', borderBottom: '1px solid var(--surface-border)' }}>
@@ -921,10 +1008,28 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
                 </div>
               ))}
             </div>
+            )
           ) : filtered.length === 0 ? (
-            <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)', fontSize: 'var(--font-size-sm)' }}>
-              <Package size={32} style={{ opacity: 0.3, marginBottom: 'var(--space-sm)' }} />
+            <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
+              <Package size={32} style={{ opacity: 0.5, marginBottom: 'var(--space-sm)' }} />
               <div>{items.length === 0 ? t('manager.empty', { label: label.toLowerCase() }) : t('manager.empty_search')}</div>
+            </div>
+          ) : cardsView ? (
+            <div className="glass-row-list" style={{ padding: 'var(--space-sm) var(--space-lg)', display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)' }}>
+              {filtered.map((item) => (
+                <ContentCardRow
+                  key={item.filename}
+                  item={item}
+                  isSelected={selectedFilenames.has(item.filename)}
+                  iconSrc={getItemIcon(item)}
+                  iconsResolving={iconsResolving}
+                  compatState={contentType === 'mod' ? compatibility[item.filename] : undefined}
+                  compatTarget={compatTarget}
+                  onRowClick={handleRowClick}
+                  onContext={handleRowContext}
+                  onToggle={toggleEnabled}
+                />
+              ))}
             </div>
           ) : (
             filtered.map((item, idx) => (
@@ -959,7 +1064,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           )}
           <div style={{ flex: 1 }} />
           <Button size="sm" variant="ghost" onClick={loadItems} disabled={loading} style={{ minWidth: 80 }}>
-            {loading ? <RefreshCw size={14} style={{ animation: 'spin 1s linear infinite' }} /> : <RefreshCw size={14} />}
+            <RefreshCw size={14} className={loading ? 'icon-spin' : undefined} />
             {t('common.refresh')}
           </Button>
         </div>
@@ -975,8 +1080,8 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           <Package size={14} style={{ flexShrink: 0 }} /> {t('manager.add_file_btn')}
         </Button>
         <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
-        <Button size="sm" variant="ghost" onClick={handleCheckUpdates} loading={checkingUpdates} disabled={checkingUpdates} style={{ width: '100%', whiteSpace: 'normal' }}>
-          {!checkingUpdates && <RefreshCw size={14} style={{ flexShrink: 0 }} />}
+        <Button size="sm" variant="ghost" onClick={handleCheckUpdates} disabled={checkingUpdates} style={{ width: '100%', whiteSpace: 'normal' }}>
+          <RefreshCw size={14} className={checkingUpdates ? 'icon-spin' : undefined} style={{ flexShrink: 0 }} />
           {t('common.check_updates')}
         </Button>
         {hasSelection && (

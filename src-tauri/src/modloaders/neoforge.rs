@@ -488,10 +488,17 @@ pub async fn install(
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("data");
+                        // The data-map key becomes a directory component; a
+                        // crafted ".." / separator must not escape _data.
+                        let key_lower = key.to_lowercase();
+                        if crate::import::check_safe_file_name(&key_lower).is_err() {
+                            tracing::warn!(target: "launcher", "Skipping NeoForge data entry with unsafe key: {}", key);
+                            continue;
+                        }
                         let dest = libraries_dir
                             .join(&data_base)
                             .join("_data")
-                            .join(key.to_lowercase())
+                            .join(key_lower)
                             .join(fname);
                         if !dest.exists() {
                             if let Some(parent) = dest.parent() {

@@ -52,6 +52,7 @@ export const en = {
   'common.all':                        'All',
   'common.copied':                     'Copied',
   'common.copy_failed':                'Failed to copy',
+  'common.retry':                      'Retry',
 
   // ── Error Boundary ──────────────────────────────────────────
   'error_boundary.heading':            'Something went wrong',
@@ -125,6 +126,15 @@ export const en = {
   'accounts.elyby_skin_help_title':    'Change Ely.by skin',
   'accounts.elyby_skin_help_body':     'For Ely.by accounts the skin can only be changed on the official Ely.by website — the launcher has no access to their skin API. Open the skins page, sign in, and pick a new skin.',
   'accounts.elyby_skin_help_open':     'Open ely.by/skins',
+  'accounts.make_active':              'Make active',
+  'accounts.remove_btn':               'Remove account',
+  'accounts.active_for_launch':        'This account is used to launch the game',
+  'accounts.skin_viewer_hint':         'Click and drag to rotate • scroll to zoom',
+  'accounts.skin_viewer_unavailable':  'Couldn\'t load this account\'s skin',
+  'accounts.capes_title':              'Cape',
+  'accounts.cape_none':                'No cape',
+  'accounts.cape_update_error':        'Couldn\'t change the cape: {error}',
+  'accounts.capes_load_error':         'Couldn\'t load capes: {error}',
 
   // ── Instance List ───────────────────────────────────────────
   'instances.page_title':              'Instances',
@@ -199,6 +209,9 @@ export const en = {
   'verify.kind_missing':               'missing',
   'verify.kind_corrupt':               'corrupt',
   'verify.kind_invalid':               'invalid',
+  'verify.kind_unsafe':                'unsafe path',
+  'verify.kind_outdated_loader':       'needs a newer Fabric Loader',
+  'verify.issue_requires':             'requires {range}',
 
   // ── Create Instance Wizard ──────────────────────────────────
   'create_instance.title':             'Create Instance',
@@ -247,6 +260,7 @@ export const en = {
   'instance_detail.tab_resourcepacks': 'Resource Packs',
   'instance_detail.tab_shaderpacks':   'Shader Packs',
   'instance_detail.tab_worlds':        'Worlds',
+  'instance_detail.tab_servers':       'Servers',
   'instance_detail.tab_screenshots':   'Screenshots',
   'instance_detail.confirm_delete_title': 'Delete Instance',
   'instance_detail.confirm_delete_text':  'Are you sure you want to delete "{name}"? This will permanently remove all files.',
@@ -259,6 +273,8 @@ export const en = {
   'instance_editor.title':             'Edit Instance',
   'instance_editor.name_label':        'Instance Name',
   'instance_editor.notes_label':       'Notes',
+  'instance_editor.loader_label':      'Mod loader',
+  'instance_editor.loader_change':     'Change version\u2026',
   'instance_editor.java_path_label':   'Java Path',
   'instance_editor.browse_btn':        'Browse',
   'instance_editor.resolution_label':  'Resolution',
@@ -352,6 +368,7 @@ export const en = {
   'settings.exp_section_desc':        'Separate rendering modes. These are not colour presets of the theme above.',
   'settings.lg_title':                'Liquid Glass',
   'settings.lg_desc':                 'A distinct glass material system: its own background, surfaces, blur, light refraction and depth. It replaces the normal theme instead of recolouring it.',
+  'settings.lg_perf_note':            'Animated theme: while the window is open, the launcher loads the CPU and GPU more than the regular themes do — noticeable on weaker machines. When the launcher is minimized, the animation stops and the load drops to zero.',
   'settings.lg_active':               'Liquid Glass is on. {theme} is saved and will be restored when you switch it off.',
   'settings.wallpaper_title':          'Backdrop',
   'settings.wallpaper_desc':           'The field the glass refracts. It is visible through the title bar and the sidebar, and behind dialogs.',
@@ -360,6 +377,9 @@ export const en = {
   'settings.wallpaper_ribbons':        'Liquid Ribbons',
   'settings.wallpaper_mesh':           'Gradient Mesh',
   'settings.wallpaper_nebula':         'Particle Nebula',
+  'settings.content_cards_title':      'Cards in the builds sections',
+  'settings.content_cards_desc':       'Mods, resource packs and shaders are shown as individual cards — like servers, worlds and screenshots. Turn it off to go back to the table list.',
+  'settings.content_cards_locked':     'Unavailable while Liquid Glass is off. Your choice is kept and comes back when you switch it on.',
   'common.experimental':              'Experimental',
 
 
@@ -563,6 +583,39 @@ export const en = {
   'worlds.backup_delete_toast':        'Backup deleted',
   'worlds.backups_count':              '{n} backups',
 
+  // ── Servers ─────────────────────────────────────────────────
+  'servers.title':                     'Servers',
+  'servers.count':                     '{n} servers',
+  'servers.empty':                     'No servers added yet.',
+  'servers.hint':                      'Add a server and it will appear in the in-game server list.',
+  'servers.add':                       'Add server',
+  'servers.add_title':                 'Add Server',
+  'servers.edit_title':                'Edit Server',
+  'servers.name_label':                'Name',
+  'servers.name_placeholder':          'My server',
+  'servers.address_label':             'Address',
+  'servers.address_placeholder':       'play.example.com',
+  'servers.delete_title':              'Remove server',
+  'servers.edit':                      'Edit',
+  'servers.delete_confirm':            'Remove "{name}" from the server list?',
+  'servers.delete':                    'Remove',
+  'servers.added_toast':               'Server added',
+  'servers.updated_toast':             'Server updated',
+  'servers.deleted_toast':             'Server removed',
+  'servers.load_error':                'Failed to load servers: {error}',
+  'servers.action_error':              'Error: {error}',
+  'servers.status_checking':           'Checking\u2026',
+  'servers.status_online':             'Online: {online}/{max}',
+  'servers.status_online_plain':       'Online',
+  'servers.status_timeout':            'Timed out',
+  'servers.status_unreachable':        'Couldn\u2019t connect',
+  'servers.status_error':              'Check failed',
+  'servers.ping_ms':                   'Ping: {ms} ms',
+  'servers.play':                      'Play',
+  'servers.launch_started':            'Launching \u201c{name}\u201d\u2026',
+  'servers.launch_error':              'Failed to launch the game: {error}',
+  'servers.invalid_address':           'Invalid server address',
+
   // ── Login ───────────────────────────────────────────────────
   'login.title':                       'Sign In',
   'login.desc':                        'Sign in with your Microsoft account to play Minecraft',
@@ -593,6 +646,7 @@ export const en = {
   'game_logs.analyze':                 'Crash Analysis',
   'game_logs.analyzing':               'Analyzing...',
   'game_logs.no_crash':                'No crash files found for this run',
+  'game_logs.clean_run':               'The game closed normally — no signs of a crash',
   'game_logs.open_report':             'Open Crash Report',
   'game_logs.copy_analysis':           'Copy Analysis',
 
@@ -603,6 +657,17 @@ export const en = {
   'loader_install.installing':         'Installing {loader}...',
   'loader_install.retry':              'Retry',
   'loader_install.done':               '{loader} installed successfully!',
+
+  // ── Loader Version Update ────────────────────────────────────
+  'loader_update.title':               'Change {loader} version',
+  'loader_update.current':             'Currently installed: {version}',
+  'loader_update.current_none':        'Not installed yet',
+  'loader_update.stable':              'stable',
+  'loader_update.install_btn':         'Install {version}',
+  'loader_update.done_toast':          'Loader updated: {loader} {version}',
+  'loader_update.error_toast':         'Failed to update the loader: {error}',
+  'loader_update.load_error':          'Failed to load the version list: {error}',
+  'loader_update.empty':               'No versions available for Minecraft {mc}',
 
   // ── Install Overlay ─────────────────────────────────────────
   'install.stage_fetching':            'Fetching version info',
@@ -634,6 +699,9 @@ export const en = {
   'launch.java_stage_extracting':       'Extracting Java...',
   'launch.java_stage_verifying':        'Verifying Java installation...',
   'launch.java_stage_done':             'Java setup complete!',
+  'launch.running_games':               'Running games',
+  'launch.stop_game':                   'Stop',
+  'launch.stop_game_hint':              'The game will be closed forcefully — unsaved progress may be lost.',
 
   // ── Offline account username validation ─────────────────────
   'accounts.offline_username_cyrillic': 'Username must not contain Cyrillic characters.',
@@ -862,6 +930,8 @@ export const en = {
   'diag.crash_jvm_args':               'Invalid JVM arguments',
   'diag.crash_launch_config':          'Invalid launch configuration',
   'diag.crash_mod_crash':              'A mod crashed the game: {culprit}',
+  'diag.crash_mod_dependency':         'The instance failed to start: mods are incompatible with each other or something is missing',
+  'diag.crash_loader_outdated':        'The instance failed to start: mod “{culprit}” needs a newer Fabric Loader',
   'diag.crash_missing_dependency':     'Missing mod dependency: {culprit}',
   'diag.crash_missing_class':          'Missing class or broken mod file: {culprit}',
   'diag.crash_mod_conflict':           'Mod conflict: {culprit}',
@@ -873,6 +943,8 @@ export const en = {
   'diag.crash_hint_jvm':               'Reset custom JVM arguments in settings.',
   'diag.crash_hint_launch':            'Recreate the instance or verify its files.',
   'diag.crash_hint_mod':               'Update or remove the culprit mod.',
+  'diag.crash_hint_dependency':        'The error text (“Incompatible mods found!”) names the culprit — update or remove that mod.',
+  'diag.crash_hint_loader':            'Update Fabric Loader to the version stated in the error (“with version … or later”) and start the game again.',
   'diag.crash_hint_deps':              'Install the missing dependency or reinstall the mod.',
   'diag.crash_hint_conflict':          'Remove one of the conflicting mods.',
   'diag.crash_hint_graphics':          'Update your graphics driver.',

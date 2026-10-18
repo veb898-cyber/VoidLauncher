@@ -71,6 +71,14 @@ pub async fn cmd_install_version(
         "install",
         &format!("Version {} fetched", version_info.id),
     );
+
+    // The id and asset-index name are remote metadata used as directory and
+    // file names — they must be plain components, never a path.
+    crate::import::check_safe_file_name(&version_info.id)
+        .map_err(|_| "Invalid version id in remote metadata".to_string())?;
+    crate::import::check_safe_file_name(&version_info.assets)
+        .map_err(|_| "Invalid asset index name in remote metadata".to_string())?;
+
     send_progress(5.0, "manifest", "Collecting files to download...");
 
     // Collect files to download
@@ -185,18 +193,46 @@ async fn ensure_java_for_launch(
     app: &AppHandle,
     data_dir: &Path,
     version_info: &versions::VersionInfo,
-    _instance_name: &str,
+    instance: &instances::Instance,
+    config: &crate::config::AppConfig,
 ) -> Result<(), String> {
     let required_major = version_info.required_java_major();
 
-    // Only use the exact required version. Newer JDKs (21+/23+) scan classpath
-    // JARs for automatic module names during boot layer initialisation, but the
-    // obfuscated client.jar contains classes in the unnamed package, which
-    // causes java.lang.module.FindException.
+    // An explicitly configured Java (instance or launcher settings) takes
+    // priority in `launch::get_java_path`. If it is present, this function
+    // has nothing to download: a matching runtime needs no help, and a
+    // mismatching/broken one is reported by `get_java_path` at spawn time
+    // with a precise error (downloading a managed runtime would be ignored
+    // anyway). Previously the launcher downloaded a whole managed JRE even
+    // though the user had already pointed it at a valid one.
+    if let Some(path) = instance
+        .java_path
+        .as_ref()
+        .filter(|p| p.exists())
+        .or_else(|| config.java_path.as_ref().filter(|p| p.exists()))
+    {
+        if let Some(inst) = crate::java::probe_java_by_path(path) {
+            if inst.major_version == required_major {
+                tracing::debug!(
+                    target: "launcher",
+                    "Configured Java {} already matches required Java {}",
+                    inst.version, required_major
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // Only use the exact required version AND a 64-bit build. Newer JDKs
+    // (21+/23+) scan classpath JARs for automatic module names during boot
+    // layer initialisation, but the obfuscated client.jar contains classes in
+    // the unnamed package, which causes java.lang.module.FindException. A
+    // 32-bit install cannot run modern clients (and is filtered out of the
+    // auto-detection too), so it must not satisfy this check.
     let installations = launch::find_all_java_installations(data_dir);
     if installations
         .iter()
-        .any(|j| j.major_version == required_major)
+        .any(|j| j.is_64bit && j.major_version == required_major)
     {
         return Ok(());
     }
@@ -228,6 +264,49 @@ async fn ensure_java_for_launch(
     Ok(())
 }
 
+/// RAII slot in `running_instances` that reserves an instance name for the
+/// whole launch-preparation phase. If the command returns early (error
+/// before the game starts) the slot is released automatically; on success
+/// `disarm()` keeps the entry until the exit handler removes it.
+struct LaunchReservation<'a> {
+    state: &'a AppState,
+    instance_name: String,
+    armed: bool,
+}
+
+impl<'a> LaunchReservation<'a> {
+    fn acquire(state: &'a AppState, instance_name: &str) -> Result<Self, String> {
+        let mut running = state.running_instances.lock().map_err(|e| e.to_string())?;
+        if running.iter().any(|n| n == instance_name) {
+            return Err(format!(
+                "Instance '{}' is already running. Launch it again after it exits.",
+                instance_name
+            ));
+        }
+        running.push(instance_name.to_string());
+        Ok(Self {
+            state,
+            instance_name: instance_name.to_string(),
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LaunchReservation<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut running) = self.state.running_instances.lock() {
+            running.retain(|n| n != &self.instance_name);
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_launch_game(
     app: AppHandle,
@@ -240,25 +319,43 @@ pub async fn cmd_launch_game(
 
     // Guard against launching the same instance twice concurrently — a
     // second click on a running instance must be a no-op, not a second copy.
-    {
-        let running = state.running_instances.lock().map_err(|e| e.to_string())?;
-        if running.iter().any(|n| n == &instance_name) {
-            let msg = format!(
-                "Instance '{}' is already running. Launch it again after it exits.",
-                instance_name
-            );
-            events::emit_log(&app, "warn", "launch", &msg);
-            return Err(msg);
-        }
-    }
-
+    // The slot is reserved NOW (before the long download/prepare phase) and
+    // released automatically if this launch fails before the game starts;
+    // otherwise it stays until the process exits (see the exit handler).
     let (config, data_dir) = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
         (c.clone(), c.data_dir.clone())
     };
 
-    // Create game log file early so all launch messages are captured in it
-    let _ = game_logs::create_game_log_file(&data_dir, &instance_name);
+    // Reconcile persisted pid files with the live process table BEFORE
+    // reserving the name. A game orphaned by a launcher restart or an
+    // auto-update relaunch must both reappear in the running list (badge,
+    // Stop button) and block a second launch of the same instance.
+    for game in crate::running_state::scan_live_games(&data_dir) {
+        if let Ok(mut running) = state.running_instances.lock() {
+            if !running.iter().any(|n| n == &game.instance) {
+                running.push(game.instance.clone());
+            }
+        }
+    }
+
+    // Guard against launching the same instance twice concurrently — a
+    // second click on a running instance must be a no-op, not a second copy.
+    // The slot is reserved NOW (before the long download/prepare phase) and
+    // released automatically if this launch fails before the game starts;
+    // otherwise it stays until the process exits (see the exit handler).
+    let mut reservation = match LaunchReservation::acquire(state.inner(), &instance_name) {
+        Ok(r) => r,
+        Err(msg) => {
+            events::emit_log(&app, "warn", "launch", &msg);
+            return Err(msg);
+        }
+    };
+
+    // Create game log file early so all launch messages are captured in it.
+    // The path is threaded through this launch explicitly (quick play log,
+    // output readers) so concurrent games never write into each other's logs.
+    let session_log = game_logs::create_game_log_file(&data_dir, &instance_name).ok();
 
     events::emit_log(
         &app,
@@ -558,7 +655,7 @@ pub async fn cmd_launch_game(
     }
 
     // Ensure suitable Java is available (download if missing)
-    ensure_java_for_launch(&app, &data_dir, &version_info, &instance_name).await?;
+    ensure_java_for_launch(&app, &data_dir, &version_info, &instance, &config).await?;
 
     // Ensure Forge processor-generated JARs exist (client-*-srg.jar, forge-*-client.jar, etc.)
     if instance.loader == instances::LoaderType::Forge {
@@ -630,6 +727,7 @@ pub async fn cmd_launch_game(
             username: &username,
         },
         server_address.as_deref().map(|h| (h, server_port)),
+        session_log.as_deref(),
     )
     .map_err(|e| {
         events::emit_log(&app, "error", "launch", &format!("Launch failed: {}", e));
@@ -638,8 +736,57 @@ pub async fn cmd_launch_game(
 
     let pid = child.id();
     let _ = instances::update_last_played(&config.instances_dir(), &instance_name);
+    // Persist the pid BEFORE anything else can fail: if the launcher is
+    // closed or updated while the game runs, the next start recovers the
+    // still-running game from this file (badge + Stop + relaunch guard).
+    crate::running_state::write_pid_file(&data_dir, &instance_name, pid);
     let child_handle: Arc<std::sync::Mutex<Option<std::process::Child>>> =
         Arc::new(std::sync::Mutex::new(Some(child)));
+
+    // Start the playtime session BEFORE releasing the reservation and before
+    // the "close on launch" window close: the CloseRequested handler flushes
+    // active sessions, and the exit watcher finalizes this one by pid. If the
+    // sessions lock is poisoned we stop the freshly started game instead of
+    // leaving it marked "running" without tracking — which would block every
+    // future relaunch until an app restart.
+    {
+        let now = Instant::now();
+        let mut sessions = match state.active_sessions.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                if let Ok(mut guard) = child_handle.lock() {
+                    if let Some(mut c) = guard.take() {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                }
+                crate::running_state::remove_pid_file(&data_dir, &instance_name);
+                if let Ok(mut running) = state.running_instances.lock() {
+                    running.retain(|n| n != &instance_name);
+                }
+                if let Some(p) = session_log.as_deref() {
+                    game_logs::clear_current_log_path_if(p);
+                }
+                return Err(format!("Failed to start playtime session: {}", e));
+            }
+        };
+        sessions.insert(
+            instance_name.clone(),
+            playtime::ActiveSession {
+                instance_name: instance_name.clone(),
+                pid,
+                started_at: now,
+                last_flush: now,
+                child: child_handle.clone(),
+            },
+        );
+    }
+    events::emit_log(
+        &app,
+        "info",
+        "launch",
+        &format!("Playtime session started for: {}", instance_name),
+    );
 
     // Notify the frontend that the game process is actually running. The
     // launcher window is minimized from the `game_started` handler, not on
@@ -663,44 +810,24 @@ pub async fn cmd_launch_game(
     }
 
     // Mark this instance as running (the frontend shows a "Running" badge).
-    // Multiple games may run at once, so this is an append to a list.
-    {
-        let mut running = state.running_instances.lock().map_err(|e| e.to_string())?;
-        running.push(instance_name.clone());
-    }
-
-    // Start the playtime-tracking session, keyed by instance name.
-    {
-        let now = Instant::now();
-        let mut sessions = state.active_sessions.lock().map_err(|e| e.to_string())?;
-        sessions.insert(
-            instance_name.clone(),
-            playtime::ActiveSession {
-                instance_name: instance_name.clone(),
-                pid,
-                started_at: now,
-                last_flush: now,
-                child: child_handle.clone(),
-            },
-        );
-    }
-    events::emit_log(
-        &app,
-        "info",
-        "launch",
-        &format!("Playtime session started for: {}", instance_name),
-    );
+    // Multiple games may run at once, so the reservation slot from the start
+    // of this command becomes permanent until the process exits.
+    reservation.disarm();
 
     // Background timer: while the game runs, flush whole minutes to disk every
-    // minute; when the process exits, commit the sub-minute tail and stop.
+    // minute. The exit watcher owns the final teardown; the pid-guarded
+    // helpers keep a stale timer (map keys are instance names, reused across
+    // relaunches) from ever touching a newer run's session.
     let app_for_timer = app.clone();
     let data_dir_for_timer = data_dir.clone();
     let instance_for_timer = instance_name.clone();
     let child_for_timer = child_handle.clone();
+    let pid_for_timer = pid;
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            // If the game process has exited, commit the tail and stop the timer.
+            // If the game process has exited, stop the timer — the exit
+            // watcher commits the final tail within ~500 ms.
             let exited = {
                 if let Ok(mut guard) = child_for_timer.lock() {
                     guard
@@ -712,45 +839,21 @@ pub async fn cmd_launch_game(
                 }
             };
             if exited {
-                // Process exited — commit any final sub-minute tail via the helper.
-                let now = Instant::now();
-                let app_state = app_for_timer.state::<AppState>();
-                if let Some((name, delta)) = playtime::take_keyed_session(
-                    &app_state.active_sessions,
-                    &instance_for_timer,
-                    now,
-                ) {
-                    if delta > 0 {
-                        playtime::add_minutes_and_save(&data_dir_for_timer, &name, delta);
-                    }
-                }
-                events::emit_log(
-                    &app_for_timer,
-                    "info",
-                    "launch",
-                    &format!("Playtime session ended for: {}", instance_for_timer),
-                );
                 break;
             }
             // Commit the actual unpaid minutes since the last flush. The timer
-            // tick is just a cadence hint — a slow tick (GC pause, system suspend)
-            // should credit 2+ minutes, and a fast tick should credit 0. The
-            // `last_flush` cursor is advanced by `take_keyed_session` /
-            // `touch_keyed_session` so the sub-minute remainder is preserved for
-            // the next tick or the final teardown.
+            // tick is just a cadence hint — a slow tick (GC pause, system
+            // suspend) credits 2+ minutes, a fast tick credits 0.
             let now = Instant::now();
             let app_state = app_for_timer.state::<AppState>();
-            let delta = if let Ok(guard) = app_state.active_sessions.lock() {
-                guard
-                    .get(&instance_for_timer)
-                    .map(|s| s.unpaid_minutes(now))
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            let delta = playtime::flush_keyed_session_for_pid(
+                &app_state.active_sessions,
+                &instance_for_timer,
+                pid_for_timer,
+                now,
+            );
             if delta > 0 {
                 playtime::add_minutes_and_save(&data_dir_for_timer, &instance_for_timer, delta);
-                playtime::touch_keyed_session(&app_state.active_sessions, &instance_for_timer, now);
             }
         }
     });
@@ -760,6 +863,8 @@ pub async fn cmd_launch_game(
     let instance_clone = instance_name.clone();
     let child_for_wait = child_handle.clone();
     let pid_for_exit = pid;
+    let data_dir_for_exit = data_dir.clone();
+    let session_log_for_exit = session_log.clone();
     tokio::spawn(async move {
         // Poll try_wait in a loop; multiple try_wait callers are safe.
         let exit_code: i32 = loop {
@@ -785,6 +890,33 @@ pub async fn cmd_launch_game(
         // LAST appends the final chronological line to the session log, so
         // no game output can land after it.
         crate::game_logs::mark_game_exit(pid_for_exit, exit_code);
+        // The game is gone: drop its persisted pid record so the next app
+        // start does not try to reconcile a dead process.
+        crate::running_state::remove_pid_file(&data_dir_for_exit, &instance_clone);
+        // Final playtime commit. This watcher reacts within ~500 ms — long
+        // before the 60-second timer would — and the pid guard plus the
+        // atomic cursor advance make both paths safe to race. A relaunch
+        // that already replaced the session is left untouched.
+        {
+            let now = Instant::now();
+            let app_state = app_clone.state::<AppState>();
+            if let Some((name, delta)) = playtime::take_keyed_session_for_pid(
+                &app_state.active_sessions,
+                &instance_clone,
+                pid_for_exit,
+                now,
+            ) {
+                if delta > 0 {
+                    playtime::add_minutes_and_save(&data_dir_for_exit, &name, delta);
+                }
+                events::emit_log(
+                    &app_clone,
+                    "info",
+                    "launch",
+                    &format!("Playtime session ended for: {}", name),
+                );
+            }
+        }
         // Clear only THIS instance from the running list. Other games may
         // still be running, so never wipe the whole list.
         if let Ok(mut running) = app_clone.state::<AppState>().running_instances.lock() {
@@ -795,7 +927,11 @@ pub async fn cmd_launch_game(
             "info",
             &format!("Game exited with code {}", exit_code),
         );
-        game_logs::clear_current_log_path();
+        // Drop the global "current log" pointer only if this run still owns
+        // it — another instance may have started meanwhile and re-pointed it.
+        if let Some(p) = session_log_for_exit.as_deref() {
+            game_logs::clear_current_log_path_if(p);
+        }
         let _ = app_clone.emit(
             "launch_complete",
             events::LaunchEventPayload {
@@ -1003,7 +1139,6 @@ pub async fn cmd_install_neoforge(
 }
 
 #[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LoaderCheckResult {
     needs_install: bool,
     loader_type: String,
@@ -1149,6 +1284,127 @@ pub async fn cmd_install_instance_loader(
     events::emit_log(&app, "info", "loader", &msg_saved);
     Ok(())
 }
+
+/// Changes the mod loader of an existing instance to an explicitly chosen
+/// version. Unlike `cmd_install_instance_loader` (which installs whatever
+/// version the instance already records), the new version is installed
+/// first and only then written to the instance together with the profile —
+/// a failed install leaves the instance on its previous version.
+#[tauri::command]
+pub async fn cmd_update_instance_loader(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    instance_name: String,
+    loader_version: String,
+    lang: Option<String>,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    let lang = lang.as_deref().unwrap_or("en");
+    let loader_version = loader_version.trim().to_string();
+    if loader_version.is_empty() {
+        return Err(i18n::tr(lang, "instance_no_loader_version", &[]));
+    }
+
+    let (libraries_dir, versions_dir, loader_type, mc_version, old_version) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
+            .map_err(|e| e.to_string())?;
+
+        let loader_type = match instance.loader {
+            instances::LoaderType::Fabric => "Fabric",
+            instances::LoaderType::Forge => "Forge",
+            instances::LoaderType::NeoForge => "NeoForge",
+            instances::LoaderType::Vanilla => {
+                return Err(i18n::tr(lang, "instance_no_loader", &[]));
+            }
+        };
+        (
+            config.libraries_dir(),
+            config.versions_dir(),
+            loader_type.to_string(),
+            instance.mc_version.clone(),
+            instance.loader_version.clone().unwrap_or_default(),
+        )
+    };
+
+    let installing_msg = i18n::tr(
+        lang,
+        "installing_loader",
+        &[
+            ("loader", &loader_type),
+            ("version", &loader_version),
+            ("mc", &mc_version),
+        ],
+    );
+    let _ = app.emit(
+        "loader-install-progress",
+        serde_json::json!({ "stage": "start", "message": installing_msg }),
+    );
+    let downloading_msg = i18n::tr(lang, "downloading_loader_libs", &[("loader", &loader_type)]);
+    let _ = app.emit(
+        "loader-install-progress",
+        serde_json::json!({ "stage": "download", "message": downloading_msg }),
+    );
+
+    let profile = modloaders::install_loader(
+        &loader_type,
+        &mc_version,
+        &loader_version,
+        &libraries_dir,
+        &versions_dir,
+        Some(&app),
+    )
+    .await
+    .map_err(|e| {
+        let msg = i18n::tr(
+            lang,
+            "loader_install_failed",
+            &[("loader", &loader_type), ("error", &e.to_string())],
+        );
+        let _ = app.emit(
+            "loader-install-progress",
+            serde_json::json!({
+                "stage": "error",
+                "message": &msg,
+            }),
+        );
+        msg
+    })?;
+
+    // Install succeeded: record the new version and profile together.
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
+        .map_err(|e| e.to_string())?;
+    instance.loader_version = Some(loader_version.clone());
+    instance.loader_profile = Some(profile);
+    instances::save_instance(&config.instances_dir(), &instance, None)
+        .map_err(|e| e.to_string())?;
+
+    let msg_done = i18n::tr(lang, "loader_install_success", &[("loader", &loader_type)]);
+    let _ = app.emit(
+        "loader-install-progress",
+        serde_json::json!({
+            "stage": "done",
+            "message": msg_done,
+        }),
+    );
+
+    // Launcher logs stay English regardless of the UI language.
+    let msg_saved = if old_version.is_empty() {
+        format!(
+            "{} {} installed for {}",
+            loader_type, loader_version, instance_name
+        )
+    } else {
+        format!(
+            "{} {} updated for {} (was {})",
+            loader_type, loader_version, instance_name, old_version
+        )
+    };
+    events::emit_log(&app, "info", "loader", &msg_saved);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn cmd_emit_log(
     app: AppHandle,
@@ -1299,6 +1555,80 @@ pub fn cmd_flush_playtime(state: State<'_, AppState>, instance_name: String) -> 
         if delta > 0 {
             playtime::add_minutes_and_save(&config.data_dir, &name, delta);
         }
+    }
+    Ok(())
+}
+
+/// Force-stop a running game. Used by the "Running" badge's Stop button and
+/// as the recovery path for a game orphaned by a launcher restart/update
+/// (there is no in-memory child handle for those — the pid file is the
+/// source of truth).
+#[tauri::command]
+pub fn cmd_stop_game(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    instance_name: String,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    let data_dir = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.data_dir.clone()
+    };
+
+    // Prefer the live session pid (launcher-owned process); fall back to the
+    // persisted pid file (orphan from a previous app run).
+    let session_pid = state
+        .active_sessions
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&instance_name).map(|s| s.pid));
+    let pid = session_pid.or_else(|| {
+        crate::running_state::scan_live_games(&data_dir)
+            .into_iter()
+            .find(|g| g.instance == instance_name)
+            .map(|g| g.pid)
+    });
+
+    let Some(pid) = pid else {
+        // Not running anymore — heal the local state so the badge cannot
+        // stick forever (e.g. the progress died while the launcher slept).
+        crate::running_state::remove_pid_file(&data_dir, &instance_name);
+        if let Ok(mut running) = state.running_instances.lock() {
+            running.retain(|n| n != &instance_name);
+        }
+        return Err(format!("Instance '{}' is not running.", instance_name));
+    };
+
+    crate::running_state::kill_process_tree(pid)?;
+    events::emit_log(
+        &app,
+        "info",
+        "launch",
+        &format!("Stopping game '{}' (PID {})...", instance_name, pid),
+    );
+
+    let owned = state
+        .active_sessions
+        .lock()
+        .map(|g| g.contains_key(&instance_name))
+        .unwrap_or(false);
+    if !owned {
+        // Orphaned game: no exit watcher exists to clean up after it, so do
+        // the bookkeeping here. (The playtime session from the previous app
+        // run was already flushed when that app closed.)
+        crate::running_state::remove_pid_file(&data_dir, &instance_name);
+        if let Ok(mut running) = state.running_instances.lock() {
+            running.retain(|n| n != &instance_name);
+        }
+        let _ = app.emit(
+            "launch_complete",
+            events::LaunchEventPayload {
+                instance_id: instance_name,
+                status: "exited".into(),
+                pid: None,
+                exit_code: None,
+            },
+        );
     }
     Ok(())
 }

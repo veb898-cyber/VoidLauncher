@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::error::{LauncherError, Result};
 use crate::instances::Instance;
-use crate::java::{detect_java_installations, get_recommended_java, JavaInstallation};
+use crate::java::{detect_java_installations, JavaInstallation};
 use crate::jvm::{build_jvm_args, detect_java_major, strip_gc_selection_flags, GcPreset};
 use crate::versions::{build_classpath, get_game_arguments, get_jvm_arguments, VersionInfo};
 use std::path::{Path, PathBuf};
@@ -79,13 +79,16 @@ pub struct LaunchAuth<'a> {
     pub username: &'a str,
 }
 
-/// Launch Minecraft for a given instance
+/// Launch Minecraft for a given instance. `session_log_path` is this run's
+/// game-log file (used for the Quick Play join log) — passed explicitly so
+/// concurrent launches cannot mix their logs up via a global pointer.
 pub fn launch_minecraft(
     config: &AppConfig,
     instance: &Instance,
     version_info: &VersionInfo,
     auth: &LaunchAuth,
     server: Option<(&str, Option<u16>)>,
+    session_log_path: Option<&str>,
 ) -> Result<std::process::Child> {
     tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
     tracing::info!(target: "launcher", "MC version: {}", instance.mc_version);
@@ -102,6 +105,10 @@ pub fn launch_minecraft(
     tracing::info!(target: "launcher", "Detected Java major version: {}", java_major);
 
     // 3. Build classpath
+    // The version id is used as a directory name below and ultimately came
+    // from remote metadata — refuse anything that is not a bare name.
+    crate::import::check_safe_file_name(&version_info.id)
+        .map_err(|_| LauncherError::Launch(format!("Invalid version id: {}", version_info.id)))?;
     let client_jar = config
         .versions_dir()
         .join(&version_info.id)
@@ -127,6 +134,12 @@ pub fn launch_minecraft(
     if let Some(profile) = &instance.loader_profile {
         tracing::info!(target: "launcher", "Mod loader: main_class={}", profile.main_class);
         for lib in &profile.libraries {
+            // Loader metadata decides these relative paths; skip any that
+            // try to escape the libraries directory.
+            if crate::import::check_safe_remote_path(&lib.path).is_err() {
+                tracing::warn!(target: "launcher", "Skipping loader library with unsafe path: {}", lib.path);
+                continue;
+            }
             let lib_path = config.libraries_dir().join(&lib.path);
             if lib_path.exists() {
                 loader_cp_entries.push(lib_path.to_string_lossy().to_string());
@@ -151,7 +164,10 @@ pub fn launch_minecraft(
         let loader_artifacts: std::collections::HashSet<String> = profile
             .libraries
             .iter()
-            .filter(|lib| config.libraries_dir().join(&lib.path).exists())
+            .filter(|lib| {
+                crate::import::check_safe_remote_path(&lib.path).is_ok()
+                    && config.libraries_dir().join(&lib.path).exists()
+            })
             .filter_map(|lib| artifact_key(&lib.name))
             .collect();
         if !loader_artifacts.is_empty() {
@@ -165,6 +181,11 @@ pub fn launch_minecraft(
                 if loader_artifacts.contains(&key) {
                     if let Some(artifact) = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref())
                     {
+                        // Remote metadata path — never let it point outside
+                        // the libraries directory, even in the dedup set.
+                        if crate::import::check_safe_remote_path(&artifact.path).is_err() {
+                            continue;
+                        }
                         let p = config.libraries_dir().join(&artifact.path);
                         if p.exists() {
                             skip_vanilla_paths.insert(p.to_string_lossy().to_string());
@@ -561,7 +582,7 @@ pub fn launch_minecraft(
             if connector.discovery().join_mechanism(&instance.mc_version)
                 == Some(crate::rooms::minecraft_connector::JoinMechanism::QuickPlay)
             {
-                if let Some(session_path) = crate::game_logs::get_current_log_path() {
+                if let Some(session_path) = session_log_path {
                     let quickplay_log = format!("{}.quickplay.json", session_path);
                     join_args.push("--quickPlayPath".to_string());
                     join_args.push(quickplay_log);
@@ -641,6 +662,7 @@ pub fn launch_minecraft(
             Box::new(err),
             raw_out,
             raw_err,
+            session_log_path.map(|s| s.to_string()),
         );
     }
 
@@ -664,47 +686,60 @@ pub fn find_all_java_installations(data_dir: &Path) -> Vec<JavaInstallation> {
     installations
 }
 
+/// Validate a user-configured Java executable (instance or launcher
+/// settings) against the major version this Minecraft version needs.
+///
+/// `probe_java_by_path` is the same validation the Settings page uses: the
+/// file must be a real, runnable Java (a broken MSI stub is rejected by the
+/// size floor, a non-Java executable by the exit-status/version parse). The
+/// older `detect_java_major` helper accepted any spawnable EXE, so a wrong
+/// path could slip a bogus "JVM" into the game command line.
+fn validate_explicit_java(path: &Path, required_major: u32, source: &str) -> Result<PathBuf> {
+    match crate::java::probe_java_by_path(path) {
+        None => Err(LauncherError::Java(format!(
+            "The Java configured for this {} does not appear to be a working Java installation: {}. Pick the Java executable again in the settings, or set Java to 'Automatic'.",
+            source,
+            path.display()
+        ))),
+        Some(inst) if inst.major_version != required_major => Err(LauncherError::Java(format!(
+            "The Java configured for this {} is Java {} ({}), but this Minecraft version requires Java {}. Change the Java version in the settings, or set it to 'Automatic' to let the launcher choose.",
+            source, inst.major_version, inst.version, required_major
+        ))),
+        Some(inst) => {
+            tracing::info!(target: "launcher", "Using {} Java: {:?} (v{}, {})", source, path, inst.version, inst.vendor);
+            Ok(path.to_path_buf())
+        }
+    }
+}
+
 /// Determine which Java executable to use
 fn get_java_path(
     config: &AppConfig,
     instance: &Instance,
     version_info: &VersionInfo,
 ) -> Result<PathBuf> {
+    let required_java = version_info.required_java_major();
+
     // Priority: instance java > config java > auto-detect (system + managed)
     if let Some(path) = &instance.java_path {
         if path.exists() {
-            // A user-supplied path must actually be a runnable Java — never
-            // let a non-Java executable be launched. `detect_java_major` runs
-            // `java -version` once, which is exactly the on-launch check we
-            // want; the result is not cached unnecessarily because launch is
-            // a one-shot, per-instance operation.
-            if crate::jvm::detect_java_major(path).is_none() {
-                return Err(LauncherError::Java(format!(
-                    "The configured Java path does not appear to be a runnable Java: {:?}",
-                    path
-                )));
-            }
-            tracing::info!(target: "launcher", "Using instance Java: {:?}", path);
-            return Ok(path.clone());
+            return validate_explicit_java(path, required_java, "instance");
         }
         tracing::debug!(target: "launcher", "Instance Java not found: {:?}", path);
     }
 
     if let Some(path) = &config.java_path {
         if path.exists() {
-            if crate::jvm::detect_java_major(path).is_none() {
-                return Err(LauncherError::Java(format!(
-                    "The configured Java path does not appear to be a runnable Java: {:?}",
-                    path
-                )));
-            }
-            tracing::info!(target: "launcher", "Using config Java: {:?}", path);
-            return Ok(path.clone());
+            return validate_explicit_java(path, required_java, "launcher settings");
         }
         tracing::debug!(target: "launcher", "Config Java not found: {:?}", path);
     }
 
-    // Auto-detect (system + managed)
+    // Auto-detect (system + managed). Only an EXACT 64-bit major match is
+    // acceptable — the same rule `ensure_java_for_launch` enforces when it
+    // downloads a runtime. "Closest newer" is never safe: modern JDKs abort
+    // on obfuscated old clients (unnamed-package classes trigger
+    // java.lang.module.FindException during boot-layer scan).
     tracing::info!(target: "launcher", "Auto-detecting Java installations...");
     let installations = find_all_java_installations(&config.data_dir);
     tracing::info!(target: "launcher", "Found {} Java installations", installations.len());
@@ -718,17 +753,19 @@ fn get_java_path(
         ));
     }
 
-    let required_java = version_info.required_java_major();
-    tracing::info!(target: "launcher", "Required Java version: {}+", required_java);
+    tracing::info!(target: "launcher", "Required Java version: {}", required_java);
 
-    match get_recommended_java(Some(required_java), &installations) {
+    match installations
+        .iter()
+        .find(|j| j.is_64bit && j.major_version == required_java)
+    {
         Some(java) => {
             tracing::info!(target: "launcher", "Selected Java: {} v{} at {:?}", java.vendor, java.version, java.path);
-            Ok(java.path)
+            Ok(java.path.clone())
         }
         None => Err(LauncherError::Java(format!(
-            "No suitable Java found. Required: Java {}+",
-            required_java
+            "No 64-bit Java {} found. Install Java {} or let the launcher download it automatically.",
+            required_java, required_java
         ))),
     }
 }

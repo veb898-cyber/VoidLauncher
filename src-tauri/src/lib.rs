@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod content;
 mod curseforge;
+mod default_skin;
 mod diagnostics;
 mod download;
 mod entry;
@@ -24,6 +25,9 @@ mod modrinth;
 mod packlock;
 mod playtime;
 mod rooms;
+mod running_state;
+mod server_ping;
+mod servers;
 mod verify;
 mod versions;
 
@@ -238,6 +242,7 @@ pub fn run() {
             commands::launcher::cmd_install_neoforge,
             commands::launcher::cmd_check_instance_loader,
             commands::launcher::cmd_install_instance_loader,
+            commands::launcher::cmd_update_instance_loader,
             commands::misc::cmd_get_config,
             commands::misc::cmd_save_config,
             commands::misc::cmd_read_image_file,
@@ -248,6 +253,8 @@ pub fn run() {
             commands::misc::cmd_detect_system_ram,
             commands::misc::cmd_get_installer_language,
             commands::heads::cmd_get_player_head,
+            commands::heads::cmd_get_player_capes,
+            commands::heads::cmd_set_player_cape,
             commands::mods::cmd_search_modrinth,
             commands::mods::cmd_search_curseforge,
             commands::mods::cmd_get_modrinth_versions,
@@ -349,6 +356,12 @@ pub fn run() {
             commands::verify::cmd_repair_instance,
             commands::diagnostics::cmd_run_diagnostics,
             commands::diagnostics::cmd_analyze_crash,
+            commands::servers::cmd_list_servers,
+            commands::servers::cmd_add_server,
+            commands::servers::cmd_update_server,
+            commands::servers::cmd_delete_server,
+            commands::servers::cmd_ping_server,
+            commands::launcher::cmd_stop_game,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {

@@ -208,6 +208,29 @@ pub fn take_keyed_session(
     Some((instance_name.to_string(), delta))
 }
 
+/// Pid-guarded variant of `take_keyed_session`: takes the session only when
+/// the stored pid matches `expected_pid`.
+///
+/// Map keys are instance NAMES, so a quick relaunch of the same instance
+/// replaces the old session with a new one before the previous run's
+/// 60-second timer tick fires. Without the pid check that stale timer would
+/// `take_keyed_session` the NEW session and commit its minutes (typically 0,
+/// destroying the second run's playtime tracking).
+pub fn take_keyed_session_for_pid(
+    sessions: &Mutex<HashMap<String, ActiveSession>>,
+    instance_name: &str,
+    expected_pid: u32,
+    now: Instant,
+) -> Option<(String, u64)> {
+    let mut guard = sessions.lock().ok()?;
+    if guard.get(instance_name).map(|s| s.pid) != Some(expected_pid) {
+        return None;
+    }
+    let s = guard.remove(instance_name)?;
+    let delta = s.unpaid_minutes(now);
+    Some((instance_name.to_string(), delta))
+}
+
 /// Take and commit all active sessions (used on window close). Returns the
 /// total number of flushed sessions for logging.
 pub fn flush_all_sessions(
@@ -233,19 +256,35 @@ pub fn flush_all_sessions(
     count
 }
 
-/// Bump `last_flush` on the session for a single instance in a multi-instance map.
-pub fn touch_keyed_session(
+/// Atomically compute AND commit the unpaid whole minutes of a pid-matched
+/// session: returns the delta to credit and advances the `last_flush` cursor
+/// inside the same lock.
+///
+/// Doing both under one lock is what makes the periodic timer and the exit
+/// watcher safe to race: whichever runs first advances the cursor, so the
+/// other one credits zero — minutes can never be double-counted. Foreign
+/// pids (a relaunch already replaced the map entry) return 0 and are left
+/// untouched.
+pub fn flush_keyed_session_for_pid(
     sessions: &Mutex<HashMap<String, ActiveSession>>,
     instance_name: &str,
+    expected_pid: u32,
     now: Instant,
-) {
-    if let Ok(mut guard) = sessions.lock() {
-        if let Some(s) = guard.get_mut(instance_name) {
-            if s.unpaid_minutes(now) > 0 {
-                s.last_flush = now;
-            }
-        }
+) -> u64 {
+    let Ok(mut guard) = sessions.lock() else {
+        return 0;
+    };
+    let Some(s) = guard.get_mut(instance_name) else {
+        return 0;
+    };
+    if s.pid != expected_pid {
+        return 0;
     }
+    let delta = s.unpaid_minutes(now);
+    if delta > 0 {
+        s.last_flush = now;
+    }
+    delta
 }
 
 #[cfg(test)]
@@ -350,20 +389,55 @@ mod tests {
     }
 
     #[test]
-    fn touch_keyed_session_advances_last_flush_for_one_instance() {
-        let start = Instant::now();
+    fn pid_guarded_take_ignores_newer_session_with_same_name() {
+        // Simulate a quick relaunch: the map holds a NEW session (pid 222)
+        // while the OLD run's timer (pid 111) still ticks. The stale timer
+        // must not steal the new session.
+        let now = Instant::now();
         let mut map = HashMap::new();
-        map.insert("A".to_string(), fake_session("A", start));
+        let mut new_session = fake_session("A", now);
+        new_session.pid = 222;
+        map.insert("A".to_string(), new_session);
         let sessions = Mutex::new(map);
 
-        let later = start + std::time::Duration::from_secs(121);
-        touch_keyed_session(&sessions, "A", later);
-
+        assert!(take_keyed_session_for_pid(&sessions, "A", 111, now).is_none());
         {
             let guard = sessions.lock().unwrap();
-            let s = guard.get("A").unwrap();
-            assert_eq!(s.unpaid_minutes(later), 0); // advanced flush cursor
+            let s = guard.get("A").expect("new session must survive");
+            assert_eq!(s.pid, 222);
         }
+
+        // The owning run removes its own session normally.
+        let taken = take_keyed_session_for_pid(&sessions, "A", 222, now).expect("own session");
+        assert_eq!(taken.1, 0);
+        assert!(sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pid_guarded_flush_ignores_foreign_session_and_is_not_double_counted() {
+        let start = Instant::now();
+        let mut map = HashMap::new();
+        let mut session = fake_session("A", start);
+        session.pid = 222;
+        map.insert("A".to_string(), session);
+        let sessions = Mutex::new(map);
+
+        // Stale timer from the previous run (pid 111): no-op, session intact.
+        let later = start + std::time::Duration::from_secs(121);
+        assert_eq!(flush_keyed_session_for_pid(&sessions, "A", 111, later), 0);
+        {
+            let guard = sessions.lock().unwrap();
+            assert_eq!(
+                guard.get("A").unwrap().unpaid_minutes(later),
+                2,
+                "foreign flush must not touch the cursor"
+            );
+        }
+
+        // The owner flushes exactly once; the same lock advanced the cursor,
+        // so a second flush (e.g. from the exit watcher) credits zero.
+        assert_eq!(flush_keyed_session_for_pid(&sessions, "A", 222, later), 2);
+        assert_eq!(flush_keyed_session_for_pid(&sessions, "A", 222, later), 0);
     }
 
     #[test]

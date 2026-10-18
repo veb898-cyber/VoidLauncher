@@ -5,6 +5,7 @@ import { Modal } from '../ui/Modal';
 import { ProgressBar } from '../ui/ProgressBar';
 import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { useT, getLanguage } from '../../lib/i18n';
+import { parseLoaderProgress } from '../../lib/loaderProgress';
 import { useLogPlaque } from '../../lib/uiLog';
 
 export interface LoaderCheckResult {
@@ -19,17 +20,6 @@ interface LoaderInstallModalProps {
   onClose: () => void;
   onInstalled: () => void;
   instanceName: string;
-}
-
-function parseProgress(message: string): { label: string; percent: number } {
-  const match = message.match(/\((\d+)\/(\d+)\)/);
-  if (match) {
-    const current = parseInt(match[1], 10);
-    const total = parseInt(match[2], 10);
-    const shortName = message.replace(/\s*\(\d+\/\d+\)/, '').split(':').pop()?.trim() || message;
-    return { label: `${shortName} (${current}/${total})`, percent: Math.round((current / total) * 100) };
-  }
-  return { label: message, percent: -1 };
 }
 
 export function LoaderInstallModal({ open, onClose, onInstalled, instanceName }: LoaderInstallModalProps) {
@@ -89,7 +79,7 @@ export function LoaderInstallModal({ open, onClose, onInstalled, instanceName }:
 
   if (!open) return null;
 
-  const { label, percent } = message ? parseProgress(message) : { label: '', percent: -1 };
+  const { label, percent } = message ? parseLoaderProgress(message) : { label: '', percent: -1 };
 
   return (
     <Modal

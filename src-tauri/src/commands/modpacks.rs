@@ -100,6 +100,7 @@ pub async fn cmd_install_atlauncher_modpack(
     version: String,
     instance_name: String,
 ) -> Result<crate::instances::Instance, String> {
+    let _pause_scope = crate::download::PausableInstallScope::begin();
     validate_instance_name(&instance_name)?;
     let (instances_dir, libraries_dir, versions_dir) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -109,6 +110,10 @@ pub async fn cmd_install_atlauncher_modpack(
             config.versions_dir(),
         )
     };
+    // Check before any network work — a same-named instance would be
+    // overwritten by the importer.
+    crate::import::ensure_instance_target_free(&instances_dir, &instance_name)
+        .map_err(|e| e.to_string())?;
     atlauncher::install_atlauncher_pack(
         &instances_dir,
         &libraries_dir,
@@ -187,6 +192,7 @@ pub async fn cmd_install_curseforge_modpack(
     file_id: u64,
     instance_name: String,
 ) -> Result<crate::instances::Instance, String> {
+    let _pause_scope = crate::download::PausableInstallScope::begin();
     validate_instance_name(&instance_name)?;
     let (instances_dir, api_key, libraries_dir) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -196,6 +202,8 @@ pub async fn cmd_install_curseforge_modpack(
             config.libraries_dir(),
         )
     };
+    crate::import::ensure_instance_target_free(&instances_dir, &instance_name)
+        .map_err(|e| e.to_string())?;
     let file = curseforge::get_mod_file(mod_id, file_id, &api_key)
         .await
         .map_err(|e| e.to_string())?;
@@ -231,6 +239,9 @@ pub async fn cmd_install_curseforge_modpack(
         Ok(i) => i,
         Err(e) => {
             let _ = std::fs::remove_file(&temp_path);
+            // The importer does not clean up after itself; the target was
+            // verified fresh above, so removing it cannot hit user data.
+            let _ = std::fs::remove_dir_all(instances_dir.join(&instance_name));
             return Err(e.to_string());
         }
     };
@@ -299,11 +310,14 @@ pub async fn cmd_install_modrinth_modpack(
     version_id: String,
     instance_name: String,
 ) -> Result<crate::instances::Instance, String> {
+    let _pause_scope = crate::download::PausableInstallScope::begin();
     validate_instance_name(&instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir().clone()
     };
+    crate::import::ensure_instance_target_free(&instances_dir, &instance_name)
+        .map_err(|e| e.to_string())?;
     let version = modrinth::get_version_by_id(&version_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -351,6 +365,11 @@ pub async fn cmd_install_modrinth_modpack(
         Some(&app),
     )
     .await;
+    if result.is_err() {
+        // The importer does not clean up after itself; the target was
+        // verified fresh above, so removing it cannot hit user data.
+        let _ = std::fs::remove_dir_all(instances_dir.join(&instance_name));
+    }
     if let Ok(instance) = &result {
         // Track the pack so update/repair can find it later. Best-effort: a
         // failed lock write leaves an untracked but fully usable instance.

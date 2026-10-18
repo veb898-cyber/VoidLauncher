@@ -7,9 +7,13 @@ interface FocusState {
   isGameRunning: boolean;
   /// True when window is unfocused AND a game is running — UI should freeze heavy work
   isFrozen: boolean;
+  /// True when the OS window is minimized (WebView2 does not set document.hidden
+  /// for a minimized window, so this is detected through the Tauri window API).
+  isMinimized: boolean;
   /// Internal count of concurrently running games.
   _gameCount: number;
   setWindowFocused: (focused: boolean) => void;
+  setMinimized: (minimized: boolean) => void;
   /// Set the running-game count directly (used to seed from backend state).
   setRunningCount: (count: number) => void;
 }
@@ -18,12 +22,14 @@ export const useFocusStore = create<FocusState>((set) => ({
   isWindowFocused: true,
   isGameRunning: false,
   isFrozen: false,
+  isMinimized: false,
   _gameCount: 0,
   setWindowFocused: (focused) =>
     set((state) => ({
       isWindowFocused: focused,
       isFrozen: state.isGameRunning && !focused,
     })),
+  setMinimized: (minimized) => set({ isMinimized: minimized }),
   setRunningCount: (count) =>
     set((state) => {
       const safe = Math.max(0, count);

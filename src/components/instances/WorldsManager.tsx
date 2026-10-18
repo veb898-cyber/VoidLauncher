@@ -1,12 +1,14 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Globe, FolderOpen, Pencil, Copy, Trash2, KeyRound, RefreshCw, Archive, RotateCcw } from 'lucide-react';
+import { Globe, FolderOpen, Pencil, Copy, Trash2, RefreshCw, Archive, RotateCcw } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { CopyButton } from '../ui/CopyButton';
 import { Tooltip } from '../ui/Tooltip';
 import { Modal } from '../ui/Modal';
 import { Input } from '../ui/Input';
 import { addToast } from '../ui/Toast';
 import { t } from '../../lib/i18n';
+import { useThemeStore } from '../../stores/themeStore';
 import { formatSize as fmtSize } from '../../lib/format';
 
 interface SaveEntry {
@@ -30,6 +32,7 @@ interface Props {
 }
 
 export function WorldsManager({ instanceName, onOpenFolder }: Props) {
+  const liquidGlass = useThemeStore((s) => s.liquidGlass);
   const [saves, setSaves] = useState<SaveEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [renameTarget, setRenameTarget] = useState<SaveEntry | null>(null);
@@ -116,15 +119,6 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
     }
   };
 
-  const handleCopySeed = async (seed: number) => {
-    try {
-      await navigator.clipboard.writeText(seed.toString());
-      addToast(t('worlds.seed_toast'), 'success');
-    } catch (e: any) {
-      addToast(t('worlds.action_error', { error: e.toString() }), 'error');
-    }
-  };
-
   const handleBackup = async (save: SaveEntry) => {
     setBackuping(save.name);
     try {
@@ -200,7 +194,11 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
   };
 
   return (
-    <div className="content-manager__pane" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    /* Liquid Glass: a material card per world and no section-wide tray
+       behind them (owner: «в разделе с мирами сделай такие же карточки как
+       и с серверами. и заднее стекло убери»). Normal themes keep the
+       original flat list. */
+    <div className={`content-manager__pane${liquidGlass ? ' content-manager__pane--glassless' : ''}`} style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <div style={{ padding: 'var(--space-md) var(--space-2xl)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', borderBottom: '1px solid var(--surface-border)', flexShrink: 0 }}>
         <h2 style={{ fontSize: 'var(--font-size-lg)', fontWeight: 600, margin: 0, flex: 1 }}>
           {t('worlds.title')}
@@ -208,19 +206,66 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
             {t('worlds.count', { n: saves.length.toString() })}
           </span>
         </h2>
-        <Button size="sm" variant="ghost" onClick={loadSaves}>
-          <RefreshCw size={14} /> {t('common.refresh')}
+        <Button size="sm" variant="ghost" onClick={loadSaves} disabled={loading}>
+          <RefreshCw size={14} className={loading ? 'icon-spin' : undefined} /> {t('common.refresh')}
         </Button>
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto' }}>
+      <div style={{ flex: 1, overflowY: 'auto', ...(liquidGlass ? { padding: 'var(--space-lg) var(--space-2xl)' } : {}) }}>
         {loading ? (
           <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>
         ) : saves.length === 0 ? (
-          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>
-            <Globe size={32} style={{ opacity: 0.3, marginBottom: 'var(--space-sm)' }} />
+          <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>
+            <Globe size={32} style={{ opacity: 0.5, marginBottom: 'var(--space-sm)' }} />
             <div>{t('worlds.empty')}</div>
             <div style={{ fontSize: 'var(--font-size-sm)', marginTop: 4 }}>{t('worlds.hint')}</div>
+          </div>
+        ) : liquidGlass ? (
+          <div className="glass-row-list" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
+            {saves.map((save) => (
+              <div key={save.name} className="glass-card" style={{ padding: 'var(--space-md)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)' }}>
+                {save.icon_data ? (
+                  <img src={save.icon_data} alt="" style={{ width: 36, height: 36, borderRadius: 'var(--radius-sm)', objectFit: 'cover', flexShrink: 0 }} />
+                ) : (
+                  <div style={{ width: 36, height: 36, borderRadius: 'var(--radius-sm)', background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <Globe size={18} style={{ color: 'var(--text-tertiary)' }} />
+                  </div>
+                )}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 600, fontSize: 'var(--font-size-sm)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{save.name}</div>
+                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{formatDate(save.last_modified)}</div>
+                </div>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', width: 110, flexShrink: 0 }}>{gameModeLabel(save.game_mode)}</div>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', width: 80, textAlign: 'right', flexShrink: 0 }}>{formatSize(save.size_bytes)}</div>
+                <div style={{ display: 'flex', gap: 'var(--space-sm)', flexShrink: 0 }}>
+                  <Tooltip content={t('worlds.backup')}>
+                    <Button size="sm" variant="ghost" disabled={backuping === save.name} onClick={() => handleBackup(save)} style={backuping === save.name ? { color: 'var(--accent)' } : undefined}><Archive size={14} /></Button>
+                  </Tooltip>
+                  <Tooltip content={t('worlds.restore')}>
+                    <Button size="sm" variant="ghost" onClick={() => openRestore(save)}><RotateCcw size={14} /></Button>
+                  </Tooltip>
+                  <Tooltip content={t('worlds.rename')}>
+                    <Button size="sm" variant="ghost" onClick={() => { setRenameTarget(save); setRenameValue(save.name); }}><Pencil size={14} /></Button>
+                  </Tooltip>
+                  <Tooltip content={t('worlds.copy')}>
+                    <Button size="sm" variant="ghost" onClick={() => { setCopyTarget(save); setCopyValue(`${save.name} ${t('worlds.copy_suffix')}`); }}><Copy size={14} /></Button>
+                  </Tooltip>
+                  <Tooltip content={t('worlds.delete')}>
+                    <Button size="sm" variant="ghost" onClick={() => setDeleteTarget(save)} style={{ color: 'var(--color-danger)' }}><Trash2 size={14} /></Button>
+                  </Tooltip>
+                  {save.seed != null && (
+                    <Tooltip content={t('worlds.copy_seed')}>
+                      <CopyButton
+                        tooltip={t('worlds.copy_seed')}
+                        text={() => String(save.seed)}
+                        size={14}
+                        className="btn btn--ghost btn--sm"
+                      />
+                    </Tooltip>
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
         ) : (
           saves.map((save) => (
@@ -255,7 +300,15 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
                 <Tooltip content={t('worlds.copy')}><button onClick={() => { setCopyTarget(save); setCopyValue(`${save.name} ${t('worlds.copy_suffix')}`); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Copy size={14} /></button></Tooltip>
                 <Tooltip content={t('worlds.delete')}><button onClick={() => setDeleteTarget(save)} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Trash2 size={14} /></button></Tooltip>
                 {save.seed != null && (
-                  <Tooltip content={t('worlds.copy_seed')}><button onClick={() => handleCopySeed(save.seed!)} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><KeyRound size={14} /></button></Tooltip>
+                  <Tooltip content={t('worlds.copy_seed')}>
+                    <CopyButton
+                      tooltip={t('worlds.copy_seed')}
+                      text={() => String(save.seed)}
+                      size={14}
+                      className=""
+                      style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}
+                    />
+                  </Tooltip>
                 )}
               </div>
             </div>

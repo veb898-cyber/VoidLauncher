@@ -355,43 +355,12 @@ export function Avatar({
   );
 }
 
-// ---- Offline account head (grayscale default Steve) --------------------------
-// Offline accounts have no Mojang profile: mc-heads would return an
-// unknown/placeholder head. Instead we embed the standard Steve face,
-// desaturated to grayscale (same look Prism Launcher uses for offline).
-
-const OFFLINE_STEVE_PNG =
-  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAJQSURBVHhe7dG9zqlREIBR1yGCKOjcCEKpIVqiUYhGp/HTSERE60Z9/SrmzQ5xijM7Wd1+t3lGrdPpvCPtdjvkfTWbzVC9Xg81Go2Q86jVaoVqDiwflPdlsAyWwXIeGaxcgAPLB+V9GSyDZbCcRwYrF+DA8kF5XwbLYBks55HBygU4sHxQ3pfBMlgGy3lksGp+8G3dbjfU7/c/4u/JhSsX4AffZrAMKuXvyWDlAvzg2wyWQaX8PRmsXIAffJvBMqiUvyeDlQvwA91ut9Dz+Qy9Xq/Q4/EI+Z4Oh0Oo1+uFcgEGy2A5kAyWwfI9GSyDlQswWAbLgWSwDJbvyWAZrFyAwTJYDiSDZbB8TwbLYOUCjsfjO3K9XkPe1+VyCe33+9D9fg9tt9uP5AIcWAbL+zJYBstgGVQqF+DAMljel8EyWAbLoFK5AAeWwfK+DJbBMlgGlcoFGKSqMxwOQ+fzOWSQfE9Vxz9EuQCDVXUcSAbLYPmeqo7BygUYrKrjQDJYBsv3VHUMVi7AYFUdB5LBMli+p6pjsHIBm83mHTmdTiEXpsFg8BEXot1uF5rNZqFcgMEyWAbLoFIGy2AZrFyAwTJYBsugUgbLYBmsXIDBMlgGy6BSBstgGaxcwGq1ekfW63VoMpn8U8vlMjSfz0O5AINlsBzo1wyWwcoFGCyD5UC/ZrAMVi7AYBksB/o1g2WwcgHj8fgdGY1GIR8sNZ1OQ4vF4iO+p1yAwTJYBpVyIBlUyveUCzBYBsugUg4kg0r5nnIBBstgGVTKgWRQKd/Tf7+AP6y08fAFyS2jAAAAAElFTkSuQmCC';
-
-export function OfflineAvatar({
-  size = 40,
-  style,
-  className,
-  radius = 'var(--radius-md)',
-}: {
-  size?: number;
-  style?: React.CSSProperties;
-  className?: string;
-  radius?: string;
-}) {
-  const box: React.CSSProperties = {
-    width: size,
-    height: size,
-    flexShrink: 0,
-    borderRadius: radius,
-    objectFit: 'cover',
-    imageRendering: 'pixelated',
-    ...style,
-  };
-  return (
-    <img
-      src={OFFLINE_STEVE_PNG}
-      alt="Steve"
-      className={className}
-      style={box}
-    />
-  );
-}
+// ---- Offline accounts ---------------------------------------------------------
+// Offline accounts used to render a fixed grayscale Steve. Now that the
+// backend resolves every profile uuid — including offline ones — to the
+// bundled vanilla default skin the game itself would show (see
+// src-tauri/src/default_skin.rs), they go through the same Avatar pipeline
+// as licensed accounts and every surface stays consistent.
 
 // ---- Content/list icon with transparent letter fallback ----------------------
 // Square icon on the shared remote pipeline: shine while loading,

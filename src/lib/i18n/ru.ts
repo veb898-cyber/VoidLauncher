@@ -56,6 +56,7 @@ export const ru: Record<string, string> = {
   'common.all':                        'Все',
   'common.copied':                     'Скопировано',
   'common.copy_failed':                'Не удалось скопировать',
+  'common.retry':                      'Повторить',
 
   // ── Error Boundary ──────────────────────────────────────────
   'error_boundary.heading':            'Что-то пошло не так',
@@ -129,6 +130,15 @@ export const ru: Record<string, string> = {
   'accounts.elyby_skin_help_title':    'Смена скина Ely.by',
   'accounts.elyby_skin_help_body':     'Для аккаунтов Ely.by скин можно поменять только на официальном сайте Ely.by — лаунчер не имеет доступа к их API смены скина. Откройте страницу скинов, войдите в аккаунт и выберите новый скин.',
   'accounts.elyby_skin_help_open':     'Открыть ely.by/skins',
+  'accounts.make_active':              'Сделать активным',
+  'accounts.remove_btn':               'Удалить аккаунт',
+  'accounts.active_for_launch':        'Этот аккаунт используется для запуска игры',
+  'accounts.skin_viewer_hint':         'Зажмите и перетаскивайте мышь, чтобы вращать • колесо мыши — приближение',
+  'accounts.skin_viewer_unavailable':  'Не удалось загрузить скин этого аккаунта',
+  'accounts.capes_title':              'Плащ',
+  'accounts.cape_none':                'Без плаща',
+  'accounts.cape_update_error':        'Не удалось сменить плащ: {error}',
+  'accounts.capes_load_error':         'Не удалось загрузить плащи: {error}',
 
   // ── Instance List ───────────────────────────────────────────
   'instances.page_title':              'Сборки',
@@ -203,6 +213,9 @@ export const ru: Record<string, string> = {
   'verify.kind_missing':               'отсутствует',
   'verify.kind_corrupt':               'повреждён',
   'verify.kind_invalid':               'некорректен',
+  'verify.kind_unsafe':                'небезопасный путь',
+  'verify.kind_outdated_loader':       'нужен новый Fabric Loader',
+  'verify.issue_requires':             'требуется {range}',
 
   // ── Create Instance Wizard ──────────────────────────────────
   'create_instance.title':             'Создание сборки',
@@ -251,6 +264,7 @@ export const ru: Record<string, string> = {
   'instance_detail.tab_resourcepacks':  'Ресурспаки',
   'instance_detail.tab_shaderpacks':   'Шейдеры',
   'instance_detail.tab_worlds':        'Миры',
+  'instance_detail.tab_servers':       'Серверы',
   'instance_detail.tab_screenshots':   'Скриншоты',
   'instance_detail.confirm_delete_title': 'Удаление сборки',
   'instance_detail.confirm_delete_text':  'Вы уверены, что хотите удалить "{name}"? Все файлы будут удалены навсегда.',
@@ -263,6 +277,8 @@ export const ru: Record<string, string> = {
   'instance_editor.title':             'Настройки сборки',
   'instance_editor.name_label':        'Название сборки',
   'instance_editor.notes_label':       'Заметки',
+  'instance_editor.loader_label':      'Загрузчик модов',
+  'instance_editor.loader_change':     'Сменить версию\u2026',
   'instance_editor.java_path_label':   'Путь к Java',
   'instance_editor.browse_btn':        'Обзор',
   'instance_editor.resolution_label':  'Разрешение',
@@ -356,6 +372,7 @@ export const ru: Record<string, string> = {
   'settings.exp_section_desc':        'Отдельные режимы отрисовки. Это не цветовые пресеты темы выше.',
   'settings.lg_title':                'Liquid Glass',
   'settings.lg_desc':                 'Отдельная система материалов на стекле: собственный фон, поверхности, размытие, преломление света и глубина. Заменяет обычную тему, а не перекрашивает её.',
+  'settings.lg_perf_note':            'Тема анимированная: пока окно открыто, лаунчер нагружает процессор и видеокарту сильнее, чем обычные темы, — на слабых компьютерах это заметно. Когда лаунчер свёрнут, анимация останавливается, и нагрузка падает до нуля.',
   'settings.lg_active':               'Liquid Glass включён. Тема {theme} сохранена и вернётся после выключения.',
   'settings.wallpaper_title':          'Обои',
   'settings.wallpaper_desc':           'Подложка, которую преломляет стекло. Видна сквозь заголовок и сайдбар, а также за диалоговыми окнами.',
@@ -364,6 +381,9 @@ export const ru: Record<string, string> = {
   'settings.wallpaper_ribbons':        'Жидкие ленты',
   'settings.wallpaper_mesh':           'Градиентная сетка',
   'settings.wallpaper_nebula':         'Туманность',
+  'settings.content_cards_title':      'Карточки в разделах сборки',
+  'settings.content_cards_desc':       'Моды, ресурспаки и шейдеры показываются отдельными карточками — как серверы, миры и скриншоты. Выключите, чтобы вернуться к списку-таблице.',
+  'settings.content_cards_locked':     'Недоступно, пока Liquid Glass выключен. Выбранный вид сохранится и вернётся после включения.',
   'common.experimental':              'Экспериментально',
 
 
@@ -567,6 +587,39 @@ export const ru: Record<string, string> = {
   'worlds.backup_delete_toast':        'Бэкап удалён',
   'worlds.backups_count':              '{n} бэкапов',
 
+  // ── Servers ─────────────────────────────────────────────────
+  'servers.title':                     'Серверы',
+  'servers.count':                     '{n} серверов',
+  'servers.empty':                     'Список серверов пуст.',
+  'servers.hint':                      'Добавьте сервер — он появится в игре в списке серверов.',
+  'servers.add':                       'Добавить сервер',
+  'servers.add_title':                 'Добавить сервер',
+  'servers.edit_title':                'Изменить сервер',
+  'servers.name_label':                'Название',
+  'servers.name_placeholder':          'Мой сервер',
+  'servers.address_label':             'Адрес',
+  'servers.address_placeholder':       'play.example.com',
+  'servers.delete_title':              'Удалить сервер',
+  'servers.edit':                      'Изменить',
+  'servers.delete_confirm':            'Удалить «{name}» из списка серверов?',
+  'servers.delete':                    'Удалить',
+  'servers.added_toast':               'Сервер добавлен',
+  'servers.updated_toast':             'Сервер обновлён',
+  'servers.deleted_toast':             'Сервер удалён',
+  'servers.load_error':                'Не удалось загрузить серверы: {error}',
+  'servers.action_error':              'Ошибка: {error}',
+  'servers.status_checking':           'Проверяется\u2026',
+  'servers.status_online':             'Онлайн: {online}/{max}',
+  'servers.status_online_plain':       'Онлайн',
+  'servers.status_timeout':            'Тайм-аут',
+  'servers.status_unreachable':        'Не удалось подключиться',
+  'servers.status_error':              'Ошибка проверки',
+  'servers.ping_ms':                   'Пинг: {ms} мс',
+  'servers.play':                      'Играть',
+  'servers.launch_started':            'Запускаем \u00ab{name}\u00bb\u2026',
+  'servers.launch_error':              'Не удалось запустить игру: {error}',
+  'servers.invalid_address':           'Неверный адрес сервера',
+
   // ── Login ───────────────────────────────────────────────────
   'login.title':                       'Вход',
   'login.desc':                        'Войдите через Microsoft, чтобы играть в Minecraft',
@@ -597,6 +650,7 @@ export const ru: Record<string, string> = {
   'game_logs.analyze':                 'Анализ краша',
   'game_logs.analyzing':               'Анализ...',
   'game_logs.no_crash':                'Файлы крашей для этого запуска не найдены',
+  'game_logs.clean_run':               'Игра завершилась штатно — признаков краша нет',
   'game_logs.open_report':             'Открыть отчёт о краше',
   'game_logs.copy_analysis':           'Копировать анализ',
 
@@ -608,6 +662,17 @@ export const ru: Record<string, string> = {
   'loader_install.retry':              'Повторить',
   'loader_install.done':               '{loader} успешно установлен!',
 
+  // ── Loader Version Update ────────────────────────────────────
+  'loader_update.title':               'Смена версии {loader}',
+  'loader_update.current':             'Сейчас установлена версия {version}',
+  'loader_update.current_none':        'Загрузчик ещё не установлен',
+  'loader_update.stable':              'стабильная',
+  'loader_update.install_btn':         'Установить {version}',
+  'loader_update.done_toast':          'Загрузчик обновлён: {loader} {version}',
+  'loader_update.error_toast':         'Не удалось обновить загрузчик: {error}',
+  'loader_update.load_error':          'Не удалось загрузить список версий: {error}',
+  'loader_update.empty':               'Нет доступных версий для Minecraft {mc}',
+
   // ── Launch ───────────────────────────────────────────
   'launch.java_setup_title':            'Настройка Java',
   'launch.checking_java':               'Проверка Java...',
@@ -616,6 +681,9 @@ export const ru: Record<string, string> = {
   'launch.java_stage_extracting':       'Распаковка Java...',
   'launch.java_stage_verifying':        'Проверка установки Java...',
   'launch.java_stage_done':             'Java готова!',
+  'launch.running_games':               'Запущенные игры',
+  'launch.stop_game':                   'Остановить',
+  'launch.stop_game_hint':              'Игра будет закрыта принудительно — несохранённый прогресс может быть потерян.',
 
   // ── Install Overlay ─────────────────────────────────────────
   'install.stage_fetching':            'Получение информации о версии',
@@ -866,6 +934,8 @@ export const ru: Record<string, string> = {
   'diag.crash_jvm_args':               'Некорректные аргументы JVM',
   'diag.crash_launch_config':          'Некорректная конфигурация запуска',
   'diag.crash_mod_crash':              'Мод вызвал краш игры: {culprit}',
+  'diag.crash_mod_dependency':         'Сборка не запустилась: моды несовместимы друг с другом или чего-то не хватает',
+  'diag.crash_loader_outdated':        'Сборка не запустилась: моду «{culprit}» нужна более новая версия Fabric Loader',
   'diag.crash_missing_dependency':     'Отсутствует зависимость мода: {culprit}',
   'diag.crash_missing_class':          'Отсутствует класс или повреждён файл мода: {culprit}',
   'diag.crash_mod_conflict':           'Конфликт модов: {culprit}',
@@ -877,6 +947,8 @@ export const ru: Record<string, string> = {
   'diag.crash_hint_jvm':               'Сбросьте пользовательские аргументы JVM в настройках.',
   'diag.crash_hint_launch':            'Пересоздайте сборку или выполните проверку её файлов.',
   'diag.crash_hint_mod':               'Обновите или уберите виновный мод.',
+  'diag.crash_hint_dependency':        'В тексте ошибки («Incompatible mods found!») игра называет виновника — обновите или уберите этот мод.',
+  'diag.crash_hint_loader':            'Обновите Fabric Loader до версии из текста ошибки («with version … or later») и запустите игру снова.',
   'diag.crash_hint_deps':              'Установите недостающую зависимость или переустановите мод.',
   'diag.crash_hint_conflict':          'Уберите один из конфликтующих модов.',
   'diag.crash_hint_graphics':          'Обновите драйвер видеокарты.',

@@ -218,56 +218,115 @@ fn is_v4_reserved(v4: &std::net::Ipv4Addr) -> bool {
 /// resolved to all of their addresses and every one must be public (if any
 /// single address is private/local the host is refused) — this catches a
 /// hostname that resolves to 127.0.0.1 or a private NAT range.
-async fn host_is_public(url: &str) -> Result<bool, String> {
+///
+/// Returns the host name plus the validated addresses so the caller can PIN
+/// them for the actual request. Without pinning there is a DNS-rebinding
+/// TOCTOU: the name could resolve to a public IP here and to a private one
+/// microseconds later, when `reqwest` resolves it again for the fetch.
+async fn resolve_public_host(url: &str) -> Result<(String, Vec<std::net::IpAddr>), String> {
     let host = extract_host(url).ok_or_else(|| "Invalid URL".to_string())?;
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Ok(is_public_ip(ip));
+        return if is_public_ip(ip) {
+            Ok((host, vec![ip]))
+        } else {
+            Err("Refusing to fetch from a private address".to_string())
+        };
     }
-    tokio::task::spawn_blocking(move || {
+    let host_lookup = host.clone();
+    let ips = tokio::task::spawn_blocking(move || {
         use std::net::ToSocketAddrs;
-        match (host.as_str(), 443u16).to_socket_addrs() {
+        match (host_lookup.as_str(), 443u16).to_socket_addrs() {
             Ok(addrs) => {
                 let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
                 if ips.is_empty() {
                     return Err("Host resolved to no addresses".to_string());
                 }
-                Ok(ips.iter().all(|ip| is_public_ip(*ip)))
+                Ok(ips)
             }
             Err(e) => Err(e.to_string()),
         }
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+    if !ips.iter().all(|ip| is_public_ip(*ip)) {
+        return Err("Refusing to fetch from a private address".to_string());
+    }
+    Ok((host, ips))
+}
+
+/// GET a URL through a client that pins `host` to the validated `addrs`.
+/// Mirrors the global "proxy, then direct on network failure" behavior —
+/// but both clients keep the pin, so the fallback cannot re-resolve DNS.
+async fn send_pinned(
+    url: &str,
+    host: &str,
+    addrs: &[std::net::IpAddr],
+) -> Result<reqwest::Response, String> {
+    let client = crate::download::pinned_http_client(host, addrs).map_err(|e| e.to_string())?;
+    match client.get(url).send().await {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            if crate::download::configured_proxy().is_some() {
+                let direct = crate::download::pinned_http_client_direct(host, addrs)
+                    .map_err(|e2| e2.to_string())?;
+                match direct.get(url).send().await {
+                    Ok(r) => Ok(r),
+                    Err(_) => Err(e.to_string()),
+                }
+            } else {
+                Err(e.to_string())
+            }
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String> {
     const MAX_ASSET_BYTES: usize = 10 * 1024 * 1024;
+    const MAX_REDIRECTS: usize = 5;
 
     let url = url.trim().to_string();
     if !url.starts_with("https://") {
         return Err("Only https URLs are allowed".into());
     }
 
-    match host_is_public(&url).await {
-        Ok(true) => {}
-        Ok(false) => return Err("Refusing to fetch from a private address".into()),
-        Err(e) => return Err(e),
+    // Follow redirects manually so EVERY hop's host is validated and pinned
+    // before the request goes out (reqwest would follow them itself without
+    // our IP pinning, re-opening the rebinding window).
+    let mut current = url.clone();
+    let mut response = None;
+    for _ in 0..=MAX_REDIRECTS {
+        let (host, addrs) = resolve_public_host(&current).await?;
+        let resp = send_pinned(&current, &host, &addrs).await?;
+        if resp.status().is_redirection() {
+            let Some(location) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
+                return Ok(None);
+            };
+            let Ok(base) = reqwest::Url::parse(&current) else {
+                return Ok(None);
+            };
+            let Ok(next) = base.join(location) else {
+                return Ok(None);
+            };
+            if next.scheme() != "https" {
+                return Ok(None);
+            }
+            current = next.to_string();
+            continue;
+        }
+        response = Some(resp);
+        break;
     }
-
-    let client = crate::download::global_http_client().map_err(|e| e.to_string())?;
-    let resp = crate::download::send_with_fallback(client.get(&url))
-        .await
-        .map_err(|e| e.to_string())?;
+    let Some(resp) = response else {
+        // Too many redirects — give up quietly like other non-fatal cases.
+        return Ok(None);
+    };
     if !resp.status().is_success() {
         return Ok(None);
-    }
-    // Re-check the FINAL url after redirects (redirect target could be private).
-    let final_url = resp.url().to_string();
-    if final_url != url {
-        if let Ok(false) = host_is_public(&final_url).await {
-            return Err("Refusing to fetch from a private address".into());
-        }
     }
     if let Some(len) = resp.content_length() {
         if len as usize > MAX_ASSET_BYTES {
@@ -291,7 +350,7 @@ pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String>
     } else if bytes.starts_with(b"<svg") || bytes.starts_with(b"<?xml") {
         "image/svg+xml"
     } else {
-        match url
+        match current
             .split('?')
             .next()
             .and_then(|p| p.rsplit('.').next())
@@ -339,11 +398,34 @@ pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
 
 // ==================== Launch State Commands ====================
 
-/// Return the names of all instances whose game processes are currently running.
+/// Return the names of all instances whose game processes are currently
+/// running. Reconciles persisted pid files with the live process table so a
+/// game orphaned by a launcher restart/update still shows its "Running"
+/// badge (and blocks a second launch of the same instance).
 #[tauri::command]
 pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let running = state.running_instances.lock().map_err(|e| e.to_string())?;
-    Ok(running.clone())
+    let data_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.data_dir.clone()
+    };
+    let mut running = state
+        .running_instances
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    for game in crate::running_state::scan_live_games(&data_dir) {
+        if !running.iter().any(|n| n == &game.instance) {
+            running.push(game.instance);
+        }
+    }
+    if let Ok(mut live) = state.running_instances.lock() {
+        for name in &running {
+            if !live.iter().any(|n| n == name) {
+                live.push(name.clone());
+            }
+        }
+    }
+    Ok(running)
 }
 
 // ==================== Cache Commands ====================

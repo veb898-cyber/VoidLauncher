@@ -488,21 +488,27 @@ a {
    ============================ */
 
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 12px;
+  height: 12px;
 }
 
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
+/* The 3px transparent border + background-clip keep the visible thumb 6px
+   thin (as before) while insetting it from every edge of its track, so it
+   can no longer overlap the rounded corners of the surface it scrolls
+   (owner: «ползунок выходит за рамки окна на пару или более пикселей»). */
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
+  background-color: rgba(255, 255, 255, 0.1);
+  border: 3px solid transparent;
+  background-clip: padding-box;
   border-radius: var(--radius-full);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background-color: rgba(255, 255, 255, 0.2);
 }
 
 /* ============================
@@ -1235,14 +1241,16 @@ select option {
   flex-shrink: 0;
 }
 .custom-select__list::-webkit-scrollbar {
-  width: 8px;
+  width: 12px;
 }
 .custom-select__list::-webkit-scrollbar-track {
   background: transparent;
 }
 .custom-select__list::-webkit-scrollbar-thumb {
-  background: var(--surface-border-hover);
-  border-radius: 4px;
+  background-color: var(--surface-border-hover);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: var(--radius-full);
 }
 
 /* ============================
@@ -1579,9 +1587,25 @@ select option {
   width: 90%;
   max-width: 500px;
   max-height: 85vh;
-  overflow-y: auto;
+  /* The dialog itself never scrolls: the inner `.modal__scroll` does, and
+     this rounded box clips its scrollbar at the corners. A scrollbar owned
+     by the rounded element itself is not clipped by its own radius in
+     Chromium, so the thumb visibly poked a few pixels past the corner
+     (owner: «ползунок выходит за рамки окна»). */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   box-shadow: var(--shadow-xl);
   animation: slideUp var(--transition-normal);
+}
+
+/* The actual scroll area — header, body and footer keep scrolling together
+   exactly as they did when the dialog owned the scrollbar. */
+.modal__scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .modal__header {
@@ -1741,7 +1765,13 @@ select option {
 .toast--info { border-left: 3px solid var(--info); }
 
 /* Thin line that depletes over the toast's lifetime. Purely a CSS
-   animation; duration is fed from the same constant as the dismiss timer. */
+   animation; duration is fed from the same constant as the dismiss timer.
+   The animation NAME comes from `--toast-anim` so the item can restart the
+   bar whenever its counter bumps: swapping between the two identical
+   keyframe sets changes `animation-name`, which restarts the animation from
+   zero — the same moment the JS lifetime above is restarted. Without that
+   swap the bar kept running on its old timeline (text said "(2)" while the
+   progress line kept depleting as if the toast were about to leave). */
 .toast::after {
   content: '';
   position: absolute;
@@ -1750,7 +1780,7 @@ select option {
   height: 2px;
   width: 100%;
   transform-origin: left;
-  animation: toast-life var(--toast-duration, 4000ms) linear forwards;
+  animation: var(--toast-anim, toast-life) var(--toast-duration, 4000ms) linear forwards;
 }
 
 .toast--success::after { background: var(--success); }
@@ -1759,6 +1789,13 @@ select option {
 .toast--info::after { background: var(--info); }
 
 @keyframes toast-life {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
+/* Identical twin of `toast-life`; exists only to give the counter bump a
+   different animation-name to switch to (see the ::after comment). */
+@keyframes toast-life-b {
   from { transform: scaleX(1); }
   to { transform: scaleX(0); }
 }
@@ -1788,8 +1825,13 @@ select option {
   transition: color var(--transition-fast);
 }
 
-.tab:hover {
+.tab:hover:not(:disabled) {
   color: var(--text-primary);
+}
+
+.tab:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .tab--active {
@@ -2175,6 +2217,51 @@ select option {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* Refresh buttons spin their own glyph instead of adding a separate spinner
+   next to it (owner: «надо анимировать именно эту иконку, а не добавлять
+   ещё один вращающийся круг»). */
+.icon-spin {
+  animation: spin 1s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .icon-spin {
+    animation: none;
+  }
+}
+
+/* Copy buttons: the icon flips to a checkmark in place — no toast. */
+.copy-flip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.copy-flip > svg {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  transition: opacity 170ms ease, transform 210ms ease;
+}
+.copy-flip__idle {
+  opacity: 1;
+  transform: scale(1);
+}
+.copy-flip__done {
+  opacity: 0;
+  transform: scale(0.4);
+  color: var(--success, #4ade80);
+}
+.copy-flip--done .copy-flip__idle {
+  opacity: 0;
+  transform: scale(0.4);
+}
+.copy-flip--done .copy-flip__done {
+  opacity: 1;
+  transform: scale(1);
+  transition: opacity 140ms ease 40ms, transform 260ms cubic-bezier(0.34, 1.56, 0.64, 1) 40ms;
 }
 
 @keyframes slideUp {
@@ -2637,7 +2724,7 @@ select option {
 }
 
 .log-container::-webkit-scrollbar {
-  width: 6px;
+  width: 12px;
 }
 
 .log-container::-webkit-scrollbar-track {
@@ -2645,12 +2732,14 @@ select option {
 }
 
 .log-container::-webkit-scrollbar-thumb {
-  background: var(--surface-border-hover);
-  border-radius: 3px;
+  background-color: var(--surface-border-hover);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: var(--radius-full);
 }
 
 .log-container::-webkit-scrollbar-thumb:hover {
-  background: var(--text-tertiary);
+  background-color: var(--text-tertiary);
 }
 
 .log-line {
@@ -3286,7 +3375,8 @@ input[type="range"]:active::-moz-range-thumb {
 
 /* Frozen-glass look for the tall markdown panels of the modpacks page. */
 
-/* Accounts page: whole card activates the account on click */
+/* Accounts page: whole card selects the account (the 3D preview on the
+   right shows the selection; switching is an explicit action). */
 .account-card {
   cursor: pointer;
   transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
@@ -3298,12 +3388,151 @@ input[type="range"]:active::-moz-range-thumb {
 .account-card:active {
   transform: scale(0.997);
 }
-.account-card--active {
+.account-card:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/* Account rows are outline-only: the dark plate backing plus the hover
+   shadow stacked into a heavy slab (owner: a dark layer under the plates).
+   The fill goes fully transparent, hover tints the row instead of raising
+   it, and the selection ring keeps marking the active card. Liquid Glass
+   has its own scoped overrides further down (the material also adds a
+   drop shadow and an inner dark pool there). */
+.page--accounts .account-card {
+  background: transparent;
+}
+.page--accounts .account-card:hover {
+  background: var(--surface-glass-hover);
+  box-shadow: none;
+}
+
+/* Accounts page layout: the page occupies exactly the window height at the
+   default size — the preview canvas scales down to its card, only the
+   account list scrolls internally, and the action/cape cards stay on screen. */
+.page--accounts {
+  height: 100%;
+  min-height: 0;
+}
+
+.accounts-layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xl);
+}
+
+.accounts-preview {
+  flex: 1 1 460px;
+  min-width: 340px;
+  min-height: 0;
+  overflow: hidden;
+  padding: var(--space-lg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-lg);
+}
+
+.accounts-preview__stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+}
+
+.accounts-rail {
+  flex: 0 1 380px;
+  min-width: 300px;
+  min-height: 0;
+  /* Never let the rail grow past the layout height (a long list used to
+     push the rail — and the cape picker with it — below the window):
+     clamp it so the list inside does the shrinking/scrolling instead. */
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  /* Safety net for extreme window heights: the list shrinks first, but a
+     very large cape set can still outgrow the rail — let the rail scroll
+     instead of painting over the page. */
+  overflow-y: auto;
+}
+
+.accounts-list {
+  /* Hug the cards so the cape picker sits right under the list — the grown
+     list used to leave a dead gap; when the rail runs out of room the list
+     (not the picker) shrinks and scrolls. */
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding-right: 2px;
+}
+
+/* Accounts page: cape picker tiles. The thumbnail shows the FRONT face of
+   the 64×32 cape texture (rect 1,1 10×16) scaled 4× and pixelated. */
+.cape-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 64px;
+  padding: 8px 10px;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: transform 0.15s ease, border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+.cape-tile:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: var(--surface-border-hover);
+  background: var(--surface-border);
+  color: var(--text-primary);
+}
+.cape-tile:active:not(:disabled) {
+  transform: scale(0.98);
+}
+.cape-tile--active {
+  border-color: var(--primary);
+  color: var(--text-primary);
+}
+.cape-tile:disabled {
+  opacity: 0.55;
   cursor: default;
 }
-.account-card--active:hover {
-  transform: none;
-  box-shadow: none;
+.cape-tile:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+.cape-thumb {
+  width: 40px;
+  height: 64px;
+  border-radius: 4px;
+  background-color: rgba(255, 255, 255, 0.06);
+  background-repeat: no-repeat;
+  background-size: 256px 128px; /* 64×32 texture at 4× */
+  background-position: -4px -4px; /* front face starts at tex (1,1) */
+  image-rendering: pixelated;
+  box-shadow: inset 0 0 0 1px var(--surface-border);
+}
+.cape-thumb--none {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  background-image: none;
+}
+.cape-alias {
+  max-width: 76px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
 }
 
 /* Floating dropdown surfaces (instance icon / banner picker menus):
@@ -3440,12 +3669,17 @@ input[type="range"]:active::-moz-range-thumb {
   pointer-events: none;
   opacity: 0;
   transform: translateY(4px);
-  transition: opacity var(--transition-fast), transform var(--transition-fast);
+  /* Leaving (visible → hidden) runs on THIS rule's transition — a shorter
+     fade so the hint clears almost with the cursor (owner: «убиралась чуть
+     быстрее»). Entering runs on the visible rule below, keeping the shared
+     150ms token. */
+  transition: opacity 0.1s ease-out, transform 0.1s ease-out;
 }
 
 .tooltip-bubble--visible {
   opacity: 1;
   transform: translateY(0);
+  transition: opacity var(--transition-fast), transform var(--transition-fast);
 }
 
 @keyframes indeterminate {
@@ -3454,18 +3688,63 @@ input[type="range"]:active::-moz-range-thumb {
 }
 
 /* ============================
-   Card entrance stagger
-   Removed on purpose: per-row delay cascades made tab switches read as rows
-   popping in one by one (owner: «появляются, иногда дерганно»). Lists and
-   cards now appear as one piece; motion lives in the sliding tab pill.
+   Dropdown pop
+   The click-open lists pop open: CustomSelect lists (settings presets,
+   fonts, console font, language, skin model) and the recent-runs picker in
+   Game Logs. Fast — 0.18s — with a light overshoot on the spring curve and
+   a small scale from the trigger edge, so opening reads instant but feels
+   elastic. These surfaces mount fresh on every open, so the plain CSS
+   animation replays each time; no exit animation — closing is instant.
+   Card entrances (accounts, capes, home cards, settings sections)
+   deliberately have NO stagger — the owner rejected per-row cascades.
    Disabled for prefers-reduced-motion via the block below.
    ============================ */
+
+@keyframes dropdown-pop {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes dropdown-pop-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.custom-select__list {
+  transform-origin: top center;
+  animation: dropdown-pop 0.18s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.custom-select__list--up {
+  transform-origin: bottom center;
+  animation-name: dropdown-pop-up;
+}
+
+.game-logs-picker-panel {
+  transform-origin: top center;
+  animation: dropdown-pop 0.18s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
 
 @media (prefers-reduced-motion: reduce) {
   .skeleton { animation: none; }
   .icon-shine::after { animation: none; }
   .progress-fill::after { animation: none; }
   .spinner-snake__rot { animation-duration: 1.6s; }
+  /* The dropdown pop switches off entirely — lists just appear. */
+  .custom-select__list,
+  .game-logs-picker-panel { animation: none; }
 }
 
 /* ============================
@@ -3812,66 +4091,13 @@ input[type="range"]:active::-moz-range-thumb {
   display: block;
 }
 
-/* Two soft light fields drifting over the backdrop.
-   Why they exist: the procedural scenes paint a mostly dark, fairly even field,
-   and a 22px blur of an even field is still an even field - the glass then
-   reads as a dark flat panel, because there is nothing behind it for the blur
-   to smear and nothing for saturate() to pick up. These give the material two
-   slow-moving luminous patches to refract, on every backdrop setting including
-   "no wallpaper".
-
-   Cost: soft-stop radial gradients (no blur filter, no noise layer), moved only
-   by transform so the compositor never re-rasterises them; screen blend,
-   contained by the substrate's stacking context so nothing bleeds into the app.
-   Paused by `.app-frozen *` along with the rest of the chrome, and stopped
-   under prefers-reduced-motion. No grain: there is no banding problem here,
-   and visible noise would read as dirt on the glass. */
-[data-theme='lg'] .lg-glow {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  overflow: hidden;
-  pointer-events: none;
-  mix-blend-mode: screen;
-}
-
-[data-theme='lg'] .lg-glow__orb {
-  position: absolute;
-  width: 72vmax;
-  height: 72vmax;
-  border-radius: 50%;
-  will-change: transform;
-  animation: lg-orb-drift 90s ease-in-out infinite alternate;
-}
-
-[data-theme='lg'] .lg-glow__orb--a {
-  top: -30%;
-  left: -18%;
-  background: radial-gradient(closest-side, hsla(214, 100%, 66%, 0.30) 0%, hsla(214, 100%, 66%, 0) 70%);
-}
-
-[data-theme='lg'] .lg-glow__orb--b {
-  right: -24%;
-  bottom: -34%;
-  background: radial-gradient(closest-side, hsla(186, 95%, 55%, 0.24) 0%, hsla(186, 95%, 55%, 0) 70%);
-  animation-duration: 130s;
-  animation-direction: alternate-reverse;
-}
-
-@keyframes lg-orb-drift {
-  from {
-    transform: translate3d(0, 0, 0) scale(1);
-  }
-  to {
-    transform: translate3d(16vw, 12vh, 0) scale(1.18);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  [data-theme='lg'] .lg-glow__orb {
-    animation: none;
-  }
-}
+/* The two drifting light fields that give the material something to refract
+   are painted by the wallpaper canvas itself (LiquidGlassWallpaper): as a
+   compositor-animated transform layer under the glass they forced a full
+   backdrop re-render of every glass surface at display refresh rate, on the
+   main thread AND on the GPU, on every frame - including while the window was
+   minimised. Riding the canvas frame budget instead keeps the same light,
+   the same drift and the same refraction, at the wallpaper's own frame rate. */
 
 /* ------------------------------------------------------------
    Stage 2 — accessibility fallback
@@ -4333,13 +4559,11 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
     background: var(--lg-fill);
     backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
     -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
-    border-color: var(--lg-divider);
-    /* No outer drop shadow: the scrim behind the sheet already separates it
-       from the page, and the depth shadow on top of that dark fill reads as
-       a thick black outline around the dialog. The rim-ring hairlines and
-       the inner depth pool stay — they carry the material edge without
-       framing the sheet in a dark halo. */
-    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth);
+    /* Owner wave: the divider border plus the two rim hairlines and the inner
+       depth pool read as a «жирная обводка» around the dialog. The material
+       edge is now a single 5% hairline; everything else was removed. */
+    border-color: transparent;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
     position: relative;
     z-index: var(--z-sheet);
   }
@@ -4486,6 +4710,27 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
     -webkit-backdrop-filter: none;
     box-shadow: none;
     border-color: var(--lg-divider);
+  }
+
+/* Accounts page, Liquid Glass: the material's dark sheet + drop shadow +
+   inner bottom pool stacked under every account row into one heavy slab,
+   and the 32px drop shadows of the rail cards met in the gap between the
+   list and the cape picker as a dark band (owner report). Account rows
+   become rim-only glass rows (no fill, no drop shadow, no inner pool) and
+   the solid rail cards keep their material but lose the outer drop shadow.
+   Scope is the accounts page only — other glass stays untouched. */
+  [data-theme='lg'] .page--accounts .account-card {
+    background: transparent;
+    box-shadow: var(--lg-rim-ring);
+  }
+
+  [data-theme='lg'] .page--accounts .account-card:hover {
+    background: var(--lg-tint-hover);
+    box-shadow: var(--lg-rim-ring);
+  }
+
+  [data-theme='lg'] .page--accounts .accounts-rail > .glass-card {
+    box-shadow: var(--lg-rim-ring), var(--lg-inner-depth);
   }
 
 /* The 260px instances column: a rail beside the rail, so it takes the rail
@@ -4836,6 +5081,21 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
   box-shadow: var(--lg-sunk);
 }
 
+/* Card list mode (owner wave 27): the mods / resource packs / shaders
+   sections can show one glass card per entry instead of the table inside
+   the tray, and worlds/screenshots always do under Liquid Glass. With the
+   cards carrying the material themselves, the tray behind them stops being
+   a surface — the back glass goes away (owner: «в новом интерфейсе заднее
+   стекло убери»). The base class stays on the element so the ghost-chip
+   rules below keep matching; the normal themes never saw the tray at all,
+   so this modifier is exclusively a Liquid Glass override. */
+[data-theme='lg'] .content-manager__pane--glassless {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+}
+
 /* The ghost controls in the tray and the install column get the material
    ("добавить файл / проверить обновления / обновить / открыть папку — в
    стиле liquid glass"): fill + blur + rim, the same treatment the floating
@@ -4850,6 +5110,43 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
   [data-theme='lg'] :is(.content-manager__pane, .content-actions) .btn--ghost:hover {
     background: linear-gradient(var(--lg-tint-hover), var(--lg-tint-hover)), var(--lg-fill);
   }
+
+/* Buttons sitting on a card inside a glassless list read like the server-card
+   icon buttons, not like tray controls (owner: «кнопки в карточках с мирами
+   сделай такого же стиля как и на карточках серверов»): the chip rule above
+   is re-neutralised for them, keeping only the plain ghost reading — no fill
+   at rest, the usual light wash + rim on hover. */
+[data-theme='lg'] .content-manager__pane--glassless .glass-card .btn--ghost {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: none;
+}
+
+[data-theme='lg'] .content-manager__pane--glassless .glass-card .btn--ghost:hover {
+  background: var(--surface-glass-hover);
+  box-shadow: var(--lg-rim-ring);
+}
+
+/* The material lists of stacked cards — installable mods / resource packs
+   and shaders, worlds, servers — read calmer than standalone glass panels
+   (owner, 18.10.2026, from design feedback on the mod cards screenshot):
+   dozens of stacked cards with the default rim read as one shiny wall, so
+   the light top-edge and hairline fade (0.12/0.055 → 0.07/0.035), the edge
+   colour drops to 0.06, and the corner radius steps down (14 → 10px). The
+   version / provider labels get lighter tones (68%/48% → 78%/62%) so they
+   stay readable on colourful wallpapers while the name keeps its weight.
+   Fill, blur and the hover / selected glow stay untouched — the owner
+   explicitly asked not to raise transparency or glow. */
+[data-theme='lg'] .glass-row-list .glass-card {
+  --lg-rim-ring:
+    inset 0 1px 0 0 rgb(255, 255, 255, 0.07),
+    inset 0 0 0 1px rgb(255, 255, 255, 0.035);
+  --text-secondary: hsl(220, 16%, 78%);
+  --text-tertiary: hsl(220, 15%, 62%);
+  border-color: rgb(226, 236, 252, 0.06);
+  border-radius: var(--radius-md);
+}
 
 [data-theme='lg'] .content-table-head {
   background: transparent;
@@ -4954,4 +5251,131 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
   [data-motion='liquid'] .btn:active:not(:disabled) {
     transition: transform 80ms cubic-bezier(0.4, 0, 0.2, 1);
   }
+}
+
+/* ============================
+   Server list — Minecraft-style status indicator
+   The vanilla server list language: a signal staircase while and after a
+   check, a red cross instead of text on failure. Numbers are bare
+   `players/max`; the hover tooltip carries the ping or the failure reason.
+   ============================ */
+
+.server-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 92px;
+  flex-shrink: 0;
+}
+
+.server-status__numbers {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* During a re-check the previous numbers stay but step back visually. */
+.server-status__numbers--stale {
+  opacity: 0.45;
+  transition: opacity 150ms ease-out;
+}
+
+.server-status__fail {
+  display: flex;
+  align-items: center;
+  color: var(--color-danger);
+}
+
+.ping-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 13px;
+}
+
+.ping-bars__bar {
+  width: 3px;
+  border-radius: 1.5px;
+  background: rgba(148, 163, 184, 0.25);
+  transition: background-color 180ms ease-out;
+}
+
+.ping-bars__bar:nth-child(1) { height: 4px; }
+.ping-bars__bar:nth-child(2) { height: 6px; }
+.ping-bars__bar:nth-child(3) { height: 8px; }
+.ping-bars__bar:nth-child(4) { height: 10px; }
+.ping-bars__bar:nth-child(5) { height: 12.5px; }
+
+.ping-bars__bar--on {
+  background: var(--success);
+}
+
+/* Checking: the accent colour travels up the staircase as a soft wave. */
+@keyframes ping-bar-wave {
+  0%, 55%, 100% { background-color: rgba(148, 163, 184, 0.25); }
+  25% { background-color: var(--primary); }
+}
+
+.ping-bars--checking .ping-bars__bar {
+  animation: ping-bar-wave 1.15s ease-in-out infinite;
+}
+.ping-bars--checking .ping-bars__bar:nth-child(2) { animation-delay: 120ms; }
+.ping-bars--checking .ping-bars__bar:nth-child(3) { animation-delay: 240ms; }
+.ping-bars--checking .ping-bars__bar:nth-child(4) { animation-delay: 360ms; }
+.ping-bars--checking .ping-bars__bar:nth-child(5) { animation-delay: 480ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ping-bars--checking .ping-bars__bar {
+    animation: none;
+    background-color: var(--primary);
+    opacity: 0.6;
+  }
+}
+
+/* ============================
+   Loader version picker (instance editor → change loader version)
+   ============================ */
+
+.loader-version-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.loader-version-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--surface-border);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  font-family: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 150ms ease-out, border-color 150ms ease-out;
+}
+
+.loader-version-item:hover {
+  background: var(--surface-glass);
+}
+
+.loader-version-item--selected {
+  border-color: var(--primary);
+  background: var(--surface-glass);
+}
+
+.loader-version-item__badge {
+  font-size: var(--font-size-xs);
+  color: var(--success);
+  white-space: nowrap;
 }

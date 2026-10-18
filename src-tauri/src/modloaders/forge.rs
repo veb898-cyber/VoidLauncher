@@ -156,60 +156,6 @@ async fn download_installer(mc_version: &str, forge_version: &str) -> Result<Pat
     Ok(installer_path)
 }
 
-/// Find Java on the system for running the Forge installer processes.
-fn find_java() -> Option<PathBuf> {
-    if let Ok(java_home) = std::env::var("JAVA_HOME") {
-        let p = PathBuf::from(&java_home).join("bin").join("java.exe");
-        if p.exists() {
-            return Some(p);
-        }
-        let p = PathBuf::from(&java_home).join("bin").join("java");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(';') {
-            let p = PathBuf::from(dir).join("java.exe");
-            if p.exists() {
-                return Some(p);
-            }
-            let p = PathBuf::from(dir).join("java");
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    let common = vec![
-        r"C:\Program Files\Java",
-        r"C:\Program Files\Eclipse Adoptium",
-        r"C:\Program Files\Microsoft\jdk",
-        r"C:\Program Files\OpenJDK",
-        r"C:\Program Files\Amazon Corretto",
-        r"C:\Program Files\BellSoft\LibericaJDK",
-        r"C:\Program Files (x86)\Java",
-        r"C:\Program Files (x86)\Eclipse Adoptium",
-    ];
-    for base in common {
-        if let Ok(entries) = std::fs::read_dir(base) {
-            for entry in entries.flatten() {
-                let p = entry.path().join("bin").join("java.exe");
-                if p.exists() {
-                    return Some(p);
-                }
-            }
-        }
-    }
-    let mut sys = std::process::Command::new("java");
-    sys.arg("-version");
-    #[cfg(target_os = "windows")]
-    sys.creation_flags(0x08000000);
-    if crate::java::run_command_with_timeout(&mut sys, std::time::Duration::from_secs(15)).is_ok() {
-        return Some(PathBuf::from("java"));
-    }
-    None
-}
-
 /// Java major version expected by Forge for a MC version:
 /// 1.8–1.16.5 → 8, 1.17 → 16, 1.18–1.20.4 → 17, 1.20.5+ → 21.
 pub(crate) fn required_forge_java_major(mc_version: &str) -> u32 {
@@ -224,22 +170,40 @@ pub(crate) fn required_forge_java_major(mc_version: &str) -> u32 {
     }
 }
 
-/// Pick a Java for the Forge installer processor pipeline: prefer the
-/// same auto-detection the launch flow uses (`find_all_java_installations`
-/// + `get_recommended_java` — exact major match, else closest higher),
-///   so we never run old ForgeGradle with a too-new JVM (which fails with
-///   cryptic "did not generate" errors). Falls back to any system Java.
+/// Pick a Java for the Forge installer processor pipeline.
+///
+/// Processors are version-sensitive in BOTH directions: old ForgeGradle
+/// dies on a too-new JVM with cryptic "Unsupported class file major
+/// version" / "did not generate" errors, while new installers need at least
+/// their required major. So an EXACT major is required below 21, and 21 is
+/// treated as a minimum (modern installers run on 22+). The old
+/// closest-higher matching handed Java 21 to 1.16-era ForgeGradle. Falls
+/// back to any system Java only when nothing suitable is installed.
 pub(crate) fn find_java_for(data_dir: &Path, mc_version: &str) -> Option<PathBuf> {
     let want = required_forge_java_major(mc_version);
     let data_dir = data_dir.to_path_buf();
     let all = crate::launch::find_all_java_installations(&data_dir);
-    match crate::java::get_recommended_java(Some(want), &all) {
+    let chosen = all
+        .iter()
+        .find(|j| j.is_64bit && j.major_version == want)
+        .cloned()
+        .or_else(|| {
+            if want >= 21 {
+                all.iter()
+                    .filter(|j| j.is_64bit && j.major_version > want)
+                    .min_by_key(|j| j.major_version)
+                    .cloned()
+            } else {
+                None
+            }
+        });
+    match chosen {
         Some(j) => {
             tracing::debug!(target: "launcher", "Using Java {} (v{}) for Forge processors (want {})",
                 j.major_version, j.version, want);
             Some(j.path)
         }
-        None => find_java(),
+        None => None,
     }
 }
 

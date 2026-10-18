@@ -49,6 +49,7 @@ pub fn sanitize_instance_name(name: &str) -> String {
 // ---------------------------------------------------------------------------
 
 struct OutputReaderShared {
+    pid: u32,
     session_path: Option<String>,
     remaining: AtomicUsize,
     exit_code: AtomicI32,
@@ -108,19 +109,27 @@ fn finish_stream(shared: &Arc<OutputReaderShared>) {
             &format!("[INFO] [launch] Game exited with code {}", code),
         );
     }
+    // The run is over — drop its registry entry so long sessions don't leak
+    // one Arc<OutputReaderShared> per launch for the launcher's lifetime.
+    with_exit_registry(|reg| reg.remove(&shared.pid));
 }
 
 /// Spawn reader threads for a freshly spawned game process. Called once per
-/// launch right after `Command::spawn` with piped stdio.
+/// launch right after `Command::spawn` with piped stdio. `session_path` is
+/// the session file this run must append to — passed explicitly so that
+/// launching instance B while instance A is still running cannot redirect
+/// A's output into B's log (and vice versa).
 pub fn attach_output_readers(
     pid: u32,
     stdout_pipe: Box<dyn std::io::Read + Send>,
     stderr_pipe: Box<dyn std::io::Read + Send>,
     raw_stdout_file: Option<std::fs::File>,
     raw_stderr_file: Option<std::fs::File>,
+    session_path: Option<String>,
 ) {
     let shared = Arc::new(OutputReaderShared {
-        session_path: get_current_log_path(),
+        pid,
+        session_path,
         remaining: AtomicUsize::new(2),
         exit_code: AtomicI32::new(0),
         exit_set: Arc::new(AtomicBool::new(false)),
@@ -185,6 +194,18 @@ pub fn get_current_log_path() -> Option<String> {
 pub fn clear_current_log_path() {
     if let Ok(mut guard) = CURRENT_LOG_PATH.lock() {
         *guard = None;
+    }
+}
+
+/// Clear the current session pointer only if it still points at `path`.
+/// The exit watcher calls this with its own run's path: with several games
+/// running, a game that exits must not wipe the pointer that now belongs to
+/// a newer launch.
+pub fn clear_current_log_path_if(path: &str) {
+    if let Ok(mut guard) = CURRENT_LOG_PATH.lock() {
+        if guard.as_deref() == Some(path) {
+            *guard = None;
+        }
     }
 }
 

@@ -47,14 +47,24 @@ interface InstanceState {
   error: string | null;
   isLaunching: boolean;
   launchStatus: string | null;
-  /** Pending loader install: instance name + check result */
-  pendingLoaderInstall: { instanceName: string; check: LoaderCheckResult } | null;
+  /** Pending loader install: instance name + check result. If the launch
+   *  started from a saved server, the auto-join target is kept so the launch
+   *  resumes with it after the loader is installed. */
+  pendingLoaderInstall: {
+    instanceName: string;
+    check: LoaderCheckResult;
+    serverAddress?: string;
+    serverPort?: number;
+  } | null;
 
   loadInstances: () => Promise<void>;
   createInstance: (name: string, mcVersion: string, loader?: string, loaderVersion?: string) => Promise<void>;
   deleteInstance: (name: string) => Promise<void>;
   selectInstance: (name: string | null) => void;
-  launchGame: (instanceName: string, serverAddress?: string, serverPort?: number) => Promise<void>;
+  /** Launches the instance. Resolves `true` when the launch was accepted;
+   *  `false` when it failed (error is set) or is waiting for the user to
+   *  install the loader (pendingLoaderInstall is set). */
+  launchGame: (instanceName: string, serverAddress?: string, serverPort?: number) => Promise<boolean>;
   dismissLoaderInstall: () => void;
   installVersion: (versionUrl: string, instanceId?: string) => Promise<string>;
   checkInstalled: (instanceName: string) => Promise<boolean>;
@@ -69,6 +79,14 @@ function reportInstanceError(message: string) {
 function reportLaunchStatus(message: string | null) {
   if (message) logUiMessage(message, 'info', 'launch');
 }
+
+/**
+ * In-flight launch guard, keyed by instance name. A double-click (or two
+ * callers racing) must not fire `cmd_launch_game` twice for the same
+ * instance — the backend also reserves the slot, this just avoids the
+ * duplicate round-trip and duplicate error toasts.
+ */
+const launchingInstances = new Set<string>();
 
 export const useInstanceStore = create<InstanceState>((set) => ({
   instances: [],
@@ -120,26 +138,35 @@ export const useInstanceStore = create<InstanceState>((set) => ({
   },
 
   launchGame: async (instanceName: string, serverAddress?: string, serverPort?: number) => {
-    set({ isLaunching: true, launchStatus: 'Checking instance...' });
+    if (launchingInstances.has(instanceName)) return false;
+    launchingInstances.add(instanceName);
+
+    // Clear a stale error so callers can reliably tell this launch's outcome
+    // apart from an earlier failure.
+    set({ isLaunching: true, launchStatus: 'Checking instance...', error: null });
     reportLaunchStatus('Checking instance...');
 
     try {
-      // Check if loader needs to be installed
-      const check = await invoke<LoaderCheckResult>('cmd_check_instance_loader', { instanceName });
-      if (check.needs_install) {
-        set({ isLaunching: false, launchStatus: null, pendingLoaderInstall: { instanceName, check } });
-        return;
+      try {
+        // Check if loader needs to be installed
+        const check = await invoke<LoaderCheckResult>('cmd_check_instance_loader', { instanceName });
+        if (check.needs_install) {
+          set({
+            isLaunching: false,
+            launchStatus: null,
+            pendingLoaderInstall: { instanceName, check, serverAddress, serverPort },
+          });
+          return false;
+        }
+      } catch {
+        // If check fails, try launching anyway (will get an error from backend if truly missing)
       }
-    } catch {
-      // If check fails, try launching anyway (will get an error from backend if truly missing)
-    }
 
-    set({ launchStatus: 'Launching...' });
-    reportLaunchStatus('Launching...');
-    // The window is NOT minimized here. It gets minimized only when the
-    // `game_started` event arrives from the backend (see useGameEvents),
-    // i.e. when the Minecraft process is actually running.
-    try {
+      set({ launchStatus: 'Launching...' });
+      reportLaunchStatus('Launching...');
+      // The window is NOT minimized here. It gets minimized only when the
+      // `game_started` event arrives from the backend (see useGameEvents),
+      // i.e. when the Minecraft process is actually running.
       const result = await invoke<string>('cmd_launch_game', {
         instanceName,
         serverAddress: serverAddress ?? null,
@@ -147,10 +174,14 @@ export const useInstanceStore = create<InstanceState>((set) => ({
       });
       reportLaunchStatus(result);
       set({ isLaunching: false, launchStatus: result });
+      return true;
     } catch (e: any) {
       const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);
       set({ isLaunching: false, launchStatus: null, error: msg });
+      return false;
+    } finally {
+      launchingInstances.delete(instanceName);
     }
   },
 

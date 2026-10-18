@@ -5,13 +5,15 @@ import { CheckCircle2, AlertTriangle, Loader2, Wrench } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
-import { Segmented } from '../ui/Segmented';
+import { SlidingTabs } from '../ui/SlidingTabs';
 import { useT, type MessageKey } from '../../lib/i18n';
 
 interface VerifyIssue {
   path: string;
   kind: string;
   repairable: boolean;
+  /** Extra context for the kind ("outdated_loader" carries the loader range). */
+  detail?: string | null;
 }
 
 interface VerifyCategory {
@@ -55,6 +57,8 @@ const KIND_LABELS: Record<string, MessageKey> = {
   missing: 'verify.kind_missing',
   corrupt: 'verify.kind_corrupt',
   invalid: 'verify.kind_invalid',
+  unsafe: 'verify.kind_unsafe',
+  outdated_loader: 'verify.kind_outdated_loader',
 };
 
 /** Which part of an instance to scan: everything, launcher files only, or one
@@ -84,8 +88,29 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
   const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<RepairSummary | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
+  // Per-scope results stay valid for the lifetime of the open dialog: switching
+  // the scope tab shows the stored result instead of re-scanning. The cache is
+  // dropped by «Проверить снова», by a repair, and on unmount (closing the
+  // dialog) — owner: «результаты одни и те же, пока не закрою это окно или
+  // пока не проведу проверку заново».
+  const cacheRef = useRef<Partial<Record<VerifyScope, VerifyReport>>>({});
+  // Latest scan request wins: a slow reply for a previous scope must not
+  // overwrite the report of the scope the user is looking at now.
+  const requestSeq = useRef(0);
 
-  const runVerify = useCallback(async () => {
+  const runVerify = useCallback(async (force = false) => {
+    if (!force) {
+      const cached = cacheRef.current[scope];
+      if (cached) {
+        requestSeq.current += 1;
+        setReport(cached);
+        setError(null);
+        setSummary(null);
+        setChecking(false);
+        return;
+      }
+    }
+    const seq = ++requestSeq.current;
     setChecking(true);
     setError(null);
     setSummary(null);
@@ -94,12 +119,15 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
         instanceName,
         scope,
       });
-      setReport(result);
+      cacheRef.current[scope] = result;
+      if (seq === requestSeq.current) setReport(result);
     } catch (e) {
-      setError(String(e));
-      setReport(null);
+      if (seq === requestSeq.current) {
+        setError(String(e));
+        setReport(null);
+      }
     } finally {
-      setChecking(false);
+      if (seq === requestSeq.current) setChecking(false);
     }
   }, [instanceName, scope]);
 
@@ -146,7 +174,9 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
         instanceName,
       });
       setSummary(result);
-      await runVerify();
+      // The instance changed on disk — every cached scope is stale now.
+      cacheRef.current = {};
+      await runVerify(true);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -170,7 +200,7 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
             {t('verify.close')}
           </Button>
           {!busy && (
-            <Button variant="secondary" onClick={runVerify}>
+            <Button variant="secondary" onClick={() => runVerify(true)}>
               {t('verify.retry')}
             </Button>
           )}
@@ -187,19 +217,22 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
 
       {/* Scope: all / launcher files / one content folder. Changing it
           re-runs the scan (runVerify depends on scope). Repair is always
-          launcher-managed, so a content-only scope has nothing to repair. */}
+          launcher-managed, so a content-only scope has nothing to repair.
+          Same sliding-frame row as the create dialog's version/loader
+          switches (owner directive: the indicator must match those). */}
       <div style={{ marginBottom: 'var(--space-md)' }}>
-        <Segmented
+        <SlidingTabs<VerifyScope>
           ariaLabel={t('verify.scope_label')}
-          block
-          value={scope}
+          className="wizard-switch"
+          style={{ borderBottom: 'none', marginBottom: 0, justifyContent: 'center' }}
+          active={scope}
           onChange={setScope}
-          options={[
-            { value: 'all', label: t('verify.scope_all'), disabled: busy },
-            { value: 'launcher', label: t('verify.scope_launcher'), disabled: busy },
-            { value: 'mods', label: t('verify.scope_mods'), disabled: busy },
-            { value: 'resourcepacks', label: t('verify.scope_resourcepacks'), disabled: busy },
-            { value: 'shaderpacks', label: t('verify.scope_shaderpacks'), disabled: busy },
+          tabs={[
+            { id: 'all', label: t('verify.scope_all'), disabled: busy },
+            { id: 'launcher', label: t('verify.scope_launcher'), disabled: busy },
+            { id: 'mods', label: t('verify.scope_mods'), disabled: busy },
+            { id: 'resourcepacks', label: t('verify.scope_resourcepacks'), disabled: busy },
+            { id: 'shaderpacks', label: t('verify.scope_shaderpacks'), disabled: busy },
           ]}
         />
       </div>
@@ -310,6 +343,11 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
                     }}
                   >
                     <code style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{issue.path}</code>
+                    {issue.detail && (
+                      <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>
+                        {t('verify.issue_requires', { range: issue.detail })}
+                      </span>
+                    )}
                     <span style={{ color: issue.kind === 'missing' ? 'var(--danger, #e5534b)' : 'var(--warning, #d29922)', flexShrink: 0 }}>
                       {KIND_LABELS[issue.kind] ? t(KIND_LABELS[issue.kind]) : issue.kind}
                     </span>

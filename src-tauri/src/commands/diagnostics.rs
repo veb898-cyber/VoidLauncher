@@ -37,6 +37,33 @@ pub async fn cmd_analyze_crash(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.clone()
     };
+
+    // The renderer picks the session file; keep it inside the launcher data
+    // directory so a crafted path cannot make the backend read arbitrary
+    // files (game logs live under <data_dir>/logs/game).
+    let session_path = match session_path {
+        Some(p) => {
+            let data_dir = config
+                .data_dir
+                .canonicalize()
+                .map_err(|_| "Invalid launcher data directory".to_string())?;
+            match std::path::Path::new(&p).canonicalize() {
+                Ok(canon) if canon.starts_with(&data_dir) => {
+                    Some(canon.to_string_lossy().to_string())
+                }
+                Ok(_) => {
+                    return Err(
+                        "Access denied: session log is outside the launcher data directory"
+                            .to_string(),
+                    )
+                }
+                // Missing file: analyze as if no specific session was given.
+                Err(_) => None,
+            }
+        }
+        None => None,
+    };
+
     tauri::async_runtime::spawn_blocking(move || {
         diagnostics::analyze_crash(&config, &instance_name, session_path.as_deref())
     })

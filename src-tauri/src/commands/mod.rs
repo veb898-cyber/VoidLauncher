@@ -16,5 +16,6 @@ pub mod modpacks;
 pub mod mods;
 pub mod packlock;
 pub mod rooms;
+pub mod servers;
 pub mod verify;
 pub mod versions;

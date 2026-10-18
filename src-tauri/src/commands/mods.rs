@@ -13,7 +13,7 @@ use crate::AppState;
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 // ==================== Modrinth API ====================
 
@@ -96,6 +96,7 @@ pub struct ModUpdateResult {
 
 #[tauri::command]
 pub async fn cmd_check_mod_updates(
+    app: AppHandle,
     state: State<'_, AppState>,
     instance_name: String,
     mc_version: Option<String>,
@@ -288,8 +289,17 @@ pub async fn cmd_check_mod_updates(
             .await
             {
                 Ok(r) => r.data,
-                // A blip must never claim "no updates".
-                Err(_) => continue,
+                // A blip must never silently claim "no updates" for this mod:
+                // surface it in the log, keep checking the rest.
+                Err(e) => {
+                    let msg = format!(
+                        "Update check: CurseForge request failed for '{}': {}",
+                        m.name, e
+                    );
+                    tracing::warn!(target: "launcher", "{}", msg);
+                    crate::events::emit_log(&app, "warn", "content", &msg);
+                    continue;
+                }
             };
             let Some(new_file) = files
                 .iter()
@@ -357,14 +367,17 @@ pub async fn cmd_check_mod_updates(
             };
 
             let installed_hash = mod_file.hash.as_deref().unwrap_or("");
+            // Compare only like-for-like: sha512 used to be substituted for
+            // the missing sha1, so the comparison never matched and every
+            // check reported a phantom update. No sha1 → report the update
+            // without a hash guard (expected_sha1 empty = no verification).
             let file_hash = primary_file
                 .hashes
                 .get("sha1")
-                .or_else(|| primary_file.hashes.get("sha512"))
                 .map(|s| s.as_str())
                 .unwrap_or("");
 
-            if installed_hash == file_hash {
+            if !file_hash.is_empty() && installed_hash == file_hash {
                 continue;
             }
 
@@ -554,16 +567,25 @@ pub async fn cmd_popular_curseforge(
 
 // ==================== Mod Installation ====================
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModMetadata {
+    #[serde(default)]
     pub filename: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
     pub provider: String,
+    #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
     pub file_size: u64,
+    #[serde(default)]
     pub icon: Option<String>,
+    #[serde(default)]
     pub slug: Option<String>,
+    #[serde(default)]
     pub project_id: Option<String>,
     /// `true` when the slug came from the `.voidlauncher.json` sidecar
     /// (i.e. the mod was installed via the launcher and the slug is the
@@ -674,7 +696,13 @@ pub async fn cmd_install_mod(
             return Err(format!("Local file not found: {}", local_path.display()));
         }
         std::fs::copy(&local_path, &dest).map_err(|e| e.to_string())?;
-        download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
+        // Reject non-archives (a picked .txt renamed to .jar, a truncated
+        // file) and do not leave the bad copy behind: it would show up in
+        // the mods list as a broken entry forever.
+        if let Err(e) = download::verify_zip_magic(&dest) {
+            let _ = std::fs::remove_file(&dest);
+            return Err(e.to_string());
+        }
         // Unified sidecar so the Source column shows Local instead of a
         // loader name from jar metadata (no project — nothing to update).
         let hash = download::hash_file_sha1(&dest).ok();
@@ -705,12 +733,18 @@ pub async fn cmd_install_mod(
             download_url
         ));
     }
-    download::download_file(&download_url, &dest, "")
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = download::download_file(&download_url, &dest, "").await {
+        // A failed transfer must not leave a partial/corrupt file in the
+        // mods folder (it would be listed as an installed mod).
+        let _ = std::fs::remove_file(&dest);
+        return Err(e.to_string());
+    }
     // No SHA1 is available for mod downloads — at least verify the result is
     // a real JAR archive and not an error page / bogus response.
-    download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
+    if let Err(e) = download::verify_zip_magic(&dest) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e.to_string());
+    }
     let final_name = safe_name.clone();
 
     // Write unified sidecar metadata (`.index/` folder, same layout as
@@ -791,7 +825,7 @@ pub async fn cmd_download_to_folder(
     {
         return Err("Subfolder contains invalid characters.".to_string());
     }
-    let (dest_dir, safe_name, dest) = {
+    let (dest_dir, safe_name) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let instance = instances::get_instance(&config.instances_dir(), &instance_name)
             .map_err(|e| e.to_string())?;
@@ -804,9 +838,34 @@ pub async fn cmd_download_to_folder(
             .and_then(|n| n.to_str())
             .ok_or("Invalid file name")?
             .to_string();
-        let dest = dest_dir.join(&safe_name);
-        (dest_dir, safe_name, dest)
+        (dest_dir, safe_name)
     };
+    // No caller-provided old filename? Resolve it from the sidecar index by
+    // project id: installing another version of an already-installed project
+    // (or a dependency that is already present) must replace the old file
+    // instead of adding a second jar next to it.
+    let old_filename = match old_filename {
+        Some(f) => Some(f),
+        None => project_id.as_deref().and_then(|pid| {
+            content::list_installed(&dest_dir, content::content_type_for_dir(safe_subfolder))
+                .into_iter()
+                .find(|ic| ic.project_id.as_deref() == Some(pid))
+                .map(|ic| ic.filename)
+        }),
+    };
+    // An update of a DISABLED file must stay disabled: the `.disabled`
+    // suffix is the enable switch the game honors, and dropping it silently
+    // re-enabled the mod on every update.
+    let keep_disabled = old_filename
+        .as_deref()
+        .map(|f| f.ends_with(".disabled"))
+        .unwrap_or(false);
+    let final_name = if keep_disabled {
+        format!("{}.disabled", safe_name)
+    } else {
+        safe_name.clone()
+    };
+    let dest = dest_dir.join(&final_name);
     // Park any old file aside (rename, never delete): the previous code
     // deleted the old jar before the network transfer started, so a failed
     // download left the user with no mod at all — and, due to a stem bug,
@@ -856,7 +915,7 @@ pub async fn cmd_download_to_folder(
     // Replacement verified — the parked old file is no longer needed.
     crate::instances::discard_stashed_files(&stashed);
     if let Some(ref raw_old) = old_filename {
-        crate::instances::cleanup_old_sidecar_after_update(&dest_dir, raw_old, &safe_name);
+        crate::instances::cleanup_old_sidecar_after_update(&dest_dir, raw_old, &final_name);
     }
 
     // Write unified sidecar metadata (`.index/` folder) so the installed file
@@ -869,7 +928,7 @@ pub async fn cmd_download_to_folder(
     };
     let _ = content::write_sidecar(
         &dest_dir,
-        &safe_name,
+        &final_name,
         &content::SidecarWrite {
             provider: &provider,
             content_type: content::content_type_for_dir(safe_subfolder),
@@ -882,7 +941,7 @@ pub async fn cmd_download_to_folder(
         },
     );
 
-    Ok(safe_name)
+    Ok(final_name)
 }
 
 #[tauri::command]
@@ -1026,13 +1085,137 @@ pub async fn cmd_get_mod_metadata(
 
 /// Session-level metadata cache: path -> (mtime, size, parsed metadata).
 /// Opening the mods tab re-scans the folder on every visit; with this cache a
-/// repeat visit skips re-opening every jar (the cold scan of ~250 jars took
+/// repeat visit skips re-opening every jar (the cold scan of a big pack took
 /// seconds). Entries invalidate automatically when file size/mtime changes.
+/// The map is ALSO persisted between runs (see `MetaCacheFile`) — a cold scan
+/// of the owner's ~370-mod pack measured 1.8s while the validated on-disk
+/// cache makes the first open of the next session cost only a stat pass.
 type ModMetaCache = std::collections::HashMap<PathBuf, (std::time::SystemTime, u64, ModMetadata)>;
 static META_CACHE: OnceLock<Mutex<ModMetaCache>> = OnceLock::new();
+/// Where the metadata cache is persisted between runs; resolved once from
+/// the config so the lazy statics have no config dependency.
+static META_CACHE_FILE: OnceLock<PathBuf> = OnceLock::new();
 
-fn meta_cache() -> &'static Mutex<ModMetaCache> {
-    META_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+/// Bump when jar parsing changes in a way that alters stored values:
+/// persisted entries are keyed only by path+mtime+size and would otherwise
+/// survive a parser change with stale results.
+const META_CACHE_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MetaCacheFile {
+    version: u32,
+    entries: Vec<MetaCacheFileEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MetaCacheFileEntry {
+    #[serde(default)]
+    path: String,
+    /// Milliseconds since the Unix epoch (0 = unknown, simply never matches
+    /// a real mtime, so the entry gets re-parsed).
+    #[serde(default)]
+    mtime_ms: u64,
+    #[serde(default)]
+    size: u64,
+    meta: ModMetadata,
+}
+
+fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn millis_to_system_time(ms: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)
+}
+
+fn meta_cache_file(config: &AppConfig) -> &'static PathBuf {
+    META_CACHE_FILE.get_or_init(|| config.data_dir.join("mod_meta_cache.json"))
+}
+
+fn meta_cache(config: &AppConfig) -> &'static Mutex<ModMetaCache> {
+    META_CACHE.get_or_init(|| Mutex::new(load_meta_cache_from_disk(meta_cache_file(config))))
+}
+
+/// Best-effort load of the persisted metadata cache. Any problem (missing
+/// file, version mismatch, corruption) silently degrades to an empty cache —
+/// the scan then just re-parses the jars.
+fn load_meta_cache_from_disk(path: &std::path::Path) -> ModMetaCache {
+    let mut cache = ModMetaCache::new();
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return cache;
+    };
+    let Ok(file) = serde_json::from_str::<MetaCacheFile>(&raw) else {
+        return cache;
+    };
+    if file.version != META_CACHE_VERSION {
+        return cache;
+    }
+    for e in file.entries {
+        if e.path.is_empty() {
+            continue;
+        }
+        cache.insert(
+            PathBuf::from(e.path),
+            (millis_to_system_time(e.mtime_ms), e.size, e.meta),
+        );
+    }
+    cache
+}
+
+/// Best-effort persistence of the metadata cache. Write-to-tmp-then-rename,
+/// so a crash mid-write can never leave a truncated (and then ignored) file.
+/// A growth guard prunes entries whose files no longer exist once the cache
+/// carries thousands of them; below the threshold nothing is checked, so the
+/// common case stays cheap.
+fn save_meta_cache_to_disk(path: &std::path::Path, cache: &ModMetaCache) {
+    let mut entries: Vec<MetaCacheFileEntry> = cache
+        .iter()
+        .map(|(p, (mtime, size, meta))| MetaCacheFileEntry {
+            path: p.to_string_lossy().to_string(),
+            mtime_ms: system_time_to_millis(*mtime),
+            size: *size,
+            meta: meta.clone(),
+        })
+        .collect();
+    if entries.len() > 4000 {
+        entries.retain(|e| std::path::Path::new(&e.path).exists());
+    }
+    let Ok(json) = serde_json::to_string(&MetaCacheFile {
+        version: META_CACHE_VERSION,
+        entries,
+    }) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Patch a network-resolved mod icon into the metadata cache entry for
+/// `jar_path` (only when the entry still matches the file's mtime/size) and
+/// persist the cache. Called only when the jar itself ships no logo: such a
+/// mod had its icon re-fetched from the network on every app run — after the
+/// first resolve the metadata list itself carries the icon, so the slow
+/// fallback runs once, ever. Icons extracted from jars are NOT stored (the
+/// quick local extraction stays the source of truth; embedding every jar
+/// icon would bloat the metadata payload).
+fn store_mod_icon_in_meta_cache(
+    config: &AppConfig,
+    jar_path: &std::path::Path,
+    mtime: std::time::SystemTime,
+    size: u64,
+    icon: &str,
+) {
+    let mut cache = meta_cache(config).lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((m, s, meta)) = cache.get_mut(jar_path) {
+        if *m == mtime && *s == size && meta.icon.as_deref() != Some(icon) {
+            meta.icon = Some(icon.to_string());
+            save_meta_cache_to_disk(meta_cache_file(config), &cache);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1054,6 +1237,10 @@ pub(crate) fn get_mod_metadata(
     if !mods_dir.exists() {
         return Ok(Vec::new());
     }
+    // Roll back any file parked by an interrupted update before scanning —
+    // otherwise the mod stays invisible (a parked name is not a .jar and is
+    // skipped by this listing) until some other screen happens to recover it.
+    instances::recover_stashed_content_files(&mods_dir);
     let pw_index = std::sync::Arc::new(instances::load_packwiz_index(&mods_dir));
 
     // Collect candidate files (cheap stat calls) before spawning workers.
@@ -1077,7 +1264,16 @@ pub(crate) fn get_mod_metadata(
                 continue;
             }
             let (mtime, size) = match std::fs::metadata(&path) {
-                Ok(m) => (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len()),
+                // Truncate to whole milliseconds: the metadata cache persists
+                // mtimes as ints and a raw Windows SystemTime carries 100ns
+                // precision, so an un-truncated value never matches the value
+                // reloaded from disk (every entry was a miss on every run).
+                Ok(m) => (
+                    millis_to_system_time(system_time_to_millis(
+                        m.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    )),
+                    m.len(),
+                ),
                 Err(_) => (std::time::UNIX_EPOCH, 0),
             };
             files.push(ModFileEntry {
@@ -1101,7 +1297,7 @@ pub(crate) fn get_mod_metadata(
     let mut jobs: Vec<Job> = Vec::with_capacity(files.len());
     let mut missed_idx: Vec<usize> = Vec::new();
     {
-        let cache = meta_cache().lock().unwrap_or_else(|p| p.into_inner());
+        let cache = meta_cache(config).lock().unwrap_or_else(|p| p.into_inner());
         for (i, f) in files.iter().enumerate() {
             match cache.get(&f.path) {
                 Some((m, s, meta)) if *m == f.mtime && *s == f.size => {
@@ -1158,15 +1354,21 @@ pub(crate) fn get_mod_metadata(
     };
 
     // Store freshly computed entries in the cache, then merge results back
-    // into job order (jobs[i] for i in missed_idx are replaced).
+    // into job order (jobs[i] for i in missed_idx are replaced). When
+    // anything was freshly parsed, persist the cache so the NEXT app run
+    // opens the pack from validated disk data instead of re-parsing every
+    // jar; files are still validated by the mtime/size stat pass above.
     {
-        let mut cache = meta_cache().lock().unwrap_or_else(|p| p.into_inner());
+        let mut cache = meta_cache(config).lock().unwrap_or_else(|p| p.into_inner());
         for per_thread in &computed {
             for (k, meta) in per_thread {
                 let f = fresh[*k];
                 cache.insert(f.path.clone(), (f.mtime, f.size, meta.clone()));
                 jobs[missed_idx[*k]] = Job::Cached(meta.clone());
             }
+        }
+        if !missed_idx.is_empty() {
+            save_meta_cache_to_disk(meta_cache_file(config), &cache);
         }
     }
     let mut mods: Vec<ModMetadata> = Vec::with_capacity(jobs.len());
@@ -1556,6 +1758,35 @@ async fn cmd_get_mod_icon_impl(
         return Ok(None);
     }
 
+    // Same millisecond-truncated stat the metadata scan stores, so cache
+    // lookups and patches always compare like with like.
+    let (mtime, size) = match std::fs::metadata(&jar_path) {
+        Ok(m) => (
+            millis_to_system_time(system_time_to_millis(
+                m.modified().unwrap_or(std::time::UNIX_EPOCH),
+            )),
+            m.len(),
+        ),
+        Err(_) => (std::time::UNIX_EPOCH, 0),
+    };
+
+    // An icon already *resolved* on an earlier run (a network logo stored as
+    // a data URL) is served immediately — no network round trip. A plain
+    // scan value is NOT displayable and must never be returned: it is the
+    // icon's path INSIDE the jar ("assets/modid/icon.png" from
+    // fabric.mod.json / logoFile), so the jar must be read and the real
+    // image extracted below.
+    {
+        let cache = meta_cache(config).lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((m, s, meta)) = cache.get(&jar_path) {
+            if *m == mtime && *s == size {
+                if let Some(icon) = meta.icon.as_deref().filter(|i| i.starts_with("data:")) {
+                    return Ok(Some(icon.to_string()));
+                }
+            }
+        }
+    }
+
     // Try extracting icon from the jar itself
     if let Ok(Some(icon)) = extract_icon_from_jar(&jar_path) {
         return Ok(Some(icon));
@@ -1575,6 +1806,7 @@ async fn cmd_get_mod_icon_impl(
                             if let Ok(Some(icon)) =
                                 fetch_curseforge_mod_icon(pid, &curseforge_api_key).await
                             {
+                                store_mod_icon_in_meta_cache(config, &jar_path, mtime, size, &icon);
                                 return Ok(Some(icon));
                             }
                         }
@@ -1610,6 +1842,9 @@ async fn cmd_get_mod_icon_impl(
                 if let Ok(project) = modrinth::get_project(&pid).await {
                     if let Some(icon_url) = project.icon_url {
                         if let Some(icon_data) = fetch_remote_icon(&icon_url).await {
+                            store_mod_icon_in_meta_cache(
+                                config, &jar_path, mtime, size, &icon_data,
+                            );
                             return Ok(Some(icon_data));
                         }
                     }
@@ -1868,4 +2103,102 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod meta_cache_file_tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn sample_meta() -> ModMetadata {
+        ModMetadata {
+            filename: "sodium.jar".into(),
+            name: "Sodium".into(),
+            version: "0.6.0".into(),
+            provider: "Modrinth".into(),
+            enabled: true,
+            file_size: 4242,
+            icon: None,
+            slug: Some("sodium".into()),
+            project_id: Some("AANobbMI".into()),
+            slug_verified: true,
+        }
+    }
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vl-metacache-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    #[test]
+    fn disk_cache_roundtrip_preserves_entries() {
+        let dir = test_dir("roundtrip");
+        let file = dir.join("mod_meta_cache.json");
+
+        // Missing file → empty cache, no error.
+        assert!(load_meta_cache_from_disk(&file).is_empty());
+
+        let mut cache = ModMetaCache::new();
+        let mtime = UNIX_EPOCH + Duration::from_millis(1_700_000_123_456);
+        cache.insert(
+            PathBuf::from("C:/inst/mods/sodium.jar"),
+            (mtime, 4242, sample_meta()),
+        );
+        save_meta_cache_to_disk(&file, &cache);
+
+        let loaded = load_meta_cache_from_disk(&file);
+        assert_eq!(loaded.len(), 1);
+        let (m, s, meta) = loaded
+            .get(std::path::Path::new("C:/inst/mods/sodium.jar"))
+            .expect("entry survives the roundtrip");
+        assert_eq!(*m, mtime, "mtime keeps millisecond precision");
+        assert_eq!(*s, 4242);
+        assert_eq!(meta.name, "Sodium");
+        assert_eq!(meta.project_id.as_deref(), Some("AANobbMI"));
+        assert!(meta.slug_verified);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_cache_rejects_wrong_version_and_garbage() {
+        let dir = test_dir("reject");
+        let file = dir.join("mod_meta_cache.json");
+
+        // Wrong format version → discarded wholesale (parser may have changed).
+        std::fs::write(
+            &file,
+            r#"{"version":999999,"entries":[{"path":"C:/x.jar","mtime_ms":1,"size":2,"meta":{}}]}"#,
+        )
+        .unwrap();
+        assert!(load_meta_cache_from_disk(&file).is_empty());
+
+        // Corrupt JSON → discarded, never panics.
+        std::fs::write(&file, "{not json at all").unwrap();
+        assert!(load_meta_cache_from_disk(&file).is_empty());
+
+        // Current version, but the entry itself is partial: serde defaults
+        // fill non-meta fields, so the entry still loads.
+        std::fs::write(
+            &file,
+            r#"{"version":1,"entries":[{"path":"C:/x.jar","mtime_ms":5,"size":6,"meta":{"name":"X"}}]}"#,
+        )
+        .unwrap();
+        let loaded = load_meta_cache_from_disk(&file);
+        assert_eq!(loaded.len(), 1);
+        let meta = loaded
+            .values()
+            .next()
+            .map(|(_, _, m)| m)
+            .expect("partial entry loads");
+        assert_eq!(meta.name, "X");
+        assert_eq!(
+            meta.filename, "",
+            "missing fields default instead of failing"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

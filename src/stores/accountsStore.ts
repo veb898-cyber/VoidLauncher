@@ -20,6 +20,14 @@ export interface AccountEntry {
   has_ms_session?: boolean;
 }
 
+/** One cape owned by a Microsoft account (png = texture as a data URL). */
+export interface CapeEntry {
+  id: string;
+  alias: string;
+  active: boolean;
+  png: string;
+}
+
 interface AccountsState {
   accounts: AccountEntry[];
   isLoading: boolean;
@@ -30,6 +38,8 @@ interface AccountsState {
   removeAccount: (id: string) => Promise<void>;
   setDefaultAccount: (id: string) => Promise<void>;
   changeSkin: (accountId: string, skinPath: string, variant?: string) => Promise<void>;
+  getPlayerCapes: (accountId: string) => Promise<CapeEntry[]>;
+  setPlayerCape: (accountId: string, capeId: string | null) => Promise<CapeEntry[]>;
 }
 
 export const useAccountsStore = create<AccountsState>((set, get) => ({
@@ -96,4 +106,10 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       throw e;
     }
   },
+
+  getPlayerCapes: (accountId: string) =>
+    invoke<CapeEntry[]>('cmd_get_player_capes', { accountId }),
+
+  setPlayerCape: (accountId: string, capeId: string | null) =>
+    invoke<CapeEntry[]>('cmd_set_player_cape', { accountId, capeId }),
 }));

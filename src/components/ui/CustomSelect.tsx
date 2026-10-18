@@ -184,7 +184,7 @@ export function CustomSelect<T extends string>({
   const list = open && pos ? (
     <ul
       ref={listRef}
-      className={`custom-select__list ${openUpward ? 'custom-select__list--up' : ''}`}
+      className={`custom-select__list ${pos.top === null ? 'custom-select__list--up' : ''}`}
       role="listbox"
       style={{
         position: 'fixed',

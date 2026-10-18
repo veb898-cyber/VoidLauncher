@@ -14,10 +14,12 @@
 use crate::config::AppConfig;
 use crate::download;
 use crate::error::{LauncherError, Result};
+use crate::import::check_safe_remote_path;
 use crate::instances::{self, Instance, LoaderType};
 use crate::modloaders;
 use crate::versions::{self, VersionInfo};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
@@ -29,10 +31,14 @@ const MAX_ISSUES_LISTED: usize = 100;
 pub struct VerifyIssue {
     /// Path relative to the launcher data or instance directory.
     pub path: String,
-    /// "missing" | "corrupt" | "invalid"
+    /// "missing" | "corrupt" | "invalid" | "outdated_loader"
     pub kind: String,
     /// True when repair can fix this issue by re-downloading.
     pub repairable: bool,
+    /// Extra context for the kind: "outdated_loader" carries the loader
+    /// version range the mod asked for (e.g. ">=0.19.5"). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -94,6 +100,7 @@ impl CategoryBuilder {
                 path: path.into(),
                 kind: kind.to_string(),
                 repairable,
+                detail: None,
             });
         }
     }
@@ -157,8 +164,136 @@ fn scan_content(instances_dir: &Path, instance: &Instance, dirs: &[&str]) -> Vec
                     path: format!("{}/{}", dir_name, name),
                     kind: "corrupt".to_string(),
                     repairable: false,
+                    detail: None,
                 });
             }
+        }
+    }
+    issues
+}
+
+/// Read `depends.fabricloader` from a mod jar's `fabric.mod.json`.
+/// `None` when the file is not a Fabric mod, declares no loader requirement,
+/// or cannot be read (corrupt archives are reported by `scan_content`).
+fn fabric_loader_dep(jar: &Path) -> Option<Vec<String>> {
+    let file = std::fs::File::open(jar).ok()?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
+    let mut entry = archive.by_name("fabric.mod.json").ok()?;
+    let mut contents = String::new();
+    entry.read_to_string(&mut contents).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    match json.get("depends")?.get("fabricloader")? {
+        serde_json::Value::String(s) => Some(vec![s.clone()]),
+        serde_json::Value::Array(a) => {
+            let ranges: Vec<String> = a
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            if ranges.is_empty() {
+                None
+            } else {
+                Some(ranges)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Does `installed` satisfy one simple Fabric version range ("\u22650.19.5"
+/// style)? Supports plain comparators mods actually use; `None` for ranges
+/// with syntax we do not model (\u201c*\u201d, wildcards, pre-release/build tails of
+/// the constraint) so unusual constraints can never produce a false warning.
+fn version_satisfies(installed: &str, range: &str) -> Option<bool> {
+    use std::cmp::Ordering;
+    let range = range.trim();
+    if range.is_empty() || range == "*" {
+        return None;
+    }
+    if range
+        .chars()
+        .any(|c| matches!(c, 'x' | 'X' | '*' | '^' | '~'))
+    {
+        return None;
+    }
+    let (op, version) = [">=", "<=", "==", ">", "<", "="]
+        .iter()
+        .find_map(|op| range.strip_prefix(op).map(|v| (*op, v)))
+        .unwrap_or(("=", range));
+    // Keep digits and dots only ("0.19.5-", "0.19.5+build" \u2192 "0.19.5").
+    let version: String = version
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if version.is_empty() || version.ends_with('.') {
+        return None;
+    }
+    let ord = crate::modloaders::prism_meta::compare_versions(installed, &version);
+    Some(match op {
+        ">=" => ord != Ordering::Less,
+        "<=" => ord != Ordering::Greater,
+        ">" => ord == Ordering::Greater,
+        "<" => ord == Ordering::Less,
+        _ => ord == Ordering::Equal,
+    })
+}
+
+/// Fabric mods whose `depends.fabricloader` the instance's loader version
+/// does not satisfy. This failure aborts the run at mod resolution before
+/// any crash report exists, so the launch log used to say "nothing found"
+/// and verification called the files fine (owner bug). Read-only warning:
+/// updating Fabric Loader fixes it, repair cannot.
+fn scan_fabric_loader_requirements(instances_dir: &Path, instance: &Instance) -> Vec<VerifyIssue> {
+    if instance.loader != LoaderType::Fabric {
+        return Vec::new();
+    }
+    let Some(installed) = instance.loader_version.as_deref().filter(|v| !v.is_empty()) else {
+        return Vec::new();
+    };
+    let dir = instance.minecraft_dir(instances_dir).join("mods");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut issues = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.ends_with(".disabled") {
+            continue;
+        }
+        if !name.to_lowercase().ends_with(".jar") {
+            continue;
+        }
+        let Some(ranges) = fabric_loader_dep(&path) else {
+            continue;
+        };
+        let mut violated: Option<String> = None;
+        let mut skip = false;
+        for range in &ranges {
+            match version_satisfies(installed, range) {
+                Some(true) => {}
+                Some(false) => {
+                    violated = Some(range.clone());
+                    break;
+                }
+                None => {
+                    skip = true;
+                    break;
+                }
+            }
+        }
+        if skip {
+            continue;
+        }
+        if let Some(range) = violated {
+            issues.push(VerifyIssue {
+                path: format!("mods/{}", name),
+                kind: "outdated_loader".to_string(),
+                repairable: false,
+                detail: Some(range),
+            });
         }
     }
     issues
@@ -210,7 +345,11 @@ impl VerifyScope {
 
 /// Report for a content-only scope: no launcher categories, nothing repairable.
 fn content_only_report(config: &AppConfig, instance: &Instance, dirs: &[&str]) -> VerifyReport {
-    let content_issues = scan_content(&config.instances_dir(), instance, dirs);
+    let instances_dir = config.instances_dir();
+    let mut content_issues = scan_content(&instances_dir, instance, dirs);
+    if dirs.contains(&"mods") {
+        content_issues.extend(scan_fabric_loader_requirements(&instances_dir, instance));
+    }
     let content_issues_count = content_issues.len() as u32;
     let categories = vec![VerifyCategory {
         id: "content".to_string(),
@@ -311,18 +450,31 @@ pub fn verify_instance_scoped(
             }
             if let Some(downloads) = &lib.downloads {
                 if let Some(artifact) = &downloads.artifact {
-                    let p = libraries_dir.join(&artifact.path);
-                    check_library_file(
-                        &mut libraries,
-                        &p,
-                        &artifact.sha1,
-                        &format!("libraries/{}", artifact.path),
-                    );
+                    // Never stat/hash a path that remote metadata could have
+                    // pointed outside the libraries directory.
+                    if check_safe_remote_path(&artifact.path).is_err() {
+                        libraries.add_issue(
+                            format!("libraries/{}", artifact.path),
+                            "unsafe",
+                            false,
+                        );
+                    } else {
+                        let p = libraries_dir.join(&artifact.path);
+                        check_library_file(
+                            &mut libraries,
+                            &p,
+                            &artifact.sha1,
+                            &format!("libraries/{}", artifact.path),
+                        );
+                    }
                 }
                 if let Some(classifier) = versions::native_classifier(lib) {
                     if let Some(classifiers) = &downloads.classifiers {
                         if let Some(native) = classifiers.get(classifier.as_str()) {
                             if let Some(path) = native.get("path").and_then(|v| v.as_str()) {
+                                if check_safe_remote_path(path).is_err() {
+                                    continue;
+                                }
                                 let sha1 =
                                     native.get("sha1").and_then(|v| v.as_str()).unwrap_or("");
                                 let p = libraries_dir.join(path);
@@ -488,11 +640,12 @@ pub fn verify_instance_scoped(
     let mut categories = vec![metadata, minecraft, libraries, assets, loader, java];
     let mut content_issues_count = 0;
     if scope == VerifyScope::All {
-        let content_issues = scan_content(
+        let mut content_issues = scan_content(
             &instances_dir,
             instance,
             &["mods", "resourcepacks", "shaderpacks"],
         );
+        content_issues.extend(scan_fabric_loader_requirements(&instances_dir, instance));
         content_issues_count = content_issues.len() as u32;
         categories.push(VerifyCategory {
             id: "content".to_string(),
@@ -553,6 +706,9 @@ fn collect_repair_targets(
         }
         if let Some(downloads) = &lib.downloads {
             if let Some(artifact) = &downloads.artifact {
+                if check_safe_remote_path(&artifact.path).is_err() {
+                    continue;
+                }
                 let p = libraries_dir.join(&artifact.path);
                 let ok = p.exists()
                     && (artifact.sha1.is_empty()
@@ -575,6 +731,9 @@ fn collect_repair_targets(
                             native.get("sha1").and_then(|v| v.as_str()),
                             native.get("size").and_then(|v| v.as_u64()),
                         ) {
+                            if check_safe_remote_path(path).is_err() {
+                                continue;
+                            }
                             let p = libraries_dir.join(path);
                             let ok = p.exists()
                                 && (sha1.is_empty()
@@ -588,6 +747,9 @@ fn collect_repair_targets(
             }
         } else if let Some(url_base) = &lib.url {
             let rel = versions::maven_to_path(&lib.name);
+            if check_safe_remote_path(&rel).is_err() {
+                continue;
+            }
             let p = libraries_dir.join(&rel);
             if !p.exists() {
                 targets.push((format!("{}{}", url_base, rel), p, String::new(), 0));
@@ -1171,6 +1333,94 @@ mod tests {
             "content-only scope has nothing to repair"
         );
         assert!(!report.healthy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_fabric_mod_jar(path: &Path, mod_json: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("fabric.mod.json", opts).unwrap();
+        zw.write_all(mod_json.as_bytes()).unwrap();
+        zw.finish().unwrap();
+    }
+
+    fn fabric_instance(mc: &str, loader_version: &str) -> Instance {
+        let mut instance = test_instance(mc);
+        instance.loader = LoaderType::Fabric;
+        instance.loader_version = Some(loader_version.to_string());
+        instance
+    }
+
+    #[test]
+    fn version_satisfies_simple_ranges() {
+        assert_eq!(version_satisfies("0.19.3", ">=0.19.5"), Some(false));
+        assert_eq!(version_satisfies("0.19.5", ">=0.19.5"), Some(true));
+        assert_eq!(version_satisfies("0.20.0", ">=0.19.5"), Some(true));
+        assert_eq!(version_satisfies("0.19.3", "<0.19.5"), Some(true));
+        assert_eq!(version_satisfies("0.19.5", "<0.19.5"), Some(false));
+        assert_eq!(version_satisfies("0.15.0", "0.15.0"), Some(true));
+        assert_eq!(version_satisfies("0.16.0", "0.15.0"), Some(false));
+        assert_eq!(version_satisfies("0.19.3", ">=0.15.0-"), Some(true));
+        assert_eq!(version_satisfies("0.19.3", ">=0.15.0+build.1"), Some(true));
+        // Unmodelled ranges never yield a verdict.
+        assert_eq!(version_satisfies("0.19.3", "*"), None);
+        assert_eq!(version_satisfies("0.19.3", "^0.15.0"), None);
+        assert_eq!(version_satisfies("0.19.3", "~0.15"), None);
+        assert_eq!(version_satisfies("0.19.3", "0.19.x"), None);
+        assert_eq!(version_satisfies("0.19.3", ""), None);
+    }
+
+    #[test]
+    fn fabric_loader_requirement_is_flagged() {
+        let dir = temp_dir("loader_req");
+        let config = test_config(&dir);
+        let instance = fabric_instance("1.21.11", "0.19.3");
+        let mods = instance.mods_dir(&config.instances_dir());
+        write_fabric_mod_jar(
+            &mods.join("old-lang.jar"),
+            r#"{"id":"old-lang","depends":{"fabricloader":">=0.19.5"}}"#,
+        );
+        write_fabric_mod_jar(
+            &mods.join("fine.jar"),
+            r#"{"id":"fine","depends":{"fabricloader":">=0.15.0","minecraft":"1.21.11"}}"#,
+        );
+        write_fabric_mod_jar(
+            &mods.join("any-loader.jar"),
+            r#"{"id":"any-loader","depends":{"fabricloader":"*"}}"#,
+        );
+        write_fabric_mod_jar(&mods.join("plain.jar"), r#"{"id":"plain"}"#);
+
+        let report = verify_instance_scoped(&config, &instance, VerifyScope::Mods);
+
+        let content = cat(&report, "content");
+        assert_eq!(content.issue_count, 1);
+        let issue = &content.issues[0];
+        assert_eq!(issue.path, "mods/old-lang.jar");
+        assert_eq!(issue.kind, "outdated_loader");
+        assert_eq!(issue.detail.as_deref(), Some(">=0.19.5"));
+        assert!(!issue.repairable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fabric_loader_requirement_skipped_without_fabric() {
+        let dir = temp_dir("loader_req_forge");
+        let config = test_config(&dir);
+        let mut instance = test_instance("1.20.1");
+        instance.loader = LoaderType::Forge;
+        instance.loader_version = Some("47.2.0".to_string());
+        let mods = instance.mods_dir(&config.instances_dir());
+        write_fabric_mod_jar(
+            &mods.join("old-lang.jar"),
+            r#"{"id":"old-lang","depends":{"fabricloader":">=0.19.5"}}"#,
+        );
+
+        let report = verify_instance_scoped(&config, &instance, VerifyScope::Mods);
+
+        assert_eq!(report.content_issues, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

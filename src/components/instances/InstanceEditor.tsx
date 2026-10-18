@@ -17,6 +17,7 @@ import {
   resolveInitialMemoryMb,
 } from '../../lib/memory';
 import { useSettingsStore } from '../../stores/settingsStore';
+import { LoaderVersionModal } from './LoaderVersionModal';
 import { useT, getLanguage } from '../../lib/i18n';
 
 interface InstanceData {
@@ -69,6 +70,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const [systemRamMb, setSystemRamMb] = useState<number>(8192);
   const [baseline, setBaseline] = useState('');
   const [confirmClose, setConfirmClose] = useState(false);
+  const [loaderModalOpen, setLoaderModalOpen] = useState(false);
 
   useEffect(() => {
     // Initial memory resolves in this order:
@@ -104,8 +106,12 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     baseline !== '' &&
     JSON.stringify({ name, notes, memoryMb, jvmArgs, gcPreset, javaPath, resWidth, resHeight }) !== baseline;
 
-  /** Close via overlay click / Escape / Cancel — but ask first when dirty. */
+  /** Close via overlay click / Escape / Cancel — but ask first when dirty.
+   *  While the loader version dialog is open, Escape belongs to it: both
+   *  modals listen on the window, and without this guard one Escape would
+   *  close the editor underneath as well. */
   const requestClose = () => {
+    if (loaderModalOpen) return;
     if (dirty) setConfirmClose(true);
     else onClose();
   };
@@ -180,10 +186,36 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const zgcDisabled = memoryMb < 8192;
 
   return (
+    <>
     <Modal open={open} onClose={requestClose} title={t('instance_editor.title')} fitContent>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
         <Input label={t('instance_editor.name_label')} id="edit-name" type="text" value={name} onChange={(e) => setName(e.target.value)} />
         <Input label={t('instance_editor.notes_label')} id="edit-notes" type="text" value={notes} onChange={(e) => setNotes(e.target.value)} />
+
+        {/* Mod loader version (hidden for vanilla instances) — the picker
+            installs the chosen version and updates the instance. Styled
+            exactly like the Java path row (field + button) so it reads as
+            a real setting instead of a stray line of text (owner: «выглядит
+            как какая-то надпись и ты его даже не заметишь»). */}
+        {instance.loader && instance.loader !== 'Vanilla' && (
+          <div>
+            <label className="input__label" style={{ display: 'block', marginBottom: 4 }}>
+              {t('instance_editor.loader_label')}
+            </label>
+            <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
+              <input
+                className="input"
+                type="text"
+                readOnly
+                value={`${instance.loader}${instance.loader_version ? ` ${instance.loader_version}` : ''}`}
+                style={{ flex: 1 }}
+              />
+              <Button size="sm" variant="ghost" onClick={() => setLoaderModalOpen(true)}>
+                {t('instance_editor.loader_change')}
+              </Button>
+            </div>
+          </div>
+        )}
 
         {/* Memory slider with dynamic max */}
         <div>
@@ -294,5 +326,21 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
         document.body
       )}
     </Modal>
+    {instance.loader && instance.loader !== 'Vanilla' && (
+      <LoaderVersionModal
+        open={loaderModalOpen}
+        instanceName={instance.name}
+        loader={instance.loader}
+        mcVersion={instance.mc_version}
+        currentVersion={instance.loader_version ?? null}
+        onClose={() => setLoaderModalOpen(false)}
+        onUpdated={() => {
+          setLoaderModalOpen(false);
+          onSaved();
+          onClose();
+        }}
+      />
+    )}
+    </>
   );
 }

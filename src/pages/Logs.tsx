@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Copy, Trash2 } from 'lucide-react';
+import { Trash2 } from 'lucide-react';
 import { useLogStore } from '../stores/logStore';
 import { useT } from '../lib/i18n';
-import { addToast } from '../components/ui/Toast';
+import { CopyButton } from '../components/ui/CopyButton';
 import { Tooltip } from '../components/ui/Tooltip';
 import {
   LogToolbar, allLevelsOn, toLevelFilter,
@@ -57,21 +57,10 @@ export function LauncherLogs() {
           <>
             {/* Icon-only for parity with the game-logs tab toolbar. */}
             <Tooltip content={t('common.copy_all')} side="bottom">
-              <button
-                className="btn btn--secondary btn--sm"
-                aria-label={t('common.copy_all')}
-                onClick={async () => {
-                  const text = visibleLogs.map(l => `[${l.timestamp}] [${l.source}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
-                  try {
-                    await navigator.clipboard.writeText(text);
-                    addToast(t('common.copied'), 'success');
-                  } catch {
-                    addToast(t('common.copy_failed'), 'error');
-                  }
-                }}
-              >
-                <Copy size={15} />
-              </button>
+              <CopyButton
+                tooltip={t('common.copy_all')}
+                text={() => visibleLogs.map(l => `[${l.timestamp}] [${l.source}] [${l.level.toUpperCase()}] ${l.message}`).join('\n')}
+              />
             </Tooltip>
             <Tooltip content={t('common.clear')} side="bottom">
               <button

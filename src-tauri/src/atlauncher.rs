@@ -510,6 +510,9 @@ pub async fn install_atlauncher_pack(
 
     let target_dir = instances_dir.join(instance_name);
     let mc_dir = target_dir.join(".minecraft");
+    // Never install into an existing instance — a same-named install would
+    // overwrite its mods/configs (and cleanup paths below wipe the whole dir).
+    crate::import::ensure_instance_target_free(instances_dir, instance_name)?;
     std::fs::create_dir_all(&mc_dir)?;
 
     let mut instance = Instance {
@@ -595,12 +598,27 @@ pub async fn install_atlauncher_pack(
                 match dl {
                     Ok(()) => {
                         if let Err(e) = crate::import::extract_zip_to_dir(&zip_path, &mc_dir) {
-                            tracing::warn!(target: "launcher", "Failed to extract ATL configs.zip: {}", e);
+                            // Pack configs are core content (configs/scripts/
+                            // quests) — a failed extraction leaves a broken
+                            // pack, so fail the install instead of shipping it.
+                            let _ = std::fs::remove_file(&zip_path);
+                            let _ = std::fs::remove_dir_all(&target_dir);
+                            return Err(LauncherError::Instance(format!(
+                                "Failed to extract pack configs for '{}': {}",
+                                pack.name, e
+                            )));
                         }
                         let _ = std::fs::remove_file(&zip_path);
                     }
                     Err(e) => {
-                        tracing::warn!(target: "launcher", "Failed to download ATL configs.zip: {}", e);
+                        // Same reasoning: silently skipping the configs made
+                        // the instance launch-only and looked "installed".
+                        let _ = std::fs::remove_file(&zip_path);
+                        let _ = std::fs::remove_dir_all(&target_dir);
+                        return Err(LauncherError::Download(format!(
+                            "Failed to download pack configs for '{}': {}",
+                            pack.name, e
+                        )));
                     }
                 }
             }
@@ -719,8 +737,25 @@ let client = crate::download::global_http_client()
         }));
     }
 
+    // Collect failures instead of discarding them: an import that "succeeds"
+    // with half the mods missing is worse than a clear error.
+    let mut failed: Vec<String> = Vec::new();
     for t in tasks {
-        let _ = t.await;
+        match t.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => failed.push(e),
+            Err(e) => failed.push(format!("task panicked: {}", e)),
+        }
+    }
+    if !failed.is_empty() {
+        let _ = std::fs::remove_dir_all(&target_dir);
+        return Err(LauncherError::Download(format!(
+            "Failed to download {} of {} mods for '{}': {}",
+            failed.len(),
+            total,
+            pack.name,
+            failed.join("; ")
+        )));
     }
 
     instances::save_instance(instances_dir, &instance, None)?;

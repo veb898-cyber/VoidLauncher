@@ -96,13 +96,15 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare, 
         onClick={(e) => e.stopPropagation()}
         style={maxWidth ? { maxWidth } : undefined}
       >
-        {title && (
-          <div className="modal__header">
-            <h2 className="modal__title">{title}</h2>
-          </div>
-        )}
-        <div className="modal__body">{children}</div>
-        {footer && <div className="modal__footer">{footer}</div>}
+        <div className="modal__scroll">
+          {title && (
+            <div className="modal__header">
+              <h2 className="modal__title">{title}</h2>
+            </div>
+          )}
+          <div className="modal__body">{children}</div>
+          {footer && <div className="modal__footer">{footer}</div>}
+        </div>
       </div>
     </div>,
     document.body

@@ -2,10 +2,11 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { AlertTriangle, HelpCircle, XCircle, FileText, Copy, FileSearch, FolderOpen, Loader2 } from 'lucide-react';
+import { AlertTriangle, HelpCircle, XCircle, FileText, FileSearch, FolderOpen, Loader2 } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
 import { addToast } from '../components/ui/Toast';
+import { CopyButton } from '../components/ui/CopyButton';
 import { Tooltip } from '../components/ui/Tooltip';
 import { CRASH_KEYS, VERDICT_KEYS, type CrashAnalysis } from '../lib/diagnostics';
 import {
@@ -223,7 +224,12 @@ export function GameLogs() {
         instanceName: instance,
         sessionPath: shownSession.path,
       });
-      if (data.source === 'clean' || data.source === 'none') {
+      if (data.source === 'clean') {
+        setAnalysis(null);
+        addToast(t('game_logs.clean_run'), 'info');
+        return;
+      }
+      if (data.source === 'none') {
         setAnalysis(null);
         addToast(t('game_logs.no_crash'), 'info');
         return;
@@ -239,8 +245,8 @@ export function GameLogs() {
   const analysisVisible =
     analysis !== null && shownSession !== null && analysis.instance === shownSession.instance_name;
 
-  const copyAnalysis = async () => {
-    if (!analysis) return;
+  const copyAnalysis = () => {
+    if (!analysis) return '';
     const entry = CRASH_KEYS[analysis.data.kind] ?? CRASH_KEYS.unknown;
     const lines = [
       t('diag.crash_heading'),
@@ -250,12 +256,7 @@ export function GameLogs() {
       analysis.data.detail,
       analysis.data.report_path ?? '',
     ].filter(Boolean);
-    try {
-      await navigator.clipboard.writeText(lines.join('\n'));
-      addToast(t('common.copied'), 'success');
-    } catch {
-      addToast(t('common.copy_failed'), 'error');
-    }
+    return lines.join('\n');
   };
 
   // Chronological order (oldest → newest): render the file as-is, the view
@@ -374,20 +375,10 @@ export function GameLogs() {
               </button>
             </Tooltip>
             <Tooltip content={t('common.copy_all')} side="bottom">
-              <button
-                className="btn btn--secondary btn--sm"
-                aria-label={t('common.copy_all')}
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(visibleLines.join('\n'));
-                    addToast(t('common.copied'), 'success');
-                  } catch {
-                    addToast(t('common.copy_failed'), 'error');
-                  }
-                }}
-              >
-                <Copy size={15} />
-              </button>
+              <CopyButton
+                tooltip={t('common.copy_all')}
+                text={() => visibleLines.join('\n')}
+              />
             </Tooltip>
             <Tooltip content={t('game_logs.open_folder')} side="bottom">
               <button
@@ -475,10 +466,12 @@ export function GameLogs() {
                       {t('game_logs.open_report')}
                     </button>
                   )}
-                  <button className="btn btn--secondary btn--sm" onClick={copyAnalysis}>
-                    <Copy size={14} style={{ marginRight: 6 }} />
-                    {t('game_logs.copy_analysis')}
-                  </button>
+                  <CopyButton
+                    tooltip={t('game_logs.copy_analysis')}
+                    label={t('game_logs.copy_analysis')}
+                    text={copyAnalysis}
+                    size={14}
+                  />
                   <button className="btn btn--ghost btn--sm" onClick={() => setAnalysis(null)}>
                     {t('common.close')}
                   </button>

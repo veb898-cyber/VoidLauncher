@@ -230,7 +230,7 @@ pub fn save_instance(
         std::fs::create_dir_all(config_dir)?;
     }
     let json = serde_json::to_string_pretty(instance)?;
-    std::fs::write(&config_path, json)?;
+    write_file_atomic(&config_path, json.as_bytes())?;
 
     // Write Prism-compatible instance.cfg
     write_prism_cfg(instance, instances_dir)?;
@@ -243,6 +243,29 @@ pub fn save_instance(
         write_pack_png(instances_dir, &instance.name, icon);
     }
 
+    Ok(())
+}
+
+/// Write a file atomically: the contents go to a sibling temp file first,
+/// which is then renamed over the target. A crash or power loss mid-save
+/// can never leave a truncated/half-written config behind — the old file
+/// stays intact until the final rename.
+pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| LauncherError::Instance("File path has no parent directory".into()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| LauncherError::Instance("File path has no file name".into()))?;
+    let tmp_path = parent.join(format!(".{}.tmp", file_name));
+    std::fs::write(&tmp_path, contents)?;
+    // `rename` replaces the destination atomically on Windows; on the rare
+    // sharing violation (target briefly open elsewhere) retry after removal.
+    if std::fs::rename(&tmp_path, path).is_err() {
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&tmp_path, path)?;
+    }
     Ok(())
 }
 
@@ -323,7 +346,13 @@ pub fn duplicate_instance(
             new_name
         )));
     }
-    copy_dir_filtered(&src, &dst, "", &|rel| duplicate_skip(rel, exclude))?;
+    // A partially copied directory (disk full, a file locked by antivirus)
+    // must not be left behind as a broken "instance" — remove what WE just
+    // created (the existence check above guarantees it is ours).
+    if let Err(e) = copy_dir_filtered(&src, &dst, "", &|rel| duplicate_skip(rel, exclude)) {
+        let _ = std::fs::remove_dir_all(&dst);
+        return Err(e);
+    }
     // Read and update the instance config
     let mut instance = get_instance(instances_dir, new_name)?;
     instance.name = new_name.to_string();
@@ -1536,7 +1565,7 @@ pub fn update_last_played(instances_dir: &Path, name: &str) -> Result<()> {
 /// Write a Prism/MultiMC-compatible instance.cfg from our Instance
 fn write_prism_cfg(instance: &Instance, instances_dir: &Path) -> Result<()> {
     let cfg_path = instance.prism_cfg_file(instances_dir);
-    std::fs::write(&cfg_path, build_prism_cfg_content(instance))?;
+    write_file_atomic(&cfg_path, build_prism_cfg_content(instance).as_bytes())?;
     Ok(())
 }
 
@@ -1582,7 +1611,7 @@ fn build_mmc_pack_json(instance: &Instance) -> Result<String> {
 /// folder is browsable/importable by Prism-derived launchers at any time.
 fn write_mmc_pack_json(instance: &Instance, instances_dir: &Path) -> Result<()> {
     let path = instance.dir(instances_dir).join("mmc-pack.json");
-    std::fs::write(&path, build_mmc_pack_json(instance)?)?;
+    write_file_atomic(&path, build_mmc_pack_json(instance)?.as_bytes())?;
     Ok(())
 }
 
@@ -1810,8 +1839,11 @@ pub fn import_prism_pack(instances_dir: &Path, zip_path: &str) -> Result<Instanc
         )));
     }
 
-    // Create target directory
+    // Create target directory. Refuse to merge into an existing instance —
+    // the importer has no per-file conflict handling and would overwrite
+    // the previous instance's mods/configs.
     let target_dir = instances_dir.join(&name);
+    crate::import::ensure_instance_target_free(instances_dir, &name)?;
     std::fs::create_dir_all(&target_dir)?;
 
     // Extract with mapping: Prism `minecraft/` (and our own `.minecraft/`
@@ -2529,20 +2561,60 @@ pub fn restore_world(
     };
 
     let target_dir = saves_dir.join(&target_world);
-    // Replace: drop the existing world first (the backup is already on disk).
-    if mode == "replace" && target_dir.exists() {
-        std::fs::remove_dir_all(&target_dir)?;
-    }
-    if target_dir.exists() {
+    if mode != "replace" && target_dir.exists() {
         return Err(LauncherError::Instance(format!(
             "A world named '{}' already exists",
             target_world
         )));
     }
 
-    // Extract with zip-slip protection (blocks traversal, separators, and
-    // absolute/Windows drive paths via a `starts_with` check on the join).
-    extract_zip_to_dir(&backup_path, &target_dir)?;
+    // Extract into a temp directory FIRST and only swap it in when the whole
+    // archive has extracted. Replacing the live world before extraction would
+    // destroy it if the backup turns out to be corrupt (extract fails
+    // midway). The temp dir lives under `.backups/` so a crash cannot leave
+    // it looking like a playable world in the saves list.
+    let tmp_dir = instances_dir
+        .join(instance_name)
+        .join(".backups")
+        .join(".restore-tmp");
+    if tmp_dir.exists() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+    if let Err(e) = extract_zip_to_dir(&backup_path, &tmp_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+
+    if target_dir.exists() {
+        // Replace: park the old world next to the temp dir, move the new one
+        // in, then drop the parked copy. A failed swap restores the original.
+        let old_dir = instances_dir
+            .join(instance_name)
+            .join(".backups")
+            .join(".restore-old");
+        if old_dir.exists() {
+            let _ = std::fs::remove_dir_all(&old_dir);
+        }
+        std::fs::rename(&target_dir, &old_dir).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            LauncherError::Instance(format!("Failed to replace world '{}': {}", target_world, e))
+        })?;
+        if let Err(e) = std::fs::rename(&tmp_dir, &target_dir) {
+            let _ = std::fs::rename(&old_dir, &target_dir);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(LauncherError::Instance(format!(
+                "Failed to restore world '{}': {}",
+                target_world, e
+            )));
+        }
+        let _ = std::fs::remove_dir_all(&old_dir);
+    } else if let Err(e) = std::fs::rename(&tmp_dir, &target_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(LauncherError::Instance(format!(
+            "Failed to restore world '{}': {}",
+            target_world, e
+        )));
+    }
     tracing::info!(
         target: "launcher",
         "Restored world '{}' of '{}' from '{}' (mode {}) as '{}'",
@@ -3792,6 +3864,56 @@ version = 'hIibTfxn'
             Some("Src")
         )
         .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_world_corrupt_backup_keeps_original() {
+        let dir = temp_dir("world_restore_corrupt");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("CorruptPack", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_world(&instances_dir, &instance, "Keep", "original");
+
+        // Garbage file where a backup would be: extraction must fail BEFORE
+        // touching the live world (regression: "replace" used to delete the
+        // world first, so a corrupt backup destroyed it).
+        let backups = world_backups_dir(&instances_dir, "CorruptPack", "Keep");
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(backups.join("Keep__broken.zip"), b"not a zip").unwrap();
+
+        let err = restore_world(
+            &instances_dir,
+            "CorruptPack",
+            "Keep",
+            "Keep__broken.zip",
+            "replace",
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid backup archive"),
+            "got: {}",
+            err
+        );
+
+        let world_dir = instance
+            .minecraft_dir(&instances_dir)
+            .join("saves")
+            .join("Keep");
+        assert_eq!(
+            std::fs::read_to_string(world_dir.join("level.dat")).unwrap(),
+            "level-original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(world_dir.join("region").join("r.0.0.mca")).unwrap(),
+            "region-original"
+        );
+        // No leftover restore temp/parked directories.
+        let backups_root = instance.dir(&instances_dir).join(".backups");
+        assert!(!backups_root.join(".restore-tmp").exists());
+        assert!(!backups_root.join(".restore-old").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

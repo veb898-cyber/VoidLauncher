@@ -101,6 +101,35 @@ pub(crate) fn check_safe_relative(relative: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject a remote-supplied file name that could escape the directory it is
+/// joined into: must be a bare file name — no separators, drive prefixes,
+/// "." / ".." or null bytes.
+pub(crate) fn check_safe_file_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('\0') || name == "." || name == ".." {
+        return Err(LauncherError::Instance(format!(
+            "Invalid file name in remote metadata: {:?}",
+            name
+        )));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains(':') {
+        return Err(LauncherError::Instance(format!(
+            "File name in remote metadata contains a path: {}",
+            name
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an unsafe relative path from remote metadata (Mojang version JSON
+/// libraries, NeoForge data map). Same rules as zip entries — no "..",
+/// absolute/rooted paths, drive prefixes or null bytes — but with a message
+/// naming the actual source.
+pub(crate) fn check_safe_remote_path(relative: &str) -> Result<()> {
+    check_safe_relative(relative).map_err(|_| {
+        LauncherError::Instance(format!("Unsafe path in remote metadata: {}", relative))
+    })
+}
+
 /// Stream a zip entry to disk under `base`, verifying no path traversal.
 /// File-backed writer: large entries are copied in chunks instead of being
 /// buffered in memory (`std::io::copy`).
@@ -545,12 +574,13 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
                     .and_then(|c| c.iter().find(|x| x["type"] == "minecraft"))
                     .and_then(|x| x["version"].as_str())
             });
+            let (loader, loader_version) = atl_loader_from_instance_json(&inst, mc.unwrap_or(""));
             return Ok(ModpackMetadata {
                 format: ModpackFormat::ATLauncher,
                 name,
                 mc_version: mc.map(|s| s.to_string()),
-                loader: None,
-                loader_version: None,
+                loader: loader_slug(&loader),
+                loader_version,
                 summary: None,
             });
         }
@@ -559,6 +589,79 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
     Err(LauncherError::Instance(
         "Unrecognized modpack format. Supported: Prism/MultiMC (.zip), Modrinth (.mrpack), CurseForge/FTB (.zip), ATLauncher (.zip)".to_string()
     ))
+}
+
+/// Best-effort loader detection from an ATLauncher `instance.json`.
+///
+/// ATL exports are inconsistent: format v2 stores entries in `components`
+/// (some exports use the singular `component`), with a `uid` like
+/// `net.minecraftforge`, `net.neoforged` or `net.fabricmc.fabric-loader`;
+/// the pack-detail API shape uses a top-level `loader` object instead. Both
+/// shapes are probed and keywords are matched on `uid` + `type`.
+fn atl_loader_from_instance_json(
+    inst: &serde_json::Value,
+    mc_version: &str,
+) -> (LoaderType, Option<String>) {
+    // Some exports store "<mc>-<loader>" (e.g. "1.20.1-47.2.0"); our loader
+    // installer expects the bare loader version ("47.2.0").
+    let normalize = |v: Option<String>| {
+        v.map(|v| {
+            v.strip_prefix(&format!("{}-", mc_version))
+                .map(|s| s.to_string())
+                .unwrap_or(v)
+        })
+    };
+    let keyword_to_loader =
+        |text: &str, version: Option<String>| -> Option<(LoaderType, Option<String>)> {
+            let t = text.to_lowercase();
+            if t.contains("neoforge") {
+                Some((LoaderType::NeoForge, normalize(version)))
+            } else if t.contains("forge") {
+                Some((LoaderType::Forge, normalize(version)))
+            } else if t.contains("fabric") || t.contains("quilt") {
+                Some((LoaderType::Fabric, normalize(version)))
+            } else {
+                None
+            }
+        };
+
+    // Top-level loader object (ATL API pack-detail shape).
+    if let Some(t) = inst["loader"]["type"].as_str() {
+        let version = inst["loader"]["version"]
+            .as_str()
+            .or_else(|| inst["loader"]["metadata"]["version"].as_str())
+            .or_else(|| inst["loader"]["metadata"]["loader"].as_str())
+            .map(|s| s.to_string());
+        if let Some(hit) = keyword_to_loader(t, version) {
+            return hit;
+        }
+    }
+
+    // Components array (export v2). `type` may be "minecraft"/"game" for the
+    // game itself — the keyword match naturally skips those.
+    for key in ["components", "component"] {
+        if let Some(arr) = inst[key].as_array() {
+            for x in arr {
+                let uid = x["uid"].as_str().unwrap_or("");
+                let type_ = x["type"].as_str().unwrap_or("");
+                let version = x["version"].as_str().map(|s| s.to_string());
+                if let Some(hit) = keyword_to_loader(&format!("{} {}", uid, type_), version) {
+                    return hit;
+                }
+            }
+        }
+    }
+
+    (LoaderType::Vanilla, None)
+}
+
+/// Lowercase loader slug for the wizard's pack preview (matches the
+/// Mrpack/CurseForge conventions: "forge", "neoforge", "fabric").
+fn loader_slug(lt: &LoaderType) -> Option<String> {
+    match lt {
+        LoaderType::Vanilla => None,
+        other => Some(format!("{:?}", other).to_lowercase()),
+    }
 }
 
 /// Import a modpack into the instances directory
@@ -571,6 +674,10 @@ pub async fn import_modpack(
     app: Option<&AppHandle>,
 ) -> Result<Instance> {
     emit_progress(app, "reading", 0, 1, "Reading archive...");
+
+    // Never merge into an existing instance — a same-named import would
+    // silently overwrite its mods/configs.
+    ensure_instance_target_free(instances_dir, instance_name)?;
 
     // Sniff the archive format cheaply (one pass over the entry names). The
     // archive is file-backed, so no full copy of the pack is held in memory;
@@ -634,6 +741,24 @@ pub async fn import_modpack(
     Ok(instance)
 }
 
+/// Refuse to import/install into an ALREADY EXISTING instance directory.
+///
+/// Every import path used to merge files into an instance with the same name
+/// (silently overwriting mods/configs, and on the ATLauncher path even
+/// wiping the whole directory when a loader install failed). Update flows
+/// for managed packs go through the pack-lock updater, never a re-import, so
+/// a name collision here is always a user mistake worth stopping.
+pub(crate) fn ensure_instance_target_free(instances_dir: &Path, instance_name: &str) -> Result<()> {
+    let target = instances_dir.join(instance_name);
+    if target.exists() {
+        return Err(LauncherError::Instance(format!(
+            "An instance named '{}' already exists. Choose a different name for the imported pack.",
+            instance_name
+        )));
+    }
+    Ok(())
+}
+
 /// Run a format-specific importer against `instances_dir/<instance_name>` and,
 /// if it fails, remove the partially-created instance directory so a failed
 /// import never leaves broken/missing files behind.
@@ -672,6 +797,7 @@ pub(crate) async fn import_mrpack(
     app: Option<&AppHandle>,
 ) -> Result<Instance> {
     emit_progress(app, "extracting", 0, 1, "Extracting overrides...");
+    ensure_instance_target_free(instances_dir, instance_name)?;
 
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
@@ -904,6 +1030,7 @@ pub(crate) async fn import_curseforge_pack(
     app: Option<&AppHandle>,
 ) -> Result<Instance> {
     emit_progress(app, "extracting", 0, 1, "Extracting overrides...");
+    ensure_instance_target_free(instances_dir, instance_name)?;
 
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
@@ -1043,6 +1170,10 @@ pub(crate) async fn import_curseforge_pack(
                             .map_err(|e| format!("CF API error: {}", e))?;
                         last_name = cf_file.display_name.clone();
 
+                        // The file name comes from remote metadata and is
+                        // joined into mods/ — reject any path component.
+                        check_safe_file_name(&cf_file.file_name)
+                            .map_err(|e| e.to_string())?;
                         let dest_path = mods_dir.join(&cf_file.file_name);
                         crate::curseforge::download_mod_file(pid, fid, &cf_file, &api_key, &dest_path)
                             .await
@@ -1196,6 +1327,8 @@ fn import_atlauncher_pack(
     path: &str,
     instance_name: &str,
 ) -> Result<Instance> {
+    ensure_instance_target_free(instances_dir, instance_name)?;
+
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
 
@@ -1211,7 +1344,7 @@ fn import_atlauncher_pack(
         }
     }
 
-    let mc_version;
+    let (mc_version, loader, loader_version);
     if let Ok(inst) = serde_json::from_str::<serde_json::Value>(&inst_str) {
         mc_version = inst["minecraftVersion"]
             .as_str()
@@ -1223,8 +1356,13 @@ fn import_atlauncher_pack(
             })
             .unwrap_or("1.20.1")
             .to_string();
+        let detected = atl_loader_from_instance_json(&inst, &mc_version);
+        loader = detected.0;
+        loader_version = detected.1;
     } else {
         mc_version = "1.20.1".to_string();
+        loader = LoaderType::Vanilla;
+        loader_version = None;
     }
 
     let target_dir = instances_dir.join(instance_name);
@@ -1250,8 +1388,8 @@ fn import_atlauncher_pack(
     let instance = Instance {
         name: instance_name.to_string(),
         mc_version,
-        loader: LoaderType::Vanilla,
-        loader_version: None,
+        loader,
+        loader_version,
         loader_profile: None,
         memory_mb: None,
         jvm_args: None,
@@ -1558,5 +1696,78 @@ mod tests {
         assert_eq!(meta.name, "AT Pack");
         assert_eq!(meta.mc_version.as_deref(), Some("1.19.2"));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn atl_loader_detection_components_and_top_level() {
+        // Export v2 components array; an MC-prefixed loader version must be
+        // normalised to the bare loader version the installer expects.
+        let inst: serde_json::Value = serde_json::from_str(
+            r#"{"components":[{"uid":"net.minecraft","version":"1.20.1"},{"uid":"net.neoforged","version":"1.20.1-47.1.106"}]}"#,
+        )
+        .unwrap();
+        let (l, v) = atl_loader_from_instance_json(&inst, "1.20.1");
+        assert_eq!(l, LoaderType::NeoForge);
+        assert_eq!(v.as_deref(), Some("47.1.106"));
+
+        // API pack-detail shape: top-level loader object.
+        let inst: serde_json::Value =
+            serde_json::from_str(r#"{"loader":{"type":"forge","version":"47.2.0"}}"#).unwrap();
+        let (l, v) = atl_loader_from_instance_json(&inst, "1.20.1");
+        assert_eq!(l, LoaderType::Forge);
+        assert_eq!(v.as_deref(), Some("47.2.0"));
+
+        // No loader components -> Vanilla.
+        let inst: serde_json::Value =
+            serde_json::from_str(r#"{"components":[{"uid":"net.minecraft","version":"1.20.1"}]}"#)
+                .unwrap();
+        let (l, v) = atl_loader_from_instance_json(&inst, "1.20.1");
+        assert_eq!(l, LoaderType::Vanilla);
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn probe_reads_atlauncher_loader_from_components() {
+        let inst = br#"{"name":"AT Forge Pack","minecraftVersion":"1.20.1","components":[{"uid":"net.minecraftforge","version":"47.2.0"}]}"#;
+        let p = temp_probe_zip("atl_loader.zip", &[("instance.json", inst.as_slice())]);
+        let meta = probe_modpack(p.to_str().unwrap()).unwrap();
+        assert_eq!(meta.format, ModpackFormat::ATLauncher);
+        assert_eq!(meta.loader.as_deref(), Some("forge"));
+        assert_eq!(meta.loader_version.as_deref(), Some("47.2.0"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn import_atlauncher_detects_loader_and_rejects_existing_target() {
+        let dir = std::env::temp_dir().join(format!("vl_atl_import_{}", std::process::id()));
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let inst = br#"{"name":"AT Pack","minecraftVersion":"1.19.2","components":[{"uid":"net.minecraftforge","version":"43.3.5"}]}"#;
+        let p = temp_probe_zip(
+            "atl_full.zip",
+            &[
+                ("instance.json", inst.as_slice()),
+                ("mods/example.jar", b"jar".as_slice()),
+            ],
+        );
+
+        let instance =
+            import_atlauncher_pack(&instances_dir, p.to_str().unwrap(), "AT Pack").unwrap();
+        assert_eq!(instance.loader, LoaderType::Forge);
+        assert_eq!(instance.loader_version.as_deref(), Some("43.3.5"));
+        assert!(instances_dir
+            .join("AT Pack")
+            .join(".minecraft")
+            .join("mods")
+            .join("example.jar")
+            .exists());
+
+        // A second import into the same name must be refused, not merged.
+        let err =
+            import_atlauncher_pack(&instances_dir, p.to_str().unwrap(), "AT Pack").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {}", err);
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

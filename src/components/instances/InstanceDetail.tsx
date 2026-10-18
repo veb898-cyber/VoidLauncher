@@ -13,11 +13,12 @@ import { addToast } from '../ui/Toast';
 import { InstanceEditor } from './InstanceEditor';
 import { ContentManager } from './ContentManager';
 import { WorldsManager } from './WorldsManager';
+import { ServersManager } from './ServersManager';
 import { ScreenshotsGallery } from './ScreenshotsGallery';
 import { BANNER_PRESETS, isGradientBanner, getGradientValue } from '../../lib/bannerPresets';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 
-type Tab = 'mods' | 'resourcepacks' | 'shaderpacks' | 'worlds' | 'screenshots';
+type Tab = 'mods' | 'resourcepacks' | 'shaderpacks' | 'worlds' | 'servers' | 'screenshots';
 
 interface InstanceDetailProps {
   onNavigate?: (page: string) => void;
@@ -60,6 +61,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
     { id: 'resourcepacks', label: t('instance_detail.tab_resourcepacks') },
     { id: 'shaderpacks', label: t('instance_detail.tab_shaderpacks') },
     { id: 'worlds', label: t('instance_detail.tab_worlds') },
+    { id: 'servers', label: t('instance_detail.tab_servers') },
     { id: 'screenshots', label: t('instance_detail.tab_screenshots') },
   ];
 
@@ -317,6 +319,9 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
         )}
         {tab === 'worlds' && (
           <WorldsManager instanceName={instance.name} onOpenFolder={() => handleOpenFolder('saves')} />
+        )}
+        {tab === 'servers' && (
+          <ServersManager instanceName={instance.name} />
         )}
         {tab === 'screenshots' && (
           <ScreenshotsGallery instanceName={instance.name} onOpenFolder={() => handleOpenFolder('screenshots')} />

@@ -8,6 +8,8 @@ export interface SlidingTabDef<T extends string> {
   label: ReactNode;
   /** Tooltip / accessible name when the label is an abbreviation. */
   title?: string;
+  /** Blocked while a background task (e.g. a scan) is in flight. */
+  disabled?: boolean;
 }
 
 interface Thumb {
@@ -133,6 +135,7 @@ export function SlidingTabs<T extends string>({
             else tabRefs.current.delete(tb.id);
           }}
           className={`tab${active === tb.id ? ' tab--active' : ''}`}
+          disabled={tb.disabled}
           onClick={() => onChange(tb.id)}
         >
           {tb.label}

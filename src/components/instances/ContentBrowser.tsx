@@ -208,6 +208,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     ++popularReqRef.current;
     ++searchReqRef.current;
     ++resolveReqRef.current;
+    ++detailReqRef.current;
     setQuery('');
     setResults([]);
     setPopular([]);
@@ -231,6 +232,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   // filter switching) must never overwrite fresher results.
   const popularReqRef = useRef(0);
   const searchReqRef = useRef(0);
+  const detailReqRef = useRef(0);
 
   const loadPopular = useCallback(async () => {
     const reqId = ++popularReqRef.current;
@@ -406,6 +408,9 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   }, [selected, versions, versionLimit]);
 
   const handleSelect = async (hit: Hit) => {
+    // Rapid clicks between projects: only the LATEST selection may fill the
+    // detail pane — a slower earlier response must not overwrite it.
+    const reqId = ++detailReqRef.current;
     setSelected(hit);
     setLoadingDetail(true);
     setModDetail(null);
@@ -416,10 +421,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         provider.getProject(hit.project_id),
         provider.getVersions(hit.project_id, mcVersion ?? null, versionLoader),
       ]);
+      if (reqId !== detailReqRef.current) return;
       setModDetail(detail);
       setVersions(vers);
-    } catch (e: any) { addToast(t('content.detail_error', { error: e.toString() }), 'error'); }
-    setLoadingDetail(false);
+    } catch (e: any) {
+      if (reqId !== detailReqRef.current) return;
+      addToast(t('content.detail_error', { error: e.toString() }), 'error');
+    }
+    if (reqId === detailReqRef.current) setLoadingDetail(false);
   };
 
   const isAdded = (id: string, slug?: string, title?: string) =>
@@ -601,7 +610,10 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     return items;
   };
 
-  const displayHits = results.length > 0 ? results : popular;
+  // A non-empty query must never fall back to the popular list: zero matches
+  // has to say "nothing found" instead of silently showing popular mods as if
+  // they were the search results.
+  const displayHits = query.trim().length > 0 ? results : popular;
 
   const renderMarkdown = (text: string): string => renderMarkdownToHtml(text, providerId);
 

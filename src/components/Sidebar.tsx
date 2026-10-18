@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Liquid } from 'liquid-gooey';
 import { useAuthStore } from '../stores/authStore';
+import { useAccountsStore } from '../stores/accountsStore';
 import { GameRunningBadge } from './launch/GameRunningBadge';
 import { Tooltip } from './ui/Tooltip';
 import { t } from '../lib/i18n';
@@ -16,12 +17,29 @@ const ACCENT_HEIGHT = 24;
 
 export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const { profile, isLoggedIn } = useAuthStore();
+  const accounts = useAccountsStore((s) => s.accounts);
+  const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const gooey = useGooey();
   const sidebarRef = useRef<HTMLElement>(null);
   const itemRefs = useRef(new Map<string, HTMLButtonElement>());
   // Null until measured, so the accent mounts already at its place instead
   // of sliding in from the top on first paint.
   const [accent, setAccent] = useState<{ top: number; left: number } | null>(null);
+
+  // The sidebar is mounted on every page, so it seeds the account list once.
+  // After that the store stays current (Accounts page and Home reload it).
+  useEffect(() => {
+    if (accounts.length === 0) loadAccounts();
+  }, [accounts.length, loadAccounts]);
+
+  // The bottom-left head belongs to the LICENSE (Microsoft) account whenever
+  // one exists — switching the active account to offline/Ely.by must never
+  // hide a working licensed account behind a «log in» button. The active
+  // Microsoft account wins if there are several; otherwise the first one.
+  const licensed =
+    accounts.find((a) => a.account_type === 'Microsoft' && a.default) ??
+    accounts.find((a) => a.account_type === 'Microsoft') ??
+    null;
 
   const navItems = [
     { id: 'home', icon: <HomeIcon />, label: t('sidebar.home') },
@@ -129,7 +147,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           <SettingsIcon />
         </button>
         <div className="sidebar__separator" />
-        {isLoggedIn && profile ? (
+        {licensed ? (
           <div
             className="sidebar__avatar"
             onClick={() => onNavigate('accounts')}
@@ -137,6 +155,18 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
             {/* The 2px border eats into the 36px box (border-box), so the head
                 must fill the 32px content box — otherwise it renders at 36px
                 and gets clipped, which reads as an over-zoomed avatar. */}
+            <Avatar
+              uuid={licensed.uuid ?? ''}
+              name={licensed.name}
+              size={36}
+              style={{ width: '100%', height: '100%' }}
+            />
+          </div>
+        ) : isLoggedIn && profile ? (
+          <div
+            className="sidebar__avatar"
+            onClick={() => onNavigate('accounts')}
+          >
             <Avatar
               uuid={profile.id}
               name={profile.name}

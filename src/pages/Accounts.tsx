@@ -1,18 +1,20 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { useAccountsStore, type AccountEntry } from '../stores/accountsStore';
+import { useAccountsStore, type AccountEntry, type CapeEntry } from '../stores/accountsStore';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Modal } from '../components/ui/Modal';
 import { CustomSelect } from '../components/ui/CustomSelect';
 import { Tooltip } from '../components/ui/Tooltip';
 import { EmptyState } from '../components/ui/EmptyState';
+import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
+import { SkinPreview } from '../components/accounts/SkinPreview';
 import { addToast } from '../components/ui/Toast';
-import { Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
+import { Ban, Check, RefreshCw, Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
 import { t } from '../lib/i18n';
-import { Avatar, OfflineAvatar } from '../lib/remoteImage';
+import { Avatar } from '../lib/remoteImage';
 
 const ELYBY_SKINS_URL = 'https://ely.by/skins';
 
@@ -45,7 +47,17 @@ function validateOfflineUsername(name: string): string | null {
 }
 
 export function Accounts() {
-  const { accounts, loadAccounts, addOfflineAccount, addElybyAccount, removeAccount, setDefaultAccount, changeSkin } = useAccountsStore();
+  const {
+    accounts,
+    loadAccounts,
+    addOfflineAccount,
+    addElybyAccount,
+    removeAccount,
+    setDefaultAccount,
+    changeSkin,
+    getPlayerCapes,
+    setPlayerCape,
+  } = useAccountsStore();
 
   const [showAddOffline, setShowOffline] = useState(false);
   const [offlineName, setOfflineName] = useState('');
@@ -58,8 +70,68 @@ export function Accounts() {
   const [skinModalPath, setSkinModalPath] = useState('');
   const [skinVariant, setSkinVariant] = useState<'classic' | 'slim'>('classic');
   const [showElybySkinHelp, setShowElybySkinHelp] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [switching, setSwitching] = useState(false);
+  const [capes, setCapes] = useState<CapeEntry[]>([]);
+  const [capesLoading, setCapesLoading] = useState(false);
+  const [capesError, setCapesError] = useState<string | null>(null);
+  const [capesNonce, setCapesNonce] = useState(0);
+  const [capeSaving, setCapeSaving] = useState(false);
 
   useEffect(() => { loadAccounts(); }, [loadAccounts]);
+
+  // Effective selection: the clicked account, else the active one, else the
+  // first in the list. Derived (not stored) so account list changes (add /
+  // remove) always leave a valid selection.
+  const selected = useMemo(
+    () =>
+      accounts.find((a) => a.id === selectedId) ??
+      accounts.find((a) => a.default) ??
+      accounts[0] ??
+      null,
+    [accounts, selectedId]
+  );
+
+  // Latest selection, readable from async callbacks that outlive a render
+  // (a slow cape switch must not overwrite the state of another account).
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selected?.id ?? null;
+
+  // Load the owned capes whenever a signed-in Microsoft account is selected.
+  // Offline/Ely.by accounts have no capes; a Microsoft account without a
+  // stored session would only produce a network error, so it is skipped.
+  // A failed fetch is NOT silently treated as "no capes": the reason is kept
+  // and shown with a retry, and the picker never disappears once it is up.
+  const capesAccountRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (
+      !selected ||
+      selected.account_type !== 'Microsoft' ||
+      selected.has_ms_session === false
+    ) {
+      capesAccountRef.current = null;
+      setCapes([]);
+      setCapesError(null);
+      setCapesLoading(false);
+      return;
+    }
+    let alive = true;
+    const accountId = selected.id;
+    // Switching to another account drops its predecessor's list; the same
+    // account keeps the list visible while a revisit refreshes it.
+    if (capesAccountRef.current !== accountId) setCapes([]);
+    setCapesError(null);
+    setCapesLoading(true);
+    getPlayerCapes(accountId)
+      .then((list) => { if (alive) { capesAccountRef.current = accountId; setCapes(list); } })
+      .catch((e) => { if (alive) { capesAccountRef.current = accountId; setCapesError(String(e)); } })
+      .finally(() => { if (alive) setCapesLoading(false); });
+    return () => { alive = false; };
+  }, [selected, getPlayerCapes, capesNonce]);
+
+  const retryCapes = () => setCapesNonce((n) => n + 1);
+
+  const activeCapePng = capes.find((c) => c.active && c.png)?.png ?? null;
 
   const handleAddOffline = async () => {
     if (offlineNameError) {
@@ -88,16 +160,61 @@ export function Accounts() {
     }
   };
 
+  const handleMakeActive = async () => {
+    if (!selected || selected.default || switching) return;
+    setSwitching(true);
+    try {
+      await setDefaultAccount(selected.id);
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  const handleRemoveAccount = async (account: AccountEntry) => {
+    try {
+      await removeAccount(account.id);
+      if (selectedId === account.id) setSelectedId(null);
+      addToast(t('accounts.removed_toast'), 'success');
+    } catch (err) {
+      addToast(t('accounts.removed_error', { error: String(err) }), 'error');
+    }
+  };
+
+  // Cape switching is optimistic: the worn marker moves instantly and the
+  // request runs in the background. Success only confirms the server list
+  // (no toast — the picker itself shows the result); failure rolls the
+  // marker back and surfaces the error.
+  const handleSetCape = async (capeId: string | null) => {
+    if (!selected || capeSaving) return;
+    const accountId = selected.id;
+    const prev = capes;
+    setCapes(prev.map((c) => ({ ...c, active: capeId !== null && c.id === capeId })));
+    setCapeSaving(true);
+    try {
+      const list = await setPlayerCape(accountId, capeId);
+      if (selectedIdRef.current !== accountId) return;
+      // The backend answers with metadata only (textures are unchanged);
+      // keep the PNGs we already have, keyed by cape id.
+      const pngById = new Map(prev.map((c) => [c.id, c.png]));
+      setCapes(list.map((c) => ({ ...c, png: c.png || pngById.get(c.id) || '' })));
+    } catch (e) {
+      if (selectedIdRef.current === accountId) setCapes(prev);
+      addToast(t('accounts.cape_update_error', { error: String(e) }), 'error');
+    } finally {
+      setCapeSaving(false);
+    }
+  };
+
   const handleSkinChange = async (account: AccountEntry) => {
-    const selected = await openFileDialog({
+    const selectedFile = await openFileDialog({
       title: t('accounts.skin_file_title'),
       filters: [{ name: 'PNG Image', extensions: ['png'] }],
       multiple: false,
     });
-    if (!selected) return;
+    if (!selectedFile) return;
 
     setSkinModalAccount(account);
-    setSkinModalPath(selected);
+    setSkinModalPath(selectedFile);
     setSkinVariant((account.skin_variant || 'classic') as 'classic' | 'slim');
   };
 
@@ -113,26 +230,17 @@ export function Accounts() {
     }
   };
 
-  const getTypeLabel = (t: string) => {
-    switch (t) {
+  const getTypeLabel = (type: string) => {
+    switch (type) {
       case 'Microsoft': return 'Microsoft';
       case 'Offline': return 'Offline';
       case 'ElyBy': return 'Ely.by';
-      default: return t;
-    }
-  };
-
-  const getTypeColor = (t: string) => {
-    switch (t) {
-      case 'Microsoft': return 'var(--success)';
-      case 'Offline': return 'var(--text-tertiary)';
-      case 'ElyBy': return 'var(--warning)';
-      default: return 'var(--text-tertiary)';
+      default: return type;
     }
   };
 
   return (
-    <div className="page">
+    <div className="page page--accounts">
       <div className="page__header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <h1 className="page__title">{t('accounts.title')}</h1>
@@ -149,105 +257,208 @@ export function Accounts() {
         </div>
       </div>
 
-      {/* Accounts list — stays top-aligned: the list grows downwards as
-          accounts are added, so centring it would make the first card drift
-          on every change. */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
-        {accounts.map((acc) => (
-          <div key={acc.id} className={`glass-card account-card${acc.default ? ' account-card--active' : ''}`}
-            onClick={() => { if (!acc.default) setDefaultAccount(acc.id); }}
-            style={{
-              padding: 'var(--space-lg)', display: 'flex', alignItems: 'center', gap: 'var(--space-lg)',
-              border: acc.default ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
-            }}>
-            {acc.account_type === 'Offline' ? (
-              <OfflineAvatar size={40} />
-            ) : acc.uuid ? (
-              <Avatar uuid={acc.uuid} name={acc.name} size={40} />
+      {accounts.length === 0 ? (
+        <div className="glass-card" style={{ padding: 'var(--space-lg)' }}>
+          <EmptyState compact icon={<UserRoundPlus size={24} />} title={t('accounts.empty_text')} />
+        </div>
+      ) : (
+        /* Big skin first (left), account management on the right: the preview
+           owns the leftover height and scales down to it, so at the default
+           window size the whole page fits without scrolling. */
+        <div className="accounts-layout">
+          <div className="glass-card accounts-preview">
+            {selected ? (
+              <>
+                <div className="accounts-preview__stage">
+                  <SkinPreview
+                    uuid={selected.uuid ?? ''}
+                    name={selected.name}
+                    cape={selected.account_type === 'Microsoft' ? activeCapePng : null}
+                  />
+                </div>
+                <div style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', gap: 4, flexShrink: 0 }}>
+                  <div style={{ fontWeight: 700, fontSize: 'var(--font-size-lg)' }}>{selected.name}</div>
+                  <div style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
+                    {getTypeLabel(selected.account_type)}
+                    {selected.uuid ? ` • ${selected.uuid.substring(0, 8)}...` : ''}
+                  </div>
+                  {selected.default && (
+                    <div style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)' }}>
+                      {t('accounts.active_for_launch')}
+                    </div>
+                  )}
+                </div>
+              </>
             ) : (
-              <div
-                style={{
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  width: 40, height: 40, borderRadius: 'var(--radius-md)', flexShrink: 0,
-                  fontWeight: 700, fontSize: 'var(--font-size-lg)', color: getTypeColor(acc.account_type),
-                }}
-              >
-                {acc.name.charAt(0).toUpperCase()}
+              <EmptyState compact icon={<UserRoundPlus size={24} />} title={t('accounts.empty_text')} />
+            )}
+          </div>
+
+          <div className="accounts-rail">
+            <div className="accounts-list">
+              {accounts.map((acc) => {
+                const isSelected = selected?.id === acc.id;
+                return (
+                  <div
+                    key={acc.id}
+                    className="glass-card account-card"
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={isSelected}
+                    onClick={() => setSelectedId(acc.id)}
+                    onKeyDown={(e) => {
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setSelectedId(acc.id);
+                      }
+                    }}
+                    style={{
+                      /* Tightened side padding/gaps (12px, 8px, 6px) purely to
+                         free row width: with both badges (АКТИВЕН +
+                         ЛИЦЕНЗИЯ) the name line needed ~17px more than the
+                         380px rail could give and wrapped to a second line. */
+                      padding: 'var(--space-md)', display: 'flex', alignItems: 'center', gap: 'var(--space-sm)',
+                      border: isSelected ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
+                    }}
+                  >
+                    <Avatar uuid={acc.uuid ?? ''} name={acc.name} size={36} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        {acc.name}
+                        {acc.default && (
+                          <span style={{ fontSize: 10, background: 'var(--primary)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}>
+                            {t('accounts.badge_active')}
+                          </span>
+                        )}
+                        {acc.account_type === 'Microsoft' && (
+                          <span style={{ fontSize: 10, background: 'var(--success)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}>
+                            {t('accounts.badge_licensed')}
+                          </span>
+                        )}
+                        {acc.account_type === 'Microsoft' && acc.has_ms_session === false && (
+                          <Tooltip content={t('accounts.needs_login_hint')}>
+                            <span
+                              style={{ fontSize: 10, background: 'var(--warning)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}
+                            >
+                              {t('accounts.badge_needs_login')}
+                            </span>
+                          </Tooltip>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        {getTypeLabel(acc.account_type)}
+                        {acc.uuid && ` • ${acc.uuid.substring(0, 8)}...`}
+                      </div>
+                    </div>
+                    {/* Per-account actions live on the card itself — the same
+                        quick icon row the list had before the redesign. */}
+                    <div style={{ display: 'flex', gap: 'var(--space-xs)', flexShrink: 0 }}>
+                      {acc.account_type === 'Microsoft' && (
+                        <Tooltip content={t('accounts.btn_change_skin')}>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            aria-label={t('accounts.btn_change_skin')}
+                            onClick={(e) => { e.stopPropagation(); handleSkinChange(acc); }}
+                          >
+                            <Shirt size={14} />
+                          </Button>
+                        </Tooltip>
+                      )}
+                      {acc.account_type === 'ElyBy' && (
+                        <Tooltip content={t('accounts.elyby_skin_help_btn')}>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            aria-label={t('accounts.elyby_skin_help_btn')}
+                            onClick={(e) => { e.stopPropagation(); setShowElybySkinHelp(true); }}
+                          >
+                            <HelpCircle size={14} />
+                          </Button>
+                        </Tooltip>
+                      )}
+                      <Tooltip content={t('accounts.remove_btn')}>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          aria-label={t('accounts.remove_btn')}
+                          onClick={(e) => { e.stopPropagation(); handleRemoveAccount(acc); }}
+                          style={{ color: 'var(--color-danger)' }}
+                        >
+                          <Trash2 size={14} />
+                        </Button>
+                      </Tooltip>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {selected && !selected.default && (
+              <div className="glass-card" style={{ padding: 'var(--space-md) var(--space-lg)', flexShrink: 0 }}>
+                <Button onClick={handleMakeActive} disabled={switching} style={{ width: '100%' }}>
+                  <Check size={14} style={{ marginRight: 6 }} />
+                  {t('accounts.make_active')}
+                </Button>
               </div>
             )}
-            <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
-                {acc.name}
-                {acc.default && (
-                  <span style={{ fontSize: 10, background: 'var(--primary)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}>
-                    {t('accounts.badge_active')}
-                  </span>
-                )}
-                {acc.account_type === 'Microsoft' && (
-                  <span style={{ fontSize: 10, background: 'var(--success)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}>
-                    {t('accounts.badge_licensed')}
-                  </span>
-                )}
-                {acc.account_type === 'Microsoft' && acc.has_ms_session === false && (
-                  <Tooltip content={t('accounts.needs_login_hint')}>
-                    <span
-                      style={{ fontSize: 10, background: 'var(--warning)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}
+
+            {selected?.account_type === 'Microsoft' && selected.has_ms_session !== false && (
+              <div className="glass-card" style={{ padding: 'var(--space-lg)', flexShrink: 0 }}>
+                <div style={{ fontWeight: 600, marginBottom: 'var(--space-sm)' }}>
+                  {t('accounts.capes_title')}
+                </div>
+                {capesLoading && capes.length === 0 ? (
+                  <div style={{ display: 'flex', justifyContent: 'center', padding: 'var(--space-md)' }}>
+                    <LoadingSpinner size={18} />
+                  </div>
+                ) : capesError && capes.length === 0 ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)', alignItems: 'flex-start' }}>
+                    <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
+                      {t('accounts.capes_load_error', { error: capesError })}
+                    </div>
+                    <Button size="sm" variant="secondary" onClick={retryCapes}>
+                      <RefreshCw size={14} style={{ marginRight: 6 }} />
+                      {t('common.retry')}
+                    </Button>
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-sm)' }}>
+                    <button
+                      type="button"
+                      className={`cape-tile${!capes.some((c) => c.active) ? ' cape-tile--active' : ''}`}
+                      onClick={() => handleSetCape(null)}
+                      disabled={capeSaving}
+                      title={t('accounts.cape_none')}
                     >
-                      {t('accounts.badge_needs_login')}
-                    </span>
-                  </Tooltip>
+                      <span className="cape-thumb cape-thumb--none"><Ban size={18} /></span>
+                      <span className="cape-alias">{t('accounts.cape_none')}</span>
+                    </button>
+                    {capes.map((c) => (
+                      <button
+                        key={c.id}
+                        type="button"
+                        className={`cape-tile${c.active ? ' cape-tile--active' : ''}`}
+                        onClick={() => { if (!c.active) handleSetCape(c.id); }}
+                        disabled={capeSaving}
+                        title={c.alias}
+                      >
+                        {c.png ? (
+                          <span className="cape-thumb" style={{ backgroundImage: `url(${c.png})` }} />
+                        ) : (
+                          <span className="cape-thumb" />
+                        )}
+                        <span className="cape-alias">{c.alias || '—'}</span>
+                      </button>
+                    ))}
+                  </div>
                 )}
               </div>
-              <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
-                {getTypeLabel(acc.account_type)}
-                {acc.uuid && ` • ${acc.uuid.substring(0, 8)}...`}
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: 'var(--space-xs)', flexShrink: 0 }}>
-              {acc.account_type === 'Microsoft' && (
-                <Tooltip content={t('accounts.btn_change_skin')}>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    aria-label={t('accounts.btn_change_skin')}
-                    onClick={(e) => { e.stopPropagation(); handleSkinChange(acc); }}
-                  >
-                    <Shirt size={14} />
-                  </Button>
-                </Tooltip>
-              )}
-              {acc.account_type === 'ElyBy' && (
-                <Tooltip content={t('accounts.elyby_skin_help_btn')}>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    aria-label={t('accounts.elyby_skin_help_btn')}
-                    onClick={(e) => { e.stopPropagation(); setShowElybySkinHelp(true); }}
-                  >
-                    <HelpCircle size={14} />
-                  </Button>
-                </Tooltip>
-              )}
-              <Button size="sm" variant="ghost" onClick={async (e) => {
-              e.stopPropagation();
-              try {
-                await removeAccount(acc.id);
-                addToast(t('accounts.removed_toast'), 'success');
-              } catch (err) {
-                addToast(t('accounts.removed_error', { error: String(err) }), 'error');
-              }
-            }} style={{ color: 'var(--color-danger)' }}>
-                <Trash2 size={14} />
-              </Button>
-            </div>
+            )}
           </div>
-        ))}
-        {accounts.length === 0 && (
-          <div className="glass-card" style={{ padding: 'var(--space-lg)' }}>
-            <EmptyState compact icon={<UserRoundPlus size={24} />} title={t('accounts.empty_text')} />
-          </div>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* Add Offline Modal */}
       <Modal open={showAddOffline} onClose={() => setShowOffline(false)} title={t('accounts.modal_offline_title')}>
@@ -305,7 +516,8 @@ export function Accounts() {
         </div>
       </Modal>
 
-      {/* Ely.by skin help — no official API, point the user at the website */}
+      {/* Ely.by skin help — no public skin-upload API, point the user at the
+          website. The launcher still SHOWS the actual Ely.by skin in 3D. */}
       <Modal
         open={showElybySkinHelp}
         onClose={() => setShowElybySkinHelp(false)}

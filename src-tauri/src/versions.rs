@@ -1,4 +1,5 @@
 use crate::error::{LauncherError, Result};
+use crate::import::check_safe_remote_path;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -329,6 +330,12 @@ pub fn build_classpath(
 
         if let Some(downloads) = &lib.downloads {
             if let Some(artifact) = &downloads.artifact {
+                // Remote metadata decides the path; a crafted ".." must never
+                // make us read/write outside the libraries directory.
+                if check_safe_remote_path(&artifact.path).is_err() {
+                    tracing::warn!(target: "launcher", "Skipping library with unsafe path: {}", artifact.path);
+                    continue;
+                }
                 let lib_path = libraries_dir.join(&artifact.path);
                 if lib_path.exists() {
                     classpath_entries.push(lib_path.to_string_lossy().to_string());
@@ -339,6 +346,10 @@ pub fn build_classpath(
                 if let Some(classifiers) = &downloads.classifiers {
                     if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
                         if let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) {
+                            if check_safe_remote_path(path).is_err() {
+                                tracing::warn!(target: "launcher", "Skipping native library with unsafe path: {}", path);
+                                continue;
+                            }
                             let native_path = libraries_dir.join(path);
                             if native_path.exists() {
                                 classpath_entries.push(native_path.to_string_lossy().to_string());
@@ -531,6 +542,10 @@ pub fn collect_downloads(
         if let Some(downloads) = &lib.downloads {
             // Main artifact
             if let Some(artifact) = &downloads.artifact {
+                if check_safe_remote_path(&artifact.path).is_err() {
+                    tracing::warn!(target: "launcher", "Skipping library with unsafe path: {}", artifact.path);
+                    continue;
+                }
                 let lib_path = libraries_dir.join(&artifact.path);
                 if !lib_path.exists() {
                     files.push((
@@ -551,6 +566,10 @@ pub fn collect_downloads(
                             native_artifact.get("sha1").and_then(|s| s.as_str()),
                             native_artifact.get("size").and_then(|s| s.as_u64()),
                         ) {
+                            if check_safe_remote_path(path).is_err() {
+                                tracing::warn!(target: "launcher", "Skipping native library with unsafe path: {}", path);
+                                continue;
+                            }
                             let native_path = libraries_dir.join(path);
                             if !native_path.exists() {
                                 files.push((url.to_string(), native_path, sha1.to_string(), size));

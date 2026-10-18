@@ -11,7 +11,7 @@ import { createPortal } from 'react-dom';
 import { addToast } from '../components/ui/Toast';
 import { invoke } from '@tauri-apps/api/core';
 import { BANNER_PRESETS, isGradientBanner, getGradientValue } from '../lib/bannerPresets';
-import { Avatar, OfflineAvatar } from '../lib/remoteImage';
+import { Avatar } from '../lib/remoteImage';
 
 interface HomeProps {
   onNavigate: (page: string) => void;
@@ -139,9 +139,7 @@ export function Home({ onNavigate }: HomeProps) {
     <div className="page" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xl)' }}>
       {/* Top bar: greeting + quick play */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-lg)' }}>
-        {defaultAccount?.account_type === 'Offline' ? (
-          <OfflineAvatar size={56} />
-        ) : activeId ? (
+        {activeId ? (
           <Avatar uuid={activeId} name={activeName ?? ''} size={56} />
         ) : (
           <div style={{

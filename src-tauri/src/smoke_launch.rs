@@ -96,7 +96,10 @@ fn java_dir(data_dir: &Path) -> PathBuf {
 
 fn check_java_availability(data_dir: &Path, required_major: u32) -> bool {
     let installations = launch::find_all_java_installations(data_dir);
-    crate::java::get_recommended_java(Some(required_major), &installations).is_some()
+    // Mirrors the launch flow: only an exact 64-bit major match is accepted.
+    installations
+        .iter()
+        .any(|j| j.is_64bit && j.major_version == required_major)
 }
 
 /// Ensure a managed JRE of `major` exists in `data_dir/java/jdk-<major>`.
@@ -431,6 +434,7 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
             uuid,
             username,
         },
+        None,
         None,
     ) {
         Ok(c) => c,

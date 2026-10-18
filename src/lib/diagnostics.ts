@@ -24,6 +24,8 @@ export interface VerifyIssue {
   path: string;
   kind: string;
   repairable: boolean;
+  /** Extra context for the kind ("outdated_loader" carries the loader range). */
+  detail?: string | null;
 }
 
 export interface VerifyCategory {
@@ -106,6 +108,8 @@ export const CRASH_KEYS: Record<string, { message: MessageKey; hint?: MessageKey
   jvm_args: { message: 'diag.crash_jvm_args', hint: 'diag.crash_hint_jvm' },
   launch_config: { message: 'diag.crash_launch_config', hint: 'diag.crash_hint_launch' },
   mod_crash: { message: 'diag.crash_mod_crash', hint: 'diag.crash_hint_mod' },
+  mod_dependency: { message: 'diag.crash_mod_dependency', hint: 'diag.crash_hint_dependency' },
+  loader_outdated: { message: 'diag.crash_loader_outdated', hint: 'diag.crash_hint_loader' },
   missing_dependency: { message: 'diag.crash_missing_dependency', hint: 'diag.crash_hint_deps' },
   missing_class: { message: 'diag.crash_missing_class', hint: 'diag.crash_hint_mod' },
   mod_conflict: { message: 'diag.crash_mod_conflict', hint: 'diag.crash_hint_conflict' },

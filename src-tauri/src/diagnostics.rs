@@ -527,7 +527,7 @@ pub struct CrashAnalysis {
     pub culprit: Option<String>,
     /// Evidence: the first log line matching the classification.
     pub detail: String,
-    /// `"crash-report"` | `"latest-log"` | `"none"`.
+    /// `"crash-report"` | `"session-log"` | `"latest-log"` | `"clean"` | `"none"`.
     pub source: String,
     /// Absolute path of the crash report, when one exists (for opening it).
     pub report_path: Option<String>,
@@ -579,6 +579,16 @@ const RULES: &[Rule] = &[
             "failed loading mod",
         ],
     },
+    // Fabric's mod-resolution failure ("Incompatible mods found!" is the
+    // modern wording; the exception class appears in the same block). Runs
+    // before the dependency rule so the loader-version refinement in
+    // `classify_run_crash` can sharpen it to `loader_outdated` when the log
+    // blames the loader version rather than a missing mod.
+    Rule {
+        kind: "mod_dependency",
+        verdict: "likely",
+        needles: &["incompatible mods found", "formattedexception"],
+    },
     Rule {
         kind: "missing_dependency",
         verdict: "likely",
@@ -616,22 +626,53 @@ fn find_ci(low: &str, needle: &str) -> Option<usize> {
     low.find(needle)
 }
 
-fn line_containing(original: &str, needles: &[&str]) -> Option<String> {
+/// A log-style WARN line ("[12:00:00] [main/WARN]: …"). Forge/NeoForge emit
+/// benign "Error loading class: … ClassNotFoundException" warnings while
+/// probing optional compat hooks; they are not crash evidence.
+fn is_warn_line(line: &str) -> bool {
+    let low = line.to_ascii_lowercase();
+    low.contains("/warn]") || low.contains("[warn")
+}
+
+/// First line containing any needle, returned with its byte offset in
+/// `original`. Strong (non-WARN) lines beat WARN ones regardless of
+/// position; with `reject_warn` a WARN-only match yields `None` (used by
+/// the noise-prone rules).
+fn evidence_line(original: &str, needles: &[&str], reject_warn: bool) -> Option<(String, usize)> {
+    let mut weak: Option<(String, usize)> = None;
+    let mut offset = 0usize;
     for line in original.split('\n') {
+        let line_start = offset;
+        offset += line.len() + 1;
         let line_low = line.to_ascii_lowercase();
         if needles.iter().any(|n| line_low.contains(n)) {
             let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.chars().take(400).collect());
+            if trimmed.is_empty() {
+                continue;
             }
+            let value: String = trimmed.chars().take(400).collect();
+            if is_warn_line(trimmed) {
+                if weak.is_none() {
+                    weak = Some((value, line_start));
+                }
+                continue;
+            }
+            return Some((value, line_start));
         }
     }
-    None
+    if reject_warn {
+        None
+    } else {
+        weak
+    }
 }
 
 /// Pull a mod/file name out of the evidence text. Strategies are ordered
-/// from most to least specific; all are plain substring scans.
-fn extract_culprit(original: &str) -> Option<String> {
+/// from most to least specific; all are plain substring scans. `focus`,
+/// when given, is the byte offset (within `original`) of the evidence line:
+/// the jar-path scan then prefers the line closest to it instead of the
+/// first one, so a stack frame beats an unrelated "mods/…jar" line.
+fn extract_culprit(original: &str, focus: Option<usize>) -> Option<String> {
     let low = original.to_ascii_lowercase();
 
     // "… from mod [sodium] …" / "… from mod 'sodium' …" (Mixin failures).
@@ -689,47 +730,172 @@ fn extract_culprit(original: &str) -> Option<String> {
             let end = tail
                 .find(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == '\'' || c == '"')
                 .unwrap_or(tail.len());
+            if end == 0 {
+                // The tail begins with a delimiter (e.g. ",)" right after the
+                // phrase) — skip that one char and keep scanning, otherwise
+                // `cursor` would never advance and this loop would spin.
+                cursor += tail.chars().next().map(char::len_utf8).unwrap_or(1);
+                continue;
+            }
             let word = &tail[..end];
             cursor += end;
-            if word.is_empty()
-                || word.eq_ignore_ascii_case("file")
-                || word.eq_ignore_ascii_case("mod")
-            {
+            if word.eq_ignore_ascii_case("file") || word.eq_ignore_ascii_case("mod") {
                 continue;
             }
             return Some(word.chars().take(80).collect());
         }
     }
 
-    // A jar path on the failing line: "… mods/sodium.jar"
+    // A jar path in the text: "… (mods/sodium.jar)". With a focus point the
+    // line nearest to the evidence wins; without one the first match wins
+    // (for callers that scan isolated snippets).
+    let mut best: Option<(usize, String)> = None;
+    let mut offset = 0usize;
     for line in original.split('\n') {
+        let line_start = offset;
+        offset += line.len() + 1;
         let line_low = line.to_ascii_lowercase();
         if line_low.contains(".jar") && (line_low.contains("mods/") || line_low.contains("mods\\"))
         {
-            let start = line_low.rfind(['/', '\\'])? + 1;
-            let end = line_low[start..].find(".jar").map(|e| start + e + 4)?;
+            let Some(start) = line_low.rfind(['/', '\\']).map(|p| p + 1) else {
+                continue;
+            };
+            let Some(rel) = line_low[start..].find(".jar") else {
+                continue;
+            };
+            let end = start + rel + 4;
             let name = line[start..end].trim();
             if !name.is_empty() {
-                return Some(name.chars().take(120).collect());
+                let dist = focus.map(|f| line_start.abs_diff(f)).unwrap_or(0);
+                if best.as_ref().map(|(d, _)| dist < *d).unwrap_or(true) {
+                    best = Some((dist, name.chars().take(120).collect()));
+                }
             }
         }
     }
+    best.map(|(_, name)| name)
+}
 
-    None
+/// Context window (bytes) taken around the evidence line for culprit
+/// extraction: wide enough for a stack trace, narrow enough that unrelated
+/// lines from the rest of the log can't be blamed.
+const EVIDENCE_CTX_BEFORE: usize = 2000;
+const EVIDENCE_CTX_AFTER: usize = 4000;
+
+fn clamp_to_char_boundary(text: &str, mut pos: usize) -> usize {
+    while pos > 0 && !text.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
 }
 
 /// Classify a text blob (crash report or log tail). Returns the matched
-/// rule, the evidence line, and the extracted culprit.
+/// rule, the evidence line, and the culprit extracted around that line.
 fn classify_crash(text: &str) -> Option<(&'static Rule, String, Option<String>)> {
-    let low = text.to_ascii_lowercase();
     for rule in RULES {
-        if rule.needles.iter().any(|n| find_ci(&low, n).is_some()) {
-            let detail = line_containing(text, rule.needles).unwrap_or_default();
-            let culprit = extract_culprit(text);
-            return Some((rule, detail, culprit));
+        // These needles are routinely hit by benign WARN probes (Forge
+        // "Error loading class" for optional compat hooks), so a WARN-only
+        // match is not evidence of a crash.
+        let reject_warn = matches!(rule.kind, "missing_class" | "mod_conflict");
+        let Some((detail, line_start)) = evidence_line(text, rule.needles, reject_warn) else {
+            continue;
+        };
+        let from = clamp_to_char_boundary(text, line_start.saturating_sub(EVIDENCE_CTX_BEFORE));
+        let to = clamp_to_char_boundary(text, (line_start + EVIDENCE_CTX_AFTER).min(text.len()));
+        let culprit = extract_culprit(&text[from..to], Some(line_start - from));
+        return Some((rule, detail, culprit));
+    }
+    None
+}
+
+/// First `'…'` or `"…"` quoted span of a line (short, non-empty).
+fn first_quoted(line: &str) -> Option<String> {
+    for q in ['\'', '"'] {
+        if let Some(inner) = line.split(q).nth(1) {
+            let name = inner.trim();
+            if !name.is_empty() {
+                return Some(name.chars().take(80).collect());
+            }
         }
     }
     None
+}
+
+/// Loader-version reading of a Fabric "Incompatible mods found!" failure:
+/// when the log explains that a mod needs a *newer loader* («… requires
+/// version 0.19.5 or later of mod 'Fabric Loader'», «Replace mod 'Fabric
+/// Loader' … with version … or later», or the solver's «{depends
+/// fabricloader @ [>=0.19.5]}» lines), the run died on the loader version —
+/// updating the loader fixes it, removing mods would not.
+struct LoaderOutdatedHint {
+    /// The mod that raised the requirement, when the log names one.
+    culprit: Option<String>,
+    /// The most actionable log line (the "Replace … or later" sentence).
+    detail: Option<String>,
+}
+
+fn fabric_loader_outdated(text: &str) -> Option<LoaderOutdatedHint> {
+    let low = text.to_ascii_lowercase();
+    if !(low.contains("fabricloader") || low.contains("fabric loader")) {
+        return None;
+    }
+    let about_loader = low.contains("of mod 'fabric loader'")
+        || low.contains("of mod \"fabric loader\"")
+        || low.contains("replace mod 'fabric loader'")
+        || low.contains("replace mod \"fabric loader\"")
+        || low.contains("depends fabricloader");
+    if !about_loader {
+        return None;
+    }
+    let mut hint = LoaderOutdatedHint {
+        culprit: None,
+        detail: None,
+    };
+    for line in text.split('\n') {
+        let line_low = line.to_ascii_lowercase();
+        if hint.detail.is_none()
+            && line_low.contains(" or later")
+            && line_low.contains("fabric loader")
+        {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                hint.detail = Some(trimmed.chars().take(400).collect());
+            }
+        }
+        if hint.culprit.is_none() && line_low.contains("requires version") {
+            if let Some(name) =
+                first_quoted(line).filter(|n| !n.to_ascii_lowercase().contains("fabric loader"))
+            {
+                hint.culprit = Some(name);
+            }
+        }
+        if hint.detail.is_some() && hint.culprit.is_some() {
+            break;
+        }
+    }
+    Some(hint)
+}
+
+/// `classify_crash` + the run-level refinement: a generic "mods are
+/// incompatible" hit is sharpened to `loader_outdated` when the log shows a
+/// mod demanding a newer loader. Returns `(kind, verdict, detail, culprit)`.
+fn classify_run_crash(text: &str) -> Option<(String, &'static str, String, Option<String>)> {
+    let (rule, detail, culprit) = classify_crash(text)?;
+    let mut kind = rule.kind.to_string();
+    let mut detail = detail;
+    let mut culprit = culprit;
+    if rule.kind == "mod_dependency" {
+        if let Some(hint) = fabric_loader_outdated(text) {
+            kind = "loader_outdated".to_string();
+            if let Some(d) = hint.detail {
+                detail = d;
+            }
+            if culprit.is_none() {
+                culprit = hint.culprit;
+            }
+        }
+    }
+    Some((kind, rule.verdict, detail, culprit))
 }
 
 const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
@@ -819,9 +985,10 @@ fn exit_code_from_session_log(text: &str) -> Option<i32> {
 /// launcher session log (`{safe}_{YYYYMMDD}_{HHMMSS}.log`): the filename
 /// carries the start time, the file mtime the end. Crash reports are only
 /// considered inside that window — otherwise a normal close after an old
-/// crash would surface a stale report as "cause unknown". The run's own
-/// unified log is classified before falling back to `latest.log` (which is
-/// only trustworthy when it belongs to the same run).
+/// crash would surface a stale report as "cause unknown". A run whose log
+/// records a clean exit (code 0) and has no report is reported as `clean`;
+/// only failed runs get their unified log classified, with `latest.log` as
+/// the last fallback (trustworthy only when it belongs to the same run).
 ///
 /// `session_path: None` resolves to the newest session of the instance
 /// (used by the auto-analysis right after exit, when the current-log path
@@ -864,10 +1031,10 @@ pub fn analyze_crash(
 
     if let Some(path) = &report_path {
         if let Some(text) = read_report(path) {
-            if let Some((rule, detail, culprit)) = classify_crash(&text) {
+            if let Some((kind, verdict, detail, culprit)) = classify_run_crash(&text) {
                 return Ok(CrashAnalysis {
-                    verdict: rule.verdict.to_string(),
-                    kind: rule.kind.to_string(),
+                    verdict: verdict.to_string(),
+                    kind,
                     culprit,
                     detail,
                     source: "crash-report".into(),
@@ -887,26 +1054,17 @@ pub fn analyze_crash(
         }
     }
 
-    // No crash report for this run — classify the run's own unified log
-    // (full stdout/stderr stream; catches early startup failures that never
-    // reach a crash report).
+    // No crash report for this run — read the run's own unified log (full
+    // stdout/stderr stream; catches early startup failures that never reach
+    // a crash report).
     let session_text = session.and_then(|s| read_tail(s, MAX_LOG_TAIL_BYTES));
-    if let Some(text) = &session_text {
-        if let Some((rule, detail, culprit)) = classify_crash(text) {
-            return Ok(CrashAnalysis {
-                verdict: rule.verdict.to_string(),
-                kind: rule.kind.to_string(),
-                culprit,
-                detail,
-                source: "session-log".into(),
-                report_path: None,
-            });
-        }
-    }
 
-    // The run ended with a clean exit code and left no crash artifacts in
-    // its window: say so plainly instead of "the game crashed" — the old
-    // behavior blamed a leftover report from an earlier run.
+    // A confirmed clean exit (code 0) with no crash report in the window is
+    // not a crash. This gate MUST run before the log classification: healthy
+    // sessions routinely contain benign WARN noise ("Error loading class: …
+    // ClassNotFoundException" for optional compat hooks) that would
+    // otherwise be reported as a possible cause. A real startup failure
+    // exits non-zero and is still classified below.
     if let Some(text) = &session_text {
         if exit_code_from_session_log(text) == Some(0) {
             return Ok(CrashAnalysis {
@@ -915,6 +1073,19 @@ pub fn analyze_crash(
                 culprit: None,
                 detail: String::new(),
                 source: "clean".into(),
+                report_path: None,
+            });
+        }
+    }
+
+    if let Some(text) = &session_text {
+        if let Some((kind, verdict, detail, culprit)) = classify_run_crash(text) {
+            return Ok(CrashAnalysis {
+                verdict: verdict.to_string(),
+                kind,
+                culprit,
+                detail,
+                source: "session-log".into(),
                 report_path: None,
             });
         }
@@ -936,10 +1107,10 @@ pub fn analyze_crash(
         .unwrap_or(true);
     if latest_is_current {
         if let Some(text) = read_tail(&latest, MAX_LOG_TAIL_BYTES) {
-            if let Some((rule, detail, culprit)) = classify_crash(&text) {
+            if let Some((kind, verdict, detail, culprit)) = classify_run_crash(&text) {
                 return Ok(CrashAnalysis {
-                    verdict: rule.verdict.to_string(),
-                    kind: rule.kind.to_string(),
+                    verdict: verdict.to_string(),
+                    kind,
                     culprit,
                     detail,
                     source: "latest-log".into(),
@@ -973,6 +1144,11 @@ mod tests {
 
     fn classify(text: &str) -> Option<(&'static str, &'static str, Option<String>)> {
         classify_crash(text).map(|(rule, _, culprit)| (rule.kind, rule.verdict, culprit))
+    }
+
+    /// `classify_run_crash` without the detail, for the refinement tests.
+    fn classify_run(text: &str) -> Option<(String, &'static str, Option<String>)> {
+        classify_run_crash(text).map(|(kind, verdict, _, culprit)| (kind, verdict, culprit))
     }
 
     #[test]
@@ -1012,6 +1188,48 @@ mod tests {
     }
 
     #[test]
+    fn fabric_incompatible_mods_found_is_loader_outdated() {
+        // The owner-reported failure: Fabric Language Kotlin demands a newer
+        // loader, the game dies at mod resolution and never writes a crash
+        // report — the analyzer must read this straight from the run log.
+        let text = "[08:20:58] [main/INFO]: Immediate reason: [HARD_DEP_NO_CANDIDATE fabric-language-kotlin 1.14.2+kotlin.2.4.21 {depends fabricloader @ [>=0.19.5]}, ROOT_FORCELOAD_SINGLE fabric-language-kotlin 1.14.2+kotlin.2.4.21]\n\
+                    [08:20:58] [main/INFO]: Reason: [HARD_DEP fabric-language-kotlin 1.14.2+kotlin.2.4.21 {depends fabricloader @ [>=0.19.5]}]\n\
+                    [08:20:58] [main/INFO]: Fix: add [], remove [], replace [[fabricloader 0.19.3] -> add:fabricloader 0.19.5 ([[0.19.5,\u{221e})])]\n\
+                    [08:20:58] [main/ERROR]: Incompatible mods found!\n\
+                    net.fabricmc.loader.impl.FormattedException: Some of your mods are incompatible with the game or each other!\n\
+                    \t - Replace mod 'Fabric Loader' (fabricloader) 0.19.3 with version 0.19.5 or later.\n\
+                    \t - Mod 'Fabric Language Kotlin' (fabric-language-kotlin) 1.14.2+kotlin.2.4.21 requires version 0.19.5 or later of mod 'Fabric Loader' (fabricloader), but only the wrong version is present: 0.19.3!";
+        let (kind, verdict, detail, culprit) =
+            classify_run_crash(text).expect("fabric should classify");
+        assert_eq!(kind, "loader_outdated");
+        assert_eq!(verdict, "likely");
+        assert!(
+            detail.contains("Replace mod 'Fabric Loader'"),
+            "detail: {detail}"
+        );
+        assert_eq!(culprit.as_deref(), Some("Fabric Language Kotlin"));
+    }
+
+    #[test]
+    fn fabric_incompatible_mods_without_loader_blame_stays_generic() {
+        // A mod clash that has nothing to do with the loader version keeps
+        // the generic kind — never a wrong "update the loader" verdict.
+        let text = "[08:20:58] [main/ERROR]: Incompatible mods found!\n\
+                    net.fabricmc.loader.impl.FormattedException: Some of your mods are incompatible with the game or each other!\n\
+                    \t - Mod 'Cool Mod' (coolmod) 1.0.0 requires any version of fabric-api, which is missing!";
+        let (kind, verdict, _) = classify_run(text).expect("fabric should classify");
+        assert_eq!(kind, "mod_dependency");
+        assert_eq!(verdict, "likely");
+    }
+
+    #[test]
+    fn loader_mention_without_upgrade_lines_stays_generic() {
+        let text = "fabricloader is present but the mod set failed\n[08:20:58] [main/ERROR]: Incompatible mods found!";
+        let (kind, _, _) = classify_run(text).expect("fabric should classify");
+        assert_eq!(kind, "mod_dependency");
+    }
+
+    #[test]
     fn java_version_mismatch() {
         let text = "Error: LinkageError occurred while loading main class net.minecraft.client.main.Main\njava.lang.UnsupportedClassVersionError: has been compiled by a more recent version of the Java Runtime";
         let (kind, verdict, _) = classify(text).expect("java should classify");
@@ -1031,6 +1249,37 @@ mod tests {
     #[test]
     fn unknown_text_does_not_classify() {
         assert!(classify("Everything worked fine and the game stopped normally.").is_none());
+    }
+
+    #[test]
+    fn warn_noise_is_not_missing_class_evidence() {
+        // Forge/NeoForge probe optional compat hooks and log this benign
+        // WARN on perfectly healthy launches.
+        let text = "[19:12:03] [main/WARN]: Error loading class: ca/spottedleaf/starlight/common/light/StarLightInterface$1 (java.lang.ClassNotFoundException: ca.spottedleaf.starlight.common.light.StarLightInterface$1)\n[19:12:05] [Render thread/INFO]: Sound engine started";
+        assert!(classify(text).is_none());
+    }
+
+    #[test]
+    fn fatal_missing_class_beats_warn_noise() {
+        let text = "[19:12:03] [main/WARN]: Error loading class: opt.probe (java.lang.ClassNotFoundException: opt.probe)\n[19:12:10] [main/FATAL]: Caused by: java.lang.ClassNotFoundException: com.example.Real";
+        let (kind, verdict, _) = classify(text).expect("fatal should classify");
+        assert_eq!(kind, "missing_class");
+        assert_eq!(verdict, "possible");
+    }
+
+    #[test]
+    fn culprit_scan_prefers_the_evidence_neighborhood() {
+        // The decoy jar line sits above the failure inside the context
+        // window; an unrelated line must not win over the stack frame that
+        // actually names the failing jar.
+        let mut text = String::from("[12:00:00] [main/INFO]: Old listing (mods/decoy.jar)\n");
+        for i in 0..10 {
+            text.push_str(&format!("[12:00:0{i}] [main/INFO]: Filler line {i}\n"));
+        }
+        text.push_str("java.lang.OutOfMemoryError: Java heap space\n");
+        text.push_str("\tat net.foo.Bar.baz (mods/realcause.jar)\n");
+        let (_, _, culprit) = classify_crash(&text).expect("oom should classify");
+        assert_eq!(culprit.as_deref(), Some("realcause.jar"));
     }
 
     #[test]
@@ -1107,5 +1356,20 @@ mod tests {
         let text = read_report(&path).expect("gz read");
         assert!(text.contains("OutOfMemoryError"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_loading_mod_with_trailing_delimiter_terminates() {
+        // Regression: the phrase is followed immediately by ",)" — the
+        // scanner used to spin forever because the cursor never advanced
+        // past the delimiter.
+        let text = "Failed loading mod,) the game crashed";
+        let culprit = extract_culprit(text, None);
+        assert_eq!(culprit.as_deref(), Some("the"));
+        let text = "Failed loading mod,,,'' words here";
+        let culprit = extract_culprit(text, None);
+        assert_eq!(culprit.as_deref(), Some("words"));
+        // Phrase at the very end of the text must not loop either.
+        assert_eq!(extract_culprit("Failed loading mod,", None), None);
     }
 }

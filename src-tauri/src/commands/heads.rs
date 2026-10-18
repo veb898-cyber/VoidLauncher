@@ -9,13 +9,34 @@
 //!   1. sessionserver.mojang.com (public profile → textures.minecraft.net)
 //!   2. api.minecraftservices.com/minecraft/profile with the account's own
 //!      stored Minecraft token (covers sessionserver rate-limit windows)
-//!   3. skin.ely.by for Ely.by accounts (their own skin delivery)
+//!   3. skinsystem.ely.by for Ely.by accounts (their own skin delivery, which
+//!      also proxies skins of premium Minecraft users)
 //!   4. mc-heads.net/skin as the last resort
 //!
 //! The frontend crops the square head out of the skin PNG (canvas), so every
 //! surface (Home, Settings, Sidebar, Accounts) renders the SAME cached image
-//! for the same account. Offline accounts never reach this command — the UI
-//! shows a fixed grayscale Steve for them by design.
+//! for the same account. Offline accounts never go to the network: their
+//! random profile uuid deterministically maps onto one of the bundled
+//! vanilla default skins (see `crate::default_skin`), which is exactly what
+//! the game itself renders for a skinless profile. Microsoft/Ely.by profiles
+//! fall back to that same bundled default when every source (and the disk
+//! cache) comes up empty.
+//!
+//! This module also owns CAPES for Microsoft accounts: the official profile
+//! lists every cape the account owns (id/alias/state/url), and the
+//! `/minecraft/profile/capes/active` endpoint switches the worn one. Cape
+//! PNGs travel to the renderer as data URLs through the same byte-capped
+//! allowlisted pipeline as skins and are cached on disk by their content
+//! hash, so repeat visits skip the downloads. A cape SWITCH answers with
+//! metadata only: the renderer already holds the textures, so no texture is
+//! ever re-downloaded just to flip which one is worn. The parsed list itself
+//! is memoized for a short TTL (every switch refreshes it), so re-opening the
+//! page never hammers the rate-limited profile endpoint — and a failed fetch
+//! is reported as an error instead of a fake empty list.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tauri::State;
 
@@ -251,10 +272,38 @@ async fn fetch_skin_minecraftservices(account: &AccountEntry) -> Option<Vec<u8>>
     fetch_skin_capped(&upgrade_texture_url(&skin_url)).await
 }
 
-/// Ely.by's own skin delivery. 404 means "no custom skin set" — callers
-/// continue down the chain (a default Steve is then the honest answer).
-async fn fetch_skin_elyby(norm: &str) -> Option<Vec<u8>> {
-    fetch_skin_capped(&format!("https://skin.ely.by/{}.png", norm)).await
+/// Pull the SKIN texture URL out of an Ely.by textures-system document
+/// (skinsystem.ely.by/textures/{nickname}: `{"SKIN":{"url":"..."}}`).
+fn skin_url_from_elyby_textures(json: &serde_json::Value) -> Option<String> {
+    let url = json["SKIN"]["url"].as_str()?;
+    if url.is_empty() {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+/// Ely.by's own skin delivery, keyed by NICKNAME (their system is premium-
+/// aware: for non-Ely.by names it proxies the Mojang skin). The textures
+/// endpoint yields the real texture URL, which is then upgraded to https and
+/// fetched through the allowlisted, byte-capped pipeline — same shape as the
+/// sessionserver flow above.
+async fn fetch_skin_elyby(name: &str) -> Option<Vec<u8>> {
+    // Ely.by nicknames follow the Minecraft rules (alnum + underscore); the
+    // name is interpolated into a URL path, so keep it strictly to that set.
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let url = format!("https://skinsystem.ely.by/textures/{}", name);
+    let client = crate::download::global_http_client().ok()?;
+    let resp = crate::download::send_with_fallback(client.get(&url))
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let skin_url = skin_url_from_elyby_textures(&json)?;
+    fetch_skin_capped(&upgrade_texture_url(&skin_url)).await
 }
 
 /// Last resort: mc-heads' RAW SKIN endpoint (not /avatar, which renders a
@@ -264,10 +313,11 @@ async fn fetch_skin_mcheads(norm: &str) -> Option<Vec<u8>> {
 }
 
 async fn fetch_skin_fresh(norm: &str, account: Option<&AccountEntry>) -> Option<Vec<u8>> {
-    let is_ely = account.is_some_and(|a| a.account_type == AccountType::ElyBy);
-    if is_ely {
-        if let Some(bytes) = fetch_skin_elyby(norm).await {
-            return Some(bytes);
+    if let Some(a) = account {
+        if a.account_type == AccountType::ElyBy {
+            if let Some(bytes) = fetch_skin_elyby(&a.name).await {
+                return Some(bytes);
+            }
         }
     }
     if let Some(bytes) = fetch_skin_sessionserver(norm).await {
@@ -309,6 +359,15 @@ pub async fn cmd_get_player_head(
     };
     let path = skin_cache_path(&data_dir, &norm);
 
+    let account_list = accounts::list_accounts(&data_dir);
+    let account = find_account_by_uuid(&account_list, &norm);
+
+    // Offline accounts have no network identity: the deterministic bundled
+    // vanilla default for their uuid is exactly what the game renders.
+    if account.is_some_and(|a| a.account_type == AccountType::Offline) {
+        return Ok(bundled_default_skin(&norm));
+    }
+
     // Fresh cache: instant answer, no network.
     if cache_is_fresh(&path) {
         if let Ok(bytes) = std::fs::read(&path) {
@@ -317,9 +376,6 @@ pub async fn cmd_get_player_head(
             }
         }
     }
-
-    let account_list = accounts::list_accounts(&data_dir);
-    let account = find_account_by_uuid(&account_list, &norm);
 
     if let Some(bytes) = fetch_skin_fresh(&norm, account).await {
         let _ = std::fs::create_dir_all(path.parent().unwrap_or(&data_dir));
@@ -336,7 +392,328 @@ pub async fn cmd_get_player_head(
             return Ok(Some(data_url(&bytes)));
         }
     }
-    Ok(None)
+
+    // Nothing cached either: the vanilla default by uuid is the honest
+    // stand-in (a skinless profile renders exactly like this). Not written to
+    // the disk cache — a later successful fetch must be able to win.
+    Ok(bundled_default_skin(&norm))
+}
+
+/// PNG data URL of the bundled vanilla default skin for the uuid.
+fn bundled_default_skin(norm: &str) -> Option<String> {
+    crate::default_skin::default_skin_png(norm).map(|(_, _, png)| data_url(png))
+}
+
+// ==================== Microsoft capes ====================
+
+/// One cape owned by a Microsoft account, ready for the renderer: metadata
+/// plus the cape texture as a PNG data URL (empty string when the texture
+/// could not be downloaded — the UI still shows the owned cape by alias).
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct CapeInfo {
+    pub id: String,
+    pub alias: String,
+    pub active: bool,
+    pub png: String,
+}
+
+/// Parse the `capes` list out of an official profile document
+/// (`api.minecraftservices.com/minecraft/profile`). Absent/empty list is
+/// legitimate (an account may own no capes); entries without an id are
+/// dropped.
+fn capes_from_profile(json: &serde_json::Value) -> Vec<(String, String, bool, String)> {
+    let Some(capes) = json["capes"].as_array() else {
+        return Vec::new();
+    };
+    capes
+        .iter()
+        .filter_map(|c| {
+            let id = c["id"].as_str()?;
+            if id.is_empty() {
+                return None;
+            }
+            Some((
+                id.to_string(),
+                c["alias"].as_str().unwrap_or("").to_string(),
+                c["state"].as_str() == Some("ACTIVE"),
+                c["url"].as_str().unwrap_or("").to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Metadata-only cape list from parsed tuples (the renderer keeps the PNGs it
+/// already received from `cmd_get_player_capes`).
+fn capes_meta_from_tuples(tuples: Vec<(String, String, bool, String)>) -> Vec<CapeInfo> {
+    tuples
+        .into_iter()
+        .map(|(id, alias, active, _url)| CapeInfo {
+            id,
+            alias,
+            active,
+            png: String::new(),
+        })
+        .collect()
+}
+
+/// How long a cached cape list may answer without a network round-trip.
+const CAPE_CACHE_TTL: Duration = Duration::from_secs(45);
+
+/// Last-seen cape tuples of one account, plus the fetch time.
+struct CapeCacheEntry {
+    at: Instant,
+    capes: Vec<(String, String, bool, String)>,
+}
+
+/// Recently fetched cape lists, keyed by account id. Re-entering the page
+/// reuses a fresh entry instead of hammering the rate-limited official
+/// profile endpoint; every cape switch refreshes the entry immediately.
+fn cape_cache() -> &'static Mutex<HashMap<String, CapeCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CapeCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cape_cache_is_fresh(at: Instant) -> bool {
+    at.elapsed() < CAPE_CACHE_TTL
+}
+
+fn cape_cache_get(account_id: &str) -> Option<Vec<(String, String, bool, String)>> {
+    let guard = cape_cache().lock().ok()?;
+    let entry = guard.get(account_id)?;
+    cape_cache_is_fresh(entry.at).then(|| entry.capes.clone())
+}
+
+fn cape_cache_store(account_id: &str, capes: &[(String, String, bool, String)]) {
+    if let Ok(mut guard) = cape_cache().lock() {
+        guard.retain(|_, e| cape_cache_is_fresh(e.at));
+        guard.insert(
+            account_id.to_string(),
+            CapeCacheEntry {
+                at: Instant::now(),
+                capes: capes.to_vec(),
+            },
+        );
+    }
+}
+
+/// Cache file for a cape texture, keyed by the content hash in the URL's
+/// last segment (Mojang textures are immutable per hash, so a hit can never
+/// serve stale art). Non-hash URLs (anything but a pure hex segment) are
+/// simply not cached.
+fn cape_cache_path(data_dir: &std::path::Path, url: &str) -> Option<std::path::PathBuf> {
+    let seg = url.rsplit('/').next()?;
+    if seg.len() < 8 || seg.len() > 64 || !seg.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(
+        data_dir
+            .join("capes")
+            .join(format!("{}.png", seg.to_ascii_lowercase())),
+    )
+}
+
+/// Download a cape texture (a few KB) or serve it from the disk cache as a
+/// PNG data URL.
+async fn fetch_cape_png_cached(data_dir: &std::path::Path, url: &str) -> Option<String> {
+    let path = cape_cache_path(data_dir, url);
+    if let Some(p) = &path {
+        if cache_is_fresh(p) {
+            if let Ok(bytes) = std::fs::read(p) {
+                if png_bytes_ok(&bytes) {
+                    return Some(data_url(&bytes));
+                }
+            }
+        }
+    }
+    let bytes = fetch_skin_capped(url).await?;
+    if let Some(p) = &path {
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(data_dir));
+        if let Err(e) = std::fs::write(p, &bytes) {
+            tracing::warn!(target: "launcher", "Could not cache cape texture: {}", e);
+        }
+    }
+    Some(data_url(&bytes))
+}
+
+/// GET the official profile for a Minecraft token.
+async fn fetch_ms_profile(token: &str) -> Option<serde_json::Value> {
+    let client = crate::download::global_http_client().ok()?;
+    let resp = crate::download::send_with_fallback(
+        client
+            .get("https://api.minecraftservices.com/minecraft/profile")
+            .header("Authorization", format!("Bearer {}", token)),
+    )
+    .await
+    .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
+/// Turn parsed cape tuples into renderer-ready entries, downloading each cape
+/// texture (small PNGs) through the allowlisted byte-capped pipeline — or
+/// serving it from the per-hash disk cache.
+async fn fetch_cape_infos(
+    parsed: Vec<(String, String, bool, String)>,
+    data_dir: &std::path::Path,
+) -> Vec<CapeInfo> {
+    let fetches = parsed
+        .into_iter()
+        .map(|(id, alias, active, url)| async move {
+            let png = if url.is_empty() {
+                String::new()
+            } else {
+                fetch_cape_png_cached(data_dir, &upgrade_texture_url(&url))
+                    .await
+                    .unwrap_or_default()
+            };
+            CapeInfo {
+                id,
+                alias,
+                active,
+                png,
+            }
+        });
+    futures::future::join_all(fetches).await
+}
+
+/// Parsed cape list (id, alias, active, texture url) of a Microsoft account:
+/// the session is ensured (tokens refresh as needed) and the official profile
+/// is fetched.
+async fn fetch_capes_meta(
+    state: &AppState,
+    account: &AccountEntry,
+) -> Result<Vec<(String, String, bool, String)>, String> {
+    let session = crate::commands::auth::ensure_ms_session(state, account).await?;
+    let token = session
+        .minecraft_token
+        .ok_or("Not logged in with Microsoft")?
+        .access_token;
+    if token.is_empty() {
+        return Err("Empty Minecraft token".to_string());
+    }
+    let json = fetch_ms_profile(&token)
+        .await
+        .ok_or("Could not load the Minecraft profile")?;
+    Ok(capes_from_profile(&json))
+}
+
+/// List the capes owned by a Microsoft account. A fresh cached list answers
+/// without touching the network; otherwise the official profile is fetched
+/// and memoized. A failed fetch is a real error — the renderer keeps the
+/// list it already has and shows the reason instead of a fake empty picker.
+/// Only a non-Microsoft account or an account genuinely owning no capes
+/// yields an empty list.
+#[tauri::command]
+pub async fn cmd_get_player_capes(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Vec<CapeInfo>, String> {
+    let (account, data_dir) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        let account = accounts::list_accounts(&config.data_dir)
+            .into_iter()
+            .find(|a| a.id == account_id)
+            .ok_or("Account not found")?;
+        (account, config.data_dir.clone())
+    };
+    if account.account_type != AccountType::Microsoft {
+        return Ok(Vec::new());
+    }
+    // Fresh cache: instant answer, no request to the rate-limited profile
+    // endpoint (textures still come from the per-hash disk cache).
+    if let Some(tuples) = cape_cache_get(&account_id) {
+        return Ok(fetch_cape_infos(tuples, &data_dir).await);
+    }
+    match fetch_capes_meta(state.inner(), &account).await {
+        Ok(tuples) => {
+            cape_cache_store(&account_id, &tuples);
+            Ok(fetch_cape_infos(tuples, &data_dir).await)
+        }
+        Err(e) => {
+            tracing::warn!(target: "launcher", "Could not load capes for '{}': {}", account.name, e);
+            Err(e)
+        }
+    }
+}
+
+/// Wear a cape (`Some(cape_id)`) or hide the cape (`None`) on a Microsoft
+/// account. The official endpoints return the updated profile, from which
+/// the fresh METADATA list is built — textures are not re-downloaded, the
+/// renderer keeps the PNGs it already received. If the body cannot be parsed
+/// the profile is re-fetched explicitly.
+#[tauri::command]
+pub async fn cmd_set_player_cape(
+    state: State<'_, AppState>,
+    account_id: String,
+    cape_id: Option<String>,
+) -> Result<Vec<CapeInfo>, String> {
+    let account = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        accounts::list_accounts(&config.data_dir)
+            .into_iter()
+            .find(|a| a.id == account_id)
+            .ok_or("Account not found")?
+    };
+    if account.account_type != AccountType::Microsoft {
+        return Err("Capes are only available for Microsoft accounts.".to_string());
+    }
+    let session = crate::commands::auth::ensure_ms_session(state.inner(), &account).await?;
+    let token = session
+        .minecraft_token
+        .ok_or("Not logged in with Microsoft")?
+        .access_token;
+    if token.is_empty() {
+        return Err("Empty Minecraft token".to_string());
+    }
+
+    const CAPES_ACTIVE_URL: &str =
+        "https://api.minecraftservices.com/minecraft/profile/capes/active";
+    let client = crate::download::global_http_client().map_err(|e| e.to_string())?;
+    let resp = match cape_id.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => {
+            // The id goes into a JSON body, but keep it to the uuid alphabet:
+            // a malformed id can never reach the API.
+            if id.len() > 36 || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                return Err("Invalid cape id".to_string());
+            }
+            crate::download::send_with_fallback(
+                client
+                    .put(CAPES_ACTIVE_URL)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .json(&serde_json::json!({ "capeId": id })),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        }
+        _ => crate::download::send_with_fallback(
+            client
+                .delete(CAPES_ACTIVE_URL)
+                .header("Authorization", format!("Bearer {}", token)),
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let text = text.chars().take(200).collect::<String>();
+        return Err(format!("Cape change failed ({}): {}", status, text));
+    }
+
+    let json = match resp.json::<serde_json::Value>().await {
+        Ok(j) => j,
+        Err(_) => fetch_ms_profile(&token)
+            .await
+            .ok_or("Could not reload the Minecraft profile")?,
+    };
+    // The switch response carries the updated list: memoize it so re-entering
+    // the page right after a change does not re-fetch the profile.
+    let tuples = capes_from_profile(&json);
+    cape_cache_store(&account_id, &tuples);
+    Ok(capes_meta_from_tuples(tuples))
 }
 
 #[cfg(test)]
@@ -409,6 +786,36 @@ mod tests {
         assert!(skin_url_from_sessionserver(&json).is_none());
     }
 
+    // ---- Ely.by textures parsing ----
+
+    #[test]
+    fn elyby_textures_skin_url_is_extracted_and_upgraded() {
+        // Real response shape (erickskrauch, trimmed to the relevant field).
+        let json = serde_json::json!({
+            "SKIN": { "url": "http://ely.by/storage/skins/69c6740d2993e5d6f6a7fc92420efc29.png" }
+        });
+        let url = skin_url_from_elyby_textures(&json).expect("skin url");
+        assert_eq!(
+            url,
+            "http://ely.by/storage/skins/69c6740d2993e5d6f6a7fc92420efc29.png"
+        );
+        assert_eq!(
+            upgrade_texture_url(&url),
+            "https://ely.by/storage/skins/69c6740d2993e5d6f6a7fc92420efc29.png"
+        );
+    }
+
+    #[test]
+    fn elyby_textures_without_skin_yields_none() {
+        assert!(skin_url_from_elyby_textures(&serde_json::json!({})).is_none());
+        assert!(
+            skin_url_from_elyby_textures(&serde_json::json!({ "CAPE": { "url": "x" } })).is_none()
+        );
+        assert!(
+            skin_url_from_elyby_textures(&serde_json::json!({ "SKIN": { "url": "" } })).is_none()
+        );
+    }
+
     // ---- minecraftservices profile parsing ----
 
     #[test]
@@ -453,5 +860,113 @@ mod tests {
         assert!(png_bytes_ok(b"\x89PNG\r\n\x1a\nrest"));
         assert!(!png_bytes_ok(b"\x89PNG"));
         assert!(!png_bytes_ok(b"<html>not a png</html>"));
+    }
+
+    // ---- capes profile parsing ----
+
+    #[test]
+    fn capes_parse_active_and_inactive() {
+        // Real response shape (trimmed): the owned capes with states.
+        let json = serde_json::json!({
+            "id": "1a65",
+            "name": "Black893",
+            "capes": [
+                { "id": "cape-1", "state": "ACTIVE", "url": "http://textures.minecraft.net/texture/a", "alias": "Migrator" },
+                { "id": "cape-2", "state": "INACTIVE", "url": "https://textures.minecraft.net/texture/b", "alias": "Vanilla" }
+            ]
+        });
+        let capes = capes_from_profile(&json);
+        assert_eq!(capes.len(), 2);
+        assert_eq!(capes[0].0, "cape-1");
+        assert_eq!(capes[0].1, "Migrator");
+        assert!(capes[0].2);
+        assert_eq!(capes[0].3, "http://textures.minecraft.net/texture/a");
+        assert!(!capes[1].2);
+        assert_eq!(capes[1].1, "Vanilla");
+    }
+
+    #[test]
+    fn capes_absent_empty_or_idless_yield_nothing() {
+        assert!(capes_from_profile(&serde_json::json!({})).is_empty());
+        assert!(capes_from_profile(&serde_json::json!({ "capes": [] })).is_empty());
+        // Entry without an id cannot be activated — dropped, with or without
+        // the surrounding valid entries.
+        let json = serde_json::json!({
+            "capes": [
+                { "state": "ACTIVE", "alias": "Ghost" },
+                { "id": "ok", "state": "INACTIVE", "url": "", "alias": "" }
+            ]
+        });
+        let capes = capes_from_profile(&json);
+        assert_eq!(capes.len(), 1);
+        assert_eq!(capes[0].0, "ok");
+        assert_eq!(capes[0].1, "");
+        assert_eq!(capes[0].3, "");
+    }
+
+    // ---- cape cache path + metadata-only switch response ----
+
+    #[test]
+    fn cape_cache_path_accepts_only_hex_hash_segments() {
+        let dir = std::path::Path::new("/data");
+        let ok = cape_cache_path(
+            dir,
+            "https://textures.minecraft.net/texture/292009A4925B58F02C77DADC3ECEF07EA4C7472F64E0FDC32CE5522489362680",
+        );
+        assert_eq!(
+            ok,
+            Some(
+                dir.join("capes")
+                    .join("292009a4925b58f02c77dadc3ecef07ea4c7472f64e0fdc32ce5522489362680.png")
+            )
+        );
+        // Ely.by storage URLs end with ".png" — not a pure hex segment.
+        assert!(cape_cache_path(
+            dir,
+            "https://ely.by/storage/skins/69c6740d2993e5d6f6a7fc92420efc29.png"
+        )
+        .is_none());
+        assert!(cape_cache_path(dir, "https://textures.minecraft.net/texture/short").is_none());
+        assert!(
+            cape_cache_path(dir, "https://textures.minecraft.net/texture/../../evil").is_none()
+        );
+    }
+
+    #[test]
+    fn capes_meta_carries_states_without_textures() {
+        let json = serde_json::json!({
+            "capes": [
+                { "id": "c1", "alias": "Migrator", "state": "ACTIVE", "url": "https://x/a" },
+                { "id": "c2", "alias": "Vanilla", "state": "INACTIVE", "url": "https://x/b" }
+            ]
+        });
+        let meta = capes_meta_from_tuples(capes_from_profile(&json));
+        assert_eq!(meta.len(), 2);
+        assert!(meta[0].active);
+        assert!(!meta[1].active);
+        assert!(meta.iter().all(|c| c.png.is_empty()));
+    }
+
+    // ---- cape cache freshness / metadata from tuples ----
+
+    #[test]
+    fn cape_cache_freshness_respects_ttl() {
+        assert!(cape_cache_is_fresh(Instant::now()));
+        let old = Instant::now()
+            .checked_sub(CAPE_CACHE_TTL + Duration::from_secs(1))
+            .expect("monotonic clock");
+        assert!(!cape_cache_is_fresh(old));
+    }
+
+    #[test]
+    fn capes_meta_from_tuples_drops_textures() {
+        let meta = capes_meta_from_tuples(vec![
+            ("a".into(), "Migrator".into(), true, "https://x/a".into()),
+            ("b".into(), String::new(), false, String::new()),
+        ]);
+        assert_eq!(meta.len(), 2);
+        assert!(meta[0].active);
+        assert!(meta[0].png.is_empty());
+        assert!(!meta[1].active);
     }
 }

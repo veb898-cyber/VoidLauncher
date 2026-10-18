@@ -207,7 +207,7 @@ async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
 /// has more segments, it is considered greater only if all shared
 /// segments are equal. Falls back to string comparison if parsing
 /// fails (handles pre-release tags like "alpha", "beta").
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let a_parts: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
     let b_parts: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
     let len = a_parts.len().max(b_parts.len());

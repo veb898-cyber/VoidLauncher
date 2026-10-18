@@ -2,7 +2,7 @@
 pub mod fabric;
 pub mod forge;
 pub mod neoforge;
-mod prism_meta;
+pub(crate) mod prism_meta;
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};

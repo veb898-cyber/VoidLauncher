@@ -75,8 +75,11 @@ export function Tooltip({ content, children, side = 'right', delay = 150 }: Tool
   }, [clearTimer, delay, place]);
 
   const closeTip = useCallback(() => {
+    // No grace period: the moment the cursor leaves the trigger (or the
+    // other open-state sources of the effect fire) the bubble starts
+    // fading — owner: «убиралась чуть быстрее».
     clearTimer();
-    timerRef.current = window.setTimeout(() => setOpen(false), 60);
+    setOpen(false);
   }, [clearTimer]);
 
   useEffect(() => {
@@ -85,11 +88,42 @@ export function Tooltip({ content, children, side = 'right', delay = 150 }: Tool
       if (e.key === 'Escape') closeTip();
     };
     const onResize = () => place();
+    // Chromium does not fire `mouseleave` when the trigger scrolls out from
+    // under a stationary cursor, is disabled or replaced while hovered, or
+    // when the window loses focus — the bubble would stick until the next
+    // click. Close on any scroll (capture: also container scrolls), on
+    // pointer movement outside the trigger, on window blur, and via a light
+    // watchdog for the remaining "no events at all" cases.
+    const onScroll = () => closeTip();
+    const onPointerMove = (e: PointerEvent) => {
+      const target = e.target as Node | null;
+      if (target && triggerRef.current?.contains(target)) return;
+      closeTip();
+    };
+    const onBlur = () => closeTip();
+    const watchdog = window.setInterval(() => {
+      const trigger = triggerRef.current;
+      const anchor = (trigger?.firstElementChild as HTMLElement | null) ?? trigger;
+      if (!anchor || !anchor.isConnected) {
+        closeTip();
+        return;
+      }
+      const active = document.activeElement;
+      const focused = !!active && (anchor === active || anchor.contains(active));
+      if (!focused && !anchor.matches(':hover')) closeTip();
+    }, 500);
     window.addEventListener('keydown', onKey);
     window.addEventListener('resize', onResize);
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('pointermove', onPointerMove, true);
+    window.addEventListener('blur', onBlur);
     return () => {
       window.removeEventListener('keydown', onKey);
       window.removeEventListener('resize', onResize);
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('pointermove', onPointerMove, true);
+      window.removeEventListener('blur', onBlur);
+      window.clearInterval(watchdog);
     };
   }, [open, closeTip, place]);
 

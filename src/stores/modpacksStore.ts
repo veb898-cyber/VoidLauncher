@@ -238,12 +238,15 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
       } else if (tb === 'curseforge') {
         const apiKey = useSettingsStore.getState().config?.curseforge_api_key;
         if (!apiKey) {
+          // No API key: show the "key required" hint. Must NOT return early —
+          // the loading flag is reset after this block, and skipping it left
+          // the CurseForge tab spinning forever.
           set({ cfResults: [] });
-          return;
+        } else {
+          const res = await invoke<any>('cmd_search_curseforge_modpacks', { query: '', mcVersion: null, loader: null, offset: 0, limit: PAGE_SIZE });
+          const data: CfHit[] = res.data || [];
+          set({ cfResults: data, cfOffset: data.length, cfHasMore: data.length >= PAGE_SIZE });
         }
-        const res = await invoke<any>('cmd_search_curseforge_modpacks', { query: '', mcVersion: null, loader: null, offset: 0, limit: PAGE_SIZE });
-        const data: CfHit[] = res.data || [];
-        set({ cfResults: data, cfOffset: data.length, cfHasMore: data.length >= PAGE_SIZE });
       } else {
         const res = await invoke<any>('cmd_search_modrinth_modpacks', { query: '', mcVersion: null, loader: null, index: 'downloads', offset: 0, limit: PAGE_SIZE });
         const hits: MrHit[] = res.hits || [];
@@ -261,10 +264,14 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
     try {
       if (tab === 'curseforge') {
         const apiKey = useSettingsStore.getState().config?.curseforge_api_key;
-        if (!apiKey) return;
-        const res = await invoke<any>('cmd_search_curseforge_modpacks', { query, mcVersion: null, loader: null, offset: 0, limit: PAGE_SIZE });
-        const data: CfHit[] = res.data || [];
-        set({ cfResults: data, cfOffset: data.length, cfHasMore: data.length >= PAGE_SIZE });
+        // No API key: leave the previous results (empty) in place — the tab
+        // shows the "key required" hint. Must not return early: the loading
+        // flag is cleared after the try block.
+        if (apiKey) {
+          const res = await invoke<any>('cmd_search_curseforge_modpacks', { query, mcVersion: null, loader: null, offset: 0, limit: PAGE_SIZE });
+          const data: CfHit[] = res.data || [];
+          set({ cfResults: data, cfOffset: data.length, cfHasMore: data.length >= PAGE_SIZE });
+        }
       } else if (tab === 'modrinth') {
         const res = await invoke<any>('cmd_search_modrinth_modpacks', { query, mcVersion: null, loader: null, index: 'downloads', offset: 0, limit: PAGE_SIZE });
         const hits: MrHit[] = res.hits || [];

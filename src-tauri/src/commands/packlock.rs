@@ -13,7 +13,8 @@ use crate::commands::instances::validate_instance_name;
 use crate::content::{self, SidecarWrite};
 use crate::curseforge::{self, CfFile};
 use crate::import::{
-    check_safe_relative, write_extracted, write_override_sidecar, ImportProgressPayload,
+    check_safe_file_name, check_safe_relative, write_extracted, write_override_sidecar,
+    ImportProgressPayload,
 };
 use crate::instances;
 use crate::modrinth::{self, ModrinthVersion};
@@ -313,6 +314,7 @@ pub async fn cmd_update_modpack(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<PackUpdateReport, String> {
+    let _pause_scope = crate::download::PausableInstallScope::begin();
     let ctx = pack_ctx(&state, &instance_name)?;
     let lock = PackLock::read(&ctx.instance_dir)
         .ok_or_else(|| "This instance is not a tracked modpack.".to_string())?;
@@ -340,6 +342,7 @@ pub async fn cmd_repair_modpack(
     state: State<'_, AppState>,
     instance_name: String,
 ) -> Result<PackRepairReport, String> {
+    let _pause_scope = crate::download::PausableInstallScope::begin();
     let ctx = pack_ctx(&state, &instance_name)?;
     let lock = PackLock::read(&ctx.instance_dir)
         .ok_or_else(|| "This instance is not a tracked modpack.".to_string())?;
@@ -465,6 +468,7 @@ async fn update_curseforge(
             let cf_file = curseforge::get_mod_file(pid, fid, &ctx.api_key)
                 .await
                 .map_err(|e| format!("CurseForge info for {} failed: {}", r.project_id, e))?;
+            check_safe_file_name(&cf_file.file_name).map_err(|e| e.to_string())?;
             let dest = stage_mods.join(&cf_file.file_name);
             curseforge::download_mod_file(pid, fid, &cf_file, &ctx.api_key, &dest)
                 .await
@@ -528,6 +532,7 @@ async fn update_curseforge(
         // Manifest mods: park the old file (matched by sidecar project id),
         // move the staged replacement in, rewrite the sidecar.
         for (r, cf_file) in &staged_mods {
+            check_safe_file_name(&cf_file.file_name).map_err(|e| e.to_string())?;
             let old = installed.iter().find(|i| {
                 i.provider == "curseforge" && i.project_id.as_deref() == Some(r.project_id.as_str())
             });
@@ -748,6 +753,7 @@ async fn repair_curseforge(
             let cf_file = curseforge::get_mod_file(pid, fid, &ctx.api_key)
                 .await
                 .map_err(|e| format!("CurseForge info failed: {}", e))?;
+            check_safe_file_name(&cf_file.file_name).map_err(|e| e.to_string())?;
             let dest = ctx.mods_dir.join(&cf_file.file_name);
             curseforge::download_mod_file(pid, fid, &cf_file, &ctx.api_key, &dest)
                 .await

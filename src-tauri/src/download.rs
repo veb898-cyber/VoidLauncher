@@ -1,7 +1,7 @@
 use crate::error::{LauncherError, Result};
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -16,18 +16,54 @@ const CONCURRENT_LIMIT: usize = 32;
 /// and `download_to_part` continues from the saved offset via Range.
 static PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Request that the current download stop as soon as possible.
+/// Number of pausable operations (modpack installs/updates/repairs) that are
+/// currently running. A pause request is only honoured while at least one is
+/// active, so a session with no pack install running can never pause (or get
+/// stuck paused) unrelated downloads like game files or mod updates.
+static PAUSABLE_SCOPES: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII marker for a pausable operation. Create one at the start of a
+/// pack install/update/repair command; downloads only respond to
+/// `request_pause()` while at least one marker is alive.
+pub struct PausableInstallScope {
+    _private: (),
+}
+
+impl PausableInstallScope {
+    pub fn begin() -> Self {
+        // Clear any stale flag from a previous install that raced with its
+        // own cleanup — a fresh install always starts unpaused.
+        PAUSE_REQUESTED.store(false, Ordering::SeqCst);
+        PAUSABLE_SCOPES.fetch_add(1, Ordering::SeqCst);
+        Self { _private: () }
+    }
+}
+
+impl Drop for PausableInstallScope {
+    fn drop(&mut self) {
+        if PAUSABLE_SCOPES.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // Last pausable operation finished — a leftover request must not
+            // pause whatever the user does next.
+            PAUSE_REQUESTED.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Request that the current download stop as soon as possible. No-op when
+/// no pausable install is running.
 pub fn request_pause() {
-    PAUSE_REQUESTED.store(true, Ordering::Relaxed);
+    if PAUSABLE_SCOPES.load(Ordering::SeqCst) > 0 {
+        PAUSE_REQUESTED.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Clear the pause flag (called when the user resumes an install).
 pub fn clear_pause() {
-    PAUSE_REQUESTED.store(false, Ordering::Relaxed);
+    PAUSE_REQUESTED.store(false, Ordering::SeqCst);
 }
 
 fn pause_requested() -> bool {
-    PAUSE_REQUESTED.load(Ordering::Relaxed)
+    PAUSABLE_SCOPES.load(Ordering::SeqCst) > 0 && PAUSE_REQUESTED.load(Ordering::SeqCst)
 }
 
 /// Shared allowlist of trusted download mirrors.
@@ -56,7 +92,8 @@ pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
     "mc-heads.net",
     "sessionserver.mojang.com",
     "textures.minecraft.net",
-    "skin.ely.by",
+    "skinsystem.ely.by",
+    "ely.by",
     "repo.maven.apache.org",
     "meta.fabricmc.net",
     "meta.prismlauncher.org",
@@ -119,6 +156,12 @@ fn http_client() -> reqwest::Result<reqwest::Client> {
 }
 
 fn build_client(proxy: Option<&str>) -> reqwest::Result<reqwest::Client> {
+    base_client_builder(proxy).build()
+}
+
+/// The shared request settings (timeouts, pooling, proxy handling, user
+/// agent) used by both the global client and the per-request pinned clients.
+fn base_client_builder(proxy: Option<&str>) -> reqwest::ClientBuilder {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .connect_timeout(Duration::from_secs(5))
@@ -144,6 +187,41 @@ fn build_client(proxy: Option<&str>) -> reqwest::Result<reqwest::Client> {
             // source of truth; system-level detection is handled separately.
             builder = builder.no_proxy();
         }
+    }
+    builder
+}
+
+/// Build a client that pins `host` to the given pre-validated IP addresses
+/// (DNS-rebinding protection: the name is never re-resolved). Redirects are
+/// NOT followed automatically — the caller validates and pins each hop.
+/// Uses the configured proxy.
+pub(crate) fn pinned_http_client(
+    host: &str,
+    addrs: &[std::net::IpAddr],
+) -> reqwest::Result<reqwest::Client> {
+    let proxy = resolved_proxy_url(active_proxy_raw());
+    finish_pinned_client(base_client_builder(proxy.as_deref()), host, addrs)
+}
+
+/// Same as [`pinned_http_client`] but bypasses the proxy — the "proxy ->
+/// direct" retry path for pinned requests.
+pub(crate) fn pinned_http_client_direct(
+    host: &str,
+    addrs: &[std::net::IpAddr],
+) -> reqwest::Result<reqwest::Client> {
+    finish_pinned_client(base_client_builder(None), host, addrs)
+}
+
+fn finish_pinned_client(
+    mut builder: reqwest::ClientBuilder,
+    host: &str,
+    addrs: &[std::net::IpAddr],
+) -> reqwest::Result<reqwest::Client> {
+    builder = builder.redirect(reqwest::redirect::Policy::none());
+    for addr in addrs {
+        // The port from the URL overrides this one when explicit; https URLs
+        // without a port use 443 anyway.
+        builder = builder.resolve(host, std::net::SocketAddr::new(*addr, 443));
     }
     builder.build()
 }
@@ -1417,5 +1495,34 @@ mod tests {
         // Unknown hosts get no alternates (and no surprise network calls).
         assert!(mirror_alternates("https://api.modrinth.com/v2/project/x").is_empty());
         assert!(mirror_alternates("https://example.com/file.jar").is_empty());
+    }
+
+    #[test]
+    fn pausable_scope_gates_pause_requests() {
+        // A pause request with no active install is a no-op.
+        request_pause();
+        assert!(!pause_requested());
+
+        // While a scope is alive, a request pauses and is visible.
+        let scope = PausableInstallScope::begin();
+        request_pause();
+        assert!(pause_requested());
+
+        // A nested scope keeps the pause alive after the inner one drops.
+        let inner = PausableInstallScope::begin();
+        request_pause();
+        assert!(pause_requested());
+        drop(inner);
+        assert!(pause_requested());
+
+        // The last scope going away clears the leftover request, so the next
+        // unrelated download can never be paused by it.
+        drop(scope);
+        assert!(!pause_requested());
+
+        // A fresh scope always starts unpaused.
+        let fresh = PausableInstallScope::begin();
+        assert!(!pause_requested());
+        drop(fresh);
     }
 }

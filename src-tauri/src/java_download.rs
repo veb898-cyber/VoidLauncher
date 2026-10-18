@@ -211,8 +211,32 @@ pub async fn list_available_java_versions() -> Result<Vec<AvailableJavaVersion>>
     Ok(versions)
 }
 
-/// Download and install a Java runtime by major version
+/// Download and install a Java runtime by major version.
+///
+/// Emits a terminal `"error"` progress event when it fails — the UI listens
+/// for the event (launch-time setup modal, Settings spinner) and without it a
+/// failed download left the modal/spinner claiming progress forever.
 pub async fn download_java_runtime(
+    major_version: u32,
+    data_dir: &Path,
+    app: &AppHandle,
+) -> Result<ManagedJavaRuntime> {
+    let result = download_java_runtime_inner(major_version, data_dir, app).await;
+    if let Err(e) = &result {
+        let _ = app.emit(
+            "java_download_progress",
+            JavaDownloadProgress {
+                major_version,
+                percent: 0.0,
+                stage: "error".to_string(),
+                message: e.to_string(),
+            },
+        );
+    }
+    result
+}
+
+async fn download_java_runtime_inner(
     major_version: u32,
     data_dir: &Path,
     app: &AppHandle,
@@ -361,6 +385,16 @@ pub async fn download_java_runtime(
     // referenced by `pkg.link` (SHA-256 hex). Verified against the downloaded
     // bytes before extraction.
     let expected_checksum = pkg.checksum.clone();
+
+    // The archive name becomes a local file name, and the link is fetched —
+    // both come from remote metadata, so neither is trusted blindly.
+    crate::import::check_safe_file_name(&pkg.name)
+        .map_err(|_| LauncherError::Download("Adoptium returned an invalid package name".into()))?;
+    if !crate::is_allowed_download_host(&pkg.link) {
+        return Err(LauncherError::Download(
+            "Adoptium package link is not in the download allowlist".into(),
+        ));
+    }
 
     let archive_path = java_dir.join(&pkg.name);
     let pkg_name = pkg.name.clone();

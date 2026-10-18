@@ -46,9 +46,9 @@ function App() {
 
   const handleLoaderInstalled = useCallback(() => {
     if (!pendingLoaderInstall) return;
-    const name = pendingLoaderInstall.instanceName;
+    const { instanceName, serverAddress, serverPort } = pendingLoaderInstall;
     dismissLoaderInstall();
-    launchGame(name);
+    launchGame(instanceName, serverAddress, serverPort);
   }, [pendingLoaderInstall, dismissLoaderInstall, launchGame]);
 
   const [javaSetupVisible, setJavaSetupVisible] = useState(false);
@@ -76,9 +76,11 @@ function App() {
       'java_download_progress',
       (event) => {
         const p = event.payload;
-        if (p.stage === 'done') {
+        if (p.stage === 'done' || p.stage === 'error') {
+          // Both are terminal: stop showing progress (the launch modal shows
+          // the error text itself when it catches the event).
           useJavaDownloadStore.getState().clear();
-          if (isLaunchingRef.current) {
+          if (p.stage === 'done' && isLaunchingRef.current) {
             setTimeout(() => setJavaSetupVisible(false), 500);
           }
         } else {

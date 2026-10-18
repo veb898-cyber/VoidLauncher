@@ -284,21 +284,6 @@ fn parse_vendor(output: &str) -> String {
     }
 }
 
-/// Get recommended Java for a Minecraft version
-pub fn get_recommended_java(
-    mc_java_version: Option<u32>,
-    installations: &[JavaInstallation],
-) -> Option<JavaInstallation> {
-    let required_major = mc_java_version.unwrap_or(8);
-
-    // Prefer exact match, then closest higher version
-    installations
-        .iter()
-        .filter(|j| j.is_64bit && j.major_version >= required_major)
-        .min_by_key(|j| j.major_version - required_major)
-        .cloned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
