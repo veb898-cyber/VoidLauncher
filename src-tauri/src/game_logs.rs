@@ -302,6 +302,23 @@ pub fn append_game_log_line(log_path: &str, line: &str) {
     }
 }
 
+/// Read the real instance name from a game-log header line
+/// ("Instance: <name>", see `create_game_log_file`). Returns None for files
+/// without a recognizable header (e.g. hand-copied logs).
+fn read_instance_header(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines().take(10).flatten() {
+        if let Some(rest) = line.strip_prefix("Instance: ") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// List game log sessions (most recent first, max 7)
 pub fn list_game_log_sessions(data_dir: &Path) -> Vec<GameLogSession> {
     let game_logs_dir = data_dir.join("logs").join("game");
@@ -332,14 +349,19 @@ pub fn list_game_log_sessions(data_dir: &Path) -> Vec<GameLogSession> {
                         .unwrap_or("unknown")
                         .to_string();
 
-                    // Parse instance name from filename.
-                    // Format: {safe_name}_{YYYYMMDD}_{HHMMSS} — strip the
-                    // two trailing timestamp segments to recover the name.
-                    let instance_name = file_name
+                    // Recover the REAL instance name from the log header
+                    // ("Instance: <name>"). Fall back to the sanitized
+                    // filename stem ({safe_name}_{YYYYMMDD}_{HHMMSS} — strip
+                    // the two trailing timestamp segments): characters like
+                    // spaces or brackets sanitize to '_' and cannot be
+                    // reconstructed, yet crash analysis needs the exact name
+                    // to find the instance directory.
+                    let fallback_name = file_name
                         .rsplitn(3, '_')
                         .last()
                         .unwrap_or(&file_name)
                         .to_string();
+                    let instance_name = read_instance_header(&path).unwrap_or(fallback_name);
 
                     let started_at = if let Ok(modified) = meta.modified() {
                         let dt: chrono::DateTime<chrono::Local> = modified.into();
@@ -573,6 +595,43 @@ mod tests {
         let newest = newest_session_for_instance(&dir, "Inst").expect("newest run");
         assert_eq!(newest, new, "per-instance newest, tees excluded");
         assert!(newest_session_for_instance(&dir, "Nope").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Manual crash analysis passes the listed instance_name to the
+    /// instance lookup, so it must be the REAL name from the log header —
+    /// the sanitized filename stem can never be resolved back to an
+    /// instance directory.
+    #[test]
+    fn session_instance_name_prefers_real_header_over_sanitized_filename() {
+        let dir = std::env::temp_dir().join(format!("vl_gamelogs_name_{}", std::process::id()));
+        let logs_dir = dir.join("logs").join("game");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        std::fs::write(
+            logs_dir.join("Better_MC__FORGE__BMC4_20261018_190854.log"),
+            "VoidLauncher Game Log\nInstance: Better MC [FORGE] BMC4\nStarted: 18/10/2026 19:08:54\n====\n",
+        )
+        .unwrap();
+        // Header-less file keeps the filename-derived fallback.
+        std::fs::write(logs_dir.join("Plain_20260101_000000.log"), "no header\n").unwrap();
+
+        let sessions = list_game_log_sessions(&dir);
+        let real = sessions
+            .iter()
+            .find(|s| {
+                s.path
+                    .ends_with("Better_MC__FORGE__BMC4_20261018_190854.log")
+            })
+            .expect("session listed");
+        assert_eq!(real.instance_name, "Better MC [FORGE] BMC4");
+
+        let plain = sessions
+            .iter()
+            .find(|s| s.path.ends_with("Plain_20260101_000000.log"))
+            .expect("session listed");
+        assert_eq!(plain.instance_name, "Plain");
 
         std::fs::remove_dir_all(&dir).ok();
     }

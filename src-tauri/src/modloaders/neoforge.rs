@@ -467,8 +467,8 @@ pub async fn install(
             .join(&maven_version)
             .join(format!("{}-{}-client.jar", artifact, maven_version));
 
-        if !client_path.exists() {
-            tracing::info!(target: "launcher", "NeoForge client JAR missing, running installer processors...");
+        if !super::forge::is_usable_jar(&client_path) {
+            tracing::info!(target: "launcher", "NeoForge client JAR missing or unusable, running installer processors...");
 
             // Extract data files (client.lzma etc.) from the installer into
             // <libraries>/net/neoforged/neoforge/_data/<key>/<file>
@@ -495,20 +495,24 @@ pub async fn install(
                             tracing::warn!(target: "launcher", "Skipping NeoForge data entry with unsafe key: {}", key);
                             continue;
                         }
-                        let dest = libraries_dir
-                            .join(&data_base)
-                            .join("_data")
-                            .join(key_lower)
-                            .join(fname);
-                        if !dest.exists() {
-                            if let Some(parent) = dest.parent() {
-                                std::fs::create_dir_all(parent).ok();
-                            }
-                            if super::forge::extract_entry_from_jar(&mut archive, jar_path, &dest) {
-                                tracing::debug!(target: "launcher", "Extracted data {} -> {}", jar_path, dest.display());
-                            } else {
-                                tracing::warn!(target: "launcher", "Failed to extract data file: {}", jar_path);
-                            }
+                        let dest = super::forge::data_file_path(
+                            libraries_dir,
+                            &data_base,
+                            &maven_version,
+                            &key_lower,
+                            fname,
+                        );
+                        // Always (over)write: the directory is keyed by the
+                        // loader version, so a correct file can only come
+                        // from this loader, and overwriting clears leftovers
+                        // of an interrupted extract.
+                        if let Some(parent) = dest.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        if super::forge::extract_entry_from_jar(&mut archive, jar_path, &dest) {
+                            tracing::debug!(target: "launcher", "Extracted data {} -> {}", jar_path, dest.display());
+                        } else {
+                            tracing::warn!(target: "launcher", "Failed to extract data file: {}", jar_path);
                         }
                     }
                 }
@@ -554,7 +558,8 @@ pub async fn install(
                 let cjar = client_jar.clone();
                 let root = root_dir.clone();
                 let data_base_owned = data_base.to_string();
-                match tokio::task::spawn_blocking(move || {
+                let data_ver = maven_version.clone();
+                let pipeline = match tokio::task::spawn_blocking(move || {
                     super::forge::run_forge_processors(super::forge::ForgeProcessorInputs {
                         install_profile: &profile,
                         installer_path: &installer,
@@ -564,23 +569,36 @@ pub async fn install(
                         client_jar: &cjar,
                         root_dir: &root,
                         data_base: &data_base_owned,
+                        data_version: &data_ver,
                     })
                 })
                 .await
                 {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(target: "launcher", "NeoForge processor run failed: {}", e)
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "launcher", "NeoForge processor task failed: {}", e)
-                    }
+                    Ok(inner) => inner,
+                    Err(e) => Err(LauncherError::ModLoader(format!(
+                        "NeoForge processor task failed: {}",
+                        e
+                    ))),
+                };
+                if let Err(e) = pipeline {
+                    // A failed processor leaves the pipeline half-applied —
+                    // do not continue as if the install succeeded. Drop the
+                    // (possibly partial) patched-client output so the next
+                    // attempt re-runs the whole pipeline instead of finding
+                    // it "already present".
+                    tracing::warn!(target: "launcher", "NeoForge processor run failed: {}", e);
+                    std::fs::remove_file(&client_path).ok();
+                    std::fs::remove_file(&installer_path).ok();
+                    return Err(LauncherError::ModLoader(format!(
+                        "NeoForge processor pipeline failed: {}",
+                        e
+                    )));
                 }
             } else {
                 tracing::warn!(target: "launcher", "Java not found — cannot run NeoForge processors");
             }
 
-            if !client_path.exists() {
+            if !super::forge::is_usable_jar(&client_path) {
                 return Err(LauncherError::ModLoader(
                     "NeoForge processors did not generate the client JAR".into(),
                 ));

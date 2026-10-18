@@ -356,7 +356,13 @@ pub(crate) async fn download_processor_lib(
     };
 
     let lib_path = libraries_dir.join(&path_str);
-    if lib_path.exists() {
+    // Trust an existing file only when it is not a JAR or passes the
+    // structural check — a zero-byte/truncated processor library would
+    // otherwise be accepted and break the pipeline run that follows.
+    let existing_ok = lib_path.exists()
+        && (lib_path.extension().and_then(|e| e.to_str()) != Some("jar")
+            || is_usable_jar(&lib_path));
+    if existing_ok {
         return Ok(());
     }
 
@@ -389,6 +395,10 @@ pub(crate) struct ForgeProcessorInputs<'a> {
     pub client_jar: &'a Path,
     pub root_dir: &'a Path,
     pub data_base: &'a str,
+    /// Full loader version (e.g. `1.20.1-47.4.20`); scopes the extracted
+    /// installer data files under `<data_base>/_data/<data_version>/...` so
+    /// different loader versions can never reuse each other's patch files.
+    pub data_version: &'a str,
 }
 
 /// Run the Forge installer processors (Forge 1.13+) by spawning Java processes
@@ -401,7 +411,8 @@ pub(crate) struct ForgeProcessorInputs<'a> {
 /// `data_base` is the maven directory of the loader inside `libraries_dir`
 /// ("net/minecraftforge/forge" for Forge, "net/neoforged/neoforge" for
 /// NeoForge 21.x); installer data files extracted from the JAR live under
-/// `<data_base>/_data/...`.
+/// `<data_base>/_data/<data_version>/...` (version-scoped, see
+/// `data_file_path`).
 ///
 /// Returns Ok(()) if all processors completed successfully and output JARs exist.
 pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<()> {
@@ -414,6 +425,7 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
         client_jar,
         root_dir,
         data_base,
+        data_version,
     } = inputs;
     let processors = install_profile
         .get("processors")
@@ -457,11 +469,7 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("data");
-                let data_path = libraries_dir
-                    .join(data_base)
-                    .join("_data")
-                    .join(key.to_lowercase())
-                    .join(fname);
+                let data_path = data_file_path(libraries_dir, data_base, data_version, key, fname);
                 vars.insert(key.clone(), data_path.to_string_lossy().to_string());
             } else {
                 // Plain string (e.g. SHA hash in quotes) - use as-is, strip surrounding quotes
@@ -862,6 +870,91 @@ fn mc_needs_processor_jars(mc_version: &str) -> bool {
     true
 }
 
+/// Path of an extracted installer data file inside the version-scoped
+/// `_data` directory: `<libraries>/<data_base>/_data/<data_version>/<key>/<file>`.
+///
+/// The version component is essential: installer data files (e.g.
+/// `client.lzma` patches) differ between loader versions, and a shared path
+/// lets the first-installed version's file leak into every other version's
+/// processor run. That was observed as a binarypatcher checksum failure
+/// which silently produced an empty patched-client JAR.
+pub(crate) fn data_file_path(
+    libraries_dir: &Path,
+    data_base: &str,
+    data_version: &str,
+    key: &str,
+    file_name: &str,
+) -> PathBuf {
+    libraries_dir
+        .join(data_base)
+        .join("_data")
+        .join(data_version)
+        .join(key.to_lowercase())
+        .join(file_name)
+}
+
+/// Structural sanity check for a processor-generated JAR: the file must
+/// exist, be plausibly sized and open as a ZIP with at least one entry.
+///
+/// This rejects the "processor failed and left an empty or truncated
+/// archive" failure mode (e.g. the 22-byte EOCD-only zip binarypatcher left
+/// behind on a patching error), which a bare `exists()` check accepts as
+/// installed. It is deliberately NOT a full integrity check — a
+/// structurally valid but wrong or partial JAR still passes — so it must
+/// never be treated as a checksum comparison.
+pub(crate) fn is_usable_jar(path: &Path) -> bool {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !meta.is_file() || meta.len() < 1024 {
+        return false;
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    match zip::ZipArchive::new(file) {
+        Ok(archive) => !archive.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// List the versioned directories under `libraries/net/minecraft/client/`
+/// (e.g. `1.20.1-20230612.114412`) that may hold processor-generated JARs.
+fn scan_client_version_dirs(libraries_dir: &Path) -> Vec<PathBuf> {
+    let base = libraries_dir.join("net").join("minecraft").join("client");
+    let mut dirs = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                dirs.push(e.path());
+            }
+        }
+    }
+    dirs
+}
+
+/// Find a processor-generated client JAR by suffix (`slim`/`extra`/`srg`),
+/// accepting both naming styles (version-dir name or plain MC version).
+fn find_client_jar_in(dirs: &[PathBuf], mc_version: &str, suffix: &str) -> Option<PathBuf> {
+    dirs.iter().find_map(|d| {
+        let name = d
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let p = d.join(format!("client-{}-{}.jar", name, suffix));
+        if p.is_file() {
+            return Some(p);
+        }
+        let p2 = d.join(format!("client-{}-{}.jar", mc_version, suffix));
+        if p2.is_file() {
+            return Some(p2);
+        }
+        None
+    })
+}
+
 /// Ensure Forge processor-generated JARs exist, running the processor pipeline
 /// if needed.
 pub async fn ensure_processor_jars(
@@ -888,28 +981,19 @@ pub async fn ensure_processor_jars(
     // Processor outputs are written into the timestamped version dir
     // (e.g. 1.16.5-20210115.111550), not the plain MC version one —
     // scan whatever version dirs exist under net/minecraft/client/.
-    let client_scan_dir = libraries_dir.join("net").join("minecraft").join("client");
-    let mut client_version_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&client_scan_dir) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                client_version_dirs.push(e.path());
-            }
-        }
-    }
-    let jar_exists = |mc: &str, suffix: &str| -> bool {
-        client_version_dirs.iter().any(|d| {
-            let name = d
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            d.join(format!("client-{}-{}.jar", name, suffix)).exists()
-                || d.join(format!("client-{}-{}.jar", mc, suffix)).exists()
-        })
-    };
-    let slim_ok = jar_exists(mc_version, "slim");
-    let extra_ok = jar_exists(mc_version, "extra");
-    let srg_ok = jar_exists(mc_version, "srg");
+    let client_version_dirs = scan_client_version_dirs(&libraries_dir);
+    // Existing outputs are trusted only when they pass the structural check:
+    // an empty/truncated JAR left behind by a failed processor must trigger
+    // a re-run instead of being accepted as installed.
+    let slim_ok = find_client_jar_in(&client_version_dirs, mc_version, "slim")
+        .map(|p| is_usable_jar(&p))
+        .unwrap_or(false);
+    let extra_ok = find_client_jar_in(&client_version_dirs, mc_version, "extra")
+        .map(|p| is_usable_jar(&p))
+        .unwrap_or(false);
+    let srg_ok = find_client_jar_in(&client_version_dirs, mc_version, "srg")
+        .map(|p| is_usable_jar(&p))
+        .unwrap_or(false);
     let forge_client_path = libraries_dir
         .join("net")
         .join("minecraftforge")
@@ -917,7 +1001,7 @@ pub async fn ensure_processor_jars(
         .join(&full_version)
         .join(format!("forge-{}-client.jar", &full_version));
 
-    let client_ok = forge_client_path.exists();
+    let client_ok = is_usable_jar(&forge_client_path);
 
     if slim_ok && extra_ok && client_ok && srg_ok {
         tracing::debug!(target: "launcher", "All Forge processor JARs present");
@@ -982,7 +1066,10 @@ pub async fn ensure_processor_jars(
     // Extract embedded JARs (forge jar with empty URL)
     extract_embedded_forge_jars(&mut archive, &libraries_dir);
 
-    // Extract data files (like client.lzma) from the installer JAR
+    // Extract data files (like client.lzma) from the installer JAR into the
+    // version-scoped `_data` directory. Always (over)write: the directory is
+    // keyed by the loader version, so a correct file can only come from this
+    // loader, and overwriting clears leftovers of an interrupted extract.
     if let Some(data_map) = install_profile.get("data").and_then(|d| d.as_object()) {
         for (key, entry) in data_map {
             let client_val = entry.get("client").and_then(|c| c.as_str()).unwrap_or("");
@@ -992,22 +1079,26 @@ pub async fn ensure_processor_jars(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("data");
-                let dest = libraries_dir
-                    .join("net")
-                    .join("minecraftforge")
-                    .join("forge")
-                    .join("_data")
-                    .join(key.to_lowercase())
-                    .join(fname);
-                if !dest.exists() {
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent).ok();
-                    }
-                    if extract_entry_from_jar(&mut archive, jar_path, &dest) {
-                        tracing::debug!(target: "launcher", "Extracted data {} -> {}", jar_path, dest.display());
-                    } else {
-                        tracing::warn!(target: "launcher", "Failed to extract data file: {}", jar_path);
-                    }
+                // The data-map key becomes a directory component; a crafted
+                // ".." / separator must not escape _data.
+                if crate::import::check_safe_file_name(&key.to_lowercase()).is_err() {
+                    tracing::warn!(target: "launcher", "Skipping Forge data entry with unsafe key: {}", key);
+                    continue;
+                }
+                let dest = data_file_path(
+                    &libraries_dir,
+                    "net/minecraftforge/forge",
+                    &full_version,
+                    key,
+                    fname,
+                );
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                if extract_entry_from_jar(&mut archive, jar_path, &dest) {
+                    tracing::debug!(target: "launcher", "Extracted data {} -> {}", jar_path, dest.display());
+                } else {
+                    tracing::warn!(target: "launcher", "Failed to extract data file: {}", jar_path);
                 }
             }
         }
@@ -1054,7 +1145,8 @@ pub async fn ensure_processor_jars(
         let ver = mc_version.to_string();
         let cjar = client_jar.clone();
         let root = root_dir.clone();
-        match tokio::task::spawn_blocking(move || {
+        let data_ver = full_version.clone();
+        let pipeline = match tokio::task::spawn_blocking(move || {
             run_forge_processors(ForgeProcessorInputs {
                 install_profile: &profile,
                 installer_path: &installer,
@@ -1064,13 +1156,29 @@ pub async fn ensure_processor_jars(
                 client_jar: &cjar,
                 root_dir: &root,
                 data_base: "net/minecraftforge/forge",
+                data_version: &data_ver,
             })
         })
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(target: "launcher", "Forge processor run failed: {}", e),
-            Err(e) => tracing::warn!(target: "launcher", "Forge processor task failed: {}", e),
+            Ok(inner) => inner,
+            Err(e) => Err(LauncherError::ModLoader(format!(
+                "Forge processor task failed: {}",
+                e
+            ))),
+        };
+        if let Err(e) = pipeline {
+            // A failed processor leaves the pipeline half-applied — do not
+            // continue as if the install succeeded. Drop the (possibly
+            // partial) patched-client output so the next attempt re-runs the
+            // whole pipeline instead of finding it "already present".
+            tracing::warn!(target: "launcher", "Forge processor run failed: {}", e);
+            std::fs::remove_file(&forge_client_path).ok();
+            std::fs::remove_file(&installer_path).ok();
+            return Err(LauncherError::ModLoader(format!(
+                "Forge processor pipeline failed: {}",
+                e
+            )));
         }
     } else {
         tracing::warn!(target: "launcher", "Java not found — cannot run Forge processors");
@@ -1079,42 +1187,24 @@ pub async fn ensure_processor_jars(
     std::fs::remove_file(&installer_path).ok();
 
     // --- Step 5: Verify outputs ---
-    // Outputs live in the timestamped version dir (1.16.5-20210115.111550),
-    // so scan whatever version dirs exist rather than assuming the plain
-    // MC version path.
-    let client_scan_dir = libraries_dir.join("net").join("minecraft").join("client");
-    let mut client_version_dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&client_scan_dir) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                client_version_dirs.push(e.path());
-            }
-        }
-    }
-    let scan_jar = |suffix: &str| -> Option<PathBuf> {
-        client_version_dirs.iter().find_map(|d| {
-            let name = d
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let p = d.join(format!("client-{}-{}.jar", name, suffix));
-            if p.exists() {
-                return Some(p);
-            }
-            let p2 = d.join(format!("client-{}-{}.jar", mc_version, suffix));
-            if p2.exists() {
-                return Some(p2);
-            }
-            None
-        })
-    };
-    let slim_path = scan_jar("slim");
-    let extra_path = scan_jar("extra");
-    let srg_path = scan_jar("srg");
-    let slim_ok = slim_path.is_some();
-    let extra_ok = extra_path.is_some();
-    let srg_ok = srg_path.is_some();
-    let client_ok = forge_client_path.exists();
+    // Outputs live in the timestamped version dir (1.16.5-20210115.111550);
+    // re-scan (the pipeline may have created dirs since the skip check) and
+    // apply the same structural check — a file that fails it is not a valid
+    // output, so verification must fail instead of reporting success.
+    let post_dirs = scan_client_version_dirs(&libraries_dir);
+    let slim_path = find_client_jar_in(&post_dirs, mc_version, "slim");
+    let extra_path = find_client_jar_in(&post_dirs, mc_version, "extra");
+    let srg_path = find_client_jar_in(&post_dirs, mc_version, "srg");
+    let slim_ok = slim_path
+        .as_ref()
+        .map(|p| is_usable_jar(p))
+        .unwrap_or(false);
+    let extra_ok = extra_path
+        .as_ref()
+        .map(|p| is_usable_jar(p))
+        .unwrap_or(false);
+    let srg_ok = srg_path.as_ref().map(|p| is_usable_jar(p)).unwrap_or(false);
+    let client_ok = is_usable_jar(&forge_client_path);
 
     tracing::debug!(target: "launcher", "Post-processor JAR check: slim={} extra={} srg={} client={}",
         slim_ok, extra_ok, srg_ok, client_ok);
@@ -1136,7 +1226,7 @@ pub async fn ensure_processor_jars(
             .join(&full_version),
     );
 
-    if !slim_ok || !extra_ok || !client_ok {
+    if !slim_ok || !extra_ok || !srg_ok || !client_ok {
         return Err(LauncherError::ModLoader(
             "Forge processors did not generate required output JARs".into(),
         ));
@@ -1332,5 +1422,74 @@ mod tests {
         // Unknown/unparseable input degrades to the oldest supported Java.
         assert_eq!(required_forge_java_major(""), 8);
         assert_eq!(required_forge_java_major("banana"), 8);
+    }
+
+    /// Two loader versions must never share extracted installer data files —
+    /// the shared-path leak corrupted a 1.20.1 patching run with 1.13.2 data.
+    #[test]
+    fn data_file_path_is_version_scoped() {
+        let p = data_file_path(
+            Path::new("C:/libs"),
+            "net/minecraftforge/forge",
+            "1.20.1-47.4.20",
+            "BINPATCH",
+            "client.lzma",
+        );
+        let s = p.to_string_lossy().replace('\\', "/");
+        assert_eq!(
+            s,
+            "C:/libs/net/minecraftforge/forge/_data/1.20.1-47.4.20/binpatch/client.lzma"
+        );
+
+        let p2 = data_file_path(
+            Path::new("C:/libs"),
+            "net/minecraftforge/forge",
+            "1.13.2-25.0.223",
+            "BINPATCH",
+            "client.lzma",
+        );
+        assert_ne!(p, p2, "different loader versions must use different files");
+    }
+
+    /// The structural check must reject the exact artifact a failed
+    /// processor leaves behind (empty/truncated archives) while accepting a
+    /// real JAR — and it must never be confused with a checksum check.
+    #[test]
+    fn usable_jar_rejects_missing_empty_and_truncated_files() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("vl_usablejar_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing file.
+        assert!(!is_usable_jar(&dir.join("nope.jar")));
+
+        // The failure mode seen in the wild: binarypatcher's 22-byte
+        // end-of-central-directory-only archive (a structurally valid but
+        // EMPTY zip).
+        let empty_zip = dir.join("empty.jar");
+        let mut bytes = vec![0x50, 0x4B, 0x05, 0x06];
+        bytes.extend_from_slice(&[0u8; 18]);
+        std::fs::write(&empty_zip, &bytes).unwrap();
+        assert!(!is_usable_jar(&empty_zip));
+
+        // A real archive with content passes (Stored so the on-disk size
+        // stays above the size floor instead of compressing to a few bytes).
+        let ok_jar = dir.join("ok.jar");
+        let f = std::fs::File::create(&ok_jar).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("data.bin", opts).unwrap();
+        zw.write_all(&vec![0u8; 4096]).unwrap();
+        zw.finish().unwrap();
+        assert!(is_usable_jar(&ok_jar));
+
+        // Truncated write (interrupted download/extract) fails to open.
+        let truncated = dir.join("truncated.jar");
+        let full = std::fs::read(&ok_jar).unwrap();
+        std::fs::write(&truncated, &full[..full.len() / 2]).unwrap();
+        assert!(!is_usable_jar(&truncated));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
