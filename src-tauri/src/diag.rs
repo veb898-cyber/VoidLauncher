@@ -352,9 +352,9 @@ fn diag_bench_mod_icon_cache() {
     println!("icons persisted on disk: {}/{}", on_disk, sample.len());
 }
 
-/// Owner-requested audit: run the full diagnostics report (system + network
-/// + real instance verify) and print it. Env: DIAG_INSTANCE to override the
-/// default big pack.
+/// Owner-requested audit: run the full diagnostics report (system, network
+/// and real-instance verify) and print it. Env: DIAG_INSTANCE to override
+/// the default big pack.
 #[test]
 #[ignore]
 fn diag_probe_run_diagnostics() {
@@ -363,7 +363,7 @@ fn diag_probe_run_diagnostics() {
     let instance = std::env::var("DIAG_INSTANCE").unwrap_or_else(|_| INSTANCE.to_string());
     let rt = tokio::runtime::Runtime::new().unwrap();
     // `run_diagnostics` uses tauri's async runtime for its worker threads.
-    let _ = tauri::async_runtime::set(rt.handle().clone());
+    tauri::async_runtime::set(rt.handle().clone());
     let t = std::time::Instant::now();
     let report = rt.block_on(crate::diagnostics::run_diagnostics(config, Some(instance)));
     println!("run_diagnostics took {:?}", t.elapsed());

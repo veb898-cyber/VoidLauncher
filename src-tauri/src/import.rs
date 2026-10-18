@@ -884,7 +884,8 @@ async fn prepare_version_and_assets(
         }
     };
     // Remote metadata names are used as file/directory names below.
-    if check_safe_file_name(&version_info.id).is_err() || check_safe_file_name(&version_info.assets).is_err()
+    if check_safe_file_name(&version_info.id).is_err()
+        || check_safe_file_name(&version_info.assets).is_err()
     {
         tracing::warn!(
             target: "launcher",
@@ -1026,11 +1027,9 @@ async fn prepare_version_and_assets(
     }
     // Virtual/legacy mirror for old versions (1.8 and older) — same step the
     // version installer performs.
-    if let Err(e) = download::ensure_virtual_assets(
-        &version_info.assets,
-        &asset_index,
-        &config.assets_dir(),
-    ) {
+    if let Err(e) =
+        download::ensure_virtual_assets(&version_info.assets, &asset_index, &config.assets_dir())
+    {
         tracing::warn!(target: "launcher", "Failed to mirror virtual assets for '{}': {}", instance.name, e);
     }
 }
