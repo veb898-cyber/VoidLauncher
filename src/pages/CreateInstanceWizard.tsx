@@ -13,6 +13,8 @@ import { useInstanceStore } from '../stores/instanceStore';
 import { addToast } from '../components/ui/Toast';
 import { useLogPlaque } from '../lib/uiLog';
 import { SlidingTabs, type SlidingTabDef } from '../components/ui/SlidingTabs';
+import { ImportReportPanel } from '../components/import/ImportReportPanel';
+import { reportHasGaps, type ImportOutcome, type ImportReport } from '../lib/importReport';
 
 interface VersionEntry {
   id: string;
@@ -92,12 +94,20 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
   const [importLoading, setImportLoading] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [importProgress, setImportProgress] = useState<{ current: number; total: number; stage: string; message: string } | null>(null);
+  const [importReport, setImportReport] = useState<ImportReport | null>(null);
+  const [importReportName, setImportReportName] = useState('');
+  const [retryingImport, setRetryingImport] = useState(false);
 
   useLogPlaque(importError, 'error', 'import');
   useLogPlaque(importProgress?.message ?? null, 'info', 'import');
 
   const loaderListRef = useRef<HTMLDivElement>(null);
   const loaderVersionsLoadingRef = useRef(false);
+  // Each loader-list request gets a sequence number. Changing the Minecraft
+  // version (or loader) while a page is still downloading fires a new request;
+  // without this guard the older answer landed afterwards and mixed versions
+  // from the previous game version into the list.
+  const loaderRequestRef = useRef(0);
 
   // The dialog must occupy exactly the same frame in both modes (owner: «размер
   // окна … должен быть одинаковый» — a jumping dialog reads as broken). While
@@ -141,6 +151,9 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
     setImportLoading(false);
     setImportError(null);
     setImportProgress(null);
+    setImportReport(null);
+    setImportReportName('');
+    setRetryingImport(false);
   };
 
   const fetchVersions = async () => {
@@ -170,6 +183,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
     const offset = resetOffset ? 0 : (loaderVersions[target]?.length ?? 0);
     const totalKnown = loaderVersionTotals[target];
     if (!resetOffset && totalKnown !== null && offset >= totalKnown) return;
+    const reqId = ++loaderRequestRef.current;
     setLoaderVersionsLoading(true);
     setLoaderVersionsError(false);
     try {
@@ -183,16 +197,19 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
       } else {
         page = { versions: [], total: 0 };
       }
+      if (reqId !== loaderRequestRef.current) return;
       setLoaderVersions(prev => ({ ...prev, [target]: [...(prev[target] ?? []), ...page.versions] }));
       setLoaderVersionTotals(prev => ({ ...prev, [target]: page.total }));
       if (offset === 0 && page.versions.length > 0) {
         setSelectedLoaderVersion(page.versions[0].version);
       }
     } catch (e) {
+      if (reqId !== loaderRequestRef.current) return;
       console.error('Failed to fetch loader versions:', e);
       setLoaderVersionsError(true);
+    } finally {
+      if (reqId === loaderRequestRef.current) setLoaderVersionsLoading(false);
     }
-    setLoaderVersionsLoading(false);
   }, [loaderType, selectedVersion, loaderVersions, loaderVersionTotals]);
 
   const handleVersionSelect = (id: string) => {
@@ -323,22 +340,79 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
   const handleImport = async () => {
     if (!canImport || !importPath) return;
     setIsCreating(true);
+    setImportReport(null);
     setImportProgress({ current: 0, total: 1, stage: 'starting', message: t('create_instance.import_starting') });
     let unlisten: UnlistenFn | undefined;
     try {
       unlisten = await listen<{ current: number; total: number; stage: string; message: string }>('import-progress', (event) => {
         setImportProgress(event.payload);
       });
-      await invoke('cmd_import_modpack', { path: importPath, instanceName: instanceName.trim() });
-      addToast(t('create_instance.imported', { name: instanceName }), 'success');
+      const outcome = await invoke<ImportOutcome>('cmd_import_modpack', {
+        path: importPath,
+        instanceName: instanceName.trim(),
+      });
       await loadInstances();
-      onClose();
+      if (reportHasGaps(outcome.report)) {
+        // Keep the dialog open: the user must see which files are missing
+        // and can retry them right here.
+        setImportReport(outcome.report);
+        setImportReportName(outcome.instance.name || instanceName.trim());
+        addToast(t('create_instance.imported_partial', {
+          installed: String(outcome.report.installed),
+          total: String(outcome.report.total_files),
+        }), 'warning');
+      } else {
+        addToast(t('create_instance.imported', { name: instanceName }), 'success');
+        onClose();
+      }
     } catch (e: any) {
       addToast(t('create_instance.failed', { error: e.toString() }), 'error');
     }
     if (unlisten) unlisten();
     setIsCreating(false);
     setImportProgress(null);
+  };
+
+  const handleRetryImport = async () => {
+    if (!importReport || retryingImport) return;
+    const retryable = importReport.failed.filter(
+      (f) => f.retryable && f.project_id != null && f.file_id != null,
+    );
+    if (retryable.length === 0) return;
+    setRetryingImport(true);
+    try {
+      const result = await invoke<ImportReport>('cmd_retry_curseforge_import_files', {
+        instanceName: importReportName,
+        files: retryable.map((f) => ({ projectId: f.project_id, fileId: f.file_id })),
+      });
+      const stillFailed = [
+        ...importReport.failed.filter((f) => !retryable.includes(f)),
+        ...result.failed,
+      ];
+      const installed = importReport.installed + result.installed;
+      const updated = { ...importReport, installed, failed: stillFailed };
+      if (!reportHasGaps(updated)) {
+        setImportReport(null);
+        addToast(t('create_instance.imported_retry_done'), 'success');
+        await loadInstances();
+        onClose();
+      } else {
+        setImportReport(updated);
+        if (result.failed.length > 0) {
+          addToast(t('modpacks.retry_partial', {
+            installed: String(result.installed),
+            failed: String(result.failed.length),
+          }), 'warning');
+        } else if (importReport.skipped > 0) {
+          addToast(t('modpacks.retry_done_skipped', { n: String(importReport.skipped) }), 'warning');
+        }
+        await loadInstances();
+      }
+    } catch (e: any) {
+      addToast(t('modpacks.retry_error', { error: e.toString() }), 'error');
+    } finally {
+      setRetryingImport(false);
+    }
   };
 
   const formatLabel = (fmt: string) => {
@@ -366,7 +440,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
               {t('create_instance.title')}
             </Button>
           ) : (
-            <Button onClick={handleImport} loading={isCreating} disabled={!canImport}>
+            <Button onClick={handleImport} loading={isCreating} disabled={!canImport || !!importReport}>
               {t('create_instance.import_action')}
             </Button>
           )}
@@ -613,6 +687,15 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                     {importProgress.current} / {importProgress.total}
                   </div>
                 </div>
+              )}
+
+              {importReport && (
+                <ImportReportPanel
+                  report={importReport}
+                  instanceName={importReportName}
+                  retrying={retryingImport}
+                  onRetry={handleRetryImport}
+                />
               )}
 
               {importMeta && (

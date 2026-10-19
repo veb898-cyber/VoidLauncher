@@ -10,6 +10,8 @@ import { useModpacksStore, type ModpacksTab, type MrHit, type CfHit, type AtlPac
 import { formatBytes, formatDownloads } from '../lib/format';
 import { useSettingsStore } from '../stores/settingsStore';
 import { useRemoteImage, IconShine } from '../lib/remoteImage';
+import { ImportReportPanel } from '../components/import/ImportReportPanel';
+import { reportHasGaps } from '../lib/importReport';
 
 // Catalog icons go through the shared remote pipeline (useRemoteImage):
 // shine while loading, letter fallback only after a failed fetch.
@@ -38,7 +40,7 @@ export function Modpacks() {
     selected, versions, loadingDetail, atlDetail,
     installName, nameError, installing, paused, progress,
     installVersionId, installCfFileId, installAtlVersion,
-    fetchRetry, fileProgress,
+    fetchRetry, fileProgress, installReport, retryingInstallFiles,
   } = store;
 
   const loading = loadingByTab[tab];
@@ -371,6 +373,18 @@ export function Modpacks() {
         )}
 
         {retryHint}
+
+        {/* A partially downloaded pack stays usable; list the missing files
+            with their reasons and offer a retry instead of a success toast. */}
+        {installReport && reportHasGaps(installReport) && (
+          <ImportReportPanel
+            report={installReport}
+            instanceName={installReport.instanceName}
+            retrying={retryingInstallFiles}
+            onRetry={() => store.retryFailedInstallFiles()}
+            onDismiss={() => store.dismissInstallReport()}
+          />
+        )}
       </div>
     );
   };

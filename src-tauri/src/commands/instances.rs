@@ -321,7 +321,7 @@ pub async fn cmd_import_modpack(
     state: State<'_, AppState>,
     path: String,
     instance_name: String,
-) -> Result<instances::Instance, String> {
+) -> Result<crate::import::ImportOutcome, String> {
     validate_instance_name(&instance_name)?;
     if !std::path::PathBuf::from(&path).exists() {
         return Err("File not found".to_string());
@@ -330,7 +330,7 @@ pub async fn cmd_import_modpack(
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.clone()
     };
-    let instance = crate::import::import_modpack(
+    let outcome = crate::import::import_modpack(
         &config.instances_dir(),
         &path,
         &instance_name,
@@ -343,9 +343,9 @@ pub async fn cmd_import_modpack(
 
     // Download the loader profile, game files and assets right away, so the
     // first launch does not have to fetch them while the player waits.
-    crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
+    crate::import::prepare_instance_files(Some(&app), &config, &outcome.instance).await;
     crate::import::emit_progress(Some(&app), "done", 1, 1, "Import complete!");
-    Ok(instance)
+    Ok(outcome)
 }
 
 #[tauri::command]

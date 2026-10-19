@@ -193,7 +193,7 @@ pub async fn cmd_install_curseforge_modpack(
     mod_id: u64,
     file_id: u64,
     instance_name: String,
-) -> Result<crate::instances::Instance, String> {
+) -> Result<crate::import::ImportOutcome, String> {
     let _pause_scope = crate::download::PausableInstallScope::begin();
     validate_instance_name(&instance_name)?;
     let (instances_dir, api_key, libraries_dir) = {
@@ -228,7 +228,7 @@ pub async fn cmd_install_curseforge_modpack(
         }
     };
 
-    let instance = match crate::import::import_curseforge_pack(
+    let (instance, report) = match crate::import::import_curseforge_pack(
         &instances_dir,
         &temp_path.to_string_lossy(),
         &instance_name,
@@ -238,7 +238,7 @@ pub async fn cmd_install_curseforge_modpack(
     )
     .await
     {
-        Ok(i) => i,
+        Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&temp_path);
             // The importer does not clean up after itself; the target was
@@ -278,7 +278,43 @@ pub async fn cmd_install_curseforge_modpack(
     };
     crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
     crate::import::emit_progress(Some(&app), "done", 1, 1, "Install complete!");
-    Ok(instance)
+    Ok(crate::import::ImportOutcome { instance, report })
+}
+
+/// Request payload for retrying the files a CurseForge import failed to get.
+#[derive(Debug, serde::Deserialize)]
+pub struct RetryCurseForgeFile {
+    pub project_id: u64,
+    pub file_id: u64,
+}
+
+/// Re-download the files that a previous CurseForge import could not install.
+/// The instance is kept as-is; the returned report lists what still failed.
+#[tauri::command]
+pub async fn cmd_retry_curseforge_import_files(
+    state: State<'_, AppState>,
+    instance_name: String,
+    files: Vec<RetryCurseForgeFile>,
+) -> Result<crate::import::ImportReport, String> {
+    validate_instance_name(&instance_name)?;
+    if files.is_empty() {
+        return Ok(crate::import::ImportReport::default());
+    }
+    let (instances_dir, api_key) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (
+            config.instances_dir().clone(),
+            config.curseforge_api_key.clone(),
+        )
+    };
+    let pairs: Vec<(u64, u64)> = files
+        .iter()
+        .filter(|f| f.project_id > 0 && f.file_id > 0)
+        .map(|f| (f.project_id, f.file_id))
+        .collect();
+    crate::import::retry_curseforge_import_files(&instances_dir, &instance_name, &pairs, &api_key)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ==================== Modrinth ====================

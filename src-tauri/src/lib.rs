@@ -333,6 +333,7 @@ pub fn run() {
             commands::modpacks::cmd_search_curseforge_modpacks,
             commands::modpacks::cmd_get_curseforge_modpack_files,
             commands::modpacks::cmd_install_curseforge_modpack,
+            commands::modpacks::cmd_retry_curseforge_import_files,
             commands::packlock::cmd_get_pack_lock,
             commands::packlock::cmd_check_modpack_update,
             commands::packlock::cmd_update_modpack,

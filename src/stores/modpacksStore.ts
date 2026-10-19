@@ -4,6 +4,7 @@ import { addToast } from '../components/ui/Toast';
 import { useInstanceStore } from './instanceStore';
 import { useSettingsStore } from './settingsStore';
 import { t } from '../lib/i18n';
+import { reportHasGaps, type ImportOutcome, type ImportReport } from '../lib/importReport';
 
 export type ModpacksTab = 'modrinth' | 'curseforge' | 'atlauncher';
 
@@ -109,6 +110,9 @@ interface ModpacksState {
 
   fetchRetry: FetchRetryPayload | null;
   fileProgress: FileProgressPayload | null;
+  /** Failed files of the last import; null after a complete import. */
+  installReport: (ImportReport & { instanceName: string }) | null;
+  retryingInstallFiles: boolean;
 
 switchTab: (tb: ModpacksTab) => void;
   loadInitial: (tb: ModpacksTab) => Promise<void>;
@@ -126,12 +130,14 @@ switchTab: (tb: ModpacksTab) => void;
   setInstallCfFileId: (id: number | null) => void;
   setInstallAtlVersion: (v: string) => void;
   clearSelected: () => void;
-  runInstall: (install: () => Promise<void>, kind: 'mr' | 'cf' | 'atl') => Promise<void>;
+  runInstall: (install: () => Promise<ImportOutcome | void>, kind: 'mr' | 'cf' | 'atl') => Promise<void>;
   pauseInstall: () => Promise<void>;
   resumeInstall: () => Promise<void>;
   installFromMr: () => Promise<void>;
   installFromCf: (hit: CfHit) => Promise<void>;
   installFromAtl: (pack: AtlPack) => Promise<void>;
+  retryFailedInstallFiles: () => Promise<void>;
+  dismissInstallReport: () => void;
   onFetchRetry: (payload: FetchRetryPayload) => void;
   onFileProgress: (payload: FileProgressPayload) => void;
   onImportProgress: (payload: ProgressPayload) => void;
@@ -198,6 +204,8 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
 
   fetchRetry: null,
   fileProgress: null,
+  installReport: null,
+  retryingInstallFiles: false,
 
   switchTab: (tb) => {
     const s = get();
@@ -375,11 +383,24 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
       set({ nameError: true });
       return;
     }
-    set({ nameError: false, installing: true, paused: false, progress: null, fileProgress: null, pendingInstall: kind });
+    set({
+      nameError: false, installing: true, paused: false, progress: null, fileProgress: null,
+      pendingInstall: kind, installReport: null,
+    });
     try {
-      await install();
+      const outcome = await install();
       await useInstanceStore.getState().loadInstances();
-      addToast(t('modpacks.installed'), 'success');
+      if (outcome && reportHasGaps(outcome.report)) {
+        // Partial import: the instance exists and is usable, but saying
+        // "installed" would hide the files that are missing.
+        set({ installReport: { ...outcome.report, instanceName: outcome.instance.name || name } });
+        addToast(t('modpacks.installed_partial', {
+          installed: String(outcome.report.installed),
+          total: String(outcome.report.total_files),
+        }), 'warning');
+      } else {
+        addToast(t('modpacks.installed'), 'success');
+      }
     } catch (e: any) {
       if (typeof e === 'string' && e.includes('paused')) {
         set({ installing: false, paused: true, progress: null, fileProgress: null });
@@ -430,7 +451,11 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
     const { installCfFileId } = get();
     if (installCfFileId == null) return;
     await get().runInstall(async () => {
-      await invoke('cmd_install_curseforge_modpack', { modId: hit.id, fileId: installCfFileId, instanceName: get().installName.trim() });
+      return await invoke<ImportOutcome>('cmd_install_curseforge_modpack', {
+        modId: hit.id,
+        fileId: installCfFileId,
+        instanceName: get().installName.trim(),
+      });
     }, 'cf');
   },
 
@@ -441,6 +466,54 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
       await invoke('cmd_install_atlauncher_modpack', { packId: pack.id, version: installAtlVersion, instanceName: get().installName.trim() });
     }, 'atl');
   },
+
+  retryFailedInstallFiles: async () => {
+    const report = get().installReport;
+    if (!report || get().retryingInstallFiles) return;
+    const retryable = report.failed.filter(
+      (f) => f.retryable && f.project_id != null && f.file_id != null,
+    );
+    if (retryable.length === 0) return;
+    set({ retryingInstallFiles: true });
+    try {
+      const result = await invoke<ImportReport>('cmd_retry_curseforge_import_files', {
+        instanceName: report.instanceName,
+        files: retryable.map((f) => ({ projectId: f.project_id, fileId: f.file_id })),
+      });
+      const stillFailed = [
+        ...report.failed.filter((f) => !retryable.includes(f)),
+        ...result.failed,
+      ];
+      const installed = report.installed + result.installed;
+      const updated = { ...report, installed, failed: stillFailed };
+      if (!reportHasGaps(updated)) {
+        set({
+          installReport: null,
+          retryingInstallFiles: false,
+        });
+        addToast(t('modpacks.retry_done'), 'success');
+      } else {
+        set({
+          installReport: updated,
+          retryingInstallFiles: false,
+        });
+        if (result.failed.length > 0) {
+          addToast(t('modpacks.retry_partial', {
+            installed: String(result.installed),
+            failed: String(result.failed.length),
+          }), 'warning');
+        } else if (report.skipped > 0) {
+          addToast(t('modpacks.retry_done_skipped', { n: String(report.skipped) }), 'warning');
+        }
+      }
+      await useInstanceStore.getState().loadInstances();
+    } catch (e: any) {
+      set({ retryingInstallFiles: false });
+      addToast(t('modpacks.retry_error', { error: e.toString() }), 'error');
+    }
+  },
+
+  dismissInstallReport: () => set({ installReport: null }),
 
   onFetchRetry: (payload) => set({ fetchRetry: payload }),
   onFileProgress: (payload) => set({ fileProgress: payload }),

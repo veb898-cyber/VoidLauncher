@@ -43,6 +43,70 @@ pub struct ImportProgressPayload {
     pub message: String,
 }
 
+/// One file that could not be installed during a pack import.
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedImportFile {
+    /// Display name when the provider returned one, otherwise "project:file".
+    pub file_name: String,
+    pub project_id: Option<u64>,
+    pub file_id: Option<u64>,
+    /// Human-readable reason (provider error, unsafe file name, bad manifest).
+    pub reason: String,
+    /// False for manifest entries that carry no ids — nothing to retry.
+    pub retryable: bool,
+}
+
+/// Outcome of a pack import. A CurseForge import is allowed to finish with
+/// some files missing; the caller must show the failures and offer a retry
+/// instead of pretending the pack is complete.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ImportReport {
+    pub total_files: usize,
+    pub installed: usize,
+    pub failed: Vec<FailedImportFile>,
+    /// Entries skipped because manifest.json has no projectID/fileID.
+    pub skipped: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Instance plus the per-file report of how its import went.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportOutcome {
+    pub instance: Instance,
+    pub report: ImportReport,
+}
+
+impl ImportReport {
+    fn complete(total_files: usize, installed: usize) -> Self {
+        Self {
+            total_files,
+            installed,
+            ..Self::default()
+        }
+    }
+}
+
+/// How a pack import should be treated once all files were attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportCompletion {
+    /// Nothing to install, or every file landed.
+    Complete,
+    /// At least one file is missing but the pack is still usable.
+    Partial,
+    /// Nothing landed: the pack would be a broken shell, so fail the import.
+    Failed,
+}
+
+pub(crate) fn import_completion(total: usize, installed: usize) -> ImportCompletion {
+    if total == 0 || installed >= total {
+        ImportCompletion::Complete
+    } else if installed > 0 {
+        ImportCompletion::Partial
+    } else {
+        ImportCompletion::Failed
+    }
+}
+
 pub(crate) fn emit_progress(
     app: Option<&AppHandle>,
     stage: &str,
@@ -676,7 +740,7 @@ pub async fn import_modpack(
     curseforge_api_key: &str,
     libraries_dir: &Path,
     app: Option<&AppHandle>,
-) -> Result<Instance> {
+) -> Result<ImportOutcome> {
     emit_progress(app, "reading", 0, 1, "Reading archive...");
 
     // Never merge into an existing instance — a same-named import would
@@ -706,21 +770,29 @@ pub async fn import_modpack(
         }
     };
 
-    let instance = match format {
+    let outcome = match format {
         ModpackFormat::Prism => {
-            import_with_cleanup(instances_dir, instance_name, || async {
+            let instance = import_with_cleanup(instances_dir, instance_name, || async {
                 instances::import_prism_pack(instances_dir, path)
             })
-            .await?
+            .await?;
+            ImportOutcome {
+                report: ImportReport::complete(0, 0),
+                instance,
+            }
         }
         ModpackFormat::Modrinth => {
-            import_with_cleanup(instances_dir, instance_name, || async {
+            let instance = import_with_cleanup(instances_dir, instance_name, || async {
                 import_mrpack(instances_dir, path, instance_name, app).await
             })
-            .await?
+            .await?;
+            ImportOutcome {
+                report: ImportReport::complete(0, 0),
+                instance,
+            }
         }
         ModpackFormat::CurseForge => {
-            import_with_cleanup(instances_dir, instance_name, || async {
+            let (instance, report) = import_with_cleanup(instances_dir, instance_name, || async {
                 import_curseforge_pack(
                     instances_dir,
                     path,
@@ -731,13 +803,18 @@ pub async fn import_modpack(
                 )
                 .await
             })
-            .await?
+            .await?;
+            ImportOutcome { instance, report }
         }
         ModpackFormat::ATLauncher => {
-            import_with_cleanup(instances_dir, instance_name, || async {
+            let instance = import_with_cleanup(instances_dir, instance_name, || async {
                 import_atlauncher_pack(instances_dir, path, instance_name)
             })
-            .await?
+            .await?;
+            ImportOutcome {
+                report: ImportReport::complete(0, 0),
+                instance,
+            }
         }
     };
 
@@ -745,7 +822,7 @@ pub async fn import_modpack(
     // `prepare_instance_files` (loader profile + game files + assets) first
     // and only then emits "done", so the progress UI stays live until the
     // instance is actually ready for its first launch.
-    Ok(instance)
+    Ok(outcome)
 }
 
 /// Download everything an instance needs for its first launch: the mod-loader
@@ -1058,14 +1135,14 @@ pub(crate) fn ensure_instance_target_free(instances_dir: &Path, instance_name: &
 ///
 /// A directory is only removed when it did NOT exist before the import — a
 /// re-import over an existing instance must not wipe the previous good copy.
-async fn import_with_cleanup<F, Fut>(
+async fn import_with_cleanup<T, F, Fut>(
     instances_dir: &Path,
     instance_name: &str,
     importer: F,
-) -> Result<Instance>
+) -> Result<T>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<Instance>>,
+    Fut: std::future::Future<Output = Result<T>>,
 {
     let target = instances_dir.join(instance_name);
     let existed_before = target.exists();
@@ -1313,6 +1390,103 @@ pub(crate) async fn import_mrpack(
     Ok(instance)
 }
 
+/// Download one CurseForge mod file into an instance's `mods` directory and
+/// write its sidecar. The error carries the file name and a human-readable
+/// reason so the import report (and the retry UI) can name the failed file.
+pub(crate) async fn install_curseforge_file(
+    mods_dir: &Path,
+    pid: u64,
+    fid: u64,
+    api_key: &str,
+) -> std::result::Result<String, (String, String)> {
+    let fallback = format!("{}:{}", pid, fid);
+    let cf_file = crate::curseforge::get_mod_file(pid, fid, api_key)
+        .await
+        .map_err(|e| (fallback.clone(), format!("CurseForge API error: {}", e)))?;
+    let display = if cf_file.display_name.trim().is_empty() {
+        fallback.clone()
+    } else {
+        cf_file.display_name.clone()
+    };
+
+    // The file name comes from remote metadata and is joined into mods/ —
+    // reject any path component.
+    if let Err(e) = check_safe_file_name(&cf_file.file_name) {
+        return Err((display, format!("Unsafe file name: {}", e)));
+    }
+    let dest_path = mods_dir.join(&cf_file.file_name);
+    if let Err(e) =
+        crate::curseforge::download_mod_file(pid, fid, &cf_file, api_key, &dest_path).await
+    {
+        return Err((display, format!("Download failed: {}", e)));
+    }
+
+    // Sidecar: unified writer, with the CF file id and the verified hash so
+    // update checks can compare this file against the CF file list later.
+    let pid_str = pid.to_string();
+    let fid_str = fid.to_string();
+    let hash = cf_file.sha1_hash().map(|s| s.to_string());
+    let _ = content::write_sidecar(
+        mods_dir,
+        &cf_file.file_name,
+        &content::SidecarWrite {
+            provider: "curseforge",
+            content_type: "mod",
+            project_id: Some(&pid_str),
+            project_name: Some(&display),
+            version_id: None,
+            // CurseForge has no separate version field; the display name
+            // (e.g. "jei-1.20.1-forge-15.21.0.138") is the closest thing to
+            // a real version and beats the "${file.jarVersion}" placeholder
+            // many JARs ship with.
+            version_number: Some(&display),
+            file_id: Some(&fid_str),
+            hash: hash.as_deref(),
+        },
+    );
+
+    Ok(display)
+}
+
+/// Retry a subset of a CurseForge import (the files reported as failed by a
+/// previous import). Best-effort: the returned report lists what still could
+/// not be downloaded; the instance itself is never removed here.
+pub(crate) async fn retry_curseforge_import_files(
+    instances_dir: &Path,
+    instance_name: &str,
+    files: &[(u64, u64)],
+    api_key: &str,
+) -> Result<ImportReport> {
+    let mods_dir = instances_dir
+        .join(instance_name)
+        .join(".minecraft")
+        .join("mods");
+    if !instances_dir.join(instance_name).exists() {
+        return Err(LauncherError::Instance(format!(
+            "Instance '{}' does not exist",
+            instance_name
+        )));
+    }
+    std::fs::create_dir_all(&mods_dir)?;
+
+    let total = files.len();
+    let mut report = ImportReport::complete(total, 0);
+    for (pid, fid) in files {
+        match install_curseforge_file(&mods_dir, *pid, *fid, api_key).await {
+            Ok(_) => report.installed += 1,
+            Err((name, reason)) => report.failed.push(FailedImportFile {
+                file_name: name,
+                project_id: Some(*pid),
+                file_id: Some(*fid),
+                reason,
+                retryable: true,
+            }),
+        }
+    }
+    report.total_files = total;
+    Ok(report)
+}
+
 /// Import a CurseForge modpack
 pub(crate) async fn import_curseforge_pack(
     instances_dir: &Path,
@@ -1321,7 +1495,7 @@ pub(crate) async fn import_curseforge_pack(
     curseforge_api_key: &str,
     _libraries_dir: &Path,
     app: Option<&AppHandle>,
-) -> Result<Instance> {
+) -> Result<(Instance, ImportReport)> {
     emit_progress(app, "extracting", 0, 1, "Extracting overrides...");
     ensure_instance_target_free(instances_dir, instance_name)?;
 
@@ -1409,12 +1583,13 @@ pub(crate) async fn import_curseforge_pack(
     // Download mods listed in the files array via CurseForge API (concurrent)
     let files = manifest["files"].as_array().cloned().unwrap_or_default();
     let total = files.len();
+    let mut report = ImportReport::complete(total, total);
     if total > 0 {
         let semaphore = Arc::new(Semaphore::new(4));
         let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let in_progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let succeeded = Arc::new(AtomicUsize::new(0));
-        let failed_ids = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let failed_ids = Arc::new(Mutex::new(Vec::<FailedImportFile>::new()));
         let mut tasks = Vec::with_capacity(total);
         let mut skipped = 0usize;
 
@@ -1427,7 +1602,7 @@ pub(crate) async fn import_curseforge_pack(
             &format!("Preparing {} mods...", total),
         );
 
-        for file_entry in files {
+        for (entry_idx, file_entry) in files.into_iter().enumerate() {
             let project_id = file_entry["projectID"].as_u64();
             let file_id = file_entry["fileID"].as_u64();
 
@@ -1457,72 +1632,36 @@ pub(crate) async fn import_curseforge_pack(
                         });
                     }
 
-                    let mut last_name = String::new();
-                    let result: std::result::Result<(), String> = async {
-                        let cf_file = crate::curseforge::get_mod_file(pid, fid, &api_key).await
-                            .map_err(|e| format!("CF API error: {}", e))?;
-                        last_name = cf_file.display_name.clone();
-
-                        // The file name comes from remote metadata and is
-                        // joined into mods/ — reject any path component.
-                        check_safe_file_name(&cf_file.file_name)
-                            .map_err(|e| e.to_string())?;
-                        let dest_path = mods_dir.join(&cf_file.file_name);
-                        crate::curseforge::download_mod_file(pid, fid, &cf_file, &api_key, &dest_path)
-                            .await
-                            .map_err(|e| e.to_string())?;
-
-                        // Sidecar: unified writer, with the CF file id and
-                        // the verified hash so update checks can compare
-                        // this file against the CF file list later.
-                        let pid_str = pid.to_string();
-                        let fid_str = fid.to_string();
-                        let display = cf_file.display_name.clone();
-                        let hash = cf_file.sha1_hash().map(|s| s.to_string());
-                        let _ = content::write_sidecar(
-                            &mods_dir,
-                            &cf_file.file_name,
-                            &content::SidecarWrite {
-                                provider: "curseforge",
-                                content_type: "mod",
-                                project_id: Some(&pid_str),
-                                project_name: Some(&display),
-                                version_id: None,
-                                // CurseForge has no separate version field;
-                                // the display name (e.g.
-                                // "jei-1.20.1-forge-15.21.0.138") is the
-                                // closest thing to a real version and beats
-                                // the "${file.jarVersion}" placeholder many
-                                // JARs ship with.
-                                version_number: Some(&display),
-                                file_id: Some(&fid_str),
-                                hash: hash.as_deref(),
-                            },
-                        );
-
-                        Ok(())
-                    }.await;
+                    let result = install_curseforge_file(&mods_dir, pid, fid, &api_key).await;
 
                     in_progress.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-                    match &result {
-                        Ok(()) => {
+                    let (last_name, file_ok) = match &result {
+                        Ok(name) => {
                             succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            (name.clone(), true)
                         }
-                        Err(e) => {
-                            tracing::warn!(target: "launcher", "CurseForge mod download failed ({}:{}): {}", pid, fid, e);
+                        Err((name, reason)) => {
+                            tracing::warn!(target: "launcher", "CurseForge mod download failed ({}:{}): {}", pid, fid, reason);
                             if let Ok(mut failed) = failed_ids.lock() {
-                                failed.push((last_name.clone(), format!("{}:{}", pid, fid)));
+                                failed.push(FailedImportFile {
+                                    file_name: name.clone(),
+                                    project_id: Some(pid),
+                                    file_id: Some(fid),
+                                    reason: reason.clone(),
+                                    retryable: true,
+                                });
                             }
+                            (name.clone(), false)
                         }
-                    }
+                    };
 
                     // Emit completion progress
                     if let Some(ref a) = app_owned {
                         let inflight = in_progress.load(std::sync::atomic::Ordering::Relaxed);
                         let ok = succeeded.load(std::sync::atomic::Ordering::Relaxed);
-                        let msg = if result.is_ok() {
+                        let msg = if file_ok {
                             format!("Downloaded: {} ({}/{} installed, {} active)", last_name, ok, total, inflight)
                         } else {
                             format!("Failed: {} ({}/{} installed, {} active)", last_name, ok, total, inflight)
@@ -1539,46 +1678,55 @@ pub(crate) async fn import_curseforge_pack(
                 }));
             } else {
                 skipped += 1;
-                tracing::warn!(target: "launcher", "Skipping CurseForge file entry: missing projectID or fileID");
+                tracing::warn!(target: "launcher", "Skipping CurseForge file entry #{}: missing projectID or fileID", entry_idx + 1);
             }
         }
 
         // Wait for all downloads to complete
         join_all(tasks).await;
-        let download_failed = failed_ids.lock().map(|f| f.len()).unwrap_or(0);
+        let failed_list = failed_ids.lock().map(|f| f.clone()).unwrap_or_default();
         let ok = succeeded.load(std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             target: "launcher",
             "CurseForge mod download: {} succeeded, {} failed, {} skipped (no IDs)",
             ok,
-            download_failed,
+            failed_list.len(),
             skipped
         );
 
-        if download_failed > 0 || skipped > 0 {
-            let failed_list = failed_ids.lock().map(|f| f.clone()).unwrap_or_default();
+        // A pack with at least one installed file is usable: keep it and let
+        // the caller show the failed list with a retry. Only a pack where
+        // nothing at all landed is unrecoverable — return an error so the
+        // caller's cleanup removes the empty shell.
+        if import_completion(total, ok) == ImportCompletion::Failed {
             let preview: Vec<String> = failed_list
                 .iter()
-                .take(5)
-                .map(|(name, id)| format!("{} ({})", name, id))
+                .take(3)
+                .map(|f| format!("{}: {}", f.file_name, f.reason))
                 .collect();
-            let more = if failed_list.len() > 5 {
-                format!(" and {} more", failed_list.len() - 5)
+            let details = if preview.is_empty() {
+                String::new()
+            } else {
+                format!(" First errors: {}.", preview.join("; "))
+            };
+            let skipped_note = if skipped > 0 {
+                format!(" {} manifest entries had no projectID/fileID.", skipped)
             } else {
                 String::new()
             };
-            let mut msg = format!(
-                "CurseForge import incomplete: {} installed, {} failed to download",
-                ok, download_failed,
-            );
-            if skipped > 0 {
-                msg.push_str(&format!(", {} skipped (missing IDs in manifest)", skipped));
-            }
-            if !preview.is_empty() {
-                msg.push_str(&format!(". Failed: {}{}", preview.join(", "), more));
-            }
-            return Err(LauncherError::Instance(msg));
+            return Err(LauncherError::Instance(format!(
+                "CurseForge import failed: none of the {} mod files could be installed.{}{}",
+                total, details, skipped_note
+            )));
         }
+
+        report = ImportReport {
+            total_files: total,
+            installed: ok,
+            failed: failed_list,
+            skipped,
+            warnings: Vec::new(),
+        };
     }
 
     let ldr_type = match loader {
@@ -1610,8 +1758,8 @@ pub(crate) async fn import_curseforge_pack(
 
     instances::save_instance(instances_dir, &instance, None)?;
 
-    tracing::info!(target: "launcher", "Imported CurseForge pack as '{}' ({} mods) - loader install pending", instance_name, total);
-    Ok(instance)
+    tracing::info!(target: "launcher", "Imported CurseForge pack as '{}' ({} of {} mods) - loader install pending", instance_name, report.installed, total);
+    Ok((instance, report))
 }
 
 /// Import an ATLauncher instance
@@ -1965,6 +2113,65 @@ mod tests {
         assert_eq!(meta.format, ModpackFormat::Prism);
         assert_eq!(meta.name, "My Prism Pack");
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ── CurseForge partial-success policy ──
+
+    #[test]
+    fn import_completion_keeps_partially_downloaded_pack() {
+        // Some files missing is a warning, not a failed import: the instance
+        // stays usable and the UI offers a retry for the missing files.
+        assert_eq!(import_completion(10, 7), ImportCompletion::Partial);
+        assert_eq!(import_completion(10, 9), ImportCompletion::Partial);
+        assert_eq!(import_completion(10, 10), ImportCompletion::Complete);
+        assert_eq!(import_completion(0, 0), ImportCompletion::Complete);
+    }
+
+    #[test]
+    fn import_completion_rejects_pack_with_no_installed_files() {
+        assert_eq!(import_completion(10, 0), ImportCompletion::Failed);
+        assert_eq!(import_completion(1, 0), ImportCompletion::Failed);
+    }
+
+    #[tokio::test]
+    async fn curseforge_import_without_any_downloadable_file_is_rejected() {
+        // A manifest whose only entry has no fileID cannot install a single
+        // mod. That is a critical failure: no network is needed to prove it,
+        // and the partially created instance directory must be cleaned up.
+        let manifest = br#"{"minecraft":{"version":"1.20.1","modLoaders":[{"id":"forge-1.20.1-47.2.0","primary":true}]},"files":[{"projectID":123}]}"#;
+        let zip_path = temp_probe_zip(
+            "cf_critical.zip",
+            &[
+                ("manifest.json", manifest.as_slice()),
+                ("overrides/config/example.cfg", b"x=1".as_slice()),
+            ],
+        );
+        let instances_dir =
+            std::env::temp_dir().join(format!("vl_cf_critical_{}", std::process::id()));
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let err = import_modpack(
+            &instances_dir,
+            zip_path.to_str().unwrap(),
+            "Broken Pack",
+            "",
+            &instances_dir,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("none of the 1 mod files"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            !instances_dir.join("Broken Pack").exists(),
+            "a critically failed import must not leave a shell instance"
+        );
+
+        let _ = std::fs::remove_file(&zip_path);
+        let _ = std::fs::remove_dir_all(&instances_dir);
     }
 
     #[test]
