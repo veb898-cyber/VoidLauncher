@@ -94,58 +94,40 @@ pub struct ModUpdateResult {
     file_id: Option<String>,
 }
 
-#[tauri::command]
-pub async fn cmd_check_mod_updates(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    instance_name: String,
-    mc_version: Option<String>,
-    loader: Option<String>,
-    pack_type: String,
-) -> Result<Vec<ModUpdateResult>, String> {
-    validate_instance_name(&instance_name)?;
+struct ModFile {
+    filename: String,
+    name: String,
+    version: String,
+    hash: Option<String>,
+    /// Sidecar identity: which provider installed the file and under
+    /// which ids. `unknown` files stay in the Modrinth hash pass (the
+    /// pre-CF-integration behaviour for sidecar-less drops).
+    provider: String,
+    project_id: Option<String>,
+    file_id: Option<String>,
+}
 
-    struct ModFile {
-        filename: String,
-        name: String,
-        version: String,
-        hash: Option<String>,
-        /// Sidecar identity: which provider installed the file and under
-        /// which ids. `unknown` files stay in the Modrinth hash pass (the
-        /// pre-CF-integration behaviour for sidecar-less drops).
-        provider: String,
-        project_id: Option<String>,
-        file_id: Option<String>,
-    }
+struct ModScan {
+    mod_files: Vec<ModFile>,
+    hash_to_mod: std::collections::HashMap<String, usize>,
+    all_hashes: Vec<String>,
+}
 
-    let packs_dir = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
-        instance
-            .minecraft_dir(&config.instances_dir())
-            .join(&pack_type)
-    };
-
-    if !packs_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let is_mods = pack_type == "mods";
-    let content_type = if is_mods {
-        "mod"
-    } else if pack_type == "resourcepacks" {
-        "resourcepack"
-    } else {
-        "shader"
-    };
-
+/// Synchronous directory scan + JAR/zip metadata and SHA1 hashing. Runs on
+/// the blocking pool: with hundreds of mods this can take seconds and would
+/// otherwise freeze every other async command (UI included).
+fn scan_mod_files(
+    packs_dir: &std::path::Path,
+    is_mods: bool,
+    loader: Option<&str>,
+    content_type: &str,
+) -> ModScan {
     let mut mod_files: Vec<ModFile> = Vec::new();
     let mut hash_to_mod: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut all_hashes: Vec<String> = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir(&packs_dir) {
+    if let Ok(entries) = std::fs::read_dir(packs_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             let filename = path
@@ -168,7 +150,7 @@ pub async fn cmd_check_mod_updates(
                 }
 
                 let meta = read_mod_meta_from_jar(&path);
-                let matches_loader = match loader.as_deref() {
+                let matches_loader = match loader {
                     Some("Fabric") => meta.provider == "Fabric" || meta.provider == "Local",
                     Some("Forge") => meta.provider == "Forge" || meta.provider == "Local",
                     Some("NeoForge") => meta.provider == "NeoForge" || meta.provider == "Local",
@@ -180,7 +162,7 @@ pub async fn cmd_check_mod_updates(
                 }
 
                 let hash = download::hash_file_sha1(&path).ok();
-                let ic = content::InstalledContent::read(&packs_dir, &filename, content_type);
+                let ic = content::InstalledContent::read(packs_dir, &filename, content_type);
 
                 // CurseForge files update through the id chain, not the
                 // Modrinth hash index — keep them out of the hash pass.
@@ -221,7 +203,7 @@ pub async fn cmd_check_mod_updates(
                 });
 
                 let hash = download::hash_file_sha1(&path).ok();
-                let ic = content::InstalledContent::read(&packs_dir, &filename, content_type);
+                let ic = content::InstalledContent::read(packs_dir, &filename, content_type);
 
                 if ic.provider != "curseforge" {
                     if let Some(ref h) = hash {
@@ -243,6 +225,63 @@ pub async fn cmd_check_mod_updates(
             }
         }
     }
+
+    ModScan {
+        mod_files,
+        hash_to_mod,
+        all_hashes,
+    }
+}
+
+#[tauri::command]
+pub async fn cmd_check_mod_updates(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    instance_name: String,
+    mc_version: Option<String>,
+    loader: Option<String>,
+    pack_type: String,
+) -> Result<Vec<ModUpdateResult>, String> {
+    validate_instance_name(&instance_name)?;
+
+    let packs_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
+            .map_err(|e| e.to_string())?;
+        instance
+            .minecraft_dir(&config.instances_dir())
+            .join(&pack_type)
+    };
+
+    if !packs_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let is_mods = pack_type == "mods";
+    let content_type: &'static str = if is_mods {
+        "mod"
+    } else if pack_type == "resourcepacks" {
+        "resourcepack"
+    } else {
+        "shader"
+    };
+
+    let loader_for_scan = loader.clone();
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_mod_files(
+            &packs_dir,
+            is_mods,
+            loader_for_scan.as_deref(),
+            content_type,
+        )
+    })
+    .await
+    .map_err(|e| format!("Update check scan failed: {}", e))?;
+    let ModScan {
+        mod_files,
+        hash_to_mod,
+        all_hashes,
+    } = scan;
 
     let mut results = Vec::new();
 

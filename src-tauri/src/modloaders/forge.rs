@@ -110,15 +110,21 @@ async fn download_installer(mc_version: &str, forge_version: &str) -> Result<Pat
 
     let installer_path = std::env::temp_dir().join(format!("forge-{}-installer.jar", full_version));
 
-    // Reuse existing downloaded installer
-    if installer_path.exists()
-        && installer_path
-            .metadata()
-            .map(|m| m.len() > 1000)
-            .unwrap_or(false)
-    {
-        tracing::debug!(target: "launcher", "Reusing existing installer at {}", installer_path.display());
-        return Ok(installer_path);
+    // Reuse a cached installer only when it is a real, readable installer
+    // archive. A truncation, an HTML error page or a partially downloaded
+    // file must trigger a fresh download instead of failing later in the
+    // processor pipeline.
+    if installer_path.exists() {
+        if installer_jar_is_valid(&installer_path) {
+            tracing::debug!(target: "launcher", "Reusing existing installer at {}", installer_path.display());
+            return Ok(installer_path);
+        }
+        tracing::warn!(
+            target: "launcher",
+            "Cached Forge installer is not a valid archive, re-downloading: {}",
+            installer_path.display()
+        );
+        let _ = std::fs::remove_file(&installer_path);
     }
 
     let mut last_err = String::new();
@@ -128,8 +134,17 @@ async fn download_installer(mc_version: &str, forge_version: &str) -> Result<Pat
         for attempt in 1..=3u32 {
             match crate::download::download_file(installer_url, &installer_path, "").await {
                 Ok(()) => {
-                    downloaded = true;
-                    break;
+                    if installer_jar_is_valid(&installer_path) {
+                        downloaded = true;
+                        break;
+                    }
+                    last_err = "downloaded file is not a valid installer archive".to_string();
+                    let _ = std::fs::remove_file(&installer_path);
+                    tracing::warn!(target: "launcher", "Forge installer download attempt {}/3 for {} produced an invalid archive", attempt, installer_url);
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(3 * attempt as u64))
+                            .await;
+                    }
                 }
                 Err(e) => {
                     last_err = e.to_string();
@@ -154,6 +169,25 @@ async fn download_installer(mc_version: &str, forge_version: &str) -> Result<Pat
     }
 
     Ok(installer_path)
+}
+
+/// A cached installer is usable only if it opens as a ZIP and carries one of
+/// the metadata files the profile/processor code expects. Size alone is not
+/// enough: a truncated download or an HTML error page can easily exceed 1 KB.
+pub(crate) fn installer_jar_is_valid(path: &Path) -> bool {
+    let ok_meta = std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 1000)
+        .unwrap_or(false);
+    if !ok_meta {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    archive.by_name("install_profile.json").is_ok() || archive.by_name("version.json").is_ok()
 }
 
 /// Java major version expected by Forge for a MC version:
@@ -1041,7 +1075,8 @@ pub async fn ensure_processor_jars(
 
     if !has_processors {
         tracing::debug!(target: "launcher", "No processors in install_profile.json, nothing to do");
-        std::fs::remove_file(&installer_path).ok();
+        // Keep the validated installer cached: a later self-heal must not
+        // re-download several megabytes for an unchanged loader version.
         return Ok(());
     }
 
@@ -1114,7 +1149,6 @@ pub async fn ensure_processor_jars(
         vd.join(format!("{}.jar", mc_version))
     };
     if !client_jar.exists() {
-        std::fs::remove_file(&installer_path).ok();
         return Err(LauncherError::ModLoader(format!(
             "Client JAR not found at {:?}",
             client_jar
@@ -1184,7 +1218,8 @@ pub async fn ensure_processor_jars(
         tracing::warn!(target: "launcher", "Java not found — cannot run Forge processors");
     }
 
-    std::fs::remove_file(&installer_path).ok();
+    // Keep the validated installer cached (see download_installer) so a
+    // self-heal of an unrelated processor JAR does not download it again.
 
     // --- Step 5: Verify outputs ---
     // Outputs live in the timestamped version dir (1.16.5-20210115.111550);
@@ -1396,7 +1431,8 @@ pub async fn install(
             extract_embedded_forge_jars(&mut archive, libraries_dir);
         }
     }
-    std::fs::remove_file(&extraction_installer).ok();
+    // Leave the installer in the cache for ensure_processor_jars below (it
+    // would otherwise re-download the same file immediately).
 
     ensure_processor_jars(mc_version, loader_version, libraries_dir, versions_dir).await?;
 
@@ -1489,6 +1525,48 @@ mod tests {
         let full = std::fs::read(&ok_jar).unwrap();
         std::fs::write(&truncated, &full[..full.len() / 2]).unwrap();
         assert!(!is_usable_jar(&truncated));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn installer_cache_requires_zip_with_metadata() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("vl_installer_cache_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Junk that is big enough to pass a size-only check.
+        let junk = dir.join("junk.jar");
+        std::fs::write(&junk, vec![0x41u8; 8192]).unwrap();
+        assert!(!installer_jar_is_valid(&junk));
+
+        // A valid zip without installer metadata is still not an installer.
+        let nometa = dir.join("nometa.jar");
+        let f = std::fs::File::create(&nometa).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("hello.txt", opts).unwrap();
+        zw.write_all(&vec![0u8; 4096]).unwrap();
+        zw.finish().unwrap();
+        assert!(!installer_jar_is_valid(&nometa));
+
+        // A readable archive carrying install_profile.json is usable.
+        let good = dir.join("good.jar");
+        let f = std::fs::File::create(&good).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        zw.start_file("install_profile.json", opts).unwrap();
+        zw.write_all(&vec![b' '; 2048]).unwrap();
+        zw.start_file("version.json", opts).unwrap();
+        zw.write_all(b"{}").unwrap();
+        zw.finish().unwrap();
+        assert!(installer_jar_is_valid(&good));
+
+        // Truncated archive is rejected even if the file is large.
+        let truncated = dir.join("truncated.jar");
+        let full = std::fs::read(&good).unwrap();
+        std::fs::write(&truncated, &full[..full.len() / 2]).unwrap();
+        assert!(!installer_jar_is_valid(&truncated));
 
         std::fs::remove_dir_all(&dir).ok();
     }

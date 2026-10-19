@@ -657,31 +657,70 @@ pub async fn cmd_launch_game(
     // Ensure suitable Java is available (download if missing)
     ensure_java_for_launch(&app, &data_dir, &version_info, &instance, &config).await?;
 
-    // Ensure Forge processor-generated JARs exist (client-*-srg.jar, forge-*-client.jar, etc.)
-    if instance.loader == instances::LoaderType::Forge {
-        if let Some(ref loader_ver) = instance.loader_version {
-            if let Err(e) = modloaders::forge::ensure_processor_jars(
-                &instance.mc_version,
-                loader_ver,
-                &config.libraries_dir(),
-                &config.versions_dir(),
-            )
-            .await
-            {
-                tracing::warn!(target: "launcher", "Processor JAR check failed (continuing anyway): {}", e);
+    // Ensure loader processor-generated JARs exist (client-*-srg.jar,
+    // forge-*-client.jar, NeoForge's patched client, etc.). Do NOT refresh
+    // the stored launch profile here: it is persisted in instance.json, and
+    // re-fetching it on every launch re-downloaded the 9–14 MB installer.
+    match instance.loader {
+        instances::LoaderType::Forge => {
+            if let Some(ref loader_ver) = instance.loader_version {
+                if let Err(e) = modloaders::forge::ensure_processor_jars(
+                    &instance.mc_version,
+                    loader_ver,
+                    &config.libraries_dir(),
+                    &config.versions_dir(),
+                )
+                .await
+                {
+                    tracing::warn!(target: "launcher", "Processor JAR check failed (continuing anyway): {}", e);
+                }
             }
-            // Refresh the launch profile from the installer. This picks up
-            // fixes (e.g. legacy minecraftArguments parsing) for instances
-            // that were created with an older launcher build.
-            match modloaders::forge::get_profile(&instance.mc_version, loader_ver).await {
-                Ok(profile) => {
-                    instance.loader_profile = Some(profile);
-                    tracing::debug!(target: "launcher", "Forge launch profile refreshed (game_args={})",
-                        instance.loader_profile.as_ref().map(|p| p.game_args.len()).unwrap_or(0));
+        }
+        instances::LoaderType::NeoForge => {
+            if let Some(ref loader_ver) = instance.loader_version {
+                if let Err(e) = modloaders::neoforge::ensure_processor_jars(
+                    &instance.mc_version,
+                    loader_ver,
+                    &config.libraries_dir(),
+                    &config.versions_dir(),
+                )
+                .await
+                {
+                    tracing::warn!(target: "launcher", "NeoForge processor JAR check failed (continuing anyway): {}", e);
                 }
-                Err(e) => {
-                    tracing::warn!(target: "launcher", "Forge profile refresh failed (using stored one): {}", e);
-                }
+            }
+        }
+        _ => {}
+    }
+
+    // Self-heal loader libraries: if one was deleted or quarantined after
+    // installation, download it now instead of silently dropping it from the
+    // classpath (which surfaces later as NoClassDefFoundError).
+    if let Some(profile) = &instance.loader_profile {
+        for lib in &profile.libraries {
+            if lib.url.is_empty() || crate::import::check_safe_remote_path(&lib.path).is_err() {
+                continue;
+            }
+            let lib_path = config.libraries_dir().join(&lib.path);
+            let is_jar = lib.path.to_ascii_lowercase().ends_with(".jar");
+            let needs_download =
+                !lib_path.is_file() || (is_jar && !modloaders::forge::is_usable_jar(&lib_path));
+            if !needs_download {
+                continue;
+            }
+            events::emit_log(
+                &app,
+                "info",
+                "launch",
+                &format!("Repairing loader library {}...", lib.name),
+            );
+            if let Err(e) =
+                download::download_file(&lib.url, &lib_path, lib.sha1.as_deref().unwrap_or(""))
+                    .await
+            {
+                let msg = format!("Failed to repair loader library {}: {}", lib.name, e);
+                events::emit_log(&app, "error", "launch", &msg);
+                return Err(msg);
             }
         }
     }
@@ -717,22 +756,40 @@ pub async fn cmd_launch_game(
         "launch",
         "Building classpath and launching Java...",
     );
-    let child = launch::launch_minecraft(
-        &config,
-        &instance,
-        &version_info,
-        &launch::LaunchAuth {
-            access_token: &access_token,
-            uuid: &uuid,
-            username: &username,
-        },
-        server_address.as_deref().map(|h| (h, server_port)),
-        session_log.as_deref(),
-    )
-    .map_err(|e| {
-        events::emit_log(&app, "error", "launch", &format!("Launch failed: {}", e));
-        e.to_string()
-    })?;
+    // Launch preparation (Java probing, classpath assembly, argument
+    // composition) is blocking I/O and subprocess work; run it on the
+    // blocking pool so it cannot stall the async runtime / UI.
+    let child = {
+        let launch_config = config.clone();
+        let launch_instance = instance.clone();
+        let launch_version_info = version_info.clone();
+        let launch_token = access_token.clone();
+        let launch_uuid = uuid.clone();
+        let launch_username = username.clone();
+        let launch_server = server_address.clone();
+        let launch_session_log = session_log.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            launch::launch_minecraft(
+                &launch_config,
+                &launch_instance,
+                &launch_version_info,
+                &launch::LaunchAuth {
+                    access_token: &launch_token,
+                    uuid: &launch_uuid,
+                    username: &launch_username,
+                },
+                launch_server.as_deref().map(|h| (h, server_port)),
+                launch_session_log.as_deref(),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Launch task failed: {}", e))?;
+        result.map_err(|e| {
+            events::emit_log(&app, "error", "launch", &format!("Launch failed: {}", e));
+            e
+        })?
+    };
 
     let pid = child.id();
     let _ = instances::update_last_played(&config.instances_dir(), &instance_name);

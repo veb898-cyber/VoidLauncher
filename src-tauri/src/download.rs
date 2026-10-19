@@ -566,6 +566,37 @@ fn validate_download(path: &std::path::Path, expected_sha1: &str) -> Result<()> 
     Ok(())
 }
 
+/// Extract the total size from a `Content-Range` header
+/// (`bytes 0-99/1234` → 1234, `bytes */1234` → 1234). Unknown totals (`*`)
+/// and malformed values yield `None`.
+fn content_range_total(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .strip_prefix("bytes")?
+        .trim_start()
+        .rsplit('/')
+        .next()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Extract the start offset from a `Content-Range` header
+/// (`bytes 100-199/1234` → 100). `bytes */1234` yields `None`.
+fn content_range_start(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .strip_prefix("bytes")?
+        .trim_start()
+        .split('/')
+        .next()?
+        .split('-')
+        .next()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 /// Validate URL + host, then download to a .part temp file, validate,
 /// and atomically rename to `path` on success. On ANY error the .part file
 /// is cleaned up and `path` is never touched.
@@ -637,6 +668,7 @@ pub(crate) async fn download_to_part(
     // the bar never walks backwards when a retry restarts from zero.
     let mut direct_only = false;
     let mut last_downloaded: u64 = 0;
+    let mut known_total = expected_size;
 
     ensure_proxy_resolved().await;
 
@@ -677,10 +709,36 @@ pub(crate) async fn download_to_part(
         };
 
         let status = response.status();
-        // Server says the range we asked for is already past the end of the
-        // file — everything we have is everything there is.
+        // Server says the range we asked for is past the end of the file.
+        // That only means "done" if the bytes we already have match the real
+        // size; a stale .part from another artifact must not be accepted as
+        // complete just because the server rejected the range.
         if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-            complete = true;
+            let range_total = response
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(content_range_total);
+            let part_len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+            let total = expected_size.or(range_total);
+            let size_ok =
+                offset > 0 && total.map(|t| part_len == t && offset == t).unwrap_or(false);
+            if size_ok {
+                known_total = total;
+                complete = true;
+                break;
+            }
+            // Drop the unusable partial file and retry from zero.
+            let partial_offset = offset;
+            let _ = std::fs::remove_file(&part_path);
+            offset = 0;
+            last_err = Some(format!(
+                "server rejected range at offset {} (partial {} bytes, expected {:?})",
+                partial_offset, part_len, total
+            ));
+            if attempt < max_attempts {
+                continue;
+            }
             break;
         }
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
@@ -707,8 +765,31 @@ pub(crate) async fn download_to_part(
             .headers()
             .get("content-range")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.rsplit('/').next())
-            .and_then(|s| s.parse::<u64>().ok());
+            .and_then(content_range_total);
+        known_total = expected_size.or(total_hint);
+        let content_length = response.content_length();
+
+        // A 206 response must start exactly where our .part ends; otherwise
+        // appending would splice bytes from two different ranges together.
+        if status == reqwest::StatusCode::PARTIAL_CONTENT && offset > 0 {
+            let start = response
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(content_range_start);
+            if start != Some(offset) {
+                let _ = std::fs::remove_file(&part_path);
+                last_err = Some(format!(
+                    "server returned range starting at {:?}, expected {}",
+                    start, offset
+                ));
+                offset = 0;
+                if attempt < max_attempts {
+                    continue;
+                }
+                break;
+            }
+        }
 
         // If the server ignored the Range header (plain 200), restart from zero.
         let mut file = if status == reqwest::StatusCode::PARTIAL_CONTENT && offset > 0 {
@@ -792,6 +873,22 @@ pub(crate) async fn download_to_part(
                 .await
                 .map_err(|e| LauncherError::Download(format!("Failed to flush .part: {}", e)))?;
             offset += received;
+            // A clean EOF is not proof of a complete transfer when the
+            // server announced a body length: a proxy can terminate the
+            // stream early and reqwest reports EOF without an error. Retry
+            // (Range resumes where this attempt stopped) unless the number
+            // of received bytes matches Content-Length exactly.
+            if !broken {
+                if let Some(expected_len) = content_length {
+                    if received != expected_len {
+                        last_err = Some(format!(
+                            "truncated body: received {} of {} bytes",
+                            received, expected_len
+                        ));
+                        broken = true;
+                    }
+                }
+            }
             if !broken {
                 complete = true;
                 break;
@@ -811,9 +908,10 @@ pub(crate) async fn download_to_part(
         )));
     }
 
-    // Size check: when the manifest knows the expected size, reject files
-    // that don't match (truncated transfers, wrong artifact, error pages).
-    if let Some(expected) = expected_size {
+    // Size check: when the manifest or Content-Range knows the total size,
+    // reject files that don't match (truncated transfers, wrong artifact,
+    // error pages).
+    if let Some(expected) = known_total {
         let actual = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
         if actual != expected {
             let _ = std::fs::remove_file(&part_path);
@@ -1495,6 +1593,19 @@ mod tests {
         // Unknown hosts get no alternates (and no surprise network calls).
         assert!(mirror_alternates("https://api.modrinth.com/v2/project/x").is_empty());
         assert!(mirror_alternates("https://example.com/file.jar").is_empty());
+    }
+
+    #[test]
+    fn content_range_parsing_handles_partial_and_unsatisfied_forms() {
+        assert_eq!(content_range_total("bytes 0-99/1234"), Some(1234));
+        assert_eq!(content_range_total("bytes 100-199/*"), None);
+        assert_eq!(content_range_total("bytes */1234"), Some(1234));
+        assert_eq!(content_range_total("garbage"), None);
+
+        assert_eq!(content_range_start("bytes 100-199/1234"), Some(100));
+        assert_eq!(content_range_start("bytes */1234"), None);
+        assert_eq!(content_range_start("bytes 0-0/1"), Some(0));
+        assert_eq!(content_range_start("garbage"), None);
     }
 
     #[test]

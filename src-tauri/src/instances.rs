@@ -250,6 +250,11 @@ pub fn save_instance(
 /// which is then renamed over the target. A crash or power loss mid-save
 /// can never leave a truncated/half-written config behind — the old file
 /// stays intact until the final rename.
+///
+/// If the direct rename is blocked (Windows sharing violation), the old
+/// file is parked as `.bak` instead of being deleted: the new file is
+/// swapped in, and the backup is removed only after that succeeds. If the
+/// swap fails too, the backup is restored — the config is never lost.
 pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -259,14 +264,48 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| LauncherError::Instance("File path has no file name".into()))?;
     let tmp_path = parent.join(format!(".{}.tmp", file_name));
+    let bak_path = parent.join(format!(".{}.bak", file_name));
+
     std::fs::write(&tmp_path, contents)?;
-    // `rename` replaces the destination atomically on Windows; on the rare
-    // sharing violation (target briefly open elsewhere) retry after removal.
-    if std::fs::rename(&tmp_path, path).is_err() {
-        let _ = std::fs::remove_file(path);
-        std::fs::rename(&tmp_path, path)?;
+    // Flush the temp file before the rename so a crash cannot leave a
+    // renamed-but-empty file on a delayed-write filesystem.
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp_path) {
+        let _ = f.sync_all();
     }
-    Ok(())
+
+    match std::fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(first_err) => {
+            if !path.exists() {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(first_err.into());
+            }
+            let _ = std::fs::remove_file(&bak_path);
+            if let Err(e) = std::fs::rename(path, &bak_path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e.into());
+            }
+            match std::fs::rename(&tmp_path, path) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&bak_path);
+                    Ok(())
+                }
+                Err(e) => {
+                    // Put the original back; keep .bak if even that fails so
+                    // the data is still recoverable manually.
+                    if let Err(restore_err) = std::fs::rename(&bak_path, path) {
+                        tracing::error!(
+                            target: "launcher",
+                            "Failed to restore config backup {:?}: {} (backup kept)",
+                            bak_path, restore_err
+                        );
+                    }
+                    let _ = std::fs::remove_file(&tmp_path);
+                    Err(e.into())
+                }
+            }
+        }
+    }
 }
 
 /// Delete an instance
@@ -2134,6 +2173,14 @@ pub struct LevelDatData {
     pub last_played: Option<i64>,
 }
 
+/// Safety bounds for untrusted `level.dat` input. A corrupt/hostile file
+/// must never make the worlds tab allocate gigabytes or recurse until the
+/// stack overflows.
+const NBT_MAX_DEPTH: u32 = 64;
+const NBT_MAX_LIST_LEN: usize = 1_000_000;
+const NBT_MAX_SKIP_BYTES: u64 = 256 * 1024 * 1024;
+const NBT_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 fn nbt_read_string(r: &mut impl Read) -> Result<String> {
     let mut len_buf = [0u8; 2];
     r.read_exact(&mut len_buf)
@@ -2146,42 +2193,26 @@ fn nbt_read_string(r: &mut impl Read) -> Result<String> {
         .map_err(|e| LauncherError::Instance(format!("Invalid UTF-8 in NBT: {e}")))
 }
 
-fn nbt_skip(r: &mut impl Read, tag: u8) -> Result<()> {
+fn nbt_skip(r: &mut impl Read, tag: u8, depth: u32) -> Result<()> {
+    if depth > NBT_MAX_DEPTH {
+        return Err(LauncherError::Instance(
+            "NBT nesting depth limit exceeded".into(),
+        ));
+    }
     match tag {
         0 => Ok(()),
-        1 => {
-            let mut b = [0u8; 1];
-            r.read_exact(&mut b)
-                .map_err(|e| LauncherError::Instance(e.to_string()))?;
-            Ok(())
-        }
-        2 => {
-            let mut b = [0u8; 2];
-            r.read_exact(&mut b)
-                .map_err(|e| LauncherError::Instance(e.to_string()))?;
-            Ok(())
-        }
-        3 => {
-            let mut b = [0u8; 4];
-            r.read_exact(&mut b)
-                .map_err(|e| LauncherError::Instance(e.to_string()))?;
-            Ok(())
-        }
-        4 => {
+        1..=6 => {
+            let len = match tag {
+                1 => 1,
+                2 => 2,
+                3 => 4,
+                4 => 8,
+                5 => 4,
+                6 => 8,
+                _ => unreachable!(),
+            };
             let mut b = [0u8; 8];
-            r.read_exact(&mut b)
-                .map_err(|e| LauncherError::Instance(e.to_string()))?;
-            Ok(())
-        }
-        5 => {
-            let mut b = [0u8; 4];
-            r.read_exact(&mut b)
-                .map_err(|e| LauncherError::Instance(e.to_string()))?;
-            Ok(())
-        }
-        6 => {
-            let mut b = [0u8; 8];
-            r.read_exact(&mut b)
+            r.read_exact(&mut b[..len])
                 .map_err(|e| LauncherError::Instance(e.to_string()))?;
             Ok(())
         }
@@ -2189,16 +2220,30 @@ fn nbt_skip(r: &mut impl Read, tag: u8) -> Result<()> {
             let mut len_buf = [0u8; 4];
             r.read_exact(&mut len_buf)
                 .map_err(|e| LauncherError::Instance(e.to_string()))?;
-            let elem_size: usize = match tag {
+            let elem_size: u64 = match tag {
                 7 => 1,
                 11 => 4,
                 12 => 8,
                 _ => 1,
             };
-            let len = u32::from_be_bytes(len_buf) as usize;
-            let mut skip = vec![0u8; len * elem_size];
-            r.read_exact(&mut skip)
+            let len = u32::from_be_bytes(len_buf) as u64;
+            let total = len * elem_size;
+            if total > NBT_MAX_SKIP_BYTES {
+                return Err(LauncherError::Instance(format!(
+                    "NBT array too large: {} bytes",
+                    total
+                )));
+            }
+            // Stream-skip instead of allocating `total` bytes: a corrupt
+            // length must not allocate gigabytes up front.
+            let mut limited = r.by_ref().take(total);
+            let copied = std::io::copy(&mut limited, &mut std::io::sink())
                 .map_err(|e| LauncherError::Instance(e.to_string()))?;
+            if copied != total {
+                return Err(LauncherError::Instance(
+                    "Truncated NBT array payload".into(),
+                ));
+            }
             Ok(())
         }
         8 => {
@@ -2213,8 +2258,19 @@ fn nbt_skip(r: &mut impl Read, tag: u8) -> Result<()> {
             r.read_exact(&mut len_buf)
                 .map_err(|e| LauncherError::Instance(e.to_string()))?;
             let len = u32::from_be_bytes(len_buf) as usize;
+            if len > NBT_MAX_LIST_LEN {
+                return Err(LauncherError::Instance(format!(
+                    "NBT list too long: {} entries",
+                    len
+                )));
+            }
+            if elem_type[0] == 0 && len > 0 {
+                return Err(LauncherError::Instance(
+                    "NBT list uses TAG_End as its element type".into(),
+                ));
+            }
             for _ in 0..len {
-                nbt_skip(r, elem_type[0])?;
+                nbt_skip(r, elem_type[0], depth + 1)?;
             }
             Ok(())
         }
@@ -2227,7 +2283,7 @@ fn nbt_skip(r: &mut impl Read, tag: u8) -> Result<()> {
                     break;
                 }
                 nbt_read_string(r)?;
-                nbt_skip(r, t[0])?;
+                nbt_skip(r, t[0], depth + 1)?;
             }
             Ok(())
         }
@@ -2237,7 +2293,12 @@ fn nbt_skip(r: &mut impl Read, tag: u8) -> Result<()> {
     }
 }
 
-fn nbt_parse_compound_fields(r: &mut impl Read, data: &mut LevelDatData) -> Result<()> {
+fn nbt_parse_compound_fields(r: &mut impl Read, data: &mut LevelDatData, depth: u32) -> Result<()> {
+    if depth > NBT_MAX_DEPTH {
+        return Err(LauncherError::Instance(
+            "NBT nesting depth limit exceeded".into(),
+        ));
+    }
     loop {
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag)
@@ -2275,13 +2336,13 @@ fn nbt_parse_compound_fields(r: &mut impl Read, data: &mut LevelDatData) -> Resu
             }
             10 => {
                 if name == "Data" {
-                    nbt_parse_compound_fields(r, data)?;
+                    nbt_parse_compound_fields(r, data, depth + 1)?;
                 } else {
-                    nbt_skip(r, 10)?;
+                    nbt_skip(r, 10, depth + 1)?;
                 }
             }
             _ => {
-                nbt_skip(r, tag[0])?;
+                nbt_skip(r, tag[0], depth + 1)?;
             }
         }
     }
@@ -2293,14 +2354,16 @@ pub fn parse_level_dat(path: &std::path::Path) -> LevelDatData {
     let Ok(file) = std::fs::File::open(path) else {
         return LevelDatData::default();
     };
-    let mut decoder = GzDecoder::new(file);
+    // Bound the decompressed stream as well: a gzip bomb in a downloaded
+    // world must not keep the parser reading forever.
+    let mut decoder = GzDecoder::new(file).take(NBT_MAX_FILE_BYTES);
     let mut tag = [0u8; 1];
     if decoder.read_exact(&mut tag).is_err() || tag[0] != 10 {
         return LevelDatData::default();
     }
     let _ = nbt_read_string(&mut decoder);
     let mut data = LevelDatData::default();
-    let _ = nbt_parse_compound_fields(&mut decoder, &mut data);
+    let _ = nbt_parse_compound_fields(&mut decoder, &mut data, 0);
     data
 }
 
@@ -2422,6 +2485,14 @@ fn validate_backup_filename(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Sibling `.part` path used while building a backup archive, so an
+/// interrupted backup never appears in the backup list as a valid `.zip`.
+fn backup_part_path(path: &std::path::Path) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(".part");
+    PathBuf::from(p)
+}
+
 /// Zip a world save into `<instance>/.backups/worlds/<world>/<world>__<ts>.zip`
 /// and return the resulting archive's metadata.
 pub fn backup_world(
@@ -2453,11 +2524,26 @@ pub fn backup_world(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let file = std::fs::File::create(&out_path)?;
-    let mut zip_w = zip::ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    add_dir_contents_to_zip(&mut zip_w, &world_dir, "", options, &|_| false)?;
-    zip_w.finish()?;
+    let part_path = backup_part_path(&out_path);
+    let _ = std::fs::remove_file(&part_path);
+    let built = (|| -> Result<()> {
+        let file = std::fs::File::create(&part_path)?;
+        let mut zip_w = zip::ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        add_dir_contents_to_zip(&mut zip_w, &world_dir, "", options, &|_| false)?;
+        let file = zip_w.finish()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = built {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&part_path, &out_path) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(e.into());
+    }
     let size_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
     tracing::info!(target: "launcher", "Backed up world '{}' of '{}' to {:?}", world_name, instance_name, out_path);
     Ok(BackupInfo {
@@ -2573,10 +2659,13 @@ pub fn restore_world(
     // destroy it if the backup turns out to be corrupt (extract fails
     // midway). The temp dir lives under `.backups/` so a crash cannot leave
     // it looking like a playable world in the saves list.
+    // Unique per operation: two concurrent restores (or a leftover from a
+    // crashed run) must never share the same temp/old directories.
+    let restore_token = uuid::Uuid::new_v4().simple().to_string();
     let tmp_dir = instances_dir
         .join(instance_name)
         .join(".backups")
-        .join(".restore-tmp");
+        .join(format!(".restore-tmp-{}", restore_token));
     if tmp_dir.exists() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -2591,7 +2680,7 @@ pub fn restore_world(
         let old_dir = instances_dir
             .join(instance_name)
             .join(".backups")
-            .join(".restore-old");
+            .join(format!(".restore-old-{}", restore_token));
         if old_dir.exists() {
             let _ = std::fs::remove_dir_all(&old_dir);
         }
@@ -2727,11 +2816,26 @@ pub fn backup_instance(instances_dir: &Path, name: &str) -> Result<BackupInfo> {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let file = std::fs::File::create(&out_path)?;
-    let mut zip_w = zip::ZipWriter::new(file);
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    add_dir_contents_to_zip(&mut zip_w, &inst_dir, "", options, &instance_backup_skip)?;
-    zip_w.finish()?;
+    let part_path = backup_part_path(&out_path);
+    let _ = std::fs::remove_file(&part_path);
+    let built = (|| -> Result<()> {
+        let file = std::fs::File::create(&part_path)?;
+        let mut zip_w = zip::ZipWriter::new(file);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        add_dir_contents_to_zip(&mut zip_w, &inst_dir, "", options, &instance_backup_skip)?;
+        let file = zip_w.finish()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = built {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&part_path, &out_path) {
+        let _ = std::fs::remove_file(&part_path);
+        return Err(e.into());
+    }
     let size_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
     tracing::info!(target: "launcher", "Backed up instance '{}' to {:?}", name, out_path);
     Ok(BackupInfo {
@@ -3779,6 +3883,87 @@ version = 'hIibTfxn'
             format!("region-{}", marker),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn nbt_rejects_oversized_arrays_and_lists_without_allocating() {
+        use std::io::Cursor;
+
+        // Byte array claiming 4 GiB (the tag itself is the caller's argument,
+        // so the payload starts with the length).
+        let mut c = Cursor::new(u32::MAX.to_be_bytes().to_vec());
+        let err = nbt_skip(&mut c, 7, 0).unwrap_err().to_string();
+        assert!(err.contains("too large"), "got: {}", err);
+
+        // Int array claiming ~1.6 GiB (400M × 4 bytes).
+        let mut c = Cursor::new(400_000_000u32.to_be_bytes().to_vec());
+        assert!(nbt_skip(&mut c, 11, 0).is_err());
+
+        // A list of TAG_End with a non-zero length would loop millions of
+        // times doing no I/O.
+        let mut bytes = vec![0u8]; // element type TAG_End
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        let mut c = Cursor::new(bytes);
+        assert!(nbt_skip(&mut c, 9, 0).is_err());
+
+        // A list claiming 4 billion entries is rejected before looping.
+        let mut bytes = vec![1u8]; // element type TAG_Byte
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut c = Cursor::new(bytes);
+        assert!(nbt_skip(&mut c, 9, 0).is_err());
+    }
+
+    #[test]
+    fn nbt_rejects_deep_nesting() {
+        use std::io::Cursor;
+
+        let levels = NBT_MAX_DEPTH as usize + 10;
+        let mut bytes = Vec::new();
+        for _ in 0..levels {
+            bytes.push(10u8); // TAG_Compound
+            bytes.extend_from_slice(&0u16.to_be_bytes()); // empty name
+        }
+        bytes.push(0); // close the deepest compound
+        bytes.extend(std::iter::repeat_n(0u8, levels)); // close each parent
+        let mut c = Cursor::new(bytes);
+        let err = nbt_skip(&mut c, 10, 0).unwrap_err().to_string();
+        assert!(err.contains("depth"), "got: {}", err);
+    }
+
+    #[test]
+    fn nbt_parses_flat_compound_fields() {
+        use std::io::Cursor;
+
+        let mut bytes = vec![3u8]; // TAG_Int
+        bytes.extend_from_slice(&8u16.to_be_bytes());
+        bytes.extend_from_slice(b"GameType");
+        bytes.extend_from_slice(&2i32.to_be_bytes());
+        bytes.push(8); // TAG_String
+        bytes.extend_from_slice(&9u16.to_be_bytes());
+        bytes.extend_from_slice(b"LevelName");
+        bytes.extend_from_slice(&4u16.to_be_bytes());
+        bytes.extend_from_slice(b"Test");
+        bytes.push(0);
+
+        let mut c = Cursor::new(bytes);
+        let mut data = LevelDatData::default();
+        nbt_parse_compound_fields(&mut c, &mut data, 0).unwrap();
+        assert_eq!(data.game_type, Some(2));
+        assert_eq!(data.level_name.as_deref(), Some("Test"));
+    }
+
+    #[test]
+    fn write_file_atomic_replaces_content_and_leaves_no_temp() {
+        let dir =
+            std::env::temp_dir().join(format!("vl_atomic_write_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("instance.json");
+        write_file_atomic(&path, b"first").unwrap();
+        write_file_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert!(!dir.join(".instance.json.tmp").exists());
+        assert!(!dir.join(".instance.json.bak").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

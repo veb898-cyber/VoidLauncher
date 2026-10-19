@@ -178,15 +178,46 @@ async fn download_installer(
         "neoforge-{}--{}-installer.jar",
         mc_version, neo_version
     ));
+
+    // Reuse a cached installer only when it is a real archive. The file is
+    // kept after a successful install so repairing a processor JAR does not
+    // re-download it, which also makes this validation matter in practice.
+    if installer_path.exists() {
+        if super::forge::installer_jar_is_valid(&installer_path) {
+            tracing::debug!(target: "launcher", "Reusing existing NeoForge installer at {}", installer_path.display());
+        } else {
+            tracing::warn!(
+                target: "launcher",
+                "Cached NeoForge installer is not a valid archive, re-downloading: {}",
+                installer_path.display()
+            );
+            let _ = std::fs::remove_file(&installer_path);
+        }
+    }
+
     let mut last_err = String::new();
-    for attempt in 1..=3u32 {
-        match crate::download::download_file(&installer_url, &installer_path, "").await {
-            Ok(()) => break,
-            Err(e) => {
-                last_err = e.to_string();
-                tracing::warn!(target: "launcher", "NeoForge installer download attempt {}/3 failed: {}", attempt, last_err);
-                if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_secs(3 * attempt as u64)).await;
+    if !installer_path.exists() {
+        for attempt in 1..=3u32 {
+            match crate::download::download_file(&installer_url, &installer_path, "").await {
+                Ok(()) => {
+                    if super::forge::installer_jar_is_valid(&installer_path) {
+                        break;
+                    }
+                    last_err = "downloaded file is not a valid installer archive".to_string();
+                    let _ = std::fs::remove_file(&installer_path);
+                    tracing::warn!(target: "launcher", "NeoForge installer download attempt {}/3 produced an invalid archive", attempt);
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(3 * attempt as u64))
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    tracing::warn!(target: "launcher", "NeoForge installer download attempt {}/3 failed: {}", attempt, last_err);
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_secs(3 * attempt as u64))
+                            .await;
+                    }
                 }
             }
         }
@@ -339,6 +370,44 @@ fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
     })
 }
 
+/// Path of the client JAR produced by the NeoForge processor pipeline.
+fn client_jar_path(libraries_dir: &Path, mc_version: &str, loader_version: &str) -> PathBuf {
+    let (group_path, maven_version) = neoforge_maven(mc_version, loader_version);
+    let artifact = group_path.rsplit('/').next().unwrap_or("neoforge");
+    libraries_dir
+        .join(&group_path)
+        .join(&maven_version)
+        .join(format!("{}-{}-client.jar", artifact, maven_version))
+}
+
+/// Self-heal NeoForge at launch: if the processor-generated client JAR is
+/// missing/corrupt (e.g. quarantined by antivirus), re-run the installer.
+/// The validated installer is cached, so a repair does not re-download it.
+pub async fn ensure_processor_jars(
+    mc_version: &str,
+    loader_version: &str,
+    libraries_dir: &Path,
+    versions_dir: &Path,
+) -> Result<()> {
+    let client_path = client_jar_path(libraries_dir, mc_version, loader_version);
+    if super::forge::is_usable_jar(&client_path) {
+        return Ok(());
+    }
+    tracing::info!(
+        target: "launcher",
+        "NeoForge client JAR missing or unusable, running installer processors to repair it"
+    );
+    install(
+        mc_version,
+        loader_version,
+        libraries_dir,
+        versions_dir,
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Install NeoForge — download all libraries, run the installer processors
 /// to generate the client JAR, and return the launch profile.
 ///
@@ -457,15 +526,11 @@ pub async fn install(
         // this path, so it must match for the post-pipeline existence check.
         let (group_path, maven_version) = neoforge_maven(mc_version, loader_version);
         let data_base = group_path.clone();
-        let artifact = group_path.rsplit('/').next().unwrap_or("neoforge");
         // PATCHED = [net.neoforged:{forge|neoforge}:{version}:client] — the
         // client JAR the processors produce (plain loader-version dir for
         // modern NeoForge, e.g. 21.4.153, NOT 1.21.4-21.4.153 as Forge does;
         // for 1.20.1 it is the MC-prefixed gradle-style forge coordinate).
-        let client_path = libraries_dir
-            .join(&group_path)
-            .join(&maven_version)
-            .join(format!("{}-{}-client.jar", artifact, maven_version));
+        let client_path = client_jar_path(libraries_dir, mc_version, loader_version);
 
         if !super::forge::is_usable_jar(&client_path) {
             tracing::info!(target: "launcher", "NeoForge client JAR missing or unusable, running installer processors...");
@@ -608,7 +673,8 @@ pub async fn install(
         }
     }
 
-    std::fs::remove_file(&installer_path).ok();
+    // Keep the validated installer cached so `ensure_processor_jars` can
+    // repair a deleted client JAR without downloading it again.
 
     // NOTE: the processor-generated client JAR (neoforge-<ver>-client.jar)
     // must NOT go on the classpath. The official version.json does not list
