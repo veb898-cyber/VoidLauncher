@@ -161,8 +161,14 @@ fn scan_mod_files(
                     continue;
                 }
 
-                let hash = download::hash_file_sha1(&path).ok();
                 let ic = content::InstalledContent::read(packs_dir, &filename, content_type);
+                let hash = if ic.provider == "curseforge" {
+                    ic.hash
+                        .clone()
+                        .or_else(|| download::hash_file_sha1(&path).ok())
+                } else {
+                    download::hash_file_sha1(&path).ok()
+                };
 
                 // CurseForge files update through the id chain, not the
                 // Modrinth hash index — keep them out of the hash pass.
@@ -174,9 +180,20 @@ fn scan_mod_files(
                     }
                 }
 
+                let jar_name = instances::strip_minecraft_color_codes(&meta.name);
+                let name = if usable_mod_name(&jar_name, meta.slug.as_deref()).is_some() {
+                    jar_name
+                } else {
+                    ic.project_name
+                        .as_deref()
+                        .and_then(|n| usable_mod_name(n, meta.slug.as_deref()))
+                        .map(instances::strip_minecraft_color_codes)
+                        .unwrap_or(jar_name)
+                };
+
                 mod_files.push(ModFile {
                     filename,
-                    name: meta.name,
+                    name,
                     version: meta.version,
                     hash,
                     provider: ic.provider,
@@ -202,8 +219,14 @@ fn scan_mod_files(
                     )
                 });
 
-                let hash = download::hash_file_sha1(&path).ok();
                 let ic = content::InstalledContent::read(packs_dir, &filename, content_type);
+                let hash = if ic.provider == "curseforge" {
+                    ic.hash
+                        .clone()
+                        .or_else(|| download::hash_file_sha1(&path).ok())
+                } else {
+                    download::hash_file_sha1(&path).ok()
+                };
 
                 if ic.provider != "curseforge" {
                     if let Some(ref h) = hash {
@@ -231,6 +254,85 @@ fn scan_mod_files(
         hash_to_mod,
         all_hashes,
     }
+}
+
+const CF_BULK_LIMIT: usize = 50;
+
+struct CfPendingUpdate {
+    mod_index: usize,
+    project_id: u64,
+    project_name: String,
+    file_id: u64,
+}
+
+fn cf_index_matches(
+    index: &curseforge::CfFileIndex,
+    mc_version: Option<&str>,
+    loader_id: Option<u32>,
+) -> bool {
+    if let Some(v) = mc_version {
+        if index.game_version != v {
+            return false;
+        }
+    }
+    match loader_id {
+        None => true,
+        Some(want) => match index.mod_loader {
+            None | Some(0) => true,
+            Some(id) => id == want,
+        },
+    }
+}
+
+fn cf_pick_update_index<'a>(
+    mod_data: &'a curseforge::CfBulkMod,
+    mc_version: Option<&str>,
+    loader_id: Option<u32>,
+    installed_file_id: Option<u64>,
+) -> Option<&'a curseforge::CfFileIndex> {
+    let compatible: Vec<&curseforge::CfFileIndex> = mod_data
+        .latest_files_indexes
+        .iter()
+        .filter(|i| i.file_id != 0 && cf_index_matches(i, mc_version, loader_id))
+        .collect();
+    let installed_pos =
+        installed_file_id.and_then(|fid| compatible.iter().position(|index| index.file_id == fid));
+    if installed_pos == Some(0) {
+        return None;
+    }
+    let newer: Vec<(usize, &curseforge::CfFileIndex)> = compatible
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(pos, _)| installed_pos.is_none_or(|installed| *pos < installed))
+        .collect();
+    if let Some((_, index)) = newer.iter().find(|(_, i)| i.release_type == 1) {
+        return Some(*index);
+    }
+    if compatible.iter().any(|i| i.release_type == 1) {
+        return None;
+    }
+    newer.first().map(|(_, index)| *index)
+}
+
+fn cf_pick_latest_file<'a>(
+    mod_data: &'a curseforge::CfBulkMod,
+    mc_version: Option<&str>,
+    loader: Option<&str>,
+) -> Option<&'a curseforge::CfFile> {
+    mod_data
+        .latest_files
+        .iter()
+        .filter(|f| f.is_available.unwrap_or(true))
+        .filter(|f| mc_version.is_none_or(|v| f.game_versions.iter().any(|g| g == v)))
+        .filter(|f| {
+            loader.is_none_or(|wanted| {
+                f.game_versions
+                    .iter()
+                    .any(|g| g.eq_ignore_ascii_case(wanted))
+            })
+        })
+        .max_by(|a, b| a.file_date.cmp(&b.file_date))
 }
 
 #[tauri::command]
@@ -285,9 +387,6 @@ pub async fn cmd_check_mod_updates(
 
     let mut results = Vec::new();
 
-    // ---- CurseForge pass: sidecar-identified CF files (item 24) ----
-    // Newest available file for this instance's (MC, loader); a differing
-    // file id with an identical sha1 (re-upload) is not an update.
     let cf_indices: Vec<usize> = mod_files
         .iter()
         .enumerate()
@@ -295,80 +394,160 @@ pub async fn cmd_check_mod_updates(
         .map(|(i, _)| i)
         .collect();
     if !cf_indices.is_empty() {
-        let cf_key = {
-            let config = state.config.lock().map_err(|e| e.to_string())?;
-            config.curseforge_api_key.clone()
-        };
-        for (n, &idx) in cf_indices.iter().enumerate() {
-            if n > 0 {
-                // CF rate limits are undocumented — pace the batch.
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let cf_loader_id: Option<Option<u32>> = if is_mods {
+            match loader.as_deref() {
+                None | Some("Vanilla") => None,
+                Some(l) => Some(curseforge::loader_type_id(l)),
             }
-            let m = &mod_files[idx];
-            let Ok(pid) = m.project_id.as_deref().unwrap_or("").parse::<u64>() else {
-                continue;
+        } else {
+            Some(None)
+        };
+
+        if let Some(cf_loader_id) = cf_loader_id {
+            let cf_key = {
+                let config = state.config.lock().map_err(|e| e.to_string())?;
+                config.curseforge_api_key.clone()
             };
-            // Loader semantics only apply to mods; packs ignore loaders.
-            let cf_loader: Option<String> = if is_mods {
-                match loader.as_deref() {
-                    // "Vanilla" mods are not a CF loader — no safe match.
-                    None | Some("Vanilla") => continue,
-                    Some(l) => Some(l.to_string()),
+
+            let mut cf_entries: Vec<(usize, u64)> = Vec::new();
+            for &idx in &cf_indices {
+                if let Ok(pid) = mod_files[idx]
+                    .project_id
+                    .as_deref()
+                    .unwrap_or("")
+                    .parse::<u64>()
+                {
+                    cf_entries.push((idx, pid));
                 }
-            } else {
-                None
-            };
-            let files = match curseforge::get_mod_files(
-                pid,
-                mc_version.as_deref(),
-                cf_loader.as_deref(),
-                0,
-                &cf_key,
-            )
-            .await
-            {
-                Ok(r) => r.data,
-                // A blip must never silently claim "no updates" for this mod:
-                // surface it in the log, keep checking the rest.
-                Err(e) => {
-                    let msg = format!(
-                        "Update check: CurseForge request failed for '{}': {}",
-                        m.name, e
-                    );
-                    tracing::warn!(target: "launcher", "{}", msg);
-                    crate::events::emit_log(&app, "warn", "content", &msg);
+            }
+
+            let mut project_ids: Vec<u64> = cf_entries.iter().map(|(_, pid)| *pid).collect();
+            project_ids.sort_unstable();
+            project_ids.dedup();
+
+            let mut mods_by_id: std::collections::HashMap<u64, curseforge::CfBulkMod> =
+                std::collections::HashMap::new();
+            let mut failed_chunks = 0;
+            for chunk in project_ids.chunks(CF_BULK_LIMIT) {
+                match curseforge::get_mods_by_ids(chunk, &cf_key).await {
+                    Ok(mods) => {
+                        failed_chunks = 0;
+                        for m in mods {
+                            mods_by_id.insert(m.id, m);
+                        }
+                    }
+                    Err(e) => {
+                        failed_chunks += 1;
+                        let msg = format!(
+                            "Update check: CurseForge bulk request failed for {} mod(s): {}",
+                            chunk.len(),
+                            e
+                        );
+                        tracing::warn!(target: "launcher", "{}", msg);
+                        crate::events::emit_log(&app, "warn", "content", &msg);
+                        if failed_chunks >= 2 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let mut pending: Vec<CfPendingUpdate> = Vec::new();
+            for (idx, pid) in cf_entries {
+                let m = &mod_files[idx];
+                let Some(mod_data) = mods_by_id.get(&pid) else {
+                    continue;
+                };
+                let installed_file_id = m.file_id.as_deref().and_then(|s| s.parse::<u64>().ok());
+                let candidate = cf_pick_update_index(
+                    mod_data,
+                    mc_version.as_deref(),
+                    cf_loader_id,
+                    installed_file_id,
+                )
+                .map(|index| index.file_id)
+                .or_else(|| {
+                    cf_pick_latest_file(mod_data, mc_version.as_deref(), loader.as_deref())
+                        .map(|file| file.id)
+                });
+                let Some(file_id) = candidate else {
+                    continue;
+                };
+                if installed_file_id == Some(file_id) {
                     continue;
                 }
-            };
-            let Some(new_file) = files
-                .iter()
-                .find(|f| f.release_type == 1)
-                .or_else(|| files.first())
-            else {
-                continue;
-            };
-            let new_fid = new_file.id.to_string();
-            if m.file_id.as_deref() == Some(new_fid.as_str()) {
-                continue;
+                pending.push(CfPendingUpdate {
+                    mod_index: idx,
+                    project_id: pid,
+                    project_name: if mod_data.name.trim().is_empty() {
+                        m.name.clone()
+                    } else {
+                        mod_data.name.clone()
+                    },
+                    file_id,
+                });
             }
-            let new_sha1 = new_file.sha1_hash().unwrap_or("");
-            if !new_sha1.is_empty() && m.hash.as_deref() == Some(new_sha1) {
-                continue;
+
+            let mut file_ids: Vec<u64> = pending.iter().map(|p| p.file_id).collect();
+            file_ids.sort_unstable();
+            file_ids.dedup();
+            let mut files_by_id: std::collections::HashMap<u64, curseforge::CfFile> =
+                std::collections::HashMap::new();
+            let mut failed_file_chunks = 0;
+            for chunk in file_ids.chunks(CF_BULK_LIMIT) {
+                match curseforge::get_files_by_ids(chunk, &cf_key).await {
+                    Ok(files) => {
+                        failed_file_chunks = 0;
+                        for f in files {
+                            files_by_id.insert(f.id, f);
+                        }
+                    }
+                    Err(e) => {
+                        failed_file_chunks += 1;
+                        let msg = format!(
+                            "Update check: CurseForge file details request failed for {} file(s): {}",
+                            chunk.len(),
+                            e
+                        );
+                        tracing::warn!(target: "launcher", "{}", msg);
+                        crate::events::emit_log(&app, "warn", "content", &msg);
+                        if failed_file_chunks >= 2 {
+                            break;
+                        }
+                    }
+                }
             }
-            results.push(ModUpdateResult {
-                filename: m.filename.clone(),
-                name: m.name.clone(),
-                old_version: m.version.clone(),
-                new_version: new_file.display_name.clone(),
-                // Empty → the frontend downloads via the (project, file) chain.
-                download_url: new_file.download_url.clone().unwrap_or_default(),
-                new_filename: new_file.file_name.clone(),
-                project_id: pid.to_string(),
-                version_id: new_fid.clone(),
-                expected_sha1: new_sha1.to_string(),
-                provider: "curseforge".to_string(),
-                file_id: Some(new_fid),
-            });
+
+            for p in pending {
+                let m = &mod_files[p.mod_index];
+                let Some(new_file) = files_by_id.get(&p.file_id) else {
+                    continue;
+                };
+                if !new_file.is_available.unwrap_or(true) {
+                    continue;
+                }
+                let new_fid = new_file.id.to_string();
+                if m.file_id.as_deref() == Some(new_fid.as_str()) {
+                    continue;
+                }
+                let new_sha1 = new_file.sha1_hash().unwrap_or("");
+                if !new_sha1.is_empty() && m.hash.as_deref() == Some(new_sha1) {
+                    continue;
+                }
+                results.push(ModUpdateResult {
+                    filename: m.filename.clone(),
+                    name: p.project_name,
+                    old_version: m.version.clone(),
+                    new_version: new_file.display_name.clone(),
+                    download_url: new_file.download_url.clone().unwrap_or_default(),
+                    new_filename: new_file.file_name.clone(),
+                    project_id: p.project_id.to_string(),
+                    version_id: new_fid.clone(),
+                    expected_sha1: new_sha1.to_string(),
+                    provider: "curseforge".to_string(),
+                    file_id: Some(new_fid),
+                });
+            }
         }
     }
 
@@ -1138,7 +1317,7 @@ static META_CACHE_FILE: OnceLock<PathBuf> = OnceLock::new();
 /// Bump when jar parsing changes in a way that alters stored values:
 /// persisted entries are keyed only by path+mtime+size and would otherwise
 /// survive a parser change with stale results.
-const META_CACHE_VERSION: u32 = 1;
+const META_CACHE_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MetaCacheFile {
@@ -1444,6 +1623,12 @@ fn build_mod_metadata(
         pw.filter(|p| !p.project_id.is_empty())
             .map(|p| p.project_id.clone())
     });
+    let jar_name = instances::strip_minecraft_color_codes(&meta.name);
+    let jar_name = if usable_mod_name(&jar_name, meta.slug.as_deref()).is_some() {
+        jar_name
+    } else {
+        String::new()
+    };
     let (slug, slug_verified) = project_id
         .as_ref()
         .map(|s| (Some(s.clone()), sidecar.project_id.is_some()))
@@ -1457,26 +1642,19 @@ fn build_mod_metadata(
             .map(|p| p.provider.clone())
             .unwrap_or_else(|| "Local".to_string()),
     };
-    // Name priority: JAR metadata (when it has a real name) >
-    // sidecar project name > packwiz > filename. JAR parsing
-    // sometimes yields "Unknown" or garbage, the sidecar carries
-    // the proper CurseForge display name.
-    let jar_name = meta.name.trim().to_string();
-    let jar_name = if jar_name.is_empty() || jar_name.eq_ignore_ascii_case("unknown") {
-        String::new()
-    } else {
-        jar_name
-    };
     let name = if !jar_name.is_empty() {
         jar_name
     } else {
-        sidecar
+        let fallback = sidecar
             .project_name
             .as_deref()
-            .filter(|s| !s.is_empty())
+            .and_then(|n| usable_mod_name(n, slug.as_deref()))
             .map(str::to_string)
-            .or_else(|| pw.filter(|p| !p.name.is_empty()).map(|p| p.name.clone()))
-            .unwrap_or_else(|| filename.trim_end_matches(".jar").to_string())
+            .or_else(|| {
+                pw.and_then(|p| usable_mod_name(&p.name, slug.as_deref()).map(str::to_string))
+            })
+            .unwrap_or_else(|| filename.trim_end_matches(".jar").to_string());
+        instances::strip_minecraft_color_codes(&fallback)
     };
     // Version priority: sidecar (verified from Modrinth API) >
     // packwiz > sanitized JAR version. "${version}" and "Unknown"
@@ -1532,6 +1710,23 @@ fn read_mod_sidecar_slug(mods_dir: &std::path::Path, filename: &str) -> Option<S
 fn read_mod_sidecar_provider(mods_dir: &std::path::Path, filename: &str) -> Option<String> {
     let json = crate::instances::read_sidecar_meta(mods_dir, filename)?;
     json["provider"].as_str().map(|s| s.to_string())
+}
+
+fn usable_mod_name<'a>(name: &'a str, mod_id: Option<&str>) -> Option<&'a str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("unknown")
+        || trimmed.contains("${")
+        || trimmed.eq_ignore_ascii_case("%s")
+    {
+        return None;
+    }
+    if let Some(id) = mod_id.map(str::trim).filter(|id| !id.is_empty()) {
+        if trimmed == id {
+            return None;
+        }
+    }
+    Some(trimmed)
 }
 
 /// Strip build-placeholder versions ("${version}", "${file.jarVersion}",
@@ -1627,10 +1822,9 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                let name = json["name"]
-                    .as_str()
-                    .or_else(|| json["id"].as_str())
-                    .unwrap_or("Unknown")
+                let id = json["id"].as_str().unwrap_or("Unknown");
+                let name = usable_mod_name(json["name"].as_str().unwrap_or(""), Some(id))
+                    .unwrap_or(id)
                     .to_string();
                 let version = json["version"].as_str().unwrap_or("Unknown").to_string();
                 let slug = json["id"].as_str().map(|s| s.to_string());
@@ -1642,7 +1836,7 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                     clean
                 });
                 return ModMetaResult {
-                    name,
+                    name: instances::strip_minecraft_color_codes(&name),
                     version,
                     provider: "Fabric".into(),
                     icon,
@@ -1652,30 +1846,45 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
         }
     }
 
-    // Try META-INF/mods.toml (Forge/NeoForge)
-    for toml_name in &["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
+    for toml_name in &["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
         if let Ok(mut file) = archive.by_name(toml_name) {
             let mut contents = String::new();
             if file.read_to_string(&mut contents).is_ok() {
                 if let Ok(toml_val) = contents.parse::<toml::Table>() {
                     if let Some(mods_arr) = toml_val.get("mods").and_then(|v| v.as_array()) {
-                        if let Some(first_mod) = mods_arr.first() {
-                            let mod_id = first_mod
+                        let picked = mods_arr
+                            .iter()
+                            .filter_map(|m| m.as_table())
+                            .find(|m| {
+                                let id = m.get("modId").and_then(|v| v.as_str());
+                                usable_mod_name(
+                                    m.get("displayName").and_then(|v| v.as_str()).unwrap_or(""),
+                                    id,
+                                )
+                                .is_some()
+                            })
+                            .or_else(|| mods_arr.iter().find_map(|m| m.as_table()));
+                        if let Some(picked) = picked {
+                            let mod_id = picked
                                 .get("modId")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Unknown")
                                 .to_string();
-                            let display_name = first_mod
-                                .get("displayName")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(&mod_id)
-                                .to_string();
-                            let version = first_mod
+                            let display_name = usable_mod_name(
+                                picked
+                                    .get("displayName")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(""),
+                                Some(&mod_id),
+                            )
+                            .unwrap_or(&mod_id)
+                            .to_string();
+                            let version = picked
                                 .get("version")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Unknown")
                                 .to_string();
-                            let logo = first_mod
+                            let logo = picked
                                 .get("logoFile")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
@@ -1685,7 +1894,7 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                                 "Forge"
                             };
                             return ModMetaResult {
-                                name: display_name,
+                                name: instances::strip_minecraft_color_codes(&display_name),
                                 version,
                                 provider: provider.into(),
                                 icon: logo,
@@ -1697,8 +1906,9 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                 // Fallback to line-based parser for malformed TOML
                 let mod_id =
                     extract_toml_field(&contents, "modId").unwrap_or("Unknown".to_string());
-                let display_name =
-                    extract_toml_field(&contents, "displayName").unwrap_or_else(|| mod_id.clone());
+                let display_name = extract_toml_field(&contents, "displayName")
+                    .and_then(|name| usable_mod_name(&name, Some(&mod_id)).map(str::to_string))
+                    .unwrap_or_else(|| mod_id.clone());
                 let version =
                     extract_toml_field(&contents, "version").unwrap_or("Unknown".to_string());
                 let logo = extract_toml_field(&contents, "logoFile");
@@ -1708,13 +1918,62 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                     "Forge"
                 };
                 return ModMetaResult {
-                    name: display_name,
+                    name: instances::strip_minecraft_color_codes(&display_name),
                     version,
                     provider: provider.into(),
                     icon: logo,
                     slug: Some(mod_id),
                 };
             }
+        }
+    }
+
+    for info_name in &["mcmod.info", "META-INF/mcmod.info"] {
+        let Ok(mut file) = archive.by_name(info_name) else {
+            continue;
+        };
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_err() {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        let entries: Vec<&serde_json::Value> = if let Some(arr) = json.as_array() {
+            arr.iter().collect()
+        } else if let Some(arr) = json.get("modList").and_then(|v| v.as_array()) {
+            arr.iter().collect()
+        } else if json.get("modid").is_some() {
+            vec![&json]
+        } else {
+            Vec::new()
+        };
+        let picked = entries
+            .iter()
+            .copied()
+            .find(|m| {
+                usable_mod_name(m["name"].as_str().unwrap_or(""), m["modid"].as_str()).is_some()
+            })
+            .or_else(|| entries.first().copied());
+        if let Some(picked) = picked {
+            let mod_id = picked["modid"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Unknown")
+                .to_string();
+            let display_name =
+                usable_mod_name(picked["name"].as_str().unwrap_or(""), Some(&mod_id))
+                    .unwrap_or(&mod_id)
+                    .to_string();
+            let version = picked["version"].as_str().unwrap_or("Unknown").to_string();
+            let logo = picked["logoFile"].as_str().map(|s| s.to_string());
+            return ModMetaResult {
+                name: instances::strip_minecraft_color_codes(&display_name),
+                version,
+                provider: "Forge".into(),
+                icon: logo,
+                slug: Some(mod_id),
+            };
         }
     }
 
@@ -2171,6 +2430,166 @@ mod meta_cache_file_tests {
         dir
     }
 
+    fn write_jar(path: &std::path::Path, files: &[(&str, &str)]) {
+        use std::io::Write as _;
+        let file = std::fs::File::create(path).expect("create jar");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, contents) in files {
+            zip.start_file(*name, options).expect("start zip entry");
+            zip.write_all(contents.as_bytes()).expect("write zip entry");
+        }
+        zip.finish().expect("finish jar");
+    }
+
+    #[test]
+    fn usable_mod_name_rejects_ids_and_placeholders() {
+        assert!(usable_mod_name("", Some("x")).is_none());
+        assert!(usable_mod_name("Unknown", Some("x")).is_none());
+        assert!(usable_mod_name("${mod_name}", Some("x")).is_none());
+        assert!(usable_mod_name("x", Some("x")).is_none());
+        assert_eq!(usable_mod_name("X", Some("x")), Some("X"));
+        assert_eq!(
+            usable_mod_name("Real Mod Name", Some("realmod")),
+            Some("Real Mod Name")
+        );
+    }
+
+    #[test]
+    fn forge_multi_mod_jar_prefers_real_display_name() {
+        let dir = test_dir("forge-multi");
+        let jar = dir.join("combined.jar");
+        write_jar(
+            &jar,
+            &[(
+                "META-INF/mods.toml",
+                r#"
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="librarycore"
+version="1.0"
+
+[[mods]]
+modId="coolmod"
+displayName="Cool Mod"
+version="2.3"
+"#,
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.name, "Cool Mod");
+        assert_eq!(meta.slug.as_deref(), Some("coolmod"));
+        assert_eq!(meta.version, "2.3");
+        assert_eq!(meta.provider, "Forge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_mcmod_info_provides_display_name() {
+        let dir = test_dir("mcmod-info");
+        let jar = dir.join("old.jar");
+        write_jar(
+            &jar,
+            &[(
+                "mcmod.info",
+                r#"[{"modid":"oldmod","name":"Old Mod","version":"1.2.3","mcversion":"1.12.2"}]"#,
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.name, "Old Mod");
+        assert_eq!(meta.slug.as_deref(), Some("oldmod"));
+        assert_eq!(meta.version, "1.2.3");
+        assert_eq!(meta.provider, "Forge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn cf_index(
+        file_id: u64,
+        game_version: &str,
+        mod_loader: Option<u32>,
+    ) -> curseforge::CfFileIndex {
+        curseforge::CfFileIndex {
+            game_version: game_version.to_string(),
+            file_id,
+            filename: format!("file-{file_id}.jar"),
+            release_type: 1,
+            game_version_type_id: None,
+            mod_loader,
+        }
+    }
+
+    #[test]
+    fn cf_update_index_prefers_stable_releases() {
+        let project = curseforge::CfBulkMod {
+            id: 1,
+            name: "Test Mod".into(),
+            latest_files: Vec::new(),
+            latest_files_indexes: vec![
+                {
+                    let mut i = cf_index(40, "1.20.1", Some(1));
+                    i.release_type = 2;
+                    i
+                },
+                cf_index(30, "1.20.1", Some(1)),
+                cf_index(20, "1.20.1", Some(1)),
+            ],
+        };
+        assert_eq!(
+            cf_pick_update_index(&project, Some("1.20.1"), Some(1), Some(20)).map(|i| i.file_id),
+            Some(30)
+        );
+        assert!(cf_pick_update_index(&project, Some("1.20.1"), Some(1), Some(30)).is_none());
+    }
+
+    #[test]
+    fn cf_update_index_allows_beta_only_projects() {
+        let mut newer = cf_index(50, "1.20.1", Some(1));
+        newer.release_type = 2;
+        let mut older = cf_index(45, "1.20.1", Some(1));
+        older.release_type = 2;
+        let project = curseforge::CfBulkMod {
+            id: 1,
+            name: "Beta Only".into(),
+            latest_files: Vec::new(),
+            latest_files_indexes: vec![newer, older],
+        };
+        assert_eq!(
+            cf_pick_update_index(&project, Some("1.20.1"), Some(1), Some(45)).map(|i| i.file_id),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn cf_update_index_never_offers_the_installed_or_older_file() {
+        let project = curseforge::CfBulkMod {
+            id: 1,
+            name: "Test Mod".into(),
+            latest_files: Vec::new(),
+            latest_files_indexes: vec![
+                cf_index(30, "1.20.1", Some(1)),
+                cf_index(20, "1.20.1", Some(1)),
+                cf_index(10, "1.20.1", Some(4)),
+            ],
+        };
+        assert_eq!(
+            cf_pick_update_index(&project, Some("1.20.1"), Some(1), Some(20)).map(|i| i.file_id),
+            Some(30)
+        );
+        assert!(cf_pick_update_index(&project, Some("1.20.1"), Some(1), Some(30)).is_none());
+        assert_eq!(
+            cf_pick_update_index(&project, Some("1.20.1"), Some(1), None).map(|i| i.file_id),
+            Some(30)
+        );
+        assert!(cf_pick_update_index(&project, Some("1.21.1"), Some(1), Some(20)).is_none());
+        assert_eq!(
+            cf_pick_update_index(&project, Some("1.20.1"), Some(4), Some(10)).map(|i| i.file_id),
+            None
+        );
+    }
+
     #[test]
     fn disk_cache_roundtrip_preserves_entries() {
         let dir = test_dir("roundtrip");
@@ -2222,7 +2641,7 @@ mod meta_cache_file_tests {
         // fill non-meta fields, so the entry still loads.
         std::fs::write(
             &file,
-            r#"{"version":1,"entries":[{"path":"C:/x.jar","mtime_ms":5,"size":6,"meta":{"name":"X"}}]}"#,
+            r#"{"version":2,"entries":[{"path":"C:/x.jar","mtime_ms":5,"size":6,"meta":{"name":"X"}}]}"#,
         )
         .unwrap();
         let loaded = load_meta_cache_from_disk(&file);

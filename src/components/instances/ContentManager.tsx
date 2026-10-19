@@ -14,6 +14,7 @@ import { useT } from '../../lib/i18n';
 import { useIconCacheStore } from '../../stores/iconCacheStore';
 import { useThemeStore } from '../../stores/themeStore';
 import { useContentViewStore } from '../../stores/contentViewStore';
+import { EMPTY_UPDATE_CHECK, useUpdateCheckStore, type UpdateInfo } from '../../stores/updateCheckStore';
 import { RemoteIcon } from '../../lib/remoteImage';
 import type { CompatState } from '../../lib/contentProviders';
 
@@ -76,22 +77,6 @@ interface ContentItem {
   slug?: string | null;
   slug_verified?: boolean;
   project_id?: string;
-}
-
-interface UpdateInfo {
-  name: string;
-  oldVersion: string;
-  newVersion: string;
-  downloadUrl: string;
-  filename: string;
-  oldFilename: string;
-  projectId: string;
-  versionId: string;
-  expectedSha1: string;
-  /** `modrinth` (default) or `curseforge` — decides the download path. */
-  provider: string;
-  /** CurseForge file id of the new file (id-chain download). */
-  fileId?: string | null;
 }
 
 interface Props {
@@ -274,8 +259,15 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const [selectedFilenames, setSelectedFilenames] = useState<Set<string>>(new Set());
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; filename: string } | null>(null);
   const [compatibility, setCompatibility] = useState<Record<string, CompatState>>({});
-  const [checkingUpdates, setCheckingUpdates] = useState(false);
-  const [updates, setUpdates] = useState<UpdateInfo[] | null>(null);
+  const updateCheckKey = `${instanceName}:${SUBFOLDER[contentType]}`;
+  const updateCheck = useUpdateCheckStore((s) => s.checks[updateCheckKey]) ?? EMPTY_UPDATE_CHECK;
+  const startUpdateCheck = useUpdateCheckStore((s) => s.start);
+  const succeedUpdateCheck = useUpdateCheckStore((s) => s.succeed);
+  const failUpdateCheck = useUpdateCheckStore((s) => s.fail);
+  const removeUpdate = useUpdateCheckStore((s) => s.remove);
+  const dismissUpdateCheck = useUpdateCheckStore((s) => s.dismiss);
+  const checkingUpdates = updateCheck.running;
+  const updates = updateCheck.updates;
   const [showBrowser, setShowBrowser] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [downloadingMods, setDownloadingMods] = useState<Set<string>>(new Set());
@@ -735,7 +727,8 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   };
 
   const handleCheckUpdates = async () => {
-    setCheckingUpdates(true);
+    if (checkingUpdates) return;
+    startUpdateCheck(updateCheckKey);
     addToast(t('manager.checking_updates', { count: items.length.toString() }), 'info');
     try {
       const results = await invoke<any[]>('cmd_check_mod_updates', {
@@ -757,14 +750,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         provider: r.provider === 'curseforge' ? 'curseforge' : 'modrinth',
         fileId: r.file_id ?? null,
       }));
-      setCheckingUpdates(false);
-      if (found.length > 0) {
-        setUpdates(found);
-      } else {
-        addToast(t('common.up_to_date'), 'success');
-      }
+      succeedUpdateCheck(updateCheckKey, found);
+      if (found.length === 0) addToast(t('common.up_to_date'), 'success');
     } catch (e: any) {
-      setCheckingUpdates(false);
+      failUpdateCheck(updateCheckKey);
       addToast(t('manager.update_error', { name: '', error: e.toString() }), 'error');
     }
   };
@@ -811,7 +800,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         fileId: update.fileId ?? null,
       });
       if (!silent) logUiMessage(t('manager.updated_toast', { name: update.name, version: update.newVersion }), 'info', 'ui');
-      setUpdates((prev) => prev ? prev.filter((u) => u.name !== update.name) : null);
+      removeUpdate(updateCheckKey, update.oldFilename);
       loadItems();
     } catch (e: any) {
       if (silent) logUiMessage(t('manager.update_error', { name: update.name, error: e.toString() }), 'error', 'ui');
@@ -848,7 +837,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       setUpdateProgress((prev) => prev ? { ...prev, current: prev.current + 1 } : null);
     }
     setUpdateProgress(null);
-    setUpdates(null);
+    dismissUpdateCheck(updateCheckKey);
     loadItems();
     if (errors.length === 0) {
       addToast(t('manager.updated_all_success', { count: successes.length.toString() }), 'success');
@@ -1138,12 +1127,12 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           stays disabled while the batch is running. */}
       <Modal
         open={!!updates}
-        onClose={() => setUpdates(null)}
+        onClose={() => dismissUpdateCheck(updateCheckKey)}
         title={updates ? t('manager.updates_title', { count: updates.length.toString() }) : ''}
         maxWidth={600}
         footer={
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-            <Button variant="ghost" onClick={() => setUpdates(null)} disabled={!!updateProgress} style={{ opacity: updateProgress ? 0.5 : 1 }}>{t('common.cancel')}</Button>
+            <Button variant="ghost" onClick={() => dismissUpdateCheck(updateCheckKey)} disabled={!!updateProgress} style={{ opacity: updateProgress ? 0.5 : 1 }}>{t('common.cancel')}</Button>
             <Button onClick={handleApplyAllUpdates} disabled={!!updateProgress}>
               {updateProgress ? '...' : t('manager.update_all', { count: (updates?.length ?? 0).toString() })}
             </Button>

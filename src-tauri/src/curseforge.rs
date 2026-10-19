@@ -157,6 +157,33 @@ pub struct CfFilesResponse {
     pub pagination: CfPagination,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CfFileIndex {
+    #[serde(rename = "gameVersion", default)]
+    pub game_version: String,
+    #[serde(rename = "fileId", default)]
+    pub file_id: u64,
+    #[serde(default)]
+    pub filename: String,
+    #[serde(rename = "releaseType", default)]
+    pub release_type: u32,
+    #[serde(rename = "gameVersionTypeId", default)]
+    pub game_version_type_id: Option<u32>,
+    #[serde(rename = "modLoader", default)]
+    pub mod_loader: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CfBulkMod {
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(rename = "latestFiles", default)]
+    pub latest_files: Vec<CfFile>,
+    #[serde(rename = "latestFilesIndexes", default)]
+    pub latest_files_indexes: Vec<CfFileIndex>,
+}
+
 // CurseForge ModLoaderType enum values
 pub fn loader_type_id(loader: &str) -> Option<u32> {
     match loader.to_lowercase().as_str() {
@@ -265,6 +292,39 @@ async fn api_get_once<T: serde::de::DeserializeOwned>(
     })
 }
 
+async fn api_post<T: serde::de::DeserializeOwned, B: serde::Serialize + ?Sized>(
+    url: &str,
+    api_key: &str,
+    body: &B,
+) -> Result<T> {
+    crate::download::ensure_proxy_resolved().await;
+    let client = crate::download::global_http_client()?;
+    let response = crate::download::get_with_retry(
+        client
+            .post(url)
+            .header("x-api-key", api_key)
+            .header("Accept", "application/json")
+            .json(body)
+            .timeout(std::time::Duration::from_secs(15)),
+        "CurseForge",
+        2,
+        &[500],
+    )
+    .await?;
+
+    let text = response
+        .text()
+        .await
+        .map_err(crate::error::LauncherError::Network)?;
+    serde_json::from_str::<T>(&text).map_err(|e| {
+        crate::error::LauncherError::Download(format!(
+            "Failed to decode CurseForge response: {}. Body preview: {}",
+            e,
+            &text.chars().take(500).collect::<String>()
+        ))
+    })
+}
+
 /// Filter set for [`search_mods_filtered`]. `index` selects the sort order
 /// (`downloads`/`newest`/`oldest`, see [`sort_field_for`]).
 pub struct CfSearchQuery<'a> {
@@ -359,6 +419,26 @@ pub async fn get_mod_files(
 pub async fn get_mod_file(mod_id: u64, file_id: u64, api_key: &str) -> Result<CfFile> {
     let url = format!("{}/v1/mods/{}/files/{}", BASE_URL, mod_id, file_id);
     let resp: CfDataResponse<CfFile> = api_get(&url, api_key).await?;
+    Ok(resp.data)
+}
+
+pub async fn get_mods_by_ids(mod_ids: &[u64], api_key: &str) -> Result<Vec<CfBulkMod>> {
+    if mod_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = format!("{}/v1/mods", BASE_URL);
+    let body = serde_json::json!({ "modIds": mod_ids });
+    let resp: CfDataResponse<Vec<CfBulkMod>> = api_post(&url, api_key, &body).await?;
+    Ok(resp.data)
+}
+
+pub async fn get_files_by_ids(file_ids: &[u64], api_key: &str) -> Result<Vec<CfFile>> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = format!("{}/v1/mods/files", BASE_URL);
+    let body = serde_json::json!({ "fileIds": file_ids });
+    let resp: CfDataResponse<Vec<CfFile>> = api_post(&url, api_key, &body).await?;
     Ok(resp.data)
 }
 
@@ -643,5 +723,55 @@ mod tests {
         let mut dedup = urls.clone();
         dedup.dedup();
         assert_eq!(urls, dedup);
+    }
+
+    #[test]
+    fn bulk_project_row_parses_latest_file_indexes() {
+        let json = r#"{
+            "data": [{
+                "id": 238222,
+                "name": "Just Enough Items (JEI)",
+                "latestFiles": [],
+                "latestFilesIndexes": [{
+                    "gameVersion": "1.20.1",
+                    "fileId": 9205046,
+                    "filename": "jei-1.20.1-forge-15.71.0.224.jar",
+                    "releaseType": 2,
+                    "gameVersionTypeId": 75125,
+                    "modLoader": 1
+                }]
+            }]
+        }"#;
+        let resp: CfDataResponse<Vec<CfBulkMod>> = serde_json::from_str(json).unwrap();
+        let project = &resp.data[0];
+        assert_eq!(project.id, 238222);
+        assert_eq!(project.name, "Just Enough Items (JEI)");
+        let index = &project.latest_files_indexes[0];
+        assert_eq!(index.game_version, "1.20.1");
+        assert_eq!(index.file_id, 9205046);
+        assert_eq!(index.release_type, 2);
+        assert_eq!(index.mod_loader, Some(1));
+    }
+
+    #[test]
+    fn bulk_file_row_parses_hash_and_availability() {
+        let json = r#"{
+            "data": [{
+                "id": 9254760,
+                "displayName": "19.69.0.456 for NeoForge 1.21.1",
+                "fileName": "jei-1.21.1-neoforge-19.69.0.456.jar",
+                "downloadUrl": "https://edge.forgecdn.net/files/9254/760/jei.jar",
+                "fileLength": 1234,
+                "fileDate": "2026-01-01T00:00:00Z",
+                "gameVersions": ["1.21.1", "NeoForge"],
+                "dependencies": [],
+                "releaseType": 1,
+                "isAvailable": true,
+                "hashes": [{"value": "abc", "algo": 1}]
+            }]
+        }"#;
+        let resp: CfDataResponse<Vec<CfFile>> = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.data[0].sha1_hash(), Some("abc"));
+        assert_eq!(resp.data[0].is_available, Some(true));
     }
 }
