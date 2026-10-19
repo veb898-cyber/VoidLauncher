@@ -73,6 +73,8 @@ export function Settings() {
   const config = useSettingsStore((s) => s.config);
   const javaInstallations = useSettingsStore((s) => s.javaInstallations);
   const loadConfig = useSettingsStore((s) => s.loadConfig);
+  const loadError = useSettingsStore((s) => s.loadError);
+  const configLoading = useSettingsStore((s) => s.isLoading);
   const saveConfig = useSettingsStore((s) => s.saveConfig);
   const detectJava = useSettingsStore((s) => s.detectJava);
   const detectSystemRam = useSettingsStore((s) => s.detectSystemRam);
@@ -206,7 +208,20 @@ export function Settings() {
         <div className="page__header">
           <h1 className="page__title">{t('settings.title')}</h1>
         </div>
-        <div className="skeleton" style={{ height: 200 }} />
+        {loadError && !configLoading ? (
+          <div className="glass-card" style={{ padding: 'var(--space-lg)', display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)', alignItems: 'flex-start' }}>
+            <div style={{ fontWeight: 600 }}>{t('settings.load_error_title')}</div>
+            <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
+              {t('settings.load_error_desc', { error: loadError })}
+            </div>
+            <Button variant="secondary" onClick={() => loadConfig()}>
+              <RefreshCw size={14} style={{ marginRight: 6 }} />
+              {t('common.retry')}
+            </Button>
+          </div>
+        ) : (
+          <div className="skeleton" style={{ height: 200 }} />
+        )}
       </div>
     );
   }

@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { useAccountsStore, type AccountEntry, type CapeEntry } from '../stores/accountsStore';
+import { useAccountsStore, type AccountEntry } from '../stores/accountsStore';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Modal } from '../components/ui/Modal';
 import { CustomSelect } from '../components/ui/CustomSelect';
 import { Tooltip } from '../components/ui/Tooltip';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import { EmptyState } from '../components/ui/EmptyState';
 import { LoadingSpinner } from '../components/ui/LoadingSpinner';
 import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
@@ -55,9 +56,13 @@ export function Accounts() {
     removeAccount,
     setDefaultAccount,
     changeSkin,
-    getPlayerCapes,
+    fetchCapes,
+    applyCapes,
     setPlayerCape,
   } = useAccountsStore();
+  const capesByAccount = useAccountsStore((s) => s.capesByAccount);
+  const capesLoadingByAccount = useAccountsStore((s) => s.capesLoadingByAccount);
+  const capesErrorByAccount = useAccountsStore((s) => s.capesErrorByAccount);
 
   const [showAddOffline, setShowOffline] = useState(false);
   const [offlineName, setOfflineName] = useState('');
@@ -72,11 +77,11 @@ export function Accounts() {
   const [showElybySkinHelp, setShowElybySkinHelp] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [switching, setSwitching] = useState(false);
-  const [capes, setCapes] = useState<CapeEntry[]>([]);
-  const [capesLoading, setCapesLoading] = useState(false);
-  const [capesError, setCapesError] = useState<string | null>(null);
-  const [capesNonce, setCapesNonce] = useState(0);
   const [capeSaving, setCapeSaving] = useState(false);
+  const [addingOffline, setAddingOffline] = useState(false);
+  const [addingElyby, setAddingElyby] = useState(false);
+  const [removeTarget, setRemoveTarget] = useState<AccountEntry | null>(null);
+  const [removing, setRemoving] = useState(false);
 
   useEffect(() => { loadAccounts(); }, [loadAccounts]);
 
@@ -97,39 +102,31 @@ export function Accounts() {
   const selectedIdRef = useRef<string | null>(null);
   selectedIdRef.current = selected?.id ?? null;
 
-  // Load the owned capes whenever a signed-in Microsoft account is selected.
-  // Offline/Ely.by accounts have no capes; a Microsoft account without a
-  // stored session would only produce a network error, so it is skipped.
-  // A failed fetch is NOT silently treated as "no capes": the reason is kept
-  // and shown with a retry, and the picker never disappears once it is up.
-  const capesAccountRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (
-      !selected ||
-      selected.account_type !== 'Microsoft' ||
-      selected.has_ms_session === false
-    ) {
-      capesAccountRef.current = null;
-      setCapes([]);
-      setCapesError(null);
-      setCapesLoading(false);
-      return;
-    }
-    let alive = true;
-    const accountId = selected.id;
-    // Switching to another account drops its predecessor's list; the same
-    // account keeps the list visible while a revisit refreshes it.
-    if (capesAccountRef.current !== accountId) setCapes([]);
-    setCapesError(null);
-    setCapesLoading(true);
-    getPlayerCapes(accountId)
-      .then((list) => { if (alive) { capesAccountRef.current = accountId; setCapes(list); } })
-      .catch((e) => { if (alive) { capesAccountRef.current = accountId; setCapesError(String(e)); } })
-      .finally(() => { if (alive) setCapesLoading(false); });
-    return () => { alive = false; };
-  }, [selected, getPlayerCapes, capesNonce]);
+  // Cape lists live in the accounts store, keyed by account id. Selecting an
+  // account therefore paints its capes (and the worn cape on the 3D model)
+  // synchronously from the shared cache, while a stale entry is refreshed in
+  // the background without ever blanking what is already on screen.
+  const selectedCapeAccountId =
+    selected && selected.account_type === 'Microsoft' && selected.has_ms_session !== false
+      ? selected.id
+      : null;
+  const capes = selectedCapeAccountId
+    ? capesByAccount[selectedCapeAccountId]?.capes ?? []
+    : [];
+  const capesLoading = selectedCapeAccountId
+    ? !!capesLoadingByAccount[selectedCapeAccountId]
+    : false;
+  const capesError = selectedCapeAccountId
+    ? capesErrorByAccount[selectedCapeAccountId] ?? null
+    : null;
 
-  const retryCapes = () => setCapesNonce((n) => n + 1);
+  useEffect(() => {
+    if (selectedCapeAccountId) fetchCapes(selectedCapeAccountId);
+  }, [selectedCapeAccountId, fetchCapes]);
+
+  const retryCapes = () => {
+    if (selectedCapeAccountId) fetchCapes(selectedCapeAccountId, true);
+  };
 
   const activeCapePng = capes.find((c) => c.active && c.png)?.png ?? null;
 
@@ -138,18 +135,22 @@ export function Accounts() {
       addToast(offlineNameError, 'error');
       return;
     }
-    if (!offlineName.trim()) return;
+    if (!offlineName.trim() || addingOffline) return;
+    setAddingOffline(true);
     try {
       await addOfflineAccount(offlineName.trim());
       setOfflineName('');
       setShowOffline(false);
     } catch (e) {
       addToast(t('accounts.add_failed', { service: 'Offline', error: String(e) }), 'error');
+    } finally {
+      setAddingOffline(false);
     }
   };
 
   const handleAddElyby = async () => {
-    if (!elybyUser.trim() || !elybyPass.trim()) return;
+    if (!elybyUser.trim() || !elybyPass.trim() || addingElyby) return;
+    setAddingElyby(true);
     try {
       await addElybyAccount(elybyUser.trim(), elybyPass.trim());
       setElybyUser('');
@@ -157,6 +158,8 @@ export function Accounts() {
       setShowElyby(false);
     } catch (e) {
       addToast(t('accounts.add_failed', { service: 'Ely.by', error: String(e) }), 'error');
+    } finally {
+      setAddingElyby(false);
     }
   };
 
@@ -171,12 +174,17 @@ export function Accounts() {
   };
 
   const handleRemoveAccount = async (account: AccountEntry) => {
+    if (removing) return;
+    setRemoving(true);
     try {
       await removeAccount(account.id);
       if (selectedId === account.id) setSelectedId(null);
+      setRemoveTarget(null);
       addToast(t('accounts.removed_toast'), 'success');
     } catch (err) {
       addToast(t('accounts.removed_error', { error: String(err) }), 'error');
+    } finally {
+      setRemoving(false);
     }
   };
 
@@ -188,7 +196,7 @@ export function Accounts() {
     if (!selected || capeSaving) return;
     const accountId = selected.id;
     const prev = capes;
-    setCapes(prev.map((c) => ({ ...c, active: capeId !== null && c.id === capeId })));
+    applyCapes(accountId, prev.map((c) => ({ ...c, active: capeId !== null && c.id === capeId })));
     setCapeSaving(true);
     try {
       const list = await setPlayerCape(accountId, capeId);
@@ -196,9 +204,9 @@ export function Accounts() {
       // The backend answers with metadata only (textures are unchanged);
       // keep the PNGs we already have, keyed by cape id.
       const pngById = new Map(prev.map((c) => [c.id, c.png]));
-      setCapes(list.map((c) => ({ ...c, png: c.png || pngById.get(c.id) || '' })));
+      applyCapes(accountId, list.map((c) => ({ ...c, png: c.png || pngById.get(c.id) || '' })));
     } catch (e) {
-      if (selectedIdRef.current === accountId) setCapes(prev);
+      if (selectedIdRef.current === accountId) applyCapes(accountId, prev);
       addToast(t('accounts.cape_update_error', { error: String(e) }), 'error');
     } finally {
       setCapeSaving(false);
@@ -383,7 +391,7 @@ export function Accounts() {
                           size="sm"
                           variant="ghost"
                           aria-label={t('accounts.remove_btn')}
-                          onClick={(e) => { e.stopPropagation(); handleRemoveAccount(acc); }}
+                          onClick={(e) => { e.stopPropagation(); setRemoveTarget(acc); }}
                           style={{ color: 'var(--color-danger)' }}
                         >
                           <Trash2 size={14} />
@@ -473,7 +481,7 @@ export function Accounts() {
         )}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
           <Button variant="ghost" onClick={() => setShowOffline(false)}>{t('common.cancel')}</Button>
-          <Button onClick={handleAddOffline} disabled={!offlineName.trim() || !!offlineNameError}>{t('common.add')}</Button>
+          <Button onClick={handleAddOffline} loading={addingOffline} disabled={!offlineName.trim() || !!offlineNameError || addingOffline}>{t('common.add')}</Button>
         </div>
       </Modal>
 
@@ -485,7 +493,7 @@ export function Accounts() {
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
           <Button variant="ghost" onClick={() => setShowElyby(false)}>{t('common.cancel')}</Button>
-          <Button onClick={handleAddElyby} disabled={!elybyUser.trim() || !elybyPass.trim()}>{t('common.add')}</Button>
+          <Button onClick={handleAddElyby} loading={addingElyby} disabled={!elybyUser.trim() || !elybyPass.trim() || addingElyby}>{t('common.add')}</Button>
         </div>
       </Modal>
 
@@ -518,6 +526,16 @@ export function Accounts() {
 
       {/* Ely.by skin help — no public skin-upload API, point the user at the
           website. The launcher still SHOWS the actual Ely.by skin in 3D. */}
+      <ConfirmDialog
+        open={!!removeTarget}
+        title={t('accounts.remove_title')}
+        description={t('accounts.remove_confirm', { name: removeTarget?.name ?? '' })}
+        confirmLabel={t('accounts.remove_btn')}
+        busy={removing}
+        onCancel={() => { if (!removing) setRemoveTarget(null); }}
+        onConfirm={() => { if (removeTarget) handleRemoveAccount(removeTarget); }}
+      />
+
       <Modal
         open={showElybySkinHelp}
         onClose={() => setShowElybySkinHelp(false)}

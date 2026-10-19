@@ -141,6 +141,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         ? 'downloads'
         : 'newest';
   const [selectedItems, setSelectedItems] = useState<SelectedItem[]>([]);
+  // Latest selection readable from async add handlers. Two "add" requests can
+  // resolve out of order; appending to the render snapshot of either one used
+  // to drop the other item from the cart.
+  const selectedItemsRef = useRef<SelectedItem[]>([]);
+  const commitSelectedItems = useCallback((next: SelectedItem[]) => {
+    selectedItemsRef.current = next;
+    setSelectedItems(next);
+  }, []);
   const [addingId, setAddingId] = useState<string | null>(null);
   const [subView, setSubView] = useState<'search' | 'confirm'>('search');
   const [installing, setInstalling] = useState(false);
@@ -188,6 +196,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   // Cleanup resets it: any unmount that isn't guarded (e.g. sidebar nav)
   // or that happened after a confirmed leave must not keep a stale value.
   useEffect(() => {
+    selectedItemsRef.current = selectedItems;
     setPending(selectedItems.length);
     return () => setPending(0);
   }, [selectedItems, setPending]);
@@ -215,7 +224,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setSelected(null);
     setVersions([]);
     setModDetail(null);
-    setSelectedItems([]);
+    commitSelectedItems([]);
     setConflicts([]);
     setUnresolved([]);
     setResolving(false);
@@ -226,7 +235,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setSubView('search');
     setLoading(false);
     setLoadingMore(false);
-  }, [providerId]);
+  }, [providerId, commitSelectedItems]);
 
   // Sequence guards: a slow response from an outdated request (fast sort /
   // filter switching) must never overwrite fresher results.
@@ -479,7 +488,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         }),
       ]);
       if (reqId !== resolveReqRef.current) return;
-      setSelectedItems(res.install.map((p) => ({
+      commitSelectedItems(res.install.map((p) => ({
         name: p.name,
         iconUrl: p.icon_url ?? undefined,
         downloadUrl: p.file.url,
@@ -521,7 +530,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   };
 
   const addLatest = async (hit: Hit) => {
-    if (selectedItems.some((m) => m.projectId === hit.project_id) || isInstalled(hit.project_id, hit.slug, hit.title)) {
+    if (selectedItemsRef.current.some((m) => m.projectId === hit.project_id) || isInstalled(hit.project_id, hit.slug, hit.title)) {
       return;
     }
     setAddingId(hit.project_id);
@@ -547,8 +556,18 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           sha1: file.hashes?.sha1,
           fileId: file.file_id,
         };
-        const next = [...selectedItems, item];
-        setSelectedItems(next);
+        // Re-read the selection after the await: another add may have landed
+        // while this one was fetching versions, and appending to the old
+        // render snapshot would silently drop it.
+        const latest = selectedItemsRef.current;
+        if (
+          latest.some((m) => m.projectId === hit.project_id)
+          || latest.some((m) => m.filename === item.filename)
+        ) {
+          return;
+        }
+        const next = [...latest, item];
+        commitSelectedItems(next);
         await applyResolution(next);
       }
     } catch (e: any) { addToast(t('content.add_error', { error: e.toString() }), 'error'); }
@@ -556,13 +575,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   };
 
   const removeItem = (idx: number) => {
-    const removed = selectedItems[idx];
-    setSelectedItems((prev) => prev.filter((_, i) => i !== idx));
+    const removed = selectedItemsRef.current[idx];
+    const next = selectedItemsRef.current.filter((_, i) => i !== idx);
+    commitSelectedItems(next);
     if (removed) pruneResolution(removed.projectId);
   };
 
   const removeByProjectId = (projectId: string) => {
-    setSelectedItems((prev) => prev.filter((m) => m.projectId !== projectId));
+    commitSelectedItems(selectedItemsRef.current.filter((m) => m.projectId !== projectId));
     pruneResolution(projectId);
   };
 
@@ -593,7 +613,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setInstalling(false);
     setDownloadProgress(0);
     addToast(t('content.install_result', { success: success.toString(), failed: failed.toString() }), success > 0 ? 'success' : 'error');
-    setSelectedItems([]);
+    commitSelectedItems([]);
     setSubView('search');
     onInstalled();
     onClose();
@@ -903,8 +923,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                                 sha1: file.hashes?.sha1,
                                 fileId: file.file_id,
                               };
-                              const next = [...selectedItems, item];
-                              setSelectedItems(next);
+                              const next = [...selectedItemsRef.current, item];
+                              commitSelectedItems(next);
                               addToast(t('content.added_toast', { name: selected.title }), 'success');
                               // A pinned version goes through the same backend
                               // resolution as "add latest" (item 14).

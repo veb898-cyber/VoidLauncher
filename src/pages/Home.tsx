@@ -23,6 +23,7 @@ export function Home({ onNavigate }: HomeProps) {
   const accounts = useAccountsStore((s) => s.accounts);
   const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const instances = useInstanceStore((s) => s.instances);
+  const instancesLoading = useInstanceStore((s) => s.isLoading);
   const isLaunching = useInstanceStore((s) => s.isLaunching);
   const launchGame = useInstanceStore((s) => s.launchGame);
   const loadInstances = useInstanceStore((s) => s.loadInstances);
@@ -83,8 +84,8 @@ export function Home({ onNavigate }: HomeProps) {
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({
-        title: type === 'icon' ? 'Choose Icon' : 'Choose Banner',
-        filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg'] }],
+        title: type === 'icon' ? t('home.dialog_choose_icon') : t('home.dialog_choose_banner'),
+        filters: [{ name: t('home.dialog_images'), extensions: ['png', 'jpg', 'jpeg'] }],
         multiple: false,
       });
       if (!selected) return;
@@ -100,7 +101,8 @@ export function Home({ onNavigate }: HomeProps) {
       setMenuInstance(null);
       loadInstances();
     } catch (e: any) {
-      addToast(e?.message || `Failed to set ${type}`, 'error');
+      const key = type === 'icon' ? 'home.icon_error' : 'home.banner_error';
+      addToast(t(key, { error: e?.message || String(e) }), 'error');
     }
   };
 
@@ -200,7 +202,17 @@ export function Home({ onNavigate }: HomeProps) {
           </h2>
         )}
 
-        {instances.length === 0 ? (
+        {instances.length === 0 && instancesLoading ? (
+          <div style={{
+            flex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 'var(--space-3xl)',
+          }}>
+            <LoadingSpinner size={28} />
+          </div>
+        ) : instances.length === 0 ? (
           <div style={{
             flex: 1,
             display: 'flex', flexDirection: 'column',

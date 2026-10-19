@@ -168,13 +168,20 @@ export function CustomSelect<T extends string>({
     }
   }, [focusIdx, open]);
 
-  // Reset focus index when opening
+  // Reset the highlight only when the list opens. Depending on `options` here
+  // was wrong: callers build the array inline, so every parent re-render
+  // produced a new identity, ran this effect and yanked the keyboard
+  // highlight back to the selected item in the middle of ArrowUp/ArrowDown.
+  const valueRef = useRef(value);
+  const optionsRef = useRef(options);
+  valueRef.current = value;
+  optionsRef.current = options;
   useEffect(() => {
     if (open) {
-      const idx = options.findIndex((o) => o.value === value);
+      const idx = optionsRef.current.findIndex((o) => o.value === valueRef.current);
       setFocusIdx(idx >= 0 ? idx : 0);
     }
-  }, [open, value, options]);
+  }, [open]);
 
   // Becoming disabled while open would leave an unreachable popup on screen.
   useEffect(() => {

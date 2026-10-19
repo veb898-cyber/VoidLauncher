@@ -9,6 +9,7 @@ import { UpdaterModal } from './components/UpdaterModal';
 import { JavaSetupModal } from './components/launch/JavaSetupModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ConfirmDialog } from './components/ui/ConfirmDialog';
+import { LoadingSpinner } from './components/ui/LoadingSpinner';
 import { useAuthStore } from './stores/authStore';
 import { useSettingsStore } from './stores/settingsStore';
 import { useAccountsStore } from './stores/accountsStore';
@@ -153,7 +154,13 @@ function App() {
         <Sidebar activePage={activePage} onNavigate={navigate} />
         <main className="main-content">
           <ErrorBoundary>
-            <Suspense fallback={<div />}>
+            <Suspense
+              fallback={
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 'var(--space-3xl)' }}>
+                  <LoadingSpinner size={28} />
+                </div>
+              }
+            >
               {renderPage()}
             </Suspense>
           </ErrorBoundary>

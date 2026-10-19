@@ -34,6 +34,8 @@ interface SettingsState {
   config: AppConfig | null;
   javaInstallations: JavaInstallation[];
   isLoading: boolean;
+  /** Reason the last config load failed; cleared on the next successful load. */
+  loadError: string | null;
 
   loadConfig: () => Promise<void>;
   saveConfig: (config: AppConfig) => Promise<void>;
@@ -45,13 +47,16 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   config: null,
   javaInstallations: [],
   isLoading: false,
+  loadError: null,
 
   loadConfig: async () => {
+    set({ isLoading: true });
     try {
       const config = await invoke<AppConfig>('cmd_get_config');
-      set({ config });
+      set({ config, loadError: null, isLoading: false });
     } catch (e) {
       console.error('Failed to load config:', e);
+      set({ loadError: String(e), isLoading: false });
     }
   },
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
@@ -72,19 +72,38 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const [confirmClose, setConfirmClose] = useState(false);
   const [loaderModalOpen, setLoaderModalOpen] = useState(false);
 
+  // Values that arrive asynchronously (system RAM, the global config) are
+  // read through this ref by the one-time initializer below. They must not be
+  // effect dependencies: when detection finished a second later, the effect
+  // used to re-run and wipe everything the user had already typed.
+  const defaultsRef = useRef({ globalDefaultMemoryMb, globalDefaultGcPreset, systemRamMb });
+  defaultsRef.current = { globalDefaultMemoryMb, globalDefaultGcPreset, systemRamMb };
+  const initializedForRef = useRef<string | null>(null);
+
   useEffect(() => {
+    if (!open) return;
+    // Initialize once per opened instance (the modal is reopened later with
+    // the same prop object, and store reloads may produce a new identity).
+    if (initializedForRef.current === instance.name) return;
+    initializedForRef.current = instance.name;
+
+    const {
+      globalDefaultMemoryMb: globalMemory,
+      globalDefaultGcPreset: globalGc,
+      systemRamMb: ram,
+    } = defaultsRef.current;
     // Initial memory resolves in this order:
     //   1. instance.memory_mb (explicit per-instance value)
     //   2. global default_memory_mb from Settings (synced)
     //   3. tiered RAM recommendation (4/6/8 GB) as final fallback
     const resolvedMemory = resolveInitialMemoryMb(
-      instance.memory_mb, systemRamMb, globalDefaultMemoryMb
+      instance.memory_mb, ram, globalMemory
     );
     setName(instance.name);
     setNotes(instance.notes || '');
     setMemoryMb(resolvedMemory);
     setJvmArgs(instance.jvm_args?.join(' ') || '');
-    setGcPreset((instance.gc_preset as GcPreset) ?? globalDefaultGcPreset);
+    setGcPreset((instance.gc_preset as GcPreset) ?? globalGc);
     setJavaPath(instance.java_path || '');
     setResWidth(instance.resolution?.width?.toString() ?? '');
     setResHeight(instance.resolution?.height?.toString() ?? '');
@@ -95,12 +114,17 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
       notes: instance.notes || '',
       memoryMb: resolvedMemory,
       jvmArgs: instance.jvm_args?.join(' ') || '',
-      gcPreset: (instance.gc_preset as GcPreset) ?? globalDefaultGcPreset,
+      gcPreset: (instance.gc_preset as GcPreset) ?? globalGc,
       javaPath: instance.java_path || '',
       resWidth: instance.resolution?.width?.toString() ?? '',
       resHeight: instance.resolution?.height?.toString() ?? '',
     }));
-  }, [instance, systemRamMb, globalDefaultMemoryMb, globalDefaultGcPreset]);
+  }, [open, instance]);
+
+  // A closed editor must re-initialize the next time it is opened.
+  useEffect(() => {
+    if (!open) initializedForRef.current = null;
+  }, [open]);
 
   const dirty =
     baseline !== '' &&
