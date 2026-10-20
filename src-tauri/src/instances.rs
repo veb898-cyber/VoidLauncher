@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Instance configuration
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -481,6 +483,76 @@ pub fn save_instance_banner(instances_dir: &Path, name: &str, banner_data: &str)
     Ok(())
 }
 
+/// World folder sizes are expensive to walk (region files can be thousands per
+/// world), and the worlds tab is reopened often. Cache them briefly; the stamp
+/// still invalidates immediately when the world folder or its key metadata
+/// changes, so a newly saved world does not keep an old size for long.
+const WORLD_SIZE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy)]
+struct CachedWorldSize {
+    stamp: u64,
+    size: u64,
+    cached_at: Instant,
+}
+
+static WORLD_SIZE_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedWorldSize>>> = OnceLock::new();
+
+fn hash_path_metadata(hasher: &mut std::collections::hash_map::DefaultHasher, path: &Path) {
+    use std::hash::Hash;
+    path.hash(hasher);
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            meta.len().hash(hasher);
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            modified.hash(hasher);
+        }
+        Err(_) => 0u8.hash(hasher),
+    }
+}
+
+fn world_size_stamp(world: &Path, last_modified: Option<i64>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    world.hash(&mut hasher);
+    last_modified.hash(&mut hasher);
+    hash_path_metadata(&mut hasher, world);
+    for name in ["level.dat", "level.dat_old", "session.lock", "region"] {
+        hash_path_metadata(&mut hasher, &world.join(name));
+    }
+    hasher.finish()
+}
+
+fn cached_world_size(world: &Path, last_modified: Option<i64>) -> u64 {
+    let stamp = world_size_stamp(world, last_modified);
+    let cache = WORLD_SIZE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(entry) = guard.get(world) {
+            if entry.stamp == stamp && entry.cached_at.elapsed() < WORLD_SIZE_CACHE_TTL {
+                return entry.size;
+            }
+        }
+    }
+    let size = dir_size(world);
+    if let Ok(mut guard) = cache.lock() {
+        guard.retain(|_, entry| entry.cached_at.elapsed() < WORLD_SIZE_CACHE_TTL);
+        guard.insert(
+            world.to_path_buf(),
+            CachedWorldSize {
+                stamp,
+                size,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+    size
+}
+
 /// List saves (worlds)
 pub fn list_saves(instances_dir: &Path, name: &str) -> Result<Vec<SaveEntry>> {
     let instance = get_instance(instances_dir, name)?;
@@ -514,7 +586,7 @@ pub fn list_saves(instances_dir: &Path, name: &str) -> Result<Vec<SaveEntry>> {
             saves.push(SaveEntry {
                 name: world_name,
                 last_modified,
-                size_bytes: dir_size(&path),
+                size_bytes: cached_world_size(&path, last_modified),
                 game_mode,
                 seed: level.seed,
                 icon_data,
@@ -653,6 +725,8 @@ pub fn list_packs(instances_dir: &Path, name: &str, pack_type: &str) -> Result<V
     }
     // Roll back any file parked by an interrupted update before listing.
     recover_stashed_content_files(&packs_dir);
+    // Load Prism metadata once for the whole listing (was re-read per file).
+    let packwiz = load_packwiz_index_cached(&packs_dir);
     for entry in std::fs::read_dir(&packs_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -683,7 +757,7 @@ pub fn list_packs(instances_dir: &Path, name: &str, pack_type: &str) -> Result<V
 
         // Read sidecar metadata (project_name is the Modrinth/CurseForge display name)
         let (provider, mut version, project_id, project_name) =
-            read_pack_sidecar(&path).unwrap_or_default();
+            read_pack_sidecar(&path, &packwiz).unwrap_or_default();
         // Local packs have no real version — fall back to a version found in
         // the filename, then to the MC version range implied by pack.mcmeta
         // (pack_format), so the Version column is never empty for them.
@@ -945,6 +1019,70 @@ pub(crate) struct PackwizMeta {
     pub project_id: String,
 }
 
+const PACKWIZ_INDEX_CACHE_TTL: Duration = Duration::from_secs(300);
+
+struct CachedPackwizIndex {
+    stamp: u64,
+    index: HashMap<String, PackwizMeta>,
+    cached_at: Instant,
+}
+
+static PACKWIZ_INDEX_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedPackwizIndex>>> = OnceLock::new();
+
+/// Fingerprint of all `.pw.toml` files without parsing them. Directory entry
+/// order is not stable, so the per-file hashes are XOR-ed together.
+fn packwiz_index_stamp(content_dir: &Path) -> u64 {
+    use std::hash::Hasher;
+    let mut stamp = 0u64;
+    for dir in [content_dir.join(".index"), content_dir.to_path_buf()] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_pw_toml = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".pw.toml"));
+            if !is_pw_toml {
+                continue;
+            }
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hash_path_metadata(&mut hasher, &path);
+            stamp ^= hasher.finish();
+        }
+    }
+    stamp
+}
+
+/// Cached variant used by the content listings. `list_packs` alone calls
+/// `read_pack_sidecar` once per file; without this cache every file re-read and
+/// re-parsed the whole `.index/` directory (O(N²) on large Prism packs).
+fn load_packwiz_index_cached(content_dir: &Path) -> HashMap<String, PackwizMeta> {
+    let stamp = packwiz_index_stamp(content_dir);
+    let cache = PACKWIZ_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(entry) = guard.get(content_dir) {
+            if entry.stamp == stamp && entry.cached_at.elapsed() < PACKWIZ_INDEX_CACHE_TTL {
+                return entry.index.clone();
+            }
+        }
+    }
+    let index = load_packwiz_index(content_dir);
+    if let Ok(mut guard) = cache.lock() {
+        guard.retain(|_, entry| entry.cached_at.elapsed() < PACKWIZ_INDEX_CACHE_TTL);
+        guard.insert(
+            content_dir.to_path_buf(),
+            CachedPackwizIndex {
+                stamp,
+                index: index.clone(),
+                cached_at: Instant::now(),
+            },
+        );
+    }
+    index
+}
+
 /// Load all packwiz `.pw.toml` metadata from a content dir — scanning both
 /// the `.index/` folder (usual Prism layout) and the content dir root
 /// (Prism exports shader packs' metadata as `<slug>.pw.toml` in the root),
@@ -1021,7 +1159,10 @@ pub(crate) fn read_packwiz_meta(content_dir: &Path, filename: &str) -> Option<Pa
     load_packwiz_index(content_dir).remove(filename)
 }
 
-fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, String, String)> {
+fn read_pack_sidecar(
+    pack_path: &std::path::Path,
+    packwiz: &HashMap<String, PackwizMeta>,
+) -> Option<(String, String, String, String)> {
     let filename = pack_path.file_name()?.to_string_lossy().to_string();
     if let Some(val) = read_sidecar_meta(pack_path.parent()?, &filename) {
         let provider = normalize_provider(val["provider"].as_str().unwrap_or(""));
@@ -1031,8 +1172,13 @@ fn read_pack_sidecar(pack_path: &std::path::Path) -> Option<(String, String, Str
         return Some((provider, version, project_id, project_name));
     }
     // Fallback: Prism packwiz metadata (.pw.toml in .index/)
-    let pw = read_packwiz_meta(pack_path.parent()?, &filename)?;
-    Some((pw.provider, pw.version, pw.project_id, pw.name))
+    let pw = packwiz.get(&filename)?;
+    Some((
+        pw.provider.clone(),
+        pw.version.clone(),
+        pw.project_id.clone(),
+        pw.name.clone(),
+    ))
 }
 
 /// Normalize a raw provider string from sidecar/packwiz metadata to the
@@ -3301,6 +3447,52 @@ version = 'hIibTfxn'
         std::fs::write(index_dir.join("sodium-0.6.0.voidlauncher.json"), "{}").unwrap();
         let index2 = load_packwiz_index(&dir);
         assert_eq!(index2.len(), 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn packwiz_index_cache_invalidates_when_metadata_changes() {
+        let dir = temp_dir("pw_cache");
+        let index_dir = dir.join(".index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let meta_path = index_dir.join("demo.pw.toml");
+        std::fs::write(
+            &meta_path,
+            "filename = 'demo.jar'\nname = 'Old Name'\n[update.modrinth]\nmod-id = 'abc'\n",
+        )
+        .unwrap();
+
+        let first = load_packwiz_index_cached(&dir);
+        assert_eq!(first.get("demo.jar").unwrap().name, "Old Name");
+
+        std::fs::write(
+            &meta_path,
+            "filename = 'demo.jar'\nname = 'New Name With More Detail'\n[update.modrinth]\nmod-id = 'abc'\n",
+        )
+        .unwrap();
+        let second = load_packwiz_index_cached(&dir);
+        assert_eq!(
+            second.get("demo.jar").unwrap().name,
+            "New Name With More Detail"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn world_size_cache_invalidates_when_world_metadata_changes() {
+        let dir = temp_dir("world_size_cache");
+        let world = dir.join("World");
+        std::fs::create_dir_all(world.join("region")).unwrap();
+        std::fs::write(world.join("level.dat"), b"1234").unwrap();
+        std::fs::write(world.join("region").join("r.0.0.mca"), b"abcd").unwrap();
+
+        assert_eq!(cached_world_size(&world, None), 8);
+        assert_eq!(cached_world_size(&world, None), 8);
+
+        std::fs::write(world.join("level.dat"), b"12345678").unwrap();
+        assert_eq!(cached_world_size(&world, None), 12);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

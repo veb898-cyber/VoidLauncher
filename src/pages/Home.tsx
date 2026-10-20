@@ -188,6 +188,7 @@ export function Home({ onNavigate }: HomeProps) {
           <button
             className="btn btn--ghost"
             onClick={() => onNavigate('settings')}
+            aria-label={t('settings.title')}
           >
             <Settings size={18} />
           </button>
@@ -287,7 +288,13 @@ export function Home({ onNavigate }: HomeProps) {
                   )}
                 </div>
                 <div className="instance-card__body instance-card__body--horizontal">
-                  <div className="instance-card__icon icon-editable" style={{ position: 'relative', cursor: 'pointer' }}
+                  <div
+                    className="instance-card__icon icon-editable"
+                    style={{ position: 'relative', cursor: 'pointer' }}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={t('home.change_icon')}
+                    aria-haspopup="menu"
                     onClick={(e) => {
                       e.stopPropagation();
                       if (menuInstance !== inst.name) {
@@ -302,7 +309,14 @@ export function Home({ onNavigate }: HomeProps) {
                       }
                       setMenuInstance(menuInstance === inst.name ? null : inst.name);
                       setBannerPickerFor(null);
-                    }}>
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        (e.currentTarget as HTMLElement).click();
+                      }
+                    }}
+                  >
                     {inst.icon ? (
                       <img src={inst.icon} alt={inst.name} />
                     ) : (
@@ -408,7 +422,17 @@ export function Home({ onNavigate }: HomeProps) {
                         {BANNER_PRESETS.map((p) => (
                           <Tooltip key={p.id} content={bannerLabel(p.id)}>
                             <div
+                              role="button"
+                              tabIndex={0}
+                              aria-label={bannerLabel(p.id)}
+                              aria-pressed={inst.banner === `gradient:${p.id}`}
                               onClick={() => setBanner(inst.name, `gradient:${p.id}`)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  setBanner(inst.name, `gradient:${p.id}`);
+                                }
+                              }}
                               style={{
                                 width: '100%',
                                 aspectRatio: '16/9',
@@ -436,6 +460,7 @@ export function Home({ onNavigate }: HomeProps) {
                             <button
                               className="btn btn--ghost btn--sm"
                               style={{ justifyContent: 'center', color: 'var(--color-danger)' }}
+                              aria-label={t('home.remove_banner')}
                               onClick={() => setBanner(inst.name, '')}
                             >
                               <X size={14} />

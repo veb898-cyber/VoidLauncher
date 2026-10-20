@@ -160,7 +160,16 @@ export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
 
 <Tooltip content={t('login.click_to_copy')}>
                 <div
+                  role="button"
+                  tabIndex={0}
+                  aria-label={t('login.click_to_copy')}
                   onClick={handleCopyCode}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      handleCopyCode();
+                    }
+                  }}
                   style={{
                     fontSize: 36,
                     fontWeight: 800,

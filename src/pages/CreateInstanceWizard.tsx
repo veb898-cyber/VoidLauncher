@@ -316,7 +316,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
       const selected = await openFileDialog({
         multiple: false,
         filters: [
-          { name: 'Modpack Archives', extensions: ['zip', 'mrpack'] },
+          { name: t('create_instance.filter_modpack_archives'), extensions: ['zip', 'mrpack'] },
         ],
       });
       if (!selected) return;

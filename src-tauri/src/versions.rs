@@ -647,15 +647,24 @@ pub async fn ensure_native_libraries(
     }
 
     tracing::info!(target: "launcher", "Downloading {} missing native libraries...", missing.len());
-    for (url, path, sha1) in &missing {
+    use futures::StreamExt;
+
+    // LWJGL ships several independent classifier JARs. Downloading them
+    // sequentially added their round-trips to every cold launch; four at a
+    // time keeps the UI responsive without hammering the mirrors.
+    let downloads = missing.into_iter().map(|(url, path, sha1)| async move {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            let _ = tokio::fs::create_dir_all(parent).await;
         }
-        crate::download::download_file(url, path, sha1)
+        crate::download::download_file(&url, &path, &sha1)
             .await
             .map_err(|e| {
                 LauncherError::Version(format!("Failed to download native library {}: {}", url, e))
-            })?;
+            })
+    });
+    let mut downloads = futures::stream::iter(downloads).buffer_unordered(4);
+    while let Some(result) = downloads.next().await {
+        result?;
     }
 
     Ok(())

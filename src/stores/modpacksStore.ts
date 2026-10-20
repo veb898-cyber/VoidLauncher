@@ -144,6 +144,56 @@ switchTab: (tb: ModpacksTab) => void;
   resetInstall: () => void;
 }
 
+/**
+ * Progress events arrive from many parallel file workers (up to ~100/s).
+ * Re-render the progress panel at most five times a second; the final event
+ * still lands because the trailing timer flushes the last payload.
+ */
+const PROGRESS_THROTTLE_MS = 200;
+type ProgressPatch = Partial<Pick<ModpacksState, 'progress' | 'fileProgress'>>;
+let pendingProgress: ProgressPatch | null = null;
+let progressTimer: ReturnType<typeof setTimeout> | null = null;
+let lastProgressFlush = 0;
+
+function cancelProgressThrottle() {
+  if (progressTimer !== null) {
+    clearTimeout(progressTimer);
+    progressTimer = null;
+  }
+  pendingProgress = null;
+  lastProgressFlush = 0;
+}
+
+function flushProgress(set: (patch: ProgressPatch) => void) {
+  if (progressTimer !== null) {
+    clearTimeout(progressTimer);
+    progressTimer = null;
+  }
+  if (!pendingProgress) return;
+  const patch = pendingProgress;
+  pendingProgress = null;
+  lastProgressFlush = Date.now();
+  set(patch);
+}
+
+function queueProgress(
+  set: (patch: ProgressPatch) => void,
+  patch: ProgressPatch,
+) {
+  pendingProgress = { ...pendingProgress, ...patch };
+  const now = Date.now();
+  if (lastProgressFlush === 0 || now - lastProgressFlush >= PROGRESS_THROTTLE_MS) {
+    flushProgress(set);
+    return;
+  }
+  if (progressTimer === null) {
+    progressTimer = setTimeout(
+      () => flushProgress(set),
+      PROGRESS_THROTTLE_MS - (now - lastProgressFlush),
+    );
+  }
+}
+
 function suggestInstanceName(base: string, existingNames: Set<string>): string {
   let name = base.replace(/[\\/:*?"<>|]/g, '').trim().slice(0, 64) || 'Modpack';
   if (!existingNames.has(name.toLowerCase())) return name;
@@ -383,6 +433,7 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
       set({ nameError: true });
       return;
     }
+    cancelProgressThrottle();
     set({
       nameError: false, installing: true, paused: false, progress: null, fileProgress: null,
       pendingInstall: kind, installReport: null,
@@ -408,12 +459,14 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
       }
       addToast(t('modpacks.install_error', { error: e.toString() }), 'error');
     }
+    cancelProgressThrottle();
     set({ installing: false, progress: null, fileProgress: null, pendingInstall: null, paused: false });
   },
 
   pauseInstall: async () => {
     // Optimistic UI: flip to "paused" immediately so the user sees feedback
     // even while the backend is still finishing the current chunk/retry wait.
+    cancelProgressThrottle();
     set({ paused: true });
     try { await invoke('cmd_pause_modpack_install'); } catch { }
   },
@@ -516,12 +569,15 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
   dismissInstallReport: () => set({ installReport: null }),
 
   onFetchRetry: (payload) => set({ fetchRetry: payload }),
-  onFileProgress: (payload) => set({ fileProgress: payload }),
+  onFileProgress: (payload) => queueProgress(set, { fileProgress: payload }),
   onImportProgress: (payload) => {
     // Just track progress: the install command now runs past the pack
     // unpacking (loader profile + game files + assets), and `runInstall`
     // finalizes `installing` when the whole command resolves.
-    set({ progress: payload, fileProgress: null });
+    queueProgress(set, { progress: payload, fileProgress: null });
   },
-resetInstall: () => set({ installing: false, progress: null, fileProgress: null, pendingInstall: null, paused: false }),
+  resetInstall: () => {
+    cancelProgressThrottle();
+    set({ installing: false, progress: null, fileProgress: null, pendingInstall: null, paused: false });
+  },
 }));

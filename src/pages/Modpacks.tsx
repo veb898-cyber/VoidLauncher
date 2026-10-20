@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { listen } from '@tauri-apps/api/event';
 import { Search, Loader2, X, Check, Download, CirclePause, CirclePlay } from 'lucide-react';
 import { Button } from '../components/ui/Button';
@@ -28,9 +29,128 @@ function RemoteIcon({ url, style, className }: { url: string; style?: React.CSSP
   );
 }
 
+/**
+ * Progress lives in its own subscriber: the catalog and version list must not
+ * re-render on every download chunk. The store throttles writes as well.
+ */
+function InstallProgressPanel({ installing, paused }: { installing: boolean; paused: boolean }) {
+  const t = useT();
+  const progress = useModpacksStore((s) => s.progress);
+  const fileProgress = useModpacksStore((s) => s.fileProgress);
+
+  if (!progress && !installing && !paused) return null;
+
+  const progressLabel = (stage: string, msg: string): string => {
+    if (stage === 'done') return t('modpacks.progress_done');
+    if (stage === 'indexing') return t('modpacks.progress_indexing');
+    if (stage === 'extracting') return t('modpacks.progress_extracting');
+    if (stage === 'reading') return t('modpacks.progress_reading');
+    if (stage === 'manifest') return t('modpacks.progress_manifest');
+    if (stage === 'files' || stage === 'assets') {
+      return t(stage === 'files' ? 'modpacks.progress_game_files' : 'modpacks.progress_assets', {
+        current: String(progress?.current ?? 0),
+        total: String(progress?.total ?? 0),
+      });
+    }
+    if (stage === 'loader') {
+      if (msg.startsWith('Installing ')) return t('modpacks.progress_installing', { text: msg.slice(11) });
+      return msg;
+    }
+    if (stage === 'downloading-mods') {
+      const nameMatch = msg.match(/^(Downloaded|Skipped|Failed):?\s+(.+?)(\s*\(|$)/);
+      const name = nameMatch ? nameMatch[2] : '';
+      const base = t('modpacks.progress_downloading_mods', {
+        current: String(progress?.current ?? 0),
+        total: String(progress?.total ?? 0),
+      });
+      return name ? `${base}: ${name}` : base;
+    }
+    return msg;
+  };
+
+  const fileHint = fileProgress && fileProgress.total > 0 ? (
+    <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 4 }}>
+      {t('modpacks.file_progress', {
+        bytes: formatBytes(fileProgress.downloaded),
+        total: formatBytes(fileProgress.total),
+        percent: String(Math.round((fileProgress.downloaded / fileProgress.total) * 100)),
+      })}
+    </div>
+  ) : null;
+
+  return (
+    <div style={{ marginTop: 'var(--space-md)' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', marginBottom: 4 }}>
+        <span>{paused ? t('modpacks.paused') : (progress ? progressLabel(progress.stage, progress.message) : t('modpacks.installing'))}</span>
+        <span>{progress && progress.total > 0 ? `${Math.round((progress.current / progress.total) * 100)}%` : ''}</span>
+      </div>
+      <div className="progress-track">
+        <div className="progress-fill" style={{
+          height: '100%',
+          width: progress && progress.total > 0 ? `${Math.min(100, (progress.current / progress.total) * 100)}%` : '100%',
+          background: paused ? 'var(--text-tertiary)' : 'var(--primary)',
+          transition: 'width 0.2s ease',
+          animation: !paused && (!progress || progress.total === 0) ? 'indeterminate 1.2s ease-in-out infinite' : undefined,
+        }} />
+      </div>
+      {!paused && fileHint}
+    </div>
+  );
+}
+
 export function Modpacks() {
   const t = useT();
-  const store = useModpacksStore();
+  const store = useModpacksStore(useShallow((s) => ({
+    tab: s.tab,
+    query: s.query,
+    mcFilter: s.mcFilter,
+    loadingByTab: s.loadingByTab,
+    loadingMore: s.loadingMore,
+    mrResults: s.mrResults,
+    cfResults: s.cfResults,
+    atlPacks: s.atlPacks,
+    atlFiltered: s.atlFiltered,
+    selected: s.selected,
+    versions: s.versions,
+    loadingDetail: s.loadingDetail,
+    atlDetail: s.atlDetail,
+    installName: s.installName,
+    nameError: s.nameError,
+    installing: s.installing,
+    paused: s.paused,
+    installVersionId: s.installVersionId,
+    installCfFileId: s.installCfFileId,
+    installAtlVersion: s.installAtlVersion,
+    fetchRetry: s.fetchRetry,
+    installReport: s.installReport,
+    retryingInstallFiles: s.retryingInstallFiles,
+    switchTab: s.switchTab,
+    loadInitial: s.loadInitial,
+    setQuery: s.setQuery,
+    setMcFilter: s.setMcFilter,
+    setInstallName: s.setInstallName,
+    setNameError: s.setNameError,
+    search: s.search,
+    loadMore: s.loadMore,
+    selectMr: s.selectMr,
+    selectCf: s.selectCf,
+    selectAtl: s.selectAtl,
+    selectAtlPack: s.selectAtlPack,
+    setInstallVersionId: s.setInstallVersionId,
+    setInstallCfFileId: s.setInstallCfFileId,
+    setInstallAtlVersion: s.setInstallAtlVersion,
+    clearSelected: s.clearSelected,
+    pauseInstall: s.pauseInstall,
+    resumeInstall: s.resumeInstall,
+    installFromMr: s.installFromMr,
+    installFromCf: s.installFromCf,
+    installFromAtl: s.installFromAtl,
+    retryFailedInstallFiles: s.retryFailedInstallFiles,
+    dismissInstallReport: s.dismissInstallReport,
+    onFetchRetry: s.onFetchRetry,
+    onFileProgress: s.onFileProgress,
+    onImportProgress: s.onImportProgress,
+  })));
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const curseforgeApiKey = useSettingsStore((s) => s.config?.curseforge_api_key);
 
@@ -38,9 +158,9 @@ export function Modpacks() {
     tab, query, mcFilter, loadingByTab, loadingMore,
     mrResults, cfResults, atlPacks, atlFiltered,
     selected, versions, loadingDetail, atlDetail,
-    installName, nameError, installing, paused, progress,
+    installName, nameError, installing, paused,
     installVersionId, installCfFileId, installAtlVersion,
-    fetchRetry, fileProgress, installReport, retryingInstallFiles,
+    fetchRetry, installReport, retryingInstallFiles,
   } = store;
 
   const loading = loadingByTab[tab];
@@ -188,45 +308,6 @@ export function Modpacks() {
       </div>
     ) : null;
 
-  const fileHint = fileProgress && fileProgress.total > 0 ? (
-    <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 4 }}>
-      {t('modpacks.file_progress', {
-        bytes: formatBytes(fileProgress.downloaded),
-        total: formatBytes(fileProgress.total),
-        percent: String(Math.round((fileProgress.downloaded / fileProgress.total) * 100)),
-      })}
-    </div>
-  ) : null;
-
-  // Translate backend install status messages (they are always in English).
-  const progressLabel = (stage: string, msg: string): string => {
-    if (stage === 'done') return t('modpacks.progress_done');
-    if (stage === 'indexing') return t('modpacks.progress_indexing');
-    if (stage === 'extracting') return t('modpacks.progress_extracting');
-    if (stage === 'reading') return t('modpacks.progress_reading');
-    if (stage === 'manifest') return t('modpacks.progress_manifest');
-    if (stage === 'files' || stage === 'assets') {
-      return t(stage === 'files' ? 'modpacks.progress_game_files' : 'modpacks.progress_assets', {
-        current: String(progress?.current ?? 0),
-        total: String(progress?.total ?? 0),
-      });
-    }
-    if (stage === 'loader') {
-      if (msg.startsWith('Installing ')) return t('modpacks.progress_installing', { text: msg.slice(11) });
-      return msg;
-    }
-    if (stage === 'downloading-mods') {
-      const nameMatch = msg.match(/^(Downloaded|Skipped|Failed):?\s+(.+?)(\s*\(|$)/);
-      const name = nameMatch ? nameMatch[2] : '';
-      const base = t('modpacks.progress_downloading_mods', {
-        current: String(progress?.current ?? 0),
-        total: String(progress?.total ?? 0),
-      });
-      return name ? `${base} — ${name}` : base;
-    }
-    return msg;
-  };
-
     return (
       <div className="modpack-detail">
         <div style={{ display: 'flex', gap: 'var(--space-md)', marginBottom: 'var(--space-md)' }}>
@@ -235,7 +316,22 @@ export function Modpacks() {
             <h3 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700 }}>{detailSelectedName()}</h3>
             <p style={{ margin: 0, fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>{detailSelectedDesc()}</p>
           </div>
-          <X size={16} style={{ cursor: 'pointer', color: 'var(--text-tertiary)', flexShrink: 0 }} onClick={() => store.clearSelected()} />
+          <button
+            type="button"
+            aria-label={t('common.close')}
+            onClick={() => store.clearSelected()}
+            style={{
+              display: 'inline-flex',
+              background: 'none',
+              border: 'none',
+              padding: 0,
+              cursor: 'pointer',
+              color: 'var(--text-tertiary)',
+              flexShrink: 0,
+            }}
+          >
+            <X size={16} />
+          </button>
         </div>
 
         {loadingDetail && (
@@ -353,24 +449,7 @@ export function Modpacks() {
           {installBtn()}
         </div>
 
-        {(progress || installing || paused) && (
-          <div style={{ marginTop: 'var(--space-md)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', marginBottom: 4 }}>
-              <span>{paused ? t('modpacks.paused') : (progress ? progressLabel(progress.stage, progress.message) : t('modpacks.installing'))}</span>
-              <span>{progress && progress.total > 0 ? `${Math.round((progress.current / progress.total) * 100)}%` : ''}</span>
-            </div>
-            <div className="progress-track">
-              <div className="progress-fill" style={{
-                height: '100%',
-                width: progress && progress.total > 0 ? `${Math.min(100, (progress.current / progress.total) * 100)}%` : '100%',
-                background: paused ? 'var(--text-tertiary)' : 'var(--primary)',
-                transition: 'width 0.2s ease',
-                animation: !paused && (!progress || progress.total === 0) ? 'indeterminate 1.2s ease-in-out infinite' : undefined,
-              }} />
-            </div>
-            {!paused && fileHint}
-          </div>
-        )}
+        <InstallProgressPanel installing={installing} paused={paused} />
 
         {retryHint}
 
@@ -422,7 +501,23 @@ export function Modpacks() {
           onKeyDown={(e) => { if (e.key === 'Enter') store.search(); }}
           style={{ paddingLeft: 4 }}
         />
-        {query && <X size={14} style={{ cursor: 'pointer', color: 'var(--text-tertiary)' }} onClick={() => { store.setQuery(''); store.loadInitial(tab); }} />}
+        {query && (
+          <button
+            type="button"
+            aria-label={t('common.clear')}
+            onClick={() => { store.setQuery(''); store.loadInitial(tab); }}
+            style={{
+              display: 'inline-flex',
+              background: 'none',
+              border: 'none',
+              padding: 0,
+              cursor: 'pointer',
+              color: 'var(--text-tertiary)',
+            }}
+          >
+            <X size={14} />
+          </button>
+        )}
       </div>
 
       {tab === 'curseforge' && !curseforgeApiKey && (

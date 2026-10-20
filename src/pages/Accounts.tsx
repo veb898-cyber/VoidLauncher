@@ -216,7 +216,7 @@ export function Accounts() {
   const handleSkinChange = async (account: AccountEntry) => {
     const selectedFile = await openFileDialog({
       title: t('accounts.skin_file_title'),
-      filters: [{ name: 'PNG Image', extensions: ['png'] }],
+      filters: [{ name: t('accounts.filter_png'), extensions: ['png'] }],
       multiple: false,
     });
     if (!selectedFile) return;
@@ -241,7 +241,7 @@ export function Accounts() {
   const getTypeLabel = (type: string) => {
     switch (type) {
       case 'Microsoft': return 'Microsoft';
-      case 'Offline': return 'Offline';
+      case 'Offline': return t('settings.account_type_offline');
       case 'ElyBy': return 'Ely.by';
       default: return type;
     }
@@ -503,7 +503,7 @@ export function Accounts() {
           onSuccess closes the modal and reloads so any number of Microsoft
           accounts can be added one after another. */}
       <Modal open={showMicrosoftLogin} onClose={() => setShowMicrosoftLogin(false)} maxWidth={460} bare>
-        <MicrosoftLoginCard onSuccess={() => { setShowMicrosoftLogin(false); loadAccounts(); }} />
+        <MicrosoftLoginCard onSuccess={() => { setShowMicrosoftLogin(false); loadAccounts(true); }} />
       </Modal>
 
       {/* Skin Variant Modal */}

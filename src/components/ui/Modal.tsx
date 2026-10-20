@@ -68,9 +68,62 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare, 
 
   useEffect(() => {
     if (!open) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+    const focusableSelector = [
+      'a[href]',
+      'button:not([disabled])',
+      'textarea:not([disabled])',
+      'input:not([disabled])',
+      'select:not([disabled])',
+      '[tabindex]:not([tabindex="-1"])',
+    ].join(',');
+
+    const isTopmostDialog = () => {
+      const dialogs = Array.from(
+        document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]')
+      );
+      return dialogs[dialogs.length - 1] === dialogRef.current;
     };
+
+    const handler = (e: KeyboardEvent) => {
+      // Stacked dialogs each listen on window; let only the top one react.
+      if (!isTopmostDialog()) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+
+      const root = dialogRef.current;
+      if (!root) return;
+      const focusable = Array.from(root.querySelectorAll<HTMLElement>(focusableSelector)).filter(
+        (el) =>
+          !el.hasAttribute('disabled') &&
+          el.getAttribute('aria-hidden') !== 'true' &&
+          el.getClientRects().length > 0
+      );
+      if (focusable.length === 0) {
+        e.preventDefault();
+        root.focus({ preventScroll: true });
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      const inside = active instanceof Node && root.contains(active);
+
+      if (e.shiftKey) {
+        if (!inside || active === first || active === root) {
+          e.preventDefault();
+          last.focus({ preventScroll: true });
+        }
+      } else if (!inside || active === root || active === last) {
+        e.preventDefault();
+        first.focus({ preventScroll: true });
+      }
+    };
+
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [open, onClose]);

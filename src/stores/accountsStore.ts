@@ -44,6 +44,16 @@ const CAPES_TTL_MS = 45_000;
 /** Requests already in flight, so two mounts never fetch the same list twice. */
 const capesInflight = new Set<string>();
 
+/**
+ * The Sidebar, Home, Accounts and Settings all ask for the account list during
+ * startup. Coalesce those calls and answer repeat mounts from a very short
+ * cache; account mutations update the store directly, so this only removes
+ * duplicate IPC requests, not freshness.
+ */
+const ACCOUNTS_TTL_MS = 2_000;
+let accountsInflight: Promise<void> | null = null;
+let accountsLoadedAt = 0;
+
 interface AccountsState {
   accounts: AccountEntry[];
   isLoading: boolean;
@@ -52,7 +62,7 @@ interface AccountsState {
   capesByAccount: Record<string, CapesCacheEntry>;
   capesLoadingByAccount: Record<string, boolean>;
   capesErrorByAccount: Record<string, string | null>;
-  loadAccounts: () => Promise<void>;
+  loadAccounts: (force?: boolean) => Promise<void>;
   addOfflineAccount: (username: string) => Promise<void>;
   addElybyAccount: (username: string, password: string) => Promise<void>;
   removeAccount: (id: string) => Promise<void>;
@@ -74,13 +84,27 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   capesLoadingByAccount: {},
   capesErrorByAccount: {},
 
-  loadAccounts: async () => {
-    try {
-      const accounts = await invoke<AccountEntry[]>('cmd_list_accounts');
-      set({ accounts, error: null });
-    } catch (e: any) {
-      set({ error: e.toString() });
+  loadAccounts: async (force = false) => {
+    if (
+      !force &&
+      accountsLoadedAt > 0 &&
+      Date.now() - accountsLoadedAt < ACCOUNTS_TTL_MS
+    ) {
+      return;
     }
+    if (accountsInflight) return accountsInflight;
+    accountsInflight = (async () => {
+      try {
+        const accounts = await invoke<AccountEntry[]>('cmd_list_accounts');
+        accountsLoadedAt = Date.now();
+        set({ accounts, error: null });
+      } catch (e: any) {
+        set({ error: e.toString() });
+      } finally {
+        accountsInflight = null;
+      }
+    })();
+    return accountsInflight;
   },
 
   addOfflineAccount: async (username: string) => {
@@ -137,7 +161,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   changeSkin: async (accountId: string, skinPath: string, variant = 'classic') => {
     try {
       await invoke('cmd_change_skin', { accountId, skinPath, variant });
-      get().loadAccounts();
+      get().loadAccounts(true);
     } catch (e: any) {
       set({ error: e.toString() });
       throw e;

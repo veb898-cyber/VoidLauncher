@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { X, CheckCircle, AlertCircle, AlertTriangle, Info } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { logUiMessage, toastTypeToLogLevel } from '../../lib/uiLog';
+import { useT } from '../../lib/i18n';
 
 type ToastType = 'success' | 'error' | 'warning' | 'info';
 
@@ -28,6 +29,7 @@ const icons: Record<ToastType, React.ReactNode> = {
 const TOAST_DURATION_MS = 4000;
 
 function ToastItem({ toast, onDismiss }: ToastItemProps) {
+  const t = useT();
   const [exiting, setExiting] = useState(false);
 
   // `toast.count` in the deps restarts the lifetime whenever an identical
@@ -65,6 +67,7 @@ function ToastItem({ toast, onDismiss }: ToastItemProps) {
       </span>
       <button
         className="btn btn--ghost btn--sm"
+        aria-label={t('common.close')}
         onClick={() => onDismiss(toast.id)}
         style={{ padding: 2, height: 'auto' }}
       >
