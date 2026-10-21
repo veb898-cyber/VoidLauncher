@@ -378,6 +378,8 @@ export const ru: Record<string, string> = {
 'settings.theme_dark':              'OLED Dark',
   'settings.theme_blueprint':         'Blueprint',
   'settings.theme_ember':             'Ember',
+  'settings.theme_phosphor':          'Phosphor',
+  'settings.theme_carbon':            'Carbon',
   'settings.theme_locked':            'Недоступно, пока включён Liquid Glass. Ваша тема сохранена и вернётся после выключения Liquid Glass.',
 
   'settings.exp_section_title':       'Экспериментальное оформление',

@@ -12,9 +12,11 @@
       (function(){
         try {
           var t = localStorage.getItem('voidlauncher-theme');
-          // 'light' (OLED Light) support was removed; an older stored value
-          // simply falls back to the default Neon theme (no data-theme attr).
-          var known = (t === 'dark' || t === 'blueprint' || t === 'ember');
+          // An older/unknown stored value falls back to the default Neon
+          // theme (no data-theme attr). Must stay in sync with Theme in
+          // src/stores/themeStore.ts.
+          var known = (t === 'dark' || t === 'blueprint' || t === 'ember'
+            || t === 'phosphor' || t === 'carbon');
           // Liquid Glass is a separate experimental mode, not a theme, so it
           // gets its own sentinel value and replaces the theme instead of
           // recolouring it. Must stay in sync with `applyAppearance` in
@@ -59,7 +61,17 @@
       body { background: hsl(230, 25%, 7%); margin: 0; }
       [data-theme="dark"] body, [data-theme="dark"] #splash { background: #000000; }
       [data-theme="ember"] body, [data-theme="ember"] #splash { background: #121110; }
+      [data-theme="phosphor"] body, [data-theme="phosphor"] #splash { background: #080D09; }
+      [data-theme="carbon"] body, [data-theme="carbon"] #splash { background: #131618; }
       [data-theme="lg"] body, [data-theme="lg"] #splash { background: hsl(228, 26%, 7%); }
+      [data-theme="phosphor"] #splash h1 { background: linear-gradient(135deg, #C8F0CE, #6DB37A); }
+      [data-theme="phosphor"] #splash-grad stop:first-child { stop-color: #C8F0CE; }
+      [data-theme="phosphor"] #splash-grad stop:last-child { stop-color: #6DB37A; }
+      [data-theme="phosphor"] .splash-spinner { border-color: rgba(155, 217, 163, 0.16); border-top-color: #9AD8A1; }
+      [data-theme="carbon"] #splash h1 { background: linear-gradient(135deg, #C6CFD4, #7D8A92); }
+      [data-theme="carbon"] #splash-grad stop:first-child { stop-color: #C6CFD4; }
+      [data-theme="carbon"] #splash-grad stop:last-child { stop-color: #7D8A92; }
+      [data-theme="carbon"] .splash-spinner { border-color: rgba(174, 185, 192, 0.16); border-top-color: #AAB4BA; }
       #splash {
         position: fixed; inset: 0; z-index: 9999;
         display: flex; flex-direction: column;

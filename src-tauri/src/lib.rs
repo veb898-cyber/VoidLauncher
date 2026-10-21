@@ -279,6 +279,7 @@ pub fn run() {
             commands::mods::cmd_list_instance_mods,
             commands::mods::cmd_remove_instance_mod,
             commands::mods::cmd_get_mod_metadata,
+            commands::mods::cmd_resolve_mod_project_names,
             commands::mods::cmd_get_mod_icon,
             commands::mods::cmd_fetch_icon_url,
             commands::launcher::cmd_emit_log,

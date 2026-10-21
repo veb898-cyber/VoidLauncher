@@ -235,6 +235,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setSubView('search');
     setLoading(false);
     setLoadingMore(false);
+    hadSearchRef.current = false;
   }, [providerId, commitSelectedItems]);
 
   // Sequence guards: a slow response from an outdated request (fast sort /
@@ -242,6 +243,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const popularReqRef = useRef(0);
   const searchReqRef = useRef(0);
   const detailReqRef = useRef(0);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hadSearchRef = useRef(false);
 
   const loadPopular = useCallback(async () => {
     const reqId = ++popularReqRef.current;
@@ -306,18 +309,25 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
 
   useEffect(() => { loadPopular(); }, [loadPopular]);
 
-  const handleSearch = async () => {
-    if (!query.trim()) {
-      // Clearing the search must return to the default "popular" list;
-      // otherwise stale results would keep being displayed.
-      ++searchReqRef.current;
-      setResults([]);
-      setResultsOffset(0);
-      setHasMoreResults(true);
-      setSelected(null);
-      loadPopular();
+  const resetToPopular = useCallback(() => {
+    // Clearing the search must return to the default "popular" list;
+    // otherwise stale results would keep being displayed.
+    hadSearchRef.current = false;
+    ++searchReqRef.current;
+    setResults([]);
+    setResultsOffset(0);
+    setHasMoreResults(true);
+    setSelected(null);
+    loadPopular();
+  }, [loadPopular]);
+
+  const runSearch = useCallback(async (rawQuery: string) => {
+    const q = rawQuery.trim();
+    if (!q) {
+      resetToPopular();
       return;
     }
+    hadSearchRef.current = true;
     const reqId = ++searchReqRef.current;
     setLoading(true);
     setResults([]);
@@ -325,14 +335,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setHasMoreResults(true);
     setSelected(null);
     try {
-      const base = { query, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
-      let res = await provider.search(query, base);
+      const base = { query: q, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
+      let res = await provider.search(q, base);
       if (reqId !== searchReqRef.current) return;
       if (emulateOldest) {
         const total = Math.max(res.total_hits ?? 0, 0);
         const lastOffset = Math.max(0, total - PAGE_SIZE);
         const page = lastOffset > 0
-          ? await provider.search(query, { ...base, offset: lastOffset })
+          ? await provider.search(q, { ...base, offset: lastOffset })
           : res;
         if (reqId !== searchReqRef.current) return;
         const hits: Hit[] = [...((page.hits as Hit[]) || [])].reverse();
@@ -347,7 +357,51 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       }
     } catch (e: any) { addToast(t('content.search_error', { error: e.toString() }), 'error'); }
     if (reqId === searchReqRef.current) setLoading(false);
+  }, [contentType, mcVersion, loader, sortIndex, emulateOldest, provider, resetToPopular, t]);
+
+  const handleSearch = () => {
+    if (searchTimerRef.current !== null) {
+      clearTimeout(searchTimerRef.current);
+      searchTimerRef.current = null;
+    }
+    if (!query.trim()) {
+      resetToPopular();
+    } else {
+      void runSearch(query);
+    }
   };
+
+  // Keep the debounce effect keyed to the text alone: sort/provider changes
+  // already trigger their own immediate reload and must not reschedule it.
+  const runSearchRef = useRef(runSearch);
+  runSearchRef.current = runSearch;
+  const resetToPopularRef = useRef(resetToPopular);
+  resetToPopularRef.current = resetToPopular;
+
+  // Search-as-you-type: one request after a short pause, not one per key.
+  // Every query change invalidates an in-flight request immediately, so a
+  // slow reply for the previous text cannot flash over the current field.
+  useEffect(() => {
+    if (searchTimerRef.current !== null) {
+      clearTimeout(searchTimerRef.current);
+      searchTimerRef.current = null;
+    }
+    if (!query.trim()) {
+      if (hadSearchRef.current) resetToPopularRef.current();
+      return;
+    }
+    ++searchReqRef.current;
+    searchTimerRef.current = setTimeout(() => {
+      searchTimerRef.current = null;
+      void runSearchRef.current(query);
+    }, 450);
+    return () => {
+      if (searchTimerRef.current !== null) {
+        clearTimeout(searchTimerRef.current);
+        searchTimerRef.current = null;
+      }
+    };
+  }, [query]);
 
   const resultsOffsetRef = useRef(0);
   resultsOffsetRef.current = resultsOffset;

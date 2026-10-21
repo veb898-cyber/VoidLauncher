@@ -433,6 +433,388 @@
 }
 
 /* ============================
+   Phosphor Theme (green CRT terminal)
+   A dark phosphor screen with restrained scanlines, local emissive edges
+   and calm green-black surfaces. Legibility first, no glitch theatre.
+   ============================ */
+[data-theme="phosphor"] {
+  --bg-primary: #080D09;
+  --primary-contrast: #071009;
+  --bg-secondary: #0E150F;
+  --bg-tertiary: #141D15;
+  --bg-elevated: #1B271C;
+
+  --surface-glass: #111912;
+  --surface-glass-hover: #172218;
+  --surface-glass-active: #1D2A1F;
+  --surface-active: rgba(154, 216, 161, 0.07);
+  --surface-border: rgba(134, 191, 141, 0.17);
+  --surface-border-hover: rgba(154, 216, 161, 0.36);
+  --surface-secondary: var(--surface-glass);
+
+  --primary: #9AD8A1;
+  --primary-dim: rgba(154, 216, 161, 0.1);
+  --primary-light: #C4EFC8;
+  --primary-dark: #6EAF77;
+  --secondary: #6E9B78;
+  --gradient-primary: linear-gradient(135deg, #B5E8BA, #649D70);
+  --gradient-primary-hover: linear-gradient(135deg, #C9F0CD, #73AC7E);
+
+  --accent: #9AD8A1;
+  --accent-dim: rgba(154, 216, 161, 0.13);
+
+  --glow-primary: 0 0 16px rgba(94, 190, 108, 0.16);
+  --glow-primary-intense: 0 0 24px rgba(94, 190, 108, 0.24);
+  --glow-secondary: 0 0 14px rgba(94, 190, 108, 0.14);
+  --glow-accent: 0 0 14px rgba(94, 190, 108, 0.14);
+
+  --text-primary: #DDE9DA;
+  --text-secondary: #9CAE9B;
+  --text-tertiary: #6A7C6B;
+  --text-disabled: #435244;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.48);
+  --shadow-lg: 0 10px 28px rgba(0, 0, 0, 0.54);
+  --shadow-xl: 0 18px 48px rgba(0, 0, 0, 0.6);
+
+  --slider-shadow: 0 0 8px rgba(94, 190, 108, 0.28);
+  --slider-shadow-hover: 0 0 12px rgba(94, 190, 108, 0.42);
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+
+  --success: hsl(140, 44%, 52%);
+  --warning: hsl(42, 68%, 60%);
+  --error: hsl(4, 62%, 61%);
+  --color-danger: var(--error);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+  --color-info: hsl(175, 38%, 52%);
+  --info: var(--color-info);
+
+  --banner-error-bg: hsla(4, 62%, 61%, 0.1);
+  --banner-error-border: hsla(4, 62%, 61%, 0.26);
+  --log-error-bg: rgba(221, 108, 104, 0.07);
+  --log-warn-bg: rgba(218, 182, 98, 0.07);
+  --danger-bg: rgba(204, 102, 98, 0.12);
+  --danger-border: rgba(204, 102, 98, 0.24);
+  --danger-bg-hover: rgba(204, 102, 98, 0.2);
+}
+
+[data-theme="phosphor"] .btn--play,
+[data-theme="phosphor"] .instance-card__play {
+  color: #071009;
+}
+
+[data-theme="phosphor"] .btn--play::before {
+  opacity: 0.16;
+}
+
+[data-theme="phosphor"] .btn--play:hover::before {
+  opacity: 0.28;
+}
+
+[data-theme="phosphor"] .login-card__icon svg {
+  color: #071009;
+}
+
+/* CRT field: one-pixel scan gaps over a green-black raster. The radial
+   phosphor wash is local to the top edge, never a full-screen bloom. */
+[data-theme="phosphor"] .main-content {
+  background-image:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.32) 0,
+      rgba(0, 0, 0, 0.32) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    radial-gradient(1000px 650px at 50% -18%, rgba(119, 205, 132, 0.1), transparent 66%),
+    linear-gradient(180deg, rgba(154, 216, 161, 0.025), transparent 26%);
+  background-size: 100% 4px, auto, auto;
+  background-attachment: fixed, fixed, fixed;
+}
+
+[data-theme="phosphor"] .modpacks-overlay {
+  background-image:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.32) 0,
+      rgba(0, 0, 0, 0.32) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    radial-gradient(1000px 650px at 50% -18%, rgba(119, 205, 132, 0.1), transparent 66%),
+    linear-gradient(180deg, rgba(154, 216, 161, 0.025), transparent 26%);
+  background-size: 100% 4px, auto, auto;
+  background-attachment: fixed, fixed, fixed;
+}
+
+/* Working surfaces keep the same raster at a quieter amplitude; controls
+   therefore feel like part of the screen rather than stickers on it. */
+[data-theme="phosphor"] :is(.glass-card, .instance-card, .content-detail-panel, .modal, .empty-state, .modpack-detail-panel) {
+  background-image:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.2) 0,
+      rgba(0, 0, 0, 0.2) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    linear-gradient(180deg, rgba(154, 216, 161, 0.035), transparent 46%);
+  background-size: 100% 4px, auto;
+}
+
+[data-theme="phosphor"] .glass-card:hover {
+  background-image:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.2) 0,
+      rgba(0, 0, 0, 0.2) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    linear-gradient(180deg, rgba(154, 216, 161, 0.05), transparent 46%);
+  background-size: 100% 4px, auto;
+}
+
+[data-theme="phosphor"] .titlebar,
+[data-theme="phosphor"] .sidebar {
+  background-image: linear-gradient(180deg, rgba(154, 216, 161, 0.03), transparent 84%);
+}
+
+[data-theme="phosphor"] .titlebar__btn:hover {
+  background: rgba(154, 216, 161, 0.1);
+}
+
+[data-theme="phosphor"] .sidebar__item--active {
+  box-shadow: inset 0 0 18px rgba(94, 190, 108, 0.09);
+}
+
+[data-theme="phosphor"] .sidebar__accent {
+  background: var(--primary);
+  box-shadow: 0 0 12px rgba(94, 190, 108, 0.34);
+}
+
+[data-theme="phosphor"] .page__title {
+  text-shadow: 0 0 18px rgba(154, 216, 161, 0.13);
+}
+
+[data-theme="phosphor"] ::-webkit-scrollbar-thumb {
+  background-color: rgba(154, 216, 161, 0.18);
+}
+
+[data-theme="phosphor"] ::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(154, 216, 161, 0.3);
+}
+
+[data-theme="phosphor"] .console {
+  background: #070C08;
+  border-color: rgba(154, 216, 161, 0.2);
+}
+
+/* ============================
+   Carbon Theme (matte graphite composite)
+   The surface is a technical carbon laminate: tonal separation instead of
+   bright outlines, a diagonal weave, and a restrained brushed-steel accent.
+   ============================ */
+[data-theme="carbon"] {
+  --bg-primary: #141719;
+  --primary-contrast: #121517;
+  --bg-secondary: #1A1E21;
+  --bg-tertiary: #21262A;
+  --bg-elevated: #282E32;
+
+  --surface-glass: #1C2124;
+  --surface-glass-hover: #242A2E;
+  --surface-glass-active: #2A3135;
+  --surface-active: rgba(174, 184, 191, 0.07);
+  --surface-border: rgba(169, 180, 187, 0.13);
+  --surface-border-hover: rgba(174, 184, 191, 0.28);
+  --surface-secondary: var(--surface-glass);
+
+  --primary: #AEB8BF;
+  --primary-dim: rgba(174, 184, 191, 0.1);
+  --primary-light: #C6CFD4;
+  --primary-dark: #89959D;
+  --secondary: #7D8B94;
+  --gradient-primary: linear-gradient(135deg, #B7C0C5, #7F8C94);
+  --gradient-primary-hover: linear-gradient(135deg, #C9D2D7, #8D9AA2);
+
+  --accent: #A7B3BA;
+  --accent-dim: rgba(174, 184, 191, 0.12);
+
+  --glow-primary: 0 2px 10px rgba(0, 0, 0, 0.32);
+  --glow-primary-intense: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --glow-secondary: 0 2px 10px rgba(0, 0, 0, 0.28);
+  --glow-accent: 0 2px 10px rgba(0, 0, 0, 0.28);
+
+  --text-primary: #E6E9EA;
+  --text-secondary: #A2ABB1;
+  --text-tertiary: #6B747B;
+  --text-disabled: #464F55;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.38);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.46);
+  --shadow-lg: 0 10px 28px rgba(0, 0, 0, 0.52);
+  --shadow-xl: 0 18px 48px rgba(0, 0, 0, 0.58);
+
+  --slider-shadow: 0 0 0 2px rgba(174, 184, 191, 0.12);
+  --slider-shadow-hover: 0 0 0 3px rgba(174, 184, 191, 0.2);
+
+  --radius-sm: 5px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+
+  --success: hsl(150, 32%, 48%);
+  --warning: hsl(42, 46%, 58%);
+  --error: hsl(4, 46%, 58%);
+  --color-danger: var(--error);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+  --color-info: hsl(205, 24%, 62%);
+  --info: var(--color-info);
+
+  --banner-error-bg: hsla(4, 46%, 58%, 0.1);
+  --banner-error-border: hsla(4, 46%, 58%, 0.26);
+  --log-error-bg: rgba(211, 103, 98, 0.07);
+  --log-warn-bg: rgba(210, 172, 92, 0.07);
+  --danger-bg: rgba(194, 94, 90, 0.12);
+  --danger-border: rgba(194, 94, 90, 0.24);
+  --danger-bg-hover: rgba(194, 94, 90, 0.2);
+}
+
+[data-theme="carbon"] .btn--play,
+[data-theme="carbon"] .instance-card__play {
+  color: #121517;
+}
+
+[data-theme="carbon"] .btn--play::before {
+  opacity: 0.18;
+}
+
+[data-theme="carbon"] .login-card__icon svg {
+  color: #121517;
+}
+
+/* Two crossed diagonal weaves read as matte carbon laminate; the steel
+   highlight is broad and dim so it never turns into a glossy reflection. */
+[data-theme="carbon"] .main-content {
+  background-image:
+    repeating-linear-gradient(
+      135deg,
+      rgba(228, 235, 239, 0.032) 0,
+      rgba(228, 235, 239, 0.032) 1px,
+      transparent 1px,
+      transparent 5px
+    ),
+    repeating-linear-gradient(
+      45deg,
+      rgba(0, 0, 0, 0.18) 0,
+      rgba(0, 0, 0, 0.18) 1px,
+      transparent 1px,
+      transparent 10px
+    ),
+    radial-gradient(1200px 720px at 86% -14%, rgba(180, 193, 202, 0.075), transparent 62%);
+  background-size: 5px 5px, 10px 10px, auto;
+  background-attachment: fixed, fixed, fixed;
+}
+
+[data-theme="carbon"] .modpacks-overlay {
+  background-image:
+    repeating-linear-gradient(
+      135deg,
+      rgba(228, 235, 239, 0.032) 0,
+      rgba(228, 235, 239, 0.032) 1px,
+      transparent 1px,
+      transparent 5px
+    ),
+    repeating-linear-gradient(
+      45deg,
+      rgba(0, 0, 0, 0.18) 0,
+      rgba(0, 0, 0, 0.18) 1px,
+      transparent 1px,
+      transparent 10px
+    ),
+    radial-gradient(1200px 720px at 86% -14%, rgba(180, 193, 202, 0.075), transparent 62%);
+  background-size: 5px 5px, 10px 10px, auto;
+  background-attachment: fixed, fixed, fixed;
+}
+
+/* Components carry a much finer weave than the field, preserving the tonal
+   hierarchy between a working surface and the background it sits on. */
+[data-theme="carbon"] :is(.glass-card, .instance-card, .content-detail-panel, .modal, .empty-state, .modpack-detail-panel) {
+  background-image:
+    repeating-linear-gradient(
+      135deg,
+      rgba(228, 235, 239, 0.018) 0,
+      rgba(228, 235, 239, 0.018) 1px,
+      transparent 1px,
+      transparent 5px
+    ),
+    linear-gradient(155deg, rgba(255, 255, 255, 0.014), transparent 42%);
+  background-size: 5px 5px, auto;
+}
+
+[data-theme="carbon"] .glass-card:hover {
+  background-image:
+    repeating-linear-gradient(
+      135deg,
+      rgba(228, 235, 239, 0.024) 0,
+      rgba(228, 235, 239, 0.024) 1px,
+      transparent 1px,
+      transparent 5px
+    ),
+    linear-gradient(155deg, rgba(255, 255, 255, 0.022), transparent 42%);
+  background-size: 5px 5px, auto;
+}
+
+[data-theme="carbon"] .titlebar,
+[data-theme="carbon"] .sidebar {
+  background-image:
+    repeating-linear-gradient(
+      135deg,
+      rgba(228, 235, 239, 0.01) 0,
+      rgba(228, 235, 239, 0.01) 1px,
+      transparent 1px,
+      transparent 5px
+    ),
+    repeating-linear-gradient(
+      45deg,
+      rgba(0, 0, 0, 0.09) 0,
+      rgba(0, 0, 0, 0.09) 1px,
+      transparent 1px,
+      transparent 10px
+    );
+  background-size: 5px 5px, 10px 10px;
+}
+
+[data-theme="carbon"] .titlebar__btn:hover {
+  background: rgba(174, 184, 191, 0.1);
+}
+
+[data-theme="carbon"] .sidebar__accent {
+  background: var(--primary);
+  box-shadow: none;
+}
+
+[data-theme="carbon"] ::-webkit-scrollbar-thumb {
+  background-color: rgba(174, 184, 191, 0.16);
+}
+
+[data-theme="carbon"] ::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(174, 184, 191, 0.28);
+}
+
+[data-theme="carbon"] .console {
+  background: #101315;
+}
+
+/* ============================
    Font selection (Settings > Font / Console font)
    `data-font` remaps --font-ui (interface), `data-font-mono` remaps
    --font-mono (console and game logs). The console font follows the

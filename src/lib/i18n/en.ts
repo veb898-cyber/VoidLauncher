@@ -374,6 +374,8 @@ export const en = {
 'settings.theme_dark':              'OLED Dark',
   'settings.theme_blueprint':         'Blueprint',
   'settings.theme_ember':             'Ember',
+  'settings.theme_phosphor':          'Phosphor',
+  'settings.theme_carbon':            'Carbon',
   'settings.theme_locked':            'Unavailable while Liquid Glass is on. Your theme is kept and comes back when you switch Liquid Glass off.',
 
   'settings.exp_section_title':       'Experimental appearance',

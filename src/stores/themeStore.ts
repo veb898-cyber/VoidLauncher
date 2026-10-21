@@ -1,9 +1,28 @@
 import { create } from 'zustand';
 
-export type Theme = 'standard' | 'dark' | 'blueprint' | 'ember';
+export type Theme =
+  | 'standard'
+  | 'ember'
+  | 'dark'
+  | 'phosphor'
+  | 'carbon'
+  | 'blueprint';
+
+const THEMES: readonly Theme[] = [
+  'standard',
+  'ember',
+  'dark',
+  'phosphor',
+  'carbon',
+  'blueprint',
+];
 
 const THEME_STORAGE_KEY = 'voidlauncher-theme';
 const LG_STORAGE_KEY = 'voidlauncher-liquid-glass';
+
+function isTheme(value: string | null): value is Theme {
+  return value !== null && (THEMES as readonly string[]).includes(value);
+}
 
 /**
  * Value written to `<html data-theme>` while Liquid Glass is active.
@@ -14,16 +33,16 @@ const LG_STORAGE_KEY = 'voidlauncher-liquid-glass';
  * a representable state — there is no code path that can produce it.
  *
  * Because the Liquid Glass CSS block in index.css is scoped to exactly this
- * value, no `[data-theme="dark"|"blueprint"|"ember"]` rule matches while it is
- * applied: a theme palette cannot leak into Liquid Glass, and Liquid Glass
- * cannot be blended into a theme palette.
+ * value, no normal-theme rule matches while it is applied: a theme palette
+ * cannot leak into Liquid Glass, and Liquid Glass cannot be blended into a
+ * theme palette.
  */
 const LG_APPEARANCE = 'lg';
 
 function getInitialTheme(): Theme {
   try {
     const stored = localStorage.getItem(THEME_STORAGE_KEY);
-    if (stored === 'standard' || stored === 'dark' || stored === 'blueprint' || stored === 'ember') {
+    if (isTheme(stored)) {
       return stored;
     }
   } catch {}
@@ -52,8 +71,8 @@ function getInitialLiquidGlass(): boolean {
 function applyAppearance(theme: Theme, liquidGlass: boolean) {
   document.documentElement.setAttribute('data-theme', liquidGlass ? LG_APPEARANCE : theme);
   document.documentElement.setAttribute('data-lg-realistic', '1');
-  // Every current appearance, Liquid Glass included, is dark
-  // (OLED Light was removed).
+  // Every normal theme and Liquid Glass are dark appearances, so the native
+  // controls always use the dark colour scheme.
   document.documentElement.style.colorScheme = 'dark';
 }
 

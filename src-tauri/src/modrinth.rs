@@ -158,6 +158,19 @@ pub async fn get_project(id: &str) -> Result<ModrinthProject> {
     api_get(&url).await
 }
 
+/// Bulk project lookup used to resolve installed mod titles. The ids query is
+/// a JSON array; batching keeps the request URL short enough for large packs.
+pub async fn get_projects_by_ids(ids: &[String]) -> Result<Vec<ModrinthProject>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json = serde_json::to_string(ids).map_err(|e| {
+        crate::error::LauncherError::Download(format!("Failed to encode project ids: {}", e))
+    })?;
+    let url = format!("{}/projects?ids={}", BASE_URL, urlencoding::encode(&json));
+    api_get(&url).await
+}
+
 pub async fn get_versions(
     project_id: &str,
     mc_version: Option<&str>,

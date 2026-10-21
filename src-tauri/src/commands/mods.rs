@@ -1282,6 +1282,161 @@ pub async fn cmd_remove_instance_mod(
     .map_err(|e| e.to_string())?
 }
 
+struct ModProjectRef {
+    filename: String,
+    provider: String,
+    project_id: String,
+}
+
+fn collect_mod_project_refs(
+    config: &AppConfig,
+    instance_name: &str,
+) -> crate::error::Result<Vec<ModProjectRef>> {
+    let instance = instances::get_instance(&config.instances_dir(), instance_name)?;
+    let mods_dir = instance.minecraft_dir(&config.instances_dir()).join("mods");
+    let mut refs = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&mods_dir) else {
+        return Ok(refs);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !(filename.ends_with(".jar") || filename.ends_with(".jar.disabled")) {
+            continue;
+        }
+        let sidecar = read_sidecar_fields(&mods_dir, filename);
+        let provider = sidecar
+            .provider
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let Some(project_id) = sidecar.project_id.filter(|id| !id.trim().is_empty()) else {
+            continue;
+        };
+        if provider != "curseforge" && provider != "modrinth" {
+            continue;
+        }
+        refs.push(ModProjectRef {
+            filename: filename.to_string(),
+            provider,
+            project_id,
+        });
+    }
+    Ok(refs)
+}
+
+/// Resolve provider project titles for the installed mods. Runs after the
+/// local list is already visible: the jar parser provides an instant fallback,
+/// and this command replaces it with the canonical CurseForge/Modrinth title
+/// once the (persistent) project-name cache has been populated.
+#[tauri::command]
+pub async fn cmd_resolve_mod_project_names(
+    state: State<'_, AppState>,
+    instance_name: String,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let config = {
+        let guard = state.config.lock().map_err(|e| e.to_string())?;
+        guard.clone()
+    };
+    let scan_config = config.clone();
+    let refs = tauri::async_runtime::spawn_blocking(move || {
+        collect_mod_project_refs(&scan_config, &instance_name)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if refs.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let cached = project_name_cache(&config)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let mut curseforge_ids: Vec<u64> = Vec::new();
+    let mut modrinth_ids: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for r in &refs {
+        if !seen.insert(project_name_key(&r.provider, &r.project_id)) {
+            continue;
+        }
+        if cached.contains_key(&project_name_key(&r.provider, &r.project_id)) {
+            continue;
+        }
+        match r.provider.as_str() {
+            "curseforge" => {
+                if let Ok(id) = r.project_id.parse::<u64>() {
+                    curseforge_ids.push(id);
+                }
+            }
+            "modrinth" => modrinth_ids.push(r.project_id.clone()),
+            _ => {}
+        }
+    }
+
+    let mut fetched = ProjectNameCache::new();
+    const BATCH: usize = 50;
+    if !config.curseforge_api_key.is_empty() {
+        for chunk in curseforge_ids.chunks(BATCH) {
+            match curseforge::get_mods_by_ids(chunk, &config.curseforge_api_key).await {
+                Ok(projects) => {
+                    for p in projects {
+                        if let Some(name) = clean_project_title(&p.name) {
+                            fetched.insert(project_name_key("curseforge", &p.id.to_string()), name);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "launcher",
+                    "Could not resolve CurseForge mod titles: {}",
+                    e
+                ),
+            }
+        }
+    }
+    for chunk in modrinth_ids.chunks(BATCH) {
+        match modrinth::get_projects_by_ids(chunk).await {
+            Ok(projects) => {
+                for p in projects {
+                    if let Some(name) = clean_project_title(&p.title) {
+                        fetched.insert(project_name_key("modrinth", &p.id), name);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "launcher",
+                "Could not resolve Modrinth mod titles: {}",
+                e
+            ),
+        }
+    }
+
+    let mut out = std::collections::HashMap::new();
+    if !fetched.is_empty() {
+        let mut cache = project_name_cache(&config)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (key, name) in fetched {
+            cache.insert(key, name);
+        }
+        save_project_name_cache_to_disk(project_name_cache_file(&config), &cache);
+        for r in &refs {
+            if let Some(name) = cache.get(&project_name_key(&r.provider, &r.project_id)) {
+                out.insert(r.filename.clone(), name.clone());
+            }
+        }
+    } else {
+        for r in &refs {
+            if let Some(name) = cached.get(&project_name_key(&r.provider, &r.project_id)) {
+                out.insert(r.filename.clone(), name.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 pub async fn cmd_get_mod_metadata(
     state: State<'_, AppState>,
@@ -1317,7 +1472,7 @@ static META_CACHE_FILE: OnceLock<PathBuf> = OnceLock::new();
 /// Bump when jar parsing changes in a way that alters stored values:
 /// persisted entries are keyed only by path+mtime+size and would otherwise
 /// survive a parser change with stale results.
-const META_CACHE_VERSION: u32 = 2;
+const META_CACHE_VERSION: u32 = 3;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MetaCacheFile {
@@ -1420,6 +1575,87 @@ fn save_meta_cache_to_disk(path: &std::path::Path, cache: &ModMetaCache) {
 /// fallback runs once, ever. Icons extracted from jars are NOT stored (the
 /// quick local extraction stays the source of truth; embedding every jar
 /// icon would bloat the metadata payload).
+const PROJECT_NAME_CACHE_VERSION: u32 = 1;
+type ProjectNameCache = std::collections::HashMap<String, String>;
+static PROJECT_NAME_CACHE: OnceLock<Mutex<ProjectNameCache>> = OnceLock::new();
+static PROJECT_NAME_CACHE_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+fn project_name_cache_file(config: &AppConfig) -> &'static PathBuf {
+    PROJECT_NAME_CACHE_FILE.get_or_init(|| config.data_dir.join("project_name_cache.json"))
+}
+
+fn project_name_key(provider: &str, project_id: &str) -> String {
+    format!(
+        "{}:{}",
+        provider.trim().to_ascii_lowercase(),
+        project_id.trim()
+    )
+}
+
+fn load_project_name_cache_from_disk(path: &std::path::Path) -> ProjectNameCache {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ProjectNameCacheFile {
+        #[serde(default)]
+        version: u32,
+        #[serde(default)]
+        entries: ProjectNameCache,
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return ProjectNameCache::new();
+    };
+    let Ok(file) = serde_json::from_str::<ProjectNameCacheFile>(&raw) else {
+        return ProjectNameCache::new();
+    };
+    if file.version != PROJECT_NAME_CACHE_VERSION {
+        return ProjectNameCache::new();
+    }
+    file.entries
+}
+
+fn project_name_cache(config: &AppConfig) -> &'static Mutex<ProjectNameCache> {
+    PROJECT_NAME_CACHE.get_or_init(|| {
+        Mutex::new(load_project_name_cache_from_disk(project_name_cache_file(
+            config,
+        )))
+    })
+}
+
+fn save_project_name_cache_to_disk(path: &std::path::Path, cache: &ProjectNameCache) {
+    let json = serde_json::to_string(&serde_json::json!({
+        "version": PROJECT_NAME_CACHE_VERSION,
+        "entries": cache,
+    }));
+    let Ok(json) = json else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Provider titles are the most readable names available (e.g.
+/// "Sinytra Connector" instead of the jar's internal "connectormod").
+fn clean_project_title(raw: &str) -> Option<String> {
+    let name = usable_mod_name(raw, None)?;
+    let cleaned = instances::strip_minecraft_color_codes(name).replace(" '", "'");
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+fn project_name_override(meta: &ModMetadata, cache: &ProjectNameCache) -> Option<String> {
+    let provider = meta.provider.to_ascii_lowercase();
+    if provider != "curseforge" && provider != "modrinth" {
+        return None;
+    }
+    let project_id = meta.project_id.as_deref()?;
+    cache.get(&project_name_key(&provider, project_id)).cloned()
+}
+
 fn store_mod_icon_in_meta_cache(
     config: &AppConfig,
     jar_path: &std::path::Path,
@@ -1507,6 +1743,11 @@ pub(crate) fn get_mod_metadata(
         return Ok(Vec::new());
     }
 
+    let project_names = project_name_cache(config)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+
     // Serve cache hits first; only cache misses need the expensive jar parse.
     enum Job {
         Cached(ModMetadata),
@@ -1544,6 +1785,7 @@ pub(crate) fn get_mod_metadata(
             .take_while(|&s| s < fresh.len())
             .collect();
         let mods_dir_ref = &mods_dir;
+        let project_names_ref = &project_names;
         std::thread::scope(|scope| {
             let handles: Vec<_> = start_indices
                 .iter()
@@ -1555,7 +1797,15 @@ pub(crate) fn get_mod_metadata(
                             .iter()
                             .enumerate()
                             .map(|(k, f)| {
-                                (start + k, build_mod_metadata(mods_dir_ref, pw_index, f))
+                                (
+                                    start + k,
+                                    build_mod_metadata(
+                                        mods_dir_ref,
+                                        pw_index,
+                                        project_names_ref,
+                                        f,
+                                    ),
+                                )
                             })
                             .collect::<Vec<_>>()
                     })
@@ -1567,7 +1817,12 @@ pub(crate) fn get_mod_metadata(
         vec![fresh
             .iter()
             .enumerate()
-            .map(|(k, f)| (k, build_mod_metadata(&mods_dir, &pw_index, f)))
+            .map(|(k, f)| {
+                (
+                    k,
+                    build_mod_metadata(&mods_dir, &pw_index, &project_names, f),
+                )
+            })
             .collect()]
     };
 
@@ -1592,7 +1847,12 @@ pub(crate) fn get_mod_metadata(
     let mut mods: Vec<ModMetadata> = Vec::with_capacity(jobs.len());
     for job in jobs {
         match job {
-            Job::Cached(meta) => mods.push(meta),
+            Job::Cached(mut meta) => {
+                if let Some(name) = project_name_override(&meta, &project_names) {
+                    meta.name = name;
+                }
+                mods.push(meta);
+            }
             Job::Fresh => unreachable!("all fresh jobs were computed"),
         }
     }
@@ -1606,6 +1866,7 @@ pub(crate) fn get_mod_metadata(
 fn build_mod_metadata(
     mods_dir: &std::path::Path,
     pw_index: &std::collections::HashMap<String, instances::PackwizMeta>,
+    project_names: &ProjectNameCache,
     f: &ModFileEntry,
 ) -> ModMetadata {
     let ModFileEntry {
@@ -1642,20 +1903,25 @@ fn build_mod_metadata(
             .map(|p| p.provider.clone())
             .unwrap_or_else(|| "Local".to_string()),
     };
-    let name = if !jar_name.is_empty() {
-        jar_name
-    } else {
-        let fallback = sidecar
-            .project_name
-            .as_deref()
-            .and_then(|n| usable_mod_name(n, slug.as_deref()))
-            .map(str::to_string)
-            .or_else(|| {
-                pw.and_then(|p| usable_mod_name(&p.name, slug.as_deref()).map(str::to_string))
-            })
-            .unwrap_or_else(|| filename.trim_end_matches(".jar").to_string());
-        instances::strip_minecraft_color_codes(&fallback)
-    };
+    let canonical_name = project_id.as_ref().and_then(|pid| {
+        project_names
+            .get(&project_name_key(&provider, pid))
+            .cloned()
+    });
+    let name = canonical_name
+        .filter(|n| usable_mod_name(n, None).is_some())
+        .or_else(|| Some(jar_name).filter(|n| !n.is_empty()))
+        .or_else(|| {
+            sidecar
+                .project_name
+                .as_deref()
+                .filter(|n| !looks_like_version(n))
+                .and_then(|n| usable_mod_name(n, slug.as_deref()))
+                .map(str::to_string)
+        })
+        .or_else(|| pw.and_then(|p| usable_mod_name(&p.name, slug.as_deref()).map(str::to_string)))
+        .unwrap_or_else(|| filename.trim_end_matches(".jar").to_string());
+    let name = instances::strip_minecraft_color_codes(&name);
     // Version priority: sidecar (verified from Modrinth API) >
     // packwiz > sanitized JAR version. "${version}" and "Unknown"
     // are build-placeholders, not real versions.
@@ -1712,20 +1978,21 @@ fn read_mod_sidecar_provider(mods_dir: &std::path::Path, filename: &str) -> Opti
     json["provider"].as_str().map(|s| s.to_string())
 }
 
-fn usable_mod_name<'a>(name: &'a str, mod_id: Option<&str>) -> Option<&'a str> {
+fn usable_mod_name<'a>(name: &'a str, _mod_id: Option<&str>) -> Option<&'a str> {
     let trimmed = name.trim();
+    let lower = trimmed.to_ascii_lowercase();
     if trimmed.is_empty()
         || trimmed.eq_ignore_ascii_case("unknown")
         || trimmed.contains("${")
         || trimmed.eq_ignore_ascii_case("%s")
+        || lower.ends_with(".jar")
+        || lower.ends_with(".zip")
     {
         return None;
     }
-    if let Some(id) = mod_id.map(str::trim).filter(|id| !id.is_empty()) {
-        if trimmed == id {
-            return None;
-        }
-    }
+    // `displayName == modId` is common and valid (spark, cataclysm). Prism
+    // Launcher shows that name too, so the id equality check must not discard
+    // the only human-readable value the jar provides.
     Some(trimmed)
 }
 
@@ -1816,7 +2083,56 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
         Ok(a) => a,
         Err(_) => return fallback_meta_from_filename(path),
     };
+    if let Some(meta) = parse_mod_meta_archive(&mut archive) {
+        return meta;
+    }
+    if let Some(meta) = read_nested_jar_meta(&mut archive) {
+        return meta;
+    }
 
+    // Fallback: extract name from filename
+    fallback_meta_from_filename(path)
+}
+
+/// Read metadata from a JarJar / Fabric nested jar. Sinytra Connector, for
+/// example, has no metadata in the outer archive: the real mod descriptor
+/// lives in `META-INF/jarjar/*.jar`.
+fn read_nested_jar_meta<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Option<ModMetaResult> {
+    const MAX_NESTED_JAR_BYTES: u64 = 64 * 1024 * 1024;
+    let candidates: Vec<String> = (0..archive.len())
+        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter(|name| {
+            (name.starts_with("META-INF/jarjar/") || name.starts_with("META-INF/jars/"))
+                && name.ends_with(".jar")
+        })
+        .collect();
+    for name in candidates {
+        let Ok(mut file) = archive.by_name(&name) else {
+            continue;
+        };
+        let size = file.size();
+        if size == 0 || size > MAX_NESTED_JAR_BYTES {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(size as usize);
+        if file.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        let Ok(mut nested) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+            continue;
+        };
+        if let Some(meta) = parse_mod_meta_archive(&mut nested) {
+            return Some(meta);
+        }
+    }
+    None
+}
+
+fn parse_mod_meta_archive<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Option<ModMetaResult> {
     // Try fabric.mod.json
     if let Ok(mut file) = archive.by_name("fabric.mod.json") {
         let mut contents = String::new();
@@ -1835,13 +2151,13 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                         .to_string();
                     clean
                 });
-                return ModMetaResult {
+                return Some(ModMetaResult {
                     name: instances::strip_minecraft_color_codes(&name),
                     version,
                     provider: "Fabric".into(),
                     icon,
                     slug,
-                };
+                });
             }
         }
     }
@@ -1893,13 +2209,13 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                             } else {
                                 "Forge"
                             };
-                            return ModMetaResult {
+                            return Some(ModMetaResult {
                                 name: instances::strip_minecraft_color_codes(&display_name),
                                 version,
                                 provider: provider.into(),
                                 icon: logo,
                                 slug: Some(mod_id),
-                            };
+                            });
                         }
                     }
                 }
@@ -1917,13 +2233,13 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                 } else {
                     "Forge"
                 };
-                return ModMetaResult {
+                return Some(ModMetaResult {
                     name: instances::strip_minecraft_color_codes(&display_name),
                     version,
                     provider: provider.into(),
                     icon: logo,
                     slug: Some(mod_id),
-                };
+                });
             }
         }
     }
@@ -1967,18 +2283,17 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
                     .to_string();
             let version = picked["version"].as_str().unwrap_or("Unknown").to_string();
             let logo = picked["logoFile"].as_str().map(|s| s.to_string());
-            return ModMetaResult {
+            return Some(ModMetaResult {
                 name: instances::strip_minecraft_color_codes(&display_name),
                 version,
                 provider: "Forge".into(),
                 icon: logo,
                 slug: Some(mod_id),
-            };
+            });
         }
     }
 
-    // Fallback: extract name from filename
-    fallback_meta_from_filename(path)
+    None
 }
 
 fn strip_toml_comment(val: &str) -> &str {
@@ -2443,16 +2758,133 @@ mod meta_cache_file_tests {
     }
 
     #[test]
-    fn usable_mod_name_rejects_ids_and_placeholders() {
+    fn usable_mod_name_rejects_placeholders_and_filenames() {
         assert!(usable_mod_name("", Some("x")).is_none());
         assert!(usable_mod_name("Unknown", Some("x")).is_none());
         assert!(usable_mod_name("${mod_name}", Some("x")).is_none());
-        assert!(usable_mod_name("x", Some("x")).is_none());
+        assert!(usable_mod_name("mod.jar", None).is_none());
+        assert_eq!(usable_mod_name("x", Some("x")), Some("x"));
         assert_eq!(usable_mod_name("X", Some("x")), Some("X"));
         assert_eq!(
             usable_mod_name("Real Mod Name", Some("realmod")),
             Some("Real Mod Name")
         );
+    }
+
+    #[test]
+    fn display_name_equal_to_mod_id_is_kept() {
+        let dir = test_dir("same-name");
+        let jar = dir.join("spark.jar");
+        write_jar(
+            &jar,
+            &[(
+                "META-INF/mods.toml",
+                r#"
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="spark"
+displayName="spark"
+version="1.10.53"
+"#,
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.name, "spark");
+        assert_eq!(meta.slug.as_deref(), Some("spark"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_jar_with_nested(
+        path: &std::path::Path,
+        outer_files: &[(&str, &str)],
+        nested_name: &str,
+        nested_files: &[(&str, &str)],
+    ) {
+        use std::io::Write as _;
+        let mut nested_zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, contents) in nested_files {
+            nested_zip
+                .start_file(*name, options)
+                .expect("start nested entry");
+            nested_zip
+                .write_all(contents.as_bytes())
+                .expect("write nested entry");
+        }
+        let nested_bytes = nested_zip.finish().expect("finish nested jar").into_inner();
+
+        let file = std::fs::File::create(path).expect("create outer jar");
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, contents) in outer_files {
+            zip.start_file(*name, options).expect("start outer entry");
+            zip.write_all(contents.as_bytes())
+                .expect("write outer entry");
+        }
+        zip.start_file(nested_name, options)
+            .expect("start nested jar entry");
+        zip.write_all(&nested_bytes).expect("write nested jar");
+        zip.finish().expect("finish outer jar");
+    }
+
+    #[test]
+    fn nested_jarjar_metadata_is_used_when_outer_has_none() {
+        let dir = test_dir("nested-jarjar");
+        let jar = dir.join("Connector.jar");
+        write_jar_with_nested(
+            &jar,
+            &[("pack.mcmeta", r#"{"pack":{"pack_format":15}}"#)],
+            "META-INF/jarjar/Connector-mod.jar",
+            &[(
+                "META-INF/mods.toml",
+                r#"
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="connectormod"
+displayName="Connector"
+version="1.0.0"
+"#,
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.name, "Connector");
+        assert_eq!(meta.slug.as_deref(), Some("connectormod"));
+        assert_eq!(meta.version, "1.0.0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_titles_are_cleaned_and_filtered() {
+        assert_eq!(
+            clean_project_title("L_Ender 's Cataclysm").as_deref(),
+            Some("L_Ender's Cataclysm")
+        );
+        assert_eq!(
+            clean_project_title("§aSinytra Connector").as_deref(),
+            Some("Sinytra Connector")
+        );
+        assert!(clean_project_title("cataclysm-3.31.jar").is_none());
+        assert!(clean_project_title("   ").is_none());
+    }
+
+    #[test]
+    fn project_names_override_cached_metadata_by_normalized_key() {
+        let mut meta = sample_meta();
+        meta.provider = "CurseForge".into();
+        meta.project_id = Some("361579".into());
+        let mut cache = ProjectNameCache::new();
+        cache.insert(project_name_key("curseforge", "361579"), "spark".into());
+        assert_eq!(
+            project_name_override(&meta, &cache).as_deref(),
+            Some("spark")
+        );
+        meta.project_id = Some("890127".into());
+        assert!(project_name_override(&meta, &cache).is_none());
     }
 
     #[test]
@@ -2641,7 +3073,10 @@ version="2.3"
         // fill non-meta fields, so the entry still loads.
         std::fs::write(
             &file,
-            r#"{"version":2,"entries":[{"path":"C:/x.jar","mtime_ms":5,"size":6,"meta":{"name":"X"}}]}"#,
+            format!(
+                r#"{{"version":{},"entries":[{{"path":"C:/x.jar","mtime_ms":5,"size":6,"meta":{{"name":"X"}}}}]}}"#,
+                META_CACHE_VERSION
+            ),
         )
         .unwrap();
         let loaded = load_meta_cache_from_disk(&file);

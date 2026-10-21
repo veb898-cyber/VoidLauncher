@@ -64,9 +64,11 @@ export function Settings() {
   // will come back instead of speaking about "the theme".
   const themeLabel: Record<Theme, string> = {
     standard: t('settings.theme_standard'),
-    blueprint: t('settings.theme_blueprint'),
     ember: t('settings.theme_ember'),
     dark: t('settings.theme_dark'),
+    phosphor: t('settings.theme_phosphor'),
+    carbon: t('settings.theme_carbon'),
+    blueprint: t('settings.theme_blueprint'),
   };
   const font = useFontStore((s) => s.font);
   const consoleFont = useFontStore((s) => s.consoleFont);
@@ -599,9 +601,11 @@ export function Settings() {
               disabled={liquidGlass}
               options={[
                 { value: 'standard', label: t('settings.theme_standard') },
-                { value: 'blueprint', label: t('settings.theme_blueprint') },
                 { value: 'ember', label: t('settings.theme_ember') },
                 { value: 'dark', label: t('settings.theme_dark') },
+                { value: 'phosphor', label: t('settings.theme_phosphor') },
+                { value: 'carbon', label: t('settings.theme_carbon') },
+                { value: 'blueprint', label: t('settings.theme_blueprint') },
               ].map((o) => ({ ...o, disabled: liquidGlass }))}
               onChange={(v) => setTheme(v as Theme)}
             />

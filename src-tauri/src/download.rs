@@ -518,7 +518,38 @@ pub async fn get_with_retry(
             continue;
         }
 
+        let server_cloudfront = response
+            .headers()
+            .get(reqwest::header::SERVER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("cloudfront"));
         let text = response.text().await.unwrap_or_default();
+        // CurseForge is fronted by CloudFront, which occasionally answers a
+        // valid request with a transient HTML "Request blocked" 403. Treat
+        // only that shape as retriable; an actual API 403 (bad key, banned
+        // project) is JSON and must fail immediately.
+        if status == reqwest::StatusCode::FORBIDDEN
+            && attempt < attempts - 1
+            && is_cloudfront_block(server_cloudfront, &text)
+        {
+            let preview: String = text.chars().take(200).collect();
+            last_err = Some(LauncherError::Download(format!(
+                "{} API error ({}): {}",
+                provider, status, preview
+            )));
+            crate::events::emit_fetch_retry(
+                provider,
+                attempt + 2,
+                attempts,
+                &format!("{} was temporarily blocked, retrying", provider),
+            );
+            sleep(Duration::from_millis(
+                backoff_ms[attempt.min(backoff_ms.len() - 1)].max(750),
+            ))
+            .await;
+            continue;
+        }
+
         let preview: String = text.chars().take(500).collect();
         return Err(LauncherError::Download(format!(
             "{} API error ({}): {}",
@@ -526,6 +557,16 @@ pub async fn get_with_retry(
         )));
     }
     Err(last_err.unwrap_or_else(|| LauncherError::Download(format!("{} request failed", provider))))
+}
+
+/// CloudFront's WAF block page is HTML, while real CurseForge API errors are
+/// JSON. Matching the known block-page phrases (or an HTML body served by
+/// CloudFront) avoids retrying a genuine authorization failure.
+fn is_cloudfront_block(server_cloudfront: bool, body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("request blocked")
+        || lower.contains("the request could not be satisfied")
+        || (server_cloudfront && lower.contains("<!doctype html"))
 }
 
 /// Update the global proxy used by every HTTP request. Called when the
@@ -1545,6 +1586,26 @@ mod tests {
         assert!(validate_download(&empty, "").is_ok());
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn cloudfront_block_only_matches_the_waf_page() {
+        assert!(is_cloudfront_block(
+            false,
+            "<!DOCTYPE HTML><html><title>ERROR: The request could not be satisfied</title></html>"
+        ));
+        assert!(is_cloudfront_block(
+            true,
+            "<!DOCTYPE HTML><html><body>Request blocked</body></html>"
+        ));
+        assert!(!is_cloudfront_block(
+            false,
+            "{\"error\":\"Forbidden\",\"errorCode\":403}"
+        ));
+        assert!(!is_cloudfront_block(
+            false,
+            "<!DOCTYPE HTML><html><body>Not found</body></html>"
+        ));
     }
 
     #[test]

@@ -435,6 +435,20 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         setItems(mapped);
         setLoading(false);
 
+        // Jar metadata gives an instant fallback name; replace it with the
+        // canonical provider title once the background lookup finishes.
+        void (async () => {
+          try {
+            const names = await invoke<Record<string, string>>('cmd_resolve_mod_project_names', { instanceName });
+            if (gen !== loadGen.current || !names) return;
+            setItems((prev) => prev.map((item) => (
+              names[item.filename] && names[item.filename] !== item.name
+                ? { ...item, name: names[item.filename] }
+                : item
+            )));
+          } catch { }
+        })();
+
         const cache = iconCache;
         const uncached = raw.filter((m) => {
           if (m.icon && m.icon.startsWith('data:')) return false;
