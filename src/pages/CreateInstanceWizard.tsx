@@ -15,6 +15,7 @@ import { useLogPlaque } from '../lib/uiLog';
 import { SlidingTabs, type SlidingTabDef } from '../components/ui/SlidingTabs';
 import { ImportReportPanel } from '../components/import/ImportReportPanel';
 import { reportHasGaps, type ImportOutcome, type ImportReport } from '../lib/importReport';
+import { needsLoaderVersionFetch } from '../lib/loaderVersions';
 
 interface VersionEntry {
   id: string;
@@ -175,9 +176,9 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
     if (target === 'Vanilla') return;
     if (loaderVersionsLoadingRef.current) return;
     const mcVersion = mcVersionOverride ?? selectedVersion;
-    if (target !== 'Fabric' && mcVersion === '') {
-      setLoaderVersions(prev => ({ ...prev, [target]: [] }));
-      setLoaderVersionTotals(prev => ({ ...prev, [target]: 0 }));
+    if (mcVersion === '') {
+      // The Minecraft version list is still loading. Leave the total unset so
+      // the retry effect below requests the loader page once it arrives.
       return;
     }
     const offset = resetOffset ? 0 : (loaderVersions[target]?.length ?? 0);
@@ -211,6 +212,31 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
       if (reqId === loaderRequestRef.current) setLoaderVersionsLoading(false);
     }
   }, [loaderType, selectedVersion, loaderVersions, loaderVersionTotals]);
+
+  // If the user picks a loader before the Minecraft version list finishes
+  // loading, the initial request above is skipped. Retry once the version is
+  // known; a completed page (even an empty one) or a failure stops the retry.
+  useEffect(() => {
+    if (!open || mode !== 'new') return;
+    if (!needsLoaderVersionFetch({
+      loader: loaderType,
+      mcVersion: selectedVersion,
+      total: loaderVersionTotals[loaderType],
+      loading: loaderVersionsLoading,
+      failed: loaderVersionsError,
+    })) return;
+    fetchLoaderPage(loaderType, true);
+  }, [
+    open,
+    mode,
+    loaderType,
+    selectedVersion,
+    loaderVersions,
+    loaderVersionTotals,
+    loaderVersionsLoading,
+    loaderVersionsError,
+    fetchLoaderPage,
+  ]);
 
   const handleVersionSelect = (id: string) => {
     setSelectedVersion(id);

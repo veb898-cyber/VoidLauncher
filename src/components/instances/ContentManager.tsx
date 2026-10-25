@@ -40,14 +40,6 @@ function build_name_variants(name: string): string[] {
   return variants;
 }
 
-/// Extract a plausible version from a pack filename (e.g. "Pack 1.20.1.zip"
-/// → "1.20.1", "mod_v5.8.1.jar" → "5.8.1"). Returns "" when nothing found.
-function extractVersionFromFilename(filename: string): string {
-  const stem = filename.replace(/\.disabled$/i, '').replace(/\.(zip|jar)$/i, '');
-  const m = stem.match(/(?:[vVrR]|\s|-|_)(\d+(?:\.\d+){1,3}[a-z]*)\s*$/i);
-  return m ? m[1] : '';
-}
-
 /// Run `fn` over `items` with at most `limit` concurrent invocations.
 /// Unlike fixed-size batches, one slow item (e.g. a network fallback with
 /// retries) only occupies its own slot instead of stalling everyone else's.
@@ -480,7 +472,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         setItems(raw.map((p) => ({
           filename: p.filename,
           name: p.name,
-          version: p.version || extractVersionFromFilename(p.filename) || '',
+          version: p.version || '',
           provider: !p.provider || p.provider === 'Local' ? t('manager.provider_local') : p.provider,
           project_id: p.project_id || '',
           slug: p.project_id || undefined,

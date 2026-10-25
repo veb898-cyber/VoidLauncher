@@ -755,18 +755,11 @@ pub fn list_packs(instances_dir: &Path, name: &str, pack_type: &str) -> Result<V
             }
         }
 
-        // Read sidecar metadata (project_name is the Modrinth/CurseForge display name)
-        let (provider, mut version, project_id, project_name) =
+        // Read sidecar metadata (project_name is the Modrinth/CurseForge display name).
+        // The version comes only from that metadata — never from the file name
+        // or pack.mcmeta's pack_format, which are not the pack's own version.
+        let (provider, version, project_id, project_name) =
             read_pack_sidecar(&path, &packwiz).unwrap_or_default();
-        // Local packs have no real version — fall back to a version found in
-        // the filename, then to the MC version range implied by pack.mcmeta
-        // (pack_format), so the Version column is never empty for them.
-        if version.is_empty() {
-            version = extract_version_from_filename(&filename);
-        }
-        if version.is_empty() {
-            version = pack_format_to_mc_version(&path);
-        }
         // Name resolution: sidecar project_name > pack.mcmeta pack.name/description > filename
         let name = if !project_name.is_empty() {
             Some(project_name)
@@ -1154,9 +1147,26 @@ pub(crate) fn load_packwiz_index(content_dir: &Path) -> HashMap<String, PackwizM
     map
 }
 
+/// Look up packwiz metadata for a content file.
+///
+/// Prism stores the metadata under the enabled file name, while a disabled
+/// file on disk carries a `.disabled` suffix (`foo.jar.disabled`). Retry
+/// without that suffix so disabled content keeps its name, version, provider
+/// and project id — the same transfer Prism's `ResourceFolderLoadTask` does.
+pub(crate) fn packwiz_meta<'a>(
+    index: &'a HashMap<String, PackwizMeta>,
+    filename: &str,
+) -> Option<&'a PackwizMeta> {
+    index.get(filename).or_else(|| {
+        filename
+            .strip_suffix(".disabled")
+            .and_then(|enabled| index.get(enabled))
+    })
+}
+
 /// Look up packwiz metadata for a single content file (if any).
 pub(crate) fn read_packwiz_meta(content_dir: &Path, filename: &str) -> Option<PackwizMeta> {
-    load_packwiz_index(content_dir).remove(filename)
+    packwiz_meta(&load_packwiz_index(content_dir), filename).cloned()
 }
 
 fn read_pack_sidecar(
@@ -1172,7 +1182,7 @@ fn read_pack_sidecar(
         return Some((provider, version, project_id, project_name));
     }
     // Fallback: Prism packwiz metadata (.pw.toml in .index/)
-    let pw = packwiz.get(&filename)?;
+    let pw = packwiz_meta(packwiz, &filename)?;
     Some((
         pw.provider.clone(),
         pw.version.clone(),
@@ -1213,6 +1223,10 @@ pub(crate) fn strip_minecraft_color_codes(s: &str) -> String {
 /// "twilightforest-1.20.1-4.3.2508-universal.jar" → "4.3.2508",
 /// "curios-forge-5.14.1+1.20.1.jar" → "5.14.1+1.20.1",
 /// "CataclysmCompat1.0.zip" → "1.0"). Returns "" when nothing usable.
+///
+/// Test/diagnostic only: displayed versions must come from real metadata
+/// (JAR descriptor for mods, packwiz/sidecar for packs), never a file name.
+#[cfg(test)]
 pub(crate) fn extract_version_from_filename(filename: &str) -> String {
     let mut stem = filename
         .trim_end_matches(".disabled")
@@ -1414,12 +1428,15 @@ pub(crate) fn extract_version_from_filename(filename: &str) -> String {
     String::new()
 }
 
-/// Map a pack.mcmeta `pack_format` to the Minecraft version range it targets,
-/// so local resource packs without any metadata can still show a version.
+/// Map a pack.mcmeta `pack_format` to the Minecraft version range it targets.
+/// Test/diagnostic only — `pack_format` is not the pack's own version and must
+/// never be shown in the Version column.
+#[cfg(test)]
 pub(crate) fn pack_format_to_mc_version(pack_path: &std::path::Path) -> String {
     pack_format_to_mc_version_inner(read_pack_format(pack_path))
 }
 
+#[cfg(test)]
 fn pack_format_to_mc_version_inner(pack_format: Option<u64>) -> String {
     let range = match pack_format {
         Some(1..=3) => "MC 1.6-1.12",
@@ -1447,6 +1464,7 @@ fn pack_format_to_mc_version_inner(pack_format: Option<u64>) -> String {
 }
 
 /// Read the `pack.pack_format` integer from a resource pack (zip or folder).
+#[cfg(test)]
 pub(crate) fn read_pack_format(pack_path: &std::path::Path) -> Option<u64> {
     let read_json = |contents: &str| -> Option<u64> {
         let v: serde_json::Value = serde_json::from_str(contents).ok()?;
@@ -3193,6 +3211,28 @@ mod tests {
         for (name, bytes) in [
             ("minecraft/mods/testmod.jar", b"PK\x03\x04fakejar".to_vec()),
             (
+                "minecraft/mods/DisabledMod-1.2.3.jar.disabled",
+                b"PK\x03\x04fakedisabled".to_vec(),
+            ),
+            (
+                "minecraft/mods/.index/disabledmod.pw.toml",
+                br#"filename = 'DisabledMod-1.2.3.jar'
+name = 'Disabled Mod'
+side = 'both'
+x-prismlauncher-version-number = '1.2.3'
+
+[download]
+hash = 'abc'
+hash-format = 'sha1'
+mode = 'metadata:modrinth'
+
+[update.modrinth]
+mod-id = 'disabledmod'
+version = '1.2.3'
+"#
+                .to_vec(),
+            ),
+            (
                 "minecraft/resourcepacks/rp.zip",
                 b"PK\x03\x04fakerp".to_vec(),
             ),
@@ -3307,6 +3347,19 @@ mod tests {
             mc_dir.join("mods/testmod.jar").exists(),
             "mods mapped to .minecraft/mods"
         );
+        let disabled = mc_dir.join("mods/DisabledMod-1.2.3.jar.disabled");
+        assert!(disabled.exists(), "disabled state preserved on import");
+        assert!(
+            !mc_dir.join("mods/DisabledMod-1.2.3.jar").exists(),
+            "import must not silently enable a disabled mod"
+        );
+        let index = load_packwiz_index(&mc_dir.join("mods"));
+        let disabled_meta = packwiz_meta(&index, "DisabledMod-1.2.3.jar.disabled")
+            .expect("disabled file must reuse the enabled file's metadata");
+        assert_eq!(disabled_meta.name, "Disabled Mod");
+        assert_eq!(disabled_meta.version, "1.2.3");
+        assert_eq!(disabled_meta.provider, "Modrinth");
+        assert!(mc_dir.join("mods/.index/disabledmod.pw.toml").exists());
         assert!(mc_dir.join("resourcepacks/rp.zip").exists());
         assert!(mc_dir.join("shaderpacks/sh.zip").exists());
         assert!(mc_dir.join("config/x.yml").exists());
@@ -3783,6 +3836,36 @@ version = 'hIibTfxn'
         let packs = list_packs(&instances_dir, "P", "shaderpacks").unwrap();
         assert_eq!(packs.len(), 1, "Prism .pw.toml and .index must be hidden");
         assert_eq!(packs[0].filename, "BSL_v10.zip");
+        assert_eq!(
+            packs[0].version, "",
+            "a version-looking file name must not become the pack version"
+        );
+
+        // A disabled pack keeps the metadata of its enabled counterpart
+        // (Prism stores the .pw.toml under the un-suffixed file name).
+        let packs_dir = instances_dir
+            .join("P")
+            .join(".minecraft")
+            .join("resourcepacks");
+        std::fs::create_dir_all(packs_dir.join(".index")).unwrap();
+        std::fs::write(
+            packs_dir.join("Faithful 32x - 26.3.zip.disabled"),
+            b"PK\x03\x04faithful",
+        )
+        .unwrap();
+        std::fs::write(
+            packs_dir.join(".index").join("faithful.pw.toml"),
+            "filename = 'Faithful 32x - 26.3.zip'\nname = 'Faithful 32x'\nx-prismlauncher-version-number = '26.3'\n[update.modrinth]\nmod-id = 'faithful'\n",
+        )
+        .unwrap();
+
+        let packs = list_packs(&instances_dir, "P", "resourcepacks").unwrap();
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].filename, "Faithful 32x - 26.3.zip.disabled");
+        assert_eq!(packs[0].name, "Faithful 32x");
+        assert_eq!(packs[0].version, "26.3");
+        assert_eq!(packs[0].provider, "Modrinth");
+        assert_eq!(packs[0].project_id, "faithful");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

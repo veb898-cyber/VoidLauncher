@@ -194,7 +194,7 @@ fn scan_mod_files(
                 mod_files.push(ModFile {
                     filename,
                     name,
-                    version: meta.version,
+                    version: sanitize_version(&meta.version),
                     hash,
                     provider: ic.provider,
                     project_id: ic.project_id,
@@ -824,7 +824,6 @@ struct SidecarFields {
     project_id: Option<String>,
     provider: Option<String>,
     project_name: Option<String>,
-    version_number: Option<String>,
 }
 
 fn read_sidecar_fields(mods_dir: &std::path::Path, filename: &str) -> SidecarFields {
@@ -833,7 +832,6 @@ fn read_sidecar_fields(mods_dir: &std::path::Path, filename: &str) -> SidecarFie
             project_id: json["project_id"].as_str().map(str::to_string),
             provider: json["provider"].as_str().map(str::to_string),
             project_name: json["project_name"].as_str().map(str::to_string),
-            version_number: json["version_number"].as_str().map(str::to_string),
         },
         None => SidecarFields::default(),
     }
@@ -1472,7 +1470,7 @@ static META_CACHE_FILE: OnceLock<PathBuf> = OnceLock::new();
 /// Bump when jar parsing changes in a way that alters stored values:
 /// persisted entries are keyed only by path+mtime+size and would otherwise
 /// survive a parser change with stale results.
-const META_CACHE_VERSION: u32 = 3;
+const META_CACHE_VERSION: u32 = 4;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MetaCacheFile {
@@ -1877,7 +1875,7 @@ fn build_mod_metadata(
         ..
     } = f;
     let meta = read_mod_meta_from_jar(path);
-    let pw = pw_index.get(filename);
+    let pw = instances::packwiz_meta(pw_index, filename);
     // Single sidecar read for all fields.
     let sidecar = read_sidecar_fields(mods_dir, filename);
     let project_id = sidecar.project_id.clone().or_else(|| {
@@ -1922,34 +1920,11 @@ fn build_mod_metadata(
         .or_else(|| pw.and_then(|p| usable_mod_name(&p.name, slug.as_deref()).map(str::to_string)))
         .unwrap_or_else(|| filename.trim_end_matches(".jar").to_string());
     let name = instances::strip_minecraft_color_codes(&name);
-    // Version priority: sidecar (verified from Modrinth API) >
-    // packwiz > sanitized JAR version. "${version}" and "Unknown"
-    // are build-placeholders, not real versions.
-    let mut version = sidecar
-        .version_number
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            pw.filter(|p| !p.version.is_empty())
-                .map(|p| p.version.clone())
-        })
-        .unwrap_or_else(|| sanitize_version(&meta.version));
-    // No real version anywhere — extract one from the file name
-    // (works for JARs with version-less metadata like "${file.jarVersion}").
-    if version.is_empty() {
-        version = crate::instances::extract_version_from_filename(filename);
-    }
-    // Packs installed before the sidecar carried a version have
-    // nothing left to show — fall back to the CurseForge display
-    // name ("[Forge 1.20.1] v2.8.0") instead of an empty cell, but
-    // only when it actually looks like a version (never for garbage
-    // like "mod-1.20.1-4.7.jar").
-    if version.is_empty() {
-        if let Some(pn) = sidecar.project_name {
-            if looks_like_version(&pn) {
-                version = pn;
-            }
-        }
-    }
+    // Prism's Mod::version() returns the version declared by the JAR itself
+    // (fabric.mod.json / mods.toml), not the provider's version name, the
+    // packwiz metadata or a number guessed from the file name. "${version}"
+    // and "Unknown" are build placeholders, not real versions.
+    let version = sanitize_version(&meta.version);
     ModMetadata {
         filename: filename.clone(),
         name,
@@ -2005,6 +1980,14 @@ fn sanitize_version(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Whether a JAR-declared version is concrete enough to stop looking at other
+/// descriptors in the same archive. "NONE" is Prism's marker for a missing
+/// manifest version, not something worth preferring over a real descriptor.
+fn version_is_real(raw: &str) -> bool {
+    let version = sanitize_version(raw);
+    !version.is_empty() && !version.eq_ignore_ascii_case("NONE")
 }
 
 /// A project display name can be a usable version ("[Forge 1.20.1] v2.8.0",
@@ -2130,10 +2113,44 @@ fn read_nested_jar_meta<R: std::io::Read + std::io::Seek>(
     None
 }
 
+/// `Implementation-Version` from `META-INF/MANIFEST.MF`, normalized the way
+/// Prism Launcher does: a missing header (or Gradle's unexpanded
+/// `archiveVersion` placeholder) becomes "NONE" instead of a build string.
+fn read_manifest_version<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> String {
+    let Ok(mut file) = archive.by_name("META-INF/MANIFEST.MF") else {
+        return "NONE".to_string();
+    };
+    let mut contents = String::new();
+    if file.read_to_string(&mut contents).is_err() {
+        return "NONE".to_string();
+    }
+    for line in contents.lines() {
+        let Some((key, raw)) = line.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("Implementation-Version") {
+            continue;
+        }
+        let raw = raw.trim();
+        if raw.is_empty() || raw.contains("task ':jar' property 'archiveVersion'") {
+            return "NONE".to_string();
+        }
+        return raw.to_string();
+    }
+    "NONE".to_string()
+}
+
 fn parse_mod_meta_archive<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
 ) -> Option<ModMetaResult> {
-    // Try fabric.mod.json
+    // Fabric metadata wins when it carries a real version. Some multi-loader
+    // jars ship a Fabric descriptor with an unexpanded `${version}` next to a
+    // Forge/NeoForge mods.toml that has the actual version; Prism parses the
+    // descriptor it meets first in the archive (usually mods.toml), so keep
+    // the Fabric result as a fallback instead of returning an empty version.
+    let mut fabric_meta = None;
     if let Ok(mut file) = archive.by_name("fabric.mod.json") {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
@@ -2151,7 +2168,7 @@ fn parse_mod_meta_archive<R: std::io::Read + std::io::Seek>(
                         .to_string();
                     clean
                 });
-                return Some(ModMetaResult {
+                fabric_meta = Some(ModMetaResult {
                     name: instances::strip_minecraft_color_codes(&name),
                     version,
                     provider: "Fabric".into(),
@@ -2161,7 +2178,17 @@ fn parse_mod_meta_archive<R: std::io::Read + std::io::Seek>(
             }
         }
     }
+    if fabric_meta
+        .as_ref()
+        .is_some_and(|m| version_is_real(&m.version))
+    {
+        return fabric_meta;
+    }
 
+    // Forge/NeoForge packs commonly put `${file.jarVersion}` in mods.toml;
+    // Prism resolves it from the JAR manifest instead of showing the
+    // placeholder. Read it once for both the TOML and line-based parsers.
+    let manifest_version = read_manifest_version(archive);
     for toml_name in &["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
         if let Ok(mut file) = archive.by_name(toml_name) {
             let mut contents = String::new();
@@ -2195,11 +2222,14 @@ fn parse_mod_meta_archive<R: std::io::Read + std::io::Seek>(
                             )
                             .unwrap_or(&mod_id)
                             .to_string();
-                            let version = picked
+                            let mut version = picked
                                 .get("version")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Unknown")
                                 .to_string();
+                            if version == "${file.jarVersion}" {
+                                version = manifest_version.clone();
+                            }
                             let logo = picked
                                 .get("logoFile")
                                 .and_then(|v| v.as_str())
@@ -2225,8 +2255,11 @@ fn parse_mod_meta_archive<R: std::io::Read + std::io::Seek>(
                 let display_name = extract_toml_field(&contents, "displayName")
                     .and_then(|name| usable_mod_name(&name, Some(&mod_id)).map(str::to_string))
                     .unwrap_or_else(|| mod_id.clone());
-                let version =
+                let mut version =
                     extract_toml_field(&contents, "version").unwrap_or("Unknown".to_string());
+                if version == "${file.jarVersion}" {
+                    version = manifest_version.clone();
+                }
                 let logo = extract_toml_field(&contents, "logoFile");
                 let provider = if toml_name.contains("neoforge") {
                     "NeoForge"
@@ -2293,7 +2326,9 @@ fn parse_mod_meta_archive<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    None
+    // No Forge/legacy metadata: keep the Fabric descriptor even when its
+    // version is a placeholder, so the mod still gets its real name/icon.
+    fabric_meta
 }
 
 fn strip_toml_comment(val: &str) -> &str {
@@ -2859,6 +2894,93 @@ version="1.0.0"
     }
 
     #[test]
+    fn mod_version_comes_from_jar_not_sidecar_packwiz_or_filename() {
+        let dir = test_dir("mod-version");
+        let filename = "sound-physics-remastered-1.21.1-1.4.8.jar";
+        let jar = dir.join(filename);
+        write_jar(
+            &jar,
+            &[(
+                "fabric.mod.json",
+                r#"{"id":"sound_physics_remastered","name":"Sound Physics Remastered","version":"1.4.8+1.21.1"}"#,
+            )],
+        );
+        std::fs::create_dir_all(dir.join(".index")).unwrap();
+        std::fs::write(
+            dir.join(".index").join("sound.voidlauncher.json"),
+            r#"{"provider":"modrinth","project_id":"sound","project_name":"Sound Physics Remastered","version_number":"[FABRIC] [1.21.1] Sound Physics Remastered 1.4.8"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".index").join("sound.pw.toml"),
+            format!(
+                "filename = '{filename}'\nname = 'Sound Physics Remastered'\nx-prismlauncher-version-number = '9.9.9'\n[update.modrinth]\nmod-id = 'sound'\n"
+            ),
+        )
+        .unwrap();
+
+        let pw = instances::load_packwiz_index(&dir);
+        let meta = build_mod_metadata(
+            &dir,
+            &pw,
+            &ProjectNameCache::new(),
+            &ModFileEntry {
+                path: jar,
+                filename: filename.into(),
+                enabled: true,
+                mtime: UNIX_EPOCH,
+                size: 0,
+            },
+        );
+
+        assert_eq!(meta.version, "1.4.8+1.21.1");
+        assert_eq!(meta.provider, "Modrinth");
+        assert_eq!(meta.name, "Sound Physics Remastered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_mod_keeps_packwiz_name_version_and_provider() {
+        let dir = test_dir("disabled-mod-meta");
+        let filename = "Resourcify (26.3-fabric)-1.8.7.jar.disabled";
+        let jar = dir.join(filename);
+        write_jar(
+            &jar,
+            &[(
+                "fabric.mod.json",
+                r#"{"id":"resourcify","name":"Resourcify","version":"1.8.7"}"#,
+            )],
+        );
+        std::fs::create_dir_all(dir.join(".index")).unwrap();
+        std::fs::write(
+            dir.join(".index").join("resourcify.pw.toml"),
+            "filename = 'Resourcify (26.3-fabric)-1.8.7.jar'\nname = 'Resourcify'\nx-prismlauncher-version-number = '1.8.7'\n[update.modrinth]\nmod-id = 'RLzHAoZe'\n",
+        )
+        .unwrap();
+
+        let pw = instances::load_packwiz_index(&dir);
+        let meta = build_mod_metadata(
+            &dir,
+            &pw,
+            &ProjectNameCache::new(),
+            &ModFileEntry {
+                path: jar,
+                filename: filename.into(),
+                enabled: false,
+                mtime: UNIX_EPOCH,
+                size: 0,
+            },
+        );
+
+        assert!(!meta.enabled);
+        assert_eq!(meta.name, "Resourcify");
+        assert_eq!(meta.version, "1.8.7");
+        assert_eq!(meta.provider, "Modrinth");
+        assert_eq!(meta.project_id.as_deref(), Some("RLzHAoZe"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn project_titles_are_cleaned_and_filtered() {
         assert_eq!(
             clean_project_title("L_Ender 's Cataclysm").as_deref(),
@@ -2916,6 +3038,99 @@ version="2.3"
         assert_eq!(meta.slug.as_deref(), Some("coolmod"));
         assert_eq!(meta.version, "2.3");
         assert_eq!(meta.provider, "Forge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forge_placeholder_version_resolves_from_manifest() {
+        let dir = test_dir("forge-manifest-version");
+        let jar = dir.join("aether.jar");
+        write_jar(
+            &jar,
+            &[
+                (
+                    "META-INF/MANIFEST.MF",
+                    "Manifest-Version: 1.0\r\nImplementation-Version: 1.20.1-1.5.2-neoforge\r\n\r\n",
+                ),
+                (
+                    "META-INF/neoforge.mods.toml",
+                    r#"
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="aether"
+displayName="The Aether"
+version="${file.jarVersion}"
+"#,
+                ),
+            ],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.version, "1.20.1-1.5.2-neoforge");
+        assert_eq!(meta.provider, "NeoForge");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forge_placeholder_without_manifest_version_shows_none() {
+        let dir = test_dir("forge-manifest-none");
+        let jar = dir.join("oldforge.jar");
+        write_jar(
+            &jar,
+            &[
+                ("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n\n"),
+                (
+                    "META-INF/mods.toml",
+                    r#"
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="oldforge"
+displayName="Old Forge Mod"
+version="${file.jarVersion}"
+"#,
+                ),
+            ],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.version, "NONE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_loader_jar_prefers_forge_version_over_fabric_placeholder() {
+        let dir = test_dir("multi-loader-version");
+        let jar = dir.join("autochefsdelight.jar");
+        write_jar(
+            &jar,
+            &[
+                (
+                    "fabric.mod.json",
+                    r#"{"id":"autochefsdelight","name":"Autochef's Delight","version":"${version}"}"#,
+                ),
+                (
+                    "META-INF/mods.toml",
+                    r#"
+modLoader="javafml"
+loaderVersion="[40,)"
+license="ARR"
+
+[[mods]]
+modId="autochefsdelight"
+version="1.0.7+forge"
+displayName="Autochef's Delight"
+"#,
+                ),
+            ],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.version, "1.0.7+forge");
+        assert_eq!(meta.provider, "Forge");
+        assert_eq!(meta.name, "Autochef's Delight");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
