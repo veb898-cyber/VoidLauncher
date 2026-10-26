@@ -121,6 +121,7 @@ pub fn run() {
 
     download::set_global_proxy(config.proxy_url());
     atlauncher::set_atl_cache_dir(config.data_dir.clone());
+    modloaders::prism_meta::set_cache_dir(config.data_dir.clone());
 
     tracing::info!(target: "launcher", "Data dir: {}", data_dir.display());
     tracing::info!(target: "launcher", "Config: data_dir={}, default_memory_mb={}, gc={}",

@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::accounts::{self, AccountEntry, AccountType};
@@ -514,41 +515,82 @@ fn cape_cache_path(data_dir: &std::path::Path, url: &str) -> Option<std::path::P
 
 /// Download a cape texture (a few KB) or serve it from the disk cache as a
 /// PNG data URL.
+///
+/// Cape texture URLs are content-addressed (the last path segment is the
+/// texture hash), so a cached file can never serve outdated art. Any valid
+/// cached PNG is therefore served immediately, even if its mtime is old —
+/// this is what makes the worn cape appear on the very first frame and
+/// survive a flaky connection.
 async fn fetch_cape_png_cached(data_dir: &std::path::Path, url: &str) -> Option<String> {
     let path = cape_cache_path(data_dir, url);
     if let Some(p) = &path {
-        if cache_is_fresh(p) {
-            if let Ok(bytes) = std::fs::read(p) {
-                if png_bytes_ok(&bytes) {
-                    return Some(data_url(&bytes));
+        if let Ok(bytes) = std::fs::read(p) {
+            if png_bytes_ok(&bytes) {
+                return Some(data_url(&bytes));
+            }
+            // A truncated/corrupt cache file must not shadow a fresh
+            // download forever.
+            let _ = std::fs::remove_file(p);
+        }
+    }
+    match fetch_skin_capped(url).await {
+        Some(bytes) => {
+            if let Some(p) = &path {
+                let _ = std::fs::create_dir_all(p.parent().unwrap_or(data_dir));
+                if let Err(e) = std::fs::write(p, &bytes) {
+                    tracing::warn!(target: "launcher", "Could not cache cape texture: {}", e);
                 }
             }
+            Some(data_url(&bytes))
+        }
+        None => {
+            tracing::warn!(target: "launcher", "Could not download cape texture: {}", url);
+            None
         }
     }
-    let bytes = fetch_skin_capped(url).await?;
-    if let Some(p) = &path {
-        let _ = std::fs::create_dir_all(p.parent().unwrap_or(data_dir));
-        if let Err(e) = std::fs::write(p, &bytes) {
-            tracing::warn!(target: "launcher", "Could not cache cape texture: {}", e);
-        }
-    }
-    Some(data_url(&bytes))
 }
 
-/// GET the official profile for a Minecraft token.
-async fn fetch_ms_profile(token: &str) -> Option<serde_json::Value> {
-    let client = crate::download::global_http_client().ok()?;
-    let resp = crate::download::send_with_fallback(
-        client
+/// GET the official profile for a Minecraft token. Returns a descriptive
+/// error (HTTP status + short body, or the transport error) so the in-app
+/// log can explain WHY capes failed instead of a generic message.
+async fn fetch_ms_profile(token: &str) -> Result<serde_json::Value, String> {
+    let client = crate::download::global_http_client().map_err(|e| e.to_string())?;
+    let mut last_err = String::new();
+    for attempt in 1..=2u32 {
+        let req = client
             .get("https://api.minecraftservices.com/minecraft/profile")
-            .header("Authorization", format!("Bearer {}", token)),
-    )
-    .await
-    .ok()?;
-    if !resp.status().is_success() {
-        return None;
+            .header("Authorization", format!("Bearer {}", token))
+            .timeout(Duration::from_secs(15));
+        match crate::download::send_with_fallback(req).await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    match resp.json().await {
+                        Ok(json) => return Ok(json),
+                        Err(e) => last_err = format!("invalid profile response: {}", e),
+                    }
+                } else {
+                    let code = status.as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    let body = body.chars().take(200).collect::<String>();
+                    last_err = if body.is_empty() {
+                        format!("Minecraft profile request failed (HTTP {})", code)
+                    } else {
+                        format!("Minecraft profile request failed (HTTP {}): {}", code, body)
+                    };
+                    // A rejected token will not become valid on retry.
+                    if code == 401 || code == 403 {
+                        return Err(last_err);
+                    }
+                }
+            }
+            Err(e) => last_err = format!("Minecraft profile request failed: {}", e),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
     }
-    resp.json().await.ok()
+    Err(last_err)
 }
 
 /// Turn parsed cape tuples into renderer-ready entries, downloading each cape
@@ -595,8 +637,77 @@ async fn fetch_capes_meta(
     }
     let json = fetch_ms_profile(&token)
         .await
-        .ok_or("Could not load the Minecraft profile")?;
+        .map_err(|e| format!("Could not load the Minecraft profile: {}", e))?;
     Ok(capes_from_profile(&json))
+}
+
+/// How long on-disk cape metadata may answer without a network round-trip.
+/// In-launcher cape switches rewrite this file immediately, so it only
+/// delays noticing changes made on another device.
+const CAPE_META_DISK_TTL_SECS: u64 = 6 * 3600;
+
+/// On-disk cape metadata, so the picker and the worn cape survive an app
+/// restart even when the profile endpoint is unreachable at startup.
+type CapeTuple = (String, String, bool, String);
+
+#[derive(Serialize, Deserialize)]
+struct CapeMetaFile {
+    fetched_at: u64,
+    capes: Vec<CapeTuple>,
+}
+
+fn cape_meta_path(data_dir: &std::path::Path, account_id: &str) -> Option<std::path::PathBuf> {
+    // Account ids are opaque strings; keep the file name to a safe alphabet.
+    let safe: String = account_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if safe.is_empty() {
+        return None;
+    }
+    Some(data_dir.join("capes").join(format!("meta-{}.json", safe)))
+}
+
+fn save_cape_meta(data_dir: &std::path::Path, account_id: &str, capes: &[CapeTuple]) {
+    let Some(path) = cape_meta_path(data_dir, account_id) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(target: "launcher", "Could not create cape cache dir: {}", e);
+            return;
+        }
+    }
+    let payload = CapeMetaFile {
+        fetched_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        capes: capes.to_vec(),
+    };
+    match serde_json::to_vec(&payload) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                tracing::warn!(target: "launcher", "Could not save cape metadata: {}", e);
+            }
+        }
+        Err(e) => tracing::warn!(target: "launcher", "Could not serialize cape metadata: {}", e),
+    }
+}
+
+fn load_cape_meta(data_dir: &std::path::Path, account_id: &str) -> Option<(Vec<CapeTuple>, u64)> {
+    let path = cape_meta_path(data_dir, account_id)?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let parsed: CapeMetaFile = serde_json::from_str(&raw).ok()?;
+    Some((parsed.capes, parsed.fetched_at))
+}
+
+fn cape_meta_is_fresh(fetched_at: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(fetched_at) < CAPE_META_DISK_TTL_SECS
 }
 
 /// List the capes owned by a Microsoft account. A fresh cached list answers
@@ -607,9 +718,12 @@ async fn fetch_capes_meta(
 /// yields an empty list.
 #[tauri::command]
 pub async fn cmd_get_player_capes(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     account_id: String,
+    force: Option<bool>,
 ) -> Result<Vec<CapeInfo>, String> {
+    let force = force.unwrap_or(false);
     let (account, data_dir) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let account = accounts::list_accounts(&config.data_dir)
@@ -621,18 +735,53 @@ pub async fn cmd_get_player_capes(
     if account.account_type != AccountType::Microsoft {
         return Ok(Vec::new());
     }
-    // Fresh cache: instant answer, no request to the rate-limited profile
-    // endpoint (textures still come from the per-hash disk cache).
-    if let Some(tuples) = cape_cache_get(&account_id) {
-        return Ok(fetch_cape_infos(tuples, &data_dir).await);
+    // Fresh memory cache: instant answer, no request to the rate-limited
+    // profile endpoint (textures still come from the per-hash disk cache).
+    if !force {
+        if let Some(tuples) = cape_cache_get(&account_id) {
+            return Ok(fetch_cape_infos(tuples, &data_dir).await);
+        }
+        // Disk metadata written by an earlier session: answer immediately,
+        // so capes appear on the first frame even on a broken connection.
+        if let Some((tuples, fetched_at)) = load_cape_meta(&data_dir, &account_id) {
+            if cape_meta_is_fresh(fetched_at) {
+                cape_cache_store(&account_id, &tuples);
+                return Ok(fetch_cape_infos(tuples, &data_dir).await);
+            }
+        }
     }
     match fetch_capes_meta(state.inner(), &account).await {
         Ok(tuples) => {
             cape_cache_store(&account_id, &tuples);
+            save_cape_meta(&data_dir, &account_id, &tuples);
             Ok(fetch_cape_infos(tuples, &data_dir).await)
         }
         Err(e) => {
             tracing::warn!(target: "launcher", "Could not load capes for '{}': {}", account.name, e);
+            // The profile endpoint being down must not empty the picker or
+            // the worn cape: serve the last successfully saved list (its
+            // textures are content-addressed and cached on disk).
+            if let Some((tuples, _)) = load_cape_meta(&data_dir, &account_id) {
+                crate::events::emit_log(
+                    &app,
+                    "warn",
+                    "accounts",
+                    &format!(
+                        "Could not refresh capes for '{}': {} — showing the last saved list",
+                        account.name, e
+                    ),
+                );
+                cape_cache_store(&account_id, &tuples);
+                return Ok(fetch_cape_infos(tuples, &data_dir).await);
+            }
+            // No cached list either: surface the reason in the in-app log
+            // (tracing alone only reaches the file log).
+            crate::events::emit_log(
+                &app,
+                "error",
+                "accounts",
+                &format!("Could not load capes for '{}': {}", account.name, e),
+            );
             Err(e)
         }
     }
@@ -707,12 +856,17 @@ pub async fn cmd_set_player_cape(
         Ok(j) => j,
         Err(_) => fetch_ms_profile(&token)
             .await
-            .ok_or("Could not reload the Minecraft profile")?,
+            .map_err(|e| format!("Could not reload the Minecraft profile: {}", e))?,
     };
     // The switch response carries the updated list: memoize it so re-entering
     // the page right after a change does not re-fetch the profile.
     let tuples = capes_from_profile(&json);
     cape_cache_store(&account_id, &tuples);
+    let data_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.data_dir.clone()
+    };
+    save_cape_meta(&data_dir, &account_id, &tuples);
     Ok(capes_meta_from_tuples(tuples))
 }
 
@@ -968,5 +1122,45 @@ mod tests {
         assert!(meta[0].active);
         assert!(meta[0].png.is_empty());
         assert!(!meta[1].active);
+    }
+
+    #[test]
+    fn cape_meta_roundtrips_and_sanitizes_account_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher-cape-meta-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let tuples = vec![
+            (
+                "c1".to_string(),
+                "Migrator".to_string(),
+                true,
+                "https://x/a".to_string(),
+            ),
+            (
+                "c2".to_string(),
+                "Vanilla".to_string(),
+                false,
+                "https://x/b".to_string(),
+            ),
+        ];
+        save_cape_meta(&dir, "acct-1", &tuples);
+        let (loaded, fetched_at) = load_cape_meta(&dir, "acct-1").expect("meta file must load");
+        assert_eq!(loaded, tuples);
+        assert!(cape_meta_is_fresh(fetched_at));
+        assert!(!cape_meta_is_fresh(0));
+
+        let path = cape_meta_path(&dir, "../evil").expect("sanitized path");
+        assert!(path.starts_with(dir.join("capes")));
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("meta-evil.json")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

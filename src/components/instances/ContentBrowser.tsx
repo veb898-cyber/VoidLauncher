@@ -132,7 +132,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const curseforgeApiKey = useSettingsStore((s) => s.config?.curseforge_api_key);
   const [sortMode, setSortMode] = useState<SortMode>('downloads');
   // Modrinth has no "oldest" index; we request newest and page backwards.
-  // CurseForge does support ascending lastUpdated, so it pages normally.
+  // CurseForge supports ascending creation-date order, so it pages normally.
   const emulateOldest = providerId === 'modrinth' && sortMode === 'oldest';
   const sortIndex =
     providerId === 'curseforge'
@@ -245,6 +245,20 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const detailReqRef = useRef(0);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hadSearchRef = useRef(false);
+
+  // A filter change rebuilds the results list, so the open description must
+  // close with it: the project may not be part of the new results, and a late
+  // detail response must not re-open the pane on top of a fresh list. The
+  // provider switch has its own reset above; search resets it in
+  // `runSearch`/`resetToPopular`.
+  useEffect(() => {
+    ++detailReqRef.current;
+    setSelected(null);
+    setModDetail(null);
+    setVersions([]);
+    setLoadingDetail(false);
+    setVersionLimit(20);
+  }, [sortMode, contentType, mcVersion, loader]);
 
   const loadPopular = useCallback(async () => {
     const reqId = ++popularReqRef.current;

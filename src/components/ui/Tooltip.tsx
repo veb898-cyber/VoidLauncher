@@ -6,18 +6,26 @@ interface TooltipProps {
   children: ReactNode;
   /** Which side of the trigger the bubble appears on. Defaults to right. */
   side?: 'top' | 'bottom' | 'left' | 'right';
-  /** Delay before showing, ms. Defaults to 150. */
+  /** Delay before showing, ms. Defaults to 700. */
   delay?: number;
 }
 
 const GAP = 8;
 
 /**
+ * Hover hints must not flash while the cursor travels across a row of
+ * buttons. Windows/Chromium show native tooltips after ~1 s; the previous
+ * 150 ms made every pass over the sidebar pop a label, so the hint now
+ * appears only when the user actually rests on a control.
+ */
+const DEFAULT_DELAY_MS = 700;
+
+/**
  * Lightweight, theme-aware hover hint. Inherits `--font-ui` and the active
  * theme; the bubble is rendered through a portal so it is never clipped by
  * ancestors with overflow. Opens on hover/focus, closes on leave/blur/Escape.
  */
-export function Tooltip({ content, children, side = 'right', delay = 150 }: TooltipProps) {
+export function Tooltip({ content, children, side = 'right', delay = DEFAULT_DELAY_MS }: TooltipProps) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState({ top: 0, left: 0 });
   const triggerRef = useRef<HTMLSpanElement>(null);

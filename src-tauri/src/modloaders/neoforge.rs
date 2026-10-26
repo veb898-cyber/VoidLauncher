@@ -106,8 +106,9 @@ struct NeoForgeArguments {
 /// the parsed 1633-entry index on first request so every page
 /// after the first is instant.
 ///
-/// On fetch/parse failure the underlying `prism_meta` call logs the
-/// error and returns an empty page with `total = 0`.
+/// On fetch/parse failure the underlying `prism_meta` call returns an
+/// error; the wizard shows it with a retry button (a stale disk cache is
+/// used first when available).
 pub async fn get_loader_versions(
     mc_version: &str,
     offset: usize,

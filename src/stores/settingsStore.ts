@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 
-interface AppConfig {
+export interface AppConfig {
   data_dir: string;
   /** Azure client ID — only used by Rust; not editable in the UI. */
   client_id: string;
@@ -22,7 +22,7 @@ interface AppConfig {
   curseforge_api_key: string;
 }
 
-interface JavaInstallation {
+export interface JavaInstallation {
   path: string;
   version: string;
   major_version: number;

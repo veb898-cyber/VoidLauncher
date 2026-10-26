@@ -417,6 +417,11 @@ export function Accounts() {
                 <div style={{ fontWeight: 600, marginBottom: 'var(--space-sm)' }}>
                   {t('accounts.capes_title')}
                 </div>
+                {capesError && capes.length > 0 && (
+                  <div style={{ marginBottom: 'var(--space-sm)', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                    {t('accounts.capes_refresh_error', { error: capesError })}
+                  </div>
+                )}
                 {capesLoading && capes.length === 0 ? (
                   <div style={{ display: 'flex', justifyContent: 'center', padding: 'var(--space-md)' }}>
                     <LoadingSpinner size={18} />

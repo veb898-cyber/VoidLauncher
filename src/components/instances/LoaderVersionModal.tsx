@@ -192,19 +192,29 @@ export function LoaderVersionModal({
             </span>
           ) : (
             <div className="loader-version-list">
-              {versions.map((v) => (
-                <button
-                  key={v.version}
-                  type="button"
-                  className={`loader-version-item${selected === v.version ? ' loader-version-item--selected' : ''}`}
-                  onClick={() => setSelected(v.version)}
-                >
-                  <span>{v.version}</span>
-                  {v.stable && (
-                    <span className="loader-version-item__badge">{t('loader_update.stable')}</span>
-                  )}
-                </button>
-              ))}
+              {versions.map((v) => {
+                const isCurrent = v.version === currentVersion;
+                return (
+                  <button
+                    key={v.version}
+                    type="button"
+                    className={`loader-version-item${selected === v.version ? ' loader-version-item--selected' : ''}${isCurrent ? ' loader-version-item--current' : ''}`}
+                    onClick={() => setSelected(v.version)}
+                  >
+                    <span>{v.version}</span>
+                    <span className="loader-version-item__badges">
+                      {isCurrent && (
+                        <span className="loader-version-item__badge loader-version-item__badge--current">
+                          {t('loader_update.installed')}
+                        </span>
+                      )}
+                      {v.stable && (
+                        <span className="loader-version-item__badge">{t('loader_update.stable')}</span>
+                      )}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
           )
         )}

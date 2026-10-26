@@ -45,26 +45,178 @@ use crate::error::{LauncherError, Result};
 use crate::modloaders::{LoaderVersion, LoaderVersionPage};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Public base of the Prism metadata mirror. Prism's own
 /// `CMakeLists.txt:204` hard-codes the same URL.
 const META_BASE: &str = "https://meta.prismlauncher.org/v1";
 
-/// Per-request HTTP timeout. 60s is generous (Prism's biggest file
-/// is Forge's index at ~2 MB and takes ~3-5s from a cold cache) but
-/// matches the timeout we used pre-cache so behavior is consistent
-/// for users who manage to evict the cache between page fetches.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-request HTTP timeout. Prism's biggest file is Forge's index at
+/// ~2 MB and normally takes a few seconds; 15s is enough on a slow but
+/// working connection and keeps a dead mirror from stalling the wizard
+/// for a minute. The wizard adds its own 20s guard on top.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a disk-cached index is trusted without a network refresh.
+/// Loader release cadence is measured in days, so half a day of cache
+/// costs nothing in practice and makes repeat launches instant.
+const DISK_CACHE_TTL: Duration = Duration::from_secs(12 * 3600);
 
 /// Cached parsed index per `uid` (e.g. `net.minecraftforge`).
 type CachedIndex = Arc<Vec<PrismVersionEntry>>;
 
 static INDEX_CACHE: OnceLock<Mutex<HashMap<String, CachedIndex>>> = OnceLock::new();
+/// One async lock per `uid`: concurrent calls (the wizard's first page and
+/// an immediate scroll tick) wait for the same fetch instead of downloading
+/// the 2 MB Forge index twice.
+static INDEX_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+/// `<data_dir>/cache/prism-meta` — set once at startup.
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point the disk cache at the launcher data directory. Safe to call more
+/// than once; the first call wins.
+pub fn set_cache_dir(data_dir: PathBuf) {
+    let _ = CACHE_DIR.set(data_dir.join("cache").join("prism-meta"));
+}
 
 fn index_cache() -> &'static Mutex<HashMap<String, CachedIndex>> {
     INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn memory_lookup(uid: &str) -> Option<CachedIndex> {
+    index_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(uid)
+        .cloned()
+}
+
+fn memory_store(uid: &str, entries: &CachedIndex) {
+    index_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(uid.to_string(), entries.clone());
+}
+
+fn index_lock(uid: &str) -> Arc<tokio::sync::Mutex<()>> {
+    INDEX_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(uid.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn disk_cache_path(uid: &str) -> Option<PathBuf> {
+    let dir = CACHE_DIR.get()?;
+    let safe: String = uid
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(dir.join(format!("{}.json", safe)))
+}
+
+/// Read the cached index body. `max_age = None` accepts any age (used as a
+/// last-resort fallback when the mirror is unreachable).
+fn read_disk_cache(uid: &str, max_age: Option<Duration>) -> Option<String> {
+    let path = disk_cache_path(uid)?;
+    let meta = std::fs::metadata(&path).ok()?;
+    if let Some(max_age) = max_age {
+        let modified = meta.modified().ok()?;
+        let age = SystemTime::now().duration_since(modified).ok()?;
+        if age > max_age {
+            return None;
+        }
+    }
+    std::fs::read_to_string(&path).ok()
+}
+
+fn write_disk_cache(uid: &str, body: &str) {
+    let Some(path) = disk_cache_path(uid) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(
+                target: "launcher",
+                "Failed to create Prism meta cache dir (uid={}): {}",
+                uid, e
+            );
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&path, body) {
+        tracing::warn!(
+            target: "launcher",
+            "Failed to write Prism meta cache (uid={}): {}",
+            uid, e
+        );
+    }
+}
+
+fn parse_index(uid: &str, body: &str) -> Result<CachedIndex> {
+    let index: PrismIndex = serde_json::from_str(body).map_err(|e| {
+        // Log the first 400 chars of the body so the next time Prism
+        // changes its schema we can see *what* changed in the launcher
+        // log file (`%LOCALAPPDATA%\VoidLauncher\logs\launcher-*.log`),
+        // not just "deserialize failed".
+        let preview: String = body.chars().take(400).collect();
+        tracing::error!(
+            target: "launcher",
+            "Failed to parse Prism meta index (uid={}): {} — body: {}",
+            uid, e, preview
+        );
+        LauncherError::Json(e)
+    })?;
+    Ok(Arc::new(index.versions))
+}
+
+async fn fetch_index_body(uid: &str) -> Result<String> {
+    let client = crate::download::global_http_client()?;
+    let url = format!("{}/{}/index.json", META_BASE, uid);
+    // send_with_fallback retries through a real proxy-free client when the
+    // configured proxy can't reach this host (VPN proxies often whitelist
+    // only some domains) — without it every loader list would silently
+    // come back empty on such networks.
+    let resp = crate::download::send_with_fallback(client.get(&url).timeout(REQUEST_TIMEOUT))
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "launcher",
+                "Failed to fetch Prism meta index (uid={}): {}",
+                uid, e
+            );
+            LauncherError::Network(e)
+        })?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        tracing::error!(
+            target: "launcher",
+            "Prism meta index request failed (uid={}): HTTP {}",
+            uid, status
+        );
+        return Err(LauncherError::ModLoader(format!(
+            "Prism metadata request failed with HTTP {}",
+            status
+        )));
+    }
+    resp.text().await.map_err(|e| {
+        tracing::error!(
+            target: "launcher",
+            "Failed to read Prism meta index body (uid={}): {}",
+            uid, e
+        );
+        LauncherError::Network(e)
+    })
 }
 
 /// Top-level shape of `<uid>/index.json` — the same for every loader.
@@ -72,10 +224,10 @@ fn index_cache() -> &'static Mutex<HashMap<String, CachedIndex>> {
 struct PrismIndex {
     /// Prism's JSON key is `formatVersion` (camelCase). Without the
     /// rename, serde silently fails to deserialize the *whole* index
-    /// (the field is required, no default) and our `match` in
-    /// `fetch_loader_versions` swallows the error into an empty list
-    /// — which is what made every loader look empty in the wizard
-    /// until this rename was added. Don't drop the rename.
+    /// (the field is required, no default) and the wizard reports an
+    /// error for the whole loader list — which is what made every loader
+    /// look empty in the wizard until this rename was added. Don't drop
+    /// the rename.
     #[serde(rename = "formatVersion", default)]
     #[allow(dead_code)]
     format_version: u32,
@@ -144,62 +296,80 @@ fn is_prerelease(version: &str) -> bool {
         || v.contains("-dev")
 }
 
-/// Get the cached parsed index for `uid`, fetching + parsing the
-/// mirror JSON on first call. Subsequent calls return the cached
-/// `Arc` clone (O(1)).
+/// Get the parsed index for `uid`.
+///
+/// 1. In-memory cache (instant; all pagination after the first page).
+/// 2. Fresh disk cache (< 12h) — repeat launches skip the network.
+/// 3. Network fetch with a 15s timeout, written back to memory + disk.
+/// 4. On a network/parse failure, a stale disk cache is served so a
+///    flaky connection cannot empty the loader list.
+///
+/// Concurrent callers for the same `uid` wait on one fetch instead of
+/// starting their own.
 async fn get_or_fetch_index(uid: &str) -> Result<CachedIndex> {
-    {
-        let cache = index_cache()
-            .lock()
-            .map_err(|e| LauncherError::ModLoader(format!("Prism meta cache lock: {}", e)))?;
-        if let Some(cached) = cache.get(uid).cloned() {
-            return Ok(cached);
+    if let Some(cached) = memory_lookup(uid) {
+        return Ok(cached);
+    }
+
+    let lock = index_lock(uid);
+    let _guard = lock.lock().await;
+    if let Some(cached) = memory_lookup(uid) {
+        return Ok(cached);
+    }
+
+    if let Some(body) = read_disk_cache(uid, Some(DISK_CACHE_TTL)) {
+        match parse_index(uid, &body) {
+            Ok(entries) => {
+                memory_store(uid, &entries);
+                return Ok(entries);
+            }
+            Err(e) => tracing::warn!(
+                target: "launcher",
+                "Ignoring unreadable Prism meta disk cache (uid={}): {}",
+                uid, e
+            ),
         }
     }
-    let client = crate::download::global_http_client()?;
-    let url = format!("{}/{}/index.json", META_BASE, uid);
-    // send_with_fallback retries through a real proxy-free client when the
-    // configured proxy can't reach this host (VPN proxies often whitelist
-    // only some domains) — without it every loader list would silently
-    // come back empty on such networks.
-    let resp_value = crate::download::send_with_fallback(client.get(&url).timeout(REQUEST_TIMEOUT))
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "launcher",
-                "Failed to fetch Prism meta index (uid={}): {}",
-                uid, e
-            );
-            e
-        })?;
-    let body = resp_value.text().await.map_err(|e| {
-        tracing::error!(
-            target: "launcher",
-            "Failed to read Prism meta index body (uid={}): {}",
-            uid, e
-        );
-        e
-    })?;
-    let index: PrismIndex = serde_json::from_str(&body).map_err(|e| {
-        // Log the first 400 chars of the body so the next time
-        // Prism changes its schema we can see *what* changed in
-        // the launcher log file
-        // (`%LOCALAPPDATA%\VoidLauncher\logs\launcher-*.log`),
-        // not just "deserialize failed".
-        let preview: String = body.chars().take(400).collect();
-        tracing::error!(
-            target: "launcher",
-            "Failed to parse Prism meta index (uid={}): {} — body: {}",
-            uid, e, preview
-        );
-        e
-    })?;
-    let entries = Arc::new(index.versions);
-    index_cache()
-        .lock()
-        .map_err(|e| LauncherError::ModLoader(format!("Prism meta cache lock: {}", e)))?
-        .insert(uid.to_string(), entries.clone());
-    Ok(entries)
+
+    match fetch_index_body(uid).await {
+        Ok(body) => match parse_index(uid, &body) {
+            Ok(entries) => {
+                write_disk_cache(uid, &body);
+                memory_store(uid, &entries);
+                Ok(entries)
+            }
+            Err(parse_err) => {
+                if let Some(entries) = stale_disk_index(uid) {
+                    tracing::warn!(
+                        target: "launcher",
+                        "Prism meta response was unreadable (uid={}): {}; using stale disk cache",
+                        uid, parse_err
+                    );
+                    memory_store(uid, &entries);
+                    return Ok(entries);
+                }
+                Err(parse_err)
+            }
+        },
+        Err(network_err) => {
+            if let Some(entries) = stale_disk_index(uid) {
+                tracing::warn!(
+                    target: "launcher",
+                    "Prism meta unreachable (uid={}): {}; using stale disk cache",
+                    uid, network_err
+                );
+                memory_store(uid, &entries);
+                return Ok(entries);
+            }
+            Err(network_err)
+        }
+    }
+}
+
+/// Any-age disk cache parsed into memory, used only as a last resort.
+fn stale_disk_index(uid: &str) -> Option<CachedIndex> {
+    let body = read_disk_cache(uid, None)?;
+    parse_index(uid, &body).ok()
 }
 
 /// Compare two version strings numerically (semver-style).
@@ -275,25 +445,17 @@ fn page_from(
 /// the same `total` so the wizard can no-op without a second
 /// request.
 ///
-/// On *any* fetch/parse failure we log to the launcher log file
-/// and return an empty page with `total = 0`. This is the same
-/// fail-soft policy as the per-loader `get_loader_versions`
-/// functions.
+/// On a fetch/parse failure the error is returned to the caller so the
+/// wizard can show a real error with a retry button instead of
+/// pretending the loader has zero versions. A stale disk cache is used
+/// before giving up.
 pub async fn fetch_loader_versions(
     uid: &str,
     mc_version: Option<&str>,
     offset: usize,
     limit: usize,
 ) -> Result<LoaderVersionPage> {
-    let entries = match get_or_fetch_index(uid).await {
-        Ok(e) => e,
-        Err(_) => {
-            return Ok(LoaderVersionPage {
-                versions: Vec::new(),
-                total: 0,
-            })
-        }
-    };
+    let entries = get_or_fetch_index(uid).await?;
 
     let (page, total) = page_from(&entries, mc_version, offset, limit);
     tracing::info!(

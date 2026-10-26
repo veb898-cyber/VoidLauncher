@@ -15,6 +15,18 @@ type SkinState =
   | { status: 'error' };
 
 /**
+ * One shared dynamic import for the whole module. The Accounts page is
+ * remounted on every visit to the tab, and a fresh `import()` in each mount
+ * re-resolved the chunk through the network stack — long enough for the
+ * loading plate to be visible again on every return to the tab.
+ */
+let skinviewImport: Promise<typeof import('skinview3d')> | null = null;
+function loadSkinview3d() {
+  if (!skinviewImport) skinviewImport = import('skinview3d');
+  return skinviewImport;
+}
+
+/**
  * Persistent 3D skin preview for the accounts page. The raw skin comes from
  * the same backend pipeline as the 2D avatars (cmd_get_player_head — full
  * PNG, disk-cached per uuid; offline accounts resolve to the bundled vanilla
@@ -112,13 +124,12 @@ export function SkinPreview({
     (async () => {
       try {
         if (!viewerRef.current) {
-          const { SkinViewer, IdleAnimation } = await import('skinview3d');
+          const { SkinViewer, IdleAnimation } = await loadSkinview3d();
           if (disposed) return;
           const v = new SkinViewer({
             canvas,
             width: sizeRef.current.w,
             height: sizeRef.current.h,
-            skin: skinState.skin,
             model: 'auto-detect',
           });
           // Gentle idle breathing only — no auto-rotation by default.
@@ -128,11 +139,20 @@ export function SkinPreview({
           v.autoRotate = false;
           v.controls.enablePan = false;
           viewerRef.current = v;
+          // The texture is loaded BEFORE the canvas is revealed. The
+          // constructor draws its first frames while the skin image is still
+          // decoding, so revealing right away showed an empty plate — which
+          // read as a black rectangle flash on Liquid Glass. `render()` then
+          // guarantees a painted frame sits in the buffer before opacity
+          // flips to 1, so the fade-in never starts from a blank canvas.
+          await v.loadSkin(skinState.skin, { model: 'auto-detect' });
+          if (disposed) return;
           if (capeRef.current) {
             v.loadCape(capeRef.current).catch((e) =>
               console.error('cape load failed:', e)
             );
           }
+          v.render();
           setViewerReady(true);
         } else {
           await viewerRef.current.loadSkin(skinState.skin, { model: 'auto-detect' });
@@ -238,7 +258,11 @@ export function SkinPreview({
                   {t('accounts.skin_viewer_unavailable')}
                 </div>
               ) : (
-                <IconShine style={{ position: 'absolute', inset: 0 }} />
+                // No fill: the stage already sits on the card's own plate, and
+                // the dark --bg-tertiary of `.icon-shine` read as a black
+                // rectangle flashing on Liquid Glass. Only the light sweep is
+                // kept, so loading looks the same without the dark slab.
+                <IconShine style={{ position: 'absolute', inset: 0, background: 'transparent' }} />
               )}
             </div>
           )}

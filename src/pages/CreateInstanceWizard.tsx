@@ -59,6 +59,38 @@ type VersionFilter = 'release' | 'snapshot' | 'all';
 const LOADER_PAGE_SIZE = 20;
 const SCROLL_LOAD_THRESHOLD_PX = 50;
 
+/** A catalog request must never spin forever. The backend has its own
+ *  retry/timeout budget, but a hung socket can outlive it; after this
+ *  budget the well shows an explicit error with a retry button instead of
+ *  an endless skeleton. */
+const CATALOG_REQUEST_TIMEOUT_MS = 20_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Request timed out after ${Math.round(ms / 1000)}s`)),
+      ms,
+    );
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+type LoaderListState = {
+  loading: boolean;
+  error: string | null;
+  total: number | null;
+};
+
+const emptyLoaderStates = (): Record<LoaderType, LoaderListState> => ({
+  Vanilla: { loading: false, error: null, total: null },
+  Fabric: { loading: false, error: null, total: null },
+  Forge: { loading: false, error: null, total: null },
+  NeoForge: { loading: false, error: null, total: null },
+});
+
 type WizardMode = 'new' | 'import';
 type ModeTab = WizardMode | 'modpacks';
 
@@ -70,6 +102,11 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
   // New instance state
   const [versions, setVersions] = useState<VersionEntry[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
+  // Distinguishes "manifest has not arrived yet" from "manifest arrived but
+  // carried no versions": both leave `selectedVersion` empty, but only the
+  // first one may show a loading skeleton indefinitely.
+  const [versionsLoaded, setVersionsLoaded] = useState(false);
   const [selectedVersion, setSelectedVersion] = useState('');
   const [versionFilter, setVersionFilter] = useState<VersionFilter>('release');
   const [searchQuery, setSearchQuery] = useState('');
@@ -78,12 +115,10 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
   const [loaderVersions, setLoaderVersions] = useState<Record<LoaderType, LoaderVersion[]>>({
     Vanilla: [], Fabric: [], Forge: [], NeoForge: [],
   });
-  const [loaderVersionTotals, setLoaderVersionTotals] = useState<Record<LoaderType, number | null>>({
-    Vanilla: null, Fabric: null, Forge: null, NeoForge: null,
-  });
-  const [loaderVersionsLoading, _setLoaderVersionsLoading] = useState(false);
-  const setLoaderVersionsLoading = (v: boolean) => { loaderVersionsLoadingRef.current = v; _setLoaderVersionsLoading(v); };
-  const [loaderVersionsError, setLoaderVersionsError] = useState(false);
+  // Per-loader state: one loader failing (or hanging) must not mark the
+  // others as failed, and switching loaders must never inherit a stale
+  // "loading" flag.
+  const [loaderListState, setLoaderListState] = useState<Record<LoaderType, LoaderListState>>(emptyLoaderStates);
   const [selectedLoaderVersion, setSelectedLoaderVersion] = useState('');
 
   const [instanceName, setInstanceName] = useState('');
@@ -103,12 +138,20 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
   useLogPlaque(importProgress?.message ?? null, 'info', 'import');
 
   const loaderListRef = useRef<HTMLDivElement>(null);
-  const loaderVersionsLoadingRef = useRef(false);
-  // Each loader-list request gets a sequence number. Changing the Minecraft
-  // version (or loader) while a page is still downloading fires a new request;
-  // without this guard the older answer landed afterwards and mixed versions
-  // from the previous game version into the list.
-  const loaderRequestRef = useRef(0);
+  // Each loader-list request gets a sequence number per loader. Changing the
+  // Minecraft version (or loader) while a page is still downloading fires a
+  // new request; without this guard the older answer landed afterwards and
+  // mixed versions from the previous game version into the list.
+  const loaderRequestIds = useRef<Record<LoaderType, number>>({
+    Vanilla: 0, Fabric: 0, Forge: 0, NeoForge: 0,
+  });
+  // In-flight flags are per loader too: a slow Forge request must not block
+  // Fabric/NeoForge from loading, and a reset request must always be allowed
+  // to supersede a hung one.
+  const loaderInFlight = useRef<Record<LoaderType, boolean>>({
+    Vanilla: false, Fabric: false, Forge: false, NeoForge: false,
+  });
+  const versionsRequestRef = useRef(0);
 
   // The dialog must occupy exactly the same frame in both modes (owner: «размер
   // окна … должен быть одинаковый» — a jumping dialog reads as broken). While
@@ -145,8 +188,9 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
     setInstanceName('');
     setIsCreating(false);
     setSearchQuery('');
-    setLoaderVersionsLoading(false);
-    setLoaderVersionsError(false);
+    setVersionsError(null);
+    setVersionsLoaded(false);
+    setLoaderListState(emptyLoaderStates());
     setImportPath(null);
     setImportMeta(null);
     setImportLoading(false);
@@ -158,72 +202,111 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
   };
 
   const fetchVersions = async () => {
+    const reqId = ++versionsRequestRef.current;
     setVersionsLoading(true);
+    setVersionsError(null);
+    setVersionsLoaded(false);
     try {
-      const manifest = await invoke<{ versions: VersionEntry[] }>('cmd_get_versions');
+      const manifest = await withTimeout(
+        invoke<{ versions: VersionEntry[] }>('cmd_get_versions'),
+        CATALOG_REQUEST_TIMEOUT_MS,
+      );
+      if (reqId !== versionsRequestRef.current) return;
       setVersions(manifest.versions);
+      setVersionsLoaded(true);
       if (manifest.versions.length > 0) {
-        setSelectedVersion(manifest.versions.find((v) => v.type === 'release')?.id || manifest.versions[0].id);
+        const fallback = manifest.versions.find((v) => v.type === 'release')?.id || manifest.versions[0].id;
+        setSelectedVersion((prev) =>
+          prev && manifest.versions.some((v) => v.id === prev) ? prev : fallback,
+        );
       }
     } catch (e) {
+      if (reqId !== versionsRequestRef.current) return;
       console.error('Failed to fetch versions:', e);
+      setVersionsError(String(e));
+    } finally {
+      if (reqId === versionsRequestRef.current) setVersionsLoading(false);
     }
-    setVersionsLoading(false);
   };
 
   const fetchLoaderPage = useCallback(async (loader?: LoaderType, resetOffset = false, mcVersionOverride?: string) => {
     const target: LoaderType = loader ?? loaderType;
     if (target === 'Vanilla') return;
-    if (loaderVersionsLoadingRef.current) return;
     const mcVersion = mcVersionOverride ?? selectedVersion;
     if (mcVersion === '') {
       // The Minecraft version list is still loading. Leave the total unset so
       // the retry effect below requests the loader page once it arrives.
       return;
     }
+    if (!resetOffset && loaderInFlight.current[target]) return;
     const offset = resetOffset ? 0 : (loaderVersions[target]?.length ?? 0);
-    const totalKnown = loaderVersionTotals[target];
+    const totalKnown = loaderListState[target].total;
     if (!resetOffset && totalKnown !== null && offset >= totalKnown) return;
-    const reqId = ++loaderRequestRef.current;
-    setLoaderVersionsLoading(true);
-    setLoaderVersionsError(false);
+    // A reset supersedes any request still running for this loader.
+    if (resetOffset) loaderRequestIds.current[target] += 1;
+    const reqId = loaderRequestIds.current[target];
+    loaderInFlight.current[target] = true;
+    setLoaderListState((prev) => ({
+      ...prev,
+      [target]: { ...prev[target], loading: true, error: null },
+    }));
     try {
       let page: LoaderVersionPage;
+      const args = { mcVersion, offset, limit: LOADER_PAGE_SIZE };
       if (target === 'Fabric') {
-        page = await invoke<LoaderVersionPage>('cmd_get_fabric_versions', { mcVersion, offset, limit: LOADER_PAGE_SIZE });
+        page = await withTimeout(
+          invoke<LoaderVersionPage>('cmd_get_fabric_versions', args),
+          CATALOG_REQUEST_TIMEOUT_MS,
+        );
       } else if (target === 'Forge') {
-        page = await invoke<LoaderVersionPage>('cmd_get_forge_versions', { mcVersion, offset, limit: LOADER_PAGE_SIZE });
+        page = await withTimeout(
+          invoke<LoaderVersionPage>('cmd_get_forge_versions', args),
+          CATALOG_REQUEST_TIMEOUT_MS,
+        );
       } else if (target === 'NeoForge') {
-        page = await invoke<LoaderVersionPage>('cmd_get_neoforge_versions', { mcVersion, offset, limit: LOADER_PAGE_SIZE });
+        page = await withTimeout(
+          invoke<LoaderVersionPage>('cmd_get_neoforge_versions', args),
+          CATALOG_REQUEST_TIMEOUT_MS,
+        );
       } else {
         page = { versions: [], total: 0 };
       }
-      if (reqId !== loaderRequestRef.current) return;
-      setLoaderVersions(prev => ({ ...prev, [target]: [...(prev[target] ?? []), ...page.versions] }));
-      setLoaderVersionTotals(prev => ({ ...prev, [target]: page.total }));
+      if (reqId !== loaderRequestIds.current[target]) return;
+      setLoaderVersions(prev => ({
+        ...prev,
+        [target]: offset === 0 ? page.versions : [...(prev[target] ?? []), ...page.versions],
+      }));
+      setLoaderListState(prev => ({
+        ...prev,
+        [target]: { loading: false, error: null, total: page.total },
+      }));
       if (offset === 0 && page.versions.length > 0) {
         setSelectedLoaderVersion(page.versions[0].version);
       }
     } catch (e) {
-      if (reqId !== loaderRequestRef.current) return;
+      if (reqId !== loaderRequestIds.current[target]) return;
       console.error('Failed to fetch loader versions:', e);
-      setLoaderVersionsError(true);
+      setLoaderListState(prev => ({
+        ...prev,
+        [target]: { ...prev[target], loading: false, error: String(e) },
+      }));
     } finally {
-      if (reqId === loaderRequestRef.current) setLoaderVersionsLoading(false);
+      if (reqId === loaderRequestIds.current[target]) loaderInFlight.current[target] = false;
     }
-  }, [loaderType, selectedVersion, loaderVersions, loaderVersionTotals]);
+  }, [loaderType, selectedVersion, loaderVersions, loaderListState]);
 
   // If the user picks a loader before the Minecraft version list finishes
   // loading, the initial request above is skipped. Retry once the version is
   // known; a completed page (even an empty one) or a failure stops the retry.
   useEffect(() => {
     if (!open || mode !== 'new') return;
+    const state = loaderListState[loaderType];
     if (!needsLoaderVersionFetch({
       loader: loaderType,
       mcVersion: selectedVersion,
-      total: loaderVersionTotals[loaderType],
-      loading: loaderVersionsLoading,
-      failed: loaderVersionsError,
+      total: state.total,
+      loading: state.loading,
+      failed: state.error !== null,
     })) return;
     fetchLoaderPage(loaderType, true);
   }, [
@@ -231,37 +314,48 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
     mode,
     loaderType,
     selectedVersion,
-    loaderVersions,
-    loaderVersionTotals,
-    loaderVersionsLoading,
-    loaderVersionsError,
+    loaderListState,
     fetchLoaderPage,
   ]);
+
+  /** Abandon every in-flight loader request (they belong to the old
+   *  Minecraft version / loader). Their late answers are dropped by the
+   *  per-loader request id check. */
+  const invalidateLoaderRequests = () => {
+    loaderRequestIds.current.Fabric += 1;
+    loaderRequestIds.current.Forge += 1;
+    loaderRequestIds.current.NeoForge += 1;
+    loaderInFlight.current = { Vanilla: false, Fabric: false, Forge: false, NeoForge: false };
+  };
 
   const handleVersionSelect = (id: string) => {
     setSelectedVersion(id);
     setSelectedLoaderVersion('');
-    setLoaderVersionsError(false);
+    invalidateLoaderRequests();
     // Loader lists are version-specific — reset them all
     setLoaderVersions({ Vanilla: [], Fabric: [], Forge: [], NeoForge: [] });
-    setLoaderVersionTotals({ Vanilla: null, Fabric: null, Forge: null, NeoForge: null });
-    if (loaderType !== 'Vanilla') {
-      loaderVersionsLoadingRef.current = false;
-      fetchLoaderPage(loaderType, true, id);
-    }
+    setLoaderListState(emptyLoaderStates());
+    if (loaderType !== 'Vanilla') fetchLoaderPage(loaderType, true, id);
   };
 
   const handleLoaderChange = (loader: LoaderType) => {
     setLoaderType(loader);
     setSelectedLoaderVersion('');
-    setLoaderVersionsError(false);
-    loaderVersionsLoadingRef.current = false;
-    if (loader === 'Vanilla') {
-      _setLoaderVersionsLoading(false);
+    invalidateLoaderRequests();
+    if (loader === 'Vanilla') return;
+    // Reuse a page already fetched for this Minecraft version: switching
+    // Forge → Fabric → Forge must be instant, not a new network round-trip.
+    const cached = loaderVersions[loader] ?? [];
+    const known = loaderListState[loader].total;
+    if (known !== null) {
+      setSelectedLoaderVersion(cached[0]?.version ?? '');
       return;
     }
     setLoaderVersions(prev => ({ ...prev, [loader]: [] }));
-    setLoaderVersionTotals(prev => ({ ...prev, [loader]: null }));
+    setLoaderListState(prev => ({
+      ...prev,
+      [loader]: { loading: false, error: null, total: null },
+    }));
     fetchLoaderPage(loader, true);
   };
 
@@ -293,9 +387,21 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
     { id: 'NeoForge', label: t('create_instance.loader_neoforge') },
   ];
 
+  const currentLoaderState = loaderListState[loaderType];
   const currentLoaderVersions = loaderVersions[loaderType] ?? [];
-  const currentLoaderTotal = loaderVersionTotals[loaderType];
+  const currentLoaderTotal = currentLoaderState.total;
   const hasMoreLoaderVersions = currentLoaderTotal === null || currentLoaderVersions.length < currentLoaderTotal;
+  // The loader list cannot start until the Minecraft manifest provides a
+  // version. Three states must not be conflated:
+  //  * manifest still loading             → skeleton;
+  //  * manifest failed or came back empty → explanation + retry;
+  //  * manifest ready                     → skeleton only while this loader's
+  //                                         own request is running.
+  const mcVersionsUnavailable =
+    versionsError !== null || (versionsLoaded && versions.length === 0);
+  const awaitingMcVersions = versionsLoading || (!mcVersionsUnavailable && !versionsLoaded);
+  const loaderSkeleton = !currentLoaderState.error
+    && (awaitingMcVersions || currentLoaderState.loading || currentLoaderState.total === null);
 
   // New instance validation
   const canCreate = mode === 'new' && instanceName.trim() !== '' && selectedVersion !== '' && !isCreating
@@ -560,6 +666,18 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                   <div key={versionFilter} className="animate-content-reveal version-list" style={{ height: 'min(200px, max(64px, calc(85vh - 447px)))', overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
                     {versionsLoading ? (
                       Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} height={32} style={{ marginBottom: 2 }} />)
+                    ) : versionsError && versions.length === 0 ? (
+                      <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                        {t('create_instance.versions_failed')}
+                        <div style={{ marginTop: 4 }}>{t('create_instance.versions_failed_hint')}</div>
+                        <Button variant="secondary" size="sm" onClick={fetchVersions} style={{ marginTop: 8 }}>
+                          {t('create_instance.versions_retry')}
+                        </Button>
+                      </div>
+                    ) : filteredVersions.length === 0 ? (
+                      <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                        {t('create_instance.versions_empty')}
+                      </div>
                     ) : (
                       filteredVersions.map((v) => (
                         <button
@@ -599,11 +717,40 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                     <div key={`${loaderType}-${selectedVersion}`} ref={loaderListRef} onScroll={handleLoaderScroll}
                       className="animate-content-reveal version-list"
                       style={{ height: 'min(168px, max(56px, calc(85vh - 447px)))', width: 0, minWidth: '100%', overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
-                      {loaderVersionsError ? (
+                      {versionsError && selectedVersion === '' ? (
+                        <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                          {t('create_instance.loader_blocked_by_versions', { loader: loaderType })}
+                          <div style={{ marginTop: 4 }}>{t('create_instance.loader_blocked_hint')}</div>
+                          <Button variant="secondary" size="sm" onClick={fetchVersions} style={{ marginTop: 8 }}>
+                            {t('create_instance.versions_retry')}
+                          </Button>
+                        </div>
+                      ) : versionsLoaded && versions.length === 0 ? (
+                        <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                          {t('create_instance.versions_empty')}
+                          <div style={{ marginTop: 4 }}>{t('create_instance.loader_blocked_hint')}</div>
+                          <Button variant="secondary" size="sm" onClick={fetchVersions} style={{ marginTop: 8 }}>
+                            {t('create_instance.versions_retry')}
+                          </Button>
+                        </div>
+                      ) : currentLoaderState.error ? (
                         <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
                           {t('create_instance.loader_versions_failed', { loader: loaderType })}
+                          <div style={{ marginTop: 4, wordBreak: 'break-word' }}>{currentLoaderState.error}</div>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => fetchLoaderPage(loaderType, true)}
+                            style={{ marginTop: 8 }}
+                          >
+                            {t('create_instance.versions_retry')}
+                          </Button>
                         </div>
-                      ) : currentLoaderVersions.length === 0 && !loaderVersionsLoading ? (
+                      ) : loaderSkeleton ? (
+                        Array.from({ length: 3 }).map((_, i) => (
+                          <Skeleton key={i} height={32} style={{ margin: '2px 8px' }} />
+                        ))
+                      ) : currentLoaderVersions.length === 0 ? (
                         <div style={{ padding: '12px', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
                           {t('create_instance.loader_no_versions', { loader: loaderType, version: selectedVersion })}
                           <div style={{ marginTop: 4 }}>{t('create_instance.loader_unsupported_hint')}</div>
@@ -623,15 +770,14 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                               {lv.stable && <span className="version-item__type">{t('create_instance.stable_badge')}</span>}
                             </button>
                           ))}
-                          {loaderVersionsLoading && <Skeleton height={32} style={{ margin: '4px 8px' }} />}
-                          {!loaderVersionsLoading && !hasMoreLoaderVersions && currentLoaderTotal !== null && currentLoaderTotal > 0 && (
+                          {currentLoaderState.loading && <Skeleton height={32} style={{ margin: '4px 8px' }} />}
+                          {!currentLoaderState.loading && !hasMoreLoaderVersions && currentLoaderTotal !== null && currentLoaderTotal > 0 && (
                             <div style={{ padding: '8px', textAlign: 'center', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
                               {t('create_instance.loader_end', { loaded: currentLoaderVersions.length, total: currentLoaderTotal })}
                             </div>
                           )}
                         </>
                       )}
-                      {currentLoaderVersions.length === 0 && loaderVersionsLoading && <Skeleton height={32} style={{ margin: '4px 8px' }} />}
                     </div>
                   )}
                 </div>

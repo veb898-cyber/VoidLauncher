@@ -211,13 +211,18 @@ pub fn class_id_for_project_type(project_type: &str) -> Option<u32> {
 }
 
 /// Map the frontend sort selection onto CF `sortField`/`sortOrder`:
-/// downloads → popularity (2) desc, newest/oldest → lastUpdated (3).
-/// `sortField=3 asc` works, so no last-page emulation is needed for CF.
+/// downloads → total downloads (6) desc, newest/oldest → created date (11).
+/// The official enum is 1 Featured, 2 Popularity, 3 LastUpdated,
+/// 6 TotalDownloads, 11 ReleasedDate. Field 11 is the project's creation
+/// date (the API orders by `dateCreated`), which is what "newest/oldest"
+/// means for a catalog; field 3 would sort by the last file update instead,
+/// pushing old projects to the top whenever they receive a new version.
+/// `sortField=11 asc` works, so no last-page emulation is needed for CF.
 pub fn sort_field_for(index: Option<&str>) -> (u32, &'static str) {
     match index.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        Some("newest") => (3, "desc"),
-        Some("oldest") => (3, "asc"),
-        _ => (2, "desc"),
+        Some("newest") => (11, "desc"),
+        Some("oldest") => (11, "asc"),
+        _ => (6, "desc"),
     }
 }
 
@@ -677,11 +682,11 @@ mod tests {
 
     #[test]
     fn sort_field_for_frontend_index() {
-        assert_eq!(sort_field_for(None), (2, "desc"));
-        assert_eq!(sort_field_for(Some("downloads")), (2, "desc"));
-        assert_eq!(sort_field_for(Some("newest")), (3, "desc"));
-        assert_eq!(sort_field_for(Some("oldest")), (3, "asc"));
-        assert_eq!(sort_field_for(Some("unknown")), (2, "desc"));
+        assert_eq!(sort_field_for(None), (6, "desc"));
+        assert_eq!(sort_field_for(Some("downloads")), (6, "desc"));
+        assert_eq!(sort_field_for(Some("newest")), (11, "desc"));
+        assert_eq!(sort_field_for(Some("oldest")), (11, "asc"));
+        assert_eq!(sort_field_for(Some("unknown")), (6, "desc"));
     }
 
     #[test]

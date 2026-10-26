@@ -142,6 +142,7 @@ export const en = {
   'accounts.cape_none':                'No cape',
   'accounts.cape_update_error':        'Couldn\'t change the cape: {error}',
   'accounts.capes_load_error':         'Couldn\'t load capes: {error}',
+  'accounts.capes_refresh_error':      'Couldn\'t refresh capes: {error}. Showing the saved data.',
 
   // ── Instance List ───────────────────────────────────────────
   'instances.page_title':              'Instances',
@@ -150,7 +151,7 @@ export const en = {
   'instances.ctx_settings':            'Instance Settings',
   'instances.ctx_open_folder':         'Open Folder',
   'instances.ctx_verify':              'Verify Files',
-  'instances.ctx_export':              'Export (Prism)',
+  'instances.ctx_export':              'Export',
   'instances.export_success':          'Instance "{name}" exported',
   'instances.export_error':            'Export failed: {error}',
   'instances.ctx_backup':              'Create Backup',
@@ -241,6 +242,12 @@ export const en = {
   'create_instance.loader_versions_failed': 'Failed to load {loader} version list',
   'create_instance.loader_no_versions':'{loader} is not available for Minecraft {version}',
   'create_instance.loader_unsupported_hint': 'Try another loader or Minecraft version',
+  'create_instance.versions_failed':   'Failed to load the Minecraft version list',
+  'create_instance.versions_failed_hint': 'Check your internet connection and try again.',
+  'create_instance.versions_retry':    'Retry',
+  'create_instance.versions_empty':    'No versions match the selected filter',
+  'create_instance.loader_blocked_by_versions': '{loader} is unavailable: the Minecraft version list failed to load',
+  'create_instance.loader_blocked_hint': 'Retry the Minecraft version list — the loader list will load automatically afterwards.',
   'create_instance.loader_end':       'All {total} versions loaded',
   'create_instance.mode_new':          'New',
   'create_instance.mode_import':       'Import',
@@ -328,6 +335,7 @@ export const en = {
   'settings.save_success':             'Settings saved',
   'settings.load_error_title':         'Could not load settings',
   'settings.load_error_desc':          'Check the connection and try again. Reason: {error}',
+  'settings.nav_label':                'Settings sections',
 
   'settings.section_account':          'Account',
   'settings.sign_out':                 'Sign Out',
@@ -345,6 +353,8 @@ export const en = {
   'settings.java_browse':              'Browse',
 
   'settings.section_java':             'Java',
+  'settings.group_java_runtime':       'Java runtime',
+  'settings.group_performance':        'Default performance',
   'settings.memory_title':             'Memory Allocation',
   'settings.memory_desc':              'Default RAM (Xms = Xmx) for new instances. Per-instance overrides live in the instance editor.',
   'settings.memory_unit':              'MB',
@@ -355,6 +365,7 @@ export const en = {
   'settings.gc_desc':                  'Garbage collector preset applied to new instances. Per-instance overrides live in the instance editor.',
 
   'settings.section_appearance':       'Appearance',
+  'settings.group_interface':          'Interface',
   'settings.language_title':           'Language',
   'settings.language_desc':            'Interface language. Changes apply immediately.',
 'settings.font_title':             'Font',
@@ -398,6 +409,8 @@ export const en = {
 
 
   'settings.section_launcher':         'Launcher',
+  'settings.group_behavior':           'Behavior',
+  'settings.group_storage':            'Storage and cache',
   'settings.close_on_launch_title':    'Close on Launch',
   'settings.close_on_launch_desc':     'Close the launcher when Minecraft starts',
 
@@ -409,6 +422,7 @@ export const en = {
   'settings.game_logs_open':           'Open Folder',
 
   'settings.section_network':          'Network',
+  'settings.group_proxy':              'Proxy',
   'settings.proxy_enabled_title':      'Use Proxy',
   'settings.proxy_server_title':       'Proxy Server',
   'settings.proxy_enabled_desc':       'Route all launcher network traffic through a proxy server',
@@ -671,6 +685,7 @@ export const en = {
   'loader_update.title':               'Change {loader} version',
   'loader_update.current':             'Currently installed: {version}',
   'loader_update.current_none':        'Not installed yet',
+  'loader_update.installed':           'installed',
   'loader_update.stable':              'stable',
   'loader_update.install_btn':         'Install {version}',
   'loader_update.done_toast':          'Loader updated: {loader} {version}',

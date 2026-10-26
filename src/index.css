@@ -2380,6 +2380,94 @@ select option {
   border-bottom: 1px solid var(--surface-border);
 }
 
+.settings-section__desc {
+  margin-top: var(--space-xs);
+  margin-bottom: var(--space-md);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+/* Internal settings navigation: one tab row shared by every category page.
+   The row can scroll sideways if more categories are added later; the
+   underline is moved one pixel up so the scroll clip never shaves it off. */
+.settings-nav {
+  overflow-x: auto;
+  padding-bottom: 1px;
+  scrollbar-width: none;
+}
+
+.settings-nav::-webkit-scrollbar {
+  display: none;
+}
+
+.settings-nav .tabs__indicator {
+  bottom: 0;
+}
+
+/* Icons sit inline with the label and stay on one line. The row scrolls
+   sideways if a long translation no longer fits, so nothing is clipped. */
+.settings-nav .tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.settings-nav .tab svg {
+  flex-shrink: 0;
+}
+
+/* Category pages stay mounted so their drafts and fetched lists survive a
+   switch; only the active one is visible. */
+.settings-page[hidden] {
+  display: none;
+}
+
+/* The entrance fade is skipped under Liquid Glass: an opacity animation
+   makes the page a backdrop root, so the glass surfaces inside cannot sample
+   the wallpaper until it ends — the material visibly "arrives" late. Normal
+   themes have no backdrop-filter and keep the soft fade. */
+html:not([data-theme='lg']) .settings-page--active {
+  animation: settings-page-in 180ms ease-out;
+}
+
+@keyframes settings-page-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-page--active {
+    animation: none;
+  }
+}
+
+/* A labelled block inside a settings section (e.g. detected Java
+   installations under the runtime path). */
+.settings-subsection {
+  margin-top: var(--space-lg);
+}
+
+.settings-subsection__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  margin-bottom: var(--space-md);
+}
+
+.settings-subsection__title {
+  font-size: var(--font-size-md);
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
 .settings-row {
   display: flex;
   align-items: center;
@@ -5756,8 +5844,31 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
   background: var(--surface-glass);
 }
 
+/* The version the instance currently runs: marked in the list itself, so the
+   user does not have to match it against the "currently installed" line. */
+.loader-version-item--current {
+  border-color: var(--primary);
+  background: var(--primary-dim, var(--surface-glass));
+}
+
+.loader-version-item--current:hover {
+  background: var(--primary-dim, var(--surface-glass));
+}
+
+.loader-version-item__badges {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+}
+
 .loader-version-item__badge {
   font-size: var(--font-size-xs);
   color: var(--success);
   white-space: nowrap;
+}
+
+.loader-version-item__badge--current {
+  color: var(--primary);
+  font-weight: 600;
 }

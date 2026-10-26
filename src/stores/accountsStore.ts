@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { logUiMessage } from '../lib/uiLog';
 
 /**
  * Public, token-free account metadata. The backend strips `access_token` and
@@ -40,6 +41,63 @@ export interface CapesCacheEntry {
  * list is still shown immediately and refreshed in the background.
  */
 const CAPES_TTL_MS = 45_000;
+
+/**
+ * Last successful cape list per account, persisted across app restarts. The
+ * cape is part of the character's look, so it must be on the 3D model from the
+ * first frame — exactly like the cached skin — instead of popping in after the
+ * profile request and texture downloads finish. The list is still refreshed
+ * from the network in the background; this is only the instant first paint.
+ */
+const CAPES_STORAGE_PREFIX = 'voidlauncher-capes:';
+
+function readPersistedCapes(accountId: string): CapeEntry[] | null {
+  try {
+    const raw = localStorage.getItem(CAPES_STORAGE_PREFIX + accountId);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((c): c is CapeEntry => {
+      if (!c || typeof c !== 'object') return false;
+      const entry = c as Partial<CapeEntry>;
+      return (
+        typeof entry.id === 'string' &&
+        typeof entry.alias === 'string' &&
+        typeof entry.active === 'boolean' &&
+        typeof entry.png === 'string'
+      );
+    });
+  } catch {
+    return null;
+  }
+}
+
+function persistCapes(accountId: string, capes: CapeEntry[]): void {
+  try {
+    localStorage.setItem(CAPES_STORAGE_PREFIX + accountId, JSON.stringify(capes));
+  } catch {
+    // Storage may be unavailable or full; the in-memory cache still works.
+  }
+}
+
+function forgetPersistedCapes(accountId: string): void {
+  try {
+    localStorage.removeItem(CAPES_STORAGE_PREFIX + accountId);
+  } catch {
+    // Nothing to clean up if storage is unavailable.
+  }
+}
+
+/**
+ * Keep textures we already hold when the backend answers with metadata only
+ * (a cape switch) or when a texture download failed. A non-empty PNG always
+ * wins, so a genuinely updated texture still replaces the old one.
+ */
+function withPreservedPngs(next: CapeEntry[], previous: CapeEntry[] | undefined): CapeEntry[] {
+  if (!previous || previous.length === 0) return next;
+  const pngById = new Map(previous.map((c) => [c.id, c.png]));
+  return next.map((c) => (c.png ? c : { ...c, png: pngById.get(c.id) || '' }));
+}
 
 /** Requests already in flight, so two mounts never fetch the same list twice. */
 const capesInflight = new Set<string>();
@@ -97,7 +155,20 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       try {
         const accounts = await invoke<AccountEntry[]>('cmd_list_accounts');
         accountsLoadedAt = Date.now();
-        set({ accounts, error: null });
+        // Hydrate the persisted cape lists before the page renders, so the
+        // worn cape is already on the 3D model instead of arriving with the
+        // profile request. In-memory entries (this session) stay authoritative.
+        const persisted: Record<string, CapesCacheEntry> = {};
+        for (const account of accounts) {
+          if (account.account_type !== 'Microsoft') continue;
+          const capes = readPersistedCapes(account.id);
+          if (capes) persisted[account.id] = { capes, fetchedAt: 0 };
+        }
+        set((s) => ({
+          accounts,
+          error: null,
+          capesByAccount: { ...persisted, ...s.capesByAccount },
+        }));
       } catch (e: any) {
         set({ error: e.toString() });
       } finally {
@@ -134,6 +205,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       const accounts = await invoke<AccountEntry[]>('cmd_remove_account', { id });
       // Drop every trace of the removed account so a future account that
       // reuses the id never shows stale capes.
+      forgetPersistedCapes(id);
       set((s) => {
         const capesByAccount = { ...s.capesByAccount };
         const capesLoadingByAccount = { ...s.capesLoadingByAccount };
@@ -177,7 +249,19 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
    * last good list and reports the error next to it.
    */
   fetchCapes: async (accountId: string, force = false) => {
-    const cached = get().capesByAccount[accountId];
+    let cached = get().capesByAccount[accountId];
+    if (!cached) {
+      // First visit in this session: paint the persisted list immediately,
+      // then refresh it from the profile endpoint below (fetchedAt = 0 marks
+      // it as stale on purpose, so the background refresh always runs).
+      const persisted = readPersistedCapes(accountId);
+      if (persisted) {
+        cached = { capes: persisted, fetchedAt: 0 };
+        set((s) => ({
+          capesByAccount: { ...s.capesByAccount, [accountId]: cached! },
+        }));
+      }
+    }
     const fresh = cached && Date.now() - cached.fetchedAt < CAPES_TTL_MS;
     if (fresh && !force) return;
     if (capesInflight.has(accountId)) return;
@@ -187,16 +271,22 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       capesErrorByAccount: { ...s.capesErrorByAccount, [accountId]: null },
     }));
     try {
-      const capes = await invoke<CapeEntry[]>('cmd_get_player_capes', { accountId });
+      const capes = await invoke<CapeEntry[]>('cmd_get_player_capes', { accountId, force });
+      const merged = withPreservedPngs(capes, get().capesByAccount[accountId]?.capes);
+      persistCapes(accountId, merged);
       set((s) => ({
         capesByAccount: {
           ...s.capesByAccount,
-          [accountId]: { capes, fetchedAt: Date.now() },
+          [accountId]: { capes: merged, fetchedAt: Date.now() },
         },
       }));
     } catch (e: any) {
+      const message = String(e);
+      // The inline picker shows this too, but the user explicitly expects
+      // cape failures in the launcher log as well.
+      logUiMessage(`Could not load capes: ${message}`, 'error', 'accounts');
       set((s) => ({
-        capesErrorByAccount: { ...s.capesErrorByAccount, [accountId]: String(e) },
+        capesErrorByAccount: { ...s.capesErrorByAccount, [accountId]: message },
       }));
     } finally {
       capesInflight.delete(accountId);
@@ -206,13 +296,16 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
     }
   },
 
-  applyCapes: (accountId: string, capes: CapeEntry[]) =>
+  applyCapes: (accountId: string, capes: CapeEntry[]) => {
+    const merged = withPreservedPngs(capes, get().capesByAccount[accountId]?.capes);
+    persistCapes(accountId, merged);
     set((s) => ({
       capesByAccount: {
         ...s.capesByAccount,
-        [accountId]: { capes, fetchedAt: Date.now() },
+        [accountId]: { capes: merged, fetchedAt: Date.now() },
       },
-    })),
+    }));
+  },
 
   getPlayerCapes: (accountId: string) =>
     invoke<CapeEntry[]>('cmd_get_player_capes', { accountId }),

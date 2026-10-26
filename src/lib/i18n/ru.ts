@@ -146,7 +146,7 @@ export const ru: Record<string, string> = {
   'accounts.cape_none':                'Без плаща',
   'accounts.cape_update_error':        'Не удалось сменить плащ: {error}',
   'accounts.capes_load_error':         'Не удалось загрузить плащи: {error}',
-
+  'accounts.capes_refresh_error':      'Не удалось обновить плащи: {error}. Показаны сохранённые данные.',
   // ── Instance List ───────────────────────────────────────────
   'instances.page_title':              'Сборки',
   'instances.empty_title':             'Сборок пока нет',
@@ -154,7 +154,7 @@ export const ru: Record<string, string> = {
   'instances.ctx_settings':            'Настройки сборки',
   'instances.ctx_open_folder':         'Открыть папку',
   'instances.ctx_verify':              'Проверка файлов',
-  'instances.ctx_export':              'Экспорт (Prism)',
+  'instances.ctx_export':              'Экспорт',
   'instances.export_success':          'Сборка «{name}» экспортирована',
   'instances.export_error':            'Ошибка экспорта: {error}',
   'instances.ctx_backup':              'Создать резервную копию',
@@ -245,6 +245,12 @@ export const ru: Record<string, string> = {
   'create_instance.loader_versions_failed': 'Не удалось загрузить список версий {loader}',
   'create_instance.loader_no_versions':'{loader} недоступен для Minecraft {version}',
   'create_instance.loader_unsupported_hint': 'Попробуйте другой загрузчик или версию Minecraft',
+  'create_instance.versions_failed':   'Не удалось загрузить список версий Minecraft',
+  'create_instance.versions_failed_hint': 'Проверьте подключение к интернету и повторите попытку.',
+  'create_instance.versions_retry':    'Повторить',
+  'create_instance.versions_empty':    'Нет версий, подходящих под выбранный фильтр',
+  'create_instance.loader_blocked_by_versions': '{loader} недоступен: список версий Minecraft не загрузился',
+  'create_instance.loader_blocked_hint': 'Повторите загрузку версий Minecraft — после этого список загрузчика загрузится автоматически.',
   'create_instance.loader_end':       'Все {total} версий загружены',
   'create_instance.mode_new':          'Новая',
   'create_instance.mode_import':       'Импорт',
@@ -332,6 +338,7 @@ export const ru: Record<string, string> = {
   'settings.save_success':             'Настройки сохранены',
   'settings.load_error_title':         'Не удалось загрузить настройки',
   'settings.load_error_desc':          'Проверьте подключение и повторите попытку. Причина: {error}',
+  'settings.nav_label':                'Разделы настроек',
 
   'settings.section_account':          'Аккаунт',
   'settings.sign_out':                 'Выйти',
@@ -349,6 +356,8 @@ export const ru: Record<string, string> = {
   'settings.java_browse':              'Обзор',
 
   'settings.section_java':             'Java',
+  'settings.group_java_runtime':       'Среда Java',
+  'settings.group_performance':        'Производительность по умолчанию',
   'settings.memory_title':             'Выделение памяти',
   'settings.memory_desc':              'RAM по умолчанию (Xms = Xmx) для новых сборок. Можно изменить в настройках сборки.',
   'settings.memory_unit':              'MB',
@@ -359,6 +368,7 @@ export const ru: Record<string, string> = {
   'settings.gc_desc':                  'Пресет GC для новых сборок. Можно изменить в настройках сборки.',
 
   'settings.section_appearance':       'Внешний вид',
+  'settings.group_interface':          'Интерфейс',
   'settings.language_title':           'Язык',
   'settings.language_desc':            'Язык интерфейса. Изменения применяются сразу.',
 'settings.font_title':              'Шрифт',
@@ -402,6 +412,8 @@ export const ru: Record<string, string> = {
 
 
   'settings.section_launcher':         'Лаунчер',
+  'settings.group_behavior':           'Поведение',
+  'settings.group_storage':            'Данные и кэш',
   'settings.close_on_launch_title':    'Закрывать при запуске',
   'settings.close_on_launch_desc':     'Закрывать лаунчер при запуске Minecraft',
 
@@ -413,6 +425,7 @@ export const ru: Record<string, string> = {
   'settings.game_logs_open':           'Открыть папку',
 
   'settings.section_network':          'Сеть',
+  'settings.group_proxy':              'Прокси',
   'settings.proxy_enabled_title':      'Использовать прокси',
   'settings.proxy_enabled_desc':       'Направлять весь сетевой трафик лаунчера через прокси-сервер',
   'settings.proxy_server_title':       'Прокси-сервер',
@@ -675,6 +688,7 @@ export const ru: Record<string, string> = {
   'loader_update.title':               'Смена версии {loader}',
   'loader_update.current':             'Сейчас установлена версия {version}',
   'loader_update.current_none':        'Загрузчик ещё не установлен',
+  'loader_update.installed':           'установлена',
   'loader_update.stable':              'стабильная',
   'loader_update.install_btn':         'Установить {version}',
   'loader_update.done_toast':          'Загрузчик обновлён: {loader} {version}',

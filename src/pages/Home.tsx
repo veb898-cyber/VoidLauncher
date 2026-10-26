@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, useRef } from 'react';
-import { Play, Plus, Package, Settings, Clock, Image, Upload, X } from 'lucide-react';
+import { Play, Plus, Package, Clock, Image, Upload, X } from 'lucide-react';
 import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore } from '../stores/accountsStore';
 import { useInstanceStore } from '../stores/instanceStore';
@@ -184,13 +184,6 @@ export function Home({ onNavigate }: HomeProps) {
             ) : (
               <><Plus size={18} /> {t('home.btn_create')}</>
             )}
-          </button>
-          <button
-            className="btn btn--ghost"
-            onClick={() => onNavigate('settings')}
-            aria-label={t('settings.title')}
-          >
-            <Settings size={18} />
           </button>
         </div>
       </div>
