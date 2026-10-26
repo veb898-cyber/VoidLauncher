@@ -537,7 +537,7 @@ pub fn verify_instance_scoped(
                         }
                         assets.checked += 1;
                         let p = objects_dir.join(&obj.hash[..2]).join(&obj.hash);
-                        let display = format!("assets/objects/{}/{}", &obj.hash[..2], &obj.hash);
+                        let display = format!("assets/objects/{}/{}", &obj.hash[..2], obj.hash);
                         match std::fs::metadata(&p) {
                             Err(_) => {
                                 if assets.issue_count < MAX_ISSUES_LISTED as u32 {

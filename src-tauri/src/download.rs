@@ -785,7 +785,7 @@ pub(crate) async fn download_to_part(
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
             return Err(LauncherError::Download(format!(
                 "HTTP {} for {}",
-                status, &url
+                status, url
             )));
         }
 

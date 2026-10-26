@@ -258,7 +258,7 @@ async fn api_get<T: serde::de::DeserializeOwned>(url: &str, api_key: &str) -> Re
         crate::error::LauncherError::Download(format!(
             "Failed to decode CurseForge response: {}. Body preview: {}",
             e,
-            &text.chars().take(500).collect::<String>()
+            text.chars().take(500).collect::<String>()
         ))
     })
 }
@@ -325,7 +325,7 @@ async fn api_post<T: serde::de::DeserializeOwned, B: serde::Serialize + ?Sized>(
         crate::error::LauncherError::Download(format!(
             "Failed to decode CurseForge response: {}. Body preview: {}",
             e,
-            &text.chars().take(500).collect::<String>()
+            text.chars().take(500).collect::<String>()
         ))
     })
 }
@@ -626,9 +626,9 @@ pub async fn popular_mods(
 ) -> Result<CfSearchResponse> {
     let mut params = vec![
         format!("gameId={}", MINECRAFT_GAME_ID),
-        format!("searchFilter="),
+        "searchFilter=".to_string(),
         format!("pageSize={}", limit.min(50)),
-        format!("index=0"),
+        "index=0".to_string(),
         "sortField=2".to_string(),
         "sortOrder=desc".to_string(),
     ];

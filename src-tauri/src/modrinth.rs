@@ -111,7 +111,7 @@ async fn api_get<T: serde::de::DeserializeOwned>(url: &str) -> Result<T> {
         crate::error::LauncherError::Download(format!(
             "Failed to decode Modrinth response: {}. Body preview: {}",
             e,
-            &text.chars().take(500).collect::<String>()
+            text.chars().take(500).collect::<String>()
         ))
     })
 }
@@ -265,7 +265,7 @@ pub async fn check_version_updates(
             crate::error::LauncherError::Download(format!(
                 "Failed to decode update response: {}. Body preview: {}",
                 e,
-                &text.chars().take(500).collect::<String>()
+                text.chars().take(500).collect::<String>()
             ))
         })
 }

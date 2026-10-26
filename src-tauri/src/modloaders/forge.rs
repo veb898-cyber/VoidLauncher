@@ -1033,7 +1033,7 @@ pub async fn ensure_processor_jars(
         .join("minecraftforge")
         .join("forge")
         .join(&full_version)
-        .join(format!("forge-{}-client.jar", &full_version));
+        .join(format!("forge-{}-client.jar", full_version));
 
     let client_ok = is_usable_jar(&forge_client_path);
 
