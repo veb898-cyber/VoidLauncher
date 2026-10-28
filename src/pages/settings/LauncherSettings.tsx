@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Trash2 } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
 import { Toggle } from '../../components/ui/Toggle';
 import { addToast } from '../../components/ui/Toast';
@@ -95,7 +94,6 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
                 }
               }}
             >
-              <Trash2 size={14} />
               {t('settings.clear_cache_btn')}
             </Button>
           </div>

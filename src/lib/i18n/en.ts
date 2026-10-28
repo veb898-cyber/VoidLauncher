@@ -227,8 +227,8 @@ export const en = {
   'create_instance.version_label':     'Minecraft Version',
   'create_instance.version_search_placeholder': 'Search Minecraft version...',
   'create_instance.filter_all':        'All',
-  'create_instance.filter_release':    'Release',
-  'create_instance.filter_snapshot':   'Snapshot',
+  'create_instance.filter_release':    'Releases',
+  'create_instance.filter_snapshot':   'Snapshots',
   'create_instance.filter_modpack_archives': 'Modpack Archives',
   'create_instance.loader_label':      'Mod Loader',
   'create_instance.loader_vanilla':    'Vanilla',
@@ -328,7 +328,10 @@ export const en = {
   'instance_editor.gc_zgc_warning':    'Requires Java 17+ and at least 8 GB of RAM.',
 
   // JVM args
-  'instance_editor.jvm_label':         'JVM Arguments (custom, optional)',
+  'instance_editor.jvm_label':         'JVM Arguments',
+  'instance_editor.jvm_default_hint':  'The default arguments are shown. Edit the field to set custom arguments for this instance.',
+  'instance_editor.jvm_custom_hint':   'This instance uses custom arguments. The button below restores the defaults.',
+  'instance_editor.jvm_reset_default': 'Restore default arguments',
 
   // ── Settings ────────────────────────────────────────────────
   'settings.title':                    'Settings',

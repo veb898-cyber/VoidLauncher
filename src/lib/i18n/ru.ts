@@ -230,8 +230,8 @@ export const ru: Record<string, string> = {
   'create_instance.version_label':     'Версия Minecraft',
   'create_instance.version_search_placeholder': 'Поиск версии Minecraft...',
   'create_instance.filter_all':        'Все',
-  'create_instance.filter_release':    'Релиз',
-  'create_instance.filter_snapshot':   'Снапшот',
+  'create_instance.filter_release':    'Релизы',
+  'create_instance.filter_snapshot':   'Снапшоты',
   'create_instance.filter_modpack_archives': 'Архивы модпаков',
   'create_instance.loader_label':      'Загрузчик модов',
   'create_instance.loader_vanilla':    'Vanilla',
@@ -331,7 +331,10 @@ export const ru: Record<string, string> = {
   'instance_editor.gc_zgc_warning':    'Требуется Java 17+ и минимум 8 GB RAM.',
 
   // JVM args
-  'instance_editor.jvm_label':         'JVM-аргументы (опционально)',
+  'instance_editor.jvm_label':         'JVM-аргументы',
+  'instance_editor.jvm_default_hint':  'Показаны аргументы по умолчанию. Измените поле, чтобы задать свои для этой сборки.',
+  'instance_editor.jvm_custom_hint':   'Для этой сборки заданы свои аргументы. Кнопка ниже возвращает значения по умолчанию.',
+  'instance_editor.jvm_reset_default': 'Вернуть аргументы по умолчанию',
 
   // ── Settings ────────────────────────────────────────────────
   'settings.title':                    'Настройки',

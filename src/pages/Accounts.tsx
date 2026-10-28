@@ -13,7 +13,7 @@ import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
 import { SkinPreview } from '../components/accounts/SkinPreview';
 import { addToast } from '../components/ui/Toast';
-import { Ban, Check, RefreshCw, LogOut, Plus, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
+import { Ban, Check, RefreshCw, Plus, Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
 import { t } from '../lib/i18n';
 import { Avatar } from '../lib/remoteImage';
 
@@ -392,8 +392,9 @@ export function Accounts() {
                           variant="ghost"
                           aria-label={t('accounts.remove_btn')}
                           onClick={(e) => { e.stopPropagation(); setRemoveTarget(acc); }}
+                          style={{ color: 'var(--color-danger)' }}
                         >
-                          <LogOut size={14} />
+                          <Trash2 size={14} />
                         </Button>
                       </Tooltip>
                     </div>
@@ -536,7 +537,6 @@ export function Accounts() {
         title={t('accounts.remove_title')}
         description={t('accounts.remove_confirm', { name: removeTarget?.name ?? '' })}
         confirmLabel={t('accounts.remove_btn')}
-        tone="primary"
         busy={removing}
         onCancel={() => { if (!removing) setRemoveTarget(null); }}
         onConfirm={() => { if (removeTarget) handleRemoveAccount(removeTarget); }}

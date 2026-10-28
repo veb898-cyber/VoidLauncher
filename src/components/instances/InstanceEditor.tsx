@@ -54,13 +54,20 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const globalConfig = useSettingsStore((s) => s.config);
   const globalDefaultMemoryMb = globalConfig?.default_memory_mb ?? null;
   const globalDefaultGcPreset = (globalConfig?.default_gc_preset as GcPreset) ?? 'g1gc';
+  const globalDefaultJvmArgs = globalConfig?.default_jvm_args ?? [];
+  const defaultJvmArgsText = globalDefaultJvmArgs.join(' ');
 
   const [name, setName] = useState(instance.name);
   const [notes, setNotes] = useState(instance.notes || '');
   const [memoryMb, setMemoryMb] = useState<number>(
     instance.memory_mb ?? globalDefaultMemoryMb ?? 4096
   );
-  const [jvmArgs, setJvmArgs] = useState(instance.jvm_args?.join(' ') || '');
+  // No per-instance override means the launcher uses its global defaults:
+  // show those exact args instead of an empty field, so the value the game
+  // will actually receive is visible before editing.
+  const [jvmArgs, setJvmArgs] = useState(
+    instance.jvm_args != null ? instance.jvm_args.join(' ') : defaultJvmArgsText
+  );
   const [gcPreset, setGcPreset] = useState<GcPreset>(
     (instance.gc_preset as GcPreset) ?? globalDefaultGcPreset
   );
@@ -76,8 +83,8 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   // read through this ref by the one-time initializer below. They must not be
   // effect dependencies: when detection finished a second later, the effect
   // used to re-run and wipe everything the user had already typed.
-  const defaultsRef = useRef({ globalDefaultMemoryMb, globalDefaultGcPreset, systemRamMb });
-  defaultsRef.current = { globalDefaultMemoryMb, globalDefaultGcPreset, systemRamMb };
+  const defaultsRef = useRef({ globalDefaultMemoryMb, globalDefaultGcPreset, globalDefaultJvmArgs, systemRamMb });
+  defaultsRef.current = { globalDefaultMemoryMb, globalDefaultGcPreset, globalDefaultJvmArgs, systemRamMb };
   const initializedForRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -90,6 +97,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     const {
       globalDefaultMemoryMb: globalMemory,
       globalDefaultGcPreset: globalGc,
+      globalDefaultJvmArgs: globalJvm,
       systemRamMb: ram,
     } = defaultsRef.current;
     // Initial memory resolves in this order:
@@ -102,7 +110,10 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     setName(instance.name);
     setNotes(instance.notes || '');
     setMemoryMb(resolvedMemory);
-    setJvmArgs(instance.jvm_args?.join(' ') || '');
+    const initialJvmArgs = instance.jvm_args != null
+      ? instance.jvm_args.join(' ')
+      : globalJvm.join(' ');
+    setJvmArgs(initialJvmArgs);
     setGcPreset((instance.gc_preset as GcPreset) ?? globalGc);
     setJavaPath(instance.java_path || '');
     setResWidth(instance.resolution?.width?.toString() ?? '');
@@ -113,7 +124,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
       name: instance.name,
       notes: instance.notes || '',
       memoryMb: resolvedMemory,
-      jvmArgs: instance.jvm_args?.join(' ') || '',
+      jvmArgs: initialJvmArgs,
       gcPreset: (instance.gc_preset as GcPreset) ?? globalGc,
       javaPath: instance.java_path || '',
       resWidth: instance.resolution?.width?.toString() ?? '',
@@ -167,12 +178,24 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
 
   const handleSave = async () => {
     try {
+      // The field shows the global defaults when this instance has no
+      // override. Saving that unchanged value must keep it as "inherit"
+      // (null), otherwise the instance would pin a stale copy of the
+      // defaults. Any other value — including an intentionally empty one —
+      // becomes a real per-instance override.
+      const normalizedJvmArgs = jvmArgs.trim();
+      const normalizedDefaults = defaultJvmArgsText.trim();
+      const jvmArgsOverride = normalizedJvmArgs === normalizedDefaults
+        ? null
+        : normalizedJvmArgs
+          ? normalizedJvmArgs.split(/\s+/).filter(Boolean)
+          : [];
       const updated = {
         ...instance,
         name,
         notes,
         memory_mb: memoryMb,
-        jvm_args: jvmArgs.trim() ? jvmArgs.split(/\s+/).filter(Boolean) : null,
+        jvm_args: jvmArgsOverride,
         gc_preset: gcPreset,
         java_path: javaPath.trim() || null,
         resolution: (() => {
@@ -227,13 +250,37 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
               {t('instance_editor.loader_label')}
             </label>
             <div style={{ display: 'flex', gap: 'var(--space-sm)' }}>
-              <input
-                className="input"
-                type="text"
-                readOnly
-                value={`${instance.loader}${instance.loader_version ? ` ${instance.loader_version}` : ''}`}
-                style={{ flex: 1 }}
-              />
+              {/* A read-only form field looked editable, so the value now
+                  reads as a filled chip: name + version, no input chrome. */}
+              <div
+                title={`${instance.loader}${instance.loader_version ? ` ${instance.loader_version}` : ''}`}
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  display: 'flex',
+                  alignItems: 'baseline',
+                  gap: 'var(--space-sm)',
+                  padding: 'var(--space-md) var(--space-lg)',
+                  background: 'var(--surface-glass)',
+                  borderRadius: 'var(--radius-md)',
+                }}
+              >
+                <span style={{ fontWeight: 600, flexShrink: 0 }}>{instance.loader}</span>
+                {instance.loader_version && (
+                  <span
+                    style={{
+                      color: 'var(--text-tertiary)',
+                      fontSize: 'var(--font-size-sm)',
+                      minWidth: 0,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {instance.loader_version}
+                  </span>
+                )}
+              </div>
               <Button size="sm" variant="ghost" onClick={() => setLoaderModalOpen(true)}>
                 {t('instance_editor.loader_change')}
               </Button>
@@ -305,6 +352,21 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
           value={jvmArgs}
           onChange={(e) => setJvmArgs(e.target.value)}
         />
+        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: -4 }}>
+          {jvmArgs.trim() === defaultJvmArgsText.trim()
+            ? t('instance_editor.jvm_default_hint')
+            : t('instance_editor.jvm_custom_hint')}
+        </div>
+        {defaultJvmArgsText && jvmArgs.trim() !== defaultJvmArgsText.trim() && (
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm"
+            onClick={() => setJvmArgs(defaultJvmArgsText)}
+            style={{ alignSelf: 'flex-start' }}
+          >
+            {t('instance_editor.jvm_reset_default')}
+          </button>
+        )}
 
         <div>
           <label className="input__label" style={{ display: 'block', marginBottom: 4 }}>{t('instance_editor.java_path_label')}</label>
