@@ -1,11 +1,11 @@
 {
-  "version": "1.4.0",
-  "notes": "Release v1.4.0",
-  "pub_date": "2026-10-26T07:41:59Z",
+  "version": "1.5.0",
+  "notes": "Release v1.5.0",
+  "pub_date": "2026-10-28T09:37:16Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWG9XQjM0OGNJTk9sMmVlK09qVXJnR0dSKzh2cUhyQkp0T3kyTEJvQ2lHUWU5VC9jRnNTWnJqWkhkcStvOHhFZW1OSzhvWm82OVZabkMrVDBiRnAvS3hnbHc5aXprc1FNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMDAwNTE5CWZpbGU6aW5zdGFsbGVyLmV4ZQp4b3loaGhybjJkVHFEdS9IQVg4NE1RYUVaTDV5WStOZHp1Z245bjArOEMzaGQ5T2M2QzkrcmhlNGxYdlkyLzA5SlE4bTN3ek9Nc3A2N0VFWWg3VjRCdz09Cg==",
-      "url": "https://github.com/veb898-cyber/VoidLauncher/releases/download/v1.4.0/VoidLauncher_1.4.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRWG9XQjM0OGNJTklhV0hwM2tpZ3hMZ0tUV0llMWxtdXYvNzgwY2U4Um10bWIxaDd2U0Yrb2ErSWl1Zm85QVBBYlNkMVUwUVA5OG0za0pLanRONUhkTXl5TjZRd0ZpU3c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMTgwMjM2CWZpbGU6aW5zdGFsbGVyLmV4ZQpTcC9MTnRVOEZPcDZQQjNoUHl0U0hLc3Fsa2dIUzJtanhBQUxCZkt1b2VoT2t2LzA0Z2lkSzNoMjB2NzdKdmhhQVZ2MDBrVEMyNE1RaC9hMmxtcEpEZz09Cg==",
+      "url": "https://github.com/veb898-cyber/VoidLauncher/releases/download/v1.5.0/VoidLauncher_1.5.0_x64-setup.exe"
     }
   }
 }
