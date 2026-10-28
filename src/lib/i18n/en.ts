@@ -134,7 +134,7 @@ export const en = {
   'accounts.make_active':              'Make active',
   'accounts.remove_btn':               'Sign out',
   'accounts.remove_title':             'Sign out of this account?',
-  'accounts.remove_confirm':           'The account "{name}" will be signed out on this computer and its saved sign-in removed. You can sign in again at any time.',
+  'accounts.remove_confirm':           'The account "{name}" will be removed from the launcher along with its saved sign-in. You can add it again at any time.',
   'accounts.active_for_launch':        'This account is used to launch the game',
   'accounts.skin_viewer_hint':         'Click and drag to rotate • scroll to zoom',
   'accounts.skin_viewer_unavailable':  'Couldn\'t load this account\'s skin',

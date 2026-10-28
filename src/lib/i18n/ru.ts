@@ -138,7 +138,7 @@ export const ru: Record<string, string> = {
   'accounts.make_active':              'Сделать активным',
   'accounts.remove_btn':               'Выйти из аккаунта',
   'accounts.remove_title':             'Выйти из аккаунта?',
-  'accounts.remove_confirm':           'Аккаунт «{name}» будет отключён на этом компьютере, сохранённый вход — удалён. Вы сможете войти в него снова в любой момент.',
+  'accounts.remove_confirm':           'Аккаунт «{name}» будет удалён из лаунчера вместе с сохранённым входом. Вы сможете добавить его снова в любой момент.',
   'accounts.active_for_launch':        'Этот аккаунт используется для запуска игры',
   'accounts.skin_viewer_hint':         'Зажмите и перетаскивайте мышь, чтобы вращать • колесо мыши — приближение',
   'accounts.skin_viewer_unavailable':  'Не удалось загрузить скин этого аккаунта',
