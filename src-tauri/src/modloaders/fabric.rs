@@ -226,6 +226,7 @@ pub async fn get_game_versions() -> Result<Vec<String>> {
 
 /// Get Fabric profile for a specific MC version + loader version
 pub async fn get_profile(mc_version: &str, loader_version: &str) -> Result<LoaderProfile> {
+    super::validate_loader_request(mc_version, loader_version)?;
     if !is_supported(mc_version).await? {
         return Err(LauncherError::ModLoader(format!(
             "Fabric does not support Minecraft {} (supported: 1.14 and newer)",
@@ -250,15 +251,21 @@ pub async fn get_profile(mc_version: &str, loader_version: &str) -> Result<Loade
         .into_iter()
         .map(|lib| {
             let path = maven_to_path(&lib.name);
-            LoaderLibrary {
+            if crate::import::check_safe_remote_path(&path).is_err() {
+                return Err(LauncherError::ModLoader(format!(
+                    "Unsafe library path in Fabric profile: {}",
+                    path
+                )));
+            }
+            Ok(LoaderLibrary {
                 name: lib.name,
                 url: lib.url,
                 path,
                 sha1: None,
                 size: None,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let (game_args, jvm_args) = match profile.arguments {
         Some(args) => (args.game, args.jvm),

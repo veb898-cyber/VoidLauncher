@@ -4,6 +4,7 @@
 use crate::accounts;
 use crate::auth;
 use crate::config::AppConfig;
+use crate::error::LauncherError;
 use crate::events;
 use crate::AppState;
 use tauri::{AppHandle, State};
@@ -55,7 +56,12 @@ pub async fn cmd_start_login(
 
     auth::start_device_code_flow(&client_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| match e {
+            LauncherError::Network(_) => format!(
+                "Could not reach Microsoft (login.microsoftonline.com). Check your internet connection or proxy setting. Details: {e}"
+            ),
+            other => other.to_string(),
+        })
 }
 
 #[tauri::command]
@@ -96,12 +102,10 @@ pub async fn cmd_poll_login(
         let entry =
             accounts::upsert_microsoft_account(&config.data_dir, &profile.name, &profile.id)?;
         // A failed vault write here would leave the account entry without
-        // credentials (launch would demand a re-login), so retry once.
-        if let Err(e) = accounts::store_ms_session(&entry.id, &new_auth) {
-            tracing::warn!(target: "launcher", "Session vault write failed ({}), retrying", e);
-            accounts::store_ms_session(&entry.id, &new_auth)
-                .map_err(|e| format!("Failed to store session in OS vault: {e}"))?;
-        }
+        // credentials (launch would demand a re-login); `store_ms_session`
+        // retries once internally before surfacing the error.
+        accounts::store_ms_session(&entry.id, &new_auth)
+            .map_err(|e| format!("Failed to store session in OS vault: {e}"))?;
         accounts::set_default_account(&config.data_dir, &entry.id)?;
         auth::save_auth_state(&config.auth_file(), &new_auth).map_err(|e| e.to_string())?;
         let mut auth_state = state.auth_state.lock().map_err(|e| e.to_string())?;
@@ -143,6 +147,33 @@ pub fn cmd_get_offline_credentials(
     Ok(auth::get_offline_credentials(&config.auth_file()))
 }
 
+/// Hand the active Microsoft session to another signed-in account (prefer
+/// the one marked as default). When none remains, clear both the in-memory
+/// session and the global auth-state blob so a startup migration cannot
+/// resurrect an account the user just removed.
+fn handover_active_microsoft_session(config: &AppConfig, state: &AppState) -> Result<(), String> {
+    let next_session = accounts::list_accounts(&config.data_dir)
+        .into_iter()
+        .filter(|a| a.account_type == accounts::AccountType::Microsoft)
+        .filter_map(|a| accounts::load_ms_session(&a.id).map(|s| (a.default, s)))
+        .max_by_key(|(is_default, _)| *is_default);
+
+    let mut auth_state = state.auth_state.lock().map_err(|e| e.to_string())?;
+    match next_session {
+        Some((_, session)) => {
+            tracing::info!(target: "launcher", "Active Microsoft session handed to another signed-in account");
+            auth::save_auth_state(&config.auth_file(), &session)
+                .map_err(|e| format!("Failed to persist the handover Microsoft session: {e}"))?;
+            *auth_state = session;
+        }
+        None => {
+            *auth_state = auth::AuthState::default();
+            auth::clear_auth_state(&config.auth_file());
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn cmd_logout(state: State<'_, AppState>) -> Result<(), String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -162,30 +193,13 @@ pub fn cmd_logout(state: State<'_, AppState>) -> Result<(), String> {
         }
     };
     if let Some(id) = removed_id {
-        let _ = accounts::remove_account(&config.data_dir, &id);
+        // If the persistent list cannot be updated, keep the session instead
+        // of showing a successful logout that returns after a restart.
+        accounts::remove_account(&config.data_dir, &id)
+            .map_err(|e| format!("Failed to remove the signed-in account: {e}"))?;
     }
 
-    // Hand the active slot to another Microsoft account if one remains
-    // (prefer the account marked as default). Its tokens stay untouched.
-    let next_session = accounts::list_accounts(&config.data_dir)
-        .into_iter()
-        .filter(|a| a.account_type == accounts::AccountType::Microsoft)
-        .filter_map(|a| accounts::load_ms_session(&a.id).map(|s| (a.default, s)))
-        .max_by_key(|(is_default, _)| *is_default);
-
-    let mut auth_state = state.auth_state.lock().map_err(|e| e.to_string())?;
-    match next_session {
-        Some((_, session)) => {
-            tracing::info!(target: "launcher", "Active Microsoft session handed to another signed-in account");
-            let _ = auth::save_auth_state(&config.auth_file(), &session);
-            *auth_state = session;
-        }
-        None => {
-            *auth_state = auth::AuthState::default();
-            auth::clear_auth_state(&config.auth_file());
-        }
-    }
-    Ok(())
+    handover_active_microsoft_session(&config, state.inner())
 }
 
 // ==================== Per-account Microsoft sessions ====================
@@ -260,13 +274,29 @@ pub(crate) async fn ensure_ms_session(
                                     .as_secs(),
                                 offline_mode: false,
                             };
-                            let _ = accounts::store_ms_session(&account.id, session);
+                            // Never drop freshly refreshed tokens silently: the
+                            // vault write is retried once inside accounts and a
+                            // persistent failure is logged for diagnosis.
+                            if let Err(e) = accounts::store_ms_session(&account.id, session) {
+                                tracing::error!(
+                                    target: "launcher",
+                                    "Failed to persist refreshed Microsoft session for '{}': {}",
+                                    account.name, e
+                                );
+                            }
                             let is_active = accounts::list_accounts(&data_dir)
                                 .iter()
                                 .any(|a| a.default && a.id == account.id);
                             if is_active {
                                 let config = state.config.lock().map_err(|e| e.to_string())?;
-                                let _ = auth::save_auth_state(&config.auth_file(), session);
+                                if let Err(e) = auth::save_auth_state(&config.auth_file(), session)
+                                {
+                                    tracing::error!(
+                                        target: "launcher",
+                                        "Failed to persist global auth state for '{}': {}",
+                                        account.name, e
+                                    );
+                                }
                                 let mut auth_state =
                                     state.auth_state.lock().map_err(|e| e.to_string())?;
                                 *auth_state = session.clone();
@@ -374,7 +404,36 @@ pub fn cmd_remove_account(
     id: String,
 ) -> Result<Vec<accounts::PublicAccountEntry>, String> {
     let config = state.config.lock().map_err(|e| e.to_string())?;
+    let account = accounts::list_accounts(&config.data_dir)
+        .into_iter()
+        .find(|a| a.id == id);
+    let active_uuid = state
+        .auth_state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .profile
+        .as_ref()
+        .map(|p| p.id.clone());
+    let was_active = match (&account, active_uuid.as_deref()) {
+        (Some(acc), Some(uuid)) => {
+            acc.account_type == accounts::AccountType::Microsoft
+                && acc.uuid.as_deref() == Some(uuid)
+        }
+        _ => false,
+    };
+
+    // Persist the removal first. If the list write fails, the account is
+    // still there and the active session must stay untouched.
     accounts::remove_account(&config.data_dir, &id)?;
+
+    // Removing the active account must also clear its global cached session;
+    // otherwise the startup migration would add the account back on the next
+    // launch. Remove from the list first so the handover cannot select the
+    // account that was just deleted.
+    if was_active {
+        handover_active_microsoft_session(&config, state.inner())?;
+    }
+
     Ok(public_account_entries(&config))
 }
 
@@ -394,7 +453,13 @@ pub fn cmd_set_default_account(
     match activated.map(|a| &a.account_type) {
         Some(accounts::AccountType::Microsoft) => {
             if let Some(session) = accounts::load_ms_session(&id) {
-                let _ = auth::save_auth_state(&config.auth_file(), &session);
+                if let Err(e) = auth::save_auth_state(&config.auth_file(), &session) {
+                    tracing::error!(
+                        target: "launcher",
+                        "Failed to persist auth state after switching the default account: {}",
+                        e
+                    );
+                }
                 let mut auth_state = state.auth_state.lock().map_err(|e| e.to_string())?;
                 *auth_state = session;
             }

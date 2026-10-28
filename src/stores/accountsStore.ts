@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { logUiMessage } from '../lib/uiLog';
+import { useAuthStore } from './authStore';
 
 /**
  * Public, token-free account metadata. The backend strips `access_token` and
@@ -215,6 +216,10 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
         delete capesErrorByAccount[id];
         return { accounts, capesByAccount, capesLoadingByAccount, capesErrorByAccount };
       });
+      // Removing the ACTIVE account changes the global session on the backend
+      // (handover or sign-out); refresh it so the header/profile card does not
+      // keep showing the deleted account until the next restart.
+      await useAuthStore.getState().checkAuth();
     } catch (e: any) {
       set({ error: e.toString() });
       throw e;

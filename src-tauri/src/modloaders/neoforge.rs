@@ -165,6 +165,7 @@ async fn download_installer(
     mc_version: &str,
     neo_version: &str,
 ) -> Result<(NeoForgeInstallProfile, PathBuf)> {
+    super::validate_loader_request(mc_version, neo_version)?;
     let (group_path, maven_version) = neoforge_maven(mc_version, neo_version);
     let artifact = group_path.rsplit('/').next().unwrap_or("neoforge");
     let installer_url = format!(
@@ -175,10 +176,7 @@ async fn download_installer(
     tracing::info!(target: "launcher", "Fetching NeoForge installer JAR: {}", installer_url);
 
     // Use download_file with retries for reliable download
-    let installer_path = std::env::temp_dir().join(format!(
-        "neoforge-{}--{}-installer.jar",
-        mc_version, neo_version
-    ));
+    let installer_path = installer_cache_path(mc_version, neo_version);
 
     // Reuse a cached installer only when it is a real archive. The file is
     // kept after a successful install so repairing a processor JAR does not
@@ -346,6 +344,17 @@ fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
         });
     }
 
+    // Loader metadata is remote input too: a path containing `..`, an
+    // absolute path or a drive prefix must never reach a filesystem join.
+    for lib in &libraries {
+        if crate::import::check_safe_remote_path(&lib.path).is_err() {
+            return Err(LauncherError::ModLoader(format!(
+                "Unsafe library path in NeoForge profile: {}",
+                lib.path
+            )));
+        }
+    }
+
     let (game_args, jvm_args) = if let Some(args) = &profile.arguments {
         let game = args
             .game
@@ -371,14 +380,140 @@ fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
     })
 }
 
-/// Path of the client JAR produced by the NeoForge processor pipeline.
-fn client_jar_path(libraries_dir: &Path, mc_version: &str, loader_version: &str) -> PathBuf {
+/// Cached installer path. Keeping it after a successful install lets a
+/// repair re-run the processors without downloading the installer again.
+pub(crate) fn installer_cache_path(mc_version: &str, loader_version: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "neoforge-{}--{}-installer.jar",
+        mc_version, loader_version
+    ))
+}
+
+/// Client JAR path used by NeoForge generations whose `install_profile.json`
+/// names the loader's own `:client` classifier (20.x/21.x and the 1.20.1
+/// `net.neoforged:forge` fork). Modern NeoForge (26.x) moved the output to
+/// `net.neoforged:minecraft-client-patched`, so this is a fallback only — the
+/// installer metadata is authoritative whenever it is available.
+fn legacy_client_jar_path(libraries_dir: &Path, mc_version: &str, loader_version: &str) -> PathBuf {
     let (group_path, maven_version) = neoforge_maven(mc_version, loader_version);
     let artifact = group_path.rsplit('/').next().unwrap_or("neoforge");
     libraries_dir
         .join(&group_path)
         .join(&maven_version)
         .join(format!("{}-{}-client.jar", artifact, maven_version))
+}
+
+/// Relative library path of the patched client declared by
+/// `install_profile.json` → `data.PATCHED.client`.
+///
+/// The value is a Maven coordinate, either bare
+/// (`net.neoforged:minecraft-client-patched:26.3.0.99`) or in Maven bracket
+/// form (`[net.neoforged:neoforge:21.4.157:client]`). It comes from remote
+/// metadata, so anything that is not a plain coordinate (placeholders,
+/// extensions, path separators, traversal) is rejected rather than joined
+/// into the libraries directory.
+fn patched_client_rel_path(install_profile: &serde_json::Value) -> Option<PathBuf> {
+    let raw = install_profile
+        .get("data")?
+        .get("PATCHED")?
+        .get("client")?
+        .as_str()?
+        .trim();
+    let coord = match raw.strip_prefix('[') {
+        Some(inner) => inner.strip_suffix(']')?.trim(),
+        None => raw,
+    };
+    if coord.is_empty()
+        || coord.contains('{')
+        || coord.contains('\\')
+        || coord.contains('/')
+        || coord.contains('@')
+        || coord.split(':').count() < 3
+    {
+        tracing::warn!(
+            target: "launcher",
+            "Ignoring unusable NeoForge PATCHED coordinate: {}",
+            raw
+        );
+        return None;
+    }
+    let rel = maven_to_path(coord);
+    if crate::import::check_safe_remote_path(&rel).is_err() {
+        tracing::warn!(
+            target: "launcher",
+            "Ignoring unsafe NeoForge PATCHED coordinate: {}",
+            raw
+        );
+        return None;
+    }
+    Some(PathBuf::from(rel))
+}
+
+/// Best-effort location used by NeoForge 26.x (`minecraft-client-patched`),
+/// needed when the cached installer is gone: verification must not report a
+/// healthy install as broken just because `%TEMP%` was cleaned. The path is
+/// version-scoped, so it cannot point at another loader version's output.
+fn modern_client_jar_guess(
+    libraries_dir: &Path,
+    mc_version: &str,
+    loader_version: &str,
+) -> PathBuf {
+    let (_, maven_version) = neoforge_maven(mc_version, loader_version);
+    libraries_dir
+        .join("net/neoforged/minecraft-client-patched")
+        .join(&maven_version)
+        .join(format!("minecraft-client-patched-{}.jar", maven_version))
+}
+
+/// Every path the processor-generated client JAR may occupy, in priority
+/// order. With installer metadata at hand the declared output is
+/// authoritative; the legacy path stays as a fallback so instances installed
+/// by older launcher builds keep working. Without metadata (cached installer
+/// gone), the known 26.x layout is checked before the legacy one.
+pub(crate) fn expected_client_jar_paths(
+    libraries_dir: &Path,
+    mc_version: &str,
+    loader_version: &str,
+    install_profile: Option<&serde_json::Value>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    match install_profile.and_then(patched_client_rel_path) {
+        Some(rel) => paths.push(libraries_dir.join(rel)),
+        None => {
+            // 1.20.1 has no `minecraft-client-patched` layout; skip the noise.
+            if mc_version != "1.20.1" {
+                paths.push(modern_client_jar_guess(
+                    libraries_dir,
+                    mc_version,
+                    loader_version,
+                ));
+            }
+        }
+    }
+    let legacy = legacy_client_jar_path(libraries_dir, mc_version, loader_version);
+    if !paths.contains(&legacy) {
+        paths.push(legacy);
+    }
+    paths
+}
+
+/// First candidate that is a structurally valid JAR.
+pub(crate) fn find_client_jar(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths
+        .iter()
+        .find(|path| super::forge::is_usable_jar(path))
+        .cloned()
+}
+
+/// Read only `install_profile.json` from an installer JAR, for fast-path
+/// checks that must not download anything.
+pub(crate) fn read_install_profile_from_installer(
+    installer_path: &Path,
+) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(installer_path).ok()?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+    let text = super::forge::read_entry_from_jar(&mut archive, "install_profile.json")?;
+    serde_json::from_str(&text).ok()
 }
 
 /// Self-heal NeoForge at launch: if the processor-generated client JAR is
@@ -390,13 +525,29 @@ pub async fn ensure_processor_jars(
     libraries_dir: &Path,
     versions_dir: &Path,
 ) -> Result<()> {
-    let client_path = client_jar_path(libraries_dir, mc_version, loader_version);
-    if super::forge::is_usable_jar(&client_path) {
+    // The client JAR path is derived from both versions before any network
+    // call, so a tampered instance.json must not reach the filesystem.
+    super::validate_loader_request(mc_version, loader_version)?;
+
+    // Fast path: read the output coordinate from the cached installer. This
+    // is what makes a healthy 26.x install skip the pipeline even though its
+    // JAR is not at the legacy `neoforge-<ver>-client.jar` location.
+    let cached_profile =
+        read_install_profile_from_installer(&installer_cache_path(mc_version, loader_version));
+    let candidates = expected_client_jar_paths(
+        libraries_dir,
+        mc_version,
+        loader_version,
+        cached_profile.as_ref(),
+    );
+    if find_client_jar(&candidates).is_some() {
         return Ok(());
     }
+
     tracing::info!(
         target: "launcher",
-        "NeoForge client JAR missing or unusable, running installer processors to repair it"
+        "NeoForge client JAR missing or unusable (checked {:?}), running installer processors to repair it",
+        candidates
     );
     install(
         mc_version,
@@ -523,18 +674,27 @@ pub async fn install(
         // The loader's maven directory inside libraries_dir. For NeoForge
         // 1.20.1 this is the `net.neoforged:forge` fork ("net/neoforged/forge/<mc-loader>"),
         // for modern NeoForge it is "net/neoforged/neoforge/<loader>". The
-        // PATCHED client coordinate in install_profile.json references exactly
-        // this path, so it must match for the post-pipeline existence check.
+        // installer data files are keyed by this path + the maven version.
         let (group_path, maven_version) = neoforge_maven(mc_version, loader_version);
         let data_base = group_path.clone();
-        // PATCHED = [net.neoforged:{forge|neoforge}:{version}:client] — the
-        // client JAR the processors produce (plain loader-version dir for
-        // modern NeoForge, e.g. 21.4.153, NOT 1.21.4-21.4.153 as Forge does;
-        // for 1.20.1 it is the MC-prefixed gradle-style forge coordinate).
-        let client_path = client_jar_path(libraries_dir, mc_version, loader_version);
+        // The processor output is declared by the installer itself. Older
+        // profiles name `net.neoforged:neoforge:<ver>:client` (which we keep
+        // as a fallback), modern 26.x profiles name
+        // `net.neoforged:minecraft-client-patched:<ver>`. Hard-coding either
+        // layout made the other one fail right after a successful pipeline.
+        let client_paths = expected_client_jar_paths(
+            libraries_dir,
+            mc_version,
+            loader_version,
+            Some(&install_profile),
+        );
 
-        if !super::forge::is_usable_jar(&client_path) {
-            tracing::info!(target: "launcher", "NeoForge client JAR missing or unusable, running installer processors...");
+        if find_client_jar(&client_paths).is_none() {
+            tracing::info!(
+                target: "launcher",
+                "NeoForge client JAR missing or unusable (checked {:?}), running installer processors...",
+                client_paths
+            );
 
             // Extract data files (client.lzma etc.) from the installer into
             // <libraries>/net/neoforged/neoforge/_data/<key>/<file>
@@ -558,8 +718,9 @@ pub async fn install(
                         // crafted ".." / separator must not escape _data.
                         let key_lower = key.to_lowercase();
                         if crate::import::check_safe_file_name(&key_lower).is_err() {
-                            tracing::warn!(target: "launcher", "Skipping NeoForge data entry with unsafe key: {}", key);
-                            continue;
+                            return Err(LauncherError::ModLoader(format!(
+                                "NeoForge install profile has an unsafe data key: {key}"
+                            )));
                         }
                         let dest = super::forge::data_file_path(
                             libraries_dir,
@@ -573,12 +734,23 @@ pub async fn install(
                         // from this loader, and overwriting clears leftovers
                         // of an interrupted extract.
                         if let Some(parent) = dest.parent() {
-                            std::fs::create_dir_all(parent).ok();
+                            std::fs::create_dir_all(parent).map_err(|e| {
+                                LauncherError::ModLoader(format!(
+                                    "Failed to create NeoForge data directory {}: {}",
+                                    parent.display(),
+                                    e
+                                ))
+                            })?;
                         }
                         if super::forge::extract_entry_from_jar(&mut archive, jar_path, &dest) {
                             tracing::debug!(target: "launcher", "Extracted data {} -> {}", jar_path, dest.display());
                         } else {
-                            tracing::warn!(target: "launcher", "Failed to extract data file: {}", jar_path);
+                            // Without this file the patcher cannot work; a
+                            // warning here only delayed the failure until the
+                            // pipeline reported a missing output.
+                            return Err(LauncherError::ModLoader(format!(
+                                "NeoForge installer is missing data file '{jar_path}' required by the processors"
+                            )));
                         }
                     }
                 }
@@ -653,7 +825,9 @@ pub async fn install(
                     // attempt re-runs the whole pipeline instead of finding
                     // it "already present".
                     tracing::warn!(target: "launcher", "NeoForge processor run failed: {}", e);
-                    std::fs::remove_file(&client_path).ok();
+                    for path in &client_paths {
+                        std::fs::remove_file(path).ok();
+                    }
                     std::fs::remove_file(&installer_path).ok();
                     return Err(LauncherError::ModLoader(format!(
                         "NeoForge processor pipeline failed: {}",
@@ -661,13 +835,24 @@ pub async fn install(
                     )));
                 }
             } else {
-                tracing::warn!(target: "launcher", "Java not found — cannot run NeoForge processors");
+                // Without Java the pipeline cannot run; the old generic
+                // "processors did not generate the client JAR" error hid the
+                // actual, user-fixable cause.
+                return Err(LauncherError::ModLoader(format!(
+                    "No Java {} installation was found to run the NeoForge installers. Install a matching JDK (or let the launcher download its managed Java) and try again.",
+                    super::forge::required_forge_java_major(mc_version)
+                )));
             }
 
-            if !super::forge::is_usable_jar(&client_path) {
-                return Err(LauncherError::ModLoader(
-                    "NeoForge processors did not generate the client JAR".into(),
-                ));
+            if find_client_jar(&client_paths).is_none() {
+                return Err(LauncherError::ModLoader(format!(
+                    "NeoForge processors completed but produced no usable client JAR at any expected path: {}",
+                    client_paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
             }
         } else {
             tracing::debug!(target: "launcher", "NeoForge client JAR already present");
@@ -692,7 +877,50 @@ pub async fn install(
 
 #[cfg(test)]
 mod tests {
-    use super::neoforge_maven;
+    use super::*;
+    use std::io::Write as _;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_neoforge_test_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A structurally valid JAR (see `forge::is_usable_jar`).
+    fn write_jar(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        zw.start_file(
+            "META-INF/MANIFEST.MF",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zw.write_all(b"Manifest-Version: 1.0\n").unwrap();
+        zw.start_file("padding.bin", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        // High-entropy padding keeps the archive above the 1 KiB floor even
+        // when the writer compresses it.
+        let padding: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        zw.write_all(&padding).unwrap();
+        zw.finish().unwrap();
+    }
+
+    fn profile_with_patched(value: &str) -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "PATCHED": { "client": value, "server": value },
+                "BINPATCH": { "client": "/data/client.lzma" }
+            }
+        })
+    }
 
     /// NeoForge 1.20.1 (the `net.neoforged:forge` fork) must use the MC-prefixed
     /// gradle-style version under the forge group.
@@ -727,5 +955,99 @@ mod tests {
         let (group, version) = neoforge_maven("1.20.2", "20.2.93");
         assert_eq!(group, "net/neoforged/neoforge");
         assert_eq!(version, "20.2.93");
+    }
+
+    #[test]
+    fn patched_client_path_follows_modern_installer_metadata() {
+        let profile = profile_with_patched("[net.neoforged:minecraft-client-patched:26.3.0.99]");
+        let rel = patched_client_rel_path(&profile).expect("modern coordinate must parse");
+        assert_eq!(
+            rel,
+            PathBuf::from(
+                "net/neoforged/minecraft-client-patched/26.3.0.99/minecraft-client-patched-26.3.0.99.jar"
+            )
+        );
+    }
+
+    #[test]
+    fn patched_client_path_follows_legacy_installer_metadata() {
+        // NeoForge 21.x (and the 1.20.1 forge fork) write the loader's own
+        // `:client` artifact; that must still be recognized.
+        let modern = profile_with_patched("[net.neoforged:neoforge:21.4.157:client]");
+        assert_eq!(
+            patched_client_rel_path(&modern).unwrap(),
+            PathBuf::from("net/neoforged/neoforge/21.4.157/neoforge-21.4.157-client.jar")
+        );
+
+        let fork = profile_with_patched("[net.neoforged:forge:1.20.1-47.1.106:client]");
+        assert_eq!(
+            patched_client_rel_path(&fork).unwrap(),
+            PathBuf::from("net/neoforged/forge/1.20.1-47.1.106/forge-1.20.1-47.1.106-client.jar")
+        );
+    }
+
+    #[test]
+    fn patched_client_path_rejects_unsafe_or_missing_metadata() {
+        for raw in [
+            "../escape:1.0",
+            "[net.neoforged:neoforge:21.4.157:client@jar]",
+            "[net.neoforged/../../neoforge:21.4.157:client]",
+            "net.neoforged:neoforge",
+            "{PATCHED}",
+        ] {
+            assert!(
+                patched_client_rel_path(&profile_with_patched(raw)).is_none(),
+                "coordinate {raw:?} must be rejected"
+            );
+        }
+        let empty = serde_json::json!({ "data": {} });
+        assert!(patched_client_rel_path(&empty).is_none());
+    }
+
+    #[test]
+    fn expected_client_jar_paths_cover_both_layouts_without_metadata() {
+        let dir = temp_dir("expected_paths");
+        let paths = expected_client_jar_paths(&dir, "26.3", "26.3.0.99", None);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            paths[0],
+            dir.join(
+                "net/neoforged/minecraft-client-patched/26.3.0.99/minecraft-client-patched-26.3.0.99.jar"
+            )
+        );
+        assert_eq!(
+            paths[1],
+            dir.join("net/neoforged/neoforge/26.3.0.99/neoforge-26.3.0.99-client.jar")
+        );
+
+        // Metadata is authoritative: only it and the legacy fallback remain.
+        let profile = profile_with_patched("[net.neoforged:minecraft-client-patched:26.3.0.99]");
+        let paths = expected_client_jar_paths(&dir, "26.3", "26.3.0.99", Some(&profile));
+        assert_eq!(paths.len(), 2);
+        assert_eq!(
+            paths[0],
+            dir.join(
+                "net/neoforged/minecraft-client-patched/26.3.0.99/minecraft-client-patched-26.3.0.99.jar"
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_client_jar_accepts_the_metadata_path_and_skips_invalid_files() {
+        let dir = temp_dir("find_jar");
+        let profile = profile_with_patched("[net.neoforged:minecraft-client-patched:26.3.0.99]");
+        let paths = expected_client_jar_paths(&dir, "26.3", "26.3.0.99", Some(&profile));
+
+        // A tiny/truncated file is not an install.
+        std::fs::create_dir_all(paths[1].parent().unwrap()).unwrap();
+        std::fs::write(&paths[1], b"not a zip").unwrap();
+        assert!(find_client_jar(&paths).is_none());
+
+        write_jar(&paths[0]);
+        assert_eq!(find_client_jar(&paths).as_deref(), Some(paths[0].as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

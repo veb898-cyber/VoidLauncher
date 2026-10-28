@@ -74,6 +74,7 @@ pub async fn get_loader_versions(
 
 /// Download the Forge installer JAR, return path.
 async fn download_installer(mc_version: &str, forge_version: &str) -> Result<PathBuf> {
+    super::validate_loader_request(mc_version, forge_version)?;
     let full_version = if forge_version.contains('-') {
         forge_version.to_string()
     } else {
@@ -252,6 +253,20 @@ pub(crate) fn artifact_to_path(artifact: &str, libraries_dir: &Path, ext: &str) 
     let artifact_name = parts[1];
     let version = parts[2];
     let classifier = parts.get(3).copied().unwrap_or("");
+    // Install-profile coordinates are remote input. A component containing
+    // `..`, a separator or a drive prefix must never be joined into the
+    // libraries directory; return an empty path so the caller fails clearly.
+    let component_ok =
+        |value: &str| value.is_empty() || crate::import::check_safe_file_name(value).is_ok();
+    if crate::import::check_safe_remote_path(&group_path).is_err()
+        || !component_ok(artifact_name)
+        || !component_ok(version)
+        || !component_ok(classifier)
+        || !component_ok(ext)
+    {
+        tracing::warn!(target: "launcher", "Unsafe artifact coordinate: {}", artifact);
+        return PathBuf::new();
+    }
     let filename = if classifier.is_empty() {
         format!("{}-{}.{}", artifact_name, version, ext)
     } else {
@@ -390,6 +405,12 @@ pub(crate) async fn download_processor_lib(
     };
 
     let lib_path = libraries_dir.join(&path_str);
+    if crate::import::check_safe_remote_path(&path_str).is_err() {
+        return Err(LauncherError::ModLoader(format!(
+            "Unsafe processor library path: {}",
+            path_str
+        )));
+    }
     // Trust an existing file only when it is not a JAR or passes the
     // structural check — a zero-byte/truncated processor library would
     // otherwise be accepted and break the pipeline run that follows.
@@ -529,24 +550,28 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
 
         let jar_artifact = proc_val.get("jar").and_then(|j| j.as_str()).unwrap_or("");
         if jar_artifact.is_empty() {
-            tracing::warn!(target: "launcher", "Processor {} has no jar, skipping", idx);
-            continue;
+            // Skipping a step silently produces an incomplete pipeline whose
+            // missing output is only discovered (if at all) much later.
+            return Err(LauncherError::ModLoader(format!(
+                "Processor {idx} has no 'jar' entry in install_profile.json"
+            )));
         }
 
         // Resolve the main processor jar path
         let jar_path = resolve_artifact_ref(&format!("[{}]", jar_artifact), libraries_dir);
-        if !jar_path.exists() {
-            tracing::warn!(target: "launcher", "Processor JAR not found: {} (resolved to {}), skipping", jar_artifact, jar_path.display());
-            continue;
+        if !jar_path.is_file() {
+            return Err(LauncherError::ModLoader(format!(
+                "Processor {idx} JAR is missing: {jar_artifact} (resolved to {})",
+                jar_path.display()
+            )));
         }
 
-        let main_class = match get_jar_main_class(&jar_path) {
-            Some(cls) => cls,
-            None => {
-                tracing::warn!(target: "launcher", "No Main-Class in {} manifest, skipping", jar_path.display());
-                continue;
-            }
-        };
+        let main_class = get_jar_main_class(&jar_path).ok_or_else(|| {
+            LauncherError::ModLoader(format!(
+                "Processor {idx} JAR has no Main-Class manifest entry: {}",
+                jar_path.display()
+            ))
+        })?;
 
         // Build classpath: processor jar + all classpath dependencies
         let classpath_artifacts = proc_val
@@ -556,6 +581,7 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
             .unwrap_or_default();
 
         let mut classpath_parts: Vec<String> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
         let all_refs = std::iter::once(jar_artifact).chain(classpath_artifacts.iter().copied());
         for artifact_ref in all_refs {
             let ref_str = if artifact_ref.starts_with('[') {
@@ -564,16 +590,24 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
                 format!("[{}]", artifact_ref)
             };
             let local_path = resolve_artifact_ref(&ref_str, libraries_dir);
-            if local_path.exists() {
+            if local_path.is_file() {
                 classpath_parts.push(local_path.to_string_lossy().to_string());
             } else {
-                tracing::warn!(target: "launcher", "Processor dependency not found: {} (resolved to {})", artifact_ref, local_path.display());
+                missing.push(format!("{} -> {}", artifact_ref, local_path.display()));
             }
         }
 
+        if !missing.is_empty() {
+            return Err(LauncherError::ModLoader(format!(
+                "Processor {idx} classpath is incomplete ({} missing): {}",
+                missing.len(),
+                missing.join("; ")
+            )));
+        }
         if classpath_parts.is_empty() {
-            tracing::warn!(target: "launcher", "Processor {} has no valid classpath, skipping", idx);
-            continue;
+            return Err(LauncherError::ModLoader(format!(
+                "Processor {idx} has an empty classpath in install_profile.json"
+            )));
         }
 
         let classpath = classpath_parts.join(";");
@@ -588,13 +622,26 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
         let mut processed_args: Vec<String> = Vec::new();
         for raw_arg in &raw_args {
             let resolved = if raw_arg.starts_with('[') && raw_arg.ends_with(']') {
-                resolve_artifact_ref(raw_arg, libraries_dir)
-                    .to_string_lossy()
-                    .to_string()
+                let path = resolve_artifact_ref(raw_arg, libraries_dir);
+                if path.as_os_str().is_empty() {
+                    return Err(LauncherError::ModLoader(format!(
+                        "Processor {idx} has an unsafe or malformed artifact argument: {raw_arg}"
+                    )));
+                }
+                path.to_string_lossy().to_string()
             } else {
                 let mut arg = raw_arg.to_string();
                 for (key, val) in &vars {
                     arg = arg.replace(&format!("{{{}}}", key), val);
+                }
+                if arg.contains('{') || arg.contains('}') {
+                    // An unresolved placeholder would be passed to Java
+                    // literally and the processor would write to a path
+                    // containing braces instead of the requested output.
+                    return Err(LauncherError::ModLoader(format!(
+                        "Processor {idx} argument has an unresolved placeholder: {}",
+                        truncate_for_error(&arg, 300)
+                    )));
                 }
                 arg
             };
@@ -640,9 +687,9 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
 
         if !output.status.success() {
             let detail = if stderr.trim().is_empty() {
-                &stdout[..stdout.len().min(500)]
+                truncate_for_error(&stdout, 500)
             } else {
-                &stderr[..stderr.len().min(500)]
+                truncate_for_error(&stderr, 500)
             };
             return Err(LauncherError::ModLoader(format!(
                 "Forge processor {} failed (exit: {}): {}",
@@ -651,7 +698,7 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
         }
 
         if !stderr.trim().is_empty() {
-            tracing::debug!(target: "launcher", "  stderr: {}", &stderr[..stderr.len().min(200)]);
+            tracing::debug!(target: "launcher", "  stderr: {}", truncate_for_error(&stderr, 200));
         }
         tracing::info!(target: "launcher", "Processor {} completed", idx);
     }
@@ -720,6 +767,17 @@ fn build_profile(
             sha1: None,
             size: None,
         });
+    }
+
+    // Loader metadata is remote input too: a path containing `..`, an
+    // absolute path or a drive prefix must never reach a filesystem join.
+    for lib in &libraries {
+        if crate::import::check_safe_remote_path(&lib.path).is_err() {
+            return Err(LauncherError::ModLoader(format!(
+                "Unsafe library path in Forge profile: {}",
+                lib.path
+            )));
+        }
     }
 
     // For MC <= 1.12.2 the Forge profile carries its game arguments in the
@@ -954,6 +1012,17 @@ pub(crate) fn is_usable_jar(path: &Path) -> bool {
     }
 }
 
+/// Truncate a subprocess stream for an error message without splitting a
+/// UTF-8 code point. Raw byte slicing panicked when Java printed localized
+/// (non-ASCII) output.
+pub(crate) fn truncate_for_error(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out.trim().to_string()
+}
+
 /// List the versioned directories under `libraries/net/minecraft/client/`
 /// (e.g. `1.20.1-20230612.114412`) that may hold processor-generated JARs.
 fn scan_client_version_dirs(libraries_dir: &Path) -> Vec<PathBuf> {
@@ -997,6 +1066,9 @@ pub async fn ensure_processor_jars(
     libraries_dir: &Path,
     versions_dir: &Path,
 ) -> Result<()> {
+    // This path runs on every launch and derives file names from both
+    // versions before any network validation, so reject unsafe values first.
+    super::validate_loader_request(mc_version, loader_version)?;
     if !mc_needs_processor_jars(mc_version) {
         tracing::debug!(target: "launcher", "MC {} doesn't need processor JARs, skipping", mc_version);
         return Ok(());
@@ -1215,7 +1287,12 @@ pub async fn ensure_processor_jars(
             )));
         }
     } else {
-        tracing::warn!(target: "launcher", "Java not found — cannot run Forge processors");
+        // Without Java the pipeline cannot run; reporting a generic "outputs
+        // missing" error hid the real cause and made this look unfixable.
+        return Err(LauncherError::ModLoader(format!(
+            "No Java {} installation was found to run the Forge installers. Install a matching JDK (or let the launcher download its managed Java) and try again.",
+            required_forge_java_major(mc_version)
+        )));
     }
 
     // Keep the validated installer cached (see download_installer) so a

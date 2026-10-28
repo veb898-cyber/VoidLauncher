@@ -127,26 +127,31 @@ pub fn launch_minecraft(
     }
     tracing::debug!(target: "launcher", "Client JAR: {:?}", client_jar);
     tracing::debug!(target: "launcher", "Client JAR exists: {}", client_jar.exists());
+    if !client_jar.is_file() {
+        return Err(LauncherError::Launch(format!(
+            "Client JAR is missing for version {}: {}",
+            version_info.id,
+            client_jar.display()
+        )));
+    }
 
     // Build vanilla classpath first, then we may reorder below
-    let vanilla_cp = build_classpath(version_info, &config.libraries_dir(), &client_jar);
+    let vanilla_cp = build_classpath(version_info, &config.libraries_dir(), &client_jar)?;
 
     // Collect loader libraries (if any) before inserting into final classpath
     let mut loader_cp_entries: Vec<String> = Vec::new();
     if let Some(profile) = &instance.loader_profile {
         tracing::info!(target: "launcher", "Mod loader: main_class={}", profile.main_class);
         for lib in &profile.libraries {
-            // Loader metadata decides these relative paths; skip any that
-            // try to escape the libraries directory.
-            if crate::import::check_safe_remote_path(&lib.path).is_err() {
-                tracing::warn!(target: "launcher", "Skipping loader library with unsafe path: {}", lib.path);
-                continue;
-            }
-            let lib_path = config.libraries_dir().join(&lib.path);
-            if lib_path.exists() {
+            let lib_path = loader_library_path(&config.libraries_dir(), lib)?;
+            if lib_path.is_file() {
                 loader_cp_entries.push(lib_path.to_string_lossy().to_string());
             } else {
-                tracing::warn!(target: "launcher", "Mod library not found: {:?}", lib_path);
+                return Err(LauncherError::Launch(format!(
+                    "Mod loader library is missing: {} ({})",
+                    lib.name,
+                    lib_path.display()
+                )));
             }
         }
     }
@@ -360,7 +365,7 @@ pub fn launch_minecraft(
     // natives directory, so old LWJGL versions can find them via
     // -Djava.library.path. The native JARs are also on the classpath (added
     // by build_classpath), which covers newer LWJGL.
-    crate::versions::extract_natives(version_info, &config.libraries_dir(), &natives_dir);
+    crate::versions::extract_natives(version_info, &config.libraries_dir(), &natives_dir)?;
 
     // Add mod loader JVM args (skip -cp and ${classpath}, we add them explicitly below).
     // Loader profiles (Forge/NeoForge in particular) sometimes include their own
@@ -776,6 +781,24 @@ fn get_java_path(
     }
 }
 
+/// Resolve a loader-library path from the persisted instance profile.
+///
+/// Loader metadata decides these relative paths. An unsafe path means the
+/// profile was tampered with; fail loudly instead of launching with a
+/// silently incomplete (or externally sourced) classpath.
+fn loader_library_path(
+    libraries_dir: &Path,
+    lib: &crate::modloaders::LoaderLibrary,
+) -> Result<PathBuf> {
+    if crate::import::check_safe_remote_path(&lib.path).is_err() {
+        return Err(LauncherError::Launch(format!(
+            "Unsafe path in loader library: {} ({})",
+            lib.name, lib.path
+        )));
+    }
+    Ok(libraries_dir.join(&lib.path))
+}
+
 /// Extract "group:artifact" from a Maven coordinate like
 /// "org.ow2.asm:asm:9.8" or "com.google.code.findbugs:jsr305:3.0.2".
 fn artifact_key(name: &str) -> Option<String> {
@@ -786,4 +809,36 @@ fn artifact_key(name: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}:{}", group, artifact))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loader_lib(path: &str) -> crate::modloaders::LoaderLibrary {
+        crate::modloaders::LoaderLibrary {
+            name: "com.example:evil:1.0".to_string(),
+            url: "https://libraries.minecraft.net/".to_string(),
+            path: path.to_string(),
+            sha1: None,
+            size: None,
+        }
+    }
+
+    #[test]
+    fn loader_library_path_rejects_traversal() {
+        let err = loader_library_path(Path::new("libraries"), &loader_lib("../../evil.jar"))
+            .expect_err("traversal path must fail launch");
+        assert!(err.to_string().contains("Unsafe path"), "got: {}", err);
+    }
+
+    #[test]
+    fn loader_library_path_keeps_safe_path_under_libraries() {
+        let path = loader_library_path(
+            Path::new("libraries"),
+            &loader_lib("com/example/evil/1.0/evil-1.0.jar"),
+        )
+        .expect("safe path must resolve");
+        assert!(path.starts_with("libraries"));
+    }
 }

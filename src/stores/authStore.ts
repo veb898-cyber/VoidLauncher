@@ -34,19 +34,27 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   checkAuth: async () => {
     try {
       const state = await invoke<any>('cmd_get_auth_state');
-      if (state.profile) {
-        set({
-          profile: state.profile,
-          isLoggedIn: true,
-        });
-      }
+      // A removed/logged-out account must disappear from the UI too; only
+      // setting a profile when present left a stale name on screen.
+      set({
+        profile: state.profile ?? null,
+        isLoggedIn: Boolean(state.profile),
+      });
     } catch (e) {
       console.error('Auth check failed:', e);
     }
   },
 
   startLogin: async () => {
-    set({ isLoading: true, error: null });
+    // Drop every trace of a previous attempt before requesting a new code:
+    // an old code must never be polled or displayed after a retry fails.
+    set({
+      isLoading: true,
+      error: null,
+      deviceCode: null,
+      userCode: null,
+      verificationUri: null,
+    });
     try {
       const response = await invoke<any>('cmd_start_login');
       set({

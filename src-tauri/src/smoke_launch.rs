@@ -250,7 +250,8 @@ async fn install_version(config: &AppConfig, mc: &str) -> Result<versions::Versi
         .await
         .map_err(|e| format!("version info {}: {}", mc, e))?;
 
-    let files = versions::collect_downloads(&vi, &config.libraries_dir(), &config.versions_dir());
+    let files = versions::collect_downloads(&vi, &config.libraries_dir(), &config.versions_dir())
+        .map_err(|e| format!("collect downloads {}: {}", mc, e))?;
     if !files.is_empty() {
         report_line(&format!("downloading {} files for {}...", files.len(), mc));
         download::download_files(files, |_, _, _, _, _| {})

@@ -1937,73 +1937,81 @@ fn parse_prism_mmc_pack(content: &str) -> Result<(String, LoaderType, Option<Str
     Ok((mc_version, loader, loader_version))
 }
 
-/// Import a Prism Launcher instance.zip into VoidLauncher instances dir.
-///
-/// Prism/MultiMC store the game directory as `minecraft/` (no dot) and keep
-/// metadata in `instance.cfg` + `mmc-pack.json`. We map the game directory to
-/// our canonical `.minecraft/` and translate the loader components, so mods,
-/// resourcepacks, shaderpacks, configs and saves land where our launcher
-/// expects them. Per-launch junk (.bobby cache, .mixin.out, crash-reports,
-/// logs) and Prism metadata files are not carried over.
-pub fn import_prism_pack(instances_dir: &Path, zip_path: &str) -> Result<Instance> {
-    let zip_path = std::path::Path::new(zip_path);
-    if !zip_path.exists() {
-        return Err(LauncherError::Instance(format!(
-            "ZIP file not found: {}",
-            zip_path.display()
-        )));
+/// Metadata read from a Prism archive before any file is extracted.
+struct PrismPackMeta {
+    /// Name stored inside the pack. Only used when the caller has no name of
+    /// its own (standalone `.zip` import); a wizard import always uses the
+    /// name the user typed.
+    pack_name: String,
+    mc_version: String,
+    loader: LoaderType,
+    loader_version: Option<String>,
+}
+
+/// Read `instance.cfg` (name) + `mmc-pack.json` (version/loader) in one pass.
+/// The archive stays file-backed; Prism packs can contain huge worlds.
+fn read_prism_pack_meta(zip_path: &Path) -> Result<PrismPackMeta> {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)
+        .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
+
+    let mut found = false;
+    let mut cfg_content = String::new();
+    let mut pack_content = String::new();
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| LauncherError::Instance(e.to_string()))?;
+        let entry_name = entry.name().to_string();
+        // Preflight every entry before the target directory is created: an
+        // archive with a traversal path must fail cleanly.
+        if crate::import::check_safe_relative(&entry_name).is_err() {
+            return Err(LauncherError::Instance(format!(
+                "Unsafe path in Prism pack: {}",
+                entry_name
+            )));
+        }
+        match entry_name.as_str() {
+            "instance.cfg" => {
+                found = true;
+                entry.read_to_string(&mut cfg_content).ok();
+            }
+            "mmc-pack.json" => {
+                entry.read_to_string(&mut pack_content).ok();
+            }
+            _ => {}
+        }
     }
 
-    // Read the ZIP in one pass: instance.cfg (name) + mmc-pack.json (version/loader)
-    let zip_bytes = std::fs::read(zip_path)?;
-    let (name, mc_version, loader, loader_version) = {
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes))
-            .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
+    if !found {
+        return Err(LauncherError::Instance(
+            "Not a valid Prism instance pack: missing instance.cfg".to_string(),
+        ));
+    }
 
-        let mut found = false;
-        let mut cfg_content = String::new();
-        let mut pack_content = String::new();
+    let pack_name = cfg_content
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("name=").map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            zip_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("imported")
+                .to_string()
+        });
+    let (mc_version, loader, loader_version) = parse_prism_mmc_pack(&pack_content)?;
+    Ok(PrismPackMeta {
+        pack_name,
+        mc_version,
+        loader,
+        loader_version,
+    })
+}
 
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| LauncherError::Instance(e.to_string()))?;
-            match entry.name() {
-                "instance.cfg" => {
-                    found = true;
-                    entry.read_to_string(&mut cfg_content).ok();
-                }
-                "mmc-pack.json" => {
-                    entry.read_to_string(&mut pack_content).ok();
-                }
-                _ => {}
-            }
-        }
-
-        if !found {
-            return Err(LauncherError::Instance(
-                "Not a valid Prism instance pack: missing instance.cfg".to_string(),
-            ));
-        }
-
-        let name = cfg_content
-            .lines()
-            .find_map(|line| {
-                let line = line.trim();
-                line.strip_prefix("name=").map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| {
-                zip_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("imported")
-                    .to_string()
-            });
-        let (mc_version, loader, loader_version) = parse_prism_mmc_pack(&pack_content)?;
-        (name, mc_version, loader, loader_version)
-    };
-
-    // Validate the extracted name
+fn validate_prism_instance_name(name: &str) -> Result<()> {
     let trimmed = name.trim();
     if trimmed.is_empty()
         || trimmed.chars().count() < 3
@@ -2041,18 +2049,122 @@ pub fn import_prism_pack(instances_dir: &Path, zip_path: &str) -> Result<Instanc
             name
         )));
     }
+    Ok(())
+}
 
-    // Create target directory. Refuse to merge into an existing instance —
-    // the importer has no per-file conflict handling and would overwrite
-    // the previous instance's mods/configs.
+/// Import a Prism Launcher instance.zip into VoidLauncher instances dir.
+///
+/// Prism/MultiMC store the game directory as `minecraft/` (no dot) and keep
+/// metadata in `instance.cfg` + `mmc-pack.json`. We map the game directory to
+/// our canonical `.minecraft/` and translate the loader components, so mods,
+/// resourcepacks, shaderpacks, configs and saves land where our launcher
+/// expects them. Per-launch junk (.bobby cache, .mixin.out, crash-reports,
+/// logs) and Prism metadata files are not carried over.
+///
+/// The pack's own `instance.cfg` name is used when no explicit name is given.
+pub fn import_prism_pack(instances_dir: &Path, zip_path: &str) -> Result<Instance> {
+    import_prism_pack_as(instances_dir, zip_path, None)
+}
+
+/// Import a Prism archive under a caller-chosen instance name. The name is
+/// used for the directory, `instance.json`, `instance.cfg` and the UI, so a
+/// mismatch with the name stored in the archive can never split the instance
+/// between two folders.
+pub fn import_prism_pack_as(
+    instances_dir: &Path,
+    zip_path: &str,
+    instance_name: Option<&str>,
+) -> Result<Instance> {
+    let zip = std::path::Path::new(zip_path);
+    // Parse first: an invalid/corrupt archive must fail before the target
+    // directory is reserved.
+    let meta = read_prism_pack_meta(zip)?;
+    let chosen = instance_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| meta.pack_name.clone());
+    validate_prism_instance_name(&chosen)?;
+
+    // Atomic ownership: a concurrent import of the same name fails here
+    // instead of both importers merging into one directory.
+    let mut reservation = crate::import::InstanceReservation::reserve(instances_dir, &chosen)?;
+    let instance = import_prism_pack_into(instances_dir, zip_path, &chosen, Some(meta))?;
+    reservation.commit();
+    Ok(instance)
+}
+
+/// Import a Prism archive into an already reserved `instances_dir/<name>`.
+/// The caller (import_with_cleanup) owns the directory and its cleanup.
+pub(crate) fn import_prism_pack_reserved(
+    instances_dir: &Path,
+    zip_path: &str,
+    instance_name: &str,
+) -> Result<Instance> {
+    let name = instance_name.trim();
+    validate_prism_instance_name(name)?;
+    import_prism_pack_into(instances_dir, zip_path, name, None)
+}
+
+fn import_prism_pack_into(
+    instances_dir: &Path,
+    zip_path: &str,
+    instance_name: &str,
+    metadata: Option<PrismPackMeta>,
+) -> Result<Instance> {
+    let zip_path = std::path::Path::new(zip_path);
+    if !zip_path.exists() {
+        return Err(LauncherError::Instance(format!(
+            "ZIP file not found: {}",
+            zip_path.display()
+        )));
+    }
+
+    let meta = match metadata {
+        Some(meta) => meta,
+        None => read_prism_pack_meta(zip_path)?,
+    };
+    let name = instance_name.trim().to_string();
+    let PrismPackMeta {
+        pack_name,
+        mc_version,
+        loader,
+        loader_version,
+    } = meta;
+    if name != pack_name {
+        tracing::info!(
+            target: "launcher",
+            "Prism pack '{}' is being imported as '{}' (name chosen by the user)",
+            pack_name, name
+        );
+    }
+
+    // Version strings become directory names at launch: reject traversal
+    // from a tampered mmc-pack.json before the instance is created.
+    if !mc_version.is_empty() && crate::import::check_safe_file_name(&mc_version).is_err() {
+        return Err(LauncherError::Instance(format!(
+            "Invalid Minecraft version in Prism pack: '{}'",
+            mc_version
+        )));
+    }
+    if let Some(version) = loader_version.as_deref().filter(|v| !v.is_empty()) {
+        if crate::import::check_safe_file_name(version).is_err() {
+            return Err(LauncherError::Instance(format!(
+                "Invalid loader version in Prism pack: '{}'",
+                version
+            )));
+        }
+    }
+
+    // The directory was reserved by the caller; `create_dir_all` is a no-op
+    // for an existing (empty) directory and still works for direct callers.
     let target_dir = instances_dir.join(&name);
-    crate::import::ensure_instance_target_free(instances_dir, &name)?;
     std::fs::create_dir_all(&target_dir)?;
 
     // Extract with mapping: Prism `minecraft/` (and our own `.minecraft/`
     // exports) → canonical `.minecraft/`. Skip Prism metadata and launch junk.
     {
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)
             .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
 
         for i in 0..archive.len() {
@@ -2064,14 +2176,15 @@ pub fn import_prism_pack(instances_dir: &Path, zip_path: &str) -> Result<Instanc
             }
 
             let entry_name = entry.name().to_string();
-            // Refuse path traversal: reject any component equal to ".."
+            // Reject traversal, absolute/rooted paths and drive prefixes before
+            // mapping the entry into the target instance.
+            if crate::import::check_safe_relative(&entry_name).is_err() {
+                return Err(LauncherError::Instance(format!(
+                    "Unsafe path in Prism pack: {}",
+                    entry_name
+                )));
+            }
             let normalised = entry_name.replace('\\', "/");
-            if normalised.contains('\0') || normalised.split('/').any(|c| c == "..") {
-                continue;
-            }
-            if normalised.starts_with('/') {
-                continue;
-            }
 
             // Skip per-launch junk we don't need
             fn is_junk(rel: &str) -> bool {
@@ -2104,13 +2217,7 @@ pub fn import_prism_pack(instances_dir: &Path, zip_path: &str) -> Result<Instanc
             };
 
             let Some(relative) = relative else { continue };
-
-            let out_path = target_dir.join(&relative);
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut out_file = std::fs::File::create(&out_path)?;
-            std::io::copy(&mut entry, &mut out_file)?;
+            crate::import::write_extracted(&target_dir, &relative, &mut entry)?;
         }
     }
 
@@ -2920,7 +3027,8 @@ fn instance_backup_skip(name: &str) -> bool {
 
 /// Extract a zip archive into `dest` with zip-slip protection: entries with
 /// NUL, `:` (drive letters / NTFS streams), leading `/` or `..` segments are
-/// skipped, and the final join must stay inside `dest`.
+/// rejected, and the final join must stay inside `dest`. A rejected entry
+/// fails the whole restore so a corrupt archive is never applied partially.
 fn extract_zip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file)
@@ -2940,11 +3048,17 @@ fn extract_zip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Res
             || name.starts_with('/')
             || name.split('/').any(|c| c == "..")
         {
-            continue;
+            return Err(LauncherError::Instance(format!(
+                "Unsafe path in backup archive: {}",
+                name
+            )));
         }
         let out_path = dest.join(&name);
         if !out_path.starts_with(dest) {
-            continue;
+            return Err(LauncherError::Instance(format!(
+                "Backup entry escapes the restore directory: {}",
+                name
+            )));
         }
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -3014,6 +3128,217 @@ pub fn list_instance_backups(instances_dir: &Path, name: &str) -> Result<Vec<Bac
     list_backup_dir(&instance_backups_dir(instances_dir, name))
 }
 
+/// Hidden directories used while a restore is in progress. A random UUID token
+/// makes every operation's paths unique even when two restores start in the
+/// same second (the old PID+timestamp scheme collided).
+struct RestoreStaging {
+    tmp: PathBuf,
+    old: PathBuf,
+}
+
+fn new_restore_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn restore_staging_paths(instances_dir: &Path, token: &str) -> RestoreStaging {
+    RestoreStaging {
+        tmp: instances_dir.join(format!(".void-restore-tmp-{token}")),
+        old: instances_dir.join(format!(".void-old-{token}")),
+    }
+}
+
+/// Write the metadata files that live in an instance root into `dir`. Unlike
+/// `save_instance`, `dir` may be a staging directory that is not named after
+/// the instance yet.
+fn write_instance_metadata_in_dir(dir: &Path, instance: &Instance) -> Result<()> {
+    if !dir.is_dir() {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            LauncherError::Instance(format!(
+                "Could not create instance directory '{}': {e}",
+                dir.display()
+            ))
+        })?;
+    }
+    let json = serde_json::to_string_pretty(instance)?;
+    let write = |name: &str, contents: &[u8]| {
+        write_file_atomic(&dir.join(name), contents).map_err(|e| {
+            LauncherError::Instance(format!(
+                "Could not write {name} into '{}': {e}",
+                dir.display()
+            ))
+        })
+    };
+    write("instance.json", json.as_bytes())?;
+    write("instance.cfg", build_prism_cfg_content(instance).as_bytes())?;
+    write("mmc-pack.json", build_mmc_pack_json(instance)?.as_bytes())?;
+    if let Some(icon) = instance.icon.as_deref() {
+        if let Some(bytes) = icon.split(";base64,").nth(1).and_then(base64_decode) {
+            let _ = std::fs::write(dir.join("pack.png"), bytes);
+        }
+    }
+    Ok(())
+}
+
+/// Align the restored instance metadata with the directory it will live in.
+/// A backup taken before a rename still contains the old name; leaving it
+/// would make `Instance.dir()` point at a folder that no longer exists.
+///
+/// This runs on the extracted staging directory, BEFORE the swap, so a
+/// metadata error can no longer destroy the live instance (the old code
+/// swapped first and then tried to roll back, which itself could fail).
+fn sync_restored_instance_name(dir: &Path, target_name: &str) -> Result<()> {
+    let json_path = dir.join("instance.json");
+    let cfg_path = dir.join("instance.cfg");
+
+    let mut instance = if json_path.exists() {
+        let contents = std::fs::read_to_string(&json_path)?;
+        serde_json::from_str::<Instance>(&contents).map_err(|e| {
+            LauncherError::Instance(format!(
+                "Restored metadata for '{}' is invalid: {}",
+                target_name, e
+            ))
+        })?
+    } else if cfg_path.exists() {
+        parse_prism_cfg(&cfg_path).ok_or_else(|| {
+            LauncherError::Instance(format!(
+                "Restored metadata for '{}' is invalid: cannot parse instance.cfg",
+                target_name
+            ))
+        })?
+    } else {
+        return Err(LauncherError::Instance(format!(
+            "Restored instance '{}' has no instance.json or instance.cfg",
+            target_name
+        )));
+    };
+
+    instance.name = target_name.to_string();
+    write_instance_metadata_in_dir(dir, &instance)
+}
+
+/// Indirection over `std::fs::rename` so the restore swap can be tested with
+/// the exact Windows failure users hit (`os error 5`, Access Denied).
+/// Production always calls the OS; tests inject a wrapper that fails at one
+/// specific stage.
+trait RenameOp {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+}
+
+struct OsRename;
+
+impl RenameOp for OsRename {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+}
+
+/// Rename attempts during a restore swap. Windows refuses to rename a
+/// directory while any child file is held without delete sharing — antivirus
+/// scans, the search indexer, Explorer previews and the game itself all do
+/// that. A bounded wait lets a transient lock clear instead of aborting a
+/// restore that would succeed a moment later.
+const RENAME_ATTEMPTS: u32 = 10;
+const RENAME_BASE_DELAY_MS: u64 = 100;
+const RENAME_MAX_DELAY_MS: u64 = 1200;
+
+fn rename_with_retry(op: &dyn RenameOp, from: &Path, to: &Path, context: &str) -> Result<()> {
+    rename_with_retry_policy(
+        op,
+        from,
+        to,
+        context,
+        RENAME_ATTEMPTS,
+        RENAME_BASE_DELAY_MS,
+        RENAME_MAX_DELAY_MS,
+    )
+}
+
+fn rename_with_retry_policy(
+    op: &dyn RenameOp,
+    from: &Path,
+    to: &Path,
+    context: &str,
+    attempts: u32,
+    base_delay_ms: u64,
+    max_delay_ms: u64,
+) -> Result<()> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..attempts {
+        match op.rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let retryable = matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
+                    || e.raw_os_error() == Some(32);
+                let detail = e.to_string();
+                last = Some(e);
+                if !retryable || attempt + 1 == attempts {
+                    break;
+                }
+                let delay = base_delay_ms
+                    .saturating_mul(1u64 << attempt.min(6))
+                    .min(max_delay_ms);
+                tracing::debug!(
+                    target: "launcher",
+                    "{} attempt {}/{} failed for '{}': {}; retrying in {} ms",
+                    context,
+                    attempt + 1,
+                    attempts,
+                    from.display(),
+                    detail,
+                    delay
+                );
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
+    }
+    let detail = last
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "unknown error".to_string());
+    Err(LauncherError::Instance(format!(
+        "{context} failed for '{}' (after {attempts} attempts): {detail}",
+        from.display()
+    )))
+}
+
+/// `remove_dir_all` that first clears Windows read-only attributes when the
+/// direct attempt fails. Files restored from an archive can carry the
+/// read-only flag, which made cleanup fail with Access Denied and left the
+/// restore looking broken after it had already succeeded.
+fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            clear_readonly_recursive(path);
+            std::fs::remove_dir_all(path).map_err(|_| first)
+        }
+    }
+}
+
+fn clear_readonly_recursive(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.permissions().readonly() {
+        let mut perms = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    if meta.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                clear_readonly_recursive(&entry.path());
+            }
+        }
+    }
+}
+
+/// A directory that can be listed and launched by the instance manager: it
+/// must exist and contain one of the metadata formats the launcher reads.
+fn has_instance_metadata(dir: &Path) -> bool {
+    dir.is_dir() && (dir.join("instance.json").is_file() || dir.join("instance.cfg").is_file())
+}
+
 /// Restore an instance from a backup archive. `mode` is `"replace"` (rebuild
 /// the instance from the archive, preserving its `.backups` history) or
 /// `"as_new"` (extract into a new instance named `new_name`; the original is
@@ -3026,6 +3351,24 @@ pub fn restore_instance(
     backup_filename: &str,
     mode: &str,
     new_name: Option<&str>,
+) -> Result<()> {
+    restore_instance_with(
+        instances_dir,
+        name,
+        backup_filename,
+        mode,
+        new_name,
+        &OsRename,
+    )
+}
+
+fn restore_instance_with(
+    instances_dir: &Path,
+    name: &str,
+    backup_filename: &str,
+    mode: &str,
+    new_name: Option<&str>,
+    rename: &dyn RenameOp,
 ) -> Result<()> {
     validate_backup_filename(backup_filename)?;
     // No `get_instance` here on purpose: restore must work even when the
@@ -3082,76 +3425,205 @@ pub fn restore_instance(
     // 1. Extract fully to a hidden sibling temp dir — failures here leave the
     //    existing instance untouched. Dot-prefixed and lacking instance.json,
     //    so `list_instances` ignores it even if a crash leaves it behind.
-    let pid = std::process::id();
-    let ts = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
-    let tmp = instances_dir.join(format!(".void-restore-tmp-{}_{}", pid, ts));
+    //    A fresh UUID per operation prevents two restores from sharing (and
+    //    then deleting) each other's staging paths.
+    let staging = restore_staging_paths(instances_dir, &new_restore_token());
+    let tmp = &staging.tmp;
     if tmp.exists() {
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = remove_dir_all_force(tmp);
     }
-    if let Err(e) = extract_zip_to_dir(&backup_path, &tmp) {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(e);
+    if let Err(e) = extract_zip_to_dir(&backup_path, tmp) {
+        let _ = remove_dir_all_force(tmp);
+        return Err(LauncherError::Instance(format!(
+            "Could not extract backup '{}': {e}",
+            backup_filename
+        )));
     }
     if !tmp.join("instance.json").exists() && !tmp.join("instance.cfg").exists() {
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = remove_dir_all_force(tmp);
         return Err(LauncherError::Instance(
             "Archive does not look like a VoidLauncher or Prism instance".into(),
         ));
     }
 
-    // 2. Swap it in.
+    // 2. Re-label the extracted metadata while it is still in staging. The
+    //    archive may predate a rename, and `Instance.dir()` derives the folder
+    //    from this field. Doing it before the swap means a metadata failure
+    //    simply discards the staging copy and leaves the live instance intact.
+    if let Err(e) = sync_restored_instance_name(tmp, &target_name) {
+        let _ = remove_dir_all_force(tmp);
+        return Err(e);
+    }
+
+    // 3. Swap it in.
     if mode == "replace" {
-        // The archive never contains `.backups`, so preserve the live backup
-        // history across the swap — it holds the archive being restored.
-        let old_backups = inst_dir.join(".backups");
-        let preserved = instances_dir.join(format!(".void-backups-preserve-{}_{}", pid, ts));
-        let had_backups = old_backups.exists();
-        if had_backups {
-            std::fs::rename(&old_backups, &preserved)?;
+        let old_dir = &staging.old;
+        if old_dir.exists() {
+            let _ = remove_dir_all_force(old_dir);
         }
-        let old_dir = instances_dir.join(format!(".void-old-{}_{}", pid, ts));
-        if let Err(e) = std::fs::rename(&inst_dir, &old_dir) {
-            if had_backups {
-                let _ = std::fs::rename(&preserved, &old_backups);
+        if let Err(e) = rename_with_retry(
+            rename,
+            &inst_dir,
+            old_dir,
+            "Moving the current instance aside",
+        ) {
+            let _ = remove_dir_all_force(tmp);
+            return Err(LauncherError::Instance(format!(
+                "{e}. Nothing was changed - close the game, Explorer windows and any antivirus scan using '{}', then retry.",
+                inst_dir.display()
+            )));
+        }
+        if let Err(e) =
+            rename_with_retry(rename, tmp, &target_dir, "Installing the restored instance")
+        {
+            // Roll back to the original instance. If even that fails, keep
+            // the original directory for manual recovery; the staging copy is
+            // never installed and is safe to discard.
+            match rename_with_retry(
+                rename,
+                old_dir,
+                &inst_dir,
+                "Restoring the original instance",
+            ) {
+                Ok(()) => {
+                    let _ = remove_dir_all_force(tmp);
+                }
+                Err(rollback) => {
+                    tracing::error!(
+                        target: "launcher",
+                        "Restore swap failed ({}), rollback failed ({}); original kept at {}",
+                        e, rollback, old_dir.display()
+                    );
+                    // The original is safe in `old_dir`; the staging copy was
+                    // never installed, so removing it cannot lose user data.
+                    let _ = remove_dir_all_force(tmp);
+                    return Err(LauncherError::Instance(format!(
+                        "{e}; the original instance is preserved at '{}'",
+                        old_dir.display()
+                    )));
+                }
             }
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e.into());
+            return Err(e);
         }
-        if let Err(e) = std::fs::rename(&tmp, &target_dir) {
-            let _ = std::fs::rename(&old_dir, &inst_dir);
-            if had_backups {
-                let _ = std::fs::rename(&preserved, inst_dir.join(".backups"));
+
+        // The restored directory must be a usable instance before the old
+        // copy is touched, let alone deleted.
+        let restored_ok = has_instance_metadata(&target_dir);
+        if !restored_ok {
+            let bad = LauncherError::Instance(format!(
+                "Restored instance '{}' is incomplete after the swap",
+                target_name
+            ));
+            if remove_dir_all_force(&target_dir).is_err() {
+                tracing::error!(
+                    target: "launcher",
+                    "Could not remove the incomplete restored instance {}; previous instance kept at {}",
+                    target_dir.display(), old_dir.display()
+                );
+                return Err(bad);
             }
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e.into());
+            if let Err(rollback) = rename_with_retry(
+                rename,
+                old_dir,
+                &inst_dir,
+                "Restoring the original instance",
+            ) {
+                tracing::error!(
+                    target: "launcher",
+                    "Restore verification failed ({}), rollback failed ({}); original kept at {}",
+                    bad, rollback, old_dir.display()
+                );
+                return Err(LauncherError::Instance(format!(
+                    "{}; the original instance is preserved at '{}'",
+                    bad,
+                    old_dir.display()
+                )));
+            }
+            return Err(bad);
         }
-        if had_backups {
-            let new_backups = target_dir.join(".backups");
-            if new_backups.exists() {
+
+        // 4. Move the preserved backup history out of the old directory. It
+        //    contains the archive being restored, so this must happen after
+        //    the swap: a failure can then never leave it in a directory that
+        //    no longer exists.
+        let old_backups = old_dir.join(".backups");
+        let new_backups = target_dir.join(".backups");
+        let mut backup_history_moved = true;
+        if old_backups.is_dir() {
+            if !new_backups.exists() {
+                if let Err(e) =
+                    rename_with_retry(rename, &old_backups, &new_backups, "Moving backup history")
+                {
+                    tracing::error!(
+                        target: "launcher",
+                        "Restore succeeded but backup history could not be moved; it is kept at {}: {}",
+                        old_backups.display(), e
+                    );
+                    backup_history_moved = false;
+                }
+            } else {
                 // Extremely unlikely (a backup containing `.backups`), but
                 // keep both histories instead of losing one.
-                for entry in std::fs::read_dir(&preserved)? {
-                    let entry = entry?;
-                    let _ = std::fs::rename(entry.path(), new_backups.join(entry.file_name()));
+                match std::fs::read_dir(&old_backups) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            let dest = new_backups.join(entry.file_name());
+                            if let Err(e) = rename_with_retry(
+                                rename,
+                                &entry.path(),
+                                &dest,
+                                "Merging backup history",
+                            ) {
+                                tracing::warn!(
+                                    target: "launcher",
+                                    "Could not merge preserved backup {:?}: {}",
+                                    entry.path(), e
+                                );
+                                backup_history_moved = false;
+                            }
+                        }
+                        if backup_history_moved {
+                            let _ = remove_dir_all_force(&old_backups);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "launcher",
+                            "Backup history kept at {} (could not read it): {}",
+                            old_backups.display(), e
+                        );
+                        backup_history_moved = false;
+                    }
                 }
-                let _ = std::fs::remove_dir_all(&preserved);
-            } else {
-                std::fs::rename(&preserved, &new_backups)?;
             }
         }
-        let _ = std::fs::remove_dir_all(&old_dir);
-    } else {
-        if let Err(e) = std::fs::rename(&tmp, &target_dir) {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e.into());
+
+        // Only delete the old copy once the restored instance (and, when
+        // possible, its backup history) is safely in place. If cleanup is
+        // blocked, the hidden directory stays — a later launch ignores it and
+        // nothing is lost.
+        if backup_history_moved {
+            if let Err(e) = remove_dir_all_force(old_dir) {
+                tracing::warn!(
+                    target: "launcher",
+                    "Restored instance is in place, but the previous copy could not be fully removed ({}); it remains hidden at {}",
+                    e, old_dir.display()
+                );
+            }
         }
-        // Re-label the metadata: the archive stores the original instance
-        // name, and `Instance.dir()` derives the folder from that field —
-        // keeping it would make the copy address the original's folder.
-        if let Ok(mut restored) = get_instance(instances_dir, &target_name) {
-            restored.name = target_name.clone();
-            let _ = save_instance(instances_dir, &restored, None);
-        }
+    } else if let Err(e) =
+        rename_with_retry(rename, tmp, &target_dir, "Installing the restored instance")
+    {
+        let _ = remove_dir_all_force(tmp);
+        return Err(e);
+    } else if !has_instance_metadata(&target_dir) {
+        // Same guarantee as replace: never report success for a directory
+        // the instance manager cannot load.
+        let _ = remove_dir_all_force(&target_dir);
+        return Err(LauncherError::Instance(format!(
+            "Restored instance '{}' is incomplete after the swap",
+            target_name
+        )));
     }
 
     tracing::info!(
@@ -3750,6 +4222,44 @@ version = 'hIibTfxn'
         assert!(
             !instances_dir.join("Quilt Pack").exists(),
             "no instance written on rejection"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prism_import_rejects_traversal_entries() {
+        let dir = temp_dir("prism_traversal");
+        let zip_path = dir.join("evil.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_w = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip_w.start_file("instance.cfg", opts).unwrap();
+        zip_w.write_all(b"[General]\nname=Evil Pack\n").unwrap();
+        zip_w.start_file("mmc-pack.json", opts).unwrap();
+        zip_w
+            .write_all(br#"{"components":[{"uid":"net.minecraft","version":"1.20.1"}]}"#)
+            .unwrap();
+        zip_w
+            .start_file("minecraft/../../escape.txt", opts)
+            .unwrap();
+        zip_w.write_all(b"escaped").unwrap();
+        zip_w.finish().unwrap();
+
+        let instances_dir = dir.join("instances");
+        let err = import_prism_pack(&instances_dir, zip_path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsafe path"),
+            "error must name the unsafe path: {}",
+            err
+        );
+        assert!(
+            !instances_dir.join("Evil Pack").exists(),
+            "no instance directory may survive a rejected import"
+        );
+        assert!(
+            !dir.join("escape.txt").exists(),
+            "traversal entry must not be written outside the instance"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4379,6 +4889,32 @@ version = 'hIibTfxn'
     }
 
     #[test]
+    fn backup_archive_traversal_entry_is_rejected() {
+        let dir = temp_dir("backup_zip_traversal");
+        let zip_path = dir.join("evil.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_w = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip_w.start_file("../escape.txt", opts).unwrap();
+        zip_w.write_all(b"escaped").unwrap();
+        zip_w.finish().unwrap();
+
+        let dest = dir.join("restore");
+        let err = extract_zip_to_dir(&zip_path, &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("Unsafe path"),
+            "error must name the unsafe entry: {}",
+            err
+        );
+        assert!(
+            !dir.join("escape.txt").exists(),
+            "traversal entry must not be written outside the destination"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn world_backup_filename_traversal_rejected() {
         let dir = temp_dir("world_traversal");
         let instances_dir = dir.join("instances");
@@ -4726,6 +5262,398 @@ version = 'hIibTfxn'
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn restore_instance_metadata_failure_leaves_the_live_instance_untouched() {
+        let dir = temp_dir("inst_restore_meta_fail");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("KeepMe", "1.21.1", LoaderType::Fabric, Some("0.16.0"));
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+
+        let backups = instance_backups_dir(&instances_dir, "KeepMe");
+        std::fs::create_dir_all(&backups).unwrap();
+        let bad = backups.join("valid-but-unwritable.zip");
+        let file = std::fs::File::create(&bad).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zw.start_file("instance.json", opts).unwrap();
+        zw.write_all(
+            serde_json::to_string(&instance)
+                .expect("instance serializes")
+                .as_bytes(),
+        )
+        .unwrap();
+        // The atomic metadata write uses `.instance.json.tmp`; an archive
+        // entry that creates a directory there makes the rewrite fail exactly
+        // like a transient sharing violation would.
+        zw.start_file(".instance.json.tmp/child", opts).unwrap();
+        zw.write_all(b"x").unwrap();
+        zw.finish().unwrap();
+
+        let mod_path = instance
+            .minecraft_dir(&instances_dir)
+            .join("mods")
+            .join("sodium.jar");
+        let before = std::fs::read(&mod_path).unwrap();
+
+        let err = restore_instance(
+            &instances_dir,
+            "KeepMe",
+            "valid-but-unwritable.zip",
+            "replace",
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("instance.json"),
+            "error must name the failing metadata write: {err}"
+        );
+
+        // The failure happened in staging: the live instance is untouched and
+        // no hidden staging/rollback directories were left behind.
+        assert!(instances_dir.join("KeepMe").join("instance.json").is_file());
+        assert_eq!(std::fs::read(&mod_path).unwrap(), before);
+        for entry in std::fs::read_dir(&instances_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(!name.starts_with(".void-"), "staging leaked: {name}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rename wrapper used to inject a Windows-style failure at one restore
+    /// stage. `ErrorKind::Other` is non-retryable on purpose: these tests
+    /// exercise the swap/rollback logic, while retry behaviour is covered by
+    /// `rename_with_retry_*` below.
+    struct ScriptedRename {
+        fail_paths: Vec<PathBuf>,
+        fail_prefixes: Vec<&'static str>,
+    }
+
+    impl ScriptedRename {
+        fn new(fail_paths: Vec<PathBuf>, fail_prefixes: Vec<&'static str>) -> Self {
+            Self {
+                fail_paths,
+                fail_prefixes,
+            }
+        }
+
+        fn should_fail(&self, from: &Path) -> bool {
+            self.fail_paths.iter().any(|p| p == from)
+                || self.fail_prefixes.iter().any(|prefix| {
+                    from.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(prefix))
+                })
+        }
+    }
+
+    impl RenameOp for ScriptedRename {
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.should_fail(from) {
+                return Err(std::io::Error::other(
+                    "Access is denied. (os error 5) [injected]",
+                ));
+            }
+            std::fs::rename(from, to)
+        }
+    }
+
+    struct FlakyRename {
+        failures_left: std::cell::Cell<u32>,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl RenameOp for FlakyRename {
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.failures_left.get() > 0 {
+                self.failures_left.set(self.failures_left.get() - 1);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Access is denied. (os error 5) [injected]",
+                ));
+            }
+            std::fs::rename(from, to)
+        }
+    }
+
+    /// `replace` fixture where `live-only.txt` exists only in the live
+    /// instance (not in the backup), so a failed swap that keeps the original
+    /// can be distinguished from one that installed the archive.
+    fn restore_replace_fixture(label: &str) -> (PathBuf, PathBuf, Instance, BackupInfo) {
+        let dir = temp_dir(label);
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("Locked", "1.21.1", LoaderType::Fabric, Some("0.16.0"));
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+        let backup = backup_instance(&instances_dir, "Locked").unwrap();
+        std::fs::write(
+            instance.minecraft_dir(&instances_dir).join("live-only.txt"),
+            b"live",
+        )
+        .unwrap();
+        (dir, instances_dir, instance, backup)
+    }
+
+    fn assert_no_staging_dirs(instances_dir: &Path) {
+        for entry in std::fs::read_dir(instances_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(!name.starts_with(".void-"), "staging leaked: {name}");
+        }
+    }
+
+    #[test]
+    fn rename_with_retry_recovers_from_transient_access_denied() {
+        let dir = temp_dir("restore_rename_retry");
+        let from = dir.join("from");
+        let to = dir.join("to");
+        std::fs::create_dir_all(&from).unwrap();
+        let op = FlakyRename {
+            failures_left: std::cell::Cell::new(2),
+            calls: std::cell::Cell::new(0),
+        };
+
+        rename_with_retry_policy(
+            &op,
+            &from,
+            &to,
+            "Moving the current instance aside",
+            4,
+            1,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(op.calls.get(), 3, "two failures then a success");
+        assert!(to.is_dir() && !from.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_with_retry_reports_stage_path_and_attempts() {
+        let dir = temp_dir("restore_rename_exhausted");
+        let from = dir.join("from");
+        std::fs::create_dir_all(&from).unwrap();
+        let op = FlakyRename {
+            failures_left: std::cell::Cell::new(u32::MAX),
+            calls: std::cell::Cell::new(0),
+        };
+
+        let err = rename_with_retry_policy(
+            &op,
+            &from,
+            &dir.join("to"),
+            "Moving the current instance aside",
+            3,
+            1,
+            1,
+        )
+        .unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("Moving the current instance aside"), "{text}");
+        assert!(text.contains(&from.display().to_string()), "{text}");
+        assert!(text.contains("after 3 attempts"), "{text}");
+        assert_eq!(op.calls.get(), 3, "all attempts must be used");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_move_aside_failure_keeps_the_original_and_backup() {
+        let (dir, instances_dir, instance, backup) =
+            restore_replace_fixture("restore_locked_aside");
+        let inst = instances_dir.join("Locked");
+        let op = ScriptedRename::new(vec![inst.clone()], Vec::new());
+
+        let err = restore_instance_with(
+            &instances_dir,
+            "Locked",
+            &backup.filename,
+            "replace",
+            None,
+            &op,
+        )
+        .unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("Moving the current instance aside"), "{text}");
+        assert!(text.contains("Nothing was changed"), "{text}");
+        assert!(
+            inst.join("instance.json").is_file(),
+            "original metadata kept"
+        );
+        assert_eq!(
+            std::fs::read(instance.minecraft_dir(&instances_dir).join("live-only.txt")).unwrap(),
+            b"live",
+            "live instance content kept"
+        );
+        assert_eq!(
+            list_instance_backups(&instances_dir, "Locked")
+                .unwrap()
+                .len(),
+            1,
+            "backup history kept"
+        );
+        assert!(instance_backups_dir(&instances_dir, "Locked")
+            .join(&backup.filename)
+            .is_file());
+        assert_no_staging_dirs(&instances_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_install_failure_rolls_back_the_original() {
+        let (dir, instances_dir, instance, backup) =
+            restore_replace_fixture("restore_install_fail");
+        let op = ScriptedRename::new(Vec::new(), vec![".void-restore-tmp-"]);
+
+        let err = restore_instance_with(
+            &instances_dir,
+            "Locked",
+            &backup.filename,
+            "replace",
+            None,
+            &op,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Installing the restored instance"),
+            "{err}"
+        );
+        // The rollback put the original directory back under its real name.
+        assert!(instances_dir.join("Locked").join("instance.json").is_file());
+        assert_eq!(
+            std::fs::read(instance.minecraft_dir(&instances_dir).join("live-only.txt")).unwrap(),
+            b"live",
+            "original content rolled back, not the archive"
+        );
+        assert_eq!(
+            list_instance_backups(&instances_dir, "Locked")
+                .unwrap()
+                .len(),
+            1,
+            "backup history survived the rollback"
+        );
+        assert_no_staging_dirs(&instances_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_rollback_failure_preserves_the_original_directory() {
+        let (dir, instances_dir, _instance, backup) =
+            restore_replace_fixture("restore_rollback_fail");
+        let op = ScriptedRename::new(Vec::new(), vec![".void-restore-tmp-", ".void-old-"]);
+
+        let err = restore_instance_with(
+            &instances_dir,
+            "Locked",
+            &backup.filename,
+            "replace",
+            None,
+            &op,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("original instance is preserved at"),
+            "{err}"
+        );
+        assert!(
+            !instances_dir.join("Locked").exists(),
+            "the failed swap must not leave a half-installed instance"
+        );
+
+        let preserved: Vec<PathBuf> = std::fs::read_dir(&instances_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".void-old-"))
+            })
+            .collect();
+        assert_eq!(preserved.len(), 1, "original directory must be preserved");
+        let preserved = &preserved[0];
+        assert!(preserved.join("instance.json").is_file());
+        assert_eq!(
+            std::fs::read(preserved.join(".minecraft/live-only.txt")).unwrap(),
+            b"live"
+        );
+        assert!(
+            preserved
+                .join(".backups/instances")
+                .join(&backup.filename)
+                .is_file(),
+            "backup archive stays with the preserved original"
+        );
+        for entry in std::fs::read_dir(&instances_dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".void-restore-tmp-"),
+                "staging copy leaked: {name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_as_new_install_failure_leaves_the_original_untouched() {
+        let (dir, instances_dir, instance, backup) = restore_replace_fixture("restore_as_new_fail");
+        let op = ScriptedRename::new(Vec::new(), vec![".void-restore-tmp-"]);
+
+        let err = restore_instance_with(
+            &instances_dir,
+            "Locked",
+            &backup.filename,
+            "as_new",
+            Some("Copy"),
+            &op,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Installing the restored instance"),
+            "{err}"
+        );
+        assert!(!instances_dir.join("Copy").exists());
+        assert!(instances_dir.join("Locked").join("instance.json").is_file());
+        assert_eq!(
+            std::fs::read(instance.minecraft_dir(&instances_dir).join("live-only.txt")).unwrap(),
+            b"live"
+        );
+        assert_eq!(
+            list_instance_backups(&instances_dir, "Locked")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_no_staging_dirs(&instances_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_dir_all_force_removes_read_only_content() {
+        let dir = temp_dir("restore_cleanup_readonly");
+        let root = dir.join("old");
+        let nested = root.join(".minecraft").join("mods");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("readonly.jar");
+        std::fs::write(&file, b"x").unwrap();
+        let mut perms = std::fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&file, perms).unwrap();
+
+        remove_dir_all_force(&root).unwrap();
+        assert!(
+            !root.exists(),
+            "read-only content must not block the cleanup"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Duplicate ────────────────────────────────────────────────
 
     #[test]
@@ -4794,6 +5722,143 @@ version = 'hIibTfxn'
             !dst_mc.join("crash-reports").exists(),
             "crash reports follow logs"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_staging_paths_are_unique_and_hidden() {
+        let dir = temp_dir("restore_tokens");
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let token = new_restore_token();
+            assert!(seen.insert(token.clone()), "restore tokens must be unique");
+            let paths = restore_staging_paths(&dir, &token);
+            for path in [&paths.tmp, &paths.old] {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                assert!(name.starts_with(".void-"), "not hidden: {name}");
+                assert!(name.contains(&token), "token missing from {name}");
+            }
+            assert_ne!(paths.tmp, paths.old);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_restore_after_rename_keeps_the_target_name() {
+        let dir = temp_dir("restore_rename");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("OldName", "1.20.1", LoaderType::Fabric, Some("0.15.11"));
+        save_instance(&instances_dir, &instance, None).unwrap();
+        let mc_dir = instance.minecraft_dir(&instances_dir);
+        std::fs::create_dir_all(&mc_dir).unwrap();
+        std::fs::write(mc_dir.join("from-backup.txt"), b"backup content").unwrap();
+
+        let backup = backup_instance(&instances_dir, "OldName").unwrap();
+
+        // Rename A (OldName) -> B (NewName): the directory and metadata move.
+        let mut renamed = get_instance(&instances_dir, "OldName").unwrap();
+        renamed.name = "NewName".to_string();
+        save_instance(&instances_dir, &renamed, Some("OldName")).unwrap();
+        assert!(instances_dir.join("NewName").exists());
+        assert!(!instances_dir.join("OldName").exists());
+        // Live state that must disappear when the older backup is restored.
+        std::fs::write(
+            instances_dir.join("NewName/.minecraft/live-only.txt"),
+            b"live",
+        )
+        .unwrap();
+
+        // The backup still says "OldName"; replace-restore into B must not
+        // resurrect the old directory or leave metadata pointing at it.
+        restore_instance(&instances_dir, "NewName", &backup.filename, "replace", None).unwrap();
+
+        let restored = get_instance(&instances_dir, "NewName").unwrap();
+        assert_eq!(restored.name, "NewName");
+        assert_eq!(restored.mc_version, "1.20.1");
+        assert_eq!(restored.loader, LoaderType::Fabric);
+        assert!(instances_dir
+            .join("NewName/.minecraft/from-backup.txt")
+            .exists());
+        assert!(
+            !instances_dir
+                .join("NewName/.minecraft/live-only.txt")
+                .exists(),
+            "replace-restore must swap in the archived content"
+        );
+        assert!(
+            !instances_dir.join("OldName").exists(),
+            "metadata must not point at the pre-rename folder"
+        );
+
+        let listed = list_instances(&instances_dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "NewName");
+
+        // The backup archive travelled with the rename and survived restore.
+        let backups = list_instance_backups(&instances_dir, "NewName").unwrap();
+        assert!(backups.iter().any(|b| b.filename == backup.filename));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repeated_replace_restores_leave_no_staging_directories() {
+        let dir = temp_dir("restore_repeat");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("Repeat", "1.20.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        std::fs::create_dir_all(instance.minecraft_dir(&instances_dir)).unwrap();
+        std::fs::write(
+            instance.minecraft_dir(&instances_dir).join("state.txt"),
+            b"original",
+        )
+        .unwrap();
+        let backup = backup_instance(&instances_dir, "Repeat").unwrap();
+
+        for _ in 0..3 {
+            restore_instance(&instances_dir, "Repeat", &backup.filename, "replace", None).unwrap();
+        }
+
+        let leftovers: Vec<String> = std::fs::read_dir(&instances_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".void-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "restore staging directories left behind: {leftovers:?}"
+        );
+        assert_eq!(
+            get_instance(&instances_dir, "Repeat").unwrap().name,
+            "Repeat"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_as_new_uses_the_new_name_and_cleans_up_on_its_own() {
+        let dir = temp_dir("restore_as_new_name");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("Source", "1.21.1", LoaderType::Forge, Some("52.0.0"));
+        save_instance(&instances_dir, &instance, None).unwrap();
+        let backup = backup_instance(&instances_dir, "Source").unwrap();
+
+        restore_instance(
+            &instances_dir,
+            "Source",
+            &backup.filename,
+            "as_new",
+            Some("Copy"),
+        )
+        .unwrap();
+
+        let copy = get_instance(&instances_dir, "Copy").unwrap();
+        assert_eq!(copy.name, "Copy");
+        assert_eq!(copy.mc_version, "1.21.1");
+        assert!(instances_dir.join("Source").exists(), "original untouched");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -510,9 +510,12 @@ pub async fn install_atlauncher_pack(
 
     let target_dir = instances_dir.join(instance_name);
     let mc_dir = target_dir.join(".minecraft");
-    // Never install into an existing instance — a same-named install would
-    // overwrite its mods/configs (and cleanup paths below wipe the whole dir).
-    crate::import::ensure_instance_target_free(instances_dir, instance_name)?;
+    // Version strings become paths during launch — reject unsafe pack metadata
+    // before creating any files. The caller reserves the target directory
+    // atomically (`import_with_cleanup`), so concurrent installs of the same
+    // name cannot both proceed and the cleanup paths below only ever see this
+    // operation's own files.
+    crate::import::validate_import_versions(&detail.minecraft, loader_version.as_deref())?;
     std::fs::create_dir_all(&mc_dir)?;
 
     let mut instance = Instance {

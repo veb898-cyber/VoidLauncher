@@ -133,31 +133,79 @@ pub fn run() {
     // own stored session; a default offline/Ely.by account hides Microsoft
     // from the UI (its tokens stay safe in the vault for re-activation).
     if let Some(ref profile) = auth_state.profile {
-        tracing::info!(target: "launcher", "Restoring cached Microsoft session for {}", profile.name);
-        match accounts::upsert_microsoft_account(&data_dir, &profile.name, &profile.id) {
-            Ok(entry) => {
-                if accounts::load_ms_session(&entry.id).is_none() {
-                    // The vault write can transiently fail (Credential Manager
-                    // contention right after boot). Retry once; if it still
-                    // fails, log loudly — the account would otherwise look
-                    // signed-out on the Accounts page while still launching.
-                    match accounts::store_ms_session(&entry.id, &auth_state) {
-                        Ok(()) => {}
-                        Err(e1) => {
-                            std::thread::sleep(std::time::Duration::from_millis(300));
-                            if let Err(e2) = accounts::store_ms_session(&entry.id, &auth_state) {
-                                tracing::error!(
-                                    target: "launcher",
-                                    "Could not migrate Microsoft session of '{}' to per-account vault slot: {} / {}",
-                                    profile.name, e1, e2
-                                );
+        let accounts_file_exists = accounts::accounts_file_exists(&data_dir);
+        if !accounts_file_exists {
+            // Legacy single-session install: there is no persistent account
+            // list yet, so create it from the cached session.
+            tracing::info!(target: "launcher", "Migrating legacy Microsoft session for {}", profile.name);
+            match accounts::upsert_microsoft_account(&data_dir, &profile.name, &profile.id) {
+                Ok(entry) => {
+                    if accounts::load_ms_session(&entry.id).is_none() {
+                        // The vault write can transiently fail (Credential Manager
+                        // contention right after boot). Retry once; if it still
+                        // fails, log loudly — the account would otherwise look
+                        // signed-out on the Accounts page while still launching.
+                        match accounts::store_ms_session(&entry.id, &auth_state) {
+                            Ok(()) => {}
+                            Err(e1) => {
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                if let Err(e2) = accounts::store_ms_session(&entry.id, &auth_state)
+                                {
+                                    tracing::error!(
+                                        target: "launcher",
+                                        "Could not migrate Microsoft session of '{}' to per-account vault slot: {} / {}",
+                                        profile.name, e1, e2
+                                    );
+                                }
                             }
                         }
                     }
                 }
+                Err(e) => {
+                    tracing::warn!(target: "launcher", "Failed to register Microsoft account {}: {}", profile.name, e);
+                }
             }
-            Err(e) => {
-                tracing::warn!(target: "launcher", "Failed to register Microsoft account {}: {}", profile.name, e);
+        } else {
+            // accounts.json is the source of truth. Only attach the cached
+            // session to an account that is already listed — never create an
+            // entry here, or deleting an account would be undone at startup.
+            let existing = accounts::list_accounts(&data_dir).into_iter().find(|a| {
+                a.account_type == accounts::AccountType::Microsoft
+                    && a.uuid.as_deref() == Some(profile.id.as_str())
+            });
+            match existing {
+                Some(entry) => {
+                    if accounts::load_ms_session(&entry.id).is_none() {
+                        match accounts::store_ms_session(&entry.id, &auth_state) {
+                            Ok(()) => {}
+                            Err(e1) => {
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                if let Err(e2) = accounts::store_ms_session(&entry.id, &auth_state)
+                                {
+                                    tracing::error!(
+                                        target: "launcher",
+                                        "Could not attach Microsoft session of '{}' to its account entry: {} / {}",
+                                        profile.name, e1, e2
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                None if accounts::accounts_file_is_parseable(&data_dir) => {
+                    tracing::warn!(
+                        target: "launcher",
+                        "Cached Microsoft session belongs to an account missing from accounts.json; clearing it instead of resurrecting the account"
+                    );
+                    auth_state = auth::AuthState::default();
+                    auth::clear_auth_state(&config.auth_file());
+                }
+                None => {
+                    tracing::warn!(
+                        target: "launcher",
+                        "accounts.json is present but unreadable; keeping the cached Microsoft session for this run"
+                    );
+                }
             }
         }
     }
@@ -182,6 +230,9 @@ pub fn run() {
             Some(_) if auth_state.profile.is_some() => {
                 tracing::info!(target: "launcher", "Default account is not a Microsoft one; hiding Microsoft session from UI");
                 auth_state = auth::AuthState::default();
+                // Also drop the global blob: leaving it behind made the
+                // hidden Microsoft account look active again after a restart.
+                auth::clear_auth_state(&config.auth_file());
             }
             _ => {}
         }

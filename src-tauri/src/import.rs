@@ -76,8 +76,23 @@ pub struct ImportOutcome {
     pub report: ImportReport,
 }
 
+/// Outcome of the best-effort post-import prefetch (loader profile, game
+/// files, assets). Every warning means the instance is usable but its first
+/// launch still has to download something; the caller must surface that
+/// instead of claiming a fully ready install.
+#[derive(Debug, Clone, Default)]
+pub struct PrepareReport {
+    pub warnings: Vec<String>,
+}
+
+impl PrepareReport {
+    fn warn(&mut self, message: String) {
+        self.warnings.push(message);
+    }
+}
+
 impl ImportReport {
-    fn complete(total_files: usize, installed: usize) -> Self {
+    pub(crate) fn complete(total_files: usize, installed: usize) -> Self {
         Self {
             total_files,
             installed,
@@ -134,6 +149,15 @@ pub(crate) fn check_safe_relative(relative: &str) -> Result<()> {
             "Null byte in zip entry path".into(),
         ));
     }
+    // Windows-only launcher: a colon anywhere is either a drive prefix
+    // (`C:foo`) or an NTFS alternate data stream (`mods/a.jar:evil`). Both
+    // must be rejected before the path is joined/written.
+    if relative.contains(':') {
+        return Err(LauncherError::Instance(format!(
+            "Drive prefix or NTFS stream in zip entry path: {}",
+            relative
+        )));
+    }
     if Path::new(relative).is_absolute() {
         return Err(LauncherError::Instance(format!(
             "Absolute path in zip entry: {}",
@@ -149,7 +173,6 @@ pub(crate) fn check_safe_relative(relative: &str) -> Result<()> {
             relative
         )));
     }
-    let mut first_component = true;
     for component in normalised.split('/') {
         if component == ".." {
             return Err(LauncherError::Instance(format!(
@@ -157,14 +180,6 @@ pub(crate) fn check_safe_relative(relative: &str) -> Result<()> {
                 relative
             )));
         }
-        // "C:foo" / "C:/foo" style drive-relative paths must not escape base.
-        if first_component && component.contains(':') {
-            return Err(LauncherError::Instance(format!(
-                "Drive prefix in zip entry: {}",
-                relative
-            )));
-        }
-        first_component = false;
     }
     Ok(())
 }
@@ -188,11 +203,42 @@ pub(crate) fn check_safe_file_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate version strings read from an untrusted pack manifest. They are
+/// stored in `instance.json` and later joined into `versions/` / `libraries/`,
+/// so reject path separators, drive prefixes and empty loader versions. An
+/// empty Minecraft version is tolerated for legacy Prism imports only; the
+/// launch path reports it clearly and the user can fix the instance.
+pub(crate) fn validate_import_versions(
+    mc_version: &str,
+    loader_version: Option<&str>,
+) -> Result<()> {
+    if !mc_version.is_empty() && check_safe_file_name(mc_version).is_err() {
+        return Err(LauncherError::Instance(format!(
+            "Invalid Minecraft version in pack manifest: {:?}",
+            mc_version
+        )));
+    }
+    if let Some(version) = loader_version.filter(|v| !v.is_empty()) {
+        if check_safe_file_name(version).is_err() {
+            return Err(LauncherError::Instance(format!(
+                "Invalid mod loader version in pack manifest: {:?}",
+                version
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Reject an unsafe relative path from remote metadata (Mojang version JSON
 /// libraries, NeoForge data map). Same rules as zip entries — no "..",
 /// absolute/rooted paths, drive prefixes or null bytes — but with a message
 /// naming the actual source.
 pub(crate) fn check_safe_remote_path(relative: &str) -> Result<()> {
+    if relative.trim().is_empty() {
+        return Err(LauncherError::Instance(
+            "Empty path in remote metadata".into(),
+        ));
+    }
     check_safe_relative(relative).map_err(|_| {
         LauncherError::Instance(format!("Unsafe path in remote metadata: {}", relative))
     })
@@ -773,7 +819,7 @@ pub async fn import_modpack(
     let outcome = match format {
         ModpackFormat::Prism => {
             let instance = import_with_cleanup(instances_dir, instance_name, || async {
-                instances::import_prism_pack(instances_dir, path)
+                instances::import_prism_pack_reserved(instances_dir, path, instance_name)
             })
             .await?;
             ImportOutcome {
@@ -830,22 +876,29 @@ pub async fn import_modpack(
 /// (client JAR, libraries, natives) and the asset index + assets.
 ///
 /// Called right after a pack import/install so the first launch does not have
-/// to fetch hundreds of files while the player waits. Best-effort by design:
-/// every step logs and swallows its error — the instance itself is already
-/// fully imported, and the launch path self-heals anything still missing.
+/// to fetch hundreds of files while the player waits. Best-effort: a failed
+/// step is logged and reported as a warning (the instance itself is already
+/// fully imported, and the launch path self-heals anything still missing).
 pub async fn prepare_instance_files(
     app: Option<&AppHandle>,
     config: &AppConfig,
     instance: &Instance,
-) {
-    prepare_loader(app, config, instance).await;
-    prepare_version_and_assets(app, config, instance).await;
+) -> PrepareReport {
+    let mut report = PrepareReport::default();
+    prepare_loader(app, config, instance, &mut report).await;
+    prepare_version_and_assets(app, config, instance, &mut report).await;
+    report
 }
 
 /// Install the mod loader when the instance declares one but has no profile
 /// saved yet (every importer stores `loader_profile: None` — the profile is
 /// built from the loader's metadata service, not from the pack archive).
-async fn prepare_loader(app: Option<&AppHandle>, config: &AppConfig, instance: &Instance) {
+async fn prepare_loader(
+    app: Option<&AppHandle>,
+    config: &AppConfig,
+    instance: &Instance,
+    report: &mut PrepareReport,
+) {
     if instance.loader == LoaderType::Vanilla || instance.loader_profile.is_some() {
         return;
     }
@@ -861,6 +914,10 @@ async fn prepare_loader(app: Option<&AppHandle>, config: &AppConfig, instance: &
             "{} loader of '{}' has no version set; skipping loader install",
             loader_str, instance.name
         );
+        report.warn(format!(
+            "{} is required but no loader version is set for this instance.",
+            loader_str
+        ));
         return;
     };
     emit_progress(
@@ -889,6 +946,10 @@ async fn prepare_loader(app: Option<&AppHandle>, config: &AppConfig, instance: &
                     "Failed to save {} profile for '{}': {}",
                     loader_str, instance.name, e
                 );
+                report.warn(format!(
+                    "The {} {} profile could not be saved: {}",
+                    loader_str, loader_version, e
+                ));
             }
             emit_progress(
                 app,
@@ -904,6 +965,10 @@ async fn prepare_loader(app: Option<&AppHandle>, config: &AppConfig, instance: &
                 "Failed to install {} {} for '{}': {} (the launch will retry)",
                 loader_str, loader_version, instance.name, e
             );
+            report.warn(format!(
+                "{} {} could not be installed: {}",
+                loader_str, loader_version, e
+            ));
         }
     }
 }
@@ -915,6 +980,7 @@ async fn prepare_version_and_assets(
     app: Option<&AppHandle>,
     config: &AppConfig,
     instance: &Instance,
+    report: &mut PrepareReport,
 ) {
     emit_progress(app, "manifest", 0, 1, "Fetching version info...");
     let manifest = match versions::fetch_version_manifest().await {
@@ -925,6 +991,10 @@ async fn prepare_version_and_assets(
                 "Failed to fetch version manifest for '{}': {} (the launch will retry)",
                 instance.name, e
             );
+            report.warn(format!(
+                "The Minecraft version list could not be downloaded: {}",
+                e
+            ));
             return;
         }
     };
@@ -939,6 +1009,10 @@ async fn prepare_version_and_assets(
             "Version {} of '{}' not found in manifest; skipping file download",
             instance.mc_version, instance.name
         );
+        report.warn(format!(
+            "Minecraft {} was not found in the version list.",
+            instance.mc_version
+        ));
         return;
     };
     if !crate::is_allowed_download_host(&version_url) {
@@ -947,6 +1021,10 @@ async fn prepare_version_and_assets(
             "Version URL for {} is not in the download allowlist; skipping",
             instance.mc_version
         );
+        report.warn(format!(
+            "The download source for Minecraft {} is not allowed.",
+            instance.mc_version
+        ));
         return;
     }
     let version_info = match versions::fetch_version_info(&version_url).await {
@@ -957,6 +1035,10 @@ async fn prepare_version_and_assets(
                 "Failed to fetch version info for {}: {} (the launch will retry)",
                 instance.mc_version, e
             );
+            report.warn(format!(
+                "Metadata for Minecraft {} could not be downloaded: {}",
+                instance.mc_version, e
+            ));
             return;
         }
     };
@@ -969,18 +1051,37 @@ async fn prepare_version_and_assets(
             "Version metadata for {} contains unsafe names; skipping file download",
             instance.mc_version
         );
+        report.warn(format!(
+            "Metadata for Minecraft {} contains unsafe file names.",
+            instance.mc_version
+        ));
         return;
     }
 
     // Version files: client JAR, libraries, natives — only the missing ones.
-    let missing = versions::collect_downloads(
+    let all_files = match versions::collect_downloads(
         &version_info,
         &config.libraries_dir(),
         &config.versions_dir(),
-    )
-    .into_iter()
-    .filter(|(_, path, _, _)| !path.exists())
-    .collect::<Vec<_>>();
+    ) {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::warn!(
+                target: "launcher",
+                "Version metadata for '{}' is unsafe or invalid: {} (the launch will retry)",
+                instance.name, e
+            );
+            report.warn(format!(
+                "Metadata for Minecraft {} is unsafe or invalid: {}",
+                instance.mc_version, e
+            ));
+            return;
+        }
+    };
+    let missing = all_files
+        .into_iter()
+        .filter(|(_, path, _, _)| !path.exists())
+        .collect::<Vec<_>>();
     if !missing.is_empty() {
         let total = missing.len();
         emit_progress(
@@ -1009,6 +1110,7 @@ async fn prepare_version_and_assets(
                 "Game file download for '{}' failed: {} (the launch will retry)",
                 instance.name, e
             );
+            report.warn(format!("Game files could not be downloaded: {}", e));
             return;
         }
     }
@@ -1017,6 +1119,10 @@ async fn prepare_version_and_assets(
     let version_dir = config.versions_dir().join(&version_info.id);
     if let Err(e) = std::fs::create_dir_all(&version_dir) {
         tracing::warn!(target: "launcher", "Failed to create version dir for '{}': {}", instance.name, e);
+        report.warn(format!(
+            "The Minecraft version directory could not be created: {}",
+            e
+        ));
         return;
     }
     let version_json_path = version_dir.join(format!("{}.json", version_info.id));
@@ -1025,10 +1131,18 @@ async fn prepare_version_and_assets(
             Ok(json) => {
                 if let Err(e) = std::fs::write(&version_json_path, json) {
                     tracing::warn!(target: "launcher", "Failed to write version JSON for '{}': {}", instance.name, e);
+                    report.warn(format!(
+                        "The Minecraft version metadata could not be saved: {}",
+                        e
+                    ));
                 }
             }
             Err(e) => {
                 tracing::warn!(target: "launcher", "Failed to serialize version JSON for '{}': {}", instance.name, e);
+                report.warn(format!(
+                    "The Minecraft version metadata could not be serialized: {}",
+                    e
+                ));
             }
         }
     }
@@ -1049,6 +1163,10 @@ async fn prepare_version_and_assets(
             "Asset index URL for {} is not in the download allowlist; skipping",
             instance.mc_version
         );
+        report.warn(format!(
+            "The asset download source for Minecraft {} is not allowed.",
+            instance.mc_version
+        ));
         return;
     }
     let asset_index = match versions::fetch_asset_index(&version_info.asset_index.url).await {
@@ -1059,12 +1177,20 @@ async fn prepare_version_and_assets(
                 "Failed to fetch asset index for {}: {} (the launch will retry)",
                 instance.mc_version, e
             );
+            report.warn(format!(
+                "The asset index for Minecraft {} could not be downloaded: {}",
+                instance.mc_version, e
+            ));
             return;
         }
     };
     if let Some(parent) = index_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             tracing::warn!(target: "launcher", "Failed to create asset index dir for '{}': {}", instance.name, e);
+            report.warn(format!(
+                "The asset index directory could not be created: {}",
+                e
+            ));
             return;
         }
     }
@@ -1072,11 +1198,13 @@ async fn prepare_version_and_assets(
         Ok(json) => {
             if let Err(e) = std::fs::write(&index_path, json) {
                 tracing::warn!(target: "launcher", "Failed to write asset index for '{}': {}", instance.name, e);
+                report.warn(format!("The asset index could not be saved: {}", e));
                 return;
             }
         }
         Err(e) => {
             tracing::warn!(target: "launcher", "Failed to serialize asset index for '{}': {}", instance.name, e);
+            report.warn(format!("The asset index could not be serialized: {}", e));
             return;
         }
     }
@@ -1100,6 +1228,7 @@ async fn prepare_version_and_assets(
             "Asset download for '{}' failed: {} (the launch will retry)",
             instance.name, e
         );
+        report.warn(format!("Game assets could not be downloaded: {}", e));
         return;
     }
     // Virtual/legacy mirror for old versions (1.8 and older) — same step the
@@ -1108,6 +1237,7 @@ async fn prepare_version_and_assets(
         download::ensure_virtual_assets(&version_info.assets, &asset_index, &config.assets_dir())
     {
         tracing::warn!(target: "launcher", "Failed to mirror virtual assets for '{}': {}", instance.name, e);
+        report.warn(format!("Legacy asset files could not be prepared: {}", e));
     }
 }
 
@@ -1129,13 +1259,118 @@ pub(crate) fn ensure_instance_target_free(instances_dir: &Path, instance_name: &
     Ok(())
 }
 
-/// Run a format-specific importer against `instances_dir/<instance_name>` and,
-/// if it fails, remove the partially-created instance directory so a failed
-/// import never leaves broken/missing files behind.
+/// Marker file written inside a directory reserved by an import/install.
+/// The random token inside proves which operation created the directory; a
+/// failing operation may only delete a directory whose marker still carries
+/// its own token.
+const IMPORT_OWNER_MARKER: &str = ".void-import-owner";
+
+/// Ownership handle for one instance directory created by an import/install.
 ///
-/// A directory is only removed when it did NOT exist before the import — a
-/// re-import over an existing instance must not wipe the previous good copy.
-async fn import_with_cleanup<T, F, Fut>(
+/// `std::fs::create_dir` is the atomic claim: two concurrent operations can
+/// never both succeed for the same target. The old "check `exists()` before
+/// the import, delete on failure" sequence let a losing operation delete the
+/// winner's files (TOCTOU). Here the loser fails before touching anything,
+/// and `Drop` removes the directory only while the owner marker proves it is
+/// still the directory this operation created.
+#[derive(Debug)]
+pub(crate) struct InstanceReservation {
+    target: PathBuf,
+    marker: PathBuf,
+    token: String,
+    committed: bool,
+}
+
+impl InstanceReservation {
+    pub(crate) fn reserve(instances_dir: &Path, instance_name: &str) -> Result<Self> {
+        let name = instance_name.trim();
+        if name.is_empty() || name.starts_with('.') {
+            return Err(LauncherError::Instance(format!(
+                "Invalid instance name: '{}'",
+                instance_name
+            )));
+        }
+        check_safe_file_name(name)?;
+        std::fs::create_dir_all(instances_dir)?;
+
+        let target = instances_dir.join(name);
+        match std::fs::create_dir(&target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(LauncherError::Instance(format!(
+                    "An instance named '{}' already exists. Choose a different name for the imported pack.",
+                    name
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let marker = target.join(IMPORT_OWNER_MARKER);
+        if let Err(e) = std::fs::write(&marker, &token) {
+            let _ = std::fs::remove_dir_all(&target);
+            return Err(e.into());
+        }
+        Ok(Self {
+            target,
+            marker,
+            token,
+            committed: false,
+        })
+    }
+
+    /// Keep the directory: the import completed and the marker is retired.
+    pub(crate) fn commit(&mut self) {
+        let _ = std::fs::remove_file(&self.marker);
+        self.committed = true;
+    }
+}
+
+impl Drop for InstanceReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        match std::fs::read_to_string(&self.marker) {
+            Ok(token) if token.trim() == self.token => {
+                tracing::warn!(
+                    target: "launcher",
+                    "Import failed, removing partially-created instance {}",
+                    self.target.display()
+                );
+                if let Err(e) = std::fs::remove_dir_all(&self.target) {
+                    tracing::warn!(
+                        target: "launcher",
+                        "Cleanup of {} failed: {}",
+                        self.target.display(), e
+                    );
+                }
+            }
+            Ok(_) => tracing::warn!(
+                target: "launcher",
+                "Not removing {}: the import owner marker changed",
+                self.target.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The import itself (or the user) removed/moved the directory;
+                // there is nothing left this operation owns.
+            }
+            Err(e) => tracing::warn!(
+                target: "launcher",
+                "Not removing {}: owner marker is unreadable ({})",
+                self.target.display(), e
+            ),
+        }
+    }
+}
+
+/// Run a format-specific importer against a freshly reserved
+/// `instances_dir/<instance_name>` and, if it fails, remove that directory so
+/// a failed import never leaves broken/missing files behind.
+///
+/// The reservation is atomic: an already existing directory (including one
+/// created by a concurrent import) is never touched by this operation.
+pub(crate) async fn import_with_cleanup<T, F, Fut>(
     instances_dir: &Path,
     instance_name: &str,
     importer: F,
@@ -1144,17 +1379,10 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let target = instances_dir.join(instance_name);
-    let existed_before = target.exists();
-
+    let mut reservation = InstanceReservation::reserve(instances_dir, instance_name)?;
     let result = importer().await;
-
-    if result.is_err() && !existed_before {
-        tracing::warn!(target: "launcher", "Import failed, removing partially-created instance {}", target.display());
-        if let Err(e) = std::fs::remove_dir_all(&target) {
-            // Missing dir is fine; anything else masks the original error intent.
-            tracing::warn!(target: "launcher", "Cleanup of {} failed: {}", target.display(), e);
-        }
+    if result.is_ok() {
+        reservation.commit();
     }
     result
 }
@@ -1167,7 +1395,6 @@ pub(crate) async fn import_mrpack(
     app: Option<&AppHandle>,
 ) -> Result<Instance> {
     emit_progress(app, "extracting", 0, 1, "Extracting overrides...");
-    ensure_instance_target_free(instances_dir, instance_name)?;
 
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
@@ -1199,6 +1426,13 @@ pub(crate) async fn import_mrpack(
             )
         })?
         .to_string();
+    let deps = index["dependencies"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let (loader, loader_version) = detect_mrpack_loader(&deps);
+    validate_import_versions(&mc_version, loader_version.as_deref())?;
+    let ldr_type = mrpack_loader_type(loader.as_deref())?;
 
     let target_dir = instances_dir.join(instance_name);
     let mc_dir = target_dir.join(".minecraft");
@@ -1358,13 +1592,6 @@ pub(crate) async fn import_mrpack(
     }
 
     // Detect loader from dependencies
-    let deps = index["dependencies"]
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    let (loader, loader_version) = detect_mrpack_loader(&deps);
-    let ldr_type = mrpack_loader_type(loader.as_deref())?;
-
     let now = chrono::Utc::now().to_rfc3339();
     let instance = Instance {
         name: instance_name.to_string(),
@@ -1497,7 +1724,6 @@ pub(crate) async fn import_curseforge_pack(
     app: Option<&AppHandle>,
 ) -> Result<(Instance, ImportReport)> {
     emit_progress(app, "extracting", 0, 1, "Extracting overrides...");
-    ensure_instance_target_free(instances_dir, instance_name)?;
 
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
@@ -1542,6 +1768,8 @@ pub(crate) async fn import_curseforge_pack(
             (loader, version)
         })
         .unwrap_or((None, None));
+
+    validate_import_versions(&mc_version, loader_version)?;
 
     let target_dir = instances_dir.join(instance_name);
     let mc_dir = target_dir.join(".minecraft");
@@ -1768,8 +1996,6 @@ fn import_atlauncher_pack(
     path: &str,
     instance_name: &str,
 ) -> Result<Instance> {
-    ensure_instance_target_free(instances_dir, instance_name)?;
-
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
 
@@ -1805,6 +2031,8 @@ fn import_atlauncher_pack(
         loader = LoaderType::Vanilla;
         loader_version = None;
     }
+
+    validate_import_versions(&mc_version, loader_version.as_deref())?;
 
     let target_dir = instances_dir.join(instance_name);
     let mc_dir = target_dir.join(".minecraft");
@@ -1917,6 +2145,8 @@ mod tests {
         assert!(check_safe_relative("C:/evil.exe").is_err());
         assert!(check_safe_relative("C:\\evil.exe").is_err());
         assert!(check_safe_relative("C:evil.exe").is_err());
+        // NTFS alternate data stream (Windows would attach it to `a.jar`).
+        assert!(check_safe_relative("mods/a.jar:evil").is_err());
     }
 
     #[test]
@@ -2118,6 +2348,15 @@ mod tests {
     // ── CurseForge partial-success policy ──
 
     #[test]
+    fn validate_import_versions_rejects_path_components() {
+        assert!(validate_import_versions("1.20.1", Some("47.2.0")).is_ok());
+        assert!(validate_import_versions("", None).is_ok(), "legacy Prism");
+        assert!(validate_import_versions("../outside", None).is_err());
+        assert!(validate_import_versions("1.20.1", Some("../../evil")).is_err());
+        assert!(validate_import_versions("1.20.1", Some("47.2.0:bad")).is_err());
+    }
+
+    #[test]
     fn import_completion_keeps_partially_downloaded_pack() {
         // Some files missing is a warning, not a failed import: the instance
         // stays usable and the UI offers a retry for the missing files.
@@ -2251,8 +2490,10 @@ mod tests {
             ],
         );
 
+        let mut reservation = InstanceReservation::reserve(&instances_dir, "AT Pack").unwrap();
         let instance =
             import_atlauncher_pack(&instances_dir, p.to_str().unwrap(), "AT Pack").unwrap();
+        reservation.commit();
         assert_eq!(instance.loader, LoaderType::Forge);
         assert_eq!(instance.loader_version.as_deref(), Some("43.3.5"));
         assert!(instances_dir
@@ -2263,11 +2504,193 @@ mod tests {
             .exists());
 
         // A second import into the same name must be refused, not merged.
-        let err =
-            import_atlauncher_pack(&instances_dir, p.to_str().unwrap(), "AT Pack").unwrap_err();
+        let err = InstanceReservation::reserve(&instances_dir, "AT Pack").unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {}", err);
 
         let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn prism_zip(path: &Path, cfg_name: &str, entries: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        let cfg = format!("[General]\nname={cfg_name}\n");
+        writer.start_file("instance.cfg", opts).unwrap();
+        std::io::Write::write_all(&mut writer, cfg.as_bytes()).unwrap();
+
+        let pack =
+            r#"{"components":[{"uid":"net.minecraft","version":"1.20.1"}],"formatVersion":1}"#;
+        writer.start_file("mmc-pack.json", opts).unwrap();
+        std::io::Write::write_all(&mut writer, pack.as_bytes()).unwrap();
+
+        for (name, bytes) in entries {
+            writer.start_file(*name, opts).unwrap();
+            std::io::Write::write_all(&mut writer, bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prism_import_uses_the_chosen_name_and_cleans_failed_imports() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_prism_name_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let good = dir.join("good.zip");
+        prism_zip(
+            &good,
+            "Pack Name",
+            &[("minecraft/mods/testmod.jar", b"PK\x03\x04jar")],
+        );
+
+        // The archive says "Pack Name", but the user typed "Chosen Name".
+        let outcome = import_modpack(
+            &instances_dir,
+            good.to_str().unwrap(),
+            "Chosen Name",
+            "",
+            &instances_dir,
+            None,
+        )
+        .await
+        .expect("Prism import with a different user-chosen name must succeed");
+
+        assert_eq!(outcome.instance.name, "Chosen Name");
+        assert!(instances_dir
+            .join("Chosen Name/.minecraft/mods/testmod.jar")
+            .exists());
+        assert!(
+            !instances_dir.join("Pack Name").exists(),
+            "the pack-internal name must not create a second directory"
+        );
+        let stored = instances::get_instance(&instances_dir, "Chosen Name").unwrap();
+        assert_eq!(stored.name, "Chosen Name");
+
+        // A file where the pack expects a directory makes extraction fail
+        // after the reservation; only that directory may be removed.
+        let broken = dir.join("broken.zip");
+        prism_zip(
+            &broken,
+            "Pack Name",
+            &[
+                ("minecraft/mods", b"not a directory"),
+                ("minecraft/mods/broken.jar", b"PK\x03\x04jar"),
+            ],
+        );
+        let err = import_modpack(
+            &instances_dir,
+            broken.to_str().unwrap(),
+            "Broken Name",
+            "",
+            &instances_dir,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(
+            !instances_dir.join("Broken Name").exists(),
+            "a failed Prism import must not leave a blocking partial directory"
+        );
+
+        // Re-importing after the failed attempt must work with the same name.
+        import_modpack(
+            &instances_dir,
+            good.to_str().unwrap(),
+            "Broken Name",
+            "",
+            &instances_dir,
+            None,
+        )
+        .await
+        .expect("repeat import after cleanup must succeed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_imports_of_the_same_name_have_exactly_one_winner() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_import_race_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let target = instances_dir.join("Same Name");
+
+        let (first, second) = tokio::join!(
+            import_with_cleanup(&instances_dir, "Same Name", || async {
+                // Hold the reservation long enough for the second future to
+                // attempt (and lose) the same target.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                std::fs::create_dir_all(target.join(".minecraft")).unwrap();
+                std::fs::write(target.join(".minecraft/winner.txt"), b"winner").unwrap();
+                Ok::<_, LauncherError>("first")
+            }),
+            import_with_cleanup(&instances_dir, "Same Name", || async {
+                Ok::<_, LauncherError>("second")
+            }),
+        );
+
+        assert_eq!(first.expect("first import must win"), "first");
+        let err = second.expect_err("second import must be refused");
+        assert!(err.to_string().contains("already exists"), "got: {}", err);
+        assert_eq!(
+            std::fs::read_to_string(instances_dir.join("Same Name/.minecraft/winner.txt")).unwrap(),
+            "winner"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failed_import_removes_only_its_own_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_import_cleanup_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        // 1) Partial directory created by this operation is removed.
+        let err = import_with_cleanup(&instances_dir, "Broken", || async {
+            let target = instances_dir.join("Broken");
+            std::fs::create_dir_all(target.join(".minecraft")).unwrap();
+            std::fs::write(target.join(".minecraft/partial.jar"), b"partial").unwrap();
+            Err::<(), _>(LauncherError::Instance("injected import failure".into()))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("injected import failure"));
+        assert!(
+            !instances_dir.join("Broken").exists(),
+            "the failed operation must remove its own directory"
+        );
+
+        // 2) An existing instance is never deleted or merged into.
+        let existing = instances_dir.join("Existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("user-data.txt"), b"keep me").unwrap();
+        let err = import_with_cleanup(&instances_dir, "Existing", || async {
+            Ok::<_, LauncherError>(())
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {}", err);
+        assert_eq!(
+            std::fs::read_to_string(existing.join("user-data.txt")).unwrap(),
+            "keep me"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

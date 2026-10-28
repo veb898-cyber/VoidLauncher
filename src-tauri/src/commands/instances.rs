@@ -180,6 +180,9 @@ pub async fn cmd_create_instance(
 pub async fn cmd_delete_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
     validate_instance_name(&name)?;
     ensure_instance_not_running(state.inner(), &name)?;
+    // A live content watcher holds handles inside the instance directory and
+    // prevents Windows from removing it.
+    stop_pack_watcher_for(state.inner(), &name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -220,6 +223,13 @@ pub async fn cmd_save_instance(
     old_name: Option<String>,
 ) -> Result<(), String> {
     validate_instance_name(&instance.name)?;
+    // Renaming moves the instance directory; stop the content watcher first
+    // so Windows does not reject the move with "access denied".
+    if let Some(old_name) = old_name.as_deref() {
+        if old_name != instance.name {
+            stop_pack_watcher_for(state.inner(), old_name)?;
+        }
+    }
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -343,8 +353,16 @@ pub async fn cmd_import_modpack(
 
     // Download the loader profile, game files and assets right away, so the
     // first launch does not have to fetch them while the player waits.
-    crate::import::prepare_instance_files(Some(&app), &config, &outcome.instance).await;
-    crate::import::emit_progress(Some(&app), "done", 1, 1, "Import complete!");
+    let mut outcome = outcome;
+    let prepare =
+        crate::import::prepare_instance_files(Some(&app), &config, &outcome.instance).await;
+    outcome.report.warnings.extend(prepare.warnings);
+    let done = if outcome.report.warnings.is_empty() {
+        "Import complete!"
+    } else {
+        "Import complete — missing files will be downloaded on first launch."
+    };
+    crate::import::emit_progress(Some(&app), "done", 1, 1, done);
     Ok(outcome)
 }
 
@@ -613,6 +631,7 @@ pub async fn cmd_list_instance_backups(
 
 #[tauri::command]
 pub async fn cmd_restore_instance(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
     backup_filename: String,
@@ -625,7 +644,12 @@ pub async fn cmd_restore_instance(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
     };
-    tauri::async_runtime::spawn_blocking(move || {
+    // Restore renames the instance directory. The content watcher would keep
+    // a handle inside it and make the rename fail on Windows.
+    let watch_name = name.clone();
+    let watcher_was_active = stop_pack_watcher_for(state.inner(), &name)?;
+    let app_handle = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         instances::restore_instance(
             &instances_dir,
             &name,
@@ -636,7 +660,17 @@ pub async fn cmd_restore_instance(
         .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+
+    // The content manager may still be mounted behind the restore dialog;
+    // resume its watcher now that the directory is stable again, including
+    // after a failed attempt so external changes keep refreshing the list.
+    if watcher_was_active {
+        if let Err(e) = arm_pack_watcher(&app_handle, state.inner(), &watch_name) {
+            eprintln!("warning: could not resume content watcher for '{watch_name}': {e}");
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -772,21 +806,20 @@ pub async fn cmd_get_pack_icon(
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub fn cmd_watch_instance(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    instance_name: String,
-) -> Result<(), String> {
-    validate_instance_name(&instance_name)?;
+/// Start watching the content folders of `instance_name`, replacing any
+/// existing watcher. Shared by the Tauri command and by commands that pause
+/// the watcher while moving the instance directory.
+fn arm_pack_watcher(app: &AppHandle, state: &AppState, instance_name: &str) -> Result<(), String> {
+    validate_instance_name(instance_name)?;
     use notify::RecursiveMode;
     use notify_debouncer_mini::new_debouncer;
 
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
-    let mc_dir = instance.minecraft_dir(&config.instances_dir());
-    drop(config);
+    let mc_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        let instance = instances::get_instance(&config.instances_dir(), instance_name)
+            .map_err(|e| e.to_string())?;
+        instance.minecraft_dir(&config.instances_dir())
+    };
 
     // Watch each content subfolder
     let watch_paths: Vec<std::path::PathBuf> = ["mods", "resourcepacks", "shaderpacks"]
@@ -796,7 +829,7 @@ pub fn cmd_watch_instance(
         .collect();
 
     let app_clone = app.clone();
-    let instance_for_closure = instance_name.clone();
+    let instance_for_closure = instance_name.to_string();
     let mut debouncer = new_debouncer(
         std::time::Duration::from_millis(300),
         move |res: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
@@ -841,11 +874,45 @@ pub fn cmd_watch_instance(
     // Replace any existing watcher
     let mut watcher_slot = state.pack_watcher.lock().map_err(|e| e.to_string())?;
     *watcher_slot = Some(crate::PackWatcherHandle {
-        instance_name: instance_name.clone(),
+        instance_name: instance_name.to_string(),
         _debouncer: debouncer,
     });
 
     Ok(())
+}
+
+/// Drop the content watcher if it belongs to `instance_name`, returning
+/// whether one was stopped.
+///
+/// `notify` keeps handles open on the watched `mods`, `resourcepacks` and
+/// `shaderpacks` directories. On Windows that blocks renaming or deleting the
+/// parent instance directory with `os error 5` (access denied), so every
+/// operation that moves an instance directory calls this first.
+fn stop_pack_watcher_in_slot(
+    slot: &mut Option<crate::PackWatcherHandle>,
+    instance_name: &str,
+) -> bool {
+    let matches = slot
+        .as_ref()
+        .is_some_and(|handle| handle.instance_name == instance_name);
+    if matches {
+        *slot = None;
+    }
+    matches
+}
+
+fn stop_pack_watcher_for(state: &AppState, instance_name: &str) -> Result<bool, String> {
+    let mut watcher_slot = state.pack_watcher.lock().map_err(|e| e.to_string())?;
+    Ok(stop_pack_watcher_in_slot(&mut watcher_slot, instance_name))
+}
+
+#[tauri::command]
+pub fn cmd_watch_instance(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    instance_name: String,
+) -> Result<(), String> {
+    arm_pack_watcher(&app, state.inner(), &instance_name)
 }
 
 #[tauri::command]
@@ -959,8 +1026,41 @@ pub async fn cmd_check_instance_installed(
 
 #[cfg(test)]
 mod instance_name_tests {
+    use super::stop_pack_watcher_in_slot;
     use super::validate_instance_name;
     use super::validate_world_name;
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "voidlauncher-{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Build a real content watcher on `path`, mirroring what
+    /// `arm_pack_watcher` stores in `AppState::pack_watcher`.
+    fn test_watcher(path: &std::path::Path, instance_name: &str) -> crate::PackWatcherHandle {
+        let mut debouncer = notify_debouncer_mini::new_debouncer(
+            std::time::Duration::from_millis(100),
+            |_res: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {},
+        )
+        .expect("create debouncer");
+        debouncer
+            .watcher()
+            .watch(path, notify::RecursiveMode::NonRecursive)
+            .expect("watch test directory");
+        crate::PackWatcherHandle {
+            instance_name: instance_name.to_string(),
+            _debouncer: debouncer,
+        }
+    }
 
     #[test]
     fn accepts_valid_names() {
@@ -1054,5 +1154,51 @@ mod instance_name_tests {
         assert!(validate_world_name("a\0b").is_err());
         assert!(validate_world_name("foo:bar").is_err());
         assert!(validate_world_name("CON").is_err());
+    }
+
+    #[test]
+    fn stopping_watcher_keeps_a_watcher_for_another_instance() {
+        let dir = temp_dir("watcher-other");
+        let mods = dir.join("mods");
+        std::fs::create_dir_all(&mods).expect("create mods dir");
+        let mut slot = Some(test_watcher(&mods, "Watched"));
+
+        assert!(!stop_pack_watcher_in_slot(&mut slot, "Other"));
+        assert!(slot.is_some(), "a watcher for another instance must stay");
+        assert!(stop_pack_watcher_in_slot(&mut slot, "Watched"));
+        assert!(slot.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_watcher_unblocks_instance_directory_rename() {
+        let dir = temp_dir("watcher-rename");
+        let instances_dir = dir.join("instances");
+        let instance_dir = instances_dir.join("Watched");
+        let mods = instance_dir.join(".minecraft").join("mods");
+        std::fs::create_dir_all(&mods).expect("create instance dirs");
+        let renamed = instances_dir.join(".restore-old");
+        let mut slot = Some(test_watcher(&mods, "Watched"));
+
+        // The open directory handle inside the instance must block the move;
+        // this is the Windows behaviour that broke restore.
+        let blocked = std::fs::rename(&instance_dir, &renamed);
+        assert!(
+            blocked.is_err(),
+            "rename unexpectedly succeeded while the watcher was alive"
+        );
+        assert_eq!(blocked.unwrap_err().raw_os_error(), Some(5));
+
+        assert!(!stop_pack_watcher_in_slot(&mut slot, "Other"));
+        let blocked = std::fs::rename(&instance_dir, &renamed);
+        assert!(blocked.is_err(), "non-matching watcher must stay active");
+
+        assert!(stop_pack_watcher_in_slot(&mut slot, "Watched"));
+        std::fs::rename(&instance_dir, &renamed)
+            .expect("rename must succeed after the watcher is stopped");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

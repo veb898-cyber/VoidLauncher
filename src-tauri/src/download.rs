@@ -638,6 +638,81 @@ fn content_range_start(value: &str) -> Option<u64> {
         .ok()
 }
 
+/// Build a sibling path with an additional suffix (`client.jar` → `client.jar.part`).
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_os_string();
+    p.push(suffix);
+    PathBuf::from(p)
+}
+
+fn part_path_for(path: &Path) -> PathBuf {
+    with_suffix(path, ".part")
+}
+
+fn part_meta_path(path: &Path) -> PathBuf {
+    with_suffix(path, ".part.meta")
+}
+
+/// Identity of the artifact a `.part` belongs to. Resuming across a restart
+/// is only safe when this matches; otherwise the bytes on disk belong to a
+/// different file and must never be treated as a head start (or, when no
+/// SHA1 is available, as the final file).
+fn download_identity(url: &str, expected_sha1: &str, expected_size: Option<u64>) -> String {
+    format!("{}\n{}\n{}", url, expected_sha1, expected_size.unwrap_or(0))
+}
+
+/// Drop a stale `.part` whose sidecar identity does not match the current
+/// download, then return the safe resume offset.
+fn prepare_partial_download(path: &Path, identity: &str) -> u64 {
+    let part_path = part_path_for(path);
+    if !part_path.exists() {
+        return 0;
+    }
+    let meta_path = part_meta_path(path);
+    let matches = std::fs::read_to_string(&meta_path)
+        .map(|stored| stored == identity)
+        .unwrap_or(false);
+    if !matches {
+        tracing::debug!(
+            target: "launcher",
+            "Discarding stale .part for {} (artifact identity changed)",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(&meta_path);
+        return 0;
+    }
+    std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// 429/5xx/408 are transient and worth retrying; other 4xx (404, 403,
+/// malformed request) are permanent for this URL and should fail fast so the
+/// caller can move to a mirror.
+fn is_transient_download_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status.as_u16() >= 500
+}
+
+/// `Retry-After` in seconds, capped so a single host cannot stall an install
+/// for minutes. Falls back to exponential backoff when the header is absent
+/// or an HTTP-date (not parsed here).
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap, fallback: u64) -> u64 {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| secs.clamp(1, 30))
+        .unwrap_or(fallback)
+}
+
+/// Validate an asset-index SHA1 used as a two-level directory name. A
+/// malformed hash (short, non-hex, path separators) must never be joined
+/// into the assets directory.
+pub fn is_valid_asset_hash(hash: &str) -> bool {
+    hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Validate URL + host, then download to a .part temp file, validate,
 /// and atomically rename to `path` on success. On ANY error the .part file
 /// is cleaned up and `path` is never touched.
@@ -682,11 +757,8 @@ pub(crate) async fn download_to_part(
         std::fs::create_dir_all(parent)?;
     }
 
-    let part_path = {
-        let mut p = path.as_os_str().to_os_string();
-        p.push(".part");
-        std::path::PathBuf::from(p)
-    };
+    let part_path = part_path_for(path);
+    let meta_path = part_meta_path(path);
 
     // A leftover .part larger than the expected file is a different artifact
     // (mirror switch, new version) — drop it and restart fresh.
@@ -694,13 +766,27 @@ pub(crate) async fn download_to_part(
         if let Ok(meta) = std::fs::metadata(&part_path) {
             if meta.len() > size {
                 let _ = std::fs::remove_file(&part_path);
+                let _ = std::fs::remove_file(&meta_path);
             }
         }
     }
 
+    // A .part without a matching identity sidecar cannot be trusted: the
+    // target path may be reused for another artifact/version, and resuming
+    // would splice two files together.
+    let identity = download_identity(&url, expected_sha1, expected_size);
+    let mut offset = prepare_partial_download(path, &identity);
+    if let Err(e) = std::fs::write(&meta_path, &identity) {
+        tracing::warn!(
+            target: "launcher",
+            "Could not write .part identity for {}: {}",
+            path.display(),
+            e
+        );
+    }
+
     let client = http_client()?;
     let max_attempts = MAX_RETRIES as usize + 2;
-    let mut offset: u64 = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
     let mut last_err: Option<String> = None;
     let mut complete = false;
     // After the body stream breaks once (proxy cutting mid-transfer), the
@@ -778,6 +864,29 @@ pub(crate) async fn download_to_part(
                 partial_offset, part_len, total
             ));
             if attempt < max_attempts {
+                continue;
+            }
+            break;
+        }
+        if is_transient_download_status(status) {
+            let fallback = 1u64 << attempt.min(4);
+            let wait = retry_after_seconds(response.headers(), fallback);
+            last_err = Some(format!("HTTP {} for {}", status, url));
+            if attempt < max_attempts {
+                tracing::warn!(
+                    target: "launcher",
+                    "Transient HTTP {} for {}; retrying in {}s",
+                    status,
+                    url,
+                    wait
+                );
+                // Sleep in 1-second steps so a pause request lands promptly.
+                for _ in 0..wait {
+                    if pause_requested() {
+                        return Err(LauncherError::Paused);
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
                 continue;
             }
             break;
@@ -942,6 +1051,7 @@ pub(crate) async fn download_to_part(
             return Err(LauncherError::Paused);
         }
         let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(&meta_path);
         return Err(LauncherError::Download(format!(
             "Failed to download {}: {}",
             url,
@@ -956,6 +1066,7 @@ pub(crate) async fn download_to_part(
         let actual = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
         if actual != expected {
             let _ = std::fs::remove_file(&part_path);
+            let _ = std::fs::remove_file(&meta_path);
             return Err(LauncherError::Download(format!(
                 "Size mismatch for {}: expected {} bytes, got {}",
                 path.display(),
@@ -968,11 +1079,13 @@ pub(crate) async fn download_to_part(
     // Validate the .part file content
     if let Err(e) = validate_download(&part_path, expected_sha1) {
         let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_file(&meta_path);
         return Err(e);
     }
 
     // Atomically replace the destination: rename .part → final path
     std::fs::rename(&part_path, path)?;
+    let _ = std::fs::remove_file(&meta_path);
 
     Ok(())
 }
@@ -1040,12 +1153,9 @@ pub async fn download_file(url: &str, path: &Path, expected_sha1: &str) -> Resul
         // Mirrors serve different URLs — a .part resumed from the primary
         // host would mix two files. Reset it when switching candidates.
         if ci > 0 {
-            let part_path = {
-                let mut p = path.as_os_str().to_os_string();
-                p.push(".part");
-                std::path::PathBuf::from(p)
-            };
+            let part_path = part_path_for(path);
             let _ = std::fs::remove_file(&part_path);
+            let _ = std::fs::remove_file(part_meta_path(path));
         }
         // If mirrors exist, the primary host gets only one attempt so a
         // blocked/dead host fails over to a mirror quickly instead of
@@ -1115,12 +1225,9 @@ pub async fn download_file_sized(
 
     for (ci, candidate) in candidates.iter().enumerate() {
         if ci > 0 {
-            let part_path = {
-                let mut p = path.as_os_str().to_os_string();
-                p.push(".part");
-                std::path::PathBuf::from(p)
-            };
+            let part_path = part_path_for(path);
             let _ = std::fs::remove_file(&part_path);
+            let _ = std::fs::remove_file(part_meta_path(path));
         }
         // Mirrors get full retries; the primary host gets a single attempt
         // so it can't stall the whole install with repeated timeouts.
@@ -1167,6 +1274,25 @@ fn is_rejected_content_type(ct: &str) -> bool {
         || ct_lower.starts_with("application/xhtml")
 }
 
+/// Remove duplicate target paths from a download batch. Two concurrent
+/// downloads writing the same file (duplicate metadata entries, path casing
+/// on Windows) would race and could leave a validated file overwritten by an
+/// unvalidated one. The first entry wins; duplicates are the same artifact.
+fn dedupe_download_targets(
+    files: Vec<(String, PathBuf, String, u64)>,
+) -> Vec<(String, PathBuf, String, u64)> {
+    let mut seen = std::collections::HashSet::new();
+    files
+        .into_iter()
+        .filter(|(_, path, _, _)| {
+            // Windows filesystems are case-insensitive; compare lowercased
+            // lossy strings so `Libraries/A.jar` and `libraries/a.jar` are
+            // treated as the same target.
+            seen.insert(path.to_string_lossy().to_ascii_lowercase())
+        })
+        .collect()
+}
+
 /// Download up to CONCURRENT_LIMIT files in parallel with progress callback.
 ///
 /// The callback receives `(files_done, files_total, bytes_done, bytes_total,
@@ -1177,6 +1303,7 @@ pub async fn download_files(
     files: Vec<(String, PathBuf, String, u64)>,
     on_progress: impl Fn(usize, usize, u64, u64, &str) + Send + Sync,
 ) -> Result<()> {
+    let files = dedupe_download_targets(files);
     let total = files.len();
     let total_bytes: u64 = files.iter().map(|(_, _, _, s)| *s).sum();
     let mut completed = 0usize;
@@ -1276,6 +1403,12 @@ pub async fn download_assets(
     let mut files: Vec<(String, PathBuf, String, u64)> = Vec::new();
 
     for obj in asset_index.objects.values() {
+        if !is_valid_asset_hash(&obj.hash) {
+            return Err(LauncherError::Download(format!(
+                "Invalid asset hash in index: {:?}",
+                obj.hash
+            )));
+        }
         let hash_prefix = &obj.hash[..2];
         let path = objects_dir.join(hash_prefix).join(&obj.hash);
 
@@ -1327,11 +1460,28 @@ pub fn ensure_virtual_assets(
         if !all && !obj.is_virtual {
             continue;
         }
+        if !is_valid_asset_hash(&obj.hash) {
+            return Err(LauncherError::Download(format!(
+                "Invalid asset hash in index: {:?}",
+                obj.hash
+            )));
+        }
+        // Asset object names become paths under virtual/legacy. Treat them
+        // like zip entries: a crafted index must not escape that directory.
+        crate::import::check_safe_relative(name).map_err(|_| {
+            LauncherError::Download(format!("Unsafe asset name in index: {:?}", name))
+        })?;
         let src = objects_dir.join(&obj.hash[..2]).join(&obj.hash);
         if !src.exists() {
             continue;
         }
         let dest = virtual_dir.join(name);
+        if !dest.starts_with(&virtual_dir) {
+            return Err(LauncherError::Download(format!(
+                "Unsafe asset name in index: {:?}",
+                name
+            )));
+        }
         if dest.exists() {
             let skip = std::fs::metadata(&dest)
                 .map(|m| m.len() == obj.size)
@@ -1473,6 +1623,7 @@ mod tests {
         assert!(is_host_allowed("github.com"));
         assert!(is_host_allowed("objects.githubusercontent.com"));
         assert!(is_host_allowed("api.modrinth.com"));
+        assert!(is_host_allowed("login.live.com"));
     }
 
     #[test]
@@ -1667,6 +1818,127 @@ mod tests {
         assert_eq!(content_range_start("bytes */1234"), None);
         assert_eq!(content_range_start("bytes 0-0/1"), Some(0));
         assert_eq!(content_range_start("garbage"), None);
+    }
+
+    #[test]
+    fn asset_hash_validation_rejects_path_like_values() {
+        let good = "0123456789abcdef0123456789abcdef01234567";
+        assert!(is_valid_asset_hash(good));
+        assert!(!is_valid_asset_hash(
+            "../0123456789abcdef0123456789abcdef0123"
+        ));
+        assert!(!is_valid_asset_hash(
+            "0123456789abcdef0123/456789abcdef01234567"
+        ));
+        assert!(!is_valid_asset_hash("0123"));
+        assert!(!is_valid_asset_hash(""));
+        assert!(!is_valid_asset_hash(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        ));
+    }
+
+    #[test]
+    fn partial_download_identity_discards_stale_part() {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_part_identity_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("library.jar");
+        let part = part_path_for(&target);
+        let meta = part_meta_path(&target);
+
+        let identity = download_identity("https://example.com/a.jar", "abc", Some(10));
+        std::fs::write(&part, b"old bytes").unwrap();
+        std::fs::write(&meta, &identity).unwrap();
+        assert_eq!(
+            prepare_partial_download(&target, &identity),
+            9,
+            "matching identity must preserve the resume offset"
+        );
+
+        // A different URL/artifact must not resume from these bytes.
+        let other = download_identity("https://example.com/b.jar", "def", Some(20));
+        assert_eq!(prepare_partial_download(&target, &other), 0);
+        assert!(!part.exists(), "stale partial must be deleted");
+
+        // Missing sidecar is also untrusted.
+        std::fs::write(&part, b"old bytes").unwrap();
+        let _ = std::fs::remove_file(&meta);
+        assert_eq!(prepare_partial_download(&target, &identity), 0);
+        assert!(!part.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_download_statuses_are_classified() {
+        assert!(is_transient_download_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(is_transient_download_status(
+            reqwest::StatusCode::REQUEST_TIMEOUT
+        ));
+        assert!(is_transient_download_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(is_transient_download_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_transient_download_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        assert!(!is_transient_download_status(
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(!is_transient_download_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
+    fn retry_after_is_parsed_and_capped() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, 1), 7);
+
+        headers.insert(reqwest::header::RETRY_AFTER, "600".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, 1), 30);
+
+        headers.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, 3), 3);
+    }
+
+    #[test]
+    fn download_targets_are_deduped_case_insensitively() {
+        let files = vec![
+            (
+                "https://example.com/a".to_string(),
+                PathBuf::from("C:/Libraries/A.jar"),
+                "one".to_string(),
+                1,
+            ),
+            (
+                "https://example.com/a-dup".to_string(),
+                PathBuf::from("c:/libraries/a.jar"),
+                "two".to_string(),
+                2,
+            ),
+            (
+                "https://example.com/b".to_string(),
+                PathBuf::from("C:/Libraries/B.jar"),
+                "three".to_string(),
+                3,
+            ),
+        ];
+        let deduped = dedupe_download_targets(files);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].0, "https://example.com/a");
+        assert_eq!(deduped[1].0, "https://example.com/b");
     }
 
     #[test]

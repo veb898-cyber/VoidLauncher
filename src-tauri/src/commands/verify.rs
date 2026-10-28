@@ -22,7 +22,39 @@ pub async fn cmd_verify_instance(
     tauri::async_runtime::spawn_blocking(move || {
         let instance =
             instances::get_instance(&instances_dir, &instance_name).map_err(|e| e.to_string())?;
-        Ok(verify::verify_instance_scoped(&config, &instance, scope))
+        let report = verify::verify_instance_scoped(&config, &instance, scope);
+        // A user-visible "verify failed" is otherwise impossible to diagnose
+        // from a log: print exactly which category and file failed. Paths are
+        // instance-relative and contain no tokens.
+        if !report.healthy {
+            let categories: Vec<String> = report
+                .categories
+                .iter()
+                .map(|c| format!("{}={}/{}", c.id, c.issue_count, c.checked))
+                .collect();
+            tracing::warn!(
+                target: "launcher",
+                "Verify '{}' (scope {:?}) unhealthy: repairable={}, content={}, categories: {}",
+                instance.name,
+                scope,
+                report.repairable_count,
+                report.content_issues,
+                categories.join(", ")
+            );
+            for category in &report.categories {
+                for issue in &category.issues {
+                    tracing::warn!(
+                        target: "launcher",
+                        "Verify issue [{}] {} kind={} repairable={}",
+                        category.id,
+                        issue.path,
+                        issue.kind,
+                        issue.repairable
+                    );
+                }
+            }
+        }
+        Ok(report)
     })
     .await
     .map_err(|e| e.to_string())?

@@ -513,10 +513,17 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
+    let cancelled = false;
     const setup = async () => {
       try {
         // Start watching this instance's content dirs (mods/resourcepacks/shaderpacks)
         await invoke('cmd_watch_instance', { instanceName });
+        // The effect may have been cleaned up while the watch command was in
+        // flight; make sure no watcher is left behind in that case.
+        if (cancelled) {
+          invoke('cmd_unwatch_instance').catch(() => {});
+          return;
+        }
         // Listen for change events
         const { listen } = await import('@tauri-apps/api/event');
         const unlisten = await listen<{ instance: string; subfolder: string }>('instance_dir_changed', (e) => {
@@ -530,11 +537,17 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           if (isFrozen) return;
           loadItems();
         });
+        if (cancelled) {
+          unlisten();
+          invoke('cmd_unwatch_instance').catch(() => {});
+          return;
+        }
         unlistenFn = unlisten;
       } catch { }
     };
     setup();
     return () => {
+      cancelled = true;
       if (unlistenFn) unlistenFn();
       invoke('cmd_unwatch_instance').catch(() => {});
     };

@@ -53,6 +53,24 @@ pub struct LoaderLibrary {
     pub size: Option<u64>,
 }
 
+/// Validate version strings that loader code later uses in URLs, temp file
+/// names and library paths. Pack manifests are remote input, so `..`,
+/// separators and drive prefixes must be rejected before any join.
+pub(crate) fn validate_loader_request(mc_version: &str, loader_version: &str) -> Result<()> {
+    for (value, label) in [
+        (mc_version, "Minecraft version"),
+        (loader_version, "loader version"),
+    ] {
+        if crate::import::check_safe_file_name(value).is_err() {
+            return Err(crate::error::LauncherError::ModLoader(format!(
+                "Invalid {}: {:?}",
+                label, value
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Get the loader profile for a given loader type
 #[allow(dead_code)]
 pub async fn get_profile(
@@ -60,6 +78,7 @@ pub async fn get_profile(
     mc_version: &str,
     loader_version: &str,
 ) -> Result<LoaderProfile> {
+    validate_loader_request(mc_version, loader_version)?;
     match loader {
         "Fabric" => fabric::get_profile(mc_version, loader_version).await,
         "Forge" => forge::get_profile(mc_version, loader_version).await,
@@ -81,6 +100,7 @@ pub async fn install_loader(
     versions_dir: &Path,
     app: Option<&tauri::AppHandle>,
 ) -> Result<LoaderProfile> {
+    validate_loader_request(mc_version, loader_version)?;
     // Forge/NeoForge need the vanilla client JAR on disk to patch it into
     // the loader version. Download it first when it's missing, so installing
     // a loader works even right after a pack import (before the first launch).
@@ -133,7 +153,7 @@ async fn ensure_client_jar(
     let info = crate::versions::fetch_version_info(&url).await?;
     let libraries_dir_buf = libraries_dir.to_path_buf();
     let versions_dir_buf = versions_dir.to_path_buf();
-    let files = crate::versions::collect_downloads(&info, &libraries_dir_buf, &versions_dir_buf);
+    let files = crate::versions::collect_downloads(&info, &libraries_dir_buf, &versions_dir_buf)?;
     let missing: Vec<_> = files
         .into_iter()
         .filter(|(_, path, _, _)| !path.exists())
@@ -154,4 +174,34 @@ async fn ensure_client_jar(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loader_request_accepts_real_version_strings() {
+        for (mc, loader) in [
+            ("1.20.1", "0.15.11"),
+            ("1.21.4", "21.4.153"),
+            ("1.20.1", "47.4.0"),
+            ("24w14a", "0.15.0-beta.1"),
+        ] {
+            assert!(
+                validate_loader_request(mc, loader).is_ok(),
+                "{} / {} must be accepted",
+                mc,
+                loader
+            );
+        }
+    }
+
+    #[test]
+    fn loader_request_rejects_path_components() {
+        assert!(validate_loader_request("../escape", "1.0").is_err());
+        assert!(validate_loader_request("1.20.1", "..\\escape").is_err());
+        assert!(validate_loader_request("1.20.1", "C:evil").is_err());
+        assert!(validate_loader_request("1.20.1", "").is_err());
+    }
 }

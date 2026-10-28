@@ -68,6 +68,20 @@ export interface FetchRetryPayload {
   message: string;
 }
 
+/**
+ * Per-tab catalog generation. A newer initial/search request invalidates the
+ * response of an older one, so a slow request from a previous query/tab can
+ * never overwrite fresh results.
+ */
+const catalogGeneration: Record<ModpacksTab, number> = {
+  modrinth: 0,
+  curseforge: 0,
+  atlauncher: 0,
+};
+
+/** Generation of the selected-pack detail request (Mr/Cf/Atl). */
+let detailGeneration = 0;
+
 export interface FileProgressPayload {
   url: string;
   downloaded: number;
@@ -288,36 +302,51 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
   setNameError: (v) => set({ nameError: v }),
 
   loadInitial: async (tb: ModpacksTab) => {
+    const generation = ++catalogGeneration[tb];
     set((s) => ({ loadingByTab: { ...s.loadingByTab, [tb]: true }, selected: null, fetchRetry: null }));
     try {
       if (tb === 'atlauncher') {
         const packs = await invoke<AtlPack[]>('cmd_search_atlauncher');
-        set({ atlPacks: packs, atlFiltered: packs });
+        if (generation === catalogGeneration[tb]) {
+          set({ atlPacks: packs, atlFiltered: packs });
+        }
       } else if (tb === 'curseforge') {
         const apiKey = useSettingsStore.getState().config?.curseforge_api_key;
         if (!apiKey) {
           // No API key: show the "key required" hint. Must NOT return early —
           // the loading flag is reset after this block, and skipping it left
           // the CurseForge tab spinning forever.
-          set({ cfResults: [] });
+          if (generation === catalogGeneration[tb]) set({ cfResults: [] });
         } else {
           const res = await invoke<any>('cmd_search_curseforge_modpacks', { query: '', mcVersion: null, loader: null, offset: 0, limit: PAGE_SIZE });
           const data: CfHit[] = res.data || [];
-          set({ cfResults: data, cfOffset: data.length, cfHasMore: data.length >= PAGE_SIZE });
+          if (generation === catalogGeneration[tb]) {
+            set({ cfResults: data, cfOffset: data.length, cfHasMore: data.length >= PAGE_SIZE });
+          }
         }
       } else {
         const res = await invoke<any>('cmd_search_modrinth_modpacks', { query: '', mcVersion: null, loader: null, index: 'downloads', offset: 0, limit: PAGE_SIZE });
         const hits: MrHit[] = res.hits || [];
-        set({ mrResults: hits, mrOffset: hits.length, mrHasMore: hits.length >= PAGE_SIZE });
+        if (generation === catalogGeneration[tb]) {
+          set({ mrResults: hits, mrOffset: hits.length, mrHasMore: hits.length >= PAGE_SIZE });
+        }
       }
     } catch (e: any) {
-      addToast(t('modpacks.load_error', { error: e.toString() }), 'error');
+      if (generation === catalogGeneration[tb]) {
+        addToast(t('modpacks.load_error', { error: e.toString() }), 'error');
+      }
     }
-    set((s) => ({ loadingByTab: { ...s.loadingByTab, [tb]: false } }));
+    if (generation === catalogGeneration[tb]) {
+      set((s) => ({ loadingByTab: { ...s.loadingByTab, [tb]: false } }));
+    }
   },
 
   search: async () => {
     const { tab, query } = get();
+    // ATLauncher catalog is fetched once and filtered on the client; do not
+    // invalidate an in-flight initial load just because the user pressed Enter.
+    if (tab === 'atlauncher') return;
+    const generation = ++catalogGeneration[tab];
     set((s) => ({ loadingByTab: { ...s.loadingByTab, [tab]: true }, selected: null, fetchRetry: null }));
     try {
       if (tab === 'curseforge') {
@@ -328,17 +357,25 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
         if (apiKey) {
           const res = await invoke<any>('cmd_search_curseforge_modpacks', { query, mcVersion: null, loader: null, offset: 0, limit: PAGE_SIZE });
           const data: CfHit[] = res.data || [];
-          set({ cfResults: data, cfOffset: data.length, cfHasMore: data.length >= PAGE_SIZE });
+          if (generation === catalogGeneration[tab]) {
+            set({ cfResults: data, cfOffset: data.length, cfHasMore: data.length >= PAGE_SIZE });
+          }
         }
       } else if (tab === 'modrinth') {
         const res = await invoke<any>('cmd_search_modrinth_modpacks', { query, mcVersion: null, loader: null, index: 'downloads', offset: 0, limit: PAGE_SIZE });
         const hits: MrHit[] = res.hits || [];
-        set({ mrResults: hits, mrOffset: hits.length, mrHasMore: hits.length >= PAGE_SIZE });
+        if (generation === catalogGeneration[tab]) {
+          set({ mrResults: hits, mrOffset: hits.length, mrHasMore: hits.length >= PAGE_SIZE });
+        }
       }
     } catch (e: any) {
-      addToast(t('modpacks.search_error', { error: e.toString() }), 'error');
+      if (generation === catalogGeneration[tab]) {
+        addToast(t('modpacks.search_error', { error: e.toString() }), 'error');
+      }
     }
-    set((s) => ({ loadingByTab: { ...s.loadingByTab, [tab]: false } }));
+    if (generation === catalogGeneration[tab]) {
+      set((s) => ({ loadingByTab: { ...s.loadingByTab, [tab]: false } }));
+    }
   },
 
   loadMore: async () => {
@@ -347,24 +384,29 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
     if (s.loadingMore) return;
     const hasMore = tab === 'curseforge' ? s.cfHasMore : s.mrHasMore;
     if (!hasMore) return;
+    const generation = catalogGeneration[tab];
     const offset = tab === 'curseforge' ? s.cfOffset : s.mrOffset;
     set({ loadingMore: true });
     try {
       if (tab === 'curseforge') {
         const res = await invoke<any>('cmd_search_curseforge_modpacks', { query: s.query, mcVersion: null, loader: null, offset, limit: PAGE_SIZE });
+        if (generation !== catalogGeneration[tab]) return;
         const fresh: CfHit[] = (res.data || []).filter((h: CfHit) => !s.cfResults.some((x) => x.id === h.id));
         set({ cfResults: [...s.cfResults, ...fresh], cfOffset: offset + fresh.length, cfHasMore: fresh.length >= PAGE_SIZE });
       } else if (tab === 'modrinth') {
         const res = await invoke<any>('cmd_search_modrinth_modpacks', { query: s.query, mcVersion: null, loader: null, index: 'downloads', offset, limit: PAGE_SIZE });
+        if (generation !== catalogGeneration[tab]) return;
         const fresh: MrHit[] = (res.hits || []).filter((h: MrHit) => !s.mrResults.some((x) => x.project_id === h.project_id));
         set({ mrResults: [...s.mrResults, ...fresh], mrOffset: offset + fresh.length, mrHasMore: fresh.length >= PAGE_SIZE });
       }
-    } catch { }
-    set({ loadingMore: false });
+    } catch { } finally {
+      set({ loadingMore: false });
+    }
   },
 
   selectMr: async (hit) => {
     const sourceId = `mr:${hit.project_id}`;
+    const generation = ++detailGeneration;
     set({
       selected: hit, atlDetail: null, versions: [], loadingDetail: true, nameError: false,
       installVersionId: '', installCfFileId: null, installAtlVersion: '',
@@ -372,16 +414,19 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
     suggestNameFor(set, get, sourceId, hit.title);
     try {
       const vers = await invoke<MrVersion[]>('cmd_get_modrinth_modpack_versions', { projectId: hit.project_id });
-      set({ versions: vers });
+      if (generation === detailGeneration) set({ versions: vers });
     } catch (e: any) {
-      addToast(t('modpacks.detail_error', { error: e.toString() }), 'error');
+      if (generation === detailGeneration) {
+        addToast(t('modpacks.detail_error', { error: e.toString() }), 'error');
+      }
     }
-    set({ loadingDetail: false });
+    if (generation === detailGeneration) set({ loadingDetail: false });
   },
 
   selectCf: async (hit) => {
     const st = get();
     const sourceId = `cf:${hit.id}`;
+    const generation = ++detailGeneration;
     set({
       selected: hit, atlDetail: null, versions: [], loadingDetail: true, nameError: false,
       installVersionId: '', installCfFileId: null, installAtlVersion: '',
@@ -389,22 +434,27 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
     suggestNameFor(set, get, sourceId, hit.name);
     try {
       const res = await invoke<any>('cmd_get_curseforge_modpack_files', { modId: hit.id, mcVersion: st.mcFilter || null, loader: null });
-      set({ versions: res.data || [] });
+      if (generation === detailGeneration) set({ versions: res.data || [] });
     } catch (e: any) {
-      addToast(t('modpacks.detail_error', { error: e.toString() }), 'error');
+      if (generation === detailGeneration) {
+        addToast(t('modpacks.detail_error', { error: e.toString() }), 'error');
+      }
     }
-    set({ loadingDetail: false });
+    if (generation === detailGeneration) set({ loadingDetail: false });
   },
 
   selectAtl: async (pack, version) => {
+    const generation = ++detailGeneration;
     set({ selected: pack, atlDetail: null, loadingDetail: true, nameError: false });
     try {
       const detail = await invoke<AtlDetail>('cmd_get_atlauncher_version_detail', { safeName: pack.safeName, version });
-      set({ atlDetail: detail });
+      if (generation === detailGeneration) set({ atlDetail: detail });
     } catch (e: any) {
-      addToast(t('modpacks.detail_error', { error: e.toString() }), 'error');
+      if (generation === detailGeneration) {
+        addToast(t('modpacks.detail_error', { error: e.toString() }), 'error');
+      }
     }
-    set({ loadingDetail: false });
+    if (generation === detailGeneration) set({ loadingDetail: false });
   },
 
   selectAtlPack: (pack) => {
@@ -449,6 +499,10 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
           installed: String(outcome.report.installed),
           total: String(outcome.report.total_files),
         }), 'warning');
+      } else if (outcome && outcome.report.warnings.length > 0) {
+        // Everything the pack archive contained is installed, but the
+        // loader/game-file prefetch failed — do not claim a fully ready pack.
+        addToast(t('modpacks.installed_incomplete'), 'warning');
       } else {
         addToast(t('modpacks.installed'), 'success');
       }
@@ -496,7 +550,10 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
     const v = get().versions.find((x) => x.id === get().installVersionId) as MrVersion | undefined;
     if (!v) return;
     await get().runInstall(async () => {
-      await invoke('cmd_install_modrinth_modpack', { versionId: v.id, instanceName: get().installName.trim() });
+      return await invoke<ImportOutcome>('cmd_install_modrinth_modpack', {
+        versionId: v.id,
+        instanceName: get().installName.trim(),
+      });
     }, 'mr');
   },
 
@@ -516,7 +573,11 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
     const { installAtlVersion } = get();
     if (!installAtlVersion) return;
     await get().runInstall(async () => {
-      await invoke('cmd_install_atlauncher_modpack', { packId: pack.id, version: installAtlVersion, instanceName: get().installName.trim() });
+      return await invoke<ImportOutcome>('cmd_install_atlauncher_modpack', {
+        packId: pack.id,
+        version: installAtlVersion,
+        instanceName: get().installName.trim(),
+      });
     }, 'atl');
   },
 
@@ -524,7 +585,12 @@ export const useModpacksStore = create<ModpacksState>()((set, get) => ({
     const report = get().installReport;
     if (!report || get().retryingInstallFiles) return;
     const retryable = report.failed.filter(
-      (f) => f.retryable && f.project_id != null && f.file_id != null,
+      (f) =>
+        f.retryable &&
+        f.project_id != null &&
+        f.file_id != null &&
+        f.project_id > 0 &&
+        f.file_id > 0,
     );
     if (retryable.length === 0) return;
     set({ retryingInstallFiles: true });

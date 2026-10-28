@@ -86,7 +86,8 @@ pub async fn cmd_install_version(
         &version_info,
         &config.libraries_dir(),
         &config.versions_dir(),
-    );
+    )
+    .map_err(|e| format!("Invalid version metadata: {}", e))?;
 
     let progress_tx_clone = progress_tx.clone();
     let instance_id_clone = instance_id.clone();
@@ -466,6 +467,21 @@ pub async fn cmd_launch_game(
         }
     };
 
+    // Version strings become directory/file names at every stage below.
+    // A tampered instance.json must fail with a clear reason, not be joined
+    // onto `versions/` or `libraries/`.
+    if crate::import::check_safe_file_name(&instance.mc_version).is_err()
+        || instance
+            .loader_version
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .is_some_and(|v| crate::import::check_safe_file_name(v).is_err())
+    {
+        let msg = "Instance settings contain an invalid Minecraft or loader version.".to_string();
+        events::emit_log(&app, "error", "launch", &msg);
+        return Err(msg);
+    }
+
     // Auto-install the loader if it's set but not installed yet
     if instance.loader != instances::LoaderType::Vanilla && instance.loader_profile.is_none() {
         let loader_str = match instance.loader {
@@ -568,6 +584,18 @@ pub async fn cmd_launch_game(
         }
     };
 
+    // The id and asset-index name become directory/file names below.
+    crate::import::check_safe_file_name(&version_info.id).map_err(|_| {
+        let msg = "Invalid version id in remote metadata".to_string();
+        events::emit_log(&app, "error", "launch", &msg);
+        msg
+    })?;
+    crate::import::check_safe_file_name(&version_info.assets).map_err(|_| {
+        let msg = "Invalid asset index name in remote metadata".to_string();
+        events::emit_log(&app, "error", "launch", &msg);
+        msg
+    })?;
+
     // Self-heal: ensure the version's files (client.jar, libraries) are on
     // disk. They are normally downloaded when the instance is created, but a
     // failed creation or a manually removed file must not break the launch.
@@ -581,7 +609,12 @@ pub async fn cmd_launch_game(
         &version_info,
         &config.libraries_dir(),
         &config.versions_dir(),
-    );
+    )
+    .map_err(|e| {
+        let msg = format!("Invalid version metadata: {}", e);
+        events::emit_log(&app, "error", "launch", &msg);
+        msg
+    })?;
     let missing = files
         .into_iter()
         .filter(|(_, path, _, _)| !path.exists())
@@ -672,7 +705,9 @@ pub async fn cmd_launch_game(
                 )
                 .await
                 {
-                    tracing::warn!(target: "launcher", "Processor JAR check failed (continuing anyway): {}", e);
+                    let msg = format!("Failed to prepare Forge launch files: {}", e);
+                    events::emit_log(&app, "error", "launch", &msg);
+                    return Err(msg);
                 }
             }
         }
@@ -686,7 +721,9 @@ pub async fn cmd_launch_game(
                 )
                 .await
                 {
-                    tracing::warn!(target: "launcher", "NeoForge processor JAR check failed (continuing anyway): {}", e);
+                    let msg = format!("Failed to prepare NeoForge launch files: {}", e);
+                    events::emit_log(&app, "error", "launch", &msg);
+                    return Err(msg);
                 }
             }
         }
@@ -726,10 +763,14 @@ pub async fn cmd_launch_game(
     }
 
     // Ensure LWJGL native JARs are present (self-heal for installs that
-    // predate native-classifier downloads)
+    // predate native-classifier downloads). Missing natives are a required
+    // part of the game runtime — continuing would only crash Java later with
+    // an unrelated-looking error.
     if let Err(e) = versions::ensure_native_libraries(&version_info, &config.libraries_dir()).await
     {
-        tracing::warn!(target: "launcher", "Native library check failed (continuing anyway): {}", e);
+        let msg = format!("Failed to prepare native libraries: {}", e);
+        events::emit_log(&app, "error", "launch", &msg);
+        return Err(msg);
     }
 
     // Ensure virtual/legacy assets exist for old versions (1.6.x and

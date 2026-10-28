@@ -388,6 +388,27 @@ pub fn verify_instance_scoped(
     let instances_dir = config.instances_dir();
     let assets_dir = config.assets_dir();
 
+    // The instance's MC version becomes a directory name under `versions/`.
+    // A tampered instance.json must not make verification stat outside it.
+    if crate::import::check_safe_file_name(&instance.mc_version).is_err() {
+        return VerifyReport {
+            categories: vec![VerifyCategory {
+                id: "metadata".to_string(),
+                checked: 1,
+                issue_count: 1,
+                issues: vec![VerifyIssue {
+                    path: format!("versions/{}/", instance.mc_version),
+                    kind: "unsafe".to_string(),
+                    repairable: false,
+                    detail: None,
+                }],
+            }],
+            repairable_count: 0,
+            content_issues: 0,
+            healthy: false,
+        };
+    }
+
     let version_info = load_local_version_info(&versions_dir, &instance.mc_version);
 
     // ── metadata ────────────────────────────────────────────────
@@ -473,6 +494,12 @@ pub fn verify_instance_scoped(
                         if let Some(native) = classifiers.get(classifier.as_str()) {
                             if let Some(path) = native.get("path").and_then(|v| v.as_str()) {
                                 if check_safe_remote_path(path).is_err() {
+                                    libraries.checked += 1;
+                                    libraries.add_issue(
+                                        format!("libraries/{}", path),
+                                        "unsafe",
+                                        false,
+                                    );
                                     continue;
                                 }
                                 let sha1 =
@@ -490,8 +517,12 @@ pub fn verify_instance_scoped(
                 }
             } else if lib.url.is_some() {
                 let rel = versions::maven_to_path(&lib.name);
-                let p = libraries_dir.join(&rel);
                 libraries.checked += 1;
+                if check_safe_remote_path(&rel).is_err() {
+                    libraries.add_issue(format!("libraries/{}", rel), "unsafe", false);
+                    continue;
+                }
+                let p = libraries_dir.join(&rel);
                 if !p.exists() {
                     libraries.add_issue(format!("libraries/{}", rel), "missing", true);
                 }
@@ -500,6 +531,11 @@ pub fn verify_instance_scoped(
     }
     if let Some(profile) = &instance.loader_profile {
         for llib in &profile.libraries {
+            if check_safe_remote_path(&llib.path).is_err() {
+                libraries.checked += 1;
+                libraries.add_issue(format!("libraries/{}", llib.path), "unsafe", false);
+                continue;
+            }
             let p = libraries_dir.join(&llib.path);
             let sha1 = llib.sha1.as_deref().unwrap_or("");
             check_library_file(
@@ -517,60 +553,72 @@ pub fn verify_instance_scoped(
     //    failure mode) ───────────────────────────────────────────
     let mut assets = CategoryBuilder::new("assets");
     if let Some(vi) = &version_info {
-        let index_path = assets_dir
-            .join("indexes")
-            .join(format!("{}.json", vi.assets));
-        if !index_path.exists() {
+        // The asset-index id is joined as a file name; never follow a
+        // remote-supplied path out of `assets/indexes/`.
+        if crate::import::check_safe_file_name(&vi.assets).is_err() {
             assets.checked = 1;
-            assets.add_issue(
-                format!("assets/indexes/{}.json", vi.assets),
-                "missing",
-                true,
-            );
+            assets.add_issue(format!("assets/indexes/{}", vi.assets), "unsafe", false);
         } else {
-            match versions::load_asset_index(&index_path) {
-                Ok(index) => {
-                    let objects_dir = assets_dir.join("objects");
-                    for obj in index.objects.values() {
-                        if obj.hash.len() < 2 {
-                            continue;
-                        }
-                        assets.checked += 1;
-                        let p = objects_dir.join(&obj.hash[..2]).join(&obj.hash);
-                        let display = format!("assets/objects/{}/{}", &obj.hash[..2], obj.hash);
-                        match std::fs::metadata(&p) {
-                            Err(_) => {
-                                if assets.issue_count < MAX_ISSUES_LISTED as u32 {
-                                    assets.add_issue(&display, "missing", true);
-                                } else {
-                                    assets.issue_count += 1;
-                                }
+            let index_path = assets_dir
+                .join("indexes")
+                .join(format!("{}.json", vi.assets));
+            if !index_path.exists() {
+                assets.checked = 1;
+                assets.add_issue(
+                    format!("assets/indexes/{}.json", vi.assets),
+                    "missing",
+                    true,
+                );
+            } else {
+                match versions::load_asset_index(&index_path) {
+                    Ok(index) => {
+                        let objects_dir = assets_dir.join("objects");
+                        for obj in index.objects.values() {
+                            assets.checked += 1;
+                            if !download::is_valid_asset_hash(&obj.hash) {
+                                assets.add_issue(
+                                    format!("assets/objects/{}", obj.hash),
+                                    "unsafe",
+                                    false,
+                                );
+                                continue;
                             }
-                            Ok(m) if m.len() != obj.size => {
-                                if assets.issue_count < MAX_ISSUES_LISTED as u32 {
-                                    assets.add_issue(&display, "corrupt", true);
-                                } else {
-                                    assets.issue_count += 1;
+                            let p = objects_dir.join(&obj.hash[..2]).join(&obj.hash);
+                            let display = format!("assets/objects/{}/{}", &obj.hash[..2], obj.hash);
+                            match std::fs::metadata(&p) {
+                                Err(_) => {
+                                    if assets.issue_count < MAX_ISSUES_LISTED as u32 {
+                                        assets.add_issue(&display, "missing", true);
+                                    } else {
+                                        assets.issue_count += 1;
+                                    }
                                 }
+                                Ok(m) if m.len() != obj.size => {
+                                    if assets.issue_count < MAX_ISSUES_LISTED as u32 {
+                                        assets.add_issue(&display, "corrupt", true);
+                                    } else {
+                                        assets.issue_count += 1;
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
-                }
-                Err(_) => {
-                    assets.checked = 1;
-                    assets.add_issue(
-                        format!("assets/indexes/{}.json", vi.assets),
-                        "corrupt",
-                        true,
-                    );
+                    Err(_) => {
+                        assets.checked = 1;
+                        assets.add_issue(
+                            format!("assets/indexes/{}.json", vi.assets),
+                            "corrupt",
+                            true,
+                        );
+                    }
                 }
             }
         }
     }
     let assets = assets.build();
 
-    // ── loader profile ──────────────────────────────────────────
+    // ── loader profile + processor output ───────────────────────
     let mut loader = CategoryBuilder::new("loader");
     if !matches!(instance.loader, LoaderType::Vanilla) {
         loader.checked = 1;
@@ -580,6 +628,39 @@ pub fn verify_instance_scoped(
                 "missing",
                 instance.loader_version.is_some(),
             );
+        }
+        // NeoForge's launch-critical client JAR is generated by the installer
+        // processors and is not part of the version's library list, so the
+        // libraries category can never notice it disappearing. Its absence
+        // used to be invisible here and made "Verify & Repair" a no-op for
+        // the failure that actually blocks launching.
+        if instance.loader == LoaderType::NeoForge {
+            if let Some(loader_version) = instance.loader_version.as_deref() {
+                let cached = modloaders::neoforge::read_install_profile_from_installer(
+                    &modloaders::neoforge::installer_cache_path(
+                        &instance.mc_version,
+                        loader_version,
+                    ),
+                );
+                let expected = modloaders::neoforge::expected_client_jar_paths(
+                    &libraries_dir,
+                    &instance.mc_version,
+                    loader_version,
+                    cached.as_ref(),
+                );
+                if modloaders::neoforge::find_client_jar(&expected).is_none() {
+                    let display = expected
+                        .first()
+                        .map(|p| {
+                            p.strip_prefix(&libraries_dir)
+                                .unwrap_or(p)
+                                .display()
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "client.jar".to_string());
+                    loader.add_issue(display, "missing", true);
+                }
+            }
         }
     }
     let loader = loader.build();
@@ -667,6 +748,70 @@ pub fn verify_instance_scoped(
         content_issues: content_issues_count,
         healthy,
     }
+}
+
+/// Whether a NeoForge instance's installer-generated client JAR is missing.
+/// The install profile in `instance.json` only proves the libraries were
+/// fetched; without this JAR NeoForge cannot boot, so repair must re-run the
+/// loader installer even when `loader_profile` is present.
+fn neoforge_client_jar_missing(instance: &Instance, libraries_dir: &Path) -> bool {
+    if instance.loader != LoaderType::NeoForge {
+        return false;
+    }
+    let Some(loader_version) = instance.loader_version.as_deref() else {
+        return false;
+    };
+    let cached = modloaders::neoforge::read_install_profile_from_installer(
+        &modloaders::neoforge::installer_cache_path(&instance.mc_version, loader_version),
+    );
+    let expected = modloaders::neoforge::expected_client_jar_paths(
+        libraries_dir,
+        &instance.mc_version,
+        loader_version,
+        cached.as_ref(),
+    );
+    modloaders::neoforge::find_client_jar(&expected).is_none()
+}
+
+/// Find an unsafe path in the included vanilla libraries (artifact or native
+/// classifier). Repair must fail loudly: silently skipping it would report a
+/// successful repair while required files remain unverifiable.
+fn unsafe_version_library_path(version_info: &VersionInfo) -> Option<String> {
+    for lib in &version_info.libraries {
+        if !versions::should_include_library(lib) {
+            continue;
+        }
+        let Some(downloads) = &lib.downloads else {
+            // Legacy Maven-coordinate fallback (no `downloads` block): the
+            // coordinate becomes a path, so a crafted name must fail repair.
+            if lib.url.is_some() {
+                let rel = versions::maven_to_path(&lib.name);
+                if check_safe_remote_path(&rel).is_err() {
+                    return Some(rel);
+                }
+            }
+            continue;
+        };
+        if let Some(artifact) = &downloads.artifact {
+            if check_safe_remote_path(&artifact.path).is_err() {
+                return Some(artifact.path.clone());
+            }
+        }
+        if let Some(classifier) = versions::native_classifier(lib) {
+            if let Some(native) = downloads
+                .classifiers
+                .as_ref()
+                .and_then(|c| c.get(classifier.as_str()))
+            {
+                if let Some(path) = native.get("path").and_then(|v| v.as_str()) {
+                    if check_safe_remote_path(path).is_err() {
+                        return Some(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Collect client JAR + vanilla libraries that are missing or fail SHA1
@@ -771,6 +916,15 @@ pub async fn repair_instance(
 ) -> Result<RepairSummary> {
     let mut summary = RepairSummary::default();
 
+    // `mc_version` becomes a directory under `versions/`; a tampered
+    // instance.json must not make repair read or write outside it.
+    if crate::import::check_safe_file_name(&instance.mc_version).is_err() {
+        return Err(LauncherError::Instance(format!(
+            "Unsafe Minecraft version in instance settings: {:?}",
+            instance.mc_version
+        )));
+    }
+
     let emit = |stage: &str, percent: f64, message: &str| {
         let _ = app.emit(
             "repair_progress",
@@ -816,6 +970,21 @@ pub async fn repair_instance(
         LauncherError::Version("Version metadata unavailable after fetch".to_string())
     })?;
 
+    // The asset-index id becomes a file name under assets/indexes; a tampered
+    // local version JSON must not make repair write outside that directory.
+    if crate::import::check_safe_file_name(&vi.assets).is_err() {
+        return Err(LauncherError::Version(format!(
+            "Unsafe asset index name in version metadata: {}",
+            vi.assets
+        )));
+    }
+    if let Some(path) = unsafe_version_library_path(&vi) {
+        return Err(LauncherError::Version(format!(
+            "Unsafe library path in version metadata: {}",
+            path
+        )));
+    }
+
     // Legacy `{mc}.jar` → `client.jar` migration (same as install check).
     let client_path = versions_dir.join(&instance.mc_version).join("client.jar");
     let legacy_path = versions_dir
@@ -827,9 +996,24 @@ pub async fn repair_instance(
 
     // ── 2. client JAR + libraries ───────────────────────────────
     emit("files", 8.0, "Checking game files...");
-    let mut targets = collect_repair_targets(&vi, &libraries_dir, &versions_dir);
+    let mut targets = if crate::import::check_safe_file_name(&vi.id).is_ok() {
+        collect_repair_targets(&vi, &libraries_dir, &versions_dir)
+    } else {
+        summary.failed += 1;
+        summary
+            .errors
+            .push(format!("Unsafe version id in metadata: {}", vi.id));
+        Vec::new()
+    };
     if let Some(profile) = &instance.loader_profile {
         for llib in &profile.libraries {
+            if check_safe_remote_path(&llib.path).is_err() {
+                summary.failed += 1;
+                summary
+                    .errors
+                    .push(format!("Unsafe loader library path: {}", llib.path));
+                continue;
+            }
             let p = libraries_dir.join(&llib.path);
             let sha1 = llib.sha1.clone().unwrap_or_default();
             let ok = p.exists()
@@ -905,8 +1089,10 @@ pub async fn repair_instance(
         let objects_dir = assets_dir.join("objects");
         // Remove size-mismatched objects so download_assets re-fetches them
         // (it only looks at existence).
+        let mut invalid_asset_hashes = 0usize;
         for obj in index.objects.values() {
-            if obj.hash.len() < 2 {
+            if !download::is_valid_asset_hash(&obj.hash) {
+                invalid_asset_hashes += 1;
                 continue;
             }
             let p = objects_dir.join(&obj.hash[..2]).join(&obj.hash);
@@ -916,11 +1102,21 @@ pub async fn repair_instance(
                 }
             }
         }
+        if invalid_asset_hashes > 0 {
+            summary.failed += 1;
+            summary.errors.push(format!(
+                "Asset index contains {} invalid hash(es); they were skipped",
+                invalid_asset_hashes
+            ));
+        }
         emit("assets", 55.0, "Downloading assets...");
         let missing_before = index
             .objects
             .values()
-            .filter(|o| o.hash.len() >= 2 && !objects_dir.join(&o.hash[..2]).join(&o.hash).exists())
+            .filter(|o| {
+                download::is_valid_asset_hash(&o.hash)
+                    && !objects_dir.join(&o.hash[..2]).join(&o.hash).exists()
+            })
             .count();
         match download::download_assets(index, &assets_dir, |completed, total, _, _, _| {
             let frac = if total > 0 {
@@ -945,8 +1141,11 @@ pub async fn repair_instance(
         let _ = download::ensure_virtual_assets(&vi.assets, index, &assets_dir);
     }
 
-    // ── 4. loader profile ───────────────────────────────────────
-    if !matches!(instance.loader, LoaderType::Vanilla) && instance.loader_profile.is_none() {
+    // ── 4. loader profile + processor output ────────────────────
+    if !matches!(instance.loader, LoaderType::Vanilla)
+        && (instance.loader_profile.is_none()
+            || neoforge_client_jar_missing(instance, &libraries_dir))
+    {
         emit("loader", 88.0, "Installing mod loader...");
         match &instance.loader_version {
             Some(lv) => {
@@ -1022,7 +1221,18 @@ pub async fn repair_instance(
     )
     .len() as u32;
 
-    emit("done", 100.0, "Repair complete");
+    if summary.failed > 0 {
+        emit(
+            "done",
+            100.0,
+            &format!(
+                "Repair finished with {} unresolved error(s)",
+                summary.failed
+            ),
+        );
+    } else {
+        emit("done", 100.0, "Repair complete");
+    }
     Ok(summary)
 }
 
@@ -1424,6 +1634,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn neoforge_instance(mc: &str, loader_version: &str) -> Instance {
+        let mut instance = test_instance(mc);
+        instance.loader = LoaderType::NeoForge;
+        instance.loader_version = Some(loader_version.to_string());
+        instance.loader_profile = Some(modloaders::LoaderProfile {
+            main_class: "cpw.mods.bootstraplauncher.BootstrapLauncher".to_string(),
+            libraries: Vec::new(),
+            jvm_args: Vec::new(),
+            game_args: Vec::new(),
+            legacy_args: false,
+        });
+        instance
+    }
+
+    /// Write a structurally valid JAR (see `forge::is_usable_jar`).
+    fn write_valid_jar(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+        zw.write_all(b"Manifest-Version: 1.0\n").unwrap();
+        zw.start_file("padding.bin", opts).unwrap();
+        let padding: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        zw.write_all(&padding).unwrap();
+        zw.finish().unwrap();
+    }
+
+    #[test]
+    fn missing_neoforge_client_jar_is_reported_as_repairable() {
+        let dir = temp_dir("neoforge_client_missing");
+        let config = test_config(&dir);
+        let instance = neoforge_instance("1.21.4", "21.4.157");
+
+        let report = verify_instance(&config, &instance);
+
+        let loader = cat(&report, "loader");
+        let issue = loader
+            .issues
+            .iter()
+            .find(|i| i.kind == "missing")
+            .expect("missing NeoForge client JAR must be reported");
+        assert!(issue.repairable, "the loader installer can regenerate it");
+        assert!(
+            issue.path.contains("neoforge") && issue.path.ends_with(".jar"),
+            "issue must name the JAR: {}",
+            issue.path
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn present_neoforge_client_jar_keeps_the_loader_category_healthy() {
+        let dir = temp_dir("neoforge_client_present");
+        let config = test_config(&dir);
+        let instance = neoforge_instance("1.21.4", "21.4.157");
+        write_valid_jar(
+            &config
+                .libraries_dir()
+                .join("net/neoforged/neoforge/21.4.157/neoforge-21.4.157-client.jar"),
+        );
+
+        let report = verify_instance(&config, &instance);
+
+        let loader = cat(&report, "loader");
+        assert_eq!(loader.checked, 1);
+        assert_eq!(loader.issue_count, 0, "{:?}", loader.issues);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_trigger_detects_a_missing_neoforge_client_jar() {
+        let dir = temp_dir("neoforge_repair_trigger");
+        let config = test_config(&dir);
+        let libraries_dir = config.libraries_dir();
+        let instance = neoforge_instance("1.21.4", "21.4.157");
+
+        assert!(
+            neoforge_client_jar_missing(&instance, &libraries_dir),
+            "repair must reinstall the loader when the JAR is gone"
+        );
+        write_valid_jar(
+            &libraries_dir.join("net/neoforged/neoforge/21.4.157/neoforge-21.4.157-client.jar"),
+        );
+        assert!(
+            !neoforge_client_jar_missing(&instance, &libraries_dir),
+            "present JAR must not trigger a reinstall"
+        );
+
+        let mut vanilla = instance.clone();
+        vanilla.loader = LoaderType::Vanilla;
+        assert!(!neoforge_client_jar_missing(&vanilla, &libraries_dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn modern_neoforge_client_jar_is_found_without_cached_installer() {
+        let dir = temp_dir("neoforge_client_modern");
+        let config = test_config(&dir);
+        let loader_version = "26.3.0.99-verifytest";
+        let instance = neoforge_instance("26.3", loader_version);
+        write_valid_jar(
+            &config.libraries_dir().join(format!(
+                "net/neoforged/minecraft-client-patched/{loader_version}/minecraft-client-patched-{loader_version}.jar"
+            )),
+        );
+
+        let report = verify_instance(&config, &instance);
+
+        let loader = cat(&report, "loader");
+        assert_eq!(
+            loader.issue_count, 0,
+            "26.x layout must not be reported missing: {:?}",
+            loader.issues
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_modern_neoforge_client_jar_is_reported_as_repairable() {
+        let dir = temp_dir("neoforge_client_modern_missing");
+        let config = test_config(&dir);
+        let loader_version = "26.3.0.99-verifytest-missing";
+        let instance = neoforge_instance("26.3", loader_version);
+
+        let report = verify_instance(&config, &instance);
+
+        let loader = cat(&report, "loader");
+        let issue = loader
+            .issues
+            .iter()
+            .find(|i| i.kind == "missing")
+            .expect("missing modern NeoForge JAR must be reported");
+        assert!(
+            issue.repairable,
+            "the loader installer regenerates minecraft-client-patched"
+        );
+        assert!(
+            issue.path.contains("minecraft-client-patched") && issue.path.ends_with(".jar"),
+            "issue must name the modern JAR: {}",
+            issue.path
+        );
+        assert!(
+            neoforge_client_jar_missing(&instance, &config.libraries_dir()),
+            "repair must trigger the installer for the modern layout"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn verify_scope_parse_accepts_names_and_rejects_unknown() {
         assert_eq!(VerifyScope::parse("all").unwrap(), VerifyScope::All);
@@ -1553,6 +1914,162 @@ mod tests {
         assert!(paths.iter().any(|p| p.contains("client.jar")));
         assert!(paths.iter().any(|p| p.contains("bad-1.0.jar")));
         assert!(!paths.iter().any(|p| p.contains("good-1.0.jar")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsafe_version_id_is_reported_without_traversal() {
+        let dir = temp_dir("unsafe_mc_version");
+        let config = test_config(&dir);
+        let instance = test_instance("../../outside");
+
+        let report = verify_instance(&config, &instance);
+
+        assert!(!report.healthy);
+        assert_eq!(report.categories.len(), 1);
+        let metadata = cat(&report, "metadata");
+        assert_eq!(metadata.issue_count, 1);
+        assert_eq!(metadata.issues[0].kind, "unsafe");
+        assert!(!metadata.issues[0].repairable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsafe_asset_index_id_is_reported_not_followed() {
+        let dir = temp_dir("unsafe_assets");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
+        // Rewrite the version JSON with a traversing asset id.
+        let json_path = config.versions_dir().join("1.20.1").join("1.20.1.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        json["assets"] = serde_json::json!("../../../outside");
+        std::fs::write(&json_path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let report = verify_instance(&config, &instance);
+
+        let assets = cat(&report, "assets");
+        assert_eq!(assets.issue_count, 1);
+        assert_eq!(assets.issues[0].kind, "unsafe");
+        assert!(!assets.issues[0].repairable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsafe_native_classifier_path_is_reported() {
+        let dir = temp_dir("unsafe_native_path");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
+        let json_path = config.versions_dir().join("1.20.1").join("1.20.1.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        json["libraries"] = serde_json::json!([{
+            "name": "org.lwjgl:lwjgl:3.3.1",
+            "downloads": {
+                "artifact": {
+                    "path": "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar",
+                    "sha1": "",
+                    "size": 0,
+                    "url": "https://example.com/lwjgl.jar"
+                },
+                "classifiers": {
+                    "natives-windows": {
+                        "path": "../../evil-natives.jar",
+                        "sha1": "",
+                        "size": 0,
+                        "url": "https://example.com/natives.jar"
+                    },
+                    "natives-linux": {
+                        "path": "../../evil-natives.jar",
+                        "sha1": "",
+                        "size": 0,
+                        "url": "https://example.com/natives.jar"
+                    },
+                    "natives-macos": {
+                        "path": "../../evil-natives.jar",
+                        "sha1": "",
+                        "size": 0,
+                        "url": "https://example.com/natives.jar"
+                    }
+                }
+            },
+            "natives": {
+                "windows": "natives-windows",
+                "linux": "natives-linux",
+                "osx": "natives-macos"
+            }
+        }]);
+        std::fs::write(&json_path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let report = verify_instance(&config, &instance);
+
+        let libraries = cat(&report, "libraries");
+        assert!(
+            libraries
+                .issues
+                .iter()
+                .any(|i| i.kind == "unsafe" && i.path.contains("evil-natives.jar")),
+            "unsafe native path must be reported: {:?}",
+            libraries.issues
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsafe_maven_fallback_library_path_is_reported() {
+        let dir = temp_dir("unsafe_maven_fallback");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
+        let json_path = config.versions_dir().join("1.20.1").join("1.20.1.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        // Legacy libraries without a `downloads` block use the Maven
+        // coordinate as a path; a crafted artifact id must not traverse.
+        json["libraries"] = serde_json::json!([{
+            "name": "com.example:..:1.0",
+            "url": "https://libraries.minecraft.net/"
+        }]);
+        std::fs::write(&json_path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let report = verify_instance(&config, &instance);
+
+        let libraries = cat(&report, "libraries");
+        assert!(
+            libraries
+                .issues
+                .iter()
+                .any(|i| i.kind == "unsafe" && i.path.contains("..")),
+            "unsafe maven fallback path must be reported: {:?}",
+            libraries.issues
+        );
+        assert!(
+            unsafe_version_library_path(
+                &serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap()
+            )
+            .is_some(),
+            "repair must reject the same metadata instead of skipping it"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

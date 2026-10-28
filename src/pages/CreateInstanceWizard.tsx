@@ -16,6 +16,7 @@ import { SlidingTabs, type SlidingTabDef } from '../components/ui/SlidingTabs';
 import { ImportReportPanel } from '../components/import/ImportReportPanel';
 import { reportHasGaps, type ImportOutcome, type ImportReport } from '../lib/importReport';
 import { needsLoaderVersionFetch } from '../lib/loaderVersions';
+import { planCreateFailure, type CreateInstanceStage } from '../lib/createInstanceFlow';
 
 interface VersionEntry {
   id: string;
@@ -410,8 +411,46 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
   // Import validation
   const canImport = mode === 'import' && instanceName.trim() !== '' && importMeta !== null && !isCreating;
 
+  /**
+   * Report a create/install failure without inviting a duplicate creation.
+   * Once the instance directory exists, retrying "Create" can only report
+   * "already exists", so the wizard closes and the toast points at Verify &
+   * Repair instead.
+   */
+  const reportCreateFailure = async (
+    stage: CreateInstanceStage,
+    error: unknown,
+    existedBefore: boolean,
+  ) => {
+    const name = instanceName.trim();
+    // Refresh first: a create error may still have written the directory.
+    try {
+      await loadInstances();
+    } catch {
+      // The store already reports loading errors; never block the toast.
+    }
+    const existsNow = useInstanceStore.getState().instances.some(
+      (instance) => instance.name === name,
+    );
+    // Only a directory that appeared during this attempt is a partial
+    // success. A name that was already taken is a real error and the user
+    // must choose another name, so the wizard stays open.
+    const createdByThisAttempt = stage !== 'create' || (!existedBefore && existsNow);
+    const plan = planCreateFailure(stage, createdByThisAttempt);
+
+    setIsCreating(false);
+    addToast(t(plan.toastKey, { name, error: String(error) }), 'error');
+    if (plan.closeWizard) onClose();
+  };
+
   const handleCreate = async () => {
     if (!canCreate) return;
+    const name = instanceName.trim();
+    // Baseline for the partial-success decision: an instance with this name
+    // that exists BEFORE the attempt was not created by it.
+    const existedBefore = useInstanceStore
+      .getState()
+      .instances.some((instance) => instance.name === name);
     setIsCreating(true);
     try {
       const versionEntry = versions.find((v) => v.id === selectedVersion);
@@ -419,28 +458,46 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
       addToast(t('create_instance.downloading'), 'info');
       const ldr = loaderType === 'Vanilla' ? undefined : loaderType;
       const ldrVer = loaderType === 'Vanilla' ? undefined : selectedLoaderVersion;
-      await createInstance(instanceName.trim(), selectedVersion, ldr, ldrVer);
-      await installVersion(versionEntry.url, instanceName.trim());
+
+      try {
+        await createInstance(name, selectedVersion, ldr, ldrVer);
+      } catch (e: any) {
+        await reportCreateFailure('create', e, existedBefore);
+        return;
+      }
+
+      try {
+        await installVersion(versionEntry.url, name);
+      } catch (e: any) {
+        // The instance exists and is safe; only its game files are missing.
+        // Never delete it here — close the wizard and let the user finish
+        // from the instance page (Verify & Repair).
+        await reportCreateFailure('game-files', e, existedBefore);
+        return;
+      }
+
       if (loaderType !== 'Vanilla' && selectedLoaderVersion) {
         const cmd = loaderType === 'Fabric' ? 'cmd_install_fabric'
           : loaderType === 'Forge' ? 'cmd_install_forge'
           : 'cmd_install_neoforge';
         addToast(t('create_instance.loader_installing', { loader: loaderType }), 'info');
         try {
-          await invoke(cmd, { mcVersion: selectedVersion, loaderVersion: selectedLoaderVersion, instanceName: instanceName.trim(), lang: getLanguage() });
+          await invoke(cmd, { mcVersion: selectedVersion, loaderVersion: selectedLoaderVersion, instanceName: name, lang: getLanguage() });
         } catch (e: any) {
-          addToast(t('create_instance.loader_install_error', { loader: loaderType, error: e.toString() }), 'error');
-          setIsCreating(false);
+          await reportCreateFailure('loader', e, existedBefore);
           return;
         }
       }
-      addToast(t('create_instance.created', { name: instanceName }), 'success');
+
+      addToast(t('create_instance.created', { name }), 'success');
       await loadInstances();
       onClose();
     } catch (e: any) {
-      addToast(t('create_instance.failed', { error: e.toString() }), 'error');
+      // Failure before/around instance creation (e.g. version lookup).
+      await reportCreateFailure('create', e, existedBefore);
+    } finally {
+      setIsCreating(false);
     }
-    setIsCreating(false);
   };
 
   const handlePickFile = async () => {
@@ -493,6 +550,9 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
           installed: String(outcome.report.installed),
           total: String(outcome.report.total_files),
         }), 'warning');
+      } else if (outcome.report.warnings.length > 0) {
+        addToast(t('create_instance.imported_incomplete', { name: instanceName }), 'warning');
+        onClose();
       } else {
         addToast(t('create_instance.imported', { name: instanceName }), 'success');
         onClose();

@@ -70,11 +70,13 @@ impl PackLock {
     /// Best-effort write: a failed lock write must not fail an otherwise
     /// successful install (the instance is usable, just untracked). Writing
     /// the new name also migrates away a leftover legacy-named file.
+    ///
+    /// The JSON is written to a sibling temp file and renamed into place, so
+    /// a crash or power loss can never truncate an existing valid lock.
     pub fn write(&self, instance_dir: &Path) -> std::io::Result<()> {
-        std::fs::write(
-            Self::lock_path(instance_dir),
-            serde_json::to_string_pretty(self)?,
-        )?;
+        let json = serde_json::to_vec_pretty(self)?;
+        crate::instances::write_file_atomic(&Self::lock_path(instance_dir), &json)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let _ = std::fs::remove_file(Self::legacy_lock_path(instance_dir));
         Ok(())
     }
@@ -651,6 +653,10 @@ mod tests {
         };
         lock.write(&dir).unwrap();
         assert!(PackLock::lock_path(&dir).is_file());
+        assert!(
+            !dir.join(".pack-lock.json.tmp").exists(),
+            "atomic write must not leave a temp file behind"
+        );
         let back = PackLock::read(&dir).unwrap();
         assert_eq!(back, lock);
         assert_eq!(back.loader_filter(), Some("fabric"));

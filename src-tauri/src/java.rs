@@ -318,9 +318,13 @@ mod tests {
         }
 
         // Parent mode: spawn our own binary in child mode through
-        // run_command_with_timeout and assert it completes normally.
+        // run_command_with_timeout and assert it completes normally. Run only
+        // this test in the child: executing the whole suite would make the
+        // helper's exit code depend on unrelated (and possibly flaky) tests.
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.env(HELPER_ENV, "big-output");
+        cmd.arg("java::tests::run_command_with_timeout_drains_large_stdout_and_stderr");
+        cmd.arg("--exact");
 
         let output = run_command_with_timeout(&mut cmd, Duration::from_secs(30))
             .expect("command should complete without hanging");

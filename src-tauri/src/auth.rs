@@ -43,6 +43,43 @@ pub struct AuthState {
     pub offline_mode: bool,
 }
 
+/// Validate the device-code response before the frontend shows it. A missing
+/// field used to surface as `undefined` in the UI with no explanation; the
+/// real cause is a malformed/changed Microsoft response, not a network
+/// timeout, so it must be reported as such.
+fn validate_device_code_response(resp: &serde_json::Value) -> Result<()> {
+    if let Some(error) = resp.get("error") {
+        let msg = resp["error_description"]
+            .as_str()
+            .or_else(|| error.as_str())
+            .unwrap_or("Unknown error");
+        tracing::error!(target: "launcher", "Device code flow failed: {}", msg);
+        return Err(LauncherError::Auth(msg.to_string()));
+    }
+    for field in ["device_code", "user_code", "verification_uri"] {
+        match resp.get(field).and_then(|v| v.as_str()) {
+            Some(value) if !value.trim().is_empty() => {}
+            _ => {
+                return Err(LauncherError::Auth(format!(
+                    "Microsoft device-code response is missing '{field}'"
+                )))
+            }
+        }
+    }
+    let uri = resp["verification_uri"].as_str().unwrap_or_default();
+    let parsed = reqwest::Url::parse(uri).map_err(|e| {
+        LauncherError::Auth(format!(
+            "Microsoft returned an invalid verification URL: {e}"
+        ))
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(LauncherError::Auth(
+            "Microsoft returned a non-HTTPS verification URL".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Authenticate with Microsoft OAuth2 Device Code Flow
 /// This flow is simpler and doesn't require a redirect server
 pub async fn start_device_code_flow(client_id: &str) -> Result<serde_json::Value> {
@@ -60,14 +97,7 @@ pub async fn start_device_code_flow(client_id: &str) -> Result<serde_json::Value
     .json::<serde_json::Value>()
     .await?;
 
-    if resp.get("error").is_some() {
-        let msg = resp["error_description"]
-            .as_str()
-            .unwrap_or("Unknown error");
-        tracing::error!(target: "launcher", "Device code flow failed: {}", msg);
-        return Err(LauncherError::Auth(msg.to_string()));
-    }
-
+    validate_device_code_response(&resp)?;
     Ok(resp)
 }
 
@@ -548,4 +578,55 @@ pub async fn change_microsoft_skin(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_device_response() -> serde_json::Value {
+        serde_json::json!({
+            "device_code": "device-secret",
+            "user_code": "ABCD1234",
+            "verification_uri": "https://www.microsoft.com/link",
+            "expires_in": 900,
+            "interval": 5
+        })
+    }
+
+    #[test]
+    fn device_code_response_accepts_the_real_microsoft_shape() {
+        validate_device_code_response(&valid_device_response()).unwrap();
+    }
+
+    #[test]
+    fn device_code_response_rejects_oauth_errors() {
+        let resp = serde_json::json!({
+            "error": "invalid_client",
+            "error_description": "Client authentication failed"
+        });
+        let err = validate_device_code_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("Client authentication failed"));
+    }
+
+    #[test]
+    fn device_code_response_rejects_missing_fields() {
+        for field in ["device_code", "user_code", "verification_uri"] {
+            let mut resp = valid_device_response();
+            resp.as_object_mut().unwrap().remove(field);
+            let err = validate_device_code_response(&resp).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "error must name the missing field {field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_code_response_rejects_non_https_verification_uri() {
+        let mut resp = valid_device_response();
+        resp["verification_uri"] = serde_json::json!("http://www.microsoft.com/link");
+        let err = validate_device_code_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("non-HTTPS"));
+    }
 }

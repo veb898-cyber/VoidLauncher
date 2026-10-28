@@ -299,6 +299,25 @@ pub fn maven_to_path(name: &str) -> String {
     }
 }
 
+/// Join a remote-supplied relative path onto a launcher-managed base after
+/// validating it. Metadata that tries to escape the base must fail the
+/// install/launch instead of being silently skipped, otherwise a required
+/// library can disappear while the operation still reports success.
+fn checked_remote_join(base: &Path, relative: &str) -> Result<PathBuf> {
+    check_safe_remote_path(relative)?;
+    let joined = base.join(relative);
+    // Defense in depth: `check_safe_remote_path` already rejects absolute,
+    // rooted and drive-prefixed paths; keep the containment check close to
+    // the filesystem access as a second line of defense.
+    if !joined.starts_with(base) {
+        return Err(LauncherError::Version(format!(
+            "Unsafe path in remote metadata: {}",
+            relative
+        )));
+    }
+    Ok(joined)
+}
+
 /// Return the native classifier for the current OS (e.g. "natives-windows")
 /// by reading the library's `natives` map, or None if not applicable.
 pub(crate) fn native_classifier(lib: &Library) -> Option<String> {
@@ -316,11 +335,16 @@ pub(crate) fn native_classifier(lib: &Library) -> Option<String> {
 }
 
 /// Build classpath from version info libraries, including native classifier JARs.
+///
+/// Paths come from remote metadata, so every join is validated. An unsafe
+/// path is a hard error (never silently dropped), and a required library
+/// that is missing on disk fails with a clear message instead of letting
+/// Java die later with a cryptic `NoClassDefFoundError`.
 pub fn build_classpath(
     version_info: &VersionInfo,
     libraries_dir: &Path,
     client_jar: &Path,
-) -> String {
+) -> Result<String> {
     let mut classpath_entries: Vec<String> = Vec::new();
 
     for lib in &version_info.libraries {
@@ -330,15 +354,14 @@ pub fn build_classpath(
 
         if let Some(downloads) = &lib.downloads {
             if let Some(artifact) = &downloads.artifact {
-                // Remote metadata decides the path; a crafted ".." must never
-                // make us read/write outside the libraries directory.
-                if check_safe_remote_path(&artifact.path).is_err() {
-                    tracing::warn!(target: "launcher", "Skipping library with unsafe path: {}", artifact.path);
-                    continue;
-                }
-                let lib_path = libraries_dir.join(&artifact.path);
-                if lib_path.exists() {
+                let lib_path = checked_remote_join(libraries_dir, &artifact.path)?;
+                if lib_path.is_file() {
                     classpath_entries.push(lib_path.to_string_lossy().to_string());
+                } else {
+                    return Err(LauncherError::Launch(format!(
+                        "Required library is missing: {}",
+                        lib_path.display()
+                    )));
                 }
             }
             // Add native classifier JAR (e.g. lwjgl-3.2.1-natives-windows.jar)
@@ -346,13 +369,14 @@ pub fn build_classpath(
                 if let Some(classifiers) = &downloads.classifiers {
                     if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
                         if let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) {
-                            if check_safe_remote_path(path).is_err() {
-                                tracing::warn!(target: "launcher", "Skipping native library with unsafe path: {}", path);
-                                continue;
-                            }
-                            let native_path = libraries_dir.join(path);
-                            if native_path.exists() {
+                            let native_path = checked_remote_join(libraries_dir, path)?;
+                            if native_path.is_file() {
                                 classpath_entries.push(native_path.to_string_lossy().to_string());
+                            } else {
+                                return Err(LauncherError::Launch(format!(
+                                    "Required native library is missing: {}",
+                                    native_path.display()
+                                )));
                             }
                         }
                     }
@@ -360,16 +384,21 @@ pub fn build_classpath(
             }
         } else {
             let path = maven_to_path(&lib.name);
-            let lib_path = libraries_dir.join(&path);
-            if lib_path.exists() {
+            let lib_path = checked_remote_join(libraries_dir, &path)?;
+            if lib_path.is_file() {
                 classpath_entries.push(lib_path.to_string_lossy().to_string());
+            } else {
+                return Err(LauncherError::Launch(format!(
+                    "Required library is missing: {}",
+                    lib_path.display()
+                )));
             }
         }
     }
 
     classpath_entries.push(client_jar.to_string_lossy().to_string());
 
-    classpath_entries.join(";")
+    Ok(classpath_entries.join(";"))
 }
 
 /// Evaluate a single Mojang argument rule entry (`{"rules": [...], "value": ...}`).
@@ -516,16 +545,31 @@ pub fn get_jvm_arguments(version_info: &VersionInfo) -> Vec<String> {
 
 /// Collect all files that need to be downloaded for a version, including native
 /// classifier JARs (e.g. lwjgl natives for the current platform).
+///
+/// Every path is validated before joining. Invalid metadata fails the whole
+/// collection rather than silently omitting a required file.
 pub fn collect_downloads(
     version_info: &VersionInfo,
     libraries_dir: &Path,
     versions_dir: &Path,
-) -> Vec<(String, PathBuf, String, u64)> {
+) -> Result<Vec<(String, PathBuf, String, u64)>> {
     // Returns: (url, local_path, sha1, size)
     let mut files = Vec::new();
 
-    // Client JAR
+    // Client JAR — the version id becomes a directory name.
+    crate::import::check_safe_file_name(&version_info.id).map_err(|_| {
+        LauncherError::Version(format!(
+            "Invalid version id in remote metadata: {}",
+            version_info.id
+        ))
+    })?;
     let client_path = versions_dir.join(&version_info.id).join("client.jar");
+    if !client_path.starts_with(versions_dir) {
+        return Err(LauncherError::Version(format!(
+            "Unsafe version id in remote metadata: {}",
+            version_info.id
+        )));
+    }
     files.push((
         version_info.downloads.client.url.clone(),
         client_path,
@@ -542,11 +586,7 @@ pub fn collect_downloads(
         if let Some(downloads) = &lib.downloads {
             // Main artifact
             if let Some(artifact) = &downloads.artifact {
-                if check_safe_remote_path(&artifact.path).is_err() {
-                    tracing::warn!(target: "launcher", "Skipping library with unsafe path: {}", artifact.path);
-                    continue;
-                }
-                let lib_path = libraries_dir.join(&artifact.path);
+                let lib_path = checked_remote_join(libraries_dir, &artifact.path)?;
                 if !lib_path.exists() {
                     files.push((
                         artifact.url.clone(),
@@ -566,11 +606,7 @@ pub fn collect_downloads(
                             native_artifact.get("sha1").and_then(|s| s.as_str()),
                             native_artifact.get("size").and_then(|s| s.as_u64()),
                         ) {
-                            if check_safe_remote_path(path).is_err() {
-                                tracing::warn!(target: "launcher", "Skipping native library with unsafe path: {}", path);
-                                continue;
-                            }
-                            let native_path = libraries_dir.join(path);
+                            let native_path = checked_remote_join(libraries_dir, path)?;
                             if !native_path.exists() {
                                 files.push((url.to_string(), native_path, sha1.to_string(), size));
                             }
@@ -580,7 +616,7 @@ pub fn collect_downloads(
             }
         } else if let Some(url_base) = &lib.url {
             let path = maven_to_path(&lib.name);
-            let lib_path = libraries_dir.join(&path);
+            let lib_path = checked_remote_join(libraries_dir, &path)?;
             if !lib_path.exists() {
                 files.push((
                     format!("{}{}", url_base, path),
@@ -592,7 +628,7 @@ pub fn collect_downloads(
         }
     }
 
-    files
+    Ok(files)
 }
 
 /// Load a saved asset index (e.g. `indexes/legacy.json`) from disk
@@ -631,7 +667,7 @@ pub async fn ensure_native_libraries(
                                 .and_then(|s| s.as_str())
                                 .unwrap_or(""),
                         ) {
-                            let native_path = libraries_dir.join(path);
+                            let native_path = checked_remote_join(libraries_dir, path)?;
                             if !native_path.exists() {
                                 missing.push((url.to_string(), native_path, sha1.to_string()));
                             }
@@ -674,10 +710,17 @@ pub async fn ensure_native_libraries(
 /// the natives directory so they can be found via -Djava.library.path.
 /// This mirrors the official launcher behavior and also covers old LWJGL
 /// versions that do not load natives from the classpath.
-pub fn extract_natives(version_info: &VersionInfo, libraries_dir: &Path, natives_dir: &Path) {
+///
+/// The classifier path is validated before it is read: a crafted metadata
+/// entry must not make the launcher open a file outside `libraries_dir`.
+pub fn extract_natives(
+    version_info: &VersionInfo,
+    libraries_dir: &Path,
+    natives_dir: &Path,
+) -> Result<()> {
     use std::io::Read;
 
-    std::fs::create_dir_all(natives_dir).ok();
+    std::fs::create_dir_all(natives_dir)?;
 
     for lib in &version_info.libraries {
         if !should_include_library(lib) {
@@ -688,8 +731,8 @@ pub fn extract_natives(version_info: &VersionInfo, libraries_dir: &Path, natives
                 if let Some(classifiers) = &downloads.classifiers {
                     if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
                         if let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) {
-                            let jar_path = libraries_dir.join(path);
-                            if !jar_path.exists() {
+                            let jar_path = checked_remote_join(libraries_dir, path)?;
+                            if !jar_path.is_file() {
                                 continue;
                             }
                             let Ok(bytes) = std::fs::read(&jar_path) else {
@@ -738,6 +781,8 @@ pub fn extract_natives(version_info: &VersionInfo, libraries_dir: &Path, natives
             }
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -914,5 +959,134 @@ mod tests {
                 "some value"
             ]
         );
+    }
+
+    // ── Remote-metadata path validation ─────────────────────────
+
+    fn version_info_with_libraries(libraries: serde_json::Value) -> VersionInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": "1.20.1",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "libraries": libraries,
+            "downloads": {
+                "client": {
+                    "sha1": "",
+                    "size": 0,
+                    "url": "https://piston-data.mojang.com/v1/objects/client.jar"
+                }
+            },
+            "assetIndex": {
+                "id": "5",
+                "sha1": "",
+                "size": 0,
+                "totalSize": 0,
+                "url": "https://piston-meta.mojang.com/v1/packages/5.json"
+            },
+            "assets": "5"
+        }))
+        .expect("minimal version info must deserialize")
+    }
+
+    #[test]
+    fn collect_downloads_rejects_unsafe_client_version_id() {
+        let mut vi = version_info_with_libraries(serde_json::json!([]));
+        vi.id = "../outside".into();
+        let err = collect_downloads(&vi, Path::new("libraries"), Path::new("versions"))
+            .expect_err("unsafe version id must fail");
+        assert!(err.to_string().contains("version id"), "got: {}", err);
+    }
+
+    #[test]
+    fn collect_downloads_rejects_unsafe_library_path() {
+        let vi = version_info_with_libraries(serde_json::json!([{
+            "name": "com.example:evil:1.0",
+            "downloads": {
+                "artifact": {
+                    "path": "../../evil.jar",
+                    "sha1": "",
+                    "size": 1,
+                    "url": "https://libraries.minecraft.net/evil.jar"
+                }
+            }
+        }]));
+        let err = collect_downloads(&vi, Path::new("libraries"), Path::new("versions"))
+            .expect_err("traversal path must fail");
+        assert!(err.to_string().contains("Unsafe path"), "got: {}", err);
+    }
+
+    #[test]
+    fn collect_downloads_rejects_unsafe_maven_fallback_name() {
+        let vi = version_info_with_libraries(serde_json::json!([{
+            "name": "com.example:..:1.0",
+            "url": "https://libraries.minecraft.net/"
+        }]));
+        let err = collect_downloads(&vi, Path::new("libraries"), Path::new("versions"))
+            .expect_err("traversal in maven name must fail");
+        assert!(err.to_string().contains("Unsafe path"), "got: {}", err);
+    }
+
+    #[test]
+    fn collect_downloads_keeps_safe_paths_under_libraries() {
+        let vi = version_info_with_libraries(serde_json::json!([{
+            "name": "com.example:good:1.0",
+            "downloads": {
+                "artifact": {
+                    "path": "com/example/good/1.0/good-1.0.jar",
+                    "sha1": "",
+                    "size": 1,
+                    "url": "https://libraries.minecraft.net/good.jar"
+                }
+            }
+        }]));
+        let files = collect_downloads(&vi, Path::new("libraries"), Path::new("versions"))
+            .expect("safe metadata must pass");
+        assert_eq!(files.len(), 2, "client jar + one library");
+        assert!(files[1].1.starts_with(Path::new("libraries")));
+        assert!(files[1].1.ends_with("good-1.0.jar"));
+    }
+
+    #[test]
+    fn build_classpath_rejects_unsafe_library_path() {
+        let vi = version_info_with_libraries(serde_json::json!([{
+            "name": "com.example:evil:1.0",
+            "downloads": {
+                "artifact": {
+                    "path": "../../../evil.jar",
+                    "sha1": "",
+                    "size": 1,
+                    "url": "https://libraries.minecraft.net/evil.jar"
+                }
+            }
+        }]));
+        let err = build_classpath(
+            &vi,
+            Path::new("libraries"),
+            Path::new("versions/1.20.1/client.jar"),
+        )
+        .expect_err("traversal path must fail");
+        assert!(err.to_string().contains("Unsafe path"), "got: {}", err);
+    }
+
+    #[test]
+    fn build_classpath_fails_when_required_library_is_missing() {
+        let vi = version_info_with_libraries(serde_json::json!([{
+            "name": "com.example:missing:1.0",
+            "downloads": {
+                "artifact": {
+                    "path": "com/example/missing/1.0/missing-1.0.jar",
+                    "sha1": "",
+                    "size": 1,
+                    "url": "https://libraries.minecraft.net/missing.jar"
+                }
+            }
+        }]));
+        let err = build_classpath(
+            &vi,
+            Path::new("libraries"),
+            Path::new("versions/1.20.1/client.jar"),
+        )
+        .expect_err("missing required library must fail");
+        assert!(err.to_string().contains("missing"), "got: {}", err);
     }
 }
