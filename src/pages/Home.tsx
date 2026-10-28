@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore } from '../stores/accountsStore';
 import { useInstanceStore } from '../stores/instanceStore';
 import { useBrowserGuardStore } from '../stores/browserGuardStore';
-import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { Tooltip } from '../components/ui/Tooltip';
 import { useT, formatPlayTime, formatRelativeTime, type MessageKey } from '../lib/i18n';
 import { createPortal } from 'react-dom';
@@ -176,7 +176,7 @@ export function Home({ onNavigate }: HomeProps) {
             style={{ padding: 'var(--space-md) var(--space-xl)' }}
           >
             {isLaunching ? (
-              <><LoadingSpinner size={18} /> {t('home.btn_launching')}</>
+              <><Play size={18} className="icon-breathe" /> {t('home.btn_launching')}</>
             ) : !hasAccount ? (
               <><Play size={18} /> {t('home.btn_login')}</>
             ) : lastInstance ? (
@@ -204,7 +204,7 @@ export function Home({ onNavigate }: HomeProps) {
             justifyContent: 'center',
             padding: 'var(--space-3xl)',
           }}>
-            <LoadingSpinner size={28} />
+            <SnakeSpinner size={28} />
           </div>
         ) : instances.length === 0 ? (
           <div style={{

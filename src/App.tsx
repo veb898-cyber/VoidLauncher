@@ -9,7 +9,7 @@ import { UpdaterModal } from './components/UpdaterModal';
 import { JavaSetupModal } from './components/launch/JavaSetupModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ConfirmDialog } from './components/ui/ConfirmDialog';
-import { LoadingSpinner } from './components/ui/LoadingSpinner';
+import { SnakeSpinner } from './components/ui/SnakeSpinner';
 import { useAuthStore } from './stores/authStore';
 import { useSettingsStore } from './stores/settingsStore';
 import { useAccountsStore } from './stores/accountsStore';
@@ -157,7 +157,7 @@ function App() {
             <Suspense
               fallback={
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 'var(--space-3xl)' }}>
-                  <LoadingSpinner size={28} />
+                  <SnakeSpinner size={28} />
                 </div>
               }
             >

@@ -1300,6 +1300,35 @@ a {
   box-shadow: none !important;
 }
 
+/* Loading buttons animate the glyph that is already on them. A new spinner
+   next to the existing icon read as a second, unexplained control (owner:
+   «анимировалась сама иконка которая была видна и до начала загрузки»).
+   Rotational controls (refresh) add `.icon-spin` at the call site; every
+   other glyph gets a soft breathing pulse instead of being replaced. */
+.btn--loading {
+  cursor: progress;
+}
+
+.btn--loading > svg:not(.icon-spin) {
+  animation: icon-breathe 1.35s ease-in-out infinite;
+}
+
+@keyframes icon-breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.92); }
+}
+
+.icon-breathe {
+  animation: icon-breathe 1.35s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn--loading > svg:not(.icon-spin),
+  .icon-breathe {
+    animation: none;
+  }
+}
+
 /* ============================
    Segmented Control
    ============================ */
@@ -2640,6 +2669,13 @@ html:not([data-theme='lg']) .settings-page--active {
   max-width: 400px;
   width: 100%;
   padding: var(--space-3xl);
+}
+
+/* Inside a dialog the sheet already is the material surface: drop the
+   card's own panel and padding so there is exactly one layer. */
+.login-card--embedded {
+  max-width: none;
+  padding: 0;
 }
 
 .login-card__icon {

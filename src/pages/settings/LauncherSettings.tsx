@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { Trash2 } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
-import { LoadingSpinner } from '../../components/ui/LoadingSpinner';
 import { Toggle } from '../../components/ui/Toggle';
 import { addToast } from '../../components/ui/Toast';
 import { useT } from '../../lib/i18n';
@@ -81,6 +81,7 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
               size="sm"
               variant="secondary"
               disabled={clearingCache}
+              loading={clearingCache}
               onClick={async () => {
                 setClearingCache(true);
                 try {
@@ -94,7 +95,8 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
                 }
               }}
             >
-              {clearingCache ? <LoadingSpinner size={14} /> : t('settings.clear_cache_btn')}
+              <Trash2 size={14} />
+              {t('settings.clear_cache_btn')}
             </Button>
           </div>
         </div>

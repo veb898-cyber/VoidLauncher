@@ -242,7 +242,7 @@ export function ServersManager({ instanceName }: Props) {
        «это всё конкретно для темы liquid glass. так что верни старый вариант
        со списком серверов для обычных тем»). Normal themes keep the original
        flat list inside the section tray. */
-    <div className={liquidGlass ? undefined : 'content-manager__pane'} style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    <div className={`content-manager__pane${liquidGlass ? ' content-manager__pane--glassless' : ''}`} style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <div style={{ padding: 'var(--space-md) var(--space-2xl)', display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', borderBottom: '1px solid var(--surface-border)', flexShrink: 0 }}>
         <h2 style={{ fontSize: 'var(--font-size-lg)', fontWeight: 600, margin: 0, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {t('servers.title')}

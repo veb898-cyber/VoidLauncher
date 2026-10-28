@@ -131,13 +131,11 @@ pub async fn cmd_room_status(
         let _ =
             crate::rooms::void_link::ensure_void_link_server(ip, state.room_state.clone()).await;
     }
-    let snap = build_status(&state);
-    // Diagnostics: while Tailscale setup is stuck, surface the raw facts so
-    // the user can see in the launcher log what the CLI actually returned.
-    if !snap.tailscale.logged_in {
-        log_tailscale_diagnostics(&app, &state);
-    }
-    Ok(snap)
+    // Status polling stays silent: this command runs every few seconds while
+    // the setup screen is open, so diagnostics here flooded the log with the
+    // same warning. The explicit "check connection" action below logs once.
+    let _ = app;
+    Ok(build_status(&state))
 }
 
 /// Best-effort diagnostics dumped to the launcher log / Terminal page while
@@ -195,6 +193,8 @@ pub async fn cmd_room_check_link(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RoomStatusPublic, String> {
+    // Diagnostics belong to the explicit user action, not to the status poll.
+    log_tailscale_diagnostics(&app, &state);
     if !state.tailscale.is_installed() {
         let ts = tailscale_manager_for(&state);
         let room = state.room_state.clone();

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { CheckCircle2, AlertTriangle, Loader2, Wrench } from 'lucide-react';
+import { CheckCircle2, AlertTriangle, Wrench } from 'lucide-react';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
@@ -205,7 +206,7 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
             </Button>
           )}
           <Button variant="primary" onClick={runRepair} disabled={!canRepair} loading={repairing}>
-            {repairing ? <Loader2 size={14} className="animate-spin" /> : <Wrench size={14} />}
+            <Wrench size={14} />
             {repairing ? t('verify.repairing') : t('verify.repair')}
           </Button>
         </div>
@@ -239,7 +240,7 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
 
       {checking && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', padding: 'var(--space-lg) 0', color: 'var(--text-secondary)' }}>
-          <Loader2 size={16} className="animate-spin" />
+          <SnakeSpinner size={18} />
           <span>{t('verify.checking')}</span>
         </div>
       )}

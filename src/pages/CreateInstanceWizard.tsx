@@ -8,7 +8,7 @@ import { Modal } from '../components/ui/Modal';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Skeleton } from '../components/ui/Skeleton';
-import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { useInstanceStore } from '../stores/instanceStore';
 import { addToast } from '../components/ui/Toast';
 import { useLogPlaque } from '../lib/uiLog';
@@ -629,10 +629,12 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
           <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
           {mode === 'new' ? (
             <Button onClick={handleCreate} loading={isCreating} disabled={!canCreate}>
+              <Plus size={14} />
               {t('create_instance.title')}
             </Button>
           ) : (
             <Button onClick={handleImport} loading={isCreating} disabled={!canImport || !!importReport}>
+              <Upload size={14} />
               {t('create_instance.import_action')}
             </Button>
           )}
@@ -871,7 +873,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
 
               {importLoading && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', marginTop: 'var(--space-lg)' }}>
-                  <LoadingSpinner />
+                  <SnakeSpinner size={18} />
                   <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>{t('create_instance.import_analyzing')}</span>
                 </div>
               )}
@@ -894,7 +896,7 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                   borderRadius: 'var(--radius-lg)', padding: 'var(--space-lg)',
                 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', marginBottom: 'var(--space-sm)' }}>
-                    <LoadingSpinner />
+                    <SnakeSpinner size={18} />
                     <span style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600, color: 'var(--text-primary)' }}>
                       {importProgress.message}
                     </span>

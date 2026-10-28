@@ -1,4 +1,4 @@
-import { ShieldCheck, ExternalLink, CheckCircle2, Download } from 'lucide-react';
+import { ShieldCheck, ExternalLink, CheckCircle2, Download, RefreshCw } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
@@ -86,6 +86,7 @@ export function RoomSetupView({ status, progress, busy, onCheck }: RoomSetupView
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-md)', alignItems: 'center' }}>
         <Button onClick={onCheck} loading={busy} disabled={busy}>
+          <RefreshCw size={15} className={busy ? 'icon-spin' : undefined} />
           {busy ? t('rooms.setup_checking') : t('rooms.setup_check')}
         </Button>
 

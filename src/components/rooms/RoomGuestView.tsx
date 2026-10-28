@@ -4,7 +4,7 @@ import { Copy, Check, Play, RefreshCw, LogOut, Globe, WifiOff } from 'lucide-rea
 import { Button } from '../ui/Button';
 import { CustomSelect } from '../ui/CustomSelect';
 import type { SelectOption } from '../ui/CustomSelect';
-import { LoadingSpinner } from '../ui/LoadingSpinner';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { useRoomStore } from '../../stores/roomStore';
 import type { RoomStatus } from '../../stores/roomStore';
@@ -94,7 +94,7 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
         </h2>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', marginTop: 'var(--space-md)' }}>
-          {!hostReady && <LoadingSpinner size={16} />}
+          {!hostReady && <SnakeSpinner size={18} />}
           {hostReady && <Globe size={18} color="var(--success)" />}
           <span style={{ color: hostReady ? 'var(--success)' : 'var(--text-secondary)' }}>
             {!status.host && t('rooms.guest_searching')}

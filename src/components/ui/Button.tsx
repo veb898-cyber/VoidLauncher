@@ -1,5 +1,4 @@
 import { type ButtonHTMLAttributes } from 'react';
-import { LoadingSpinner } from './LoadingSpinner';
 
 type Variant = 'primary' | 'secondary' | 'ghost' | 'danger';
 type Size = 'sm' | 'md' | 'lg';
@@ -34,11 +33,11 @@ export function Button({
 }: ButtonProps) {
   return (
     <button
-      className={`btn ${variantClass[variant]} ${sizeClass[size]} ${className}`.trim()}
+      className={`btn ${variantClass[variant]} ${sizeClass[size]}${loading ? ' btn--loading' : ''} ${className}`.trim()}
       disabled={disabled || loading}
+      aria-busy={loading || undefined}
       {...props}
     >
-      {loading && <LoadingSpinner size={14} />}
       {children}
     </button>
   );

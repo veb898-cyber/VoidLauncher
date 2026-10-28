@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { RefreshCw } from 'lucide-react';
+import { Check, Download, RefreshCw } from 'lucide-react';
 import { useSettingsStore, type AppConfig } from '../../stores/settingsStore';
 import { useJavaDownloadStore } from '../../stores/javaDownloadStore';
 import { Button } from '../../components/ui/Button';
 import { CustomSelect } from '../../components/ui/CustomSelect';
-import { LoadingSpinner } from '../../components/ui/LoadingSpinner';
+import { SnakeSpinner } from '../../components/ui/SnakeSpinner';
 import { Tooltip } from '../../components/ui/Tooltip';
 import { addToast } from '../../components/ui/Toast';
 import { getRecommendedMemoryMb, snapToMemoryStep } from '../../lib/memory';
@@ -236,7 +236,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
         {/* Available for download */}
         {checkingJava ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: 'var(--space-md)' }}>
-            <LoadingSpinner size={16} />
+            <SnakeSpinner size={16} />
             <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>{t('settings.java_checking')}</span>
           </div>
         ) : javaError && availableJava.length === 0 ? (
@@ -272,6 +272,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
                     size="sm"
                     variant={isInstalled ? 'secondary' : 'primary'}
                     disabled={isDownloading}
+                    loading={isDownloading}
                     onClick={async () => {
                       if (isInstalled || isDownloading) return;
                       useJavaDownloadStore.getState().startDownload(jv.major_version);
@@ -287,7 +288,9 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
                       }
                     }}
                   >
-                    {isDownloading ? <><LoadingSpinner size={14} /> {javaDownload ? `${Math.round(javaDownload.percent)}%` : ''}</> : isInstalled ? `✓ ${t('settings.java_downloaded')}` : t('settings.java_download_btn')}
+                    {isInstalled
+                      ? <><Check size={14} /> {t('settings.java_downloaded')}</>
+                      : <><Download size={14} /> {t('settings.java_download_btn')}{isDownloading && javaDownload ? ` ${Math.round(javaDownload.percent)}%` : ''}</>}
                   </Button>
                 </div>
               );

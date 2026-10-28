@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Gamepad2 } from 'lucide-react';
+import { Gamepad2, Square } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { useEventStore } from '../../hooks/useGameEvents';
 import { Tooltip } from '../ui/Tooltip';
@@ -115,6 +115,7 @@ export function GameRunningBadge() {
                 disabled={stopping !== null && stopping !== id}
                 onClick={() => stop(id)}
               >
+                <Square size={13} />
                 {t('launch.stop_game')}
               </Button>
             </div>

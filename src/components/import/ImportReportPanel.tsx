@@ -86,7 +86,7 @@ export function ImportReportPanel({ report, instanceName, retrying = false, onRe
               loading={retrying}
               disabled={retrying}
             >
-              {!retrying && <RefreshCw size={14} style={{ marginRight: 6 }} />}
+              <RefreshCw size={14} className={retrying ? 'icon-spin' : undefined} style={{ marginRight: 6 }} />
               {t('import_report.retry', { n: String(retryable.length) })}
             </Button>
           )}

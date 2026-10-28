@@ -4,7 +4,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAuthStore } from '../stores/authStore';
 import { t } from '../lib/i18n';
 import { useLogPlaque } from '../lib/uiLog';
-import { LoadingSpinner } from './ui/LoadingSpinner';
+import { SnakeSpinner } from './ui/SnakeSpinner';
 import { Button } from './ui/Button';
 import { Tooltip } from './ui/Tooltip';
 
@@ -16,6 +16,12 @@ interface MicrosoftLoginCardProps {
    * the Accounts modal uses this to close itself.
    */
   onSuccess?: () => void;
+  /**
+   * Render the card without its own material surface. Used when the card
+   * is placed inside a dialog: the dialog sheet is the single visible
+   * layer, so there is no second hoverable glass panel underneath.
+   */
+  embedded?: boolean;
 }
 
 /**
@@ -27,7 +33,7 @@ interface MicrosoftLoginCardProps {
  * card can be mounted from any page or modal without coordinating
  * timers across callers.
  */
-export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
+export function MicrosoftLoginCard({ onSuccess, embedded = false }: MicrosoftLoginCardProps) {
   const {
     isLoading,
     error,
@@ -93,7 +99,7 @@ export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
   };
 
   return (
-    <div className="glass-card login-card">
+    <div className={embedded ? 'login-card login-card--embedded' : 'glass-card login-card'}>
       <div className="login-card__icon">
         <LogIn size={40} color="white" />
       </div>
@@ -213,7 +219,7 @@ export function MicrosoftLoginCard({ onSuccess }: MicrosoftLoginCardProps) {
             color: 'var(--text-tertiary)',
             fontSize: 'var(--font-size-sm)',
           }}>
-            <LoadingSpinner />
+            <SnakeSpinner size={18} />
             {t('login.waiting')}
           </div>
         </div>

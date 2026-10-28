@@ -71,6 +71,15 @@ interface ContentItem {
   project_id?: string;
 }
 
+/**
+ * Session cache of the last list per `instance:subfolder`. The tabs are
+ * keyed in InstanceDetail, so switching a tab (or an instance) remounts the
+ * manager; without this cache every return painted the skeleton again even
+ * though the files had just been read. The list is shown from here
+ * immediately and refreshed in place, exactly like the icon cache.
+ */
+const contentListCache = new Map<string, ContentItem[]>();
+
 interface Props {
   instanceName: string;
   contentType: ContentType;
@@ -241,8 +250,14 @@ const ContentCardRow = memo(function ContentCardRow({
 
 function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOpenFolder }: Props) {
   const t = useT();
-  const [items, setItems] = useState<ContentItem[]>([]);
-  const [loading, setLoading] = useState(false);
+  const contentKey = `${instanceName}:${SUBFOLDER[contentType]}`;
+  const cachedList = contentListCache.get(contentKey);
+  const [items, setItems] = useState<ContentItem[]>(() => cachedList ?? []);
+  const [loading, setLoading] = useState(true);
+  // A cached list (even an empty one) means the pane has real content to
+  // show at once: refresh in the background, never flash the skeleton.
+  const [hasLoaded, setHasLoaded] = useState(() => cachedList !== undefined);
+  const [skeletonVisible, setSkeletonVisible] = useState(false);
   const [iconsResolving, setIconsResolving] = useState(false);
   const [search, setSearch] = useState('');
   // Selected by filename (NOT by filtered index) so changing the search
@@ -425,6 +440,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           project_id: m.slug_verified ? m.slug : undefined,
         }));
         setItems(mapped);
+        setHasLoaded(true);
         setLoading(false);
 
         // Jar metadata gives an instant fallback name; replace it with the
@@ -480,6 +496,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           icon: null,
           size: p.file_size,
         })));
+        setHasLoaded(true);
         setLoading(false);
         try {
           await fetchPackIcons(raw);
@@ -502,6 +519,23 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     setSearch('');
     setCompatibility({});
   }, [loadItems, mcVersion, loader]);
+
+  // Keep the session cache in sync with local mutations (enable/disable,
+  // delete, update) so a tab switch back never shows a stale list.
+  useEffect(() => {
+    if (hasLoaded) contentListCache.set(contentKey, items);
+  }, [items, hasLoaded, contentKey]);
+
+  // Skeleton only for a genuinely cold list, and only after a short delay:
+  // a fast load must not flash a loading state at all.
+  useEffect(() => {
+    if (!loading || hasLoaded) {
+      setSkeletonVisible(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setSkeletonVisible(true), 180);
+    return () => window.clearTimeout(timer);
+  }, [loading, hasLoaded, contentKey]);
 
   // Watch the instance directory for external file changes; reload list on event.
   // UI-state values are read via refs so opening a context menu / browser does
@@ -992,7 +1026,8 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
         {/* Table body */}
         <div style={{ flex: 1, overflowY: 'auto', ...(dragOver ? { background: 'var(--primary-dim)', border: '2px dashed var(--primary)' } : {}) }}>
-          {loading ? (
+          {loading && !hasLoaded ? (
+            skeletonVisible ? (
             cardsView ? (
               <div className="glass-row-list" style={{ padding: 'var(--space-sm) var(--space-lg)', display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)' }}>
                 {[1, 2, 3, 4, 5, 6].map((i) => (
@@ -1016,6 +1051,9 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
                 </div>
               ))}
             </div>
+            )
+            ) : (
+              <div style={{ minHeight: 160 }} />
             )
           ) : filtered.length === 0 ? (
             <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>

@@ -9,11 +9,11 @@ import { CustomSelect } from '../components/ui/CustomSelect';
 import { Tooltip } from '../components/ui/Tooltip';
 import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import { EmptyState } from '../components/ui/EmptyState';
-import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
 import { SkinPreview } from '../components/accounts/SkinPreview';
 import { addToast } from '../components/ui/Toast';
-import { Ban, Check, RefreshCw, Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
+import { Ban, Check, RefreshCw, LogOut, Plus, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
 import { t } from '../lib/i18n';
 import { Avatar } from '../lib/remoteImage';
 
@@ -392,9 +392,8 @@ export function Accounts() {
                           variant="ghost"
                           aria-label={t('accounts.remove_btn')}
                           onClick={(e) => { e.stopPropagation(); setRemoveTarget(acc); }}
-                          style={{ color: 'var(--color-danger)' }}
                         >
-                          <Trash2 size={14} />
+                          <LogOut size={14} />
                         </Button>
                       </Tooltip>
                     </div>
@@ -424,7 +423,7 @@ export function Accounts() {
                 )}
                 {capesLoading && capes.length === 0 ? (
                   <div style={{ display: 'flex', justifyContent: 'center', padding: 'var(--space-md)' }}>
-                    <LoadingSpinner size={18} />
+                    <SnakeSpinner size={18} />
                   </div>
                 ) : capesError && capes.length === 0 ? (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)', alignItems: 'flex-start' }}>
@@ -486,7 +485,7 @@ export function Accounts() {
         )}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
           <Button variant="ghost" onClick={() => setShowOffline(false)}>{t('common.cancel')}</Button>
-          <Button onClick={handleAddOffline} loading={addingOffline} disabled={!offlineName.trim() || !!offlineNameError || addingOffline}>{t('common.add')}</Button>
+          <Button onClick={handleAddOffline} loading={addingOffline} disabled={!offlineName.trim() || !!offlineNameError || addingOffline}><Plus size={14} /> {t('common.add')}</Button>
         </div>
       </Modal>
 
@@ -498,17 +497,18 @@ export function Accounts() {
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', marginTop: 'var(--space-lg)' }}>
           <Button variant="ghost" onClick={() => setShowElyby(false)}>{t('common.cancel')}</Button>
-          <Button onClick={handleAddElyby} loading={addingElyby} disabled={!elybyUser.trim() || !elybyPass.trim() || addingElyby}>{t('common.add')}</Button>
+          <Button onClick={handleAddElyby} loading={addingElyby} disabled={!elybyUser.trim() || !elybyPass.trim() || addingElyby}><Plus size={14} /> {t('common.add')}</Button>
         </div>
       </Modal>
 
-      {/* Add Microsoft Modal — reuses the same login card as the main-menu "ВОЙТИ" page.
-          `bare` removes the dark blurred backdrop so this dialog looks identical
-          to the standalone Sign-In page, not like a "popover over dimmed content".
+      {/* Add Microsoft Modal — reuses the login card from the main-menu "ВОЙТИ"
+          page, but without the card's own glass: the dialog sheet is the only
+          visible surface (owner: the inner panel highlighted on hover while the
+          sheet behind it stayed flat). `bare` still keeps the page undimmed.
           onSuccess closes the modal and reloads so any number of Microsoft
           accounts can be added one after another. */}
       <Modal open={showMicrosoftLogin} onClose={() => setShowMicrosoftLogin(false)} maxWidth={460} bare>
-        <MicrosoftLoginCard onSuccess={() => { setShowMicrosoftLogin(false); loadAccounts(true); }} />
+        <MicrosoftLoginCard embedded onSuccess={() => { setShowMicrosoftLogin(false); loadAccounts(true); }} />
       </Modal>
 
       {/* Skin Variant Modal */}
@@ -536,6 +536,7 @@ export function Accounts() {
         title={t('accounts.remove_title')}
         description={t('accounts.remove_confirm', { name: removeTarget?.name ?? '' })}
         confirmLabel={t('accounts.remove_btn')}
+        tone="primary"
         busy={removing}
         onCancel={() => { if (!removing) setRemoveTarget(null); }}
         onConfirm={() => { if (removeTarget) handleRemoveAccount(removeTarget); }}

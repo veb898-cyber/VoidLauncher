@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { CheckCircle2, Loader2, Package, RefreshCw, AlertTriangle } from 'lucide-react';
+import { CheckCircle2, Package, RefreshCw, AlertTriangle } from 'lucide-react';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
@@ -203,7 +204,7 @@ export function PackModal({ open, instanceName, onClose }: Props) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', padding: 'var(--space-lg) 0', color: 'var(--text-secondary)' }}>
           {checking ? (
             <>
-              <Loader2 size={16} className="animate-spin" />
+              <SnakeSpinner size={18} />
               <span style={{ fontSize: 'var(--font-size-sm)' }}>{t('pack.checking')}</span>
             </>
           ) : (
@@ -273,7 +274,7 @@ export function PackModal({ open, instanceName, onClose }: Props) {
           {busy && stageLabel && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
-                <Loader2 size={14} className="animate-spin" />
+                <SnakeSpinner size={16} />
                 <span>{stageLabel}</span>
                 {progress && progress.total > 0 && !showPercent && (
                   <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)' }}>

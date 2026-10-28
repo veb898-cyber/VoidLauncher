@@ -1,8 +1,9 @@
 import { useEffect, useRef } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { listen } from '@tauri-apps/api/event';
-import { Search, Loader2, X, Check, Download, CirclePause, CirclePlay } from 'lucide-react';
+import { Search, X, Check, Download, CirclePause, CirclePlay } from 'lucide-react';
 import { Button } from '../components/ui/Button';
+import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ResultListSkeleton } from '../components/ui/ResultListSkeleton';
 import { SlidingTabs } from '../components/ui/SlidingTabs';
@@ -283,21 +284,21 @@ export function Modpacks() {
     const installBtn = () => {
       if (tab === 'atlauncher') {
         return (
-          <Button size="sm" disabled={paused ? false : (installing || !installAtlVersion)} onClick={() => paused ? store.resumeInstall() : store.installFromAtl(selected as AtlPack)}>
-            {paused ? <><CirclePlay size={12} /> {t('modpacks.resume')}</> : installing ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : <><Download size={12} /> {t('modpacks.install_btn')}</>}
+          <Button size="sm" loading={!paused && installing} disabled={paused ? false : (installing || !installAtlVersion)} onClick={() => paused ? store.resumeInstall() : store.installFromAtl(selected as AtlPack)}>
+            {paused ? <><CirclePlay size={12} /> {t('modpacks.resume')}</> : <><Download size={12} /> {installing ? t('modpacks.installing') : t('modpacks.install_btn')}</>}
           </Button>
         );
       }
       if (tab === 'modrinth') {
         return (
-          <Button size="sm" disabled={paused ? false : (installing || !installVersionId)} onClick={() => paused ? store.resumeInstall() : store.installFromMr()}>
-            {paused ? <><CirclePlay size={12} /> {t('modpacks.resume')}</> : installing ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : <><Download size={12} /> {t('modpacks.install_btn')}</>}
+          <Button size="sm" loading={!paused && installing} disabled={paused ? false : (installing || !installVersionId)} onClick={() => paused ? store.resumeInstall() : store.installFromMr()}>
+            {paused ? <><CirclePlay size={12} /> {t('modpacks.resume')}</> : <><Download size={12} /> {installing ? t('modpacks.installing') : t('modpacks.install_btn')}</>}
           </Button>
         );
       }
       return (
-        <Button size="sm" disabled={paused ? false : (installing || installCfFileId == null)} onClick={() => paused ? store.resumeInstall() : store.installFromCf(selected as CfHit)}>
-          {paused ? <><CirclePlay size={12} /> {t('modpacks.resume')}</> : installing ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : <><Download size={12} /> {t('modpacks.install_btn')}</>}
+        <Button size="sm" loading={!paused && installing} disabled={paused ? false : (installing || installCfFileId == null)} onClick={() => paused ? store.resumeInstall() : store.installFromCf(selected as CfHit)}>
+          {paused ? <><CirclePlay size={12} /> {t('modpacks.resume')}</> : <><Download size={12} /> {installing ? t('modpacks.installing') : t('modpacks.install_btn')}</>}
         </Button>
       );
     };
@@ -336,7 +337,7 @@ export function Modpacks() {
 
         {loadingDetail && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-tertiary)', fontSize: 'var(--font-size-sm)' }}>
-            <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} /> {t('modpacks.loading')}
+            <SnakeSpinner size={16} /> {t('modpacks.loading')}
           </div>
         )}
 
@@ -579,7 +580,7 @@ export function Modpacks() {
 
           {loadingMore && (
             <div style={{ display: 'flex', justifyContent: 'center', padding: 'var(--space-md)' }}>
-              <Loader2 size={14} style={{ animation: 'spin 1s linear infinite', color: 'var(--text-tertiary)' }} />
+              <SnakeSpinner size={16} />
             </div>
           )}
           <div ref={sentinelRef} style={{ height: 1 }} />

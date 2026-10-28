@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { AlertTriangle, HelpCircle, XCircle, FileText, FileSearch, FolderOpen, Loader2 } from 'lucide-react';
+import { AlertTriangle, HelpCircle, XCircle, FileText, FileSearch, FolderOpen } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
 import { addToast } from '../components/ui/Toast';
@@ -369,9 +369,7 @@ export function GameLogs() {
                 disabled={!shownSession || analyzing}
                 aria-label={t('game_logs.analyze')}
               >
-                {analyzing
-                  ? <Loader2 size={15} style={{ animation: 'spin 1s linear infinite' }} />
-                  : <FileSearch size={15} />}
+                <FileSearch size={15} className={analyzing ? 'icon-spin' : undefined} />
               </button>
             </Tooltip>
             <Tooltip content={t('common.copy_all')} side="bottom">

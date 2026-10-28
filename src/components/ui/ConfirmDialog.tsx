@@ -1,5 +1,6 @@
 import { Modal } from './Modal';
 import { Button } from './Button';
+import { AlertTriangle, Check } from 'lucide-react';
 import { useT } from '../../lib/i18n';
 
 interface ConfirmDialogProps {
@@ -11,9 +12,11 @@ interface ConfirmDialogProps {
   confirmLabel?: string;
   cancelLabel?: string;
   busy?: boolean;
+  /** Visual weight of the confirm button; destructive actions keep `danger`. */
+  tone?: 'danger' | 'primary';
 }
 
-/** Small confirmation modal with danger confirm button (e.g. destructive actions). */
+/** Small confirmation modal; the confirm button is destructive by default. */
 export function ConfirmDialog({
   open,
   title,
@@ -23,6 +26,7 @@ export function ConfirmDialog({
   confirmLabel,
   cancelLabel,
   busy = false,
+  tone = 'danger',
 }: ConfirmDialogProps) {
   const t = useT();
 
@@ -37,7 +41,8 @@ export function ConfirmDialog({
           <Button variant="ghost" onClick={onCancel} disabled={busy}>
             {cancelLabel ?? t('common.cancel')}
           </Button>
-          <Button variant="danger" onClick={onConfirm} loading={busy} disabled={busy}>
+          <Button variant={tone} onClick={onConfirm} loading={busy} disabled={busy}>
+            {tone === 'danger' ? <AlertTriangle size={14} /> : <Check size={14} />}
             {confirmLabel ?? t('common.confirm')}
           </Button>
         </div>

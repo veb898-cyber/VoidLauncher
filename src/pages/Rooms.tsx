@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { Check, CheckCircle2, Copy, Network, Users } from 'lucide-react';
+import { Check, CheckCircle2, Copy, LogIn, Network, Plus, Users } from 'lucide-react';
 import { useRoomStore, type RoomStatus } from '../stores/roomStore';
 import { useInstanceStore } from '../stores/instanceStore';
 import { useRoomEvents } from '../hooks/useRoomEvents';
@@ -9,7 +9,7 @@ import { RoomGuestView } from '../components/rooms/RoomGuestView';
 import { RoomStatusBadge } from '../components/rooms/RoomStatusBadge';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
-import { LoadingSpinner } from '../components/ui/LoadingSpinner';
+import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { addToast } from '../components/ui/Toast';
 import { useT } from '../lib/i18n';
 
@@ -74,7 +74,7 @@ export function Rooms() {
 
       {!loaded && !status ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', color: 'var(--text-secondary)' }}>
-          <LoadingSpinner /> {t('rooms.loading')}
+          <SnakeSpinner size={18} /> {t('rooms.loading')}
         </div>
       ) : !status ? (
         <div className="page-stage">
@@ -142,6 +142,7 @@ function RoomLobby() {
               disabled={busy}
               style={{ width: '100%', marginTop: 'var(--space-md)' }}
             >
+              <Plus size={15} />
               {t('rooms.create_btn')}
             </Button>
           </div>
@@ -173,6 +174,7 @@ function RoomLobby() {
               disabled={busy || !code.trim()}
               style={{ width: '100%' }}
             >
+              <LogIn size={15} />
               {t('rooms.join_btn')}
             </Button>
           </div>

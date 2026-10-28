@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, Loader2, X, Check, Download, AlertTriangle } from 'lucide-react';
+import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, X, Check, Download, AlertTriangle } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { SlidingTabs } from '../ui/SlidingTabs';
@@ -824,7 +824,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             aria-label={SEARCH_PLACEHOLDERS[contentType]}
             style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
         </div>
-        <Button size="sm" onClick={handleSearch} disabled={loading} loading={loading}>{t('common.find')}</Button>
+        <Button size="sm" onClick={handleSearch} disabled={loading} loading={loading}><Search size={14} /> {t('common.find')}</Button>
         {/* Catalog provider switch: one browser for both catalogs. Same
             sliding-tab idiom as the terminal's log switcher (owner wave 25):
             the frame physically travels between the buttons. */}
@@ -911,8 +911,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                     {hit.downloads != null && t('content.download_count', { n: formatDownloads(hit.downloads) })}
                   </div>
                 </div>
-                <Button size="sm" variant={installed ? 'ghost' : added ? 'ghost' : 'primary'} onClick={(e) => { e.stopPropagation(); installed ? undefined : added ? removeByProjectId(hit.project_id) : addLatest(hit); }} disabled={installed || addingId === hit.project_id} style={{ flexShrink: 0, alignSelf: 'center', color: installed ? 'var(--text-tertiary)' : added ? 'var(--color-danger)' : undefined }}>
-                  {addingId === hit.project_id ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : installed ? <><Check size={12} /> {t('content.already_installed')}</> : added ? <X size={12} /> : t('content.add_btn')}
+                <Button size="sm" variant={installed ? 'ghost' : added ? 'ghost' : 'primary'} onClick={(e) => { e.stopPropagation(); installed ? undefined : added ? removeByProjectId(hit.project_id) : addLatest(hit); }} disabled={installed || addingId === hit.project_id} loading={addingId === hit.project_id} style={{ flexShrink: 0, alignSelf: 'center', color: installed ? 'var(--text-tertiary)' : added ? 'var(--color-danger)' : undefined }}>
+                  {installed ? <><Check size={12} /> {t('content.already_installed')}</> : added ? <X size={12} /> : <><Download size={12} /> {t('content.add_btn')}</>}
                 </Button>
               </div>
             );
@@ -920,7 +920,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           <div ref={sentinelRef} style={{ height: 1 }} />
           {loadingMore && (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, color: 'var(--text-tertiary)' }}>
-              <Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} />
+              <SnakeSpinner size={18} />
             </div>
           )}
         </div>
@@ -944,8 +944,9 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                   <Button size="sm" variant={isInstalled(selected.project_id, selected.slug, selected.title) ? 'ghost' : isAdded(selected.project_id, selected.slug, selected.title) ? 'ghost' : 'primary'}
                     onClick={() => addLatest(selected)}
                     disabled={isInstalled(selected.project_id, selected.slug, selected.title) || isAdded(selected.project_id, selected.slug, selected.title) || addingId === selected.project_id}
+                    loading={addingId === selected.project_id}
                     style={{ flexShrink: 0, alignSelf: 'flex-start' }}>
-                    {addingId === selected.project_id ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : isInstalled(selected.project_id, selected.slug, selected.title) ? <><Check size={12} /> {t('content.already_installed')}</> : isAdded(selected.project_id, selected.slug, selected.title) ? <><Check size={12} /> {t('content.added_btn')}</> : t('content.add_btn')}
+                    {isInstalled(selected.project_id, selected.slug, selected.title) ? <><Check size={12} /> {t('content.already_installed')}</> : isAdded(selected.project_id, selected.slug, selected.title) ? <><Check size={12} /> {t('content.added_btn')}</> : <><Download size={12} /> {t('content.add_btn')}</>}
                   </Button>
                   <X size={16} style={{ cursor: 'pointer', color: 'var(--text-tertiary)', flexShrink: 0 }} onClick={() => setSelected(null)} />
                 </div>

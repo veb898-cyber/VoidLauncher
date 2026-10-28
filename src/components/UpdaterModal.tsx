@@ -1,6 +1,7 @@
 import { useT } from '../lib/i18n';
 import { Modal } from './ui/Modal';
 import { ProgressBar } from './ui/ProgressBar';
+import { SnakeSpinner } from './ui/SnakeSpinner';
 import { useLogPlaque } from '../lib/uiLog';
 import type { UpdaterState } from '../hooks/useUpdater';
 
@@ -87,7 +88,8 @@ export function UpdaterModal({ updateAvailable, updateInfo, downloading, downloa
         )}
 
         {installing && (
-          <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
+            <SnakeSpinner size={18} />
             {t('updater.installing')}
           </span>
         )}
