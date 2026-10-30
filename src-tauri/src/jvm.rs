@@ -23,6 +23,7 @@ pub enum GcPreset {
 impl GcPreset {
     /// Parse from the lowercase string stored in the instance config.
     /// Unknown values fall back to G1gcPrism (the safe default).
+    #[allow(clippy::should_implement_trait)] // historical name, used across the launcher
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "standard" | "std" | "" => GcPreset::Standard,

@@ -1,0 +1,55 @@
+{
+  "main_class": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+  "libraries": [
+    {
+      "name": "net.neoforged:neoforge:21.1.172:universal",
+      "url": "https://maven.neoforged.net/releases/",
+      "path": "net/neoforged/neoforge/21.1.172/neoforge-21.1.172-universal.jar",
+      "sha1": null,
+      "size": null
+    },
+    {
+      "name": "cpw.mods:bootstraplauncher:2.0.2",
+      "url": "https://maven.neoforged.net/releases/",
+      "path": "cpw/mods/bootstraplauncher/2.0.2/bootstraplauncher-2.0.2.jar",
+      "sha1": null,
+      "size": null
+    },
+    {
+      "name": "cpw.mods:securejarhandler:3.0.8",
+      "url": "https://maven.neoforged.net/releases/",
+      "path": "cpw/mods/securejarhandler/3.0.8/securejarhandler-3.0.8.jar",
+      "sha1": null,
+      "size": null
+    },
+    {
+      "name": "org.ow2.asm:asm:9.8",
+      "url": "https://maven.neoforged.net/releases/",
+      "path": "org/ow2/asm/asm/9.8/asm-9.8.jar",
+      "sha1": null,
+      "size": null
+    }
+  ],
+  "jvm_args": [
+    "-p",
+    "${library_directory}/cpw/mods/bootstraplauncher/2.0.2/bootstraplauncher-2.0.2.jar${classpath_separator}${library_directory}/cpw/mods/securejarhandler/3.0.8/securejarhandler-3.0.8.jar",
+    "--add-modules",
+    "ALL-MODULE-PATH",
+    "--add-opens",
+    "java.base/java.util.jar=cpw.mods.securejarhandler",
+    "--add-opens",
+    "java.base/java.lang.invoke=cpw.mods.securejarhandler",
+    "--add-exports",
+    "java.base/sun.security.util=cpw.mods.securejarhandler",
+    "-DlibraryDirectory=${library_directory}"
+  ],
+  "game_args": [
+    "--launchTarget",
+    "forgeclient",
+    "--fml.neoForgeVersion",
+    "21.1.172",
+    "--fml.mcVersion",
+    "1.21.4"
+  ],
+  "legacy_args": false
+}

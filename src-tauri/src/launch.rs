@@ -81,30 +81,37 @@ pub struct LaunchAuth<'a> {
     pub username: &'a str,
 }
 
-/// Launch Minecraft for a given instance. `session_log_path` is this run's
-/// game-log file (used for the Quick Play join log) — passed explicitly so
-/// concurrent launches cannot mix their logs up via a global pointer.
-pub fn launch_minecraft(
+/// Fully composed Java invocation for one launch: paths resolved, arguments
+/// substituted and validated, but no process created yet.
+///
+/// Extracted from `launch_minecraft` so the command line can be asserted in
+/// tests without spawning a JVM. Java selection is injected: the caller passes
+/// the already-probed path and major version.
+pub struct LaunchCommand {
+    pub java_path: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+/// Compose the Java command line for an instance.
+///
+/// Side effects are limited to preparing launch-owned files (entry JAR,
+/// natives directory, the instance's `.minecraft` folder). Nothing is spawned.
+#[allow(clippy::too_many_arguments)]
+pub fn build_launch_command(
     config: &AppConfig,
     instance: &Instance,
     version_info: &VersionInfo,
     auth: &LaunchAuth,
     server: Option<(&str, Option<u16>)>,
     session_log_path: Option<&str>,
-) -> Result<std::process::Child> {
-    tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
+    java_path: PathBuf,
+    java_major: u32,
+) -> Result<LaunchCommand> {
+    tracing::info!(target: "launcher", "Building launch command for instance: {}", instance.name);
     tracing::info!(target: "launcher", "MC version: {}", instance.mc_version);
     tracing::info!(target: "launcher", "Username: {}", auth.username);
-
-    // 1. Determine Java path
-    tracing::info!(target: "launcher", "Detecting Java installation...");
-    let java_path = get_java_path(config, instance, version_info)?;
-    tracing::info!(target: "launcher", "Using Java: {:?}", java_path);
-
-    // 2. Probe the selected Java's major version BEFORE composing the command.
-    //    This is what lets us safely fall back from ZGC to G1GC for older JDKs.
-    let java_major = detect_java_major(&java_path).unwrap_or(0);
-    tracing::info!(target: "launcher", "Detected Java major version: {}", java_major);
+    tracing::info!(target: "launcher", "Using Java: {:?} (major {})", java_path, java_major);
 
     // 3. Build classpath
     // The version id is used as a directory name below and ultimately came
@@ -606,8 +613,54 @@ pub fn launch_minecraft(
         }
     }
 
-    // 6. Launch
     tracing::info!(target: "launcher", "Final args count: {}", args.len());
+
+    Ok(LaunchCommand {
+        java_path,
+        args,
+        cwd: game_dir,
+    })
+}
+
+/// Launch Minecraft for a given instance. `session_log_path` is this run's
+/// game-log file (used for the Quick Play join log) — passed explicitly so
+/// concurrent launches cannot mix their logs up via a global pointer.
+pub fn launch_minecraft(
+    config: &AppConfig,
+    instance: &Instance,
+    version_info: &VersionInfo,
+    auth: &LaunchAuth,
+    server: Option<(&str, Option<u16>)>,
+    session_log_path: Option<&str>,
+) -> Result<std::process::Child> {
+    tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
+
+    // 1. Determine Java path
+    tracing::info!(target: "launcher", "Detecting Java installation...");
+    let java_path = get_java_path(config, instance, version_info)?;
+    tracing::info!(target: "launcher", "Using Java: {:?}", java_path);
+
+    // 2. Probe the selected Java's major version BEFORE composing the command.
+    //    This is what lets us safely fall back from ZGC to G1GC for older JDKs.
+    let java_major = detect_java_major(&java_path).unwrap_or(0);
+    tracing::info!(target: "launcher", "Detected Java major version: {}", java_major);
+
+    let LaunchCommand {
+        java_path,
+        args,
+        cwd: game_dir,
+    } = build_launch_command(
+        config,
+        instance,
+        version_info,
+        auth,
+        server,
+        session_log_path,
+        java_path,
+        java_major,
+    )?;
+
+    // 6. Launch
     tracing::debug!(target: "launcher", "Game dir: {:?}", game_dir);
     tracing::debug!(target: "launcher", "argv:");
     let sanitized: Vec<String> = args

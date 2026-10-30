@@ -1,0 +1,57 @@
+{
+  "main_class": "net.minecraft.launchwrapper.Launch",
+  "libraries": [
+    {
+      "name": "net.minecraftforge:forge:1.12.2-14.23.5.2860",
+      "url": "https://maven.minecraftforge.net/",
+      "path": "net/minecraftforge/forge/1.12.2-14.23.5.2860/forge-1.12.2-14.23.5.2860-universal.jar",
+      "sha1": null,
+      "size": null
+    },
+    {
+      "name": "net.minecraft:launchwrapper:1.12",
+      "url": "https://libraries.minecraft.net/",
+      "path": "net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar",
+      "sha1": null,
+      "size": null
+    },
+    {
+      "name": "org.ow2.asm:asm-all:5.2",
+      "url": "https://maven.minecraftforge.net/",
+      "path": "org/ow2/asm/asm-all/5.2/asm-all-5.2.jar",
+      "sha1": null,
+      "size": null
+    }
+  ],
+  "jvm_args": [
+    "-Djava.library.path=${natives_directory}",
+    "-Dminecraft.launcher.brand=${launcher_name}",
+    "-Dminecraft.launcher.version=${launcher_version}",
+    "-Dfml.ignoreInvalidMinecraftCertificates=true",
+    "-cp",
+    "${classpath}"
+  ],
+  "game_args": [
+    "--username",
+    "${auth_player_name}",
+    "--version",
+    "${version_name}",
+    "--gameDir",
+    "${game_directory}",
+    "--assetsDir",
+    "${assets_root}",
+    "--assetIndex",
+    "${assets_index_name}",
+    "--uuid",
+    "${auth_uuid}",
+    "--accessToken",
+    "${auth_access_token}",
+    "--userType",
+    "${user_type}",
+    "--versionType",
+    "${version_type}",
+    "--tweakClass",
+    "net.minecraftforge.fml.common.launcher.FMLTweaker"
+  ],
+  "legacy_args": true
+}
