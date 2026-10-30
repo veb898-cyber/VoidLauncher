@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use voidlauncher_lib::config::AppConfig;
 use voidlauncher_lib::instances::{Instance, LoaderType, Resolution};
-use voidlauncher_lib::launch::{build_launch_command, LaunchAuth, LaunchCommand};
+use voidlauncher_lib::launch::{
+    build_launch_command, prepare_and_build_launch_profile, LaunchAuth, LaunchCommand,
+    LaunchProfile,
+};
 use voidlauncher_lib::modloaders::LoaderProfile;
 use voidlauncher_lib::versions::{maven_to_path, VersionInfo};
 
@@ -217,6 +220,29 @@ impl Fixture {
             self.java_major(),
         )
         .unwrap_or_else(|e| panic!("build launch command: {}", e))
+    }
+
+    /// Build the pure semantic profile (after preparing launch-owned files).
+    pub fn profile(&self) -> LaunchProfile {
+        self.profile_with(None, None)
+    }
+
+    pub fn profile_with(
+        &self,
+        server: Option<(&str, Option<u16>)>,
+        session_log: Option<&str>,
+    ) -> LaunchProfile {
+        prepare_and_build_launch_profile(
+            &self.config,
+            &self.instance,
+            &self.version,
+            &auth(),
+            server,
+            session_log,
+            self.java_major(),
+        )
+        .unwrap_or_else(|e| panic!("build launch profile: {}", e))
+        .0
     }
 
     pub fn build_err(&self) -> String {

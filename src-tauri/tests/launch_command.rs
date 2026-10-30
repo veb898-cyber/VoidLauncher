@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 
 use support::*;
 use voidlauncher_lib::instances::LoaderType;
-use voidlauncher_lib::launch::LaunchCommand;
+use voidlauncher_lib::launch::{build_launch_command, LaunchCommand};
+use voidlauncher_lib::modloaders::LoaderProfile;
 
 /// G1GC preset flags emitted by `jvm::build_jvm_args` for every supported JDK.
 const G1_FLAGS: &[&str] = &[
@@ -655,6 +656,267 @@ fn forge_legacy_game_arguments_replace_vanilla_ones() {
         .iter()
         .any(|a| a == "net.minecraft.launchwrapper.Launch"));
     assert_no_placeholders(&command.args);
+}
+
+// ---------------------------------------------------------------------------
+// Launch profile contract (M2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn profile_traits_and_layout_are_explicit() {
+    let forge = Fixture::new("profile-forge", "1.12.2").with_loader(
+        LoaderType::Forge,
+        load_loader_profile("forge-14.23.5.2860-1.12.2"),
+    );
+    let profile = forge.profile();
+
+    assert!(profile.traits.legacy_args, "legacy Forge profile expected");
+    assert!(
+        !profile.traits.entry_wrapper,
+        "loader launches must use the loader main class"
+    );
+    assert!(!profile.traits.quick_play);
+    assert!(!profile.traits.has_custom_resolution);
+    assert_eq!(profile.main_class, "net.minecraft.launchwrapper.Launch");
+    assert_eq!(
+        profile.classpath.first(),
+        Some(&forge.entry_jar()),
+        "entry JAR must stay first"
+    );
+    assert_eq!(
+        profile.classpath.last(),
+        Some(&forge.client_jar()),
+        "1.12.2 Forge has no SRG JAR, so client.jar stays last"
+    );
+    assert_eq!(
+        profile.natives_dir,
+        forge.data_dir().join("versions/1.12.2/natives")
+    );
+
+    let modern = Fixture::new("profile-modern", "1.20.1").with_resolution(1920, 1080);
+    let session = modern.data_dir().join("logs/game/session.log");
+    let session_str = session.to_string_lossy().to_string();
+    let profile = modern.profile_with(Some(("play.example.com", Some(25565))), Some(&session_str));
+
+    assert!(
+        profile.traits.entry_wrapper,
+        "vanilla uses the entry wrapper"
+    );
+    assert!(profile.traits.has_custom_resolution);
+    assert!(profile.traits.quick_play, "1.20+ join must use Quick Play");
+    assert!(!profile.traits.legacy_args);
+    assert_eq!(profile.main_class, "net.minecraft.client.main.Main");
+    assert_eq!(
+        profile
+            .game_args
+            .iter()
+            .filter(|a| a.as_str() == "--width")
+            .count(),
+        1,
+        "resolution must be emitted exactly once: {:#?}",
+        profile.game_args
+    );
+    assert_eq!(
+        profile
+            .game_args
+            .iter()
+            .filter(|a| a.as_str() == "--height")
+            .count(),
+        1
+    );
+    assert!(
+        !profile.jvm_args.iter().any(|a| a == "-cp"),
+        "classpath is structured in the profile, not flattened into jvm_args"
+    );
+    assert!(!profile.jvm_args.iter().any(|a| a == "${classpath}"));
+}
+
+#[test]
+fn placeholder_expansion_covers_every_known_token() {
+    let loader = LoaderProfile {
+        main_class: "example.PlaceholderMain".to_string(),
+        libraries: Vec::new(),
+        jvm_args: vec![
+            "-Dnatives=${natives_directory}".to_string(),
+            "-Dlib=${library_directory}".to_string(),
+            "-Dsep=${classpath_separator}".to_string(),
+            "-Dver=${version_name}".to_string(),
+            "-Dln=${launcher_name}".to_string(),
+            "-Dlv=${launcher_version}".to_string(),
+            "-Dcp=${classpath}".to_string(),
+        ],
+        game_args: vec![
+            "--user".to_string(),
+            "${auth_player_name}".to_string(),
+            "--session".to_string(),
+            "${auth_session}".to_string(),
+            "--userTypeArg".to_string(),
+            "${user_type}".to_string(),
+            "--versionTypeArg".to_string(),
+            "${version_type}".to_string(),
+            "--xuidArg".to_string(),
+            "${auth_xuid}".to_string(),
+            "--clientIdArg".to_string(),
+            "${clientid}".to_string(),
+            "--props".to_string(),
+            "${user_properties}".to_string(),
+            "--gameAssets".to_string(),
+            "${game_assets}".to_string(),
+        ],
+        legacy_args: false,
+    };
+    let fixture = Fixture::new("placeholders", "1.20.1")
+        .with_loader(LoaderType::Fabric, loader)
+        .with_resolution(800, 600);
+    let command = fixture.build();
+
+    assert_no_placeholders(&command.args);
+    let classpath = value_after(&command.args, "-cp");
+    assert!(
+        command.args.contains(&format!("-Dcp={}", classpath)),
+        "embedded classpath placeholder must receive the final classpath:\n{:#?}",
+        command.args
+    );
+    assert_eq!(value_after(&command.args, "--user"), TEST_USERNAME);
+    assert_eq!(
+        value_after(&command.args, "--session"),
+        format!("0:{}:{}", TEST_UUID, TEST_USERNAME)
+    );
+    assert_eq!(value_after(&command.args, "--userTypeArg"), "msa");
+    assert_eq!(value_after(&command.args, "--versionTypeArg"), "release");
+    assert_eq!(value_after(&command.args, "--xuidArg"), "0");
+    assert_eq!(value_after(&command.args, "--clientIdArg"), "");
+    assert_eq!(value_after(&command.args, "--props"), "{}");
+    assert_eq!(
+        value_after(&command.args, "--gameAssets"),
+        fixture
+            .data_dir()
+            .join("assets")
+            .to_string_lossy()
+            .to_string()
+    );
+}
+
+#[test]
+fn loader_jvm_classpath_placeholder_is_expanded_to_final_classpath() {
+    // KI-5 regression: old Forge-era profiles ship
+    // `-DlegacyClassPath=${classpath}`. The literal token must never reach
+    // Java, and the value must be the *final* composed classpath (entry JAR,
+    // loader/vanilla order and SRG handling already applied).
+    let loader = LoaderProfile {
+        main_class: "net.minecraft.launchwrapper.Launch".to_string(),
+        libraries: Vec::new(),
+        jvm_args: vec!["-DlegacyClassPath=${classpath}".to_string()],
+        game_args: Vec::new(),
+        legacy_args: false,
+    };
+    let fixture = Fixture::new("loader-classpath", "1.20.1").with_loader(LoaderType::Forge, loader);
+    let command = fixture.build();
+
+    let classpath = value_after(&command.args, "-cp").to_string();
+    assert!(
+        !command.args.iter().any(|a| a.contains("${classpath}")),
+        "unsubstituted ${{classpath}} reached the command line:\n{:#?}",
+        command.args
+    );
+    assert!(
+        command
+            .args
+            .iter()
+            .any(|a| *a == format!("-DlegacyClassPath={}", classpath)),
+        "expected -DlegacyClassPath to receive the composed classpath:\n{:#?}",
+        command.args
+    );
+}
+
+#[test]
+fn manifest_jvm_classpath_placeholder_is_expanded() {
+    let fixture = Fixture::new("manifest-classpath", "1.20.1");
+    let mut version = fixture.version.clone();
+    version
+        .arguments
+        .as_mut()
+        .expect("1.20.1 arguments")
+        .jvm
+        .push(serde_json::json!("-Dmanifest.classpath=${classpath}"));
+
+    let command = build_launch_command(
+        &fixture.config,
+        &fixture.instance,
+        &version,
+        &auth(),
+        None,
+        None,
+        fixture.java_path(),
+        fixture.java_major(),
+    )
+    .expect("build command");
+
+    let classpath = value_after(&command.args, "-cp").to_string();
+    assert_no_placeholders(&command.args);
+    assert!(command
+        .args
+        .contains(&format!("-Dmanifest.classpath={}", classpath)));
+}
+
+#[test]
+fn manifest_gc_flags_are_stripped_and_custom_args_follow_preset() {
+    let fixture = Fixture::new("gc-strip", "1.20.1");
+    let mut version = fixture.version.clone();
+    let jvm = &mut version.arguments.as_mut().expect("1.20.1 arguments").jvm;
+    jvm.insert(0, serde_json::json!("-XX:+UseZGC"));
+    jvm.insert(0, serde_json::json!("-XX:+UseG1GC"));
+
+    let mut instance = fixture.instance.clone();
+    instance.gc_preset = Some("g1gc".to_string());
+    instance.jvm_args = Some(vec!["-XX:+UseZGC".to_string(), "-Duser.arg=1".to_string()]);
+
+    let command = build_launch_command(
+        &fixture.config,
+        &instance,
+        &version,
+        &auth(),
+        None,
+        None,
+        fixture.java_path(),
+        17,
+    )
+    .expect("build command");
+
+    // Only the preset may select a GC; manifest and custom selectors are gone.
+    assert_eq!(count_args(&command.args, "-XX:+UseG1GC"), 1);
+    assert!(!command.args.iter().any(|a| a == "-XX:+UseZGC"));
+    // Custom args are appended after the preset so they can override it.
+    let preset = index_of(&command.args, "-XX:+UseG1GC");
+    let custom = index_of(&command.args, "-Duser.arg=1");
+    assert!(
+        custom > preset,
+        "custom JVM args must follow the preset:\n{:#?}",
+        command.args
+    );
+}
+
+#[test]
+fn srg_jar_from_another_minecraft_version_keeps_client_jar() {
+    let profile = load_loader_profile("neoforge-21.1.172-1.21.4");
+    let fixture =
+        Fixture::new("srg-other-version", "1.21.4").with_loader(LoaderType::NeoForge, profile);
+
+    // A processor output for a different Minecraft version must not affect
+    // this instance: old Forge versions still need their own client.jar.
+    write_empty(
+        &fixture
+            .config
+            .libraries_dir()
+            .join("net/minecraft/client/1.20.1-test/client-1.20.1-test-srg.jar"),
+    );
+
+    let entries = split_classpath(&fixture.build());
+    assert!(
+        entries.contains(&fixture.client_jar().to_string_lossy().to_string()),
+        "client.jar must survive an SRG JAR from another MC version:\n{:#?}",
+        entries
+    );
 }
 
 // ---------------------------------------------------------------------------

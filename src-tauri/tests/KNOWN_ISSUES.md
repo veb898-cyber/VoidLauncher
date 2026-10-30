@@ -19,7 +19,12 @@ cargo test --test launch_known_issues -- --ignored --nocapture
 | KI-2 | `versions::extract_natives` silently ignores a native classifier JAR that exists but cannot be read/unzipped. | A corrupt download degrades to a runtime crash without a launcher error. Download verification should catch it earlier, but launch must not pretend extraction succeeded. | M4 |
 | KI-3 | `versions::native_classifier` replaces `${arch}` with the literal `64`. | Correct on x64, wrong on Windows ARM64 where Mojang publishes `natives-windows-arm64`. Confirmed against the 1.12.2 manifest (the only committed fixture that uses `${arch}`). | M4 (after verifying the real classifier set) |
 | KI-4 | `versions::argument_rule_allows` compares Mojang's `arm64` against `std::env::consts::ARCH` (`aarch64`), so `arm64` rules never match. The same function compares `os.name` against `std::env::consts::OS`, which is `macos` while Mojang metadata says `osx`. | Wrong arguments/natives on Windows ARM64 and macOS. No effect on Windows x64. | M3 (`RuntimeContext`-style platform normalisation) |
-| KI-5 | Loader JVM arguments only substitute `natives_directory`, `library_directory`, `classpath_separator`, `version_name`, `launcher_name`, `launcher_version`. A loader profile that ships `-DlegacyClassPath=${classpath}` (seen in some Forge-era install profiles) passes the literal placeholder to Java. | Suspected: old Forge launches receive a useless `-DlegacyClassPath=${classpath}`. Needs confirmation against a real profile captured from an actual Forge install before fixing; the loader profiles in this repo are synthetic because Fabric Meta / NeoForge Maven were unreachable. | M2/M3 |
+
+KI-5 (`${classpath}` inside loader JVM arguments) was confirmed as a real
+mechanism-level defect and fixed in M2: the placeholder now receives the final
+composed classpath, and any unresolved `${...}` fails the launch instead of
+reaching Java. The regression test lives in `tests/launch_command.rs`
+(`loader_jvm_classpath_placeholder_is_expanded_to_final_classpath`).
 
 ## Recorded behaviour that is intentional (not a bug)
 
@@ -43,9 +48,9 @@ These are asserted by the normal suite because they are deliberate policy:
   (`versions/<id>/natives`), so two concurrently running instances of the same
   version share it. Any future "clean the directory before extraction" change
   (M4) must be designed around concurrent launches.
-- `build_classpath` does not deduplicate; ordering/deduplication happens in
-  `launch::build_launch_command`. M2 should make deduplication and
-  loader-overrides explicit in the pure launch profile.
+- `build_classpath_entries` does not deduplicate or apply loader overrides;
+  ordering/deduplication now happens in the pure `launch::build_launch_profile`
+  and is covered by the M2 semantic tests.
 - Modern manifests list `natives-windows`, `natives-windows-arm64` and
   `natives-windows-x86` as separate libraries whose only rule is
   `{"os":{"name":"windows"}}` — there is no `arch` condition to filter them.

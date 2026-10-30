@@ -18,8 +18,6 @@ use std::io::Write;
 use std::path::Path;
 
 use support::*;
-use voidlauncher_lib::instances::LoaderType;
-use voidlauncher_lib::modloaders::LoaderProfile;
 use voidlauncher_lib::versions::{
     build_classpath, extract_natives, get_jvm_arguments, VersionInfo,
 };
@@ -194,39 +192,5 @@ fn arm64_argument_rule_matches_on_arm64_hosts() {
         should_match,
         "arm64 rule handling is wrong for this host (args: {:?})",
         args
-    );
-}
-
-// ---------------------------------------------------------------------------
-// KI-5: `${classpath}` inside loader JVM arguments is not substituted
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore = "known issue KI-5: loader JVM args containing ${classpath} are passed to Java verbatim (suspected old Forge profiles)"]
-fn loader_jvm_arguments_substitute_classpath_placeholder() {
-    let profile = LoaderProfile {
-        main_class: "net.minecraft.launchwrapper.Launch".to_string(),
-        libraries: Vec::new(),
-        jvm_args: vec!["-DlegacyClassPath=${classpath}".to_string()],
-        game_args: Vec::new(),
-        legacy_args: false,
-    };
-    let fixture =
-        Fixture::new("known-loader-classpath", "1.20.1").with_loader(LoaderType::Forge, profile);
-    let command = fixture.build();
-    let classpath = value_after(&command.args, "-cp").to_string();
-
-    assert!(
-        !command.args.iter().any(|a| a.contains("${classpath}")),
-        "unsubstituted ${{classpath}} reached the command line:\n{:#?}",
-        command.args
-    );
-    assert!(
-        command
-            .args
-            .iter()
-            .any(|a| *a == format!("-DlegacyClassPath={}", classpath)),
-        "expected -DlegacyClassPath to receive the composed classpath:\n{:#?}",
-        command.args
     );
 }

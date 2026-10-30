@@ -334,18 +334,37 @@ pub(crate) fn native_classifier(lib: &Library) -> Option<String> {
     Some(classifier.replace("${arch}", "64"))
 }
 
-/// Build classpath from version info libraries, including native classifier JARs.
+/// Read-only filesystem query used while composing a classpath.
+///
+/// Injected into `build_classpath_entries` so launch-profile composition can
+/// be tested without touching the real disk; production uses
+/// [`RealClasspathProbe`].
+pub trait ClasspathProbe {
+    fn is_file(&self, path: &Path) -> bool;
+}
+
+/// Production probe backed by `std::fs`.
+pub struct RealClasspathProbe;
+
+impl ClasspathProbe for RealClasspathProbe {
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
+}
+
+/// Build the ordered vanilla classpath entries from version metadata.
 ///
 /// Paths come from remote metadata, so every join is validated. An unsafe
 /// path is a hard error (never silently dropped), and a required library
 /// that is missing on disk fails with a clear message instead of letting
 /// Java die later with a cryptic `NoClassDefFoundError`.
-pub fn build_classpath(
+pub fn build_classpath_entries<P: ClasspathProbe + ?Sized>(
     version_info: &VersionInfo,
     libraries_dir: &Path,
     client_jar: &Path,
-) -> Result<String> {
-    let mut classpath_entries: Vec<String> = Vec::new();
+    probe: &P,
+) -> Result<Vec<PathBuf>> {
+    let mut classpath_entries: Vec<PathBuf> = Vec::new();
 
     for lib in &version_info.libraries {
         if !should_include_library(lib) {
@@ -355,8 +374,8 @@ pub fn build_classpath(
         if let Some(downloads) = &lib.downloads {
             if let Some(artifact) = &downloads.artifact {
                 let lib_path = checked_remote_join(libraries_dir, &artifact.path)?;
-                if lib_path.is_file() {
-                    classpath_entries.push(lib_path.to_string_lossy().to_string());
+                if probe.is_file(&lib_path) {
+                    classpath_entries.push(lib_path);
                 } else {
                     return Err(LauncherError::Launch(format!(
                         "Required library is missing: {}",
@@ -370,8 +389,8 @@ pub fn build_classpath(
                     if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
                         if let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) {
                             let native_path = checked_remote_join(libraries_dir, path)?;
-                            if native_path.is_file() {
-                                classpath_entries.push(native_path.to_string_lossy().to_string());
+                            if probe.is_file(&native_path) {
+                                classpath_entries.push(native_path);
                             } else {
                                 return Err(LauncherError::Launch(format!(
                                     "Required native library is missing: {}",
@@ -385,8 +404,8 @@ pub fn build_classpath(
         } else {
             let path = maven_to_path(&lib.name);
             let lib_path = checked_remote_join(libraries_dir, &path)?;
-            if lib_path.is_file() {
-                classpath_entries.push(lib_path.to_string_lossy().to_string());
+            if probe.is_file(&lib_path) {
+                classpath_entries.push(lib_path);
             } else {
                 return Err(LauncherError::Launch(format!(
                     "Required library is missing: {}",
@@ -396,9 +415,33 @@ pub fn build_classpath(
         }
     }
 
-    classpath_entries.push(client_jar.to_string_lossy().to_string());
+    classpath_entries.push(client_jar.to_path_buf());
 
-    Ok(classpath_entries.join(";"))
+    Ok(classpath_entries)
+}
+
+/// Build the vanilla classpath as a platform-separated string.
+///
+/// Kept as the string-returning convenience used by tests and callers that do
+/// not need the structured entries; `launch::build_launch_profile` uses
+/// [`build_classpath_entries`] directly so it can reorder and deduplicate.
+pub fn build_classpath(
+    version_info: &VersionInfo,
+    libraries_dir: &Path,
+    client_jar: &Path,
+) -> Result<String> {
+    let entries =
+        build_classpath_entries(version_info, libraries_dir, client_jar, &RealClasspathProbe)?;
+    Ok(join_classpath(&entries))
+}
+
+/// Join classpath entries with the platform separator used by the launcher.
+pub(crate) fn join_classpath(entries: &[PathBuf]) -> String {
+    entries
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 /// Evaluate a single Mojang argument rule entry (`{"rules": [...], "value": ...}`).
