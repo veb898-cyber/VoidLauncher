@@ -15,10 +15,14 @@ cargo test --test launch_known_issues -- --ignored --nocapture
 
 | ID | Issue | Impact | Planned stage |
 |---|---|---|---|
-| KI-1 | `versions::extract_natives` skips a destination file that already exists. | A DLL left over from an older download (or a half-written extraction) is never replaced. Stale/corrupt natives can crash the game after an update. | M4 (natives handling) |
-| KI-2 | `versions::extract_natives` silently ignores a native classifier JAR that exists but cannot be read/unzipped. | A corrupt download degrades to a runtime crash without a launcher error. Download verification should catch it earlier, but launch must not pretend extraction succeeded. | M4 |
 | KI-3 | `versions::native_classifier` replaces `${arch}` with the literal `64`. | Correct on x64, wrong on Windows ARM64 where Mojang publishes `natives-windows-arm64`. Confirmed against the 1.12.2 manifest (the only committed fixture that uses `${arch}`). | M4 (after verifying the real classifier set) |
 | KI-4 | `versions::argument_rule_allows` compares Mojang's `arm64` against `std::env::consts::ARCH` (`aarch64`), so `arm64` rules never match. The same function compares `os.name` against `std::env::consts::OS`, which is `macos` while Mojang metadata says `osx`. | Wrong arguments/natives on Windows ARM64 and macOS. No effect on Windows x64. | M3 (`RuntimeContext`-style platform normalisation) |
+
+KI-1 (stale natives were never replaced) and KI-2 (a corrupt native archive was
+silently skipped) are fixed in M4/A1. Extraction now stages the complete set
+first and syncs it into `versions/<id>/natives`, using a small manifest
+(`.voidlauncher-natives.json`) to know which files it owns. The regression tests
+live in `tests/launch_known_issues.rs` and run with the normal suite.
 
 KI-5 (`${classpath}` inside loader JVM arguments) was confirmed as a real
 mechanism-level defect and fixed in M2: the placeholder now receives the final
@@ -46,8 +50,11 @@ These are asserted by the normal suite because they are deliberate policy:
 
 - The natives directory is per Minecraft version
   (`versions/<id>/natives`), so two concurrently running instances of the same
-  version share it. Any future "clean the directory before extraction" change
-  (M4) must be designed around concurrent launches.
+  version share it. `extract_natives` stages a complete set and skips files
+  whose bytes already match, so a second launch does not rewrite natives that
+  the first one has loaded. If the set changed while an old game is running, a
+  locked/read-only file fails preparation with its path instead of being
+  silently replaced or skipped.
 - `build_classpath_entries` does not deduplicate or apply loader overrides;
   ordering/deduplication now happens in the pure `launch::build_launch_profile`
   and is covered by the M2 semantic tests.

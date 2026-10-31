@@ -749,10 +749,398 @@ pub async fn ensure_native_libraries(
     Ok(())
 }
 
+/// Manifest of files owned by native extraction. Without it, a file removed
+/// from the current native JARs could not be distinguished from a user file.
+const NATIVES_MANIFEST: &str = ".voidlauncher-natives.json";
+
+/// Process-wide unique suffix for staging and temporary files. Concurrent
+/// launches of the same version may prepare natives at the same time.
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}-{}", std::process::id(), n, nanos)
+}
+
+fn natives_staging_dir(natives_dir: &Path) -> PathBuf {
+    let parent = natives_dir.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(".natives-staging-{}", unique_suffix()))
+}
+
+/// Relative paths of every regular file below `root`, sorted for determinism.
+fn collect_relative_files(root: &Path) -> Result<Vec<String>> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            LauncherError::Version(format!(
+                "Failed to read natives directory {}: {}",
+                dir.display(),
+                e
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                LauncherError::Version(format!(
+                    "Failed to read natives directory {}: {}",
+                    dir.display(),
+                    e
+                ))
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|e| {
+                LauncherError::Version(format!(
+                    "Failed to inspect native file {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            if file_type.is_dir() {
+                walk(root, &path, out)?;
+            } else if file_type.is_file() {
+                let relative = path.strip_prefix(root).map_err(|_| {
+                    LauncherError::Version(format!(
+                        "Native file {} escaped {}",
+                        path.display(),
+                        root.display()
+                    ))
+                })?;
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if relative != NATIVES_MANIFEST {
+                    out.push(relative);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    if root.is_dir() {
+        walk(root, root, &mut files)?;
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn read_natives_manifest(natives_dir: &Path) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(natives_dir.join(NATIVES_MANIFEST)).ok()?;
+    let mut files: Vec<String> = serde_json::from_str(&raw).ok()?;
+    files.retain(|file| !file.is_empty() && !crate::download::is_unsafe_archive_path(file));
+    Some(files)
+}
+
+fn write_natives_manifest(natives_dir: &Path, files: &[String]) -> Result<()> {
+    let mut files = files.to_vec();
+    files.sort();
+    files.dedup();
+    let payload = serde_json::to_vec_pretty(&files)?;
+
+    let manifest = natives_dir.join(NATIVES_MANIFEST);
+    let temporary = natives_dir.join(format!(".voidlauncher-natives-{}.tmp", unique_suffix()));
+    std::fs::write(&temporary, payload).map_err(|e| {
+        LauncherError::Version(format!(
+            "Failed to write natives manifest {}: {}",
+            temporary.display(),
+            e
+        ))
+    })?;
+    if manifest.exists() {
+        if let Err(e) = std::fs::remove_file(&manifest) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(LauncherError::Version(format!(
+                "Failed to replace natives manifest {}: {}",
+                manifest.display(),
+                e
+            )));
+        }
+    }
+    std::fs::rename(&temporary, &manifest).map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        LauncherError::Version(format!(
+            "Failed to write natives manifest {}: {}",
+            manifest.display(),
+            e
+        ))
+    })
+}
+
+/// Extract every required native JAR into a fresh staging directory. Any
+/// failure aborts preparation before the live natives directory is touched.
+fn extract_natives_into(
+    version_info: &VersionInfo,
+    libraries_dir: &Path,
+    staging: &Path,
+) -> Result<Vec<String>> {
+    std::fs::create_dir_all(staging)?;
+    let mut extracted = Vec::new();
+
+    for lib in &version_info.libraries {
+        if !should_include_library(lib) {
+            continue;
+        }
+        let Some(classifier) = native_classifier(lib) else {
+            continue;
+        };
+        let Some(downloads) = &lib.downloads else {
+            continue;
+        };
+        let Some(classifiers) = &downloads.classifiers else {
+            continue;
+        };
+        let Some(native_artifact) = classifiers.get(classifier.as_str()) else {
+            continue;
+        };
+        let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) else {
+            continue;
+        };
+
+        let jar_path = checked_remote_join(libraries_dir, path)?;
+        if !jar_path.is_file() {
+            return Err(LauncherError::Version(format!(
+                "Native library '{}' is missing: {}",
+                lib.name,
+                jar_path.display()
+            )));
+        }
+
+        let file = std::fs::File::open(&jar_path).map_err(|e| {
+            LauncherError::Version(format!(
+                "Failed to open native library '{}' at {}: {}",
+                lib.name,
+                jar_path.display(),
+                e
+            ))
+        })?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| {
+            LauncherError::Version(format!(
+                "Native library '{}' at {} is not a valid archive: {}",
+                lib.name,
+                jar_path.display(),
+                e
+            ))
+        })?;
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| {
+                LauncherError::Version(format!(
+                    "Failed to read entry {} of native library '{}' at {}: {}",
+                    i,
+                    lib.name,
+                    jar_path.display(),
+                    e
+                ))
+            })?;
+            let name = entry.name().replace('\\', "/");
+            if name.starts_with("META-INF/") || name.ends_with('/') || name == NATIVES_MANIFEST {
+                continue;
+            }
+            // Refuse path traversal: an entry such as "../evil.dll" must not
+            // escape the staging/natives directory.
+            if crate::download::is_unsafe_archive_path(&name) {
+                tracing::warn!(target: "launcher", "Skipping unsafe native entry: {}", name);
+                continue;
+            }
+            let dest = staging.join(&name);
+            if !dest.starts_with(staging) {
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    LauncherError::Version(format!(
+                        "Failed to create native directory {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+            let mut output = std::fs::File::create(&dest).map_err(|e| {
+                LauncherError::Version(format!(
+                    "Failed to write native file {} from '{}': {}",
+                    dest.display(),
+                    lib.name,
+                    e
+                ))
+            })?;
+            std::io::copy(&mut entry, &mut output).map_err(|e| {
+                LauncherError::Version(format!(
+                    "Failed to extract native file {} from '{}': {}",
+                    dest.display(),
+                    lib.name,
+                    e
+                ))
+            })?;
+            extracted.push(name);
+        }
+    }
+
+    Ok(extracted)
+}
+
+fn files_equal(left: &Path, right: &Path) -> bool {
+    match (std::fs::metadata(left), std::fs::metadata(right)) {
+        (Ok(a), Ok(b)) if a.len() == b.len() => match (std::fs::read(left), std::fs::read(right)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Move one staged file into place. The destination is removed only after the
+/// staged copy exists, so a lock/read-only failure leaves the old file intact
+/// and is reported with the path that could not be replaced.
+fn install_native_file(source: &Path, destination: &Path) -> Result<()> {
+    let temporary = destination.with_file_name(format!(
+        ".{}.voidlauncher-{}.tmp",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("native"),
+        unique_suffix()
+    ));
+    std::fs::rename(source, &temporary).map_err(|e| {
+        LauncherError::Version(format!(
+            "Failed to stage native file {}: {}",
+            destination.display(),
+            e
+        ))
+    })?;
+
+    if destination.exists() {
+        if let Err(e) = std::fs::remove_file(destination) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(LauncherError::Version(format!(
+                "Cannot replace native file {}: {}. Close any running game that uses this version and try again.",
+                destination.display(),
+                e
+            )));
+        }
+    }
+    if let Err(e) = std::fs::rename(&temporary, destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(LauncherError::Version(format!(
+            "Failed to install native file {}: {}",
+            destination.display(),
+            e
+        )));
+    }
+    Ok(())
+}
+
+fn prune_empty_native_dirs(path: &Path, natives_dir: &Path) {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if dir == natives_dir || !dir.starts_with(natives_dir) {
+            break;
+        }
+        if std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+        current = dir.parent();
+    }
+}
+
+/// Replace/add desired files, then drop files that the current native JARs no
+/// longer ship. Unknown files are only removed when a previous manifest (or,
+/// on the first run after an upgrade, the existing directory) owns them.
+fn commit_natives(staging: &Path, natives_dir: &Path, desired: &[String]) -> Result<()> {
+    std::fs::create_dir_all(natives_dir)?;
+
+    // Before touching anything, prove that every file we would replace is
+    // writable. A DLL loaded by another running instance fails here instead of
+    // leaving a half-updated directory.
+    for relative in desired {
+        let source = staging.join(relative);
+        let destination = natives_dir.join(relative);
+        if destination.is_file() {
+            if files_equal(&source, &destination) {
+                continue;
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&destination)
+                .map_err(|e| {
+                    LauncherError::Version(format!(
+                        "Cannot replace native file {}: {}. Close any running game that uses this version and try again.",
+                        destination.display(),
+                        e
+                    ))
+                })?;
+        } else if destination.exists() {
+            return Err(LauncherError::Version(format!(
+                "Cannot replace native path {}: it is not a regular file",
+                destination.display()
+            )));
+        }
+    }
+
+    for relative in desired {
+        let source = staging.join(relative);
+        let destination = natives_dir.join(relative);
+        if destination.is_file() && files_equal(&source, &destination) {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        install_native_file(&source, &destination)?;
+        tracing::debug!(target: "launcher", "Extracted native: {}", destination.display());
+    }
+
+    let previous = match read_natives_manifest(natives_dir) {
+        Some(files) => files,
+        // No manifest yet (install from an older launcher): the natives
+        // directory is launcher-owned, so treat its contents as ours once.
+        None => collect_relative_files(natives_dir)?,
+    };
+    let desired_set: std::collections::HashSet<&str> =
+        desired.iter().map(|file| file.as_str()).collect();
+    let mut retained = Vec::new();
+
+    for relative in previous {
+        if desired_set.contains(relative.as_str())
+            || relative.is_empty()
+            || crate::download::is_unsafe_archive_path(&relative)
+        {
+            continue;
+        }
+        let destination = natives_dir.join(&relative);
+        match std::fs::remove_file(&destination) {
+            Ok(()) => {
+                tracing::debug!(target: "launcher", "Removed stale native: {}", destination.display());
+                prune_empty_native_dirs(&destination, natives_dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                // A file still mapped by a running game cannot be deleted.
+                // Keep it in the manifest so the next launch retries.
+                tracing::warn!(
+                    target: "launcher",
+                    "Could not remove stale native file {}: {}. It will be retried on the next launch.",
+                    destination.display(),
+                    e
+                );
+                retained.push(relative);
+            }
+        }
+    }
+
+    let mut managed = desired.to_vec();
+    managed.extend(retained);
+    write_natives_manifest(natives_dir, &managed)
+}
+
 /// Extract native libraries (DLLs etc.) from the native classifier JARs into
 /// the natives directory so they can be found via -Djava.library.path.
 /// This mirrors the official launcher behavior and also covers old LWJGL
 /// versions that do not load natives from the classpath.
+///
+/// Extraction happens in a staging directory first: a corrupt archive, a read
+/// failure or a locked destination aborts preparation and leaves the live
+/// directory untouched. After a successful extraction, files from an older
+/// native set are removed, so an outdated DLL can never shadow the current one.
 ///
 /// The classifier path is validated before it is read: a crafted metadata
 /// entry must not make the launcher open a file outside `libraries_dir`.
@@ -761,71 +1149,18 @@ pub fn extract_natives(
     libraries_dir: &Path,
     natives_dir: &Path,
 ) -> Result<()> {
-    use std::io::Read;
+    let staging = natives_staging_dir(natives_dir);
+    let _ = std::fs::remove_dir_all(&staging);
 
-    std::fs::create_dir_all(natives_dir)?;
+    let result = (|| {
+        let mut desired = extract_natives_into(version_info, libraries_dir, &staging)?;
+        desired.sort();
+        desired.dedup();
+        commit_natives(&staging, natives_dir, &desired)
+    })();
 
-    for lib in &version_info.libraries {
-        if !should_include_library(lib) {
-            continue;
-        }
-        if let Some(classifier) = native_classifier(lib) {
-            if let Some(downloads) = &lib.downloads {
-                if let Some(classifiers) = &downloads.classifiers {
-                    if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
-                        if let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) {
-                            let jar_path = checked_remote_join(libraries_dir, path)?;
-                            if !jar_path.is_file() {
-                                continue;
-                            }
-                            let Ok(bytes) = std::fs::read(&jar_path) else {
-                                continue;
-                            };
-                            let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-                            else {
-                                continue;
-                            };
-                            for i in 0..archive.len() {
-                                let Ok(mut entry) = archive.by_index(i) else {
-                                    continue;
-                                };
-                                let name = entry.name().replace('\\', "/");
-                                if name.starts_with("META-INF/") || name.ends_with('/') {
-                                    continue;
-                                }
-                                // Refuse path traversal: an entry such as
-                                // "../../evil.dll" must not escape natives_dir.
-                                if crate::download::is_unsafe_archive_path(&name) {
-                                    tracing::warn!(target: "launcher", "Skipping unsafe native entry: {}", name);
-                                    continue;
-                                }
-                                let dest = natives_dir.join(&name);
-                                if !dest.starts_with(natives_dir) {
-                                    continue;
-                                }
-                                if dest.exists() {
-                                    continue;
-                                }
-                                if let Some(parent) = dest.parent() {
-                                    std::fs::create_dir_all(parent).ok();
-                                }
-                                if let Ok(mut file) = std::fs::File::create(&dest) {
-                                    use std::io::Write;
-                                    let mut buf = Vec::new();
-                                    if entry.read_to_end(&mut buf).is_ok() {
-                                        let _ = file.write_all(&buf);
-                                        tracing::debug!(target: "launcher", "Extracted native: {}", dest.display());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
+    let _ = std::fs::remove_dir_all(&staging);
+    result
 }
 
 #[cfg(test)]

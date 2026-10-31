@@ -1,14 +1,13 @@
-//! Known behavioural defects that are **recorded, not accepted**.
+//! Regression tests for launch-composition defects recorded in
+//! `tests/KNOWN_ISSUES.md`.
 //!
-//! Every test here is `#[ignore]`d on purpose. It documents the *correct*
-//! expectation (the side that currently fails), so the suite stays green while
-//! the bug is real. When a bug is fixed, running `cargo test -- --ignored`
-//! turns the corresponding test green and forces the entry to be removed from
-//! `tests/KNOWN_ISSUES.md` instead of silently becoming a regression guard for
-//! buggy behaviour.
+//! KI-1 and KI-2 are fixed: their tests now run with the normal suite. KI-3 and
+//! KI-4 are still open and therefore `#[ignore]`d — they encode the *correct*
+//! expectation, so `cargo test -- --ignored` shows the remaining gap without
+//! turning the bug into an accepted baseline.
 //!
-//! These tests must never be un-ignored to "make CI pass" — they encode
-//! behaviour the launcher is supposed to have.
+//! Tests must never be un-ignored to "make CI pass" while the defect is real;
+//! they encode behaviour the launcher is supposed to have.
 
 #![cfg(target_os = "windows")]
 
@@ -34,6 +33,13 @@ fn write_native_jar(path: &Path, entries: &[(&str, &[u8])]) {
         writer.write_all(bytes).expect("write zip entry");
     }
     writer.finish().expect("finish native jar");
+}
+
+fn fixture_native_jar(fixture: &Fixture) -> std::path::PathBuf {
+    fixture.config.libraries_dir().join(
+        "org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/\
+         lwjgl-platform-2.9.4-nightly-20150209-natives-windows.jar",
+    )
 }
 
 fn synthetic_version(libraries: serde_json::Value, jvm: serde_json::Value) -> VersionInfo {
@@ -78,13 +84,9 @@ fn native_library_json() -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "known issue KI-1: extract_natives skips existing files, so a stale/corrupt DLL survives updates"]
 fn native_extraction_replaces_existing_file() {
     let fixture = Fixture::new("known-stale-native", "1.12.2");
-    let native_jar = fixture.config.libraries_dir().join(
-        "org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/\
-         lwjgl-platform-2.9.4-nightly-20150209-natives-windows.jar",
-    );
+    let native_jar = fixture_native_jar(&fixture);
     write_native_jar(&native_jar, &[("lwjgl.dll", b"new-build")]);
 
     let natives_dir = fixture.data_dir().join("versions/1.12.2/natives");
@@ -111,13 +113,9 @@ fn native_extraction_replaces_existing_file() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "known issue KI-2: a present but corrupt native JAR is skipped without an error"]
 fn corrupt_native_jar_is_reported() {
     let fixture = Fixture::new("known-corrupt-native", "1.12.2");
-    let native_jar = fixture.config.libraries_dir().join(
-        "org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/\
-         lwjgl-platform-2.9.4-nightly-20150209-natives-windows.jar",
-    );
+    let native_jar = fixture_native_jar(&fixture);
     std::fs::write(&native_jar, b"this is not a zip archive").expect("write corrupt jar");
 
     let result = extract_natives(
@@ -129,6 +127,154 @@ fn corrupt_native_jar_is_reported() {
     assert!(
         result.is_err(),
         "extraction of a required native JAR that exists but cannot be opened must fail loudly"
+    );
+}
+
+#[test]
+fn native_extraction_removes_files_from_a_previous_set() {
+    let fixture = Fixture::new("native-stale-set", "1.12.2");
+    let native_jar = fixture_native_jar(&fixture);
+    let natives_dir = fixture.data_dir().join("versions/1.12.2/natives");
+
+    write_native_jar(
+        &native_jar,
+        &[("lwjgl.dll", b"build-1"), ("removed.dll", b"old-only")],
+    );
+    extract_natives(
+        &fixture.version,
+        &fixture.config.libraries_dir(),
+        &natives_dir,
+    )
+    .expect("extract first native set");
+
+    write_native_jar(
+        &native_jar,
+        &[("lwjgl.dll", b"build-2"), ("added.dll", b"new-only")],
+    );
+    extract_natives(
+        &fixture.version,
+        &fixture.config.libraries_dir(),
+        &natives_dir,
+    )
+    .expect("extract second native set");
+
+    assert_eq!(
+        std::fs::read(natives_dir.join("lwjgl.dll")).expect("read replaced native"),
+        b"build-2".to_vec(),
+        "the current native must replace the previous build"
+    );
+    assert!(
+        natives_dir.join("added.dll").is_file(),
+        "a file shipped by the new native set must be extracted"
+    );
+    assert!(
+        !natives_dir.join("removed.dll").exists(),
+        "a file that is no longer shipped must be removed"
+    );
+}
+
+#[test]
+fn failed_native_extraction_does_not_touch_existing_natives() {
+    let fixture = Fixture::new("native-failure-preserves", "1.12.2");
+    let native_jar = fixture_native_jar(&fixture);
+    let natives_dir = fixture.data_dir().join("versions/1.12.2/natives");
+
+    write_native_jar(&native_jar, &[("lwjgl.dll", b"good-build")]);
+    extract_natives(
+        &fixture.version,
+        &fixture.config.libraries_dir(),
+        &natives_dir,
+    )
+    .expect("extract valid native set");
+
+    std::fs::write(&native_jar, b"this is not a zip archive").expect("corrupt native jar");
+    let err = extract_natives(
+        &fixture.version,
+        &fixture.config.libraries_dir(),
+        &natives_dir,
+    )
+    .expect_err("a corrupt native archive must fail preparation")
+    .to_string();
+
+    assert!(
+        err.contains("lwjgl-platform") && err.contains("not a valid archive"),
+        "the error must identify the archive and the reason, got: {}",
+        err
+    );
+    assert_eq!(
+        std::fs::read(natives_dir.join("lwjgl.dll")).expect("read preserved native"),
+        b"good-build".to_vec(),
+        "a failed extraction must not remove or rewrite the last good natives"
+    );
+    let staging_leftovers: Vec<String> = std::fs::read_dir(natives_dir.parent().unwrap())
+        .expect("read version dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(".natives-staging-"))
+        .collect();
+    assert!(
+        staging_leftovers.is_empty(),
+        "failed extraction must clean its staging directory, found: {:?}",
+        staging_leftovers
+    );
+}
+
+// This test file is Windows-only; `set_readonly(false)` restores the normal
+// DOS attribute and does not make anything world-writable.
+#[allow(clippy::permissions_set_readonly_false)]
+#[test]
+fn native_extraction_reports_a_native_file_that_cannot_be_replaced() {
+    let fixture = Fixture::new("native-readonly", "1.12.2");
+    let native_jar = fixture_native_jar(&fixture);
+    let natives_dir = fixture.data_dir().join("versions/1.12.2/natives");
+
+    write_native_jar(&native_jar, &[("lwjgl.dll", b"build-1")]);
+    extract_natives(
+        &fixture.version,
+        &fixture.config.libraries_dir(),
+        &natives_dir,
+    )
+    .expect("extract first native set");
+
+    let target = natives_dir.join("lwjgl.dll");
+    let mut permissions = std::fs::metadata(&target)
+        .expect("stat native")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&target, permissions).expect("make native read-only");
+
+    write_native_jar(
+        &native_jar,
+        &[("lwjgl.dll", b"build-2"), ("added.dll", b"new-only")],
+    );
+    let result = extract_natives(
+        &fixture.version,
+        &fixture.config.libraries_dir(),
+        &natives_dir,
+    );
+
+    let mut permissions = std::fs::metadata(&target)
+        .expect("stat native")
+        .permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&target, permissions).expect("restore native permissions");
+
+    let err = result
+        .expect_err("a native file that cannot be replaced must fail preparation")
+        .to_string();
+    assert!(
+        err.contains("Cannot replace native file") && err.contains("lwjgl.dll"),
+        "the error must name the blocked file and explain the lock, got: {}",
+        err
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("read blocked native"),
+        b"build-1".to_vec(),
+        "a blocked replacement must leave the old file untouched"
+    );
+    assert!(
+        !natives_dir.join("added.dll").exists(),
+        "preflight must fail before any file from the new set is installed"
     );
 }
 

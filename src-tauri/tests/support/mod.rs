@@ -87,6 +87,18 @@ pub fn write_empty(path: &Path) {
     std::fs::write(path, b"").expect("write empty file");
 }
 
+/// A valid empty ZIP. Native classifier JARs are actually opened by
+/// `extract_natives`, so the fixtures must not hand it plain empty files.
+pub fn write_empty_zip(path: &Path) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dir");
+    }
+    let file = std::fs::File::create(path).expect("create zip file");
+    zip::ZipWriter::new(file)
+        .finish()
+        .expect("finish empty zip");
+}
+
 /// Create an empty file for every artifact the fixture declares, so
 /// `build_classpath` sees a complete (but byte-empty) library tree. Tests that
 /// care about *which* entries are used assert on the classpath itself.
@@ -101,7 +113,9 @@ pub fn materialize_libraries(version: &VersionInfo, libraries_dir: &Path) {
                     if let Some(map) = classifiers.as_object() {
                         for value in map.values() {
                             if let Some(path) = value.get("path").and_then(|p| p.as_str()) {
-                                write_empty(&libraries_dir.join(path));
+                                // `extract_natives` opens these; a plain empty
+                                // file is not a valid archive.
+                                write_empty_zip(&libraries_dir.join(path));
                             }
                         }
                     }
