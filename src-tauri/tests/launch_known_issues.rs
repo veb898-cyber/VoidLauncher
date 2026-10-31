@@ -13,7 +13,7 @@
 
 mod support;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use support::*;
@@ -40,6 +40,52 @@ fn fixture_native_jar(fixture: &Fixture) -> std::path::PathBuf {
         "org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/\
          lwjgl-platform-2.9.4-nightly-20150209-natives-windows.jar",
     )
+}
+
+/// Flip the CRC stored for `entry` in the central directory, leaving the ZIP
+/// structurally valid. Opening the archive and locating the entry still work;
+/// the failure appears only when its bytes are read to EOF.
+fn corrupt_central_directory_crc(path: &Path, entry: &str) {
+    let mut bytes = std::fs::read(path).expect("read native jar");
+    let eocd = bytes
+        .windows(4)
+        .rposition(|signature| signature == [0x50, 0x4b, 0x05, 0x06])
+        .expect("end of central directory");
+    let entries = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+    let mut offset = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+
+    for _ in 0..entries {
+        assert_eq!(
+            &bytes[offset..offset + 4],
+            &[0x50, 0x4b, 0x01, 0x02],
+            "malformed central directory"
+        );
+        let name_len = u16::from_le_bytes([bytes[offset + 28], bytes[offset + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[offset + 30], bytes[offset + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([bytes[offset + 32], bytes[offset + 33]]) as usize;
+        let name_start = offset + 46;
+        let name_end = name_start + name_len;
+        assert!(name_end <= bytes.len(), "malformed central directory");
+
+        if &bytes[name_start..name_end] == entry.as_bytes() {
+            let crc = u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().unwrap());
+            bytes[offset + 16..offset + 20].copy_from_slice(&(crc ^ 0xFFFF_FFFF).to_le_bytes());
+            std::fs::write(path, bytes).expect("write corrupted native jar");
+            return;
+        }
+        offset = name_end + extra_len + comment_len;
+    }
+
+    panic!("central directory entry not found: {}", entry);
+}
+
+fn staging_leftovers(natives_dir: &Path) -> Vec<String> {
+    std::fs::read_dir(natives_dir.parent().unwrap())
+        .expect("read version dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(".natives-staging-"))
+        .collect()
 }
 
 fn synthetic_version(libraries: serde_json::Value, jvm: serde_json::Value) -> VersionInfo {
@@ -206,16 +252,95 @@ fn failed_native_extraction_does_not_touch_existing_natives() {
         b"good-build".to_vec(),
         "a failed extraction must not remove or rewrite the last good natives"
     );
-    let staging_leftovers: Vec<String> = std::fs::read_dir(natives_dir.parent().unwrap())
-        .expect("read version dir")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .filter(|name| name.starts_with(".natives-staging-"))
-        .collect();
     assert!(
-        staging_leftovers.is_empty(),
+        staging_leftovers(&natives_dir).is_empty(),
         "failed extraction must clean its staging directory, found: {:?}",
-        staging_leftovers
+        staging_leftovers(&natives_dir)
+    );
+}
+
+#[test]
+fn native_extraction_rolls_back_when_entry_data_is_corrupt() {
+    let fixture = Fixture::new("native-corrupt-entry", "1.12.2");
+    let native_jar = fixture_native_jar(&fixture);
+    let natives_dir = fixture.data_dir().join("versions/1.12.2/natives");
+
+    write_native_jar(&native_jar, &[("previous.dll", b"previous-build")]);
+    extract_natives(
+        &fixture.version,
+        &fixture.config.libraries_dir(),
+        &natives_dir,
+    )
+    .expect("extract previous native set");
+
+    let manifest_path = natives_dir.join(".voidlauncher-natives.json");
+    let manifest_before = std::fs::read(&manifest_path).expect("read manifest");
+
+    write_native_jar(
+        &native_jar,
+        &[
+            // A normal entry is extracted first, so the failure happens with
+            // partially staged content already on disk.
+            ("good.dll", b"new-good"),
+            ("corrupt.dll", b"corrupt-payload"),
+        ],
+    );
+    corrupt_central_directory_crc(&native_jar, "corrupt.dll");
+
+    // The archive itself must still open: the error has to come from reading
+    // the corrupted entry, not from `ZipArchive::new`.
+    {
+        let file = std::fs::File::open(&native_jar).expect("open corrupted native jar");
+        let mut archive =
+            zip::ZipArchive::new(file).expect("corrupted CRC must leave the archive readable");
+        let mut entry = archive
+            .by_name("corrupt.dll")
+            .expect("corrupted entry must be listed");
+        let mut sink = Vec::new();
+        let read_err = entry
+            .read_to_end(&mut sink)
+            .expect_err("reading the corrupted entry must fail");
+        assert_eq!(read_err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            read_err.to_string().contains("Invalid checksum"),
+            "unexpected read error: {}",
+            read_err
+        );
+    }
+
+    let err = extract_natives(
+        &fixture.version,
+        &fixture.config.libraries_dir(),
+        &natives_dir,
+    )
+    .expect_err("corrupt entry data must fail preparation")
+    .to_string();
+
+    assert!(
+        err.contains("Failed to extract native file")
+            && err.contains("org.lwjgl.lwjgl:lwjgl-platform")
+            && err.contains(&native_jar.display().to_string()),
+        "the error must name the library, archive path and extraction stage, got: {}",
+        err
+    );
+    assert_eq!(
+        std::fs::read(natives_dir.join("previous.dll")).expect("read previous native"),
+        b"previous-build".to_vec(),
+        "the previous native set must survive a mid-extraction failure"
+    );
+    assert!(
+        !natives_dir.join("good.dll").exists() && !natives_dir.join("corrupt.dll").exists(),
+        "no partially staged file may reach the live natives directory"
+    );
+    assert_eq!(
+        std::fs::read(&manifest_path).expect("read manifest after failure"),
+        manifest_before,
+        "a failed extraction must not rewrite the manifest"
+    );
+    assert!(
+        staging_leftovers(&natives_dir).is_empty(),
+        "failed extraction must clean its staging directory, found: {:?}",
+        staging_leftovers(&natives_dir)
     );
 }
 

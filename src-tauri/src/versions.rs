@@ -957,17 +957,19 @@ fn extract_natives_into(
             }
             let mut output = std::fs::File::create(&dest).map_err(|e| {
                 LauncherError::Version(format!(
-                    "Failed to write native file {} from '{}': {}",
+                    "Failed to write native file {} from native library '{}' at {}: {}",
                     dest.display(),
                     lib.name,
+                    jar_path.display(),
                     e
                 ))
             })?;
             std::io::copy(&mut entry, &mut output).map_err(|e| {
                 LauncherError::Version(format!(
-                    "Failed to extract native file {} from '{}': {}",
+                    "Failed to extract native file {} from native library '{}' at {}: {}",
                     dest.display(),
                     lib.name,
+                    jar_path.display(),
                     e
                 ))
             })?;
