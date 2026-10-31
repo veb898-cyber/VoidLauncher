@@ -1,34 +1,51 @@
 # Known launch-composition issues
 
-Status as of the M7.1–M7.3 test-infrastructure stage. These defects are
-**recorded, not accepted**: the normal suite never asserts them as correct.
-Each one has an `#[ignore]`d test in `launch_known_issues.rs` that encodes the
-desired behaviour, so fixing the bug makes the test fail-to-pass and reminds us
-to remove the entry here.
+Status after M4/A3. KI-1 through KI-4 are fixed and their regression tests run
+with the normal suite in `launch_known_issues.rs`. A failing test means the
+defect came back; the expectation must not be relaxed to make CI pass.
 
-Run them explicitly with:
+Run the integration target explicitly with:
 
 ```powershell
 cd src-tauri
-cargo test --test launch_known_issues -- --ignored --nocapture
+cargo test --test launch_known_issues -- --nocapture
 ```
 
-| ID | Issue | Impact | Planned stage |
-|---|---|---|---|
-| KI-3 | `versions::native_classifier` replaces `${arch}` with the literal `64`. | Correct on x64, wrong on Windows ARM64 where Mojang publishes `natives-windows-arm64`. Confirmed against the 1.12.2 manifest (the only committed fixture that uses `${arch}`). | M4 (after verifying the real classifier set) |
-| KI-4 | `versions::argument_rule_allows` compares Mojang's `arm64` against `std::env::consts::ARCH` (`aarch64`), so `arm64` rules never match. The same function compares `os.name` against `std::env::consts::OS`, which is `macos` while Mojang metadata says `osx`. | Wrong arguments/natives on Windows ARM64 and macOS. No effect on Windows x64. | M3 (`RuntimeContext`-style platform normalisation) |
+## Fixed defects
 
-KI-1 (stale natives were never replaced) and KI-2 (a corrupt native archive was
-silently skipped) are fixed in M4/A1. Extraction now stages the complete set
-first and syncs it into `versions/<id>/natives`, using a small manifest
-(`.voidlauncher-natives.json`) to know which files it owns. The regression tests
-live in `tests/launch_known_issues.rs` and run with the normal suite.
+| ID | Defect | Resolution |
+|---|---|---|
+| KI-1 | Stale native files from a previous build were never replaced. | Extraction stages the complete set and syncs it into `versions/<id>/natives` with an ownership manifest. A failed preparation leaves the previous working set untouched. |
+| KI-2 | A corrupt native archive was silently skipped. | Reading or extracting a required native archive now fails preparation with the library name, archive path and stage; no partial set is installed. |
+| KI-3 | `versions::native_classifier` replaced `${arch}` with the literal `64`. | Native selection now receives an explicit `TargetArch`; `${arch}` maps to `32`/`64`/`arm64` for x86/x86_64/ARM64 and is not resolved at all for an unknown target. Legacy plain classifiers are used as-is. |
+| KI-4 | Mojang `arm64` argument rules never matched (`aarch64` was compared with `arm64`). | OS/arch rules and native selection share the same `TargetArch` mapping, so `x86`, `x86_64` and `arm64` match exactly. |
 
-KI-5 (`${classpath}` inside loader JVM arguments) was confirmed as a real
-mechanism-level defect and fixed in M2: the placeholder now receives the final
-composed classpath, and any unresolved `${...}` fails the launch instead of
-reaching Java. The regression test lives in `tests/launch_command.rs`
+KI-5 (`${classpath}` inside loader JVM arguments) was fixed in M2: the
+placeholder receives the final composed classpath, and any unresolved `${...}`
+fails the launch instead of reaching Java. Its regression test lives in
+`tests/launch_command.rs`
 (`loader_jvm_classpath_placeholder_is_expanded_to_final_classpath`).
+
+Real Mojang metadata does **not** use `${arch}`: 1.12.2, 1.5.2 and 1.6.4 use a
+plain `natives-windows` classifier. Modern manifests (1.19+) list
+`natives-windows`, `natives-windows-x86` and `natives-windows-arm64` as separate
+libraries with only an OS rule, so the launcher filters those variants by the
+Maven classifier suffix and never puts another architecture's natives on the
+classpath.
+
+## Not verified at runtime
+
+- **Windows ARM64**: selection and rules are covered by table tests, but there
+  is no ARM64 build or ARM64 smoke run. Do not declare ARM64 runtime support
+  until a real launch is verified.
+- **x86**: mapped and tested, but VoidLauncher does not ship an x86 build and
+  managed Java is always x64 (`java_download.rs` requests `architecture=x64`).
+- **Source of the target architecture**: `TargetArch::current()` currently
+  derives from the launcher binary's compile-time target. M3 must replace it
+  with the selected JVM's `os.arch`; until then a native ARM64 launcher with an
+  x64 managed JVM would select the wrong natives.
+- **macOS** is out of scope (Windows-only project); `os.name` normalisation for
+  Mojang's `osx` token is not implemented.
 
 ## Recorded behaviour that is intentional (not a bug)
 
@@ -58,14 +75,3 @@ These are asserted by the normal suite because they are deliberate policy:
 - `build_classpath_entries` does not deduplicate or apply loader overrides;
   ordering/deduplication now happens in the pure `launch::build_launch_profile`
   and is covered by the M2 semantic tests.
-- Modern manifests list `natives-windows`, `natives-windows-arm64` and
-  `natives-windows-x86` as separate libraries whose only rule is
-  `{"os":{"name":"windows"}}` — there is no `arch` condition to filter them.
-  On x64 the normal suite therefore puts all three JARs on the classpath and
-  extracts all three native sets (7 LWJGL modules each in the 1.20.1 golden).
-  M4 must check against the reference launchers whether they filter these
-  classifier suffixes by architecture themselves, or whether shipping the
-  extra JARs is harmless.
-- Related inconsistency to unify in M3: `should_include_library` treats an
-  `x86` rule as matching `x86_64`, while `argument_rule_allows` treats `x86`
-  as never matching. Both should consult one platform context.

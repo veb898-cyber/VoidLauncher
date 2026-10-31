@@ -231,15 +231,110 @@ pub async fn fetch_asset_index(url: &str) -> Result<AssetIndexData> {
     Ok(index)
 }
 
-/// Check if a library should be included based on OS rules
-pub fn should_include_library(lib: &Library) -> bool {
+/// Architecture that native archives and Mojang `arch` rules are selected for.
+///
+/// This is the architecture of the **target JVM/environment**, not the Windows
+/// kernel. It is a parameter rather than a hidden global so the selection can
+/// be tested for every supported architecture.
+///
+/// [`TargetArch::current`] is the provisional source of truth available today:
+/// it reflects the launcher binary's compile-time target. That matches the
+/// managed x64 JVM on Windows x64 and in x64 emulation on Windows ARM64. A
+/// native Windows ARM64 build with an x64 managed JVM would not match; M3 must
+/// replace `current()` at the call site with the selected JVM's `os.arch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetArch {
+    X86,
+    X86_64,
+    Arm64,
+    /// A target architecture this launcher has no mapping for. No native
+    /// archive is selected for it instead of guessing.
+    Unknown,
+}
+
+impl TargetArch {
+    /// Provisional target architecture (see the type documentation).
+    pub fn current() -> Self {
+        match std::env::consts::ARCH {
+            "x86" => Self::X86,
+            "x86_64" => Self::X86_64,
+            "aarch64" => Self::Arm64,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Token used by Mojang's `os.arch` rules and by modern native artifact
+    /// classifiers (`x86`, `x86_64`, `arm64`).
+    fn mojang_name(self) -> Option<&'static str> {
+        match self {
+            Self::X86 => Some("x86"),
+            Self::X86_64 => Some("x86_64"),
+            Self::Arm64 => Some("arm64"),
+            Self::Unknown => None,
+        }
+    }
+
+    /// Token used by the legacy `natives-windows-${arch}` classifier form.
+    /// Mojang only ever published `32` and `64` variants; `arm64` is kept for
+    /// metadata that uses the same placeholder with an ARM64 classifier.
+    fn legacy_token(self) -> Option<&'static str> {
+        match self {
+            Self::X86 => Some("32"),
+            Self::X86_64 => Some("64"),
+            Self::Arm64 => Some("arm64"),
+            Self::Unknown => None,
+        }
+    }
+
+    fn matches_mojang(self, arch: &str) -> bool {
+        self.mojang_name() == Some(arch)
+    }
+}
+
+/// Maven classifier of a coordinate (`group:artifact:version[:classifier]`).
+fn maven_classifier(name: &str) -> Option<&str> {
+    let mut parts = name.split(':');
+    parts.next()?;
+    parts.next()?;
+    parts.next()?;
+    parts.next()
+}
+
+/// Architecture encoded in a modern Windows native artifact classifier.
+///
+/// Modern manifests list LWJGL natives as separate libraries, for example
+/// `org.lwjgl:lwjgl:3.3.1:natives-windows`,
+/// `...:natives-windows-x86` and `...:natives-windows-arm64`, with only an OS
+/// rule. Returns `Some(Some(arch))` for a recognized Windows native bundle,
+/// `Some(None)` for a Windows native bundle whose arch token is unsupported,
+/// and `None` when the library is not a Windows native bundle.
+fn windows_native_arch_from_name(name: &str) -> Option<Option<TargetArch>> {
+    let suffix = maven_classifier(name)?.strip_prefix("natives-windows")?;
+    match suffix {
+        "" => Some(Some(TargetArch::X86_64)),
+        "-x86" => Some(Some(TargetArch::X86)),
+        "-arm64" => Some(Some(TargetArch::Arm64)),
+        _ => Some(None),
+    }
+}
+
+/// Check if a library should be included for a specific target architecture.
+pub(crate) fn should_include_library_for(lib: &Library, target: TargetArch) -> bool {
+    // Modern native artifacts encode their architecture in the Maven
+    // classifier instead of an `os.arch` rule. Do not download or put another
+    // architecture's natives on the classpath.
+    match windows_native_arch_from_name(&lib.name) {
+        Some(Some(arch)) if arch != target => return false,
+        Some(None) => return false,
+        _ => {}
+    }
+
     let rules = match &lib.rules {
         Some(rules) => rules,
         None => return true,
     };
 
     let current_os = std::env::consts::OS;
-    let current_arch = std::env::consts::ARCH;
 
     // Per the version.json spec: libraries with rules are included only if
     // the last matching rule allows them. If no rule matches (e.g. a
@@ -255,11 +350,7 @@ pub fn should_include_library(lib: &Library) -> bool {
                     None => true,
                 };
                 let arch_matches = match &os_rule.arch {
-                    Some(arch) => {
-                        arch == current_arch
-                            || (arch == "x86"
-                                && (current_arch == "x86" || current_arch == "x86_64"))
-                    }
+                    Some(arch) => target.matches_mojang(arch),
                     None => true,
                 };
                 os_matches && arch_matches
@@ -272,6 +363,11 @@ pub fn should_include_library(lib: &Library) -> bool {
     }
 
     dominated_action == "allow"
+}
+
+/// Check if a library should be included for the current target architecture.
+pub fn should_include_library(lib: &Library) -> bool {
+    should_include_library_for(lib, TargetArch::current())
 }
 
 /// Convert Maven-style library name to path
@@ -318,9 +414,11 @@ fn checked_remote_join(base: &Path, relative: &str) -> Result<PathBuf> {
     Ok(joined)
 }
 
-/// Return the native classifier for the current OS (e.g. "natives-windows")
-/// by reading the library's `natives` map, or None if not applicable.
-pub(crate) fn native_classifier(lib: &Library) -> Option<String> {
+/// Return the native classifier for a specific target architecture (e.g.
+/// "natives-windows") by reading the library's `natives` map, or None if not
+/// applicable. A plain classifier is architecture-agnostic legacy metadata; an
+/// `${arch}` placeholder is never resolved for `Unknown`.
+pub(crate) fn native_classifier_for(lib: &Library, target: TargetArch) -> Option<String> {
     let natives = lib.natives.as_ref()?;
     let os_map = natives.as_object()?;
     let os_key = match std::env::consts::OS {
@@ -329,9 +427,43 @@ pub(crate) fn native_classifier(lib: &Library) -> Option<String> {
         _ => std::env::consts::OS,
     };
     let classifier = os_map.get(os_key)?.as_str()?;
-    // Old manifests contain `${arch}` (e.g. "natives-windows-${arch}") —
-    // the launcher always targets 64-bit here.
-    Some(classifier.replace("${arch}", "64"))
+    if classifier.contains("${arch}") {
+        let Some(token) = target.legacy_token() else {
+            tracing::warn!(
+                target: "launcher",
+                "Cannot select native classifier '{}' for an unknown target architecture; no native archive will be used",
+                classifier
+            );
+            return None;
+        };
+        Some(classifier.replace("${arch}", token))
+    } else {
+        Some(classifier.to_string())
+    }
+}
+
+/// Return the native classifier for the current target architecture.
+pub(crate) fn native_classifier(lib: &Library) -> Option<String> {
+    native_classifier_for(lib, TargetArch::current())
+}
+
+/// Look up the native artifact for a selected classifier and warn when the
+/// metadata advertises a native archive that it does not actually contain.
+fn native_classifier_artifact<'a>(
+    classifiers: &'a serde_json::Value,
+    classifier: &str,
+    lib: &Library,
+) -> Option<&'a serde_json::Value> {
+    let artifact = classifiers.get(classifier);
+    if artifact.is_none() {
+        tracing::warn!(
+            target: "launcher",
+            "Native classifier '{}' is missing from metadata for '{}'; no native archive will be used",
+            classifier,
+            lib.name
+        );
+    }
+    artifact
 }
 
 /// Read-only filesystem query used while composing a classpath.
@@ -352,22 +484,19 @@ impl ClasspathProbe for RealClasspathProbe {
     }
 }
 
-/// Build the ordered vanilla classpath entries from version metadata.
-///
-/// Paths come from remote metadata, so every join is validated. An unsafe
-/// path is a hard error (never silently dropped), and a required library
-/// that is missing on disk fails with a clear message instead of letting
-/// Java die later with a cryptic `NoClassDefFoundError`.
-pub fn build_classpath_entries<P: ClasspathProbe + ?Sized>(
+/// Build the ordered vanilla classpath entries for a specific target
+/// architecture. See [`build_classpath_entries`] for validation semantics.
+pub(crate) fn build_classpath_entries_for<P: ClasspathProbe + ?Sized>(
     version_info: &VersionInfo,
     libraries_dir: &Path,
     client_jar: &Path,
     probe: &P,
+    target: TargetArch,
 ) -> Result<Vec<PathBuf>> {
     let mut classpath_entries: Vec<PathBuf> = Vec::new();
 
     for lib in &version_info.libraries {
-        if !should_include_library(lib) {
+        if !should_include_library_for(lib, target) {
             continue;
         }
 
@@ -384,9 +513,11 @@ pub fn build_classpath_entries<P: ClasspathProbe + ?Sized>(
                 }
             }
             // Add native classifier JAR (e.g. lwjgl-3.2.1-natives-windows.jar)
-            if let Some(classifier) = native_classifier(lib) {
+            if let Some(classifier) = native_classifier_for(lib, target) {
                 if let Some(classifiers) = &downloads.classifiers {
-                    if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
+                    if let Some(native_artifact) =
+                        native_classifier_artifact(classifiers, &classifier, lib)
+                    {
                         if let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) {
                             let native_path = checked_remote_join(libraries_dir, path)?;
                             if probe.is_file(&native_path) {
@@ -420,6 +551,27 @@ pub fn build_classpath_entries<P: ClasspathProbe + ?Sized>(
     Ok(classpath_entries)
 }
 
+/// Build the ordered vanilla classpath entries from version metadata.
+///
+/// Paths come from remote metadata, so every join is validated. An unsafe
+/// path is a hard error (never silently dropped), and a required library
+/// that is missing on disk fails with a clear message instead of letting
+/// Java die later with a cryptic `NoClassDefFoundError`.
+pub fn build_classpath_entries<P: ClasspathProbe + ?Sized>(
+    version_info: &VersionInfo,
+    libraries_dir: &Path,
+    client_jar: &Path,
+    probe: &P,
+) -> Result<Vec<PathBuf>> {
+    build_classpath_entries_for(
+        version_info,
+        libraries_dir,
+        client_jar,
+        probe,
+        TargetArch::current(),
+    )
+}
+
 /// Build the vanilla classpath as a platform-separated string.
 ///
 /// Kept as the string-returning convenience used by tests and callers that do
@@ -444,9 +596,14 @@ pub(crate) fn join_classpath(entries: &[PathBuf]) -> String {
         .join(";")
 }
 
-/// Evaluate a single Mojang argument rule entry (`{"rules": [...], "value": ...}`).
-/// `has_custom_resolution` is the only feature flag this launcher can enable.
-fn argument_rule_allows(entry: &serde_json::Value, has_custom_resolution: bool) -> bool {
+/// Evaluate a single Mojang argument rule entry (`{"rules": [...], "value": ...}`)
+/// for a specific target architecture. `has_custom_resolution` is the only
+/// feature flag this launcher can enable.
+fn argument_rule_allows_for(
+    entry: &serde_json::Value,
+    has_custom_resolution: bool,
+    target: TargetArch,
+) -> bool {
     let Some(rules) = entry.get("rules").and_then(|r| r.as_array()) else {
         return true;
     };
@@ -465,14 +622,7 @@ fn argument_rule_allows(entry: &serde_json::Value, has_custom_resolution: bool) 
             }
             if matches {
                 if let Some(arch) = os.get("arch").and_then(|a| a.as_str()) {
-                    let current = std::env::consts::ARCH;
-                    let arch_ok = match arch {
-                        // Launcher always ships 64-bit JVMs; 32-bit rules never apply.
-                        "x86" => false,
-                        "x86_64" => current == "x86_64",
-                        a => a == current,
-                    };
-                    if !arch_ok {
+                    if !target.matches_mojang(arch) {
                         matches = false;
                     }
                 }
@@ -512,20 +662,30 @@ fn expand_argument_value(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// Evaluate Mojang `arguments` entries: plain strings pass through, objects
-/// with `rules`/`value` are evaluated against the current OS/arch/features.
-fn evaluate_arguments(args: &[serde_json::Value], has_custom_resolution: bool) -> Vec<String> {
+/// Evaluate Mojang `arguments` entries for a target architecture: plain
+/// strings pass through, objects with `rules`/`value` are evaluated against the
+/// target OS/arch/features.
+fn evaluate_arguments_for(
+    args: &[serde_json::Value],
+    has_custom_resolution: bool,
+    target: TargetArch,
+) -> Vec<String> {
     let mut out = Vec::new();
     for arg in args {
         if let Some(s) = arg.as_str() {
             out.push(s.to_string());
-        } else if arg.is_object() && argument_rule_allows(arg, has_custom_resolution) {
+        } else if arg.is_object() && argument_rule_allows_for(arg, has_custom_resolution, target) {
             if let Some(value) = arg.get("value") {
                 expand_argument_value(value, &mut out);
             }
         }
     }
     out
+}
+
+/// Evaluate Mojang `arguments` entries for the current target architecture.
+fn evaluate_arguments(args: &[serde_json::Value], has_custom_resolution: bool) -> Vec<String> {
+    evaluate_arguments_for(args, has_custom_resolution, TargetArch::current())
 }
 
 /// Split legacy `minecraftArguments` respecting double quotes
@@ -586,15 +746,16 @@ pub fn get_jvm_arguments(version_info: &VersionInfo) -> Vec<String> {
     }
 }
 
-/// Collect all files that need to be downloaded for a version, including native
-/// classifier JARs (e.g. lwjgl natives for the current platform).
+/// Collect all files that need to be downloaded for a version for a specific
+/// target architecture, including native classifier JARs (e.g. lwjgl natives).
 ///
 /// Every path is validated before joining. Invalid metadata fails the whole
 /// collection rather than silently omitting a required file.
-pub fn collect_downloads(
+fn collect_downloads_for(
     version_info: &VersionInfo,
     libraries_dir: &Path,
     versions_dir: &Path,
+    target: TargetArch,
 ) -> Result<Vec<(String, PathBuf, String, u64)>> {
     // Returns: (url, local_path, sha1, size)
     let mut files = Vec::new();
@@ -622,7 +783,7 @@ pub fn collect_downloads(
 
     // Libraries
     for lib in &version_info.libraries {
-        if !should_include_library(lib) {
+        if !should_include_library_for(lib, target) {
             continue;
         }
 
@@ -639,10 +800,12 @@ pub fn collect_downloads(
                     ));
                 }
             }
-            // Native classifier artifact for current OS
-            if let Some(classifier) = native_classifier(lib) {
+            // Native classifier artifact for the target architecture
+            if let Some(classifier) = native_classifier_for(lib, target) {
                 if let Some(classifiers) = &downloads.classifiers {
-                    if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
+                    if let Some(native_artifact) =
+                        native_classifier_artifact(classifiers, &classifier, lib)
+                    {
                         if let (Some(url), Some(path), Some(sha1), Some(size)) = (
                             native_artifact.get("url").and_then(|u| u.as_str()),
                             native_artifact.get("path").and_then(|p| p.as_str()),
@@ -674,6 +837,24 @@ pub fn collect_downloads(
     Ok(files)
 }
 
+/// Collect all files that need to be downloaded for a version, including native
+/// classifier JARs for the current target architecture.
+///
+/// Every path is validated before joining. Invalid metadata fails the whole
+/// collection rather than silently omitting a required file.
+pub fn collect_downloads(
+    version_info: &VersionInfo,
+    libraries_dir: &Path,
+    versions_dir: &Path,
+) -> Result<Vec<(String, PathBuf, String, u64)>> {
+    collect_downloads_for(
+        version_info,
+        libraries_dir,
+        versions_dir,
+        TargetArch::current(),
+    )
+}
+
 /// Load a saved asset index (e.g. `indexes/legacy.json`) from disk
 pub fn load_asset_index(path: &Path) -> Result<AssetIndexData> {
     let contents = std::fs::read_to_string(path)
@@ -701,7 +882,9 @@ pub async fn ensure_native_libraries(
         if let Some(classifier) = native_classifier(lib) {
             if let Some(downloads) = &lib.downloads {
                 if let Some(classifiers) = &downloads.classifiers {
-                    if let Some(native_artifact) = classifiers.get(classifier.as_str()) {
+                    if let Some(native_artifact) =
+                        native_classifier_artifact(classifiers, &classifier, lib)
+                    {
                         if let (Some(url), Some(path), sha1) = (
                             native_artifact.get("url").and_then(|u| u.as_str()),
                             native_artifact.get("path").and_then(|p| p.as_str()),
@@ -889,7 +1072,8 @@ fn extract_natives_into(
         let Some(classifiers) = &downloads.classifiers else {
             continue;
         };
-        let Some(native_artifact) = classifiers.get(classifier.as_str()) else {
+        let Some(native_artifact) = native_classifier_artifact(classifiers, &classifier, lib)
+        else {
             continue;
         };
         let Some(path) = native_artifact.get("path").and_then(|p| p.as_str()) else {
@@ -1180,16 +1364,39 @@ mod tests {
     }
 
     #[test]
-    fn native_classifier_substitutes_arch() {
+    fn native_classifier_substitutes_arch_per_target() {
         let lib = library_with_natives("natives-windows-${arch}");
-        let classifier = native_classifier(&lib).expect("classifier expected");
-        assert_eq!(classifier, "natives-windows-64");
+        for (target, expected) in [
+            (TargetArch::X86, Some("natives-windows-32")),
+            (TargetArch::X86_64, Some("natives-windows-64")),
+            (TargetArch::Arm64, Some("natives-windows-arm64")),
+            (TargetArch::Unknown, None),
+        ] {
+            assert_eq!(
+                native_classifier_for(&lib, target).as_deref(),
+                expected,
+                "unexpected classifier for {:?}",
+                target
+            );
+        }
     }
 
     #[test]
     fn native_classifier_plain_windows() {
         let lib = library_with_natives("natives-windows");
-        assert_eq!(native_classifier(&lib).as_deref(), Some("natives-windows"));
+        for target in [
+            TargetArch::X86,
+            TargetArch::X86_64,
+            TargetArch::Arm64,
+            TargetArch::Unknown,
+        ] {
+            assert_eq!(
+                native_classifier_for(&lib, target).as_deref(),
+                Some("natives-windows"),
+                "a plain legacy classifier is not architecture-specific ({:?})",
+                target
+            );
+        }
     }
 
     #[test]
@@ -1202,6 +1409,318 @@ mod tests {
             downloads: None,
         };
         assert!(native_classifier(&lib).is_none());
+    }
+
+    fn library_named(name: &str) -> Library {
+        Library {
+            name: name.to_string(),
+            url: None,
+            rules: None,
+            natives: None,
+            downloads: None,
+        }
+    }
+
+    #[test]
+    fn native_name_classifier_filters_foreign_architectures() {
+        let cases = [
+            (
+                "org.lwjgl:lwjgl:3.3.1:natives-windows",
+                TargetArch::X86_64,
+                true,
+            ),
+            (
+                "org.lwjgl:lwjgl:3.3.1:natives-windows",
+                TargetArch::X86,
+                false,
+            ),
+            (
+                "org.lwjgl:lwjgl:3.3.1:natives-windows",
+                TargetArch::Arm64,
+                false,
+            ),
+            (
+                "org.lwjgl:lwjgl:3.3.1:natives-windows-x86",
+                TargetArch::X86,
+                true,
+            ),
+            (
+                "org.lwjgl:lwjgl:3.3.1:natives-windows-x86",
+                TargetArch::X86_64,
+                false,
+            ),
+            (
+                "org.lwjgl:lwjgl:3.3.1:natives-windows-arm64",
+                TargetArch::Arm64,
+                true,
+            ),
+            (
+                "org.lwjgl:lwjgl:3.3.1:natives-windows-arm64",
+                TargetArch::X86_64,
+                false,
+            ),
+            (
+                "org.lwjgl:lwjgl:3.3.1:natives-windows-arm64",
+                TargetArch::X86,
+                false,
+            ),
+            (
+                "org.lwjgl:lwjgl:3.3.1:natives-windows-arm",
+                TargetArch::Arm64,
+                false,
+            ),
+            ("org.lwjgl:lwjgl:3.3.1", TargetArch::X86_64, true),
+        ];
+
+        for (name, target, expected) in cases {
+            assert_eq!(
+                should_include_library_for(&library_named(name), target),
+                expected,
+                "unexpected inclusion for '{}' on {:?}",
+                name,
+                target
+            );
+        }
+    }
+
+    fn library_with_arch_rule(arch: &str) -> Library {
+        Library {
+            name: "org.example:arch-specific:1.0".to_string(),
+            url: None,
+            rules: Some(vec![Rule {
+                action: "allow".to_string(),
+                os: Some(OsRule {
+                    name: Some("windows".to_string()),
+                    arch: Some(arch.to_string()),
+                }),
+            }]),
+            natives: None,
+            downloads: None,
+        }
+    }
+
+    #[test]
+    fn library_arch_rule_matches_only_the_target_architecture() {
+        for (target, expected) in [
+            (TargetArch::X86, "x86"),
+            (TargetArch::X86_64, "x86_64"),
+            (TargetArch::Arm64, "arm64"),
+        ] {
+            assert!(
+                should_include_library_for(&library_with_arch_rule(expected), target),
+                "the {} rule must match {:?}",
+                expected,
+                target
+            );
+            for other in ["x86", "x86_64", "arm64"] {
+                if other != expected {
+                    assert!(
+                        !should_include_library_for(&library_with_arch_rule(other), target),
+                        "the {} rule must not match {:?}",
+                        other,
+                        target
+                    );
+                }
+            }
+        }
+        assert!(
+            !should_include_library_for(&library_with_arch_rule("x86_64"), TargetArch::Unknown),
+            "unknown targets must not match an architecture rule"
+        );
+    }
+
+    #[test]
+    fn argument_arch_rules_match_mojang_tokens() {
+        for (target, expected) in [
+            (TargetArch::X86, "x86"),
+            (TargetArch::X86_64, "x86_64"),
+            (TargetArch::Arm64, "arm64"),
+        ] {
+            let entry = serde_json::json!({
+                "rules": [{ "action": "allow", "os": { "name": "windows", "arch": expected } }],
+                "value": "-Darch=true"
+            });
+            assert!(
+                argument_rule_allows_for(&entry, false, target),
+                "the {} rule must match {:?}",
+                expected,
+                target
+            );
+            assert!(
+                !argument_rule_allows_for(&entry, false, TargetArch::Unknown),
+                "an unknown target must not match the {} rule",
+                expected
+            );
+        }
+    }
+
+    struct ExistingFiles(std::collections::HashSet<PathBuf>);
+
+    impl ClasspathProbe for ExistingFiles {
+        fn is_file(&self, path: &Path) -> bool {
+            self.0.contains(path)
+        }
+    }
+
+    fn native_artifact_json(name: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "downloads": {
+                "artifact": {
+                    "path": path,
+                    "sha1": "",
+                    "size": 1,
+                    "url": format!("https://libraries.minecraft.net/{}", path)
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn classpath_includes_only_the_target_architecture_native_variant() {
+        let plain = "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows.jar";
+        let x86 = "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows-x86.jar";
+        let arm64 = "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows-arm64.jar";
+        let vi = version_info_with_libraries(serde_json::json!([
+            native_artifact_json(
+                "org.lwjgl:lwjgl:3.3.1",
+                "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar"
+            ),
+            native_artifact_json("org.lwjgl:lwjgl:3.3.1:natives-windows", plain),
+            native_artifact_json("org.lwjgl:lwjgl:3.3.1:natives-windows-x86", x86),
+            native_artifact_json("org.lwjgl:lwjgl:3.3.1:natives-windows-arm64", arm64),
+        ]));
+        let libraries = Path::new("libraries");
+        let client = Path::new("versions/1.20.1/client.jar");
+
+        let mut existing = std::collections::HashSet::new();
+        for path in [plain, x86, arm64, "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar"] {
+            existing.insert(libraries.join(path));
+        }
+        let probe = ExistingFiles(existing);
+
+        let entries =
+            build_classpath_entries_for(&vi, libraries, client, &probe, TargetArch::X86_64)
+                .expect("classpath");
+        assert_eq!(
+            entries,
+            vec![
+                libraries.join("org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar"),
+                libraries.join(plain),
+                client.to_path_buf(),
+            ],
+            "only the x86_64 native variant may be put on the x64 classpath"
+        );
+
+        let entries =
+            build_classpath_entries_for(&vi, libraries, client, &probe, TargetArch::Arm64)
+                .expect("arm64 classpath");
+        assert_eq!(
+            entries,
+            vec![
+                libraries.join("org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar"),
+                libraries.join(arm64),
+                client.to_path_buf(),
+            ],
+            "only the arm64 native variant may be put on the arm64 classpath"
+        );
+
+        let entries = build_classpath_entries_for(&vi, libraries, client, &probe, TargetArch::X86)
+            .expect("x86 classpath");
+        assert_eq!(
+            entries,
+            vec![
+                libraries.join("org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar"),
+                libraries.join(x86),
+                client.to_path_buf(),
+            ],
+            "only the x86 native variant may be put on the x86 classpath"
+        );
+    }
+
+    #[test]
+    fn classpath_does_not_fall_back_to_another_native_classifier() {
+        let main = "org/example/native/1.0/native-1.0.jar";
+        let x64 = "org/example/native/1.0/native-1.0-natives-windows-64.jar";
+        let vi = version_info_with_libraries(serde_json::json!([{
+            "name": "org.example:native:1.0",
+            "natives": { "windows": "natives-windows-${arch}" },
+            "downloads": {
+                "artifact": {
+                    "path": main,
+                    "sha1": "",
+                    "size": 1,
+                    "url": format!("https://libraries.minecraft.net/{}", main)
+                },
+                "classifiers": {
+                    "natives-windows-64": {
+                        "path": x64,
+                        "sha1": "",
+                        "size": 1,
+                        "url": format!("https://libraries.minecraft.net/{}", x64)
+                    }
+                }
+            }
+        }]));
+        let libraries = Path::new("libraries");
+        let client = Path::new("versions/1.20.1/client.jar");
+        let mut existing = std::collections::HashSet::new();
+        for path in [main, x64] {
+            existing.insert(libraries.join(path));
+        }
+        let probe = ExistingFiles(existing);
+
+        let entries =
+            build_classpath_entries_for(&vi, libraries, client, &probe, TargetArch::Arm64)
+                .expect("classpath");
+        assert_eq!(
+            entries,
+            vec![libraries.join(main), client.to_path_buf()],
+            "when the arm64 classifier is absent, the x64 archive must not be used"
+        );
+    }
+
+    #[test]
+    fn downloads_skip_foreign_native_architectures() {
+        let plain = "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows.jar";
+        let x86 = "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows-x86.jar";
+        let arm64 = "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows-arm64.jar";
+        let vi = version_info_with_libraries(serde_json::json!([
+            native_artifact_json("org.lwjgl:lwjgl:3.3.1:natives-windows", plain),
+            native_artifact_json("org.lwjgl:lwjgl:3.3.1:natives-windows-x86", x86),
+            native_artifact_json("org.lwjgl:lwjgl:3.3.1:natives-windows-arm64", arm64),
+        ]));
+
+        for (target, expected) in [
+            (TargetArch::X86, x86),
+            (TargetArch::X86_64, plain),
+            (TargetArch::Arm64, arm64),
+        ] {
+            let files =
+                collect_downloads_for(&vi, Path::new("libraries"), Path::new("versions"), target)
+                    .expect("downloads");
+            let names: Vec<String> = files
+                .iter()
+                .map(|(_, path, _, _)| path.to_string_lossy().to_string())
+                .collect();
+            assert!(
+                names.iter().any(|name| name.ends_with(expected)),
+                "the {:?} native archive must be downloaded: {:?}",
+                target,
+                names
+            );
+            for foreign in [plain, x86, arm64] {
+                if foreign != expected {
+                    assert!(
+                        !names.iter().any(|name| name.ends_with(foreign)),
+                        "the {:?} native archive must not be downloaded for {:?}: {:?}",
+                        foreign,
+                        target,
+                        names
+                    );
+                }
+            }
+        }
     }
 
     fn lib_with_rules(rules: Option<Vec<Rule>>) -> Library {

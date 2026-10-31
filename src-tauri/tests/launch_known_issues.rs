@@ -1,13 +1,12 @@
 //! Regression tests for launch-composition defects recorded in
 //! `tests/KNOWN_ISSUES.md`.
 //!
-//! KI-1 and KI-2 are fixed: their tests now run with the normal suite. KI-3 and
-//! KI-4 are still open and therefore `#[ignore]`d — they encode the *correct*
-//! expectation, so `cargo test -- --ignored` shows the remaining gap without
-//! turning the bug into an accepted baseline.
+//! KI-1 through KI-4 are fixed and their tests run with the normal suite. They
+//! encode behaviour the launcher is supposed to keep; a failure means the
+//! defect came back, not that the expectation should be relaxed.
 //!
-//! Tests must never be un-ignored to "make CI pass" while the defect is real;
-//! they encode behaviour the launcher is supposed to have.
+//! `KNOWN_ISSUES.md` keeps the history and lists what has not been verified at
+//! runtime yet (Windows ARM64 in particular).
 
 #![cfg(target_os = "windows")]
 
@@ -112,6 +111,10 @@ fn native_library_json() -> serde_json::Value {
                 "sha1": "", "size": 0, "url": ""
             },
             "classifiers": {
+                "natives-windows-32": {
+                    "path": "org/example/native/1.0/native-1.0-natives-windows-32.jar",
+                    "sha1": "", "size": 0, "url": ""
+                },
                 "natives-windows-64": {
                     "path": "org/example/native/1.0/native-1.0-natives-windows-64.jar",
                     "sha1": "", "size": 0, "url": ""
@@ -404,31 +407,34 @@ fn native_extraction_reports_a_native_file_that_cannot_be_replaced() {
 }
 
 // ---------------------------------------------------------------------------
-// KI-3: `${arch}` is hardcoded to the x64 classifier
+// KI-3: `${arch}` must follow the target architecture
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "known issue KI-3: ${arch} becomes '64' regardless of host architecture"]
-fn native_classifier_uses_the_real_host_architecture() {
+fn native_classifier_uses_the_target_architecture() {
     let temp = TempData::new("known-arch-classifier");
     let libraries = temp.path().join("libraries");
     let client = temp.path().join("client.jar");
     std::fs::write(&client, b"").expect("client jar");
-    for path in [
-        "org/example/native/1.0/native-1.0.jar",
+    let variants = [
+        "org/example/native/1.0/native-1.0-natives-windows-32.jar",
         "org/example/native/1.0/native-1.0-natives-windows-64.jar",
         "org/example/native/1.0/native-1.0-natives-windows-arm64.jar",
-    ] {
+    ];
+    for path in std::iter::once("org/example/native/1.0/native-1.0.jar").chain(variants) {
         write_empty(&libraries.join(path));
     }
 
     let version = synthetic_version(native_library_json(), serde_json::json!([]));
     let classpath = build_classpath(&version, &libraries, &client).expect("classpath");
 
-    // On x64 the current hardcoding happens to be right; the bug only shows on
-    // Windows ARM64, where Mojang expects the `arm64` classifier.
+    // The provisional target is the launcher build's architecture; M3 replaces
+    // it with the selected JVM's `os.arch`. Only that architecture's classifier
+    // may appear, and the others must stay off the classpath.
     let expected = if cfg!(target_arch = "aarch64") {
         "native-1.0-natives-windows-arm64.jar"
+    } else if cfg!(target_arch = "x86") {
+        "native-1.0-natives-windows-32.jar"
     } else {
         "native-1.0-natives-windows-64.jar"
     };
@@ -438,14 +444,28 @@ fn native_classifier_uses_the_real_host_architecture() {
         expected,
         classpath
     );
+    for foreign in variants {
+        let foreign = Path::new(foreign)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        if foreign != expected {
+            assert!(
+                !classpath.contains(&foreign),
+                "the {} classifier belongs to another architecture and must not be on the classpath:\n{}",
+                foreign,
+                classpath
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// KI-4: Mojang `arm64` argument rules never match
+// KI-4: Mojang `arm64` argument rules must match on ARM64
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "known issue KI-4: rules with arch 'arm64' never match (host arch is reported as 'aarch64')"]
 fn arm64_argument_rule_matches_on_arm64_hosts() {
     let version = synthetic_version(
         serde_json::json!([]),
