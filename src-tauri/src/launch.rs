@@ -286,6 +286,37 @@ impl PlaceholderContext<'_> {
             .replace("${launcher_name}", LAUNCHER_NAME)
             .replace("${launcher_version}", LAUNCHER_VERSION)
     }
+
+    /// Tokens [`Self::expand`] knows how to replace. Kept next to `expand` so
+    /// the two lists cannot drift silently; `placeholder_expansion_covers_every_known_token`
+    /// exercises every entry through `expand_checked`.
+    fn is_known(token: &str) -> bool {
+        matches!(
+            token,
+            "${auth_player_name}"
+                | "${version_name}"
+                | "${game_directory}"
+                | "${assets_root}"
+                | "${game_assets}"
+                | "${assets_index_name}"
+                | "${auth_uuid}"
+                | "${auth_access_token}"
+                | "${auth_session}"
+                | "${user_type}"
+                | "${version_type}"
+                | "${auth_xuid}"
+                | "${clientid}"
+                | "${user_properties}"
+                | "${resolution_width}"
+                | "${resolution_height}"
+                | "${natives_directory}"
+                | "${library_directory}"
+                | "${classpath_separator}"
+                | "${classpath}"
+                | "${launcher_name}"
+                | "${launcher_version}"
+        )
+    }
 }
 
 /// Expand a metadata-provided argument and fail loudly if a placeholder
@@ -297,14 +328,35 @@ impl PlaceholderContext<'_> {
 /// arguments are intentionally not passed through this check — they are the
 /// user's responsibility and may legitimately contain `${...}`.
 fn expand_checked(arg: &str, placeholders: &PlaceholderContext<'_>, kind: &str) -> Result<String> {
-    let expanded = placeholders.expand(arg);
-    if expanded.contains("${") {
+    if let Some(token) = unknown_template_placeholder(arg) {
         return Err(LauncherError::Launch(format!(
-            "Unresolved {} placeholder after expansion: {}",
-            kind, expanded
+            "Unresolved {} placeholder after expansion: {} (in {})",
+            kind, token, arg
         )));
     }
-    Ok(expanded)
+    Ok(placeholders.expand(arg))
+}
+
+/// Find a `${...}` token in a metadata *template* that the launcher does not
+/// know how to replace.
+///
+/// Only the template is checked. The expanded value may legitimately contain
+/// `${...}` when a substituted value (an instance directory, a username, ...)
+/// contains it; that text is data, not a placeholder.
+fn unknown_template_placeholder(template: &str) -> Option<String> {
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Some(rest[start..].to_string());
+        };
+        let token = &rest[start..start + 2 + end + 1];
+        if !PlaceholderContext::is_known(token) {
+            return Some(token.to_string());
+        }
+        rest = &rest[start + 2 + end + 1..];
+    }
+    None
 }
 
 /// Compose a launch profile from pure inputs and an injected FS probe.

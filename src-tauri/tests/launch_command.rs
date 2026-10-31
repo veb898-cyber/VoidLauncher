@@ -860,6 +860,51 @@ fn manifest_jvm_classpath_placeholder_is_expanded() {
 }
 
 #[test]
+fn literal_dollar_brace_in_instance_path_is_not_a_placeholder() {
+    // Instance names are free-form apart from path-safety rules, so a valid
+    // name may contain `${...}` — even a known token name. The expanded
+    // --gameDir must be treated as data, not as an unresolved placeholder.
+    let mut fixture = Fixture::new("literal-dollar", "1.20.1");
+    fixture.instance.name = "${game_directory}".to_string();
+    let command = fixture.build();
+
+    let expected_game_dir = fixture
+        .config
+        .instances_dir()
+        .join("${game_directory}")
+        .join(".minecraft")
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(value_after(&command.args, "--gameDir"), expected_game_dir);
+    assert_eq!(value_after(&command.args, "--username"), TEST_USERNAME);
+}
+
+#[test]
+fn unknown_metadata_placeholder_is_still_rejected() {
+    let loader = LoaderProfile {
+        main_class: "example.UnknownPlaceholderMain".to_string(),
+        libraries: Vec::new(),
+        jvm_args: vec!["-Dunknown=${not_a_known_token}".to_string()],
+        game_args: Vec::new(),
+        legacy_args: false,
+    };
+    let fixture =
+        Fixture::new("unknown-placeholder", "1.20.1").with_loader(LoaderType::Fabric, loader);
+    let err = fixture.build_err();
+
+    assert!(
+        err.contains("Unresolved JVM placeholder"),
+        "expected a JVM placeholder error, got: {}",
+        err
+    );
+    assert!(
+        err.contains("${not_a_known_token}"),
+        "error must identify the unresolved token, got: {}",
+        err
+    );
+}
+
+#[test]
 fn manifest_gc_flags_are_stripped_and_custom_args_follow_preset() {
     let fixture = Fixture::new("gc-strip", "1.20.1");
     let mut version = fixture.version.clone();
