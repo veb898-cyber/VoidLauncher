@@ -1035,6 +1035,7 @@ pub fn find_all_java_installations(data_dir: &Path) -> Vec<JavaInstallation> {
                 major_version: m.major_version,
                 is_64bit: m.is_64bit,
                 vendor: m.vendor,
+                arch: m.arch,
             }),
     );
     installations

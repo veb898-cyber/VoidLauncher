@@ -17,6 +17,9 @@ pub struct JavaDownloadProgress {
 }
 
 /// Managed Java runtime info
+///
+/// `arch` defaults for records from older launcher builds that serialized
+/// this struct before arch detection existed.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ManagedJavaRuntime {
     pub major_version: u32,
@@ -24,6 +27,8 @@ pub struct ManagedJavaRuntime {
     pub version: String,
     pub vendor: String,
     pub is_64bit: bool,
+    #[serde(default)]
+    pub arch: crate::java::JavaArch,
 }
 
 /// Available Java version from Adoptium API
@@ -269,6 +274,7 @@ async fn download_java_runtime_inner(
                     version: install.version,
                     vendor: install.vendor,
                     is_64bit: install.is_64bit,
+                    arch: install.arch,
                 });
             }
         }
@@ -520,6 +526,7 @@ async fn download_java_runtime_inner(
         version: install.version,
         vendor: install.vendor,
         is_64bit: install.is_64bit,
+        arch: install.arch,
     })
 }
 
@@ -549,6 +556,7 @@ pub fn list_managed_java(data_dir: &Path) -> Vec<ManagedJavaRuntime> {
                         version: install.version,
                         vendor: install.vendor,
                         is_64bit: install.is_64bit,
+                        arch: install.arch,
                     });
                 }
             }
