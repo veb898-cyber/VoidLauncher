@@ -128,6 +128,173 @@ fn native_library_json() -> serde_json::Value {
     }])
 }
 
+/// Two synthetic `${arch}` libraries whose native JARs carry real entries, so
+/// concurrent extraction has real files to replace.
+fn native_pair_library_json() -> serde_json::Value {
+    let mut libraries = Vec::new();
+    for artifact in ["native-a", "native-b"] {
+        libraries.push(serde_json::json!({
+            "name": format!("org.example:{}:1.0", artifact),
+            "natives": { "windows": "natives-windows-${arch}" },
+            "downloads": {
+                "artifact": {
+                    "path": format!("org/example/{}/1.0/{}-1.0.jar", artifact, artifact),
+                    "sha1": "", "size": 0, "url": ""
+                },
+                "classifiers": {
+                    "natives-windows-32": {
+                        "path": format!(
+                            "org/example/{}/1.0/{}-1.0-natives-windows-32.jar",
+                            artifact, artifact
+                        ),
+                        "sha1": "", "size": 0, "url": ""
+                    },
+                    "natives-windows-64": {
+                        "path": format!(
+                            "org/example/{}/1.0/{}-1.0-natives-windows-64.jar",
+                            artifact, artifact
+                        ),
+                        "sha1": "", "size": 0, "url": ""
+                    },
+                    "natives-windows-arm64": {
+                        "path": format!(
+                            "org/example/{}/1.0/{}-1.0-natives-windows-arm64.jar",
+                            artifact, artifact
+                        ),
+                        "sha1": "", "size": 0, "url": ""
+                    }
+                }
+            }
+        }));
+    }
+    serde_json::json!(libraries)
+}
+
+/// Write every classifier JAR for both synthetic libraries so entries carry
+/// `build` bytes; a new build differs from a previous one.
+fn write_native_pair_jars(libraries: &Path, build: &[u8]) {
+    let entries_a = [("alpha.dll", build)];
+    let entries_b = [("beta.dll", build), ("nested/gamma.dll", build)];
+    let jars = [
+        ("native-a", entries_a.as_slice()),
+        ("native-b", entries_b.as_slice()),
+    ];
+    for (artifact, jar_entries) in jars {
+        let base = format!(
+            "org/example/{}/1.0/{}-1.0-natives-windows",
+            artifact, artifact
+        );
+        for suffix in ["-32", "-64", "-arm64"] {
+            let path = libraries.join(format!("{}{}.jar", base, suffix));
+            write_native_jar(&path, jar_entries);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A4: concurrent native preparation of the same version directory
+// ---------------------------------------------------------------------------
+
+/// Two extractors and a game start racing for `versions/<id>/natives`. A
+/// barrier lines all threads up so the filesystem interleavings of
+/// `extract_natives` really collide; whatever the interleaving, the directory
+/// must end up holding exactly the current set with the manifest to match.
+#[test]
+fn concurrent_native_preparation_of_the_same_version_converges() {
+    use std::sync::{Arc, Barrier};
+
+    const THREADS: usize = 4;
+    const WANTED: [&str; 3] = ["alpha.dll", "beta.dll", "nested/gamma.dll"];
+    let builds: &[&[u8]] = &[b"build-one", b"build-two"];
+
+    fn list_files(dir: &Path, base: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read directory") {
+            let entry = entry.expect("read dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                list_files(&path, base, out);
+            } else {
+                let relative = path.strip_prefix(base).expect("file below base");
+                out.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    let temp = TempData::new("known-natives-concurrent");
+    let libraries = temp.path().join("libraries");
+    let natives_dir = temp.path().join("versions/synthetic/natives");
+    let libs_json = Arc::new(native_pair_library_json());
+
+    for build in builds {
+        write_native_pair_jars(&libraries, build);
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let libraries = libraries.clone();
+                let natives_dir = natives_dir.clone();
+                let libs = libs_json.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let version = synthetic_version(libs.as_ref().clone(), serde_json::json!([]));
+                    extract_natives(&version, &libraries, &natives_dir)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let result = handle.join().expect("extraction thread panicked");
+            result.expect("concurrent extraction must succeed");
+        }
+
+        // Staging directories are per-caller and removed even on failure.
+        assert!(
+            staging_leftovers(&natives_dir).is_empty(),
+            "staging directories must not survive concurrent extraction"
+        );
+
+        // Exactly the desired files, with the newest build's bytes.
+        for relative in WANTED {
+            let file = natives_dir.join(relative);
+            assert!(
+                file.is_file(),
+                "{} must exist after concurrent extraction",
+                relative
+            );
+            assert_eq!(
+                std::fs::read(&file).expect("read native file"),
+                *build,
+                "{} must carry the current build's bytes",
+                relative
+            );
+        }
+
+        // Nothing else: no temporary install files, no unexpected files.
+        let mut files: Vec<String> = Vec::new();
+        list_files(&natives_dir, &natives_dir, &mut files);
+        files.retain(|name| name != ".voidlauncher-natives.json");
+        assert_eq!(
+            files,
+            WANTED.map(|relative| relative.to_string()).to_vec(),
+            "concurrent extraction must leave exactly the native set"
+        );
+
+        let manifest: Vec<String> = serde_json::from_str(
+            &std::fs::read_to_string(natives_dir.join(".voidlauncher-natives.json"))
+                .expect("read natives manifest"),
+        )
+        .expect("parse natives manifest");
+        assert_eq!(
+            manifest,
+            WANTED.map(|relative| relative.to_string()).to_vec(),
+            "the manifest must describe exactly the extracted set"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KI-1: stale native files are never refreshed
 // ---------------------------------------------------------------------------

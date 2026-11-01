@@ -954,6 +954,15 @@ fn natives_staging_dir(natives_dir: &Path) -> PathBuf {
     parent.join(format!(".natives-staging-{}", unique_suffix()))
 }
 
+/// Recognize launcher-owned transitory files (native install temps, manifest
+/// temps). Concurrent preparations always leave some behind mid-flight, and a
+/// stale sweep must never consider them launcher-owned garbage to delete:
+/// that deletes the file another caller is about to rename.
+fn is_launcher_temp_file(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    name.starts_with('.') && name.ends_with(".tmp") && name.contains(".voidlauncher-")
+}
+
 /// Relative paths of every regular file below `root`, sorted for determinism.
 fn collect_relative_files(root: &Path) -> Result<Vec<String>> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
@@ -991,7 +1000,7 @@ fn collect_relative_files(root: &Path) -> Result<Vec<String>> {
                     ))
                 })?;
                 let relative = relative.to_string_lossy().replace('\\', "/");
-                if relative != NATIVES_MANIFEST {
+                if relative != NATIVES_MANIFEST && !is_launcher_temp_file(&relative) {
                     out.push(relative);
                 }
             }
@@ -1029,24 +1038,26 @@ fn write_natives_manifest(natives_dir: &Path, files: &[String]) -> Result<()> {
             e
         ))
     })?;
-    if manifest.exists() {
-        if let Err(e) = std::fs::remove_file(&manifest) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(LauncherError::Version(format!(
+    // Concurrent preparations write the same manifest path; the same
+    // delete-pending race applies, so use the shared retrying replacement.
+    replace_file_with_retry(
+        &temporary,
+        &manifest,
+        |e| {
+            LauncherError::Version(format!(
                 "Failed to replace natives manifest {}: {}",
                 manifest.display(),
                 e
-            )));
-        }
-    }
-    std::fs::rename(&temporary, &manifest).map_err(|e| {
-        let _ = std::fs::remove_file(&temporary);
-        LauncherError::Version(format!(
-            "Failed to write natives manifest {}: {}",
-            manifest.display(),
-            e
-        ))
-    })
+            ))
+        },
+        |e| {
+            LauncherError::Version(format!(
+                "Failed to write natives manifest {}: {}",
+                manifest.display(),
+                e
+            ))
+        },
+    )
 }
 
 /// Extract every required native JAR into a fresh staging directory. Any
@@ -1174,6 +1185,54 @@ fn files_equal(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// How many attempts a preflight write-open makes when the destination is
+/// transiently delete-pending by a concurrent preparer.
+const PENDING_OPEN_ATTEMPTS: usize = 8;
+
+/// Replace `destination` with `temporary` atomically. Windows cannot rename
+/// over an entry that is still delete-pending, so a collision with a
+/// concurrent preparer needs another attempt after the entry settles; a
+/// destination that is genuinely locked (a running game) keeps failing every
+/// attempt and is reported by `on_locked`, otherwise `on_rename` reports a
+/// rename that fails even after the destination was dropped.
+fn replace_file_with_retry<FLocked, FRename>(
+    temporary: &Path,
+    destination: &Path,
+    on_locked: FLocked,
+    on_rename: FRename,
+) -> Result<()>
+where
+    FLocked: Fn(std::io::Error) -> LauncherError,
+    FRename: Fn(std::io::Error) -> LauncherError,
+{
+    const RENAME_ATTEMPTS: usize = 8;
+    for attempt in 0..RENAME_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(attempt as u64));
+        }
+        match std::fs::rename(temporary, destination) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt + 1 < RENAME_ATTEMPTS => continue,
+            Err(_) => {}
+        }
+        // After all retries: drop the destination so the replacement can
+        // proceed. A removal failure means the file is not ours to replace.
+        if let Err(e) = std::fs::remove_file(destination) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                let _ = std::fs::remove_file(temporary);
+                return Err(on_locked(e));
+            }
+        }
+        let rename_result = std::fs::rename(temporary, destination);
+        let _ = std::fs::remove_file(temporary);
+        return match rename_result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(on_rename(e)),
+        };
+    }
+    unreachable!("the retry loop always returns")
+}
+
 /// Move one staged file into place. The destination is removed only after the
 /// staged copy exists, so a lock/read-only failure leaves the old file intact
 /// and is reported with the path that could not be replaced.
@@ -1194,25 +1253,24 @@ fn install_native_file(source: &Path, destination: &Path) -> Result<()> {
         ))
     })?;
 
-    if destination.exists() {
-        if let Err(e) = std::fs::remove_file(destination) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(LauncherError::Version(format!(
+    replace_file_with_retry(
+        &temporary,
+        destination,
+        |e| {
+            LauncherError::Version(format!(
                 "Cannot replace native file {}: {}. Close any running game that uses this version and try again.",
                 destination.display(),
                 e
-            )));
-        }
-    }
-    if let Err(e) = std::fs::rename(&temporary, destination) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(LauncherError::Version(format!(
-            "Failed to install native file {}: {}",
-            destination.display(),
-            e
-        )));
-    }
-    Ok(())
+            ))
+        },
+        |e| {
+            LauncherError::Version(format!(
+                "Failed to install native file {}: {}",
+                destination.display(),
+                e
+            ))
+        },
+    )
 }
 
 fn prune_empty_native_dirs(path: &Path, natives_dir: &Path) {
@@ -1244,16 +1302,37 @@ fn commit_natives(staging: &Path, natives_dir: &Path, desired: &[String]) -> Res
             if files_equal(&source, &destination) {
                 continue;
             }
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&destination)
-                .map_err(|e| {
-                    LauncherError::Version(format!(
-                        "Cannot replace native file {}: {}. Close any running game that uses this version and try again.",
-                        destination.display(),
-                        e
-                    ))
-                })?;
+            // A concurrent preparer between its remove and its rename leaves
+            // the destination delete-pending for a moment; a write-open then
+            // fails transiently. Retry briefly instead of reporting a lock.
+            let mut last_denied: Option<std::io::Error> = None;
+            let mut writable = false;
+            for attempt in 0..PENDING_OPEN_ATTEMPTS {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(attempt as u64));
+                }
+                match std::fs::OpenOptions::new().write(true).open(&destination) {
+                    Ok(_) => {
+                        writable = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        last_denied = Some(e);
+                    }
+                    Err(e) => {
+                        last_denied = Some(e);
+                        break;
+                    }
+                }
+            }
+            if !writable {
+                let e = last_denied.expect("open failed without an error");
+                return Err(LauncherError::Version(format!(
+                    "Cannot replace native file {}: {}. Close any running game that uses this version and try again.",
+                    destination.display(),
+                    e
+                )));
+            }
         } else if destination.exists() {
             return Err(LauncherError::Version(format!(
                 "Cannot replace native path {}: it is not a regular file",
@@ -1288,6 +1367,8 @@ fn commit_natives(staging: &Path, natives_dir: &Path, desired: &[String]) -> Res
     for relative in previous {
         if desired_set.contains(relative.as_str())
             || relative.is_empty()
+            || relative == NATIVES_MANIFEST
+            || is_launcher_temp_file(&relative)
             || crate::download::is_unsafe_archive_path(&relative)
         {
             continue;
