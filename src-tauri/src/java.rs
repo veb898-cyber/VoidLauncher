@@ -200,12 +200,29 @@ pub(crate) fn parse_probe_output(output: &str) -> Option<ProbeData> {
     })
 }
 
-/// Detect all Java installations on the system (Windows)
-pub fn detect_java_installations() -> Vec<JavaInstallation> {
-    let mut installations = Vec::new();
-    let mut checked_paths: Vec<PathBuf> = Vec::new();
+/// Windows registry discovery of installed JDKs (M3.2). Declared with
+/// `#[path]` so the discovery chain keeps the launcher's module root from
+/// having to change (see the commit message for why `lib.rs` is left alone);
+/// the module compiles on all platforms and touches the real registry on
+/// Windows only.
+#[path = "java_registry.rs"]
+mod java_registry;
 
-    // Check common Java locations on Windows
+/// Detect all Java installations on the system:
+/// filesystem roots, JAVA_HOME, PATH and the Windows registry.
+pub fn detect_java_installations() -> Vec<JavaInstallation> {
+    let mut candidates = java_candidates_from_environment();
+    candidates.extend(java_registry::registry_candidates_from_os());
+
+    // Registry records are only candidate paths: deduplicate against the
+    // other sources and let every unique candidate prove itself by running.
+    merge_java_installations(candidates, probe_java_by_path)
+}
+
+/// Candidate java.exe paths from the pre-registry discovery sources
+/// (unchanged behavior): standard vendor directories, `JAVA_HOME` and `PATH`.
+fn java_candidates_from_environment() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
     let program_files =
         std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
     let program_files_x86 =
@@ -229,57 +246,133 @@ pub fn detect_java_installations() -> Vec<JavaInstallation> {
 
     for dir in &search_dirs {
         let dir_path = PathBuf::from(dir);
-        if dir_path.exists() {
-            if let Ok(entries) = std::fs::read_dir(&dir_path) {
-                for entry in entries.flatten() {
-                    let java_exe = entry.path().join("bin").join("java.exe");
-                    let javaw_exe = entry.path().join("bin").join("javaw.exe");
-                    let actual = if java_exe.exists() {
-                        java_exe
-                    } else if javaw_exe.exists() {
-                        javaw_exe
-                    } else {
-                        continue;
-                    };
-
-                    if !checked_paths.contains(&actual) {
-                        if let Some(install) = probe_java_by_path(&actual) {
-                            checked_paths.push(actual);
-                            installations.push(install);
-                        }
-                    }
-                }
+        if !dir_path.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir_path) {
+            for entry in entries.flatten() {
+                let java_exe = entry.path().join("bin").join("java.exe");
+                let javaw_exe = entry.path().join("bin").join("javaw.exe");
+                let actual = if java_exe.exists() {
+                    java_exe
+                } else if javaw_exe.exists() {
+                    javaw_exe
+                } else {
+                    continue;
+                };
+                candidates.push(actual);
             }
         }
     }
 
-    // Check JAVA_HOME
+    // JAVA_HOME
     if let Ok(java_home) = std::env::var("JAVA_HOME") {
-        let java_exe = PathBuf::from(&java_home).join("bin").join("java.exe");
-        if java_exe.exists() && !checked_paths.contains(&java_exe) {
-            if let Some(install) = probe_java_by_path(&java_exe) {
-                checked_paths.push(java_exe);
-                installations.push(install);
-            }
-        }
+        candidates.push(PathBuf::from(java_home).join("bin").join("java.exe"));
     }
 
-    // Check PATH
+    // PATH
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(';') {
-            let java_exe = PathBuf::from(dir).join("java.exe");
-            if java_exe.exists() && !checked_paths.contains(&java_exe) {
-                if let Some(install) = probe_java_by_path(&java_exe) {
-                    checked_paths.push(java_exe);
-                    installations.push(install);
+            candidates.push(PathBuf::from(dir).join("java.exe"));
+        }
+    }
+
+    candidates
+}
+
+/// Turn raw candidate paths into deduplicated, probed installations.
+///
+/// Deduplication runs on the canonical path (symlinks/junctions resolved,
+/// case folded — Windows paths are case-insensitive), so an executable
+/// registered in the registry *and* found on disk is probed only once. Paths
+/// that do not exist are skipped with a diagnosable reason, not an error.
+/// A running-it gate keeps indirect registry paths from launching arbitrary
+/// files: the candidate must at least look like a PE executable before the
+/// JVM probe may start it.
+///
+/// Pure over the injected `probe`, so tests describe JVMs without processes.
+pub(crate) fn merge_java_installations(
+    candidates: Vec<PathBuf>,
+    probe: impl Fn(&Path) -> Option<JavaInstallation>,
+) -> Vec<JavaInstallation> {
+    let mut seen = std::collections::HashSet::new();
+    let mut installations = Vec::new();
+
+    for candidate in candidates {
+        let shown = candidate.display();
+        match std::fs::canonicalize(&candidate) {
+            Ok(canonical) => {
+                if !seen.insert(canonical.to_string_lossy().to_ascii_lowercase()) {
+                    tracing::debug!(
+                        target: "launcher",
+                        "Skipping duplicate Java candidate: {shown}"
+                    );
+                    continue;
                 }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    target: "launcher",
+                    "Skipping Java candidate {shown}: path does not exist ({error})"
+                );
+                continue;
+            }
+        }
+
+        if !looks_like_executable(&candidate) {
+            tracing::debug!(
+                target: "launcher",
+                "Skipping Java candidate {shown}: not a PE executable"
+            );
+            continue;
+        }
+
+        match probe(&candidate) {
+            Some(install) => installations.push(install),
+            None => {
+                tracing::debug!(
+                    target: "launcher",
+                    "Excluded invalid Java installation: {shown} did not probe as a runnable Java runtime"
+                );
             }
         }
     }
 
-    // Sort by major version descending
-    installations.sort_by_key(|b| std::cmp::Reverse(b.major_version));
+    // 1) newer Java first, 2) 64-bit builds before 32-bit ones, 3) the
+    // lowercased path as a deterministic tiebreak.
+    installations.sort_by(|a, b| {
+        a.major_version
+            .cmp(&b.major_version)
+            .reverse()
+            .then_with(|| b.is_64bit.cmp(&a.is_64bit))
+            .then_with(|| {
+                a.path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .cmp(&b.path.to_string_lossy().to_ascii_lowercase())
+            })
+    });
     installations
+}
+
+/// Cheap pre-probe sanity gate: on Windows the candidate must carry the PE
+/// header magic, which stops registry records pointing at scripts, text or
+/// arbitrary data from being executed by the probe.
+fn looks_like_executable(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut magic = [0u8; 2];
+        file.read_exact(&mut magic).is_ok() && magic == *b"MZ"
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 /// How long a Java probe may run before the child is killed. A stuck
