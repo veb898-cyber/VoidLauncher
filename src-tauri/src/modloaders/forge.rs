@@ -216,29 +216,24 @@ pub(crate) fn required_forge_java_major(mc_version: &str) -> u32 {
 /// back to any system Java only when nothing suitable is installed.
 pub(crate) fn find_java_for(data_dir: &Path, mc_version: &str) -> Option<PathBuf> {
     let want = required_forge_java_major(mc_version);
-    let data_dir = data_dir.to_path_buf();
-    let all = crate::launch::find_all_java_installations(&data_dir);
-    let chosen = all
-        .iter()
-        .find(|j| j.is_64bit && j.major_version == want)
-        .cloned()
-        .or_else(|| {
-            if want >= 21 {
-                all.iter()
-                    .filter(|j| j.is_64bit && j.major_version > want)
-                    .min_by_key(|j| j.major_version)
-                    .cloned()
-            } else {
-                None
-            }
-        });
-    match chosen {
-        Some(j) => {
+    // Processors need their own Java (often newer than the game launch uses)
+    // and — uniquely in this codebase — may run on the closest NEWER major,
+    // but only for wants of Java 21+. This requirement is the Forge-order
+    // one and is never mixed with the game's JVM choice.
+    let req = crate::java::JavaRequirement {
+        major: want,
+        arch: None,
+        require_64bit: true,
+        allow_newer: want >= 21,
+    };
+    let all = crate::launch::find_all_java_installations(data_dir);
+    match crate::java::resolve_java(&req, None, None, &all) {
+        crate::java::JavaChoice::Selected { install } => {
             tracing::debug!(target: "launcher", "Using Java {} (v{}) for Forge processors (want {})",
-                j.major_version, j.version, want);
-            Some(j.path)
+                install.major_version, install.version, want);
+            Some(install.path)
         }
-        None => None,
+        _ => None,
     }
 }
 

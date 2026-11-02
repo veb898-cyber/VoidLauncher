@@ -15,7 +15,7 @@ use crate::playtime;
 use crate::versions;
 use crate::AppState;
 use crate::{accounts, i18n};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -189,80 +189,117 @@ pub async fn cmd_install_version(
     Ok(version_info.id)
 }
 
-/// Ensure suitable Java is available. If missing, download it automatically.
+/// Ensure a usable Java executable exists and return it. The unified
+/// selection policy (`java::resolve_java`) decides; when nothing suitable is
+/// installed, the existing managed download path runs and the fresh runtime
+/// is re-verified with the M3.1 probe (via the fresh detection list, whose
+/// managed entries are re-probed) before the launch proceeds.
+///
+/// The returned executable is handed to `launch::launch_minecraft` verbatim,
+/// so prepare and spawn always run the very same JVM. An explicitly
+/// configured but broken/incompatible Java is reported instead of being
+/// replaced by another installation or a download.
 async fn ensure_java_for_launch(
     app: &AppHandle,
     data_dir: &Path,
     version_info: &versions::VersionInfo,
     instance: &instances::Instance,
     config: &crate::config::AppConfig,
-) -> Result<(), String> {
-    let required_major = version_info.required_java_major();
+) -> Result<PathBuf, String> {
+    let req = crate::java::JavaRequirement {
+        major: version_info.required_java_major(),
+        arch: None,
+        require_64bit: true,
+        allow_newer: false,
+    };
 
-    // An explicitly configured Java (instance or launcher settings) takes
-    // priority in `launch::get_java_path`. If it is present, this function
-    // has nothing to download: a matching runtime needs no help, and a
-    // mismatching/broken one is reported by `get_java_path` at spawn time
-    // with a precise error (downloading a managed runtime would be ignored
-    // anyway). Previously the launcher downloaded a whole managed JRE even
-    // though the user had already pointed it at a valid one.
-    if let Some(path) = instance
-        .java_path
-        .as_ref()
-        .filter(|p| p.exists())
-        .or_else(|| config.java_path.as_ref().filter(|p| p.exists()))
-    {
-        if let Some(inst) = crate::java::probe_java_by_path(path) {
-            if inst.major_version == required_major {
-                tracing::debug!(
-                    target: "launcher",
-                    "Configured Java {} already matches required Java {}",
-                    inst.version, required_major
-                );
+    let installations = launch::find_all_java_installations(data_dir);
+    let choice = crate::java::resolve_java(
+        &req,
+        instance.java_path.as_deref(),
+        config.java_path.as_deref(),
+        &installations,
+    );
+    tracing::debug!(
+        target: "launcher",
+        "Java requirement {} resolved: {:?}",
+        version_info.required_java_major(),
+        choice
+    );
+
+    match crate::java::preparation_from_choice(&choice) {
+        Ok(crate::java::JavaPreparation::Ready { path, install }) => {
+            tracing::info!(
+                target: "launcher",
+                "Java is ready: {} v{} at {:?}",
+                install.vendor,
+                install.version,
+                path
+            );
+            Ok(path)
+        }
+        Ok(crate::java::JavaPreparation::InstallManaged { major }) => {
+            events::emit_log(
+                app,
+                "info",
+                "launch",
+                &format!(
+                    "Java {} required but not found locally. Downloading...",
+                    major
+                ),
+            );
+
+            java_download::download_java_runtime(major, data_dir, app)
+                .await
+                .map_err(|e| {
+                    let msg = format!("Failed to download Java {}: {}", major, e);
+                    events::emit_log(app, "error", "launch", &msg);
+                    msg
+                })?;
+
+            events::emit_log(
+                app,
+                "info",
+                "launch",
+                &format!("Java {} downloaded successfully", major),
+            );
+
+            // Never trust the downloader's manifest: re-run the detection
+            // (managed entries are probed there with the M3.1 probe, so a
+            // broken or mis-labelled archive never reaches the game).
+            let installations = launch::find_all_java_installations(data_dir);
+            let choice = crate::java::resolve_java(
+                &req,
+                instance.java_path.as_deref(),
+                config.java_path.as_deref(),
+                &installations,
+            );
+            match crate::java::preparation_from_choice(&choice) {
+                Ok(crate::java::JavaPreparation::Ready { path, install }) => {
+                    tracing::info!(
+                        target: "launcher",
+                        "Downloaded Java verified: {} v{} at {:?}",
+                        install.vendor,
+                        install.version,
+                        path
+                    );
+                    Ok(path)
+                }
+                // A second `InstallManaged` after a successful download means
+                // the fresh runtime did not survive verification — abort
+                // instead of looping or shipping an unverified JVM.
+                _ => {
+                    let msg = format!(
+                        "Java {} was installed, but no usable runtime of that version was found on this system. Install Java {} manually or pick it in the settings.",
+                        major, major
+                    );
+                    events::emit_log(app, "error", "launch", &msg);
+                    Err(msg)
+                }
             }
         }
-        return Ok(());
+        Err(msg) => Err(msg),
     }
-
-    // Only use the exact required version AND a 64-bit build. Newer JDKs
-    // (21+/23+) scan classpath JARs for automatic module names during boot
-    // layer initialisation, but the obfuscated client.jar contains classes in
-    // the unnamed package, which causes java.lang.module.FindException. A
-    // 32-bit install cannot run modern clients (and is filtered out of the
-    // auto-detection too), so it must not satisfy this check.
-    let installations = launch::find_all_java_installations(data_dir);
-    if installations
-        .iter()
-        .any(|j| j.is_64bit && j.major_version == required_major)
-    {
-        return Ok(());
-    }
-
-    events::emit_log(
-        app,
-        "info",
-        "launch",
-        &format!(
-            "Java {} required but not found locally. Downloading...",
-            required_major
-        ),
-    );
-
-    java_download::download_java_runtime(required_major, data_dir, app)
-        .await
-        .map_err(|e| {
-            let msg = format!("Failed to download Java {}: {}", required_major, e);
-            events::emit_log(app, "error", "launch", &msg);
-            msg
-        })?;
-
-    events::emit_log(
-        app,
-        "info",
-        "launch",
-        &format!("Java {} downloaded successfully", required_major),
-    );
-    Ok(())
 }
 
 /// RAII slot in `running_instances` that reserves an instance name for the
@@ -687,8 +724,12 @@ pub async fn cmd_launch_game(
         })?;
     }
 
-    // Ensure suitable Java is available (download if missing)
-    ensure_java_for_launch(&app, &data_dir, &version_info, &instance, &config).await?;
+    // Ensure a usable Java executable exists (download + verify through the
+    // unified policy if missing). The returned path is the ONE executable for
+    // this run: the spawn step below receives it verbatim and must not pick
+    // its own.
+    let java_override =
+        ensure_java_for_launch(&app, &data_dir, &version_info, &instance, &config).await?;
 
     // Ensure loader processor-generated JARs exist (client-*-srg.jar,
     // forge-*-client.jar, NeoForge's patched client, etc.). Do NOT refresh
@@ -809,6 +850,7 @@ pub async fn cmd_launch_game(
         let launch_username = username.clone();
         let launch_server = server_address.clone();
         let launch_session_log = session_log.clone();
+        let launch_java_override = java_override.clone();
         let result = tokio::task::spawn_blocking(move || {
             launch::launch_minecraft(
                 &launch_config,
@@ -821,6 +863,7 @@ pub async fn cmd_launch_game(
                 },
                 launch_server.as_deref().map(|h| (h, server_port)),
                 launch_session_log.as_deref(),
+                Some(launch_java_override.as_path()),
             )
             .map_err(|e| e.to_string())
         })

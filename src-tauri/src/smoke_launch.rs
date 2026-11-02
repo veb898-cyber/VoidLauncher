@@ -437,6 +437,7 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
         },
         None,
         None,
+        None, // no pre-selected Java: the smoke test resolves its own JVM
     ) {
         Ok(c) => c,
         Err(e) => return Err(format!("launch spawn error: {}", e)),

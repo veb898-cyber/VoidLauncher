@@ -381,9 +381,9 @@ fn looks_like_executable(path: &Path) -> bool {
 // One pure, table-tested policy for every "pick a Java" decision. It
 // consumes only what the callers already prepared (M3.1 probe results and
 // M3.1/M3.2 detection lists) and touches nothing: no network, no registry,
-// no process spawns. Wiring into `get_java_path`/`ensure_java_for_launch`/
-// `forge::find_java_for` happens in M3.3.2 — until then the existing code
-// paths stay authoritative.
+// no process spawns. Wired into `get_java_path`, `ensure_java_for_launch`
+// and `forge::find_java_for` in M3.3.2a; the resolution helpers below can
+// inject a fake probe so the whole flow tests without a real JVM.
 // ══════════════════════════════════════════════════════════════════════════
 
 /// Hard requirements a scenario puts on its JVM.
@@ -394,19 +394,21 @@ fn looks_like_executable(path: &Path) -> bool {
 /// wants Java 21+). Architecture here is the JVM's OWN probed architecture
 /// (`JavaArch`), never the launcher process's.
 ///
-/// Wired into the launch/download/modloader call sites in M3.3.2 — until
-/// then only tests consume this, hence no dead-code lint.
-#[allow(dead_code)]
+/// `require_64bit` preserves the old launch rule ("32-bit JVMs cannot run
+/// modern clients") independently of the family: an ARM64 64-bit JVM
+/// satisfies it. Family constraints stay available through `arch`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct JavaRequirement {
     /// Java major the scenario needs (`javaVersion` of the manifest, or a
     /// modloader's own requirement).
     pub major: u32,
-    /// Hard architecture constraint. `Some(JavaArch::X86_64)` is what the old
-    /// "must be 64-bit" rule maps to. `None` = unconstrained. A
+    /// Hard architecture-family constraint. `None` = unconstrained. A
     /// `JavaArch::Unknown` installation never satisfies `Some(_)` — unknown
     /// is not silently promoted to a guessed match.
     pub arch: Option<JavaArch>,
+    /// The old "must be 64-bit" rule: a 32-bit JVM is rejected regardless of
+    /// family. Probed bitness (`is_64bit`), not the launcher's architecture.
+    pub require_64bit: bool,
     /// Accept the nearest **greater** compatible major when the exact one is
     /// absent. Primarily modloader processors; game launches keep this off
     /// (modern JDKs abort old obfuscated clients during boot-layer scanning).
@@ -417,28 +419,40 @@ pub(crate) struct JavaRequirement {
 ///
 /// The user's explicit choice is never silently replaced by another
 /// installation or a download; the caller surfaces this diagnosis instead.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExplicitJavaProblem {
     /// The path exists but is not a working, runnable Java (broken install,
     /// MSI stub, unrelated executable).
     NotAJava,
-    /// A working Java of the wrong (mostly: older) major.
-    VersionMismatch { got: u32, want: u32 },
-    /// A working Java with a different, or unknown, architecture.
-    ArchMismatch { got: JavaArch, want: JavaArch },
+    /// A working Java of the wrong (mostly: older) major — with the full
+    /// probed version string for the user-facing message.
+    VersionMismatch {
+        got: u32,
+        got_version: String,
+        want: u32,
+    },
+    /// A working Java of the wrong architecture family — or of unknown
+    /// family against a known requirement (`want`), or a 32-bit build
+    /// against a 64-bit requirement (`want = None`).
+    ArchMismatch {
+        got: JavaArch,
+        got_version: String,
+        want: Option<JavaArch>,
+    },
 }
 
 /// The single selection verdict for all scenarios.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum JavaChoice {
     /// The user's explicitly configured Java, verified compatible.
     Explicit { install: JavaInstallation },
     /// The user's explicit Java exists but cannot serve the scenario.
-    /// Diagnostic result — no substitution happened.
+    /// Diagnostic result — no substitution happened. `source` names the
+    /// setting the path came from ("instance", "launcher settings", ...) for
+    /// the user-facing message.
     ExplicitRejected {
         path: PathBuf,
+        source: &'static str,
         problem: ExplicitJavaProblem,
     },
     /// A suitable installation found among the detected list (system or an
@@ -453,22 +467,29 @@ pub(crate) enum JavaChoice {
     Unavailable { major: u32, reason: String },
 }
 
-/// What the caller prepared for the explicit path (instance settings win
-/// over launcher settings; the first existing path is picked and probed by
-/// the caller, so the policy itself performs no probes and no FS access).
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub(crate) enum ExplicitCandidate<'a> {
+/// What the caller prepared for the explicit path. Owned so a selector that
+/// probes the path itself (production resolution) can hand the fresh probe
+/// result straight to the policy; `source` flows into the rejection message.
+#[derive(Debug, Clone)]
+pub(crate) enum ExplicitCandidate {
     /// The selected explicit path probed into a working Java.
-    Java(&'a JavaInstallation),
+    Java {
+        install: JavaInstallation,
+        source: &'static str,
+    },
     /// The selected explicit path exists on disk but is not a working Java.
-    NotAJava { path: &'a Path },
+    NotAJava { path: PathBuf, source: &'static str },
 }
 
-/// Architecture check against the requirement. `Unknown` never satisfies a
-/// known requirement: guessing would undo the whole point of M3.1 probing.
-#[allow(dead_code)]
+/// Architecture checks against the requirement.
+///
+/// Bitness first (`require_64bit` keeps the old probed-bitness rule for any
+/// family), then the family constraint: `Unknown` never satisfies a known
+/// requirement — guessing would undo the whole point of M3.1 probing.
 fn arch_matches(inst: &JavaInstallation, req: &JavaRequirement) -> bool {
+    if req.require_64bit && !inst.is_64bit {
+        return false;
+    }
     match req.arch {
         None => true,
         Some(want) => inst.arch == want,
@@ -477,7 +498,6 @@ fn arch_matches(inst: &JavaInstallation, req: &JavaRequirement) -> bool {
 
 /// Version check: exact major, or (when allowed) a newer one. A check never
 /// accepts an OLDER major, with or without `allow_newer`.
-#[allow(dead_code)]
 fn version_matches(inst: &JavaInstallation, req: &JavaRequirement) -> bool {
     inst.major_version == req.major || (req.allow_newer && inst.major_version > req.major)
 }
@@ -494,40 +514,42 @@ fn version_matches(inst: &JavaInstallation, req: &JavaRequirement) -> bool {
 ///    the list order);
 /// 4. managed fallback of `req.major` — or, when the requirement itself is
 ///    not downloadable (32-bit), a diagnosed `Unavailable`.
-#[allow(dead_code)]
 pub(crate) fn select_java(
     req: &JavaRequirement,
-    explicit: Option<ExplicitCandidate<'_>>,
+    explicit: Option<ExplicitCandidate>,
     installations: &[JavaInstallation],
 ) -> JavaChoice {
     // 1. Explicit configuration always wins over auto-detection.
     if let Some(candidate) = explicit {
         return match candidate {
-            ExplicitCandidate::Java(inst) => {
-                if !version_matches(inst, req) {
+            ExplicitCandidate::Java { install, source } => {
+                if !version_matches(&install, req) {
                     JavaChoice::ExplicitRejected {
-                        path: inst.path.clone(),
+                        path: install.path.clone(),
+                        source,
                         problem: ExplicitJavaProblem::VersionMismatch {
-                            got: inst.major_version,
+                            got: install.major_version,
+                            got_version: install.version.clone(),
                             want: req.major,
                         },
                     }
-                } else if !arch_matches(inst, req) {
+                } else if !arch_matches(&install, req) {
                     JavaChoice::ExplicitRejected {
-                        path: inst.path.clone(),
+                        path: install.path.clone(),
+                        source,
                         problem: ExplicitJavaProblem::ArchMismatch {
-                            got: inst.arch,
-                            want: req.arch.expect("constraint checked non-empty above"),
+                            got: install.arch,
+                            got_version: install.version.clone(),
+                            want: req.arch,
                         },
                     }
                 } else {
-                    JavaChoice::Explicit {
-                        install: inst.clone(),
-                    }
+                    JavaChoice::Explicit { install }
                 }
             }
-            ExplicitCandidate::NotAJava { path } => JavaChoice::ExplicitRejected {
-                path: path.to_path_buf(),
+            ExplicitCandidate::NotAJava { path, source } => JavaChoice::ExplicitRejected {
+                path,
+                source,
                 problem: ExplicitJavaProblem::NotAJava,
             },
         };
@@ -578,6 +600,168 @@ pub(crate) fn select_java(
         }
     } else {
         JavaChoice::UseManaged { major: req.major }
+    }
+}
+
+/// A short name for the setting an explicit Java path came from, used in
+/// user-facing rejection messages.
+pub(crate) const SOURCE_INSTANCE: &str = "instance";
+pub(crate) const SOURCE_SETTINGS: &str = "launcher settings";
+
+/// A single explicit path probed against the requirement. `probe` may be the
+/// real M3.1 probe or a fake in tests; existence is checked by the caller
+/// first, so an existing-but-broken path becomes `NotAJava` (rejected without
+/// fallback) while a missing path never reaches this helper.
+fn probe_candidate(
+    probe: &impl Fn(&Path) -> Option<JavaInstallation>,
+    path: &Path,
+    source: &'static str,
+) -> ExplicitCandidate {
+    match probe(path) {
+        Some(inst) => ExplicitCandidate::Java {
+            install: inst,
+            source,
+        },
+        None => ExplicitCandidate::NotAJava {
+            path: path.to_path_buf(),
+            source,
+        },
+    }
+}
+
+/// Resolve the Java for `req`, mirroring the classic launch pipeline:
+/// explicitly configured Java (instance first, then launcher settings) wins
+/// and is probed against `req` — an existing but broken or incompatible path
+/// is diagnosed and never substituted with another JVM or a download. A
+/// *missing* explicit path falls through to the next source, and finally to
+/// the automatic selection among `installations` (system + managed). The
+/// `probe` is injectable so tests need no real JVM and no registry.
+pub(crate) fn resolve_java_with_probe(
+    req: &JavaRequirement,
+    instance_java: Option<&Path>,
+    config_java: Option<&Path>,
+    installations: &[JavaInstallation],
+    probe: impl Fn(&Path) -> Option<JavaInstallation>,
+) -> JavaChoice {
+    if let Some(path) = instance_java {
+        if path.exists() {
+            let candidate = probe_candidate(&probe, path, SOURCE_INSTANCE);
+            return select_java(req, Some(candidate), installations);
+        }
+        tracing::debug!(target: "launcher", "Instance Java not found: {:?}", path);
+    }
+    if let Some(path) = config_java {
+        if path.exists() {
+            let candidate = probe_candidate(&probe, path, SOURCE_SETTINGS);
+            return select_java(req, Some(candidate), installations);
+        }
+        tracing::debug!(target: "launcher", "Config Java not found: {:?}", path);
+    }
+    select_java(req, None, installations)
+}
+
+/// The production resolver — the real M3.1 [`probe_java_by_path`] underneath.
+///
+/// Callers keep a single resolved executable per launch: pass the returned
+/// choice (or its path) explicitly to the spawn step instead of re-resolving.
+pub(crate) fn resolve_java(
+    req: &JavaRequirement,
+    instance_java: Option<&Path>,
+    config_java: Option<&Path>,
+    installations: &[JavaInstallation],
+) -> JavaChoice {
+    resolve_java_with_probe(
+        req,
+        instance_java,
+        config_java,
+        installations,
+        probe_java_by_path,
+    )
+}
+
+/// What a launch scenario needs to do with Java before it can proceed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum JavaPreparation {
+    /// A usable executable (explicit, system, or an already-downloaded
+    /// managed runtime). Carries the chosen Java so the prepare step can hand
+    /// the very same executable to the spawn step.
+    Ready {
+        path: PathBuf,
+        install: JavaInstallation,
+    },
+    /// Nothing suitable is installed; download the managed runtime of this
+    /// major, then re-verify the real executable and only then continue.
+    InstallManaged { major: u32 },
+}
+
+/// Turn a selection verdict into launch preparation. `ExplicitRejected` and
+/// `Unavailable` become described errors — a rejected explicit choice must
+/// never trigger a managed download.
+pub(crate) fn preparation_from_choice(choice: &JavaChoice) -> Result<JavaPreparation, String> {
+    match choice {
+        JavaChoice::Explicit { install } | JavaChoice::Selected { install } => {
+            Ok(JavaPreparation::Ready {
+                path: install.path.clone(),
+                install: install.clone(),
+            })
+        }
+        JavaChoice::ExplicitRejected {
+            path,
+            source,
+            problem,
+        } => Err(describe_explicit_rejection(path, source, problem)),
+        JavaChoice::UseManaged { major } => Ok(JavaPreparation::InstallManaged { major: *major }),
+        JavaChoice::Unavailable { reason, .. } => Err(reason.clone()),
+    }
+}
+
+/// Human words for a probed architecture family.
+fn arch_word(arch: JavaArch) -> &'static str {
+    match arch {
+        JavaArch::X86_64 => "x86_64 (64-bit)",
+        JavaArch::X86 => "32-bit",
+        JavaArch::Arm64 => "ARM64",
+        JavaArch::Unknown => "of an unknown architecture",
+    }
+}
+
+/// The user-facing message for an incompatible explicit Java path. Wording
+/// mirrors the messages the launch pipeline has always shown; the user's
+/// path is named, never replaced, and the fix (re-pick the executable or
+/// switch to 'Automatic') is spelled out.
+pub(crate) fn describe_explicit_rejection(
+    path: &Path,
+    source: &str,
+    problem: &ExplicitJavaProblem,
+) -> String {
+    match problem {
+        ExplicitJavaProblem::NotAJava => format!(
+            "The Java configured for this {source} does not appear to be a working Java installation: {}. Pick the Java executable again in the settings, or set Java to 'Automatic'.",
+            path.display()
+        ),
+        ExplicitJavaProblem::VersionMismatch {
+            got,
+            got_version,
+            want,
+        } => format!(
+            "The Java configured for this {source} is Java {got} ({got_version}), but this Minecraft version requires Java {want}. Change the Java version in the settings, or set it to 'Automatic' to let the launcher choose."
+        ),
+        ExplicitJavaProblem::ArchMismatch {
+            got,
+            got_version,
+            want,
+        } => {
+            let want_desc = match want {
+                Some(want) => arch_word(*want).to_string(),
+                None => "64-bit".to_string(),
+            };
+            format!(
+                "The Java configured for this {source} is a {} Java ({}), but this Minecraft version requires a {} Java. Change the Java version in the settings, or set it to 'Automatic' to let the launcher choose.",
+                arch_word(*got),
+                got_version,
+                want_desc
+            )
+        }
     }
 }
 
@@ -1335,7 +1519,9 @@ openjdk version \"11.0.20\" 2023-07-18
     // -----------------------------
 
     use crate::java::{
-        select_java, ExplicitCandidate, ExplicitJavaProblem, JavaChoice, JavaRequirement,
+        describe_explicit_rejection, preparation_from_choice, resolve_java_with_probe, select_java,
+        ExplicitCandidate, ExplicitJavaProblem, JavaChoice, JavaPreparation, JavaRequirement,
+        SOURCE_INSTANCE, SOURCE_SETTINGS,
     };
 
     /// A fake installation: no probe, no FS, no registry — the policy input
@@ -1356,18 +1542,46 @@ openjdk version \"11.0.20\" 2023-07-18
         }
     }
 
-    /// The old "Minecraft needs 64-bit Java N" requirement.
+    /// The old "Minecraft needs 64-bit Java N" requirement: probed bitness
+    /// (not the family label) decides, and only the exact major is safe.
     fn game_req(major: u32) -> JavaRequirement {
         JavaRequirement {
             major,
-            arch: Some(JavaArch::X86_64),
+            arch: None,
+            require_64bit: true,
             allow_newer: false,
+        }
+    }
+
+    /// The Forge-processor-shaped requirement: exact major, otherwise the
+    /// closest newer one when the targets want Java 21+.
+    fn forge_req(major: u32) -> JavaRequirement {
+        JavaRequirement {
+            major,
+            arch: None,
+            require_64bit: true,
+            allow_newer: true,
+        }
+    }
+
+    fn explicit_java(inst: JavaInstallation) -> Option<ExplicitCandidate> {
+        Some(ExplicitCandidate::Java {
+            install: inst,
+            source: SOURCE_INSTANCE,
+        })
+    }
+
+    fn rejected(path: &Path, source: &'static str, problem: ExplicitJavaProblem) -> JavaChoice {
+        JavaChoice::ExplicitRejected {
+            path: path.to_path_buf(),
+            source,
+            problem,
         }
     }
 
     fn choose(
         req: &JavaRequirement,
-        explicit: Option<ExplicitCandidate<'_>>,
+        explicit: Option<ExplicitCandidate>,
         list: &[JavaInstallation],
     ) -> JavaChoice {
         select_java(req, explicit, list)
@@ -1389,11 +1603,7 @@ openjdk version \"11.0.20\" 2023-07-18
     fn explicit_java_wins_even_when_a_fresher_auto_candidate_exists() {
         let explicit = fake_inst(17, JavaArch::X86_64);
         let list = [fake_inst(21, JavaArch::X86_64), explicit.clone()];
-        let choice = choose(
-            &game_req(17),
-            Some(ExplicitCandidate::Java(&explicit)),
-            &list,
-        );
+        let choice = choose(&game_req(17), explicit_java(explicit.clone()), &list);
         assert_eq!(
             choice,
             JavaChoice::Explicit { install: explicit },
@@ -1405,11 +1615,7 @@ openjdk version \"11.0.20\" 2023-07-18
     fn explicit_java_away_from_the_list_is_not_swapped_for_detected() {
         let explicit = fake_inst(8, JavaArch::X86_64);
         let list = [fake_inst(17, JavaArch::X86_64)];
-        let choice = choose(
-            &game_req(8),
-            Some(ExplicitCandidate::Java(&explicit)),
-            &list,
-        );
+        let choice = choose(&game_req(8), explicit_java(explicit.clone()), &list);
         assert_eq!(choice, JavaChoice::Explicit { install: explicit });
     }
 
@@ -1451,11 +1657,7 @@ openjdk version \"11.0.20\" 2023-07-18
     #[test]
     fn allow_newer_picks_the_closest_larger_major() {
         // Forge-processor-shaped requirement: exact otherwise nearest newer.
-        let req = JavaRequirement {
-            major: 21,
-            arch: Some(JavaArch::X86_64),
-            allow_newer: true,
-        };
+        let req = forge_req(21);
         let list = [
             fake_inst(25, JavaArch::X86_64),
             fake_inst(22, JavaArch::X86_64),
@@ -1471,11 +1673,7 @@ openjdk version \"11.0.20\" 2023-07-18
 
     #[test]
     fn allow_newer_still_serves_an_exact_match_from_the_list() {
-        let req = JavaRequirement {
-            major: 21,
-            arch: Some(JavaArch::X86_64),
-            allow_newer: true,
-        };
+        let req = forge_req(21);
         let list = [
             fake_inst(25, JavaArch::X86_64),
             fake_inst(21, JavaArch::X86_64),
@@ -1503,11 +1701,7 @@ openjdk version \"11.0.20\" 2023-07-18
 
     #[test]
     fn an_older_major_is_never_accepted_even_with_allow_newer() {
-        let req = JavaRequirement {
-            major: 21,
-            arch: Some(JavaArch::X86_64),
-            allow_newer: true,
-        };
+        let req = forge_req(21);
         let list = [fake_inst(17, JavaArch::X86_64)];
         let choice = choose(&req, None, &list);
         assert_eq!(choice, JavaChoice::UseManaged { major: 21 });
@@ -1520,7 +1714,7 @@ openjdk version \"11.0.20\" 2023-07-18
         assert_eq!(
             choice,
             JavaChoice::UseManaged { major: 17 },
-            "32-bit must never satisfy X86_64"
+            "a 32-bit JVM must never satisfy the launch bitness rule"
         );
     }
 
@@ -1531,6 +1725,7 @@ openjdk version \"11.0.20\" 2023-07-18
         let req = JavaRequirement {
             major: 21,
             arch: Some(JavaArch::Arm64),
+            require_64bit: true,
             allow_newer: false,
         };
         assert_eq!(
@@ -1544,6 +1739,7 @@ openjdk version \"11.0.20\" 2023-07-18
         let req_x64 = JavaRequirement {
             major: 21,
             arch: Some(JavaArch::X86_64),
+            require_64bit: true,
             allow_newer: false,
         };
         let list = [arm, fake_inst(21, JavaArch::X86)];
@@ -1552,27 +1748,41 @@ openjdk version \"11.0.20\" 2023-07-18
     }
 
     #[test]
-    fn unknown_arch_never_matches_a_known_constraint() {
+    fn an_unknown_family_never_matches_a_known_family_constraint() {
         let unknown = fake_inst(17, JavaArch::Unknown);
-        let list = [unknown.clone()];
-        let choice = choose(&game_req(17), None, &list);
+        let req = JavaRequirement {
+            major: 17,
+            arch: Some(JavaArch::X86_64),
+            require_64bit: false,
+            allow_newer: false,
+        };
+        let choice = choose(&req, None, std::slice::from_ref(&unknown));
         assert_eq!(
             choice,
             JavaChoice::UseManaged { major: 17 },
-            "an M3.1-unknown arch must not be treated as x86_64"
+            "an M3.1-unknown family must not be treated as x86_64"
         );
+    }
 
-        // Without a hard constraint, an Unknown-arch record still serves.
-        let req_any = JavaRequirement {
-            major: 17,
-            arch: None,
-            allow_newer: false,
-        };
+    #[test]
+    fn the_launch_bitness_rule_uses_probed_bitness_not_the_family() {
+        // A 64-bit JVM of an unknown family still serves the plain launch
+        // requirement (`arch: None`; the probed bitness decides).
+        let unknown = fake_inst(17, JavaArch::Unknown);
         assert_eq!(
-            choose(&req_any, None, &[unknown]),
+            choose(&game_req(17), None, std::slice::from_ref(&unknown)),
             JavaChoice::Selected {
                 install: fake_inst(17, JavaArch::Unknown)
             }
+        );
+
+        // ...but a 32-bit build never does, whatever its family label says.
+        let mut bogus = fake_inst(17, JavaArch::X86_64);
+        bogus.is_64bit = false;
+        assert_eq!(
+            choose(&game_req(17), None, std::slice::from_ref(&bogus)),
+            JavaChoice::UseManaged { major: 17 },
+            "require_64bit rejects a 32-bit JVM even when the family label lies"
         );
     }
 
@@ -1580,17 +1790,18 @@ openjdk version \"11.0.20\" 2023-07-18
     fn explicit_java_of_the_wrong_major_is_reported_not_swapped() {
         let explicit = fake_inst(8, JavaArch::X86_64);
         let list = [fake_inst(17, JavaArch::X86_64)];
-        let choice = choose(
-            &game_req(17),
-            Some(ExplicitCandidate::Java(&explicit)),
-            &list,
-        );
+        let choice = choose(&game_req(17), explicit_java(explicit.clone()), &list);
         assert_eq!(
             choice,
-            JavaChoice::ExplicitRejected {
-                path: explicit.path.clone(),
-                problem: ExplicitJavaProblem::VersionMismatch { got: 8, want: 17 }
-            },
+            rejected(
+                explicit.path.as_path(),
+                SOURCE_INSTANCE,
+                ExplicitJavaProblem::VersionMismatch {
+                    got: 8,
+                    got_version: "8.0.0".to_string(),
+                    want: 17
+                }
+            ),
             "the diagnosis must name the version conflict, not pick Java 17"
         );
     }
@@ -1601,15 +1812,19 @@ openjdk version \"11.0.20\" 2023-07-18
         let list = [fake_inst(17, JavaArch::X86_64)];
         let choice = choose(
             &game_req(17),
-            Some(ExplicitCandidate::NotAJava { path: &broken }),
+            Some(ExplicitCandidate::NotAJava {
+                path: broken.clone(),
+                source: SOURCE_INSTANCE,
+            }),
             &list,
         );
         assert_eq!(
             choice,
-            JavaChoice::ExplicitRejected {
-                path: broken,
-                problem: ExplicitJavaProblem::NotAJava
-            }
+            rejected(
+                broken.as_path(),
+                SOURCE_INSTANCE,
+                ExplicitJavaProblem::NotAJava
+            )
         );
     }
 
@@ -1617,20 +1832,18 @@ openjdk version \"11.0.20\" 2023-07-18
     fn explicit_java_with_the_wrong_arch_is_reported_not_swapped() {
         let explicit = fake_inst(21, JavaArch::X86);
         let list = [fake_inst(21, JavaArch::X86_64)];
-        let choice = choose(
-            &game_req(21),
-            Some(ExplicitCandidate::Java(&explicit)),
-            &list,
-        );
+        let choice = choose(&game_req(21), explicit_java(explicit.clone()), &list);
         assert_eq!(
             choice,
-            JavaChoice::ExplicitRejected {
-                path: explicit.path.clone(),
-                problem: ExplicitJavaProblem::ArchMismatch {
+            rejected(
+                explicit.path.as_path(),
+                SOURCE_INSTANCE,
+                ExplicitJavaProblem::ArchMismatch {
                     got: JavaArch::X86,
-                    want: JavaArch::X86_64
+                    got_version: "21.0.0".to_string(),
+                    want: None
                 }
-            },
+            ),
             "arch mismatch is diagnosed even when the major matches"
         );
     }
@@ -1638,13 +1851,9 @@ openjdk version \"11.0.20\" 2023-07-18
     #[test]
     fn explicit_newer_java_is_fine_when_allow_newer_stands() {
         let explicit = fake_inst(25, JavaArch::X86_64);
-        let req = JavaRequirement {
-            major: 21,
-            arch: Some(JavaArch::X86_64),
-            allow_newer: true,
-        };
+        let req = forge_req(21);
         let list = [fake_inst(21, JavaArch::X86_64)];
-        let choice = choose(&req, Some(ExplicitCandidate::Java(&explicit)), &list);
+        let choice = choose(&req, explicit_java(explicit.clone()), &list);
         assert_eq!(
             choice,
             JavaChoice::Explicit { install: explicit },
@@ -1663,6 +1872,7 @@ openjdk version \"11.0.20\" 2023-07-18
         let req = JavaRequirement {
             major: 8,
             arch: Some(JavaArch::X86),
+            require_64bit: false,
             allow_newer: false,
         };
         let choice = choose(&req, None, &[]);
@@ -1676,5 +1886,307 @@ openjdk version \"11.0.20\" 2023-07-18
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------
+    // M3.3.2a: launch-time resolution and preparation
+    // -----------------------------------------------
+
+    /// A real temp file standing for an existing java.exe (the resolver only
+    /// checks existence itself; the probed data comes from `probe`).
+    fn existing_file(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "voidlauncher-m332a-{}-{}.tmp",
+            tag,
+            std::process::id()
+        ));
+        std::fs::write(&path, b"fake java executable").expect("create temp fake java");
+        path
+    }
+
+    fn cleanup(paths: &[PathBuf]) {
+        for p in paths {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// A fake probe that always reports the given runtime for every path.
+    fn probing<'p>(
+        major: u32,
+        version: &'p str,
+    ) -> impl Fn(&Path) -> Option<JavaInstallation> + 'p {
+        move |path: &Path| {
+            Some(JavaInstallation {
+                path: path.to_path_buf(),
+                version: version.to_string(),
+                major_version: major,
+                is_64bit: true,
+                vendor: "Test".to_string(),
+                arch: JavaArch::X86_64,
+            })
+        }
+    }
+
+    #[test]
+    fn the_instance_java_beats_the_launcher_settings() {
+        let instance = existing_file("instance-priority");
+        let settings = existing_file("settings-priority");
+        let choice = resolve_java_with_probe(
+            &game_req(17),
+            Some(&instance),
+            Some(&settings),
+            &[],
+            probing(17, "17.0.9"),
+        );
+        match choice {
+            JavaChoice::Explicit { install } => {
+                assert_eq!(install.path, instance);
+                assert_eq!(install.major_version, 17);
+            }
+            other => panic!("expected Explicit, got {other:?}"),
+        }
+        cleanup(&[instance, settings]);
+    }
+
+    #[test]
+    fn the_launcher_settings_java_is_used_when_the_instance_has_none() {
+        let missing = PathBuf::from(r"C:\nope\never-created\java.exe");
+        let settings = existing_file("settings-only");
+        let choice = resolve_java_with_probe(
+            &game_req(17),
+            Some(&missing),
+            Some(&settings),
+            &[],
+            probing(17, "17.0.9"),
+        );
+        match choice {
+            JavaChoice::Explicit { install } => {
+                assert_eq!(install.path, settings, "must fall through to settings");
+            }
+            other => panic!("expected Explicit from settings, got {other:?}"),
+        }
+        cleanup(&[settings]);
+    }
+
+    #[test]
+    fn a_broken_instance_java_is_diagnosed_and_never_replaced() {
+        let broken = existing_file("broken-instance");
+        // The detected list even contains a perfectly compatible Java 17 —
+        // the user's explicit (but broken) path must not be swapped for it.
+        let list = [fake_inst(17, JavaArch::X86_64)];
+        let choice = resolve_java_with_probe(&game_req(17), Some(&broken), None, &list, |_| None);
+        match choice {
+            JavaChoice::ExplicitRejected {
+                path,
+                source,
+                problem,
+            } => {
+                assert_eq!(path, broken);
+                assert_eq!(source, SOURCE_INSTANCE);
+                assert_eq!(problem, ExplicitJavaProblem::NotAJava);
+            }
+            other => panic!("expected ExplicitRejected, got {other:?}"),
+        }
+        cleanup(&[broken]);
+    }
+
+    #[test]
+    fn an_incompatible_instance_java_is_diagnosed_and_never_downloads_over() {
+        let old = existing_file("jvm8-instance");
+        let list = [fake_inst(17, JavaArch::X86_64)];
+        let choice = resolve_java_with_probe(
+            &game_req(17),
+            Some(&old),
+            None,
+            &list,
+            probing(8, "1.8.0_402"),
+        );
+        match &choice {
+            JavaChoice::ExplicitRejected { problem, .. } => matches!(
+                problem,
+                ExplicitJavaProblem::VersionMismatch {
+                    got: 8,
+                    want: 17,
+                    ..
+                }
+            ),
+            other => panic!("expected ExplicitRejected, got {other:?}"),
+        };
+        // The launch preparation refuses instead of scheduling a managed
+        // download behind the user's back.
+        assert!(preparation_from_choice(&choice).is_err());
+        cleanup(&[old]);
+    }
+
+    #[test]
+    fn missing_explicit_paths_fall_through_to_auto_selection() {
+        let missing = PathBuf::from(r"C:\nope\never-created\java.exe");
+        let list = [fake_inst(17, JavaArch::X86_64)];
+        let choice = resolve_java_with_probe(
+            &game_req(17),
+            Some(&missing),
+            Some(&missing),
+            &list,
+            probing(17, "17.0.9"),
+        );
+        assert_eq!(
+            choice,
+            JavaChoice::Selected {
+                install: fake_inst(17, JavaArch::X86_64)
+            }
+        );
+    }
+
+    #[test]
+    fn an_installed_java_is_chosen_without_touching_the_downloader() {
+        // A system install already satisfies the requirement: the choice is
+        // Ready — no InstallManaged is ever produced for it.
+        let choice = resolve_java_with_probe(
+            &game_req(17),
+            None,
+            None,
+            &[fake_inst(17, JavaArch::X86_64)],
+            probing(17, "17.0.9"),
+        );
+        match preparation_from_choice(&choice) {
+            Ok(JavaPreparation::Ready { path, install }) => {
+                assert_eq!(path, fake_inst(17, JavaArch::X86_64).path);
+                assert_eq!(install.major_version, 17);
+            }
+            Ok(other) => panic!("expected Ready, got {other:?}"),
+            Err(msg) => panic!("a compatible install must be ready, got error: {msg}"),
+        }
+    }
+
+    #[test]
+    fn an_incompatible_managed_runtime_must_not_start_the_game() {
+        // Only a wrong-major managed runtime is installed: the scenario must
+        // go the managed route (and, when that runtime is also bad, fail —
+        // never hand an incompatible JVM to the game).
+        let choice = resolve_java_with_probe(
+            &game_req(21),
+            None,
+            None,
+            &[fake_inst(17, JavaArch::X86_64)],
+            probing(21, "21.0.3"),
+        );
+        assert_eq!(choice, JavaChoice::UseManaged { major: 21 });
+    }
+
+    #[test]
+    fn a_downloaded_managed_runtime_passes_the_repeat_probe_before_launch() {
+        // Before the "download": nothing installed → UseManaged.
+        let before = resolve_java_with_probe(&game_req(21), None, None, &[], probing(21, "21.0.3"));
+        assert_eq!(before, JavaChoice::UseManaged { major: 21 });
+
+        // After the download, the fresh detection list carries the managed
+        // runtime — and the resolver verifies the *real* data via the probe
+        // before the launch proceeds with it.
+        let managed = JavaInstallation {
+            path: PathBuf::from(r"C:\managed\jdk-21\bin\java.exe"),
+            version: "21.0.3".to_string(),
+            major_version: 21,
+            is_64bit: true,
+            vendor: "Adoptium".to_string(),
+            arch: JavaArch::X86_64,
+        };
+        let after = resolve_java_with_probe(
+            &game_req(21),
+            None,
+            None,
+            std::slice::from_ref(&managed),
+            probing(21, "21.0.3"),
+        );
+        assert_eq!(after, JavaChoice::Selected { install: managed });
+    }
+
+    #[test]
+    fn use_managed_prepares_a_download_instead_of_launching() {
+        let choice = resolve_java_with_probe(&game_req(21), None, None, &[], probing(21, "21.0.3"));
+        assert_eq!(choice, JavaChoice::UseManaged { major: 21 });
+        assert_eq!(
+            preparation_from_choice(&choice),
+            Ok(JavaPreparation::InstallManaged { major: 21 })
+        );
+    }
+
+    #[test]
+    fn a_rejected_explicit_choice_never_leads_to_a_download() {
+        let broken = existing_file("reject-not-a-java");
+        let choice = resolve_java_with_probe(&game_req(17), Some(&broken), None, &[], |_| None);
+        let preparation = preparation_from_choice(&choice);
+        match &preparation {
+            Ok(_) => panic!("a rejected explicit choice must not prepare anything"),
+            Err(msg) => {
+                assert!(
+                    msg.contains("does not appear to be a working Java installation"),
+                    "message should describe the broken path: {msg}"
+                );
+                assert!(
+                    msg.contains("Automatic"),
+                    "message should offer the Automatic fallback: {msg}"
+                );
+            }
+        }
+        cleanup(&[broken]);
+    }
+
+    #[test]
+    fn the_version_mismatch_message_preserves_the_launch_wording() {
+        let old = existing_file("jvm8-message");
+        let choice = resolve_java_with_probe(
+            &game_req(17),
+            Some(&old),
+            None,
+            &[],
+            probing(8, "1.8.0_402"),
+        );
+        match &choice {
+            JavaChoice::ExplicitRejected {
+                problem, source, ..
+            } => {
+                assert_eq!(source, &SOURCE_INSTANCE);
+                let msg = describe_explicit_rejection(&old, source, problem);
+                assert!(
+                    msg.contains("is Java 8 (1.8.0_402)"),
+                    "message should carry the probed version: {msg}"
+                );
+                assert!(
+                    msg.contains("requires Java 17"),
+                    "message should carry the requirement: {msg}"
+                );
+                assert!(
+                    msg.contains("set it to 'Automatic'"),
+                    "message should offer the Automatic fallback: {msg}"
+                );
+            }
+            other => panic!("expected ExplicitRejected, got {other:?}"),
+        }
+        cleanup(&[old]);
+    }
+
+    #[test]
+    fn the_rejection_message_names_the_settings_source_for_config_paths() {
+        let settings = existing_file("settings-message");
+        let choice = resolve_java_with_probe(
+            &game_req(17),
+            None,
+            Some(&settings),
+            &[],
+            probing(8, "1.8.0_402"),
+        );
+        match &choice {
+            JavaChoice::ExplicitRejected { source, .. } => {
+                assert_eq!(source, &SOURCE_SETTINGS);
+                let msg =
+                    describe_explicit_rejection(&settings, source, &ExplicitJavaProblem::NotAJava);
+                assert!(
+                    msg.contains("launcher settings"),
+                    "message should name the source: {msg}"
+                );
+            }
+            other => panic!("expected ExplicitRejected, got {other:?}"),
+        }
+        cleanup(&[settings]);
     }
 }

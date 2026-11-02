@@ -1,7 +1,10 @@
 use crate::config::AppConfig;
 use crate::error::{LauncherError, Result};
 use crate::instances::Instance;
-use crate::java::{detect_java_installations, JavaInstallation};
+use crate::java::{
+    describe_explicit_rejection, detect_java_installations, resolve_java, JavaChoice,
+    JavaInstallation, JavaRequirement,
+};
 use crate::jvm::{
     build_jvm_args, detect_java_major, strip_gc_selection_flags, strip_removed_jvm_flags, GcPreset,
 };
@@ -941,12 +944,15 @@ pub fn launch_minecraft(
     auth: &LaunchAuth,
     server: Option<(&str, Option<u16>)>,
     session_log_path: Option<&str>,
+    java_override: Option<&Path>,
 ) -> Result<std::process::Child> {
     tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
 
-    // 1. Determine Java path
+    // 1. Determine Java path. `java_override` carries the executable already
+    //    selected during the prepare phase (and possibly downloaded there),
+    //    so the spawn step can never pick a different JVM.
     tracing::info!(target: "launcher", "Detecting Java installation...");
-    let java_path = get_java_path(config, instance, version_info)?;
+    let java_path = get_java_path(config, instance, version_info, java_override)?;
     tracing::info!(target: "launcher", "Using Java: {:?}", java_path);
 
     // 2. Probe the selected Java's major version BEFORE composing the command.
@@ -1041,88 +1047,88 @@ pub fn find_all_java_installations(data_dir: &Path) -> Vec<JavaInstallation> {
     installations
 }
 
-/// Validate a user-configured Java executable (instance or launcher
-/// settings) against the major version this Minecraft version needs.
-///
-/// `probe_java_by_path` is the same validation the Settings page uses: the
-/// file must be a real, runnable Java (a broken MSI stub is rejected by the
-/// size floor, a non-Java executable by the exit-status/version parse). The
-/// older `detect_java_major` helper accepted any spawnable EXE, so a wrong
-/// path could slip a bogus "JVM" into the game command line.
-fn validate_explicit_java(path: &Path, required_major: u32, source: &str) -> Result<PathBuf> {
-    match crate::java::probe_java_by_path(path) {
-        None => Err(LauncherError::Java(format!(
-            "The Java configured for this {} does not appear to be a working Java installation: {}. Pick the Java executable again in the settings, or set Java to 'Automatic'.",
-            source,
-            path.display()
-        ))),
-        Some(inst) if inst.major_version != required_major => Err(LauncherError::Java(format!(
-            "The Java configured for this {} is Java {} ({}), but this Minecraft version requires Java {}. Change the Java version in the settings, or set it to 'Automatic' to let the launcher choose.",
-            source, inst.major_version, inst.version, required_major
-        ))),
-        Some(inst) => {
-            tracing::info!(target: "launcher", "Using {} Java: {:?} (v{}, {})", source, path, inst.version, inst.vendor);
-            Ok(path.to_path_buf())
+/// Turn a selection verdict into the launch executable. An explicit-but-
+/// incompatible Java is reported with the long-standing wording instead of
+/// being silently replaced by another JVM.
+fn java_path_from_choice(choice: &JavaChoice) -> Result<PathBuf> {
+    match choice {
+        JavaChoice::Explicit { install } | JavaChoice::Selected { install } => Ok(install.path.clone()),
+        JavaChoice::ExplicitRejected { path, source, problem } => {
+            Err(LauncherError::Java(describe_explicit_rejection(
+                path,
+                source,
+                problem,
+            )))
         }
+        // The launch pipeline never downloads on its own — the prepare phase
+        // (`ensure_java_for_launch`) owns the managed fallback. Reaching this
+        // arm means no usable Java 64-bit major exists on the machine.
+        JavaChoice::UseManaged { major } => Err(LauncherError::Java(format!(
+            "No 64-bit Java {} found. Install Java {} or let the launcher download it automatically.",
+            major, major
+        ))),
+        JavaChoice::Unavailable { reason, .. } => Err(LauncherError::Java(reason.clone())),
     }
 }
 
-/// Determine which Java executable to use
+/// Determine which Java executable to use.
+///
+/// `prepared` is the executable already chosen (possibly downloaded and
+/// probed) by the launch prepare phase; when present it is used verbatim so
+/// prepare and spawn cannot disagree. Otherwise the unified policy
+/// (`java::resolve_java`) performs the whole selection: instance Java, then
+/// launcher settings, then detected installations (system + managed).
 fn get_java_path(
     config: &AppConfig,
     instance: &Instance,
     version_info: &VersionInfo,
+    prepared: Option<&Path>,
 ) -> Result<PathBuf> {
-    let required_java = version_info.required_java_major();
-
-    // Priority: instance java > config java > auto-detect (system + managed)
-    if let Some(path) = &instance.java_path {
-        if path.exists() {
-            return validate_explicit_java(path, required_java, "instance");
-        }
-        tracing::debug!(target: "launcher", "Instance Java not found: {:?}", path);
+    if let Some(path) = prepared {
+        tracing::debug!(
+            target: "launcher",
+            "Using the Java pre-selected by the launch prepare phase: {:?}",
+            path
+        );
+        return Ok(path.to_path_buf());
     }
 
-    if let Some(path) = &config.java_path {
-        if path.exists() {
-            return validate_explicit_java(path, required_java, "launcher settings");
-        }
-        tracing::debug!(target: "launcher", "Config Java not found: {:?}", path);
-    }
+    // Only the EXACT 64-bit major is acceptable. "Closest newer" is never
+    // safe: modern JDKs abort on obfuscated old clients (unnamed-package
+    // classes trigger java.lang.module.FindException during boot-layer
+    // scanning) — hence `allow_newer: false` for game launches.
+    let req = JavaRequirement {
+        major: version_info.required_java_major(),
+        arch: None,
+        require_64bit: true,
+        allow_newer: false,
+    };
 
-    // Auto-detect (system + managed). Only an EXACT 64-bit major match is
-    // acceptable — the same rule `ensure_java_for_launch` enforces when it
-    // downloads a runtime. "Closest newer" is never safe: modern JDKs abort
-    // on obfuscated old clients (unnamed-package classes trigger
-    // java.lang.module.FindException during boot-layer scan).
     tracing::info!(target: "launcher", "Auto-detecting Java installations...");
     let installations = find_all_java_installations(&config.data_dir);
     tracing::info!(target: "launcher", "Found {} Java installations", installations.len());
     for (i, inst) in installations.iter().enumerate() {
-        tracing::debug!(target: "launcher", "  [{}] {} v{} ({})", i, inst.vendor, inst.version, inst.path.display());
+        tracing::debug!(target: "launcher", "  [{}] {} v{} at {:?}", i, inst.vendor, inst.version, inst.path.display());
     }
+    tracing::info!(target: "launcher", "Required Java version: {}", req.major);
 
-    if installations.is_empty() {
-        return Err(LauncherError::Java(
-            "No Java installation found. Please install Java.".into(),
-        ));
+    let choice = resolve_java(
+        &req,
+        instance.java_path.as_deref(),
+        config.java_path.as_deref(),
+        &installations,
+    );
+    let java = java_path_from_choice(&choice)?;
+    if let JavaChoice::Selected { install } = &choice {
+        tracing::info!(
+            target: "launcher",
+            "Selected Java: {} v{} at {:?}",
+            install.vendor,
+            install.version,
+            install.path
+        );
     }
-
-    tracing::info!(target: "launcher", "Required Java version: {}", required_java);
-
-    match installations
-        .iter()
-        .find(|j| j.is_64bit && j.major_version == required_java)
-    {
-        Some(java) => {
-            tracing::info!(target: "launcher", "Selected Java: {} v{} at {:?}", java.vendor, java.version, java.path);
-            Ok(java.path.clone())
-        }
-        None => Err(LauncherError::Java(format!(
-            "No 64-bit Java {} found. Install Java {} or let the launcher download it automatically.",
-            required_java, required_java
-        ))),
-    }
+    Ok(java)
 }
 
 /// Resolve a loader-library path from the persisted instance profile.
@@ -1184,6 +1190,95 @@ mod tests {
         )
         .expect("safe path must resolve");
         assert!(path.starts_with("libraries"));
+    }
+
+    // -------------------------------
+    // M3.3.2a: single-executable run
+    // -------------------------------
+
+    fn smoke_instance() -> crate::instances::Instance {
+        crate::instances::Instance::new(
+            "JvmPick",
+            "1.20.1",
+            4096,
+            "g1gc",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        )
+    }
+
+    fn fake_x64(major: u32) -> JavaInstallation {
+        JavaInstallation {
+            path: PathBuf::from(format!(r"C:\Java\jdk{major}\bin\java.exe")),
+            version: format!("{major}.0.0"),
+            major_version: major,
+            is_64bit: true,
+            vendor: "Test".to_string(),
+            arch: crate::java::JavaArch::X86_64,
+        }
+    }
+
+    #[test]
+    fn get_java_path_uses_the_prepared_executable_unchanged() {
+        let config = AppConfig::default();
+        let mut instance = smoke_instance();
+        instance.java_path = Some(PathBuf::from(r"C:\somewhere\else\java.exe"));
+        let version = synthetic_version("1.20.1");
+        let prepared = PathBuf::from(r"C:\prepared\jdk-17\bin\java.exe");
+
+        let path =
+            get_java_path(&config, &instance, &version, Some(&prepared)).expect("prepared wins");
+        assert_eq!(
+            path, prepared,
+            "the prepared executable must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn prepare_and_spawn_agree_on_one_executable() {
+        // The prepare phase resolves through the unified policy...
+        let choice = JavaChoice::Selected {
+            install: fake_x64(17),
+        };
+        let prepared_path = match crate::java::preparation_from_choice(&choice) {
+            Ok(crate::java::JavaPreparation::Ready { path, .. }) => path,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        // ...the spawn step maps the very same verdict back to a path.
+        let spawn_path = java_path_from_choice(&choice).expect("spawn uses the choice");
+        assert_eq!(
+            prepared_path, spawn_path,
+            "prepare and spawn must share the JVM"
+        );
+    }
+
+    #[test]
+    fn an_incompatible_explicit_java_is_a_launch_error_without_downloads() {
+        let bad = fake_x64(8);
+        let choice = JavaChoice::ExplicitRejected {
+            path: bad.path.clone(),
+            source: crate::java::SOURCE_INSTANCE,
+            problem: crate::java::ExplicitJavaProblem::VersionMismatch {
+                got: 8,
+                got_version: bad.version.clone(),
+                want: 17,
+            },
+        };
+        let err = java_path_from_choice(&choice).expect_err("rejected Java must abort");
+        let msg = err.to_string();
+        assert!(msg.contains("requires Java 17"), "got: {msg}");
+        assert!(msg.contains("Automatic"), "got: {msg}");
+        // The prepare phase refuses the very same verdict — a managed
+        // download must not be scheduled behind an explicit rejection.
+        assert!(crate::java::preparation_from_choice(&choice).is_err());
+    }
+
+    #[test]
+    fn missing_java_reports_the_runtime_requirement_at_spawn() {
+        let err = java_path_from_choice(&JavaChoice::UseManaged { major: 21 })
+            .expect_err("UseManaged must not silently pick nothing at spawn time");
+        let msg = err.to_string();
+        assert!(msg.contains("No 64-bit Java 21"), "got: {msg}");
     }
 
     /// In-memory FS probe: proves the profile builder never touches disk.
