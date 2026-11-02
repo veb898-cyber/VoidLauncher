@@ -87,7 +87,7 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
 }
 
 /// Detected Java installation
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct JavaInstallation {
     pub path: PathBuf,
     pub version: String,
@@ -372,6 +372,212 @@ fn looks_like_executable(path: &Path) -> bool {
     {
         let _ = path;
         true
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// JVM selection policy (M3.3.1)
+//
+// One pure, table-tested policy for every "pick a Java" decision. It
+// consumes only what the callers already prepared (M3.1 probe results and
+// M3.1/M3.2 detection lists) and touches nothing: no network, no registry,
+// no process spawns. Wiring into `get_java_path`/`ensure_java_for_launch`/
+// `forge::find_java_for` happens in M3.3.2 — until then the existing code
+// paths stay authoritative.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Hard requirements a scenario puts on its JVM.
+///
+/// This merges the three policies the code had before (game launch: exact
+/// major + 64-bit; pre-launch download check: exact major + 64-bit; Forge
+/// processors: exact major otherwise the closest newer one when the target
+/// wants Java 21+). Architecture here is the JVM's OWN probed architecture
+/// (`JavaArch`), never the launcher process's.
+///
+/// Wired into the launch/download/modloader call sites in M3.3.2 — until
+/// then only tests consume this, hence no dead-code lint.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JavaRequirement {
+    /// Java major the scenario needs (`javaVersion` of the manifest, or a
+    /// modloader's own requirement).
+    pub major: u32,
+    /// Hard architecture constraint. `Some(JavaArch::X86_64)` is what the old
+    /// "must be 64-bit" rule maps to. `None` = unconstrained. A
+    /// `JavaArch::Unknown` installation never satisfies `Some(_)` — unknown
+    /// is not silently promoted to a guessed match.
+    pub arch: Option<JavaArch>,
+    /// Accept the nearest **greater** compatible major when the exact one is
+    /// absent. Primarily modloader processors; game launches keep this off
+    /// (modern JDKs abort old obfuscated clients during boot-layer scanning).
+    pub allow_newer: bool,
+}
+
+/// Why a user-configured Java cannot serve a scenario.
+///
+/// The user's explicit choice is never silently replaced by another
+/// installation or a download; the caller surfaces this diagnosis instead.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExplicitJavaProblem {
+    /// The path exists but is not a working, runnable Java (broken install,
+    /// MSI stub, unrelated executable).
+    NotAJava,
+    /// A working Java of the wrong (mostly: older) major.
+    VersionMismatch { got: u32, want: u32 },
+    /// A working Java with a different, or unknown, architecture.
+    ArchMismatch { got: JavaArch, want: JavaArch },
+}
+
+/// The single selection verdict for all scenarios.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum JavaChoice {
+    /// The user's explicitly configured Java, verified compatible.
+    Explicit { install: JavaInstallation },
+    /// The user's explicit Java exists but cannot serve the scenario.
+    /// Diagnostic result — no substitution happened.
+    ExplicitRejected {
+        path: PathBuf,
+        problem: ExplicitJavaProblem,
+    },
+    /// A suitable installation found among the detected list (system or an
+    /// already-downloaded managed runtime — the list carries both).
+    Selected { install: JavaInstallation },
+    /// Nothing suitable is installed; use (download) the managed runtime of
+    /// this major.
+    UseManaged { major: u32 },
+    /// Nothing suitable and the managed route cannot satisfy the requirement
+    /// (managed runtimes only ship for the host's native architecture, so a
+    /// 32-bit target cannot be fulfilled by download). Report this reason.
+    Unavailable { major: u32, reason: String },
+}
+
+/// What the caller prepared for the explicit path (instance settings win
+/// over launcher settings; the first existing path is picked and probed by
+/// the caller, so the policy itself performs no probes and no FS access).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) enum ExplicitCandidate<'a> {
+    /// The selected explicit path probed into a working Java.
+    Java(&'a JavaInstallation),
+    /// The selected explicit path exists on disk but is not a working Java.
+    NotAJava { path: &'a Path },
+}
+
+/// Architecture check against the requirement. `Unknown` never satisfies a
+/// known requirement: guessing would undo the whole point of M3.1 probing.
+#[allow(dead_code)]
+fn arch_matches(inst: &JavaInstallation, req: &JavaRequirement) -> bool {
+    match req.arch {
+        None => true,
+        Some(want) => inst.arch == want,
+    }
+}
+
+/// Version check: exact major, or (when allowed) a newer one. A check never
+/// accepts an OLDER major, with or without `allow_newer`.
+#[allow(dead_code)]
+fn version_matches(inst: &JavaInstallation, req: &JavaRequirement) -> bool {
+    inst.major_version == req.major || (req.allow_newer && inst.major_version > req.major)
+}
+
+/// Pick the Java for `req` — the single unified policy.
+///
+/// Priority order:
+/// 1. an explicit user configuration (checked against `req`; incompatible
+///    explicit paths are diagnosed, never substituted);
+/// 2. exact major + architecture among the detected installations — the
+///    input list must already be sorted (M3.2 sort: major desc, 64-bit
+///    first, lowercased path tiebreak), which makes the winner deterministic;
+/// 3. when `allow_newer`, the closest strictly-larger major (independent of
+///    the list order);
+/// 4. managed fallback of `req.major` — or, when the requirement itself is
+///    not downloadable (32-bit), a diagnosed `Unavailable`.
+#[allow(dead_code)]
+pub(crate) fn select_java(
+    req: &JavaRequirement,
+    explicit: Option<ExplicitCandidate<'_>>,
+    installations: &[JavaInstallation],
+) -> JavaChoice {
+    // 1. Explicit configuration always wins over auto-detection.
+    if let Some(candidate) = explicit {
+        return match candidate {
+            ExplicitCandidate::Java(inst) => {
+                if !version_matches(inst, req) {
+                    JavaChoice::ExplicitRejected {
+                        path: inst.path.clone(),
+                        problem: ExplicitJavaProblem::VersionMismatch {
+                            got: inst.major_version,
+                            want: req.major,
+                        },
+                    }
+                } else if !arch_matches(inst, req) {
+                    JavaChoice::ExplicitRejected {
+                        path: inst.path.clone(),
+                        problem: ExplicitJavaProblem::ArchMismatch {
+                            got: inst.arch,
+                            want: req.arch.expect("constraint checked non-empty above"),
+                        },
+                    }
+                } else {
+                    JavaChoice::Explicit {
+                        install: inst.clone(),
+                    }
+                }
+            }
+            ExplicitCandidate::NotAJava { path } => JavaChoice::ExplicitRejected {
+                path: path.to_path_buf(),
+                problem: ExplicitJavaProblem::NotAJava,
+            },
+        };
+    }
+
+    // 2.+3. Automatic selection. Exact major takes priority no matter where
+    // it appears; `allow_newer` scans for the closest strictly-larger major
+    // (independently of the list order, so an unsorted list cannot make a
+    // distant-major installation win).
+    let mut exact = None;
+    let mut closest_newer: Option<&JavaInstallation> = None;
+    for inst in installations {
+        if !arch_matches(inst, req) {
+            continue;
+        }
+        if inst.major_version == req.major {
+            exact = Some(inst);
+            break;
+        }
+        if req.allow_newer && inst.major_version > req.major {
+            let closer = match closest_newer {
+                None => true,
+                Some(best) => inst.major_version < best.major_version,
+            };
+            if closer {
+                closest_newer = Some(inst);
+            }
+        }
+    }
+    if let Some(inst) = exact.or(closest_newer) {
+        return JavaChoice::Selected {
+            install: inst.clone(),
+        };
+    }
+
+    // 4. Managed fallback. Managed runtimes are only served for the host's
+    // native architecture, so a genuinely 32-bit target cannot be fulfilled
+    // by download — say so instead of pretending a download would help.
+    if req.arch == Some(JavaArch::X86) {
+        JavaChoice::Unavailable {
+            major: req.major,
+            reason: format!(
+                "Java {} (32-bit) is not installed, and the launcher can only download \
+                 64-bit managed runtimes. Install a 32-bit Java {} yourself and point \
+                 the instance or launcher settings to it.",
+                req.major, req.major
+            ),
+        }
+    } else {
+        JavaChoice::UseManaged { major: req.major }
     }
 }
 
@@ -1122,5 +1328,353 @@ openjdk version \"11.0.20\" 2023-07-18
         );
 
         std::fs::remove_file(&exe).expect("clean up fake executable file");
+    }
+
+    // -----------------------------
+    // M3.3.1: JVM selection policy
+    // -----------------------------
+
+    use crate::java::{
+        select_java, ExplicitCandidate, ExplicitJavaProblem, JavaChoice, JavaRequirement,
+    };
+
+    /// A fake installation: no probe, no FS, no registry — the policy input
+    /// is just data.
+    fn fake_inst(major: u32, arch: JavaArch) -> JavaInstallation {
+        let bits = match arch {
+            JavaArch::X86_64 | JavaArch::Arm64 => true,
+            JavaArch::X86 => false,
+            JavaArch::Unknown => true,
+        };
+        JavaInstallation {
+            path: PathBuf::from(format!(r"C:\Java\jdk{major}-{:?}\bin\java.exe", arch)),
+            version: format!("{major}.0.0"),
+            major_version: major,
+            is_64bit: bits,
+            vendor: "Test".to_string(),
+            arch,
+        }
+    }
+
+    /// The old "Minecraft needs 64-bit Java N" requirement.
+    fn game_req(major: u32) -> JavaRequirement {
+        JavaRequirement {
+            major,
+            arch: Some(JavaArch::X86_64),
+            allow_newer: false,
+        }
+    }
+
+    fn choose(
+        req: &JavaRequirement,
+        explicit: Option<ExplicitCandidate<'_>>,
+        list: &[JavaInstallation],
+    ) -> JavaChoice {
+        select_java(req, explicit, list)
+    }
+
+    // Sorted like the M3.2 detection output (major desc, 64-bit first).
+    fn sorted(mut list: Vec<JavaInstallation>) -> Vec<JavaInstallation> {
+        list.sort_by(|a, b| {
+            a.major_version
+                .cmp(&b.major_version)
+                .reverse()
+                .then_with(|| b.is_64bit.cmp(&a.is_64bit))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        list
+    }
+
+    #[test]
+    fn explicit_java_wins_even_when_a_fresher_auto_candidate_exists() {
+        let explicit = fake_inst(17, JavaArch::X86_64);
+        let list = [fake_inst(21, JavaArch::X86_64), explicit.clone()];
+        let choice = choose(
+            &game_req(17),
+            Some(ExplicitCandidate::Java(&explicit)),
+            &list,
+        );
+        assert_eq!(
+            choice,
+            JavaChoice::Explicit { install: explicit },
+            "user choice must not be replaced by the detected list"
+        );
+    }
+
+    #[test]
+    fn explicit_java_away_from_the_list_is_not_swapped_for_detected() {
+        let explicit = fake_inst(8, JavaArch::X86_64);
+        let list = [fake_inst(17, JavaArch::X86_64)];
+        let choice = choose(
+            &game_req(8),
+            Some(ExplicitCandidate::Java(&explicit)),
+            &list,
+        );
+        assert_eq!(choice, JavaChoice::Explicit { install: explicit });
+    }
+
+    #[test]
+    fn exact_major_is_preferred_over_newer_detected_majors() {
+        let list = [
+            fake_inst(21, JavaArch::X86_64),
+            fake_inst(17, JavaArch::X86_64),
+            fake_inst(8, JavaArch::X86_64),
+        ];
+        let choice = choose(&game_req(17), None, &list);
+        assert_eq!(
+            choice,
+            JavaChoice::Selected {
+                install: fake_inst(17, JavaArch::X86_64)
+            },
+            "exact major beats the newer one"
+        );
+    }
+
+    #[test]
+    fn selection_is_deterministic_for_equal_candidates() {
+        let mut a = fake_inst(21, JavaArch::X86_64);
+        let mut b = fake_inst(21, JavaArch::X86_64);
+        a.path = PathBuf::from(r"C:\Java\a\bin\java.exe");
+        b.path = PathBuf::from(r"C:\Java\b\bin\java.exe");
+        let list = sorted(vec![b.clone(), a.clone()]);
+        let first = choose(&game_req(21), None, &list);
+        let again = choose(&game_req(21), None, &list);
+        assert_eq!(first, again, "repeated selection must be stable");
+        // The sorted input's first entry (lowest path) must win.
+        assert_eq!(
+            first,
+            JavaChoice::Selected { install: a },
+            "tiebreak must follow the M3.2 sort"
+        );
+    }
+
+    #[test]
+    fn allow_newer_picks_the_closest_larger_major() {
+        // Forge-processor-shaped requirement: exact otherwise nearest newer.
+        let req = JavaRequirement {
+            major: 21,
+            arch: Some(JavaArch::X86_64),
+            allow_newer: true,
+        };
+        let list = [
+            fake_inst(25, JavaArch::X86_64),
+            fake_inst(22, JavaArch::X86_64),
+        ];
+        let choice = choose(&req, None, &list);
+        assert_eq!(
+            choice,
+            JavaChoice::Selected {
+                install: fake_inst(22, JavaArch::X86_64)
+            }
+        );
+    }
+
+    #[test]
+    fn allow_newer_still_serves_an_exact_match_from_the_list() {
+        let req = JavaRequirement {
+            major: 21,
+            arch: Some(JavaArch::X86_64),
+            allow_newer: true,
+        };
+        let list = [
+            fake_inst(25, JavaArch::X86_64),
+            fake_inst(21, JavaArch::X86_64),
+        ];
+        let choice = choose(&req, None, &list);
+        assert_eq!(
+            choice,
+            JavaChoice::Selected {
+                install: fake_inst(21, JavaArch::X86_64)
+            }
+        );
+    }
+
+    #[test]
+    fn new_javas_never_serve_when_allow_newer_is_off() {
+        // The launch policy kept its old wording exactly: "closest newer is
+        // never safe" for the game client.
+        let list = [
+            fake_inst(25, JavaArch::X86_64),
+            fake_inst(21, JavaArch::X86_64),
+        ];
+        let choice = choose(&game_req(17), None, &list);
+        assert_eq!(choice, JavaChoice::UseManaged { major: 17 });
+    }
+
+    #[test]
+    fn an_older_major_is_never_accepted_even_with_allow_newer() {
+        let req = JavaRequirement {
+            major: 21,
+            arch: Some(JavaArch::X86_64),
+            allow_newer: true,
+        };
+        let list = [fake_inst(17, JavaArch::X86_64)];
+        let choice = choose(&req, None, &list);
+        assert_eq!(choice, JavaChoice::UseManaged { major: 21 });
+    }
+
+    #[test]
+    fn the_64_bit_requirement_rejects_a_32_bit_jvm() {
+        let list = [fake_inst(17, JavaArch::X86)];
+        let choice = choose(&game_req(17), None, &list);
+        assert_eq!(
+            choice,
+            JavaChoice::UseManaged { major: 17 },
+            "32-bit must never satisfy X86_64"
+        );
+    }
+
+    #[test]
+    fn arm64_requirement_matches_and_never_crosses_families() {
+        let arm = fake_inst(21, JavaArch::Arm64);
+        // Correct family: match.
+        let req = JavaRequirement {
+            major: 21,
+            arch: Some(JavaArch::Arm64),
+            allow_newer: false,
+        };
+        assert_eq!(
+            choose(&req, None, std::slice::from_ref(&arm)),
+            JavaChoice::Selected {
+                install: arm.clone()
+            },
+            "arm64 requirement is satisfied by an arm64 JVM"
+        );
+        // Mixed-up family: no silent cross-family selection.
+        let req_x64 = JavaRequirement {
+            major: 21,
+            arch: Some(JavaArch::X86_64),
+            allow_newer: false,
+        };
+        let list = [arm, fake_inst(21, JavaArch::X86)];
+        let choice = choose(&req_x64, None, &list);
+        assert_eq!(choice, JavaChoice::UseManaged { major: 21 });
+    }
+
+    #[test]
+    fn unknown_arch_never_matches_a_known_constraint() {
+        let unknown = fake_inst(17, JavaArch::Unknown);
+        let list = [unknown.clone()];
+        let choice = choose(&game_req(17), None, &list);
+        assert_eq!(
+            choice,
+            JavaChoice::UseManaged { major: 17 },
+            "an M3.1-unknown arch must not be treated as x86_64"
+        );
+
+        // Without a hard constraint, an Unknown-arch record still serves.
+        let req_any = JavaRequirement {
+            major: 17,
+            arch: None,
+            allow_newer: false,
+        };
+        assert_eq!(
+            choose(&req_any, None, &[unknown]),
+            JavaChoice::Selected {
+                install: fake_inst(17, JavaArch::Unknown)
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_java_of_the_wrong_major_is_reported_not_swapped() {
+        let explicit = fake_inst(8, JavaArch::X86_64);
+        let list = [fake_inst(17, JavaArch::X86_64)];
+        let choice = choose(
+            &game_req(17),
+            Some(ExplicitCandidate::Java(&explicit)),
+            &list,
+        );
+        assert_eq!(
+            choice,
+            JavaChoice::ExplicitRejected {
+                path: explicit.path.clone(),
+                problem: ExplicitJavaProblem::VersionMismatch { got: 8, want: 17 }
+            },
+            "the diagnosis must name the version conflict, not pick Java 17"
+        );
+    }
+
+    #[test]
+    fn explicit_not_a_java_path_is_reported_not_swapped() {
+        let broken = PathBuf::from(r"C:\Users\me\Downloads\some.exe");
+        let list = [fake_inst(17, JavaArch::X86_64)];
+        let choice = choose(
+            &game_req(17),
+            Some(ExplicitCandidate::NotAJava { path: &broken }),
+            &list,
+        );
+        assert_eq!(
+            choice,
+            JavaChoice::ExplicitRejected {
+                path: broken,
+                problem: ExplicitJavaProblem::NotAJava
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_java_with_the_wrong_arch_is_reported_not_swapped() {
+        let explicit = fake_inst(21, JavaArch::X86);
+        let list = [fake_inst(21, JavaArch::X86_64)];
+        let choice = choose(
+            &game_req(21),
+            Some(ExplicitCandidate::Java(&explicit)),
+            &list,
+        );
+        assert_eq!(
+            choice,
+            JavaChoice::ExplicitRejected {
+                path: explicit.path.clone(),
+                problem: ExplicitJavaProblem::ArchMismatch {
+                    got: JavaArch::X86,
+                    want: JavaArch::X86_64
+                }
+            },
+            "arch mismatch is diagnosed even when the major matches"
+        );
+    }
+
+    #[test]
+    fn explicit_newer_java_is_fine_when_allow_newer_stands() {
+        let explicit = fake_inst(25, JavaArch::X86_64);
+        let req = JavaRequirement {
+            major: 21,
+            arch: Some(JavaArch::X86_64),
+            allow_newer: true,
+        };
+        let list = [fake_inst(21, JavaArch::X86_64)];
+        let choice = choose(&req, Some(ExplicitCandidate::Java(&explicit)), &list);
+        assert_eq!(
+            choice,
+            JavaChoice::Explicit { install: explicit },
+            "an allowed-newer scenario keeps the user's fresh Java"
+        );
+    }
+
+    #[test]
+    fn no_candidates_at_all_fall_back_to_managed() {
+        let choice = choose(&game_req(21), None, &[]);
+        assert_eq!(choice, JavaChoice::UseManaged { major: 21 });
+    }
+
+    #[test]
+    fn a_32_bit_target_cannot_use_the_managed_fallback() {
+        let req = JavaRequirement {
+            major: 8,
+            arch: Some(JavaArch::X86),
+            allow_newer: false,
+        };
+        let choice = choose(&req, None, &[]);
+        match choice {
+            JavaChoice::Unavailable { major, reason } => {
+                assert_eq!(major, 8);
+                assert!(
+                    reason.contains("32-bit"),
+                    "reason must mention bitness: {reason}"
+                );
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
     }
 }
