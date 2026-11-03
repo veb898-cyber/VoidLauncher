@@ -465,8 +465,12 @@ pub fn verify_instance_scoped(
     // ── libraries (vanilla + loader profile) ────────────────────
     let mut libraries = CategoryBuilder::new("libraries");
     if let Some(vi) = &version_info {
+        // Verify checks the SAME file set the launch path would use: with an
+        // explicit/selected Java its probed architecture, otherwise Unknown —
+        // lenient (arch-neutral files only, no guessing).
+        let target = crate::launch::best_effort_target_arch(config, instance, vi);
         for lib in &vi.libraries {
-            if !versions::should_include_library(lib) {
+            if !versions::should_include_library_for(lib, target) {
                 continue;
             }
             if let Some(downloads) = &lib.downloads {
@@ -489,7 +493,7 @@ pub fn verify_instance_scoped(
                         );
                     }
                 }
-                if let Some(classifier) = versions::native_classifier(lib) {
+                if let Some(classifier) = versions::native_classifier_for(lib, target) {
                     if let Some(classifiers) = &downloads.classifiers {
                         if let Some(native) = classifiers.get(classifier.as_str()) {
                             if let Some(path) = native.get("path").and_then(|v| v.as_str()) {
@@ -776,9 +780,12 @@ fn neoforge_client_jar_missing(instance: &Instance, libraries_dir: &Path) -> boo
 /// Find an unsafe path in the included vanilla libraries (artifact or native
 /// classifier). Repair must fail loudly: silently skipping it would report a
 /// successful repair while required files remain unverifiable.
-fn unsafe_version_library_path(version_info: &VersionInfo) -> Option<String> {
+fn unsafe_version_library_path(
+    version_info: &VersionInfo,
+    target: crate::versions::TargetArch,
+) -> Option<String> {
     for lib in &version_info.libraries {
-        if !versions::should_include_library(lib) {
+        if !versions::should_include_library_for(lib, target) {
             continue;
         }
         let Some(downloads) = &lib.downloads else {
@@ -797,7 +804,7 @@ fn unsafe_version_library_path(version_info: &VersionInfo) -> Option<String> {
                 return Some(artifact.path.clone());
             }
         }
-        if let Some(classifier) = versions::native_classifier(lib) {
+        if let Some(classifier) = versions::native_classifier_for(lib, target) {
             if let Some(native) = downloads
                 .classifiers
                 .as_ref()
@@ -820,6 +827,7 @@ fn collect_repair_targets(
     version_info: &VersionInfo,
     libraries_dir: &Path,
     versions_dir: &Path,
+    target: crate::versions::TargetArch,
 ) -> Vec<(String, PathBuf, String, u64)> {
     let mut targets = Vec::new();
 
@@ -846,7 +854,7 @@ fn collect_repair_targets(
 
     // Vanilla libraries.
     for lib in &version_info.libraries {
-        if !versions::should_include_library(lib) {
+        if !versions::should_include_library_for(lib, target) {
             continue;
         }
         if let Some(downloads) = &lib.downloads {
@@ -867,7 +875,7 @@ fn collect_repair_targets(
                     ));
                 }
             }
-            if let Some(classifier) = versions::native_classifier(lib) {
+            if let Some(classifier) = versions::native_classifier_for(lib, target) {
                 if let Some(classifiers) = &downloads.classifiers {
                     if let Some(native) = classifiers.get(classifier.as_str()) {
                         if let (Some(url), Some(path), Some(sha1), Some(size)) = (
@@ -970,6 +978,10 @@ pub async fn repair_instance(
         LauncherError::Version("Version metadata unavailable after fetch".to_string())
     })?;
 
+    // Repair must inspect the same architecture the game would run: explicit
+    // or selected Java wins with its probed arch, otherwise Unknown (lenient).
+    let repair_target = crate::launch::best_effort_target_arch(config, instance, &vi);
+
     // The asset-index id becomes a file name under assets/indexes; a tampered
     // local version JSON must not make repair write outside that directory.
     if crate::import::check_safe_file_name(&vi.assets).is_err() {
@@ -978,7 +990,7 @@ pub async fn repair_instance(
             vi.assets
         )));
     }
-    if let Some(path) = unsafe_version_library_path(&vi) {
+    if let Some(path) = unsafe_version_library_path(&vi, repair_target) {
         return Err(LauncherError::Version(format!(
             "Unsafe library path in version metadata: {}",
             path
@@ -997,7 +1009,7 @@ pub async fn repair_instance(
     // ── 2. client JAR + libraries ───────────────────────────────
     emit("files", 8.0, "Checking game files...");
     let mut targets = if crate::import::check_safe_file_name(&vi.id).is_ok() {
-        collect_repair_targets(&vi, &libraries_dir, &versions_dir)
+        collect_repair_targets(&vi, &libraries_dir, &versions_dir, repair_target)
     } else {
         summary.failed += 1;
         summary
@@ -1899,7 +1911,12 @@ mod tests {
         let bad = libraries_dir.join("com/example/bad/1.0/bad-1.0.jar");
         write_file_with_sha1(&bad, b"wrong");
 
-        let targets = collect_repair_targets(&vi, &libraries_dir, &versions_dir);
+        let targets = collect_repair_targets(
+            &vi,
+            &libraries_dir,
+            &versions_dir,
+            crate::versions::TargetArch::Unknown,
+        );
         let paths: Vec<String> = targets
             .iter()
             .map(|(_, p, _, _)| p.to_string_lossy().to_string())
@@ -2065,7 +2082,8 @@ mod tests {
         );
         assert!(
             unsafe_version_library_path(
-                &serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap()
+                &serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap(),
+                crate::versions::TargetArch::Unknown,
             )
             .is_some(),
             "repair must reject the same metadata instead of skipping it"

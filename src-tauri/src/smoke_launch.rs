@@ -259,9 +259,8 @@ async fn install_version(config: &AppConfig, mc: &str) -> Result<versions::Versi
             .map_err(|e| e.to_string())?;
     }
 
-    versions::ensure_native_libraries(&vi, &config.libraries_dir())
-        .await
-        .map_err(|e| format!("natives {}: {}", mc, e))?;
+    // The native-library ensure step happens at launch (see below): that is
+    // where the JVM — and therefore the native architecture — is known.
 
     let idx_path = config
         .assets_dir()
@@ -418,7 +417,26 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
             .map_err(|e| format!("save instance: {}", e))?;
     }
 
-    // 4. Launch
+    // 4. Launch. Resolve the JVM through the same policy the launcher uses —
+    //    the probed installation then drives BOTH the native-library ensure
+    //    step and the spawn, so natives and the game run on one architecture.
+    //    (Version files were downloaded earlier with the process arch, which
+    //    is provisional; every native below is re-checked for the JVM arch.)
+    let java = launch::resolve_launch_java(config, &instance, &vi)
+        .map_err(|e| format!("resolve launch java: {}", e))?;
+    versions::ensure_native_libraries_for(
+        &vi,
+        &config.libraries_dir(),
+        versions::TargetArch::from_java_arch(java.arch),
+    )
+    .await
+    .map_err(|e| format!("natives {}: {}", mc, e))?;
+    report_line(&format!(
+        "launch java arch={:?} at {}",
+        java.arch,
+        java.path.display()
+    ));
+
     let uuid = "00000000-0000-0000-0000-000000000000";
     let token = "smoke-offline-token";
     let username = "SmokeTest";
@@ -437,7 +455,7 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
         },
         None,
         None,
-        None, // no pre-selected Java: the smoke test resolves its own JVM
+        Some(&java),
     ) {
         Ok(c) => c,
         Err(e) => return Err(format!("launch spawn error: {}", e)),

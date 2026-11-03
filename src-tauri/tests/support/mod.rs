@@ -15,7 +15,7 @@ use voidlauncher_lib::launch::{
     LaunchProfile,
 };
 use voidlauncher_lib::modloaders::LoaderProfile;
-use voidlauncher_lib::versions::{maven_to_path, VersionInfo};
+use voidlauncher_lib::versions::{maven_to_path, TargetArch, VersionInfo};
 
 /// Deterministic values every test asserts against.
 pub const TEST_USERNAME: &str = "TestPlayer";
@@ -140,6 +140,14 @@ pub fn write_client_jar(config: &AppConfig, version_id: &str) {
 }
 
 /// Config with every machine-dependent default pinned to a test constant.
+/// The target architecture used by default in test fixtures: the compiled
+/// test binary's own arch, which mirrors the pre-M3.3.2b behavior the original
+/// fixtures were written against. Use `build_with_target`/`profile_with_target`
+/// to exercise a different game-JVM architecture.
+pub fn test_target_arch() -> TargetArch {
+    TargetArch::current()
+}
+
 pub fn test_config(data_dir: &Path) -> AppConfig {
     AppConfig {
         data_dir: data_dir.to_path_buf(),
@@ -215,13 +223,22 @@ impl Fixture {
     }
 
     pub fn build(&self) -> LaunchCommand {
-        self.build_with(None, None)
+        self.build_with_target(None, None, test_target_arch())
     }
 
     pub fn build_with(
         &self,
         server: Option<(&str, Option<u16>)>,
         session_log: Option<&str>,
+    ) -> LaunchCommand {
+        self.build_with_target(server, session_log, test_target_arch())
+    }
+
+    pub fn build_with_target(
+        &self,
+        server: Option<(&str, Option<u16>)>,
+        session_log: Option<&str>,
+        target_arch: TargetArch,
     ) -> LaunchCommand {
         build_launch_command(
             &self.config,
@@ -232,6 +249,7 @@ impl Fixture {
             session_log,
             self.java_path(),
             self.java_major(),
+            target_arch,
         )
         .unwrap_or_else(|e| panic!("build launch command: {}", e))
     }
@@ -246,6 +264,15 @@ impl Fixture {
         server: Option<(&str, Option<u16>)>,
         session_log: Option<&str>,
     ) -> LaunchProfile {
+        self.profile_with_target(server, session_log, test_target_arch())
+    }
+
+    pub fn profile_with_target(
+        &self,
+        server: Option<(&str, Option<u16>)>,
+        session_log: Option<&str>,
+        target_arch: TargetArch,
+    ) -> LaunchProfile {
         prepare_and_build_launch_profile(
             &self.config,
             &self.instance,
@@ -254,12 +281,17 @@ impl Fixture {
             server,
             session_log,
             self.java_major(),
+            target_arch,
         )
         .unwrap_or_else(|e| panic!("build launch profile: {}", e))
         .0
     }
 
     pub fn build_err(&self) -> String {
+        self.build_err_with_target(test_target_arch())
+    }
+
+    pub fn build_err_with_target(&self, target_arch: TargetArch) -> String {
         match build_launch_command(
             &self.config,
             &self.instance,
@@ -269,6 +301,7 @@ impl Fixture {
             None,
             self.java_path(),
             self.java_major(),
+            target_arch,
         ) {
             Ok(_) => panic!("expected launch command build to fail"),
             Err(e) => e.to_string(),

@@ -17,7 +17,7 @@ use std::path::Path;
 
 use support::*;
 use voidlauncher_lib::versions::{
-    build_classpath, extract_natives, get_jvm_arguments, VersionInfo,
+    build_classpath_for, extract_natives, get_jvm_arguments_for, TargetArch, VersionInfo,
 };
 
 fn write_native_jar(path: &Path, entries: &[(&str, &[u8])]) {
@@ -238,7 +238,7 @@ fn concurrent_native_preparation_of_the_same_version_converges() {
                 std::thread::spawn(move || {
                     barrier.wait();
                     let version = synthetic_version(libs.as_ref().clone(), serde_json::json!([]));
-                    extract_natives(&version, &libraries, &natives_dir)
+                    extract_natives(&version, &libraries, &natives_dir, TargetArch::X86_64)
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 })
@@ -314,6 +314,7 @@ fn native_extraction_replaces_existing_file() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &natives_dir,
+        TargetArch::X86_64,
     )
     .expect("extract natives");
 
@@ -338,6 +339,7 @@ fn corrupt_native_jar_is_reported() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &fixture.data_dir().join("versions/1.12.2/natives"),
+        TargetArch::X86_64,
     );
 
     assert!(
@@ -360,6 +362,7 @@ fn native_extraction_removes_files_from_a_previous_set() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &natives_dir,
+        TargetArch::X86_64,
     )
     .expect("extract first native set");
 
@@ -371,6 +374,7 @@ fn native_extraction_removes_files_from_a_previous_set() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &natives_dir,
+        TargetArch::X86_64,
     )
     .expect("extract second native set");
 
@@ -400,6 +404,7 @@ fn failed_native_extraction_does_not_touch_existing_natives() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &natives_dir,
+        TargetArch::X86_64,
     )
     .expect("extract valid native set");
 
@@ -408,6 +413,7 @@ fn failed_native_extraction_does_not_touch_existing_natives() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &natives_dir,
+        TargetArch::X86_64,
     )
     .expect_err("a corrupt native archive must fail preparation")
     .to_string();
@@ -440,6 +446,7 @@ fn native_extraction_rolls_back_when_entry_data_is_corrupt() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &natives_dir,
+        TargetArch::X86_64,
     )
     .expect("extract previous native set");
 
@@ -482,6 +489,7 @@ fn native_extraction_rolls_back_when_entry_data_is_corrupt() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &natives_dir,
+        TargetArch::X86_64,
     )
     .expect_err("corrupt entry data must fail preparation")
     .to_string();
@@ -528,6 +536,7 @@ fn native_extraction_reports_a_native_file_that_cannot_be_replaced() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &natives_dir,
+        TargetArch::X86_64,
     )
     .expect("extract first native set");
 
@@ -546,6 +555,7 @@ fn native_extraction_reports_a_native_file_that_cannot_be_replaced() {
         &fixture.version,
         &fixture.config.libraries_dir(),
         &natives_dir,
+        TargetArch::X86_64,
     );
 
     let mut permissions = std::fs::metadata(&target)
@@ -593,37 +603,37 @@ fn native_classifier_uses_the_target_architecture() {
     }
 
     let version = synthetic_version(native_library_json(), serde_json::json!([]));
-    let classpath = build_classpath(&version, &libraries, &client).expect("classpath");
-
-    // The provisional target is the launcher build's architecture; M3 replaces
-    // it with the selected JVM's `os.arch`. Only that architecture's classifier
-    // may appear, and the others must stay off the classpath.
-    let expected = if cfg!(target_arch = "aarch64") {
-        "native-1.0-natives-windows-arm64.jar"
-    } else if cfg!(target_arch = "x86") {
-        "native-1.0-natives-windows-32.jar"
-    } else {
-        "native-1.0-natives-windows-64.jar"
-    };
-    assert!(
-        classpath.contains(expected),
-        "expected the {} classifier, classpath was:\n{}",
-        expected,
-        classpath
-    );
-    for foreign in variants {
-        let foreign = Path::new(foreign)
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        if foreign != expected {
-            assert!(
-                !classpath.contains(&foreign),
-                "the {} classifier belongs to another architecture and must not be on the classpath:\n{}",
-                foreign,
-                classpath
-            );
+    for (target, expected) in [
+        (TargetArch::X86_64, "native-1.0-natives-windows-64.jar"),
+        (TargetArch::Arm64, "native-1.0-natives-windows-arm64.jar"),
+        (TargetArch::X86, "native-1.0-natives-windows-32.jar"),
+    ] {
+        let classpath =
+            build_classpath_for(&version, &libraries, &client, target).expect("classpath");
+        // Only the requested architecture's classifier may appear, and the
+        // others must stay off the classpath.
+        assert!(
+            classpath.contains(expected),
+            "expected the {} classifier for {:?}, classpath was:\n{}",
+            expected,
+            target,
+            classpath
+        );
+        for foreign in variants {
+            let foreign = Path::new(foreign)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            if foreign != expected {
+                assert!(
+                    !classpath.contains(&foreign),
+                    "the {} classifier belongs to another architecture and must not be on the {:?} classpath:\n{}",
+                    foreign,
+                    target,
+                    classpath
+                );
+            }
         }
     }
 }
@@ -641,14 +651,21 @@ fn arm64_argument_rule_matches_on_arm64_hosts() {
             "value": "-Darm64.rule.matched=true"
         }]),
     );
-    let args = get_jvm_arguments(&version);
 
-    // On x64 the rule must stay off; on Windows ARM64 it must turn on.
-    let should_match = cfg!(target_arch = "aarch64");
-    assert_eq!(
-        args.iter().any(|a| a == "-Darm64.rule.matched=true"),
-        should_match,
-        "arm64 rule handling is wrong for this host (args: {:?})",
-        args
+    // On an ARM64 JVM the rule must turn on; on x64/x86 it must stay off.
+    let on_arm64 = get_jvm_arguments_for(&version, TargetArch::Arm64);
+    assert!(
+        on_arm64.iter().any(|a| a == "-Darm64.rule.matched=true"),
+        "arm64 rule must match an ARM64 target (args: {:?})",
+        on_arm64
     );
+    for target in [TargetArch::X86_64, TargetArch::X86] {
+        let args = get_jvm_arguments_for(&version, target);
+        assert!(
+            !args.iter().any(|a| a == "-Darm64.rule.matched=true"),
+            "arm64 rule must not match the {:?} target (args: {:?})",
+            target,
+            args
+        );
+    }
 }

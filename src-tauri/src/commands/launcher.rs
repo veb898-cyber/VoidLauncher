@@ -15,7 +15,7 @@ use crate::playtime;
 use crate::versions;
 use crate::AppState;
 use crate::{accounts, i18n};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -195,17 +195,18 @@ pub async fn cmd_install_version(
 /// is re-verified with the M3.1 probe (via the fresh detection list, whose
 /// managed entries are re-probed) before the launch proceeds.
 ///
-/// The returned executable is handed to `launch::launch_minecraft` verbatim,
-/// so prepare and spawn always run the very same JVM. An explicitly
-/// configured but broken/incompatible Java is reported instead of being
-/// replaced by another installation or a download.
+/// The returned installation (with its probed architecture) is handed to
+/// `launch::launch_minecraft` verbatim, so prepare and spawn always run the
+/// very same JVM and the native selection follows its probed architecture.
+/// An explicitly configured but broken/incompatible Java is reported instead
+/// of being replaced by another installation or a download.
 async fn ensure_java_for_launch(
     app: &AppHandle,
     data_dir: &Path,
     version_info: &versions::VersionInfo,
     instance: &instances::Instance,
     config: &crate::config::AppConfig,
-) -> Result<PathBuf, String> {
+) -> Result<crate::java::JavaInstallation, String> {
     let req = crate::java::JavaRequirement {
         major: version_info.required_java_major(),
         arch: None,
@@ -231,12 +232,13 @@ async fn ensure_java_for_launch(
         Ok(crate::java::JavaPreparation::Ready { path, install }) => {
             tracing::info!(
                 target: "launcher",
-                "Java is ready: {} v{} at {:?}",
+                "Java is ready: {} v{} at {:?} (arch {:?})",
                 install.vendor,
                 install.version,
-                path
+                path,
+                install.arch
             );
-            Ok(path)
+            Ok(install)
         }
         Ok(crate::java::JavaPreparation::InstallManaged { major }) => {
             events::emit_log(
@@ -278,12 +280,13 @@ async fn ensure_java_for_launch(
                 Ok(crate::java::JavaPreparation::Ready { path, install }) => {
                     tracing::info!(
                         target: "launcher",
-                        "Downloaded Java verified: {} v{} at {:?}",
+                        "Downloaded Java verified: {} v{} at {:?} (arch {:?})",
                         install.vendor,
                         install.version,
-                        path
+                        path,
+                        install.arch
                     );
-                    Ok(path)
+                    Ok(install)
                 }
                 // A second `InstallManaged` after a successful download means
                 // the fresh runtime did not survive verification — abort
@@ -633,19 +636,31 @@ pub async fn cmd_launch_game(
         msg
     })?;
 
-    // Self-heal: ensure the version's files (client.jar, libraries) are on
-    // disk. They are normally downloaded when the instance is created, but a
-    // failed creation or a manually removed file must not break the launch.
+    // Ensure a usable Java installation exists (download + verify through the
+    // unified policy if missing). The returned installation — probed by M3.1,
+    // so its architecture is known — is the ONE JVM for this run: the spawn
+    // step below receives it verbatim and must not pick its own. The probe's
+    // architecture also decides the native selection everywhere below, which
+    // is why this runs BEFORE any version-file download.
+    let prepared_java =
+        ensure_java_for_launch(&app, &data_dir, &version_info, &instance, &config).await?;
+    let launch_target = crate::versions::TargetArch::from_java_arch(prepared_java.arch);
+
+    // Self-heal: ensure the version's files (client.jar, libraries, and the
+    // native classifier JARs of the chosen JVM's architecture) are on disk.
+    // They are normally downloaded when the instance is created, but a failed
+    // creation or a manually removed file must not break the launch.
     events::emit_log(
         &app,
         "info",
         "launch",
         "Ensuring version files are present...",
     );
-    let files = versions::collect_downloads(
+    let files = versions::collect_downloads_for(
         &version_info,
         &config.libraries_dir(),
         &config.versions_dir(),
+        launch_target,
     )
     .map_err(|e| {
         let msg = format!("Invalid version metadata: {}", e);
@@ -724,13 +739,6 @@ pub async fn cmd_launch_game(
         })?;
     }
 
-    // Ensure a usable Java executable exists (download + verify through the
-    // unified policy if missing). The returned path is the ONE executable for
-    // this run: the spawn step below receives it verbatim and must not pick
-    // its own.
-    let java_override =
-        ensure_java_for_launch(&app, &data_dir, &version_info, &instance, &config).await?;
-
     // Ensure loader processor-generated JARs exist (client-*-srg.jar,
     // forge-*-client.jar, NeoForge's patched client, etc.). Do NOT refresh
     // the stored launch profile here: it is persisted in instance.json, and
@@ -806,8 +814,10 @@ pub async fn cmd_launch_game(
     // Ensure LWJGL native JARs are present (self-heal for installs that
     // predate native-classifier downloads). Missing natives are a required
     // part of the game runtime — continuing would only crash Java later with
-    // an unrelated-looking error.
-    if let Err(e) = versions::ensure_native_libraries(&version_info, &config.libraries_dir()).await
+    // an unrelated-looking error. Same architecture as the downloads above.
+    if let Err(e) =
+        versions::ensure_native_libraries_for(&version_info, &config.libraries_dir(), launch_target)
+            .await
     {
         let msg = format!("Failed to prepare native libraries: {}", e);
         events::emit_log(&app, "error", "launch", &msg);
@@ -850,7 +860,7 @@ pub async fn cmd_launch_game(
         let launch_username = username.clone();
         let launch_server = server_address.clone();
         let launch_session_log = session_log.clone();
-        let launch_java_override = java_override.clone();
+        let launch_java = prepared_java.clone();
         let result = tokio::task::spawn_blocking(move || {
             launch::launch_minecraft(
                 &launch_config,
@@ -863,7 +873,7 @@ pub async fn cmd_launch_game(
                 },
                 launch_server.as_deref().map(|h| (h, server_port)),
                 launch_session_log.as_deref(),
-                Some(launch_java_override.as_path()),
+                Some(&launch_java),
             )
             .map_err(|e| e.to_string())
         })

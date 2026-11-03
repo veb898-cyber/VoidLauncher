@@ -849,6 +849,7 @@ fn manifest_jvm_classpath_placeholder_is_expanded() {
         None,
         fixture.java_path(),
         fixture.java_major(),
+        voidlauncher_lib::versions::TargetArch::X86_64,
     )
     .expect("build command");
 
@@ -925,6 +926,7 @@ fn manifest_gc_flags_are_stripped_and_custom_args_follow_preset() {
         None,
         fixture.java_path(),
         17,
+        voidlauncher_lib::versions::TargetArch::X86_64,
     )
     .expect("build command");
 

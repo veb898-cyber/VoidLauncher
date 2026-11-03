@@ -5,10 +5,8 @@ use crate::java::{
     describe_explicit_rejection, detect_java_installations, resolve_java, JavaChoice,
     JavaInstallation, JavaRequirement,
 };
-use crate::jvm::{
-    build_jvm_args, detect_java_major, strip_gc_selection_flags, strip_removed_jvm_flags, GcPreset,
-};
-use crate::versions::{get_game_arguments, get_jvm_arguments, VersionInfo};
+use crate::jvm::{build_jvm_args, strip_gc_selection_flags, strip_removed_jvm_flags, GcPreset};
+use crate::versions::{get_game_arguments_for, get_jvm_arguments_for, VersionInfo};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -236,6 +234,9 @@ pub struct LaunchProfileRequest<'a> {
     pub server: Option<(&'a str, Option<u16>)>,
     pub session_log_path: Option<&'a str>,
     pub java_major: u32,
+    /// Native-selection target: the architecture of the chosen Minecraft JVM
+    /// (probed by M3.1), never the launcher binary's own architecture.
+    pub target_arch: crate::versions::TargetArch,
     pub versions_dir: &'a Path,
     pub libraries_dir: &'a Path,
     pub assets_dir: &'a Path,
@@ -398,12 +399,14 @@ pub fn build_launch_profile(
         )));
     }
 
-    // Vanilla classpath (includes client.jar last).
-    let vanilla_entries = crate::versions::build_classpath_entries(
+    // Vanilla classpath (includes client.jar last). Native selection follows
+    // the chosen JVM's architecture, not the launcher build's.
+    let vanilla_entries = crate::versions::build_classpath_entries_for(
         version_info,
         request.libraries_dir,
         &client_jar,
         fs,
+        request.target_arch,
     )?;
 
     // Collect loader libraries (if any).
@@ -447,7 +450,7 @@ pub fn build_launch_profile(
             .collect();
         if !loader_artifacts.is_empty() {
             for lib in &version_info.libraries {
-                if !crate::versions::should_include_library(lib) {
+                if !crate::versions::should_include_library_for(lib, request.target_arch) {
                     continue;
                 }
                 let Some(key) = artifact_key(&lib.name) else {
@@ -626,7 +629,7 @@ pub fn build_launch_profile(
     // upstream args first — otherwise HotSpot aborts with
     // "multiple garbage collectors selected" before the game can start.
     // See `jvm::strip_gc_selection_flags` for the full list.
-    let version_jvm_args = get_jvm_arguments(version_info);
+    let version_jvm_args = get_jvm_arguments_for(version_info, request.target_arch);
     tracing::debug!(target: "launcher", "Version manifest JVM args ({} total):", version_jvm_args.len());
     for a in &version_jvm_args {
         tracing::debug!(target: "launcher", "  raw: {}", a);
@@ -664,7 +667,11 @@ pub fn build_launch_profile(
 
     let mut game_args: Vec<String> = Vec::new();
     if !legacy_full_args {
-        for arg in get_game_arguments(version_info, instance.resolution.is_some()) {
+        for arg in get_game_arguments_for(
+            version_info,
+            instance.resolution.is_some(),
+            request.target_arch,
+        ) {
             game_args.push(expand_checked(&arg, &placeholders, "game")?);
         }
     } else {
@@ -772,6 +779,7 @@ fn prepare_launch_files(
     config: &AppConfig,
     instance: &Instance,
     version_info: &VersionInfo,
+    target_arch: crate::versions::TargetArch,
 ) -> Result<PreparedLaunch> {
     // The version id becomes a directory name below and ultimately came from
     // remote metadata — validate it before any write or join.
@@ -828,7 +836,12 @@ fn prepare_launch_files(
     // natives directory, so old LWJGL versions can find them via
     // -Djava.library.path. The native JARs are also on the classpath (added
     // by build_classpath_entries), which covers newer LWJGL.
-    crate::versions::extract_natives(version_info, &config.libraries_dir(), &natives_dir)?;
+    crate::versions::extract_natives(
+        version_info,
+        &config.libraries_dir(),
+        &natives_dir,
+        target_arch,
+    )?;
 
     let game_dir = instance.minecraft_dir(&config.instances_dir());
     std::fs::create_dir_all(&game_dir)?;
@@ -848,8 +861,9 @@ pub fn prepare_and_build_launch_profile(
     server: Option<(&str, Option<u16>)>,
     session_log_path: Option<&str>,
     java_major: u32,
+    target_arch: crate::versions::TargetArch,
 ) -> Result<(LaunchProfile, PathBuf)> {
-    let prepared = prepare_launch_files(config, instance, version_info)?;
+    let prepared = prepare_launch_files(config, instance, version_info, target_arch)?;
 
     let versions_dir = config.versions_dir();
     let libraries_dir = config.libraries_dir();
@@ -861,6 +875,7 @@ pub fn prepare_and_build_launch_profile(
         server,
         session_log_path,
         java_major,
+        target_arch,
         versions_dir: &versions_dir,
         libraries_dir: &libraries_dir,
         assets_dir: &assets_dir,
@@ -887,6 +902,7 @@ pub fn build_launch_command(
     session_log_path: Option<&str>,
     java_path: PathBuf,
     java_major: u32,
+    target_arch: crate::versions::TargetArch,
 ) -> Result<LaunchCommand> {
     tracing::info!(target: "launcher", "Building launch command for instance: {}", instance.name);
     tracing::info!(target: "launcher", "MC version: {}", instance.mc_version);
@@ -901,6 +917,7 @@ pub fn build_launch_command(
         server,
         session_log_path,
         java_major,
+        target_arch,
     )?;
     Ok(profile.to_command(java_path, game_dir))
 }
@@ -937,6 +954,11 @@ pub fn spawn_launch(
 /// Launch Minecraft for a given instance. `session_log_path` is this run's
 /// game-log file (used for the Quick Play join log) — passed explicitly so
 /// concurrent launches cannot mix their logs up via a global pointer.
+///
+/// `prepared_java` is the installation already chosen (and possibly
+/// downloaded and re-probed) by the prepare phase; when present it is used
+/// verbatim, so prepare and spawn always run the same JVM and its probed
+/// architecture drives the native selection. `None` resolves the JVM here.
 pub fn launch_minecraft(
     config: &AppConfig,
     instance: &Instance,
@@ -944,21 +966,34 @@ pub fn launch_minecraft(
     auth: &LaunchAuth,
     server: Option<(&str, Option<u16>)>,
     session_log_path: Option<&str>,
-    java_override: Option<&Path>,
+    prepared_java: Option<&crate::java::JavaInstallation>,
 ) -> Result<std::process::Child> {
     tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
 
-    // 1. Determine Java path. `java_override` carries the executable already
-    //    selected during the prepare phase (and possibly downloaded there),
-    //    so the spawn step can never pick a different JVM.
+    // 1. Determine the Java executable — and with it the native-selection
+    //    target architecture, taken from the M3.1 probe of that very
+    //    executable (never from the launcher binary's build target).
     tracing::info!(target: "launcher", "Detecting Java installation...");
-    let java_path = get_java_path(config, instance, version_info, java_override)?;
+    let java_installation = match prepared_java {
+        Some(inst) => {
+            tracing::debug!(
+                target: "launcher",
+                "Using the Java pre-selected by the launch prepare phase: {:?} (arch {:?})",
+                inst.path,
+                inst.arch
+            );
+            inst.clone()
+        }
+        None => resolve_launch_java(config, instance, version_info)?,
+    };
+    let java_path = java_installation.path.clone();
     tracing::info!(target: "launcher", "Using Java: {:?}", java_path);
 
-    // 2. Probe the selected Java's major version BEFORE composing the command.
-    //    This is what lets us safely fall back from ZGC to G1GC for older JDKs.
-    let java_major = detect_java_major(&java_path).unwrap_or(0);
-    tracing::info!(target: "launcher", "Detected Java major version: {}", java_major);
+    // 2. The major version and architecture come from the same probe that
+    //    validated the executable — no second JVM spawn is needed.
+    let java_major = java_installation.major_version;
+    let target_arch = crate::versions::TargetArch::from_java_arch(java_installation.arch);
+    tracing::info!(target: "launcher", "Java major {}: native target {:?}", java_major, target_arch);
 
     // 3. Prepare launch-owned files, then build the pure profile.
     let (profile, game_dir) = prepare_and_build_launch_profile(
@@ -969,6 +1004,7 @@ pub fn launch_minecraft(
         server,
         session_log_path,
         java_major,
+        target_arch,
     )?;
     let command = profile.to_command(java_path.clone(), game_dir.clone());
 
@@ -1050,19 +1086,16 @@ pub fn find_all_java_installations(data_dir: &Path) -> Vec<JavaInstallation> {
 /// Turn a selection verdict into the launch executable. An explicit-but-
 /// incompatible Java is reported with the long-standing wording instead of
 /// being silently replaced by another JVM.
-fn java_path_from_choice(choice: &JavaChoice) -> Result<PathBuf> {
+/// Map the unified policy's JavaChoice to the concrete, probed installation.
+/// Rejected or missing Java aborts with an actionable message — the launch
+/// pipeline never downloads on its own (`ensure_java_for_launch` owns the
+/// managed fallback); reaching this arm means no usable 64-bit major exists.
+fn java_installation_from_choice(choice: &JavaChoice) -> Result<JavaInstallation> {
     match choice {
-        JavaChoice::Explicit { install } | JavaChoice::Selected { install } => Ok(install.path.clone()),
-        JavaChoice::ExplicitRejected { path, source, problem } => {
-            Err(LauncherError::Java(describe_explicit_rejection(
-                path,
-                source,
-                problem,
-            )))
-        }
-        // The launch pipeline never downloads on its own — the prepare phase
-        // (`ensure_java_for_launch`) owns the managed fallback. Reaching this
-        // arm means no usable Java 64-bit major exists on the machine.
+        JavaChoice::Explicit { install } | JavaChoice::Selected { install } => Ok(install.clone()),
+        JavaChoice::ExplicitRejected { path, source, problem } => Err(LauncherError::Java(
+            describe_explicit_rejection(path, source, problem),
+        )),
         JavaChoice::UseManaged { major } => Err(LauncherError::Java(format!(
             "No 64-bit Java {} found. Install Java {} or let the launcher download it automatically.",
             major, major
@@ -1071,28 +1104,18 @@ fn java_path_from_choice(choice: &JavaChoice) -> Result<PathBuf> {
     }
 }
 
-/// Determine which Java executable to use.
+/// Resolve the Java installation for a game launch.
 ///
-/// `prepared` is the executable already chosen (possibly downloaded and
-/// probed) by the launch prepare phase; when present it is used verbatim so
-/// prepare and spawn cannot disagree. Otherwise the unified policy
-/// (`java::resolve_java`) performs the whole selection: instance Java, then
-/// launcher settings, then detected installations (system + managed).
-fn get_java_path(
+/// The unified policy (`java::resolve_java`) performs the whole selection:
+/// instance Java, then launcher settings, then detected installations
+/// (system + managed). The returned installation carries the probed major
+/// version AND architecture — both feed the launch composition (GC fallback
+/// and native selection) so no second JVM probe is needed.
+pub(crate) fn resolve_launch_java(
     config: &AppConfig,
     instance: &Instance,
     version_info: &VersionInfo,
-    prepared: Option<&Path>,
-) -> Result<PathBuf> {
-    if let Some(path) = prepared {
-        tracing::debug!(
-            target: "launcher",
-            "Using the Java pre-selected by the launch prepare phase: {:?}",
-            path
-        );
-        return Ok(path.to_path_buf());
-    }
-
+) -> Result<JavaInstallation> {
     // Only the EXACT 64-bit major is acceptable. "Closest newer" is never
     // safe: modern JDKs abort on obfuscated old clients (unnamed-package
     // classes trigger java.lang.module.FindException during boot-layer
@@ -1118,17 +1141,48 @@ fn get_java_path(
         config.java_path.as_deref(),
         &installations,
     );
-    let java = java_path_from_choice(&choice)?;
-    if let JavaChoice::Selected { install } = &choice {
+    let install = java_installation_from_choice(&choice)?;
+    if let JavaChoice::Selected { install: chosen } = &choice {
         tracing::info!(
             target: "launcher",
             "Selected Java: {} v{} at {:?}",
-            install.vendor,
-            install.version,
-            install.path
+            chosen.vendor,
+            chosen.version,
+            chosen.path
         );
     }
-    Ok(java)
+    Ok(install)
+}
+
+/// Best-effort native target for verify/repair paths: resolve the Java
+/// policy the same way a launch would, but never download and never fail.
+/// An explicit or selected executable contributes its probed architecture;
+/// anything else (auto-detected, managed, missing) yields `Unknown`, which
+/// library checks treat leniently — arch-neutral files are still verified,
+/// and no guess is made about the game JVM.
+pub(crate) fn best_effort_target_arch(
+    config: &AppConfig,
+    instance: &Instance,
+    version_info: &VersionInfo,
+) -> crate::versions::TargetArch {
+    let req = JavaRequirement {
+        major: version_info.required_java_major(),
+        arch: None,
+        require_64bit: true,
+        allow_newer: false,
+    };
+    let installations = find_all_java_installations(&config.data_dir);
+    match resolve_java(
+        &req,
+        instance.java_path.as_deref(),
+        config.java_path.as_deref(),
+        &installations,
+    ) {
+        JavaChoice::Explicit { install } | JavaChoice::Selected { install } => {
+            crate::versions::TargetArch::from_java_arch(install.arch)
+        }
+        _ => crate::versions::TargetArch::Unknown,
+    }
 }
 
 /// Resolve a loader-library path from the persisted instance profile.
@@ -1196,17 +1250,6 @@ mod tests {
     // M3.3.2a: single-executable run
     // -------------------------------
 
-    fn smoke_instance() -> crate::instances::Instance {
-        crate::instances::Instance::new(
-            "JvmPick",
-            "1.20.1",
-            4096,
-            "g1gc",
-            crate::instances::LoaderType::Vanilla,
-            None,
-        )
-    }
-
     fn fake_x64(major: u32) -> JavaInstallation {
         JavaInstallation {
             path: PathBuf::from(format!(r"C:\Java\jdk{major}\bin\java.exe")),
@@ -1219,18 +1262,17 @@ mod tests {
     }
 
     #[test]
-    fn get_java_path_uses_the_prepared_executable_unchanged() {
-        let config = AppConfig::default();
-        let mut instance = smoke_instance();
-        instance.java_path = Some(PathBuf::from(r"C:\somewhere\else\java.exe"));
-        let version = synthetic_version("1.20.1");
-        let prepared = PathBuf::from(r"C:\prepared\jdk-17\bin\java.exe");
-
-        let path =
-            get_java_path(&config, &instance, &version, Some(&prepared)).expect("prepared wins");
+    fn the_prepared_installation_passes_through_with_its_probed_arch() {
+        // launch_minecraft uses a prepared JavaInstallation verbatim; the
+        // native target must then be the install's own architecture — even
+        // when a differently-socialized Java path is configured elsewhere.
+        let mut prepared = fake_x64(17);
+        prepared.arch = crate::java::JavaArch::Arm64;
+        let target = crate::versions::TargetArch::from_java_arch(prepared.arch);
         assert_eq!(
-            path, prepared,
-            "the prepared executable must pass through untouched"
+            target,
+            crate::versions::TargetArch::Arm64,
+            "an ARM64 JVM must drive ARM64 natives, not the launcher build's arch"
         );
     }
 
@@ -1240,15 +1282,21 @@ mod tests {
         let choice = JavaChoice::Selected {
             install: fake_x64(17),
         };
-        let prepared_path = match crate::java::preparation_from_choice(&choice) {
-            Ok(crate::java::JavaPreparation::Ready { path, .. }) => path,
+        let (prepared_path, prepared_major) = match crate::java::preparation_from_choice(&choice) {
+            Ok(crate::java::JavaPreparation::Ready { install, .. }) => {
+                (install.path.clone(), install.major_version)
+            }
             other => panic!("expected Ready, got {other:?}"),
         };
-        // ...the spawn step maps the very same verdict back to a path.
-        let spawn_path = java_path_from_choice(&choice).expect("spawn uses the choice");
+        // ...the spawn step maps the very same verdict back to an install.
+        let spawn = java_installation_from_choice(&choice).expect("spawn uses the choice");
         assert_eq!(
-            prepared_path, spawn_path,
+            prepared_path, spawn.path,
             "prepare and spawn must share the JVM"
+        );
+        assert_eq!(
+            prepared_major, spawn.major_version,
+            "prepare and spawn must agree on the probed major"
         );
     }
 
@@ -1264,7 +1312,7 @@ mod tests {
                 want: 17,
             },
         };
-        let err = java_path_from_choice(&choice).expect_err("rejected Java must abort");
+        let err = java_installation_from_choice(&choice).expect_err("rejected Java must abort");
         let msg = err.to_string();
         assert!(msg.contains("requires Java 17"), "got: {msg}");
         assert!(msg.contains("Automatic"), "got: {msg}");
@@ -1275,7 +1323,7 @@ mod tests {
 
     #[test]
     fn missing_java_reports_the_runtime_requirement_at_spawn() {
-        let err = java_path_from_choice(&JavaChoice::UseManaged { major: 21 })
+        let err = java_installation_from_choice(&JavaChoice::UseManaged { major: 21 })
             .expect_err("UseManaged must not silently pick nothing at spawn time");
         let msg = err.to_string();
         assert!(msg.contains("No 64-bit Java 21"), "got: {msg}");
@@ -1360,6 +1408,7 @@ mod tests {
             server: None,
             session_log_path: None,
             java_major: 17,
+            target_arch: crate::versions::TargetArch::X86_64,
             versions_dir: &versions_dir,
             libraries_dir: &libraries_dir,
             assets_dir: &assets_dir,
@@ -1411,6 +1460,7 @@ mod tests {
             server: None,
             session_log_path: None,
             java_major: 17,
+            target_arch: crate::versions::TargetArch::X86_64,
             versions_dir: &root,
             libraries_dir: &root,
             assets_dir: &root,
@@ -1426,5 +1476,134 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    /// An ARM64 game JVM (probed by M3.1) must drive ARM64 native selection
+    /// even when the launcher binary itself is built as x64. The profile
+    /// request carries the JVM's architecture, so a foreign native bundle
+    /// must never reach the classpath — and the probed major feeds the JVM
+    /// args exactly like a real probe would.
+    #[test]
+    fn native_selection_uses_the_game_jvm_architecture_not_the_launcher_build() {
+        let root =
+            std::env::temp_dir().join(format!("voidlauncher-archtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let plain = "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows.jar";
+        let arm64 = "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-windows-arm64.jar";
+        let version: VersionInfo = serde_json::from_value(serde_json::json!({
+            "id": "1.20.4",
+            "type": "release",
+            "mainClass": "synthetic.Main",
+            "arguments": {
+                "game": ["--username", "${auth_player_name}"],
+                "jvm": ["-cp", "${classpath}"]
+            },
+            "libraries": [
+                {
+                    "name": "org.lwjgl:lwjgl:3.3.1",
+                    "downloads": { "artifact": {
+                        "path": "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar",
+                        "sha1": "", "size": 1, "url": "u"
+                    }}
+                },
+                {
+                    "name": "org.lwjgl:lwjgl:3.3.1:natives-windows",
+                    "downloads": { "artifact": { "path": plain, "sha1": "", "size": 1, "url": "u" } }
+                },
+                {
+                    "name": "org.lwjgl:lwjgl:3.3.1:natives-windows-arm64",
+                    "downloads": { "artifact": { "path": arm64, "sha1": "", "size": 1, "url": "u" } }
+                }
+            ],
+            "downloads": { "client": { "sha1": "", "size": 0, "url": "" } },
+            "assetIndex": { "id": "1", "sha1": "", "size": 0, "totalSize": 0, "url": "" },
+            "assets": "1"
+        }))
+        .expect("synthetic arm64 version JSON");
+
+        let instance = crate::instances::Instance::new(
+            "Arch",
+            "1.20.4",
+            4096,
+            "g1gc",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        let libraries_dir = root.join("libraries");
+        let versions_dir = root.join("versions");
+        let client_jar = versions_dir.join("1.20.4/client.jar");
+        let entry_jar = versions_dir.join("1.20.4/entry/VoidLauncherEntry.jar");
+
+        // Every candidate file exists on disk, so the ONLY filter at work is
+        // the requested target architecture.
+        let mut files = std::collections::HashSet::new();
+        for path in [client_jar.clone(), entry_jar.clone()] {
+            files.insert(path);
+        }
+        for rel in ["org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar", plain, arm64] {
+            files.insert(libraries_dir.join(rel));
+        }
+        let fs = FakeLaunchFs { files, srg: false };
+        let auth = LaunchAuth {
+            access_token: "token",
+            uuid: "uuid",
+            username: "Player",
+        };
+        let default_jvm_args = vec![];
+
+        for (java_arch, expected, foreign) in [
+            (crate::java::JavaArch::Arm64, arm64, plain),
+            (crate::java::JavaArch::X86_64, plain, arm64),
+        ] {
+            let java = crate::java::JavaInstallation {
+                path: root.join("jvm/java.exe"),
+                version: "17.0.9".to_string(),
+                major_version: 17,
+                is_64bit: java_arch != crate::java::JavaArch::X86,
+                vendor: "Test".to_string(),
+                arch: java_arch,
+            };
+            let request = LaunchProfileRequest {
+                instance: &instance,
+                version_info: &version,
+                auth: &auth,
+                server: None,
+                session_log_path: None,
+                java_major: java.major_version,
+                target_arch: crate::versions::TargetArch::from_java_arch(java.arch),
+                versions_dir: &versions_dir,
+                libraries_dir: &libraries_dir,
+                assets_dir: &root.join("assets"),
+                game_dir: &root.join("instances/Arch/.minecraft"),
+                default_memory_mb: 4096,
+                default_gc_preset: "g1gc",
+                default_jvm_args: &default_jvm_args,
+            };
+
+            let profile = build_launch_profile(&request, &fs).expect("profile builds");
+            let classpath: Vec<String> = profile
+                .classpath
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            assert!(
+                classpath.iter().any(|p| p.ends_with(expected)),
+                "the {:?} JVM ({:?} target) must use {}: {:?}",
+                java_arch,
+                request.target_arch,
+                expected,
+                classpath
+            );
+            assert!(
+                !classpath.iter().any(|p| p.ends_with(foreign)),
+                "the {:?} JVM must never get another architecture's natives {}: {:?}",
+                java_arch,
+                foreign,
+                classpath
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
