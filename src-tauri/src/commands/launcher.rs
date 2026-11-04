@@ -898,7 +898,7 @@ pub async fn cmd_launch_game(
     // Launch preparation (Java probing, classpath assembly, argument
     // composition) is blocking I/O and subprocess work; run it on the
     // blocking pool so it cannot stall the async runtime / UI.
-    let child = {
+    let mut child = {
         let launch_config = config.clone();
         let launch_instance = instance.clone();
         let launch_version_info = version_info.clone();
@@ -941,7 +941,25 @@ pub async fn cmd_launch_game(
     // Persist the pid BEFORE anything else can fail: if the launcher is
     // closed or updated while the game runs, the next start recovers the
     // still-running game from this file (badge + Stop + relaunch guard).
-    crate::running_state::write_pid_file(&data_dir, &instance_name, pid, process_identity.as_ref());
+    if let Err(cause) = crate::running_state::write_pid_file(
+        &data_dir,
+        &instance_name,
+        pid,
+        process_identity.as_ref(),
+    ) {
+        // The game exists, but nothing on disk would let the launcher find it
+        // again after a crash or an update. Do not report a registered launch:
+        // stop the process we just started (re-verifying its identity), or at
+        // least say loudly that it may still be running.
+        let outcome = stop_unpersisted_child(&mut child, process_identity.as_ref());
+        let msg = unpersisted_launch_error(&instance_name, pid, &cause, &outcome);
+        events::emit_log(&app, "error", "launch", &msg);
+        if let Some(p) = session_log.as_deref() {
+            game_logs::clear_current_log_path_if(p);
+        }
+        // The reservation is still `Starting`; returning drops it.
+        return Err(msg);
+    }
     let child_handle: Arc<std::sync::Mutex<Option<std::process::Child>>> =
         Arc::new(std::sync::Mutex::new(Some(child)));
 
@@ -1788,6 +1806,85 @@ fn stop_target(
     StopTarget::Idle
 }
 
+/// Outcome of stopping a game whose running state could not be persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopOutcome {
+    /// The process is gone.
+    Stopped,
+    /// Could not be stopped safely; the string is the underlying reason.
+    StillRunning(String),
+}
+
+/// Stop a freshly spawned game whose running state could not be saved.
+///
+/// The verified `kill_process_tree` path is tried first (exactly what Stop
+/// does). If it refuses or fails, the launcher falls back to the child handle
+/// it owns: that handle refers to the process the launcher itself spawned, so
+/// it cannot terminate a recycled pid even when no identity could be read.
+fn stop_unpersisted_child(
+    child: &mut std::process::Child,
+    identity: Option<&crate::running_state::ProcessIdentity>,
+) -> StopOutcome {
+    let mut reason = String::new();
+    if let Some(identity) = identity {
+        match crate::running_state::kill_process_tree(identity) {
+            Ok(()) => {
+                let _ = child.wait();
+                return StopOutcome::Stopped;
+            }
+            Err(err) => reason = err,
+        }
+    }
+    // The identity we were given is missing or unusable. The handle we own
+    // describes exactly this process, so read its identity from there and
+    // retry the verified tree kill (taskkill /T still covers helper processes).
+    if let Some(live) = crate::running_state::identity_of_child(child) {
+        match crate::running_state::kill_process_tree(&live) {
+            Ok(()) => {
+                let _ = child.wait();
+                return StopOutcome::Stopped;
+            }
+            Err(err) => reason = err,
+        }
+    }
+    // Last resort: the owned handle is exact and cannot hit another process,
+    // although it may leave helper processes behind.
+    if child.kill().is_ok() {
+        let _ = child.wait();
+        return StopOutcome::Stopped;
+    }
+    // The process may have exited on its own between the attempts.
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return StopOutcome::Stopped;
+    }
+    StopOutcome::StillRunning(if reason.is_empty() {
+        "the launcher has no verified identity for the process".to_string()
+    } else {
+        reason
+    })
+}
+
+/// Message for a launch whose process exists but whose state was not saved.
+/// A failure must never be reported as a successful launch, and a process that
+/// could not be stopped must never disappear silently.
+fn unpersisted_launch_error(
+    instance_name: &str,
+    pid: u32,
+    cause: &str,
+    outcome: &StopOutcome,
+) -> String {
+    match outcome {
+        StopOutcome::Stopped => format!(
+            "The game for '{}' was started, but its running state could not be saved ({}). The started game was stopped, because the launcher would not be able to track it.",
+            instance_name, cause
+        ),
+        StopOutcome::StillRunning(reason) => format!(
+            "The game for '{}' was started, but its running state could not be saved ({}). The launcher could not stop it either ({}), so a game process may still be running (PID {}). Close it manually.",
+            instance_name, cause, reason, pid
+        ),
+    }
+}
+
 /// Force-stop a running game. Used by the "Running" badge's Stop button and
 /// as the recovery path for a game orphaned by a launcher restart/update
 /// (there is no in-memory child handle for those — the pid file is the
@@ -2105,5 +2202,75 @@ mod tests {
         // Records of another instance never leak into this one.
         let scan = scan_with(vec![record("Other", 111, 1)], Vec::new());
         assert_eq!(stop_target(None, &scan, "Pack"), StopTarget::Idle);
+    }
+
+    // ---- state persistence after spawn -----------------------------------
+
+    #[test]
+    fn an_unpersisted_launch_reports_a_possible_running_process() {
+        let stopped = unpersisted_launch_error("Pack", 4242, "disk full", &StopOutcome::Stopped);
+        assert!(stopped.contains("could not be saved"), "got: {stopped}");
+        assert!(stopped.contains("was stopped"), "got: {stopped}");
+
+        let running = unpersisted_launch_error(
+            "Pack",
+            4242,
+            "disk full",
+            &StopOutcome::StillRunning("access denied".to_string()),
+        );
+        assert!(running.contains("could not be saved"), "got: {running}");
+        assert!(running.contains("disk full"), "the cause must be reported");
+        assert!(
+            running.contains("4242"),
+            "the pid must be reported so the user can find the process: {running}"
+        );
+        assert!(running.contains("may still be running"), "got: {running}");
+        assert!(running.contains("access denied"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn an_unpersisted_child_is_stopped_by_its_real_identity() {
+        let mut child = spawn_test_process();
+        let pid = child.id();
+        let forged = crate::running_state::ProcessIdentity {
+            pid,
+            exe: r"c:\nope\java.exe".to_string(),
+            created: 1,
+        };
+        // The given identity is refused by the verified path ...
+        assert!(crate::running_state::kill_process_tree(&forged).is_err());
+        // ... so the launcher re-reads the identity from the handle it owns and
+        // stops the whole tree; a persistence failure never leaves an
+        // untracked game (or its helper processes) behind.
+        assert_eq!(
+            stop_unpersisted_child(&mut child, Some(&forged)),
+            StopOutcome::Stopped
+        );
+        assert!(
+            child.try_wait().expect("wait").is_some(),
+            "the spawned process must be gone"
+        );
+        // After the stop the pid must never look like a live game again: the
+        // process is either gone, or its identity is no longer readable while
+        // the terminated process object is being torn down.
+        let probe = crate::running_state::read_identity(pid);
+        assert!(
+            !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
+            "the stopped process must not be reported as running, got: {probe:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn spawn_test_process() -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .args(["/C", "ping", "-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn a disposable test process")
     }
 }

@@ -177,17 +177,27 @@ fn pid_file(data_dir: &Path, instance: &str) -> PathBuf {
     ))
 }
 
-/// Best-effort: record that `instance` is running as `pid`, together with the
-/// identity of the process. A `None` identity (the OS refused to describe the
-/// child) is written as a legacy-shaped record: it is treated as unverified
-/// rather than trusted.
+/// Record that `instance` is running as `pid`, together with the identity of
+/// the process. A `None` identity (the OS refused to describe the child) is
+/// written as a legacy-shaped record: it is treated as unverified rather than
+/// trusted.
+///
+/// The record is replaced atomically: the JSON is written to a temporary file
+/// in the same directory, flushed to disk and then moved over the record with
+/// a single rename. On Windows that rename is
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, so there is no window in which the
+/// record is missing, and a failed replacement leaves the previous record
+/// untouched. The caller must not treat the launch as registered when this
+/// returns an error.
 pub fn write_pid_file(
     data_dir: &Path,
     instance: &str,
     pid: u32,
     identity: Option<&ProcessIdentity>,
-) {
-    let _ = std::fs::create_dir_all(running_dir(data_dir));
+) -> Result<(), String> {
+    let dir = running_dir(data_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+
     let rec = RunningGame {
         instance: instance.to_string(),
         pid,
@@ -195,9 +205,49 @@ pub fn write_pid_file(
         exe: identity.map(|i| i.exe.clone()),
         created: identity.map(|i| i.created.to_string()),
     };
-    if let Ok(json) = serde_json::to_string(&rec) {
-        let _ = std::fs::write(pid_file(data_dir, instance), json);
+    let json =
+        serde_json::to_vec(&rec).map_err(|e| format!("cannot encode the running state: {}", e))?;
+
+    // Same directory as the destination: the rename below never crosses a
+    // volume. The `.tmp` extension keeps the file out of `scan_games`.
+    let tmp = dir.join(format!(
+        ".{}.{}-{}.tmp",
+        crate::game_logs::sanitize_instance_name(instance),
+        std::process::id(),
+        unique_suffix()
+    ));
+    if let Err(e) = write_and_sync(&tmp, &json) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot write {}: {}", tmp.display(), e));
     }
+
+    let dst = pid_file(data_dir, instance);
+    if let Err(e) = std::fs::rename(&tmp, &dst) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot replace {}: {}", dst.display(), e));
+    }
+    Ok(())
+}
+
+/// Write the complete file and flush it to the storage device before it is
+/// moved into place. A crash between the two leaves only the (ignored) `.tmp`
+/// file, never a truncated record.
+fn write_and_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Distinct suffix for concurrent launches of different instances (and for
+/// repeated attempts on the same one).
+fn unique_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// Best-effort: drop the pid file for `instance` (called on game exit / stop).
@@ -276,6 +326,9 @@ pub fn read_identity(pid: u32) -> IdentityProbe {
     {
         match win::open(pid) {
             Ok(handle) => match identity_from_handle(handle.raw(), pid) {
+                // A terminated process object can linger while another handle
+                // keeps it alive; it is not a running game any more.
+                Some(_) if win::is_running(handle.raw()) == Some(false) => IdentityProbe::Gone,
                 Some(identity) => IdentityProbe::Found(identity),
                 None => IdentityProbe::Unavailable,
             },
@@ -670,7 +723,7 @@ mod tests {
         };
         assert!(identity.created > 0);
 
-        write_pid_file(&dir, "Pack", own, Some(&identity));
+        write_pid_file(&dir, "Pack", own, Some(&identity)).expect("record written");
         let raw = std::fs::read_to_string(pid_file(&dir, "Pack")).expect("record written");
         let rec: RunningGame = serde_json::from_str(&raw).expect("record parses");
         assert_eq!(rec.pid, own);
@@ -681,6 +734,140 @@ mod tests {
         assert_eq!(scan.confirmed.len(), 1);
         assert_eq!(scan.confirmed[0].identity(), Some(identity));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Files that must never survive a write attempt: the atomic replacement
+    /// writes into a `.tmp` file first.
+    fn temp_leftovers(dir: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(running_dir(dir))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().and_then(|s| s.to_str()) != Some("json"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn write_pid_file_replaces_the_record_atomically() {
+        let dir = temp_dir("atomic_write");
+        let first = identity(111, r"C:\Java\bin\java.exe", 1_000);
+        let second = identity(222, r"C:\Java\bin\java.exe", 2_000);
+
+        write_pid_file(&dir, "Pack", 111, Some(&first)).expect("first write");
+        let dst = pid_file(&dir, "Pack");
+        assert!(dst.exists(), "the record must exist after the write");
+
+        write_pid_file(&dir, "Pack", 222, Some(&second)).expect("replace an existing record");
+        let rec: RunningGame =
+            serde_json::from_str(&std::fs::read_to_string(&dst).expect("record readable"))
+                .expect("record parses");
+        assert_eq!(rec.pid, 222);
+        assert_eq!(
+            rec.identity(),
+            Some(second),
+            "the new identity replaced the old one"
+        );
+        assert!(!rec.started_at.is_empty(), "started_at is still written");
+        assert!(
+            temp_leftovers(&dir).is_empty(),
+            "no temporary files may remain after a successful write: {:?}",
+            temp_leftovers(&dir)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    // Clearing the read-only attribute is meaningful on Windows
+    // (`MoveFileExW` refuses to replace a read-only file); the call is the
+    // documented way to undo what the test set up.
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn a_failed_replacement_keeps_the_previous_good_record() {
+        let dir = temp_dir("atomic_keep");
+        let first = identity(111, r"C:\Java\bin\java.exe", 1_000);
+        write_pid_file(&dir, "Pack", 111, Some(&first)).expect("first write");
+        let dst = pid_file(&dir, "Pack");
+
+        // A read-only destination cannot be replaced; Windows fails the move.
+        let mut perms = std::fs::metadata(&dst).expect("stat").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&dst, perms).expect("make read-only");
+
+        let second = identity(222, r"C:\Java\bin\java.exe", 2_000);
+        let err = write_pid_file(&dir, "Pack", 222, Some(&second))
+            .expect_err("replacing a read-only record must fail");
+        assert!(err.contains("cannot replace"), "got: {err}");
+
+        // The previous record is intact and still describes the old process.
+        let rec: RunningGame =
+            serde_json::from_str(&std::fs::read_to_string(&dst).expect("old record still there"))
+                .expect("old record still parses");
+        assert_eq!(rec.pid, 111);
+        assert_eq!(rec.identity(), Some(first));
+
+        // Whatever went wrong, the partial file must not be left behind.
+        assert!(
+            temp_leftovers(&dir).is_empty(),
+            "temporary files must be cleaned up: {:?}",
+            temp_leftovers(&dir)
+        );
+
+        let mut perms = std::fs::metadata(&dst).expect("stat").permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&dst, perms).expect("clear read-only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_reports_an_error_when_the_state_directory_is_unusable() {
+        let dir = temp_dir("write_error");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // `running` exists as a regular file: the record cannot be placed.
+        std::fs::write(running_dir(&dir), b"not a directory").expect("blocking file");
+
+        let err = write_pid_file(&dir, "Pack", 111, None).expect_err("must fail");
+        assert!(err.contains("cannot create"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_move_cleans_up_the_temporary_file() {
+        let dir = temp_dir("atomic_rename_fail");
+        std::fs::create_dir_all(running_dir(&dir).join("Pack.json")).expect("blocking directory");
+
+        let err = write_pid_file(&dir, "Pack", 111, None)
+            .expect_err("a directory cannot be replaced by a file");
+        assert!(err.contains("cannot replace"), "got: {err}");
+        assert!(
+            temp_leftovers(&dir).is_empty(),
+            "temporary files must be cleaned up: {:?}",
+            temp_leftovers(&dir)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_ignores_an_interrupted_temporary_file() {
+        let dir = temp_dir("atomic_scan");
+        let rdir = running_dir(&dir);
+        std::fs::create_dir_all(&rdir).expect("temp dir");
+        // A crash between create and rename leaves this behind; it must never
+        // be mistaken for a record (or deleted as a corrupt one).
+        let tmp = rdir.join(".Pack.1234-5678.tmp");
+        std::fs::write(&tmp, b"{\"instance\":\"Pack\"").expect("partial temp file");
+
+        let scan = scan_games_with(&dir, &FakeProbe::new(&[]));
+        assert!(scan.confirmed.is_empty());
+        assert!(scan.unverified.is_empty());
+        assert!(
+            tmp.exists(),
+            "a temporary file is not a record and is left alone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -870,6 +1057,7 @@ mod tests {
         std::process::Command::new("cmd")
             .args(["/C", "ping", "-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .expect("spawn a disposable test process")
