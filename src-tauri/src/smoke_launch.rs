@@ -5,6 +5,12 @@
 //! Run:  cargo test --lib smoke_all -- --ignored --nocapture
 //! Env:  SMOKE_DATA_DIR  (optional, default: %TEMP%\voidsmoke-<millis>; reused
 //!                        between runs for cached libraries / resume support)
+//!       SMOKE_COMBOS    (optional: restrict the run to these scenarios, e.g.
+//!                        "latest-vanilla,1.20.1-Fabric,1.21.4-NeoForge";
+//!                        default: the curated COMBOS list)
+//!       SMOKE_RESULTS   (optional: report path, default target/smoke_results.txt)
+//!       SMOKE_FILTER    (optional: dev-only substring filter, skipped combos
+//!                        are reported as passing)
 
 use crate::config::AppConfig;
 use crate::download;
@@ -81,13 +87,111 @@ fn results_path() -> PathBuf {
 
 fn report_line(s: &str) {
     eprintln!("[smoke] {}", s);
+    let path = results_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(results_path())
+        .open(path)
         .unwrap();
     use std::io::Write;
     let _ = writeln!(f, "{}", s);
+}
+
+/// Parse one `SMOKE_COMBOS` entry that is not the `latest-vanilla` alias.
+///
+/// Version ids may contain dashes (`1.20.5-pre1`), loader names do not, so the
+/// split happens at the last dash.
+fn parse_combo_entry(entry: &str) -> Result<(String, String), String> {
+    let Some((mc, loader)) = entry.rsplit_once('-') else {
+        return Err(format!(
+            "SMOKE_COMBOS entry '{}' is not <minecraft>-<loader>",
+            entry
+        ));
+    };
+    if !matches!(loader, "Vanilla" | "Fabric" | "Forge" | "NeoForge") {
+        return Err(format!(
+            "SMOKE_COMBOS entry '{}' has an unknown loader '{}'",
+            entry, loader
+        ));
+    }
+    if mc.trim().is_empty() {
+        return Err(format!("SMOKE_COMBOS entry '{}' has no version", entry));
+    }
+    Ok((mc.to_string(), loader.to_string()))
+}
+
+/// Combos to run.
+///
+/// Default: the curated [`COMBOS`] list (handy locally). `SMOKE_COMBOS`
+/// (comma separated) restricts the run to the given scenarios, which is what
+/// CI uses so the report only contains tests that actually ran. Each entry is
+/// either `<minecraft>-<loader>` or the alias `latest-vanilla`, resolved
+/// against the official version manifest at run time.
+async fn resolve_combos() -> Result<Vec<(String, String)>, String> {
+    let raw = match std::env::var("SMOKE_COMBOS") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            return Ok(COMBOS
+                .iter()
+                .map(|(mc, loader)| (mc.to_string(), loader.to_string()))
+                .collect())
+        }
+    };
+
+    let mut combos: Vec<(String, String)> = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if entry.eq_ignore_ascii_case("latest-vanilla") {
+            let manifest = versions::fetch_version_manifest()
+                .await
+                .map_err(|e| format!("cannot resolve latest vanilla version: {}", e))?;
+            combos.push((manifest.latest.release, "Vanilla".to_string()));
+            continue;
+        }
+        combos.push(parse_combo_entry(entry)?);
+    }
+    if combos.is_empty() {
+        return Err("SMOKE_COMBOS selects no combos".to_string());
+    }
+    Ok(combos)
+}
+
+#[cfg(test)]
+mod combo_selection_tests {
+    use super::parse_combo_entry;
+
+    #[test]
+    fn parses_a_version_and_loader_pair() {
+        assert_eq!(
+            parse_combo_entry("1.20.1-Fabric").unwrap(),
+            ("1.20.1".to_string(), "Fabric".to_string())
+        );
+        assert_eq!(
+            parse_combo_entry("1.21.4-NeoForge").unwrap(),
+            ("1.21.4".to_string(), "NeoForge".to_string())
+        );
+    }
+
+    #[test]
+    fn keeps_dashes_inside_prerelease_versions() {
+        assert_eq!(
+            parse_combo_entry("1.20.5-pre1-Vanilla").unwrap(),
+            ("1.20.5-pre1".to_string(), "Vanilla".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_entries() {
+        for entry in ["1.20.1", "Fabric", "-Fabric", "1.20.1-FabricMod", ""] {
+            assert!(
+                parse_combo_entry(entry).is_err(),
+                "'{}' must be rejected",
+                entry
+            );
+        }
+    }
 }
 
 fn java_dir(data_dir: &Path) -> PathBuf {
@@ -371,6 +475,8 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
 
     let skip_install = std::env::var("SMOKE_SKIP_INSTALL").is_ok();
 
+    let prepare_start = Instant::now();
+
     // 1. Install version (libraries, natives, assets, version json)
     let vi = if skip_install && inst_dir.exists() {
         let manifest = versions::fetch_version_manifest()
@@ -389,7 +495,7 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
         if inst_dir.exists() {
             std::fs::remove_dir_all(&inst_dir).map_err(|e| format!("cleanup: {}", e))?;
         }
-        report_line(&format!("=== COMBO {} -> {} / Java {}", mc, loader, "auto"));
+        report_line(&format!("=== COMBO {} / {}", mc, loader));
         let vi = install_version(config, mc).await?;
         let required_java = vi.required_java_major();
         report_line(&format!("{} requires Java {}", mc, required_java));
@@ -417,6 +523,12 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
             .map_err(|e| format!("save instance: {}", e))?;
     }
 
+    report_line(&format!(
+        "{}: prepare OK ({:.0}s)",
+        combo_name,
+        prepare_start.elapsed().as_secs_f32()
+    ));
+
     // 4. Launch. Resolve the JVM through the same policy the launcher uses —
     //    the probed installation then drives BOTH the native-library ensure
     //    step and the spawn, so natives and the game run on one architecture.
@@ -431,10 +543,15 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
     )
     .await
     .map_err(|e| format!("natives {}: {}", mc, e))?;
+    // Architecture of the JVM that will run the game (not the launcher's).
+    // The executable path is deliberately left out of the report.
     report_line(&format!(
-        "launch java arch={:?} at {}",
+        "{}: java arch={:?} version={} vendor={} required_major={}",
+        combo_name,
         java.arch,
-        java.path.display()
+        java.version,
+        java.vendor,
+        vi.required_java_major()
     ));
 
     let uuid = "00000000-0000-0000-0000-000000000000";
@@ -503,6 +620,11 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
             // marker above is informational only.
             if saw_main {
                 kill_tree(child.id());
+                report_line(&format!(
+                    "{}: launch OK ({:.0}s, main marker reached)",
+                    combo_name,
+                    start.elapsed().as_secs_f32()
+                ));
                 report_line(&format!(
                     "{}: PASS after {:.0}s",
                     combo_name,
@@ -613,14 +735,30 @@ fn smoke_all() {
             launch::find_all_java_installations(&data_dir).len()
         ));
 
-        let mut results: Vec<(&'static str, &'static str, Verdict)> = Vec::new();
-        for (mc, loader) in COMBOS {
+        let combos = match resolve_combos().await {
+            Ok(combos) => combos,
+            Err(e) => {
+                report_line(&format!("SELECTION: FAIL ({})", e));
+                panic!("smoke combo selection failed: {}", e);
+            }
+        };
+        report_line(&format!(
+            "COMBOS: {}",
+            combos
+                .iter()
+                .map(|(mc, loader)| format!("{}-{}", mc, loader))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+
+        let mut results: Vec<(String, String, Verdict)> = Vec::new();
+        for (mc, loader) in &combos {
             let outcome = run_combo(&config, &data_dir, mc, loader).await;
             match &outcome {
                 Ok(d) => report_line(&format!("RESULT {} {}: PASS ({})", mc, loader, d)),
                 Err(e) => report_line(&format!("RESULT {} {}: FAIL ({})", mc, loader, e)),
             }
-            results.push((mc, loader, outcome));
+            results.push((mc.clone(), loader.clone(), outcome));
         }
 
         report_line("================== SUMMARY ==================");

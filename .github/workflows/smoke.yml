@@ -1,0 +1,78 @@
+name: Minecraft smoke
+
+# Real Minecraft launches (vanilla / Fabric / NeoForge) against an isolated
+# data directory. This workflow is intentionally NOT part of the pull-request
+# CI: it depends on Mojang, Fabric and NeoForge availability and downloads
+# several hundred megabytes of game files, so it runs on demand and weekly.
+#
+# It is also not wired into the release process. Making it a release gate
+# requires three consecutive successful runs of this workflow first.
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 04:23 UTC (off the hour to avoid peak load).
+    - cron: "23 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: minecraft-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Minecraft launch smoke
+    # VoidLauncher is Windows-only: the launched game is a real Win32 process.
+    runs-on: windows-latest
+    # Generous ceiling: the release build plus three real game launches each
+    # with its own 120 s watchdog inside the harness.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: src-tauri
+    env:
+      CARGO_TERM_COLOR: always
+      # Everything the harness downloads (versions, libraries, assets, instances
+      # and managed Java) lands here, inside the runner's temp directory. The
+      # real %APPDATA%\VoidLauncher is never read or written.
+      SMOKE_DATA_DIR: ${{ runner.temp }}\voidlauncher-smoke
+      # Report location; uploaded as an artifact below and removed with the
+      # rest of the smoke data.
+      SMOKE_RESULTS: ${{ runner.temp }}\voidlauncher-smoke\smoke_results.txt
+      # Three scenarios: the newest release from the official manifest, one
+      # Fabric combo and one NeoForge combo. Loader pairs are pinned to entries
+      # of the curated COMBOS list in src-tauri/src/smoke_launch.rs, where the
+      # loader install paths are exercised against known-good versions.
+      SMOKE_COMBOS: latest-vanilla,1.20.1-Fabric,1.21.4-NeoForge
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # The harness spawns the real game and waits for the in-game startup
+      # markers in logs/latest.log; a preparation, download or launch failure
+      # makes the test panic and the job fail.
+      - name: Run Minecraft launch smoke tests
+        run: cargo test --release smoke_launch::smoke_all -- --ignored --nocapture
+
+      - name: Upload smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-results
+          path: ${{ runner.temp }}/voidlauncher-smoke/smoke_results.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Remove smoke data
+        if: always()
+        run: Remove-Item -Recurse -Force "$env:SMOKE_DATA_DIR" -ErrorAction SilentlyContinue
