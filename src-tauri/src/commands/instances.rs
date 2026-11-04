@@ -84,18 +84,31 @@ pub(crate) fn validate_world_name(name: &str) -> Result<(), String> {
     validate_safe_folder_name(name.trim(), "World name")
 }
 
-/// Refuse whole-instance file operations while the game is running: the
+/// Refuse whole-instance file operations while the instance is in use: the
 /// live process holds `session.lock` and region files open, so copying,
 /// deleting or restoring its files can produce corrupt backups/worlds — or
-/// delete the directory out from under a running game. Checks both the
-/// in-memory list and the persisted pid files (a game orphaned by a
-/// launcher restart is still running).
+/// delete the directory out from under a running game. A launch may also be
+/// still *preparing* (`Starting`, no process yet), and a config mutation may
+/// hold it (`Editing`). A game orphaned by a launcher restart is still
+/// running — the persisted pid file covers that case.
 fn ensure_instance_not_running(state: &AppState, instance_name: &str) -> Result<(), String> {
-    let in_memory = state
-        .running_instances
-        .lock()
-        .map(|r| r.iter().any(|n| n == instance_name))
-        .unwrap_or(false);
+    if let Some(phase) = state.launches.phase(instance_name) {
+        let msg = match phase {
+            crate::launch_state::LaunchPhase::Starting => format!(
+                "Instance '{}' is still starting. Wait for the game to launch, then try again.",
+                instance_name
+            ),
+            crate::launch_state::LaunchPhase::Editing => format!(
+                "Instance '{}' is being modified. Try again in a moment.",
+                instance_name
+            ),
+            crate::launch_state::LaunchPhase::Running => format!(
+                "Instance '{}' is currently running. Close the game first, then try again.",
+                instance_name
+            ),
+        };
+        return Err(msg);
+    }
     let on_disk = state
         .config
         .lock()
@@ -105,7 +118,7 @@ fn ensure_instance_not_running(state: &AppState, instance_name: &str) -> Result<
                 .any(|g| g.instance == instance_name)
         })
         .unwrap_or(false);
-    if in_memory || on_disk {
+    if on_disk {
         return Err(format!(
             "Instance '{}' is currently running. Close the game first, then try again.",
             instance_name
@@ -1200,5 +1213,59 @@ mod instance_name_tests {
             .expect("rename must succeed after the watcher is stopped");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// In-use protection: an instance that is still *preparing* a launch must be
+/// treated like a running one by destructive operations.
+#[cfg(test)]
+mod instance_use_tests {
+    use super::ensure_instance_not_running;
+
+    fn temp_dir(prefix: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "voidlauncher-{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn test_state(temp: std::path::PathBuf) -> crate::AppState {
+        crate::AppState {
+            config: std::sync::Mutex::new(crate::AppConfig::default()),
+            auth_state: std::sync::Mutex::new(crate::auth::AuthState::default()),
+            launches: crate::launch_state::LaunchRegistry::new(),
+            pack_watcher: std::sync::Mutex::new(None),
+            active_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            room_state: std::sync::Arc::new(crate::rooms::room_state::RoomStateManager::new(&temp)),
+            tailscale: crate::rooms::tailscale::TailscaleManager::new(temp),
+        }
+    }
+
+    #[test]
+    fn a_starting_launch_blocks_instance_edits() {
+        let temp = temp_dir("guard_starting");
+        let state = test_state(temp.clone());
+        let instance = "test_starting_inst";
+
+        // `cmd_launch_game` reserved the instance and is still preparing it.
+        let reservation = state.launches.begin_launch(instance).expect("reserve");
+
+        // Deleting/copying the instance must be refused while preparing.
+        let message = ensure_instance_not_running(&state, instance)
+            .expect_err("a preparing instance is still in use");
+        assert!(message.contains("still starting"), "got: {message}");
+
+        // Once the launch finishes (or fails), the instance is editable again.
+        assert!(state.launches.release(instance, reservation));
+        assert!(ensure_instance_not_running(&state, instance).is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

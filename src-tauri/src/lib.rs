@@ -19,6 +19,7 @@ mod java;
 mod java_download;
 pub mod jvm;
 pub mod launch;
+mod launch_state;
 mod logger;
 pub mod modloaders;
 mod modrinth;
@@ -47,9 +48,11 @@ use tauri::{Manager, WindowEvent};
 pub struct AppState {
     pub config: Mutex<AppConfig>,
     pub auth_state: Mutex<auth::AuthState>,
-    /// Names of instances whose game processes are currently running.
-    /// Multiple games may run simultaneously.
-    pub running_instances: Mutex<Vec<String>>,
+    /// Per-instance launch phases (`Starting` while the launch is being
+    /// prepared, `Running` once the game process exists) and the config-mutation
+    /// lock. One synchronized model so Stop, a second Play and instance edits
+    /// always observe a consistent phase. Multiple games may run at once.
+    pub launches: launch_state::LaunchRegistry,
     pub pack_watcher: Mutex<Option<PackWatcherHandle>>,
     /// Active playtime-tracking sessions, keyed by instance name. One per
     /// running game, allowing concurrent sessions.
@@ -259,7 +262,7 @@ pub fn run() {
         .manage(AppState {
             config: Mutex::new(config),
             auth_state: Mutex::new(auth_state),
-            running_instances: Mutex::new(Vec::new()),
+            launches: launch_state::LaunchRegistry::new(),
             pack_watcher: Mutex::new(None),
             active_sessions: Mutex::new(HashMap::new()),
             room_state: Arc::new(rooms::room_state::RoomStateManager::new(&data_dir)),

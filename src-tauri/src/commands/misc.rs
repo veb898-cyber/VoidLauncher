@@ -402,29 +402,24 @@ pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
 /// running. Reconciles persisted pid files with the live process table so a
 /// game orphaned by a launcher restart/update still shows its "Running"
 /// badge (and blocks a second launch of the same instance).
+///
+/// Instances that are only *starting* (launch preparation in flight, no
+/// process yet) are deliberately not reported here: they are not running
+/// games, and a Stop button for them would be a lie.
 #[tauri::command]
 pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let data_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.data_dir.clone()
     };
-    let mut running = state
-        .running_instances
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clone();
+    let mut running = state.launches.running_instances();
     for game in crate::running_state::scan_live_games(&data_dir) {
+        state.launches.adopt_running(&game.instance);
         if !running.iter().any(|n| n == &game.instance) {
             running.push(game.instance);
         }
     }
-    if let Ok(mut live) = state.running_instances.lock() {
-        for name in &running {
-            if !live.iter().any(|n| n == name) {
-                live.push(name.clone());
-            }
-        }
-    }
+    running.sort();
     Ok(running)
 }
 

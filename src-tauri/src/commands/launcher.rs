@@ -305,46 +305,72 @@ async fn ensure_java_for_launch(
     }
 }
 
-/// RAII slot in `running_instances` that reserves an instance name for the
-/// whole launch-preparation phase. If the command returns early (error
-/// before the game starts) the slot is released automatically; on success
-/// `disarm()` keeps the entry until the exit handler removes it.
+/// RAII reservation of an instance for the whole launch-preparation phase.
+///
+/// Acquiring it puts the instance into `Starting` (see
+/// [`crate::launch_state`]), which blocks a second launch, a config mutation
+/// and an instance deletion while the launcher downloads files and builds the
+/// profile. If the command returns early (error before the game starts) the
+/// reservation is released automatically; once the process exists
+/// [`LaunchReservation::mark_running`] publishes it as `Running` and the exit
+/// handler owns the entry from then on.
 struct LaunchReservation<'a> {
     state: &'a AppState,
     instance_name: String,
-    armed: bool,
+    token: crate::launch_state::LaunchToken,
+    /// Still holds a `Starting` entry; becomes false after `mark_running`.
+    holds_start: bool,
 }
 
 impl<'a> LaunchReservation<'a> {
     fn acquire(state: &'a AppState, instance_name: &str) -> Result<Self, String> {
-        let mut running = state.running_instances.lock().map_err(|e| e.to_string())?;
-        if running.iter().any(|n| n == instance_name) {
-            return Err(format!(
-                "Instance '{}' is already running. Launch it again after it exits.",
-                instance_name
-            ));
-        }
-        running.push(instance_name.to_string());
+        let token = state
+            .launches
+            .begin_launch(instance_name)
+            .map_err(|busy| match busy {
+                crate::launch_state::LaunchBusy::Starting => format!(
+                    "Instance '{}' is already starting. Wait for the game to launch.",
+                    instance_name
+                ),
+                _ => format!(
+                    "Instance '{}' is already running. Launch it again after it exits.",
+                    instance_name
+                ),
+            })?;
         Ok(Self {
             state,
             instance_name: instance_name.to_string(),
-            armed: true,
+            token,
+            holds_start: true,
         })
     }
 
-    fn disarm(&mut self) {
-        self.armed = false;
+    /// The game process exists: `Starting` becomes `Running`. The entry is
+    /// kept (the exit handler removes it), so the slot is never freed while
+    /// the game is up.
+    fn mark_running(&mut self) {
+        if !self.holds_start {
+            return;
+        }
+        self.state
+            .launches
+            .mark_running(&self.instance_name, self.token);
+        self.holds_start = false;
+    }
+
+    /// Token identifying this reservation, handed to the exit handler so it
+    /// can release exactly this run's entry.
+    fn token(&self) -> crate::launch_state::LaunchToken {
+        self.token
     }
 }
 
 impl Drop for LaunchReservation<'_> {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.holds_start {
             return;
         }
-        if let Ok(mut running) = self.state.running_instances.lock() {
-            running.retain(|n| n != &self.instance_name);
-        }
+        self.state.launches.release(&self.instance_name, self.token);
     }
 }
 
@@ -373,18 +399,15 @@ pub async fn cmd_launch_game(
     // auto-update relaunch must both reappear in the running list (badge,
     // Stop button) and block a second launch of the same instance.
     for game in crate::running_state::scan_live_games(&data_dir) {
-        if let Ok(mut running) = state.running_instances.lock() {
-            if !running.iter().any(|n| n == &game.instance) {
-                running.push(game.instance.clone());
-            }
-        }
+        state.launches.adopt_running(&game.instance);
     }
 
     // Guard against launching the same instance twice concurrently — a
     // second click on a running instance must be a no-op, not a second copy.
-    // The slot is reserved NOW (before the long download/prepare phase) and
-    // released automatically if this launch fails before the game starts;
-    // otherwise it stays until the process exits (see the exit handler).
+    // The instance enters `Starting` NOW (before the long download/prepare
+    // phase) and is released automatically if this launch fails before the
+    // game starts; on success it becomes `Running` until the process exits
+    // (see the exit handler).
     let mut reservation = match LaunchReservation::acquire(state.inner(), &instance_name) {
         Ok(r) => r,
         Err(msg) => {
@@ -912,9 +935,8 @@ pub async fn cmd_launch_game(
                     }
                 }
                 crate::running_state::remove_pid_file(&data_dir, &instance_name);
-                if let Ok(mut running) = state.running_instances.lock() {
-                    running.retain(|n| n != &instance_name);
-                }
+                // The reservation is still armed: returning drops it and
+                // releases the `Starting` entry automatically.
                 if let Some(p) = session_log.as_deref() {
                     game_logs::clear_current_log_path_if(p);
                 }
@@ -960,10 +982,11 @@ pub async fn cmd_launch_game(
         }
     }
 
-    // Mark this instance as running (the frontend shows a "Running" badge).
-    // Multiple games may run at once, so the reservation slot from the start
-    // of this command becomes permanent until the process exits.
-    reservation.disarm();
+    // The process exists: publish this instance as `Running` (it stops being
+    // `Starting`) and keep it reserved until the exit handler releases the
+    // entry. Multiple games may run at once.
+    reservation.mark_running();
+    let launch_token = reservation.token();
 
     // Background timer: while the game runs, flush whole minutes to disk every
     // minute. The exit watcher owns the final teardown; the pid-guarded
@@ -1068,11 +1091,12 @@ pub async fn cmd_launch_game(
                 );
             }
         }
-        // Clear only THIS instance from the running list. Other games may
-        // still be running, so never wipe the whole list.
-        if let Ok(mut running) = app_clone.state::<AppState>().running_instances.lock() {
-            running.retain(|n| n != &instance_clone);
-        }
+        // Release exactly this run's entry: a newer launch of the same
+        // instance (if one ever follows) is never freed by a stale watcher.
+        app_clone
+            .state::<AppState>()
+            .launches
+            .release(&instance_clone, launch_token);
         events::emit_launch_event(
             &app_clone,
             "info",
@@ -1670,10 +1694,35 @@ pub fn cmd_flush_playtime(state: State<'_, AppState>, instance_name: String) -> 
     Ok(())
 }
 
+/// What `cmd_stop_game` can do when no process pid was found for the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoPidStop {
+    /// The launch is still being prepared: the reservation is alive and no
+    /// process exists yet. Stop must not pretend the launch is over.
+    StillStarting,
+    /// A config/resource-pack mutation holds the instance right now.
+    BeingModified,
+    /// No live reservation: heal a stale `Running` record, if any.
+    Heal,
+}
+
+fn no_pid_stop(phase: Option<crate::launch_state::LaunchPhase>) -> NoPidStop {
+    match phase {
+        Some(crate::launch_state::LaunchPhase::Starting) => NoPidStop::StillStarting,
+        Some(crate::launch_state::LaunchPhase::Editing) => NoPidStop::BeingModified,
+        _ => NoPidStop::Heal,
+    }
+}
+
 /// Force-stop a running game. Used by the "Running" badge's Stop button and
 /// as the recovery path for a game orphaned by a launcher restart/update
 /// (there is no in-memory child handle for those — the pid file is the
 /// source of truth).
+///
+/// Stop is not a cancel: while the instance is still `Starting` there is no
+/// process to kill, so the launch keeps going. The reservation is preserved
+/// (the instance must stay protected until the game starts or the launch
+/// fails) and the caller gets an explanation instead of "not running".
 #[tauri::command]
 pub fn cmd_stop_game(
     app: AppHandle,
@@ -1701,12 +1750,27 @@ pub fn cmd_stop_game(
     });
 
     let Some(pid) = pid else {
-        // Not running anymore — heal the local state so the badge cannot
-        // stick forever (e.g. the progress died while the launcher slept).
-        crate::running_state::remove_pid_file(&data_dir, &instance_name);
-        if let Ok(mut running) = state.running_instances.lock() {
-            running.retain(|n| n != &instance_name);
+        match no_pid_stop(state.launches.phase(&instance_name)) {
+            NoPidStop::StillStarting => {
+                return Err(format!(
+                    "Instance '{}' is still starting. Wait for the game to launch, then stop it.",
+                    instance_name
+                ));
+            }
+            NoPidStop::BeingModified => {
+                return Err(format!(
+                    "Instance '{}' is being modified. Try again in a moment.",
+                    instance_name
+                ));
+            }
+            NoPidStop::Heal => {}
         }
+        // Not running anymore — heal the local state so the badge cannot
+        // stick forever (e.g. the process died while the launcher slept).
+        // Only a `Running` entry is cleared; a preparation that slipped
+        // through would keep its reservation.
+        crate::running_state::remove_pid_file(&data_dir, &instance_name);
+        state.launches.clear_running(&instance_name);
         return Err(format!("Instance '{}' is not running.", instance_name));
     };
 
@@ -1728,9 +1792,7 @@ pub fn cmd_stop_game(
         // the bookkeeping here. (The playtime session from the previous app
         // run was already flushed when that app closed.)
         crate::running_state::remove_pid_file(&data_dir, &instance_name);
-        if let Ok(mut running) = state.running_instances.lock() {
-            running.retain(|n| n != &instance_name);
-        }
+        state.launches.clear_running(&instance_name);
         let _ = app.emit(
             "launch_complete",
             events::LaunchEventPayload {
@@ -1742,4 +1804,132 @@ pub fn cmd_stop_game(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launch_state::{LaunchPhase, LaunchRegistry};
+
+    /// `AppState` with a launch registry and no Tauri app.
+    fn test_state() -> AppState {
+        let dir = std::env::temp_dir().join(format!(
+            "vl-launch-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        ));
+        AppState {
+            config: std::sync::Mutex::new(crate::AppConfig::default()),
+            auth_state: std::sync::Mutex::new(crate::auth::AuthState::default()),
+            launches: LaunchRegistry::new(),
+            pack_watcher: std::sync::Mutex::new(None),
+            active_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            room_state: std::sync::Arc::new(crate::rooms::room_state::RoomStateManager::new(&dir)),
+            tailscale: crate::rooms::tailscale::TailscaleManager::new(dir),
+        }
+    }
+
+    #[test]
+    fn reservation_enters_starting_and_blocks_a_second_launch() {
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack")
+            .expect("the first launch reserves the instance");
+
+        assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Starting));
+        assert!(
+            state.launches.running_instances().is_empty(),
+            "a preparing instance is not a running game"
+        );
+
+        let err = LaunchReservation::acquire(&state, "Pack")
+            .err()
+            .expect("the second launch must be rejected");
+        assert!(err.contains("already starting"), "got: {err}");
+
+        drop(reservation);
+    }
+
+    #[test]
+    fn a_failed_preparation_releases_the_reservation() {
+        let state = test_state();
+        {
+            // Mirrors an early `return Err(...)` in `cmd_launch_game`: the
+            // local reservation is dropped on every error path.
+            let _reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        }
+        assert_eq!(state.launches.phase("Pack"), None);
+        assert!(
+            LaunchReservation::acquire(&state, "Pack").is_ok(),
+            "the instance must be launchable again after a failed preparation"
+        );
+    }
+
+    #[test]
+    fn a_successful_spawn_moves_starting_to_running_and_keeps_it_reserved() {
+        let state = test_state();
+        let mut reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let token = reservation.token();
+
+        reservation.mark_running();
+        assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Running));
+        assert_eq!(state.launches.running_instances(), vec!["Pack".to_string()]);
+
+        // Dropping the reservation must not free a running game: the exit
+        // handler owns the entry now.
+        drop(reservation);
+        assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Running));
+
+        // The exit handler releases exactly this run's entry.
+        assert!(state.launches.release("Pack", token));
+        assert_eq!(state.launches.phase("Pack"), None);
+    }
+
+    #[test]
+    fn stop_during_starting_keeps_the_reservation() {
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+
+        // No process exists yet, so the Stop path takes the "no pid" branch.
+        assert_eq!(
+            no_pid_stop(state.launches.phase("Pack")),
+            NoPidStop::StillStarting
+        );
+        // ... and must not heal/clear the slot.
+        assert!(!state.launches.clear_running("Pack"));
+        assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Starting));
+
+        // A second Play is still rejected while Stop was pressed.
+        assert!(LaunchReservation::acquire(&state, "Pack").is_err());
+
+        drop(reservation);
+    }
+
+    #[test]
+    fn stop_after_running_keeps_the_existing_heal_behavior() {
+        let state = test_state();
+        let mut reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        reservation.mark_running();
+        drop(reservation);
+
+        // Once the process is gone (pid file already removed), the stale
+        // `Running` entry is cleared and the caller is told it is not running.
+        assert_eq!(no_pid_stop(state.launches.phase("Pack")), NoPidStop::Heal);
+        assert!(state.launches.clear_running("Pack"));
+        assert_eq!(state.launches.phase("Pack"), None);
+    }
+
+    #[test]
+    fn stop_while_the_instance_is_being_modified_does_not_clear_it() {
+        let state = test_state();
+        let edit = state.launches.begin_edit("Pack").expect("reserve for edit");
+        assert_eq!(
+            no_pid_stop(state.launches.phase("Pack")),
+            NoPidStop::BeingModified
+        );
+        assert!(!state.launches.clear_running("Pack"));
+        assert!(state.launches.release("Pack", edit));
+    }
 }
