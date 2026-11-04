@@ -34,13 +34,6 @@ jobs:
         working-directory: src-tauri
     env:
       CARGO_TERM_COLOR: always
-      # Everything the harness downloads (versions, libraries, assets, instances
-      # and managed Java) lands here, inside the runner's temp directory. The
-      # real %APPDATA%\VoidLauncher is never read or written.
-      SMOKE_DATA_DIR: ${{ runner.temp }}\voidlauncher-smoke
-      # Report location; uploaded as an artifact below and removed with the
-      # rest of the smoke data.
-      SMOKE_RESULTS: ${{ runner.temp }}\voidlauncher-smoke\smoke_results.txt
       # Three scenarios: the newest release from the official manifest, one
       # Fabric combo and one NeoForge combo. Loader pairs are pinned to entries
       # of the curated COMBOS list in src-tauri/src/smoke_launch.rs, where the
@@ -62,6 +55,16 @@ jobs:
       # markers in logs/latest.log; a preparation, download or launch failure
       # makes the test panic and the job fail.
       - name: Run Minecraft launch smoke tests
+        # The `runner` context is only available in steps, not in a job-level
+        # `env`, so the smoke paths are defined here.
+        env:
+          # Everything the harness downloads (versions, libraries, assets,
+          # instances and managed Java) lands here, inside the runner's temp
+          # directory. The real %APPDATA%\VoidLauncher is never touched.
+          SMOKE_DATA_DIR: ${{ runner.temp }}\voidlauncher-smoke
+          # Report location; uploaded as an artifact below and removed with
+          # the rest of the smoke data.
+          SMOKE_RESULTS: ${{ runner.temp }}\voidlauncher-smoke\smoke_results.txt
         run: cargo test --release smoke_launch::smoke_all -- --ignored --nocapture
 
       - name: Upload smoke report
@@ -75,4 +78,6 @@ jobs:
 
       - name: Remove smoke data
         if: always()
+        env:
+          SMOKE_DATA_DIR: ${{ runner.temp }}\voidlauncher-smoke
         run: Remove-Item -Recurse -Force "$env:SMOKE_DATA_DIR" -ErrorAction SilentlyContinue
