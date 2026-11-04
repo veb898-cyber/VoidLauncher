@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
+use crate::running_state::ProcessIdentity;
+
 /// What the launcher is doing with one instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchPhase {
@@ -64,10 +66,14 @@ pub struct LaunchToken(u64);
 /// a live reservation, so a `release` with a real token cannot remove it.
 const ADOPTED: u64 = 0;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Entry {
     token: u64,
     phase: LaunchPhase,
+    /// Exact identity of the game process once it exists. Recorded together
+    /// with the `Starting` -> `Running` transition, so the pid and the identity
+    /// it was published with can never disagree.
+    identity: Option<ProcessIdentity>,
 }
 
 #[derive(Default)]
@@ -116,6 +122,7 @@ impl LaunchRegistry {
             Entry {
                 token: token.0,
                 phase,
+                identity: None,
             },
         );
         Ok(token)
@@ -133,15 +140,22 @@ impl LaunchRegistry {
         self.reserve(instance, LaunchPhase::Editing)
     }
 
-    /// Transition our own reservation `Starting` -> `Running`.
+    /// Transition our own reservation `Starting` -> `Running` and record the
+    /// identity of the spawned process in the same step.
     ///
     /// Returns `false` when the entry no longer belongs to this token (it was
     /// already released or replaced), in which case nothing is changed.
-    pub fn mark_running(&self, instance: &str, token: LaunchToken) -> bool {
+    pub fn mark_running(
+        &self,
+        instance: &str,
+        token: LaunchToken,
+        identity: Option<ProcessIdentity>,
+    ) -> bool {
         let mut inner = self.lock();
         match inner.entries.get_mut(instance) {
             Some(entry) if entry.token == token.0 && entry.phase == LaunchPhase::Starting => {
                 entry.phase = LaunchPhase::Running;
+                entry.identity = identity;
                 true
             }
             _ => false,
@@ -176,14 +190,25 @@ impl LaunchRegistry {
         }
     }
 
-    /// Register a game recovered from a persisted pid file. Never downgrades a
-    /// live reservation: a launch that is still preparing stays `Starting`.
-    pub fn adopt_running(&self, instance: &str) {
+    /// Register a game recovered from a persisted pid file, together with the
+    /// identity that was verified for it. Never downgrades a live reservation:
+    /// a launch that is still preparing stays `Starting`.
+    pub fn adopt_running(&self, instance: &str, identity: Option<ProcessIdentity>) {
         let mut inner = self.lock();
         inner.entries.entry(instance.to_string()).or_insert(Entry {
             token: ADOPTED,
             phase: LaunchPhase::Running,
+            identity,
         });
+    }
+
+    /// Identity of the running game, if one was recorded. `cmd_stop_game`
+    /// verifies exactly this process before terminating anything.
+    pub fn process_identity(&self, instance: &str) -> Option<ProcessIdentity> {
+        self.lock()
+            .entries
+            .get(instance)
+            .and_then(|entry| entry.identity.clone())
     }
 
     pub fn phase(&self, instance: &str) -> Option<LaunchPhase> {
@@ -245,10 +270,29 @@ mod tests {
     fn mark_running_publishes_the_instance_and_keeps_it_reserved() {
         let registry = LaunchRegistry::new();
         let token = registry.begin_launch("Pack").expect("reserve");
-        assert!(registry.mark_running("Pack", token));
+        assert!(registry.mark_running("Pack", token, None));
         assert_eq!(registry.phase("Pack"), Some(LaunchPhase::Running));
         assert_eq!(registry.running_instances(), vec!["Pack".to_string()]);
-        assert!(!registry.mark_running("Pack", token), "already running");
+        assert!(
+            !registry.mark_running("Pack", token, None),
+            "already running"
+        );
+    }
+
+    #[test]
+    fn the_running_transition_records_the_process_identity() {
+        let registry = LaunchRegistry::new();
+        let token = registry.begin_launch("Pack").expect("reserve");
+        assert!(registry.process_identity("Pack").is_none());
+        let identity = crate::running_state::ProcessIdentity {
+            pid: 4242,
+            exe: r"c:\java\bin\java.exe".to_string(),
+            created: 134_512_345_678_901_234,
+        };
+
+        assert!(registry.mark_running("Pack", token, Some(identity.clone())));
+        assert_eq!(registry.phase("Pack"), Some(LaunchPhase::Running));
+        assert_eq!(registry.process_identity("Pack"), Some(identity));
     }
 
     #[test]
@@ -276,7 +320,7 @@ mod tests {
         assert_eq!(registry.phase("Pack"), Some(LaunchPhase::Starting));
 
         // Spawned game whose bookkeeping is stale: healing removes it.
-        assert!(registry.mark_running("Pack", token));
+        assert!(registry.mark_running("Pack", token, None));
         assert!(registry.clear_running("Pack"));
         assert!(!registry.is_busy("Pack"));
     }
@@ -294,7 +338,7 @@ mod tests {
     fn adopting_a_pid_file_does_not_downgrade_a_starting_launch() {
         let registry = LaunchRegistry::new();
         let token = registry.begin_launch("Pack").expect("reserve");
-        registry.adopt_running("Pack");
+        registry.adopt_running("Pack", None);
         assert_eq!(
             registry.phase("Pack"),
             Some(LaunchPhase::Starting),
@@ -302,7 +346,7 @@ mod tests {
         );
         assert!(registry.release("Pack", token));
 
-        registry.adopt_running("Pack");
+        registry.adopt_running("Pack", None);
         assert_eq!(registry.phase("Pack"), Some(LaunchPhase::Running));
         assert_eq!(registry.running_instances(), vec!["Pack".to_string()]);
     }
@@ -322,7 +366,7 @@ mod tests {
             });
         });
 
-        assert!(registry.mark_running("Pack", token));
+        assert!(registry.mark_running("Pack", token, None));
         assert_eq!(registry.phase("Pack"), Some(LaunchPhase::Running));
     }
 }

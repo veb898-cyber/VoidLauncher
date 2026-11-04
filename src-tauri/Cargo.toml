@@ -54,6 +54,13 @@ keyring = { version = "3", features = ["windows-native"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+# Already in the dependency graph; the features below provide the precise
+# process identity API (GetProcessTimes / QueryFullProcessImageNameW) that pid
+# reuse protection needs.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 strip = true

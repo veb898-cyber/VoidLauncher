@@ -109,18 +109,24 @@ fn ensure_instance_not_running(state: &AppState, instance_name: &str) -> Result<
         };
         return Err(msg);
     }
-    let on_disk = state
+    let data_dir = state
         .config
         .lock()
-        .map(|c| {
-            crate::running_state::scan_live_games(&c.data_dir)
-                .iter()
-                .any(|g| g.instance == instance_name)
-        })
-        .unwrap_or(false);
-    if on_disk {
+        .map(|c| c.data_dir.clone())
+        .map_err(|_| "Cannot check whether the instance is running".to_string())?;
+    let scan = crate::running_state::scan_games(&data_dir);
+    if scan.confirmed.iter().any(|g| g.instance == instance_name) {
         return Err(format!(
             "Instance '{}' is currently running. Close the game first, then try again.",
+            instance_name
+        ));
+    }
+    if scan.unverified.iter().any(|g| g.instance == instance_name) {
+        // A pid is occupied but its identity cannot be verified (record from
+        // an older launcher). Touching the files could corrupt a live world,
+        // so refuse and let the user resolve it.
+        return Err(format!(
+            "Instance '{}' may still be running: the launcher cannot verify the game process recorded for it. Close the game manually, then try again.",
             instance_name
         ));
     }

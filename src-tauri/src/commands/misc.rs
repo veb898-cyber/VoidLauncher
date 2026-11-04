@@ -413,8 +413,13 @@ pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Vec<String>, S
         config.data_dir.clone()
     };
     let mut running = state.launches.running_instances();
+    // Only games whose recorded process identity matches the live process are
+    // adopted; a legacy or mismatched record is not presented as a running
+    // game (and could be an unrelated process that received a recycled pid).
     for game in crate::running_state::scan_live_games(&data_dir) {
-        state.launches.adopt_running(&game.instance);
+        state
+            .launches
+            .adopt_running(&game.instance, game.identity());
         if !running.iter().any(|n| n == &game.instance) {
             running.push(game.instance);
         }

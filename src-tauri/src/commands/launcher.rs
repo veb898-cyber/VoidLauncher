@@ -345,16 +345,18 @@ impl<'a> LaunchReservation<'a> {
         })
     }
 
-    /// The game process exists: `Starting` becomes `Running`. The entry is
-    /// kept (the exit handler removes it), so the slot is never freed while
-    /// the game is up.
-    fn mark_running(&mut self) {
+    /// The game process exists: `Starting` becomes `Running`, and the identity
+    /// of the spawned process is recorded in the same synchronized step so a
+    /// later Stop can only ever act on that exact process. The entry is kept
+    /// (the exit handler removes it), so the slot is never freed while the game
+    /// is up.
+    fn mark_running(&mut self, identity: Option<crate::running_state::ProcessIdentity>) {
         if !self.holds_start {
             return;
         }
         self.state
             .launches
-            .mark_running(&self.instance_name, self.token);
+            .mark_running(&self.instance_name, self.token, identity);
         self.holds_start = false;
     }
 
@@ -398,8 +400,30 @@ pub async fn cmd_launch_game(
     // reserving the name. A game orphaned by a launcher restart or an
     // auto-update relaunch must both reappear in the running list (badge,
     // Stop button) and block a second launch of the same instance.
-    for game in crate::running_state::scan_live_games(&data_dir) {
-        state.launches.adopt_running(&game.instance);
+    //
+    // Only a record whose live process matches the recorded identity exactly
+    // (executable + exact creation time) is adopted: a pid alone proves
+    // nothing, because Windows reuses pids.
+    let scan = crate::running_state::scan_games(&data_dir);
+    for game in &scan.confirmed {
+        state
+            .launches
+            .adopt_running(&game.instance, game.identity());
+    }
+    if let Some(stale) = scan
+        .unverified
+        .iter()
+        .find(|game| game.instance == instance_name)
+    {
+        // Legacy record: the pid is occupied, but nothing proves it is this
+        // instance's game. Never trust it (no badge, never killed) — and never
+        // start a second copy on the same instance either.
+        let msg = format!(
+            "Instance '{}' may still be running (process {}), but the launcher cannot verify it was started by it: the record was written by an older version. Close the game manually, then try again.",
+            instance_name, stale.pid
+        );
+        events::emit_log(&app, "warn", "launch", &msg);
+        return Err(msg);
     }
 
     // Guard against launching the same instance twice concurrently — a
@@ -909,11 +933,15 @@ pub async fn cmd_launch_game(
     };
 
     let pid = child.id();
+    // Read the exact identity of the process we just spawned (through its own
+    // handle, so it cannot describe any other process). It is persisted below
+    // and published through the registry, and every later Stop re-verifies it.
+    let process_identity = crate::running_state::identity_of_child(&child);
     let _ = instances::update_last_played(&config.instances_dir(), &instance_name);
     // Persist the pid BEFORE anything else can fail: if the launcher is
     // closed or updated while the game runs, the next start recovers the
     // still-running game from this file (badge + Stop + relaunch guard).
-    crate::running_state::write_pid_file(&data_dir, &instance_name, pid);
+    crate::running_state::write_pid_file(&data_dir, &instance_name, pid, process_identity.as_ref());
     let child_handle: Arc<std::sync::Mutex<Option<std::process::Child>>> =
         Arc::new(std::sync::Mutex::new(Some(child)));
 
@@ -983,9 +1011,10 @@ pub async fn cmd_launch_game(
     }
 
     // The process exists: publish this instance as `Running` (it stops being
-    // `Starting`) and keep it reserved until the exit handler releases the
-    // entry. Multiple games may run at once.
-    reservation.mark_running();
+    // `Starting`) together with the verified process identity, and keep it
+    // reserved until the exit handler releases the entry. Multiple games may
+    // run at once.
+    reservation.mark_running(process_identity);
     let launch_token = reservation.token();
 
     // Background timer: while the game runs, flush whole minutes to disk every
@@ -1714,6 +1743,51 @@ fn no_pid_stop(phase: Option<crate::launch_state::LaunchPhase>) -> NoPidStop {
     }
 }
 
+/// The process the Stop button may act on, decided from the synchronized
+/// in-memory state and the verified pid records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopTarget {
+    /// Terminate exactly this process (it was verified against its identity).
+    Kill(crate::running_state::ProcessIdentity),
+    /// A live process may be the game, but its identity cannot be proven.
+    Unverified { pid: u32 },
+    /// Nothing is running.
+    Idle,
+}
+
+/// Pick what Stop should do.
+///
+/// The registry entry (written at the `Starting` -> `Running` transition, or
+/// when a pid record was adopted) wins over the persisted record: it belongs to
+/// the newest run, whereas a file could still describe a previous one. A record
+/// is only a kill target when its identity matched the live process exactly.
+fn stop_target(
+    session_identity: Option<crate::running_state::ProcessIdentity>,
+    scan: &crate::running_state::LiveScan,
+    instance_name: &str,
+) -> StopTarget {
+    if let Some(identity) = session_identity {
+        return StopTarget::Kill(identity);
+    }
+    if let Some(rec) = scan
+        .confirmed
+        .iter()
+        .find(|game| game.instance == instance_name)
+    {
+        if let Some(identity) = rec.identity() {
+            return StopTarget::Kill(identity);
+        }
+    }
+    if let Some(rec) = scan
+        .unverified
+        .iter()
+        .find(|game| game.instance == instance_name)
+    {
+        return StopTarget::Unverified { pid: rec.pid };
+    }
+    StopTarget::Idle
+}
+
 /// Force-stop a running game. Used by the "Running" badge's Stop button and
 /// as the recovery path for a game orphaned by a launcher restart/update
 /// (there is no in-memory child handle for those — the pid file is the
@@ -1723,6 +1797,11 @@ fn no_pid_stop(phase: Option<crate::launch_state::LaunchPhase>) -> NoPidStop {
 /// process to kill, so the launch keeps going. The reservation is preserved
 /// (the instance must stay protected until the game starts or the launch
 /// fails) and the caller gets an explanation instead of "not running".
+///
+/// Stop never trusts a bare pid: the process is re-verified against the
+/// identity recorded at launch (executable + exact creation time) right before
+/// the kill, and the verification handle is kept open across `taskkill` so a
+/// recycled pid cannot be hit by mistake.
 #[tauri::command]
 pub fn cmd_stop_game(
     app: AppHandle,
@@ -1735,51 +1814,57 @@ pub fn cmd_stop_game(
         c.data_dir.clone()
     };
 
-    // Prefer the live session pid (launcher-owned process); fall back to the
-    // persisted pid file (orphan from a previous app run).
-    let session_pid = state
-        .active_sessions
-        .lock()
-        .ok()
-        .and_then(|g| g.get(&instance_name).map(|s| s.pid));
-    let pid = session_pid.or_else(|| {
-        crate::running_state::scan_live_games(&data_dir)
-            .into_iter()
-            .find(|g| g.instance == instance_name)
-            .map(|g| g.pid)
-    });
+    // A launcher-owned game is published in the registry together with the
+    // identity of the process it spawned; an orphaned game is recovered from a
+    // pid file only when that file's identity is verified.
+    let session_identity = state.launches.process_identity(&instance_name);
+    let scan = crate::running_state::scan_games(&data_dir);
 
-    let Some(pid) = pid else {
-        match no_pid_stop(state.launches.phase(&instance_name)) {
-            NoPidStop::StillStarting => {
-                return Err(format!(
-                    "Instance '{}' is still starting. Wait for the game to launch, then stop it.",
-                    instance_name
-                ));
-            }
-            NoPidStop::BeingModified => {
-                return Err(format!(
-                    "Instance '{}' is being modified. Try again in a moment.",
-                    instance_name
-                ));
-            }
-            NoPidStop::Heal => {}
+    let identity = match stop_target(session_identity, &scan, &instance_name) {
+        StopTarget::Kill(identity) => identity,
+        StopTarget::Unverified { pid } => {
+            // The file has no identity (older launcher) and the pid is taken.
+            // Killing is forbidden; the user has to close the game by hand.
+            return Err(format!(
+                "Instance '{}' may still be running as process {}, but the launcher cannot verify it was started by it: the record was written by an older version. Close the game manually, then try again.",
+                instance_name, pid
+            ));
         }
-        // Not running anymore — heal the local state so the badge cannot
-        // stick forever (e.g. the process died while the launcher slept).
-        // Only a `Running` entry is cleared; a preparation that slipped
-        // through would keep its reservation.
-        crate::running_state::remove_pid_file(&data_dir, &instance_name);
-        state.launches.clear_running(&instance_name);
-        return Err(format!("Instance '{}' is not running.", instance_name));
+        StopTarget::Idle => {
+            match no_pid_stop(state.launches.phase(&instance_name)) {
+                NoPidStop::StillStarting => {
+                    return Err(format!(
+                        "Instance '{}' is still starting. Wait for the game to launch, then stop it.",
+                        instance_name
+                    ));
+                }
+                NoPidStop::BeingModified => {
+                    return Err(format!(
+                        "Instance '{}' is being modified. Try again in a moment.",
+                        instance_name
+                    ));
+                }
+                NoPidStop::Heal => {}
+            }
+            // Not running anymore — heal the local state so the badge cannot
+            // stick forever (e.g. the process died while the launcher slept).
+            // Only a `Running` entry is cleared; a preparation that slipped
+            // through would keep its reservation.
+            crate::running_state::remove_pid_file(&data_dir, &instance_name);
+            state.launches.clear_running(&instance_name);
+            return Err(format!("Instance '{}' is not running.", instance_name));
+        }
     };
 
-    crate::running_state::kill_process_tree(pid)?;
+    crate::running_state::kill_process_tree(&identity)?;
     events::emit_log(
         &app,
         "info",
         "launch",
-        &format!("Stopping game '{}' (PID {})...", instance_name, pid),
+        &format!(
+            "Stopping game '{}' (PID {})...",
+            instance_name, identity.pid
+        ),
     );
 
     let owned = state
@@ -1873,7 +1958,7 @@ mod tests {
         let mut reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
         let token = reservation.token();
 
-        reservation.mark_running();
+        reservation.mark_running(None);
         assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Running));
         assert_eq!(state.launches.running_instances(), vec!["Pack".to_string()]);
 
@@ -1911,7 +1996,7 @@ mod tests {
     fn stop_after_running_keeps_the_existing_heal_behavior() {
         let state = test_state();
         let mut reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
-        reservation.mark_running();
+        reservation.mark_running(None);
         drop(reservation);
 
         // Once the process is gone (pid file already removed), the stale
@@ -1931,5 +2016,94 @@ mod tests {
         );
         assert!(!state.launches.clear_running("Pack"));
         assert!(state.launches.release("Pack", edit));
+    }
+
+    // ---- process identity in the Stop path -------------------------------
+
+    fn identity(pid: u32, created: u64) -> crate::running_state::ProcessIdentity {
+        crate::running_state::ProcessIdentity {
+            pid,
+            exe: r"c:\java\bin\java.exe".to_string(),
+            created,
+        }
+    }
+
+    fn record(instance: &str, pid: u32, created: u64) -> crate::running_state::RunningGame {
+        crate::running_state::RunningGame {
+            instance: instance.to_string(),
+            pid,
+            started_at: "2026-01-02T03:04:05+03:00".to_string(),
+            exe: Some(r"c:\java\bin\java.exe".to_string()),
+            created: Some(created.to_string()),
+        }
+    }
+
+    fn scan_with(
+        confirmed: Vec<crate::running_state::RunningGame>,
+        unverified: Vec<crate::running_state::RunningGame>,
+    ) -> crate::running_state::LiveScan {
+        crate::running_state::LiveScan {
+            confirmed,
+            unverified,
+        }
+    }
+
+    #[test]
+    fn stop_kills_a_verified_record_with_its_own_identity() {
+        let rec = record("Pack", 4242, 134_512_345_678_901_234);
+        let scan = scan_with(vec![rec.clone()], Vec::new());
+        assert_eq!(
+            stop_target(None, &scan, "Pack"),
+            StopTarget::Kill(rec.identity().expect("verified identity"))
+        );
+    }
+
+    #[test]
+    fn stop_refuses_a_record_whose_identity_cannot_be_verified() {
+        // A legacy-shaped record: a live pid, no identity. It must never become
+        // a kill target — only a refusal with an explanation.
+        let legacy = crate::running_state::RunningGame {
+            instance: "Pack".to_string(),
+            pid: 4242,
+            started_at: "2026-01-02T03:04:05+03:00".to_string(),
+            exe: None,
+            created: None,
+        };
+        let scan = scan_with(Vec::new(), vec![legacy]);
+        assert_eq!(
+            stop_target(None, &scan, "Pack"),
+            StopTarget::Unverified { pid: 4242 }
+        );
+    }
+
+    #[test]
+    fn stop_never_uses_a_stale_record_for_a_newer_run() {
+        // A new game is running as pid 222; an old record still mentions 111.
+        // The registry (newest run) must win — the stale pid is never touched.
+        let scan = scan_with(vec![record("Pack", 111, 1)], Vec::new());
+        let session = identity(222, 2);
+        assert_eq!(
+            stop_target(Some(session.clone()), &scan, "Pack"),
+            StopTarget::Kill(session)
+        );
+
+        // The registry identity wins over an unverified record too.
+        let scan = scan_with(Vec::new(), vec![record("Pack", 111, 1)]);
+        let session = identity(222, 2);
+        assert_eq!(
+            stop_target(Some(session.clone()), &scan, "Pack"),
+            StopTarget::Kill(session)
+        );
+    }
+
+    #[test]
+    fn stop_without_any_process_is_idle() {
+        assert_eq!(
+            stop_target(None, &scan_with(Vec::new(), Vec::new()), "Pack"),
+            StopTarget::Idle
+        );
+        // Records of another instance never leak into this one.
+        let scan = scan_with(vec![record("Other", 111, 1)], Vec::new());
+        assert_eq!(stop_target(None, &scan, "Pack"), StopTarget::Idle);
     }
 }
