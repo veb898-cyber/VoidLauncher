@@ -3,15 +3,13 @@ name: Minecraft smoke
 # Real Minecraft launches (vanilla / Fabric / NeoForge) against an isolated
 # data directory. This workflow is intentionally NOT part of the pull-request
 # CI: it depends on Mojang, Fabric and NeoForge availability and downloads
-# several hundred megabytes of game files, so it runs on demand and weekly.
+# several hundred megabytes of game files, so it runs on demand only
+# (manual `workflow_dispatch`).
 #
 # It is also not wired into the release process. Making it a release gate
 # requires three consecutive successful runs of this workflow first.
 on:
   workflow_dispatch:
-  schedule:
-    # Weekly, Monday 04:23 UTC (off the hour to avoid peak load).
-    - cron: "23 4 * * 1"
 
 permissions:
   contents: read
