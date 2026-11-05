@@ -60,6 +60,13 @@ winreg = "0.55"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # Used only by the smoke harness' OpenGL capability probe (M7.4.1):
+    # a hidden window + a 3.2 core context, so CI reports what the runner's
+    # graphics stack actually supports.
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_OpenGL",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [profile.release]

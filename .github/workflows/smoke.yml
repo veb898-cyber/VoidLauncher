@@ -62,17 +62,19 @@ jobs:
           # instances and managed Java) lands here, inside the runner's temp
           # directory. The real %APPDATA%\VoidLauncher is never touched.
           SMOKE_DATA_DIR: ${{ runner.temp }}\voidlauncher-smoke
-          # Report location; uploaded as an artifact below and removed with
-          # the rest of the smoke data.
-          SMOKE_RESULTS: ${{ runner.temp }}\voidlauncher-smoke\smoke_results.txt
+          # Diagnostic catalogue: the report, per-combo stdout/stderr,
+          # latest.log and crash reports. Uploaded as one artifact below and
+          # removed with the rest of the smoke data.
+          SMOKE_DIAG_DIR: ${{ runner.temp }}\voidlauncher-smoke\diagnostics
+          SMOKE_RESULTS: ${{ runner.temp }}\voidlauncher-smoke\diagnostics\smoke_results.txt
         run: cargo test --release smoke_launch::smoke_all -- --ignored --nocapture
 
-      - name: Upload smoke report
+      - name: Upload smoke diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-results
-          path: ${{ runner.temp }}/voidlauncher-smoke/smoke_results.txt
+          name: smoke-diagnostics
+          path: ${{ runner.temp }}/voidlauncher-smoke/diagnostics
           if-no-files-found: warn
           retention-days: 30
 

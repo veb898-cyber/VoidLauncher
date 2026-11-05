@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Metadata for a game log session
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -54,6 +55,10 @@ struct OutputReaderShared {
     remaining: AtomicUsize,
     exit_code: AtomicI32,
     exit_set: Arc<AtomicBool>,
+    /// Set when the LAST reader reached EOF and flushed its raw tee file.
+    /// `readers_done_cv` wakes callers of [`wait_for_output_readers`].
+    readers_done: Mutex<bool>,
+    readers_done_cv: Condvar,
 }
 
 static EXIT_REGISTRY: Mutex<Option<HashMap<u32, Arc<OutputReaderShared>>>> = Mutex::new(None);
@@ -89,6 +94,13 @@ fn pump_stream(
             append_game_log_line(path, &line);
         }
     }
+    // Flush the forensic copy explicitly and drop it BEFORE reporting the
+    // reader as finished: callers (and the smoke harness) read these files
+    // immediately after `wait_for_output_readers`.
+    if let Some(w) = raw.as_mut() {
+        let _ = w.flush();
+    }
+    drop(raw);
     finish_stream(&shared);
 }
 
@@ -96,6 +108,14 @@ fn pump_stream(
 fn finish_stream(shared: &Arc<OutputReaderShared>) {
     if shared.remaining.fetch_sub(1, Ordering::SeqCst) != 1 {
         return;
+    }
+    // Both readers have reached EOF and flushed their raw files: wake waiters
+    // now, before the bounded exit-code bookkeeping below (which may take up
+    // to `EXIT_WAIT_MAX_MS` when no exit watcher is running, e.g. in the
+    // smoke harness).
+    if let Ok(mut done) = shared.readers_done.lock() {
+        *done = true;
+        shared.readers_done_cv.notify_all();
     }
     // Wait (bounded) for the wait-task to record the exit code.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(EXIT_WAIT_MAX_MS);
@@ -133,6 +153,8 @@ pub fn attach_output_readers(
         remaining: AtomicUsize::new(2),
         exit_code: AtomicI32::new(0),
         exit_set: Arc::new(AtomicBool::new(false)),
+        readers_done: Mutex::new(false),
+        readers_done_cv: Condvar::new(),
     });
     if with_exit_registry(|reg| reg.insert(pid, shared.clone())).is_none() {
         tracing::warn!(target: "launcher", "Exit registry unavailable for pid {}", pid);
@@ -161,6 +183,65 @@ pub fn attach_output_readers(
             );
         })
         .ok();
+}
+
+/// Result of [`wait_for_output_readers`].
+// `smoke_launch` (cfg(test)) is the caller; the API stays available outside
+// tests on purpose.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadersWait {
+    /// Both readers reached EOF and flushed their raw tee files — every byte
+    /// the game wrote is on disk.
+    Finished,
+    /// No readers are registered for this pid (they were never attached, or
+    /// they already finished and cleaned up).
+    Unknown,
+    /// The deadline passed while a reader was still draining.
+    TimedOut,
+}
+
+/// Block (bounded by `timeout`) until both output readers of `pid` have
+/// reached EOF and flushed their raw `.stdout.log`/`.stderr.log` files.
+///
+/// A broken reader can never hang the caller: the wait always ends, and the
+/// caller can tell the difference between "finished" and "timed out".
+#[allow(dead_code)]
+pub fn wait_for_output_readers(pid: u32, timeout: Duration) -> ReadersWait {
+    let shared = with_exit_registry(|reg| reg.get(&pid).cloned()).flatten();
+    let Some(shared) = shared else {
+        return ReadersWait::Unknown;
+    };
+
+    let Ok(done) = shared.readers_done.lock() else {
+        return ReadersWait::TimedOut;
+    };
+    if *done {
+        return ReadersWait::Finished;
+    }
+    let deadline = Instant::now() + timeout;
+    let mut guard = done;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return if *guard {
+                ReadersWait::Finished
+            } else {
+                ReadersWait::TimedOut
+            };
+        }
+        let (next, result) = shared
+            .readers_done_cv
+            .wait_timeout(guard, deadline - now)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard = next;
+        if *guard {
+            return ReadersWait::Finished;
+        }
+        if result.timed_out() {
+            return ReadersWait::TimedOut;
+        }
+    }
 }
 
 /// Record the process exit code; the last finishing reader thread uses it
@@ -685,5 +766,143 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+    // ---- output reader completion (smoke diagnostics) ---------------------
+
+    /// A stream that yields `lines` and then blocks until `release` is set,
+    /// so a test controls exactly when EOF happens.
+    struct GatedReader {
+        lines: std::collections::VecDeque<String>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl std::io::Read for GatedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(line) = self.lines.pop_front() {
+                let bytes = format!("{}\n", line).into_bytes();
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                return Ok(bytes.len());
+            }
+            let (lock, cv) = &*self.gate;
+            let mut released = lock.lock().expect("gate");
+            while !*released {
+                released = cv.wait(released).expect("gate wait");
+            }
+            Ok(0)
+        }
+    }
+
+    fn gated(lines: &[&str]) -> (GatedReader, Arc<(Mutex<bool>, Condvar)>) {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        (
+            GatedReader {
+                lines: lines.iter().map(|s| s.to_string()).collect(),
+                gate: gate.clone(),
+            },
+            gate,
+        )
+    }
+
+    fn release(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (lock, cv) = &**gate;
+        *lock.lock().expect("gate") = true;
+        cv.notify_all();
+    }
+
+    fn reader_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_readers_{}_{}",
+            prefix,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn wait_for_readers_blocks_until_both_streams_end_and_never_hangs() {
+        let dir = reader_temp_dir("wait");
+        let out_path = dir.join("game.stdout.log");
+        let err_path = dir.join("game.stderr.log");
+        let (out, out_gate) = gated(&["java: line from stdout"]);
+        let (err, err_gate) = gated(&["java: line from stderr"]);
+        let pid = 424_242;
+        attach_output_readers(
+            pid,
+            Box::new(out),
+            Box::new(err),
+            std::fs::File::create(&out_path).ok(),
+            std::fs::File::create(&err_path).ok(),
+            None,
+        );
+
+        // A stalled reader must not hang the caller: the bounded wait ends.
+        assert_eq!(
+            wait_for_output_readers(pid, Duration::from_millis(300)),
+            ReadersWait::TimedOut
+        );
+
+        release(&out_gate);
+        release(&err_gate);
+        assert_eq!(
+            wait_for_output_readers(pid, Duration::from_secs(5)),
+            ReadersWait::Finished
+        );
+
+        // EOF + flush is reported only after the last lines are on disk, so
+        // the files can be read immediately after the wait.
+        let out_text = std::fs::read_to_string(&out_path).expect("stdout tee");
+        let err_text = std::fs::read_to_string(&err_path).expect("stderr tee");
+        assert!(out_text.contains("java: line from stdout"), "{out_text}");
+        assert!(err_text.contains("java: line from stderr"), "{err_text}");
+        assert!(
+            out_text.ends_with("java: line from stdout\n"),
+            "the last line must be flushed before completion: {out_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_for_readers_reports_unknown_for_an_unattached_pid() {
+        assert_eq!(
+            wait_for_output_readers(999_999, Duration::from_millis(50)),
+            ReadersWait::Unknown
+        );
+    }
+
+    #[test]
+    fn last_lines_survive_process_end_even_with_heavy_output() {
+        let dir = reader_temp_dir("tail");
+        let out_path = dir.join("game.stdout.log");
+        let mut lines: Vec<String> = (0..500).map(|i| format!("line-{:04}", i)).collect();
+        let last = lines.last().cloned().expect("lines");
+        let mut out = std::collections::VecDeque::new();
+        out.extend(lines.drain(..));
+        let gate = Arc::new((Mutex::new(true), Condvar::new()));
+        let pid = 424_243;
+        attach_output_readers(
+            pid,
+            Box::new(GatedReader { lines: out, gate }),
+            Box::new(std::io::Cursor::new(Vec::new())),
+            std::fs::File::create(&out_path).ok(),
+            None,
+            None,
+        );
+        assert!(
+            matches!(
+                wait_for_output_readers(pid, Duration::from_secs(5)),
+                ReadersWait::Finished | ReadersWait::Unknown
+            ),
+            "the run must complete"
+        );
+        let text = std::fs::read_to_string(&out_path).expect("stdout tee");
+        assert!(
+            text.contains(&last),
+            "the final line is missing: {:?}",
+            text.lines().last()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
