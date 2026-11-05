@@ -284,6 +284,37 @@ impl ApplyPlan {
     fn installs_at(&self, dest: &Path) -> bool {
         self.installs.iter().any(|i| i.dest == dest)
     }
+
+    /// Drop removals that target a path this same update installs.
+    ///
+    /// Installs run first: the install already parks whatever occupied the
+    /// path, so a later removal would park the freshly installed file and the
+    /// commit would discard it. The install wins — this is also what the old
+    /// "removals before overrides" order produced.
+    fn drop_conflicting_removals(&mut self) {
+        if self.removals.is_empty() {
+            return;
+        }
+        let installs: Vec<String> = self.installs.iter().map(|i| path_key(&i.dest)).collect();
+        self.removals
+            .retain(|removal| !installs.contains(&path_key(&removal.path)));
+    }
+}
+
+/// Comparison key for an instance path: separators normalized and case-folded
+/// (Windows paths are case-insensitive). Inside content folders the
+/// `.disabled` suffix is stripped, so `<name>` and `<name>.disabled` are
+/// recognized as the same target; elsewhere the suffix is just part of a name.
+fn path_key(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let in_content_dir = ["/mods/", "/resourcepacks/", "/shaderpacks/"]
+        .iter()
+        .any(|dir| text.contains(dir));
+    if in_content_dir {
+        text.strip_suffix(".disabled").unwrap_or(&text).to_string()
+    } else {
+        text
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +408,11 @@ fn install_one(
                 ));
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
+            // The override replaces whatever pack file occupied this path, so
+            // old content metadata (e.g. the removed mod's project id) no
+            // longer describes it. The rollback snapshot restores the old
+            // sidecar if the update fails.
+            instances::remove_sidecar_meta(parent, name);
             write_override_sidecar(mc_dir, &rel, provider);
         }
     }
@@ -543,7 +579,13 @@ fn plan_curseforge_update(
             .unwrap_or(false);
         let mut previous_name = None;
         if let Some(old) = old {
-            if old.filename != cf_file.file_name {
+            // A disabled file carries the `.disabled` suffix, so compare the
+            // canonical target (case-folded, suffix stripped) instead of the
+            // raw names: `sodium.jar` and `sodium.jar.disabled` are the same
+            // target, and the install already parks the old file.
+            let same_target = path_key(&mods_dir.join(&old.filename))
+                == path_key(&mods_dir.join(&cf_file.file_name));
+            if !same_target {
                 // The replacement has a new file name: the old file must be
                 // parked as well, or it would stay next to the new one.
                 plan.removals.push(PlannedRemoval {
@@ -595,6 +637,7 @@ fn plan_curseforge_update(
         "curseforge",
     );
     plan_override_removals(&mut plan, mc_dir, input.new_overrides, input.old_overrides);
+    plan.drop_conflicting_removals();
     plan
 }
 
@@ -723,6 +766,7 @@ fn plan_modrinth_update(mc_dir: &Path, staging: &Path, input: &MrApplyInput<'_>)
         "modrinth",
     );
     plan_override_removals(&mut plan, mc_dir, input.new_overrides, input.old_overrides);
+    plan.drop_conflicting_removals();
     plan
 }
 
@@ -2220,6 +2264,268 @@ mod update_integrity_tests {
             b"world"
         );
         assert!(!pack.mods().join("pack.jar").exists());
+    }
+
+    #[test]
+    fn curseforge_disabled_mod_with_the_same_file_name_stays_disabled() {
+        let pack = TestPack::new("cf_disabled_same_name");
+        write(&pack.mods().join("sodium.jar.disabled"), b"old-version");
+        write_sidecar(&pack, "sodium.jar", "curseforge", "5");
+        let installed = content::list_installed(&pack.mods(), "mod");
+        staged(&pack, "mods/sodium.jar", b"new-version");
+        let staged_mods = vec![(
+            PackFileRef {
+                project_id: "10".to_string(),
+                file_id: "6".to_string(),
+            },
+            cf_file("sodium.jar", 6),
+        )];
+
+        let plan = cf_plan(&pack, &installed, &staged_mods, &[], &[]);
+        assert!(
+            plan.removals.is_empty(),
+            "the disabled file is the same target as the install and must not be queued for removal"
+        );
+
+        let new_lock = sample_lock("6");
+        apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan,
+            &pack.staging,
+            &pack.temp_zip,
+            &new_lock,
+        )
+        .expect("update succeeds");
+
+        assert_eq!(
+            std::fs::read(pack.mods().join("sodium.jar.disabled")).unwrap(),
+            b"new-version",
+            "the updated mod must be present and disabled"
+        );
+        assert!(!pack.mods().join("sodium.jar").exists(), "no enabled twin");
+        assert!(!pack.mods().join("sodium.jar.voidlauncher-old").exists());
+        assert!(!pack
+            .mods()
+            .join("sodium.jar.disabled.voidlauncher-old")
+            .exists());
+
+        let sidecar: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pack.index().join("sodium.voidlauncher.json")).unwrap(),
+        )
+        .expect("sidecar is valid JSON");
+        assert_eq!(sidecar["provider"], "curseforge");
+        assert_eq!(sidecar["content_type"], "mod");
+        assert_eq!(sidecar["project_id"], "10");
+        assert_eq!(sidecar["file_id"], "6");
+        assert_eq!(PackLock::read(&pack.instance), Some(new_lock));
+    }
+
+    #[test]
+    fn curseforge_removed_mod_and_override_at_the_same_path_keep_the_override() {
+        let pack = TestPack::new("cf_override_conflict");
+        write(&pack.mods().join("pack.jar"), b"old-mod");
+        write_sidecar(&pack, "pack.jar", "curseforge", "5");
+        write(&pack.mc.join("config/user.toml"), b"user-config");
+        staged(&pack, "overrides/mods/pack.jar", b"new-override");
+
+        let old_manifest =
+            serde_json::json!({"files": [{"projectID": 10, "fileID": 5, "required": true}]});
+        let new_manifest = serde_json::json!({"files": []});
+        let diff = packlock::diff_manifests(&old_manifest, &new_manifest);
+        assert_eq!(diff.removed.len(), 1, "the mod is dropped by the manifest");
+
+        let installed = content::list_installed(&pack.mods(), "mod");
+        let plan = plan_curseforge_update(
+            &pack.mods(),
+            &pack.mc,
+            &pack.staging.join("mods"),
+            &pack.staging.join("overrides"),
+            &CfApplyInput {
+                installed: &installed,
+                staged_mods: &[],
+                diff: &diff,
+                new_overrides: &["mods/pack.jar".to_string()],
+                old_overrides: &[],
+            },
+        );
+        assert_eq!(plan.installs.len(), 1, "the override is installed");
+        assert!(
+            plan.removals.is_empty(),
+            "the removed-mod entry must not delete the override installed at the same path"
+        );
+
+        let new_lock = sample_lock("6");
+        apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan,
+            &pack.staging,
+            &pack.temp_zip,
+            &new_lock,
+        )
+        .expect("update succeeds");
+
+        assert_eq!(
+            std::fs::read(pack.mods().join("pack.jar")).unwrap(),
+            b"new-override",
+            "the override wins over the removed manifest entry"
+        );
+        assert!(!pack.mods().join("pack.jar.voidlauncher-old").exists());
+        assert_eq!(
+            std::fs::read(pack.mc.join("config/user.toml")).unwrap(),
+            b"user-config",
+            "user files outside the pack inventory are untouched"
+        );
+        let sidecar: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pack.index().join("pack.voidlauncher.json")).unwrap(),
+        )
+        .expect("sidecar is valid JSON");
+        assert_eq!(sidecar["downloaded_from_pack"], true);
+        assert!(
+            sidecar.get("file_id").is_none(),
+            "stale mod metadata must not describe the override: {sidecar}"
+        );
+        assert_eq!(PackLock::read(&pack.instance), Some(new_lock));
+    }
+
+    #[test]
+    fn modrinth_removed_file_and_override_at_the_same_path_keep_the_override() {
+        let pack = TestPack::new("mr_override_conflict");
+        write(&pack.mods().join("pack.jar"), b"old-mod");
+        write_sidecar(&pack, "pack.jar", "modrinth", "v5");
+        write(&pack.mc.join("config/user.toml"), b"user-config");
+        staged(&pack, "overrides/mods/pack.jar", b"new-override");
+
+        let old_manifest = serde_json::json!({
+            "files": [{
+                "path": "mods/pack.jar",
+                "project_id": "pack",
+                "version_id": "v5",
+                "hashes": {"sha1": "a"}
+            }]
+        });
+        let new_manifest = serde_json::json!({"files": []});
+        let old_map = packlock::mrpack_manifest_map(&old_manifest);
+        let new_map = packlock::mrpack_manifest_map(&new_manifest);
+        let diff = packlock::diff_mrpack_manifests(&old_manifest, &new_manifest);
+
+        let plan = plan_modrinth_update(
+            &pack.mc,
+            &pack.staging,
+            &MrApplyInput {
+                old_map: &old_map,
+                new_map: &new_map,
+                diff: &diff,
+                new_overrides: &["mods/pack.jar".to_string()],
+                old_overrides: &[],
+            },
+        );
+        assert_eq!(plan.installs.len(), 1);
+        assert!(
+            plan.removals.is_empty(),
+            "the removed pack file must not delete the override installed at the same path"
+        );
+
+        apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan,
+            &pack.staging,
+            &pack.temp_zip,
+            &sample_lock("6"),
+        )
+        .expect("update succeeds");
+
+        assert_eq!(
+            std::fs::read(pack.mods().join("pack.jar")).unwrap(),
+            b"new-override"
+        );
+        assert_eq!(
+            std::fs::read(pack.mc.join("config/user.toml")).unwrap(),
+            b"user-config"
+        );
+        let sidecar: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pack.index().join("pack.voidlauncher.json")).unwrap(),
+        )
+        .expect("sidecar is valid JSON");
+        assert_eq!(sidecar["downloaded_from_pack"], true);
+    }
+
+    #[test]
+    fn failed_lock_in_a_conflicting_update_restores_the_removed_mod_and_sidecar() {
+        let pack = TestPack::new("cf_conflict_rollback");
+        write(&pack.mods().join("pack.jar"), b"old-mod");
+        write_sidecar(&pack, "pack.jar", "curseforge", "5");
+        let sidecar_before = std::fs::read(pack.index().join("pack.voidlauncher.json")).unwrap();
+        staged(&pack, "overrides/mods/pack.jar", b"new-override");
+
+        let old_manifest =
+            serde_json::json!({"files": [{"projectID": 10, "fileID": 5, "required": true}]});
+        let new_manifest = serde_json::json!({"files": []});
+        let diff = packlock::diff_manifests(&old_manifest, &new_manifest);
+        let installed = content::list_installed(&pack.mods(), "mod");
+        let plan = plan_curseforge_update(
+            &pack.mods(),
+            &pack.mc,
+            &pack.staging.join("mods"),
+            &pack.staging.join("overrides"),
+            &CfApplyInput {
+                installed: &installed,
+                staged_mods: &[],
+                diff: &diff,
+                new_overrides: &["mods/pack.jar".to_string()],
+                old_overrides: &[],
+            },
+        );
+
+        // Controlled lock failure after the override replaced the old mod.
+        std::fs::create_dir_all(pack.instance.join(".pack-lock.json.tmp")).unwrap();
+        let err = apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan,
+            &pack.staging,
+            &pack.temp_zip,
+            &sample_lock("6"),
+        )
+        .expect_err("the blocked lock write must fail the update");
+        assert!(err.contains("rolled back"), "got: {err}");
+
+        assert_eq!(
+            std::fs::read(pack.mods().join("pack.jar")).unwrap(),
+            b"old-mod",
+            "the removed mod must come back when the update cannot commit"
+        );
+        assert_eq!(
+            std::fs::read(pack.index().join("pack.voidlauncher.json")).unwrap(),
+            sidecar_before,
+            "the old mod sidecar must be restored"
+        );
+        assert!(!pack.mods().join("pack.jar.voidlauncher-old").exists());
+    }
+
+    #[test]
+    fn removals_are_matched_to_installs_case_insensitively() {
+        let pack = TestPack::new("case_conflict");
+        write(&pack.mods().join("foo.jar"), b"old");
+        write_sidecar(&pack, "foo.jar", "curseforge", "5");
+        let installed = content::list_installed(&pack.mods(), "mod");
+        staged(&pack, "mods/Foo.jar", b"new");
+        let staged_mods = vec![(
+            PackFileRef {
+                project_id: "10".to_string(),
+                file_id: "6".to_string(),
+            },
+            cf_file("Foo.jar", 6),
+        )];
+
+        let plan = cf_plan(&pack, &installed, &staged_mods, &[], &[]);
+        assert!(
+            plan.removals.is_empty(),
+            "a case-only difference is the same Windows target: {:?}",
+            plan.removals.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
     }
 
     #[test]
