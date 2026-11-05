@@ -291,26 +291,68 @@ impl ApplyPlan {
     /// path, so a later removal would park the freshly installed file and the
     /// commit would discard it. The install wins — this is also what the old
     /// "removals before overrides" order produced.
-    fn drop_conflicting_removals(&mut self) {
+    fn drop_conflicting_removals(&mut self, mc_dir: &Path) {
         if self.removals.is_empty() {
             return;
         }
-        let installs: Vec<String> = self.installs.iter().map(|i| path_key(&i.dest)).collect();
+        let installs: Vec<String> = self
+            .installs
+            .iter()
+            .map(|i| path_key(&i.dest, mc_dir))
+            .collect();
         self.removals
-            .retain(|removal| !installs.contains(&path_key(&removal.path)));
+            .retain(|removal| !installs.contains(&path_key(&removal.path, mc_dir)));
+    }
+
+    /// Keep exactly one install per canonical target, the last one.
+    ///
+    /// Pack manifests and pack overrides can name the same path (both formats
+    /// allow it). Installing it twice would park the first replacement and
+    /// overwrite that park with the second one, so a rollback could no longer
+    /// restore the original file. Overrides are appended after manifest files,
+    /// so the last install is the override: it wins, which matches the pack
+    /// format's "overrides are applied on top" semantics.
+    fn drop_shadowed_installs(&mut self, mc_dir: &Path) {
+        if self.installs.len() < 2 {
+            return;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut kept = Vec::with_capacity(self.installs.len());
+        for install in self.installs.drain(..).rev() {
+            if seen.insert(path_key(&install.dest, mc_dir)) {
+                kept.push(install);
+            }
+        }
+        kept.reverse();
+        self.installs = kept;
     }
 }
 
+/// Is `path` a file directly inside one of the instance's content folders?
+/// The check is relative to the instance's `.minecraft` directory and compares
+/// exact path components, so a parent folder that happens to be named `mods`
+/// (e.g. `C:/workspace/mods/instances/...`) does not turn unrelated files into
+/// content files.
+fn in_content_dir(path: &Path, mc_dir: &Path) -> bool {
+    let path_norm = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let root_norm = mc_dir.to_string_lossy().replace('\\', "/").to_lowercase();
+    let root_norm = root_norm.trim_end_matches('/');
+    let Some(rel) = path_norm.strip_prefix(root_norm) else {
+        return false;
+    };
+    let rel = rel.trim_start_matches('/');
+    let parts: Vec<&str> = rel.split('/').collect();
+    parts.len() == 2 && matches!(parts[0], "mods" | "resourcepacks" | "shaderpacks")
+}
+
 /// Comparison key for an instance path: separators normalized and case-folded
-/// (Windows paths are case-insensitive). Inside content folders the
-/// `.disabled` suffix is stripped, so `<name>` and `<name>.disabled` are
-/// recognized as the same target; elsewhere the suffix is just part of a name.
-fn path_key(path: &Path) -> String {
+/// (Windows paths are case-insensitive). Only a file directly inside a content
+/// folder gets its `.disabled` suffix stripped, so `<name>` and
+/// `<name>.disabled` are recognized as the same target; elsewhere the suffix is
+/// just part of a name.
+fn path_key(path: &Path, mc_dir: &Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/").to_lowercase();
-    let in_content_dir = ["/mods/", "/resourcepacks/", "/shaderpacks/"]
-        .iter()
-        .any(|dir| text.contains(dir));
-    if in_content_dir {
+    if in_content_dir(path, mc_dir) {
         text.strip_suffix(".disabled").unwrap_or(&text).to_string()
     } else {
         text
@@ -583,8 +625,8 @@ fn plan_curseforge_update(
             // canonical target (case-folded, suffix stripped) instead of the
             // raw names: `sodium.jar` and `sodium.jar.disabled` are the same
             // target, and the install already parks the old file.
-            let same_target = path_key(&mods_dir.join(&old.filename))
-                == path_key(&mods_dir.join(&cf_file.file_name));
+            let same_target = path_key(&mods_dir.join(&old.filename), mc_dir)
+                == path_key(&mods_dir.join(&cf_file.file_name), mc_dir);
             if !same_target {
                 // The replacement has a new file name: the old file must be
                 // parked as well, or it would stay next to the new one.
@@ -637,7 +679,8 @@ fn plan_curseforge_update(
         "curseforge",
     );
     plan_override_removals(&mut plan, mc_dir, input.new_overrides, input.old_overrides);
-    plan.drop_conflicting_removals();
+    plan.drop_shadowed_installs(mc_dir);
+    plan.drop_conflicting_removals(mc_dir);
     plan
 }
 
@@ -766,7 +809,8 @@ fn plan_modrinth_update(mc_dir: &Path, staging: &Path, input: &MrApplyInput<'_>)
         "modrinth",
     );
     plan_override_removals(&mut plan, mc_dir, input.new_overrides, input.old_overrides);
-    plan.drop_conflicting_removals();
+    plan.drop_shadowed_installs(mc_dir);
+    plan.drop_conflicting_removals(mc_dir);
     plan
 }
 
@@ -2526,6 +2570,247 @@ mod update_integrity_tests {
             "a case-only difference is the same Windows target: {:?}",
             plan.removals.iter().map(|r| &r.path).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn path_key_strips_disabled_only_for_direct_content_files() {
+        let mc = Path::new(r"C:\workspace\mods\instances\test\.minecraft");
+
+        // A parent folder named `mods` must not turn unrelated files into
+        // content files.
+        let config_disabled =
+            Path::new(r"C:\workspace\mods\instances\test\config\settings.disabled");
+        assert!(!in_content_dir(config_disabled, mc));
+        assert!(
+            path_key(config_disabled, mc).ends_with("settings.disabled"),
+            "a config name keeps its `.disabled` suffix"
+        );
+
+        for dir in ["mods", "resourcepacks", "shaderpacks"] {
+            let disabled = mc.join(dir).join("example.jar.disabled");
+            let plain = mc.join(dir).join("example.jar");
+            assert!(in_content_dir(&disabled, mc), "{dir}: {disabled:?}");
+            assert!(in_content_dir(&plain, mc));
+            assert_eq!(
+                path_key(&disabled, mc),
+                path_key(&plain, mc),
+                "{dir}: the disabled twin is the same target"
+            );
+        }
+
+        // Nested folders are not direct content files.
+        let nested = mc.join("mods").join("nested").join("example.jar.disabled");
+        assert!(!in_content_dir(&nested, mc));
+        assert!(path_key(&nested, mc).ends_with(".disabled"));
+    }
+
+    #[test]
+    fn a_config_named_disabled_is_not_confused_with_its_plain_name() {
+        // Instance root deliberately contains a `mods` component.
+        let root = std::env::temp_dir().join("vl_packlock_key/mods/instances/test");
+        let mc = root.join(".minecraft");
+        let mut plan = ApplyPlan {
+            installs: vec![PlannedInstall {
+                staged: mc.join("config/settings.disabled"),
+                dest: mc.join("config/settings.disabled"),
+                preserve_disabled: false,
+                previous_name: None,
+                sidecar: SidecarPlan::Override("curseforge"),
+                is_mod: false,
+            }],
+            removals: vec![PlannedRemoval {
+                path: mc.join("config/settings"),
+                is_mod: false,
+                counted: true,
+            }],
+        };
+
+        plan.drop_conflicting_removals(&mc);
+        assert_eq!(
+            plan.removals.len(),
+            1,
+            "a config named `settings.disabled` is not the same target as `settings`"
+        );
+
+        // A genuine content twin is still the same target.
+        let mut content = ApplyPlan {
+            installs: vec![PlannedInstall {
+                staged: mc.join("mods/example.jar"),
+                dest: mc.join("mods/example.jar"),
+                preserve_disabled: false,
+                previous_name: None,
+                sidecar: SidecarPlan::Override("curseforge"),
+                is_mod: true,
+            }],
+            removals: vec![PlannedRemoval {
+                path: mc.join("mods/example.jar.disabled"),
+                is_mod: true,
+                counted: true,
+            }],
+        };
+        content.drop_conflicting_removals(&mc);
+        assert!(content.removals.is_empty());
+    }
+
+    #[test]
+    fn override_wins_over_a_manifest_file_at_the_same_path() {
+        let pack = TestPack::new("cf_manifest_vs_override");
+        write(&pack.mods().join("example.jar"), b"old");
+        write_sidecar(&pack, "example.jar", "curseforge", "5");
+        staged(&pack, "mods/example.jar", b"manifest-bytes");
+        staged(&pack, "overrides/mods/example.jar", b"override-bytes");
+
+        let staged_mods = vec![(
+            PackFileRef {
+                project_id: "10".to_string(),
+                file_id: "6".to_string(),
+            },
+            cf_file("example.jar", 6),
+        )];
+        let plan = cf_plan(
+            &pack,
+            &content::list_installed(&pack.mods(), "mod"),
+            &staged_mods,
+            &["mods/example.jar".to_string()],
+            &[],
+        );
+        assert_eq!(plan.installs.len(), 1, "one file, one install");
+        assert!(
+            matches!(
+                plan.installs[0].sidecar,
+                SidecarPlan::Override("curseforge")
+            ),
+            "the surviving install is the override"
+        );
+
+        let new_lock = sample_lock("6");
+        apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan,
+            &pack.staging,
+            &pack.temp_zip,
+            &new_lock,
+        )
+        .expect("update succeeds");
+
+        assert_eq!(
+            std::fs::read(pack.mods().join("example.jar")).unwrap(),
+            b"override-bytes",
+            "the pack override is applied on top of the manifest file"
+        );
+        assert!(!pack.mods().join("example.jar.voidlauncher-old").exists());
+        let sidecar: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pack.index().join("example.voidlauncher.json")).unwrap(),
+        )
+        .expect("sidecar is valid JSON");
+        assert_eq!(sidecar["downloaded_from_pack"], true);
+        assert!(sidecar.get("file_id").is_none());
+        assert_eq!(PackLock::read(&pack.instance), Some(new_lock));
+    }
+
+    #[test]
+    fn modrinth_override_wins_over_a_manifest_file_at_the_same_path() {
+        let pack = TestPack::new("mr_manifest_vs_override");
+        write(&pack.mods().join("example.jar"), b"old");
+        write_sidecar(&pack, "example.jar", "modrinth", "v5");
+        staged(&pack, "mods/example.jar", b"manifest-bytes");
+        staged(&pack, "overrides/mods/example.jar", b"override-bytes");
+
+        let old_manifest = serde_json::json!({"files": []});
+        let new_manifest = serde_json::json!({
+            "files": [{
+                "path": "mods/example.jar",
+                "project_id": "example",
+                "version_id": "v6",
+                "hashes": {"sha1": "b"}
+            }]
+        });
+        let old_map = packlock::mrpack_manifest_map(&old_manifest);
+        let new_map = packlock::mrpack_manifest_map(&new_manifest);
+        let diff = packlock::diff_mrpack_manifests(&old_manifest, &new_manifest);
+        let plan = plan_modrinth_update(
+            &pack.mc,
+            &pack.staging,
+            &MrApplyInput {
+                old_map: &old_map,
+                new_map: &new_map,
+                diff: &diff,
+                new_overrides: &["mods/example.jar".to_string()],
+                old_overrides: &[],
+            },
+        );
+        assert_eq!(plan.installs.len(), 1);
+        assert!(matches!(
+            plan.installs[0].sidecar,
+            SidecarPlan::Override("modrinth")
+        ));
+
+        apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan,
+            &pack.staging,
+            &pack.temp_zip,
+            &sample_lock("6"),
+        )
+        .expect("update succeeds");
+        assert_eq!(
+            std::fs::read(pack.mods().join("example.jar")).unwrap(),
+            b"override-bytes"
+        );
+        assert!(!pack.mods().join("example.jar.voidlauncher-old").exists());
+    }
+
+    #[test]
+    fn failed_override_install_restores_the_shadowed_mod() {
+        let pack = TestPack::new("cf_override_rollback");
+        write(&pack.mods().join("example.jar"), b"old");
+        write_sidecar(&pack, "example.jar", "curseforge", "5");
+        let sidecar_before = std::fs::read(pack.index().join("example.voidlauncher.json")).unwrap();
+        staged(&pack, "mods/example.jar", b"manifest-bytes");
+        let override_staged = staged(&pack, "overrides/mods/example.jar", b"override-bytes");
+
+        let staged_mods = vec![(
+            PackFileRef {
+                project_id: "10".to_string(),
+                file_id: "6".to_string(),
+            },
+            cf_file("example.jar", 6),
+        )];
+        let plan = cf_plan(
+            &pack,
+            &content::list_installed(&pack.mods(), "mod"),
+            &staged_mods,
+            &["mods/example.jar".to_string()],
+            &[],
+        );
+
+        // The installation is planned, then its staged file disappears.
+        std::fs::remove_file(&override_staged).unwrap();
+        let err = apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan,
+            &pack.staging,
+            &pack.temp_zip,
+            &sample_lock("6"),
+        )
+        .expect_err("the missing staged override must fail the update");
+        assert!(err.contains("rolled back"), "got: {err}");
+
+        assert_eq!(
+            std::fs::read(pack.mods().join("example.jar")).unwrap(),
+            b"old",
+            "the original file is restored"
+        );
+        assert_eq!(
+            std::fs::read(pack.index().join("example.voidlauncher.json")).unwrap(),
+            sidecar_before,
+            "the original sidecar is restored"
+        );
+        assert!(!pack.mods().join("example.jar.voidlauncher-old").exists());
+        assert!(!pack.instance.join("pack-lock.json").exists());
     }
 
     #[test]
