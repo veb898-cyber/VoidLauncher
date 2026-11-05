@@ -810,11 +810,8 @@ mod tests {
     }
 
     fn reader_temp_dir(prefix: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vl_readers_{}_{}",
-            prefix,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vl_readers_{}_{}", prefix, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
