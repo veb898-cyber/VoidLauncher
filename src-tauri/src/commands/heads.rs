@@ -35,7 +35,7 @@
 //! is reported as an error instead of a fake empty list.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,69 @@ fn normalize_uuid(raw: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+static SKIN_GENERATIONS: OnceLock<RwLock<HashMap<String, u64>>> = OnceLock::new();
+
+fn get_skin_generations() -> &'static RwLock<HashMap<String, u64>> {
+    SKIN_GENERATIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn get_skin_generation(norm: &str) -> u64 {
+    let generations = get_skin_generations();
+    // A panic while a writer held the map must not disable generation checks
+    // for the rest of the process: recover the guard instead of returning 0.
+    let map = generations
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.get(norm).copied().unwrap_or(0)
+}
+
+/// Invalidate cached head for a player UUID, deleting disk file and advancing generation token.
+///
+/// Any in-flight fetch that started before this invalidation will observe a mismatched
+/// generation and will discard its stale bytes instead of overwriting the newly cleared state.
+pub fn invalidate_player_head_cache(data_dir: &std::path::Path, uuid: &str) -> u64 {
+    let Some(norm) = normalize_uuid(uuid) else {
+        return 0;
+    };
+    let mut map = get_skin_generations()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = skin_cache_path(data_dir, &norm);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    let next_gen = map.get(&norm).copied().unwrap_or(0) + 1;
+    map.insert(norm, next_gen);
+    next_gen
+}
+
+/// Commit skin bytes to disk cache only if generation token matches expected.
+/// Both checking the generation and writing to disk are performed under the
+/// generation write lock, guaranteeing atomicity against concurrent invalidation.
+pub fn commit_player_head_cache(
+    data_dir: &std::path::Path,
+    norm: &str,
+    expected_gen: u64,
+    bytes: &[u8],
+) -> bool {
+    let map = get_skin_generations()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current_gen = map.get(norm).copied().unwrap_or(0);
+    if current_gen != expected_gen {
+        return false;
+    }
+    let path = skin_cache_path(data_dir, norm);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, bytes) {
+        tracing::warn!(target: "launcher", "Could not cache skin for {}: {}", norm, e);
+        return false;
+    }
+    true
 }
 
 fn skin_cache_path(data_dir: &std::path::Path, norm: &str) -> std::path::PathBuf {
@@ -344,6 +407,17 @@ fn find_account_by_uuid<'a>(accounts: &'a [AccountEntry], norm: &str) -> Option<
     })
 }
 
+/// Invalidate the cached head for `uuid`: delete the disk file and advance the
+/// generation token so an in-flight fetch cannot save stale bytes afterwards.
+#[tauri::command]
+pub fn cmd_invalidate_player_head(state: State<'_, AppState>, uuid: String) -> Result<u64, String> {
+    let data_dir = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.data_dir.clone()
+    };
+    Ok(invalidate_player_head_cache(&data_dir, &uuid))
+}
+
 /// Fetch (or serve from the disk cache) the raw skin of an account as a
 /// PNG data URL. The renderer crops the head from it; see module docs.
 #[tauri::command]
@@ -369,6 +443,9 @@ pub async fn cmd_get_player_head(
         return Ok(bundled_default_skin(&norm));
     }
 
+    // Capture generation token before cache checks or async fetch
+    let gen_before = get_skin_generation(&norm);
+
     // Fresh cache: instant answer, no network.
     if cache_is_fresh(&path) {
         if let Ok(bytes) = std::fs::read(&path) {
@@ -379,11 +456,16 @@ pub async fn cmd_get_player_head(
     }
 
     if let Some(bytes) = fetch_skin_fresh(&norm, account).await {
-        let _ = std::fs::create_dir_all(path.parent().unwrap_or(&data_dir));
-        if let Err(e) = std::fs::write(&path, &bytes) {
-            tracing::warn!(target: "launcher", "Could not cache skin for {}: {}", norm, e);
+        // Only write to cache if the skin wasn't invalidated while fetching
+        if commit_player_head_cache(&data_dir, &norm, gen_before, &bytes) {
+            return Ok(Some(data_url(&bytes)));
+        } else {
+            tracing::info!(
+                target: "launcher",
+                "Skin fetch for {} completed after cache invalidation (expected gen {}), discarding stale bytes",
+                norm, gen_before
+            );
         }
-        return Ok(Some(data_url(&bytes)));
     }
 
     // Refresh failed (Mojang down, rate-limited, offline): a possibly
@@ -875,6 +957,108 @@ mod tests {
     use super::*;
 
     // ---- normalize_uuid: the value is a file name — path safety matters ----
+
+    #[test]
+    fn invalidate_player_head_cache_removes_file_and_increments_generation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("voidlauncher-head-test-{}", uuid::Uuid::new_v4()));
+        let uuid = "1a650540-fb59-4d9d-a1d3-f8f7a67379a3";
+        let norm = normalize_uuid(uuid).unwrap();
+        let heads_dir = temp_dir.join("heads");
+        std::fs::create_dir_all(&heads_dir).unwrap();
+        let head_file = heads_dir.join(format!("{}.png", norm));
+        std::fs::write(&head_file, b"fake png bytes").unwrap();
+        assert!(head_file.exists());
+
+        let gen1 = invalidate_player_head_cache(&temp_dir, uuid);
+        assert!(
+            !head_file.exists(),
+            "Cache file must be deleted on invalidation"
+        );
+        assert_eq!(gen1, get_skin_generation(&norm));
+
+        let gen2 = invalidate_player_head_cache(&temp_dir, uuid);
+        assert_eq!(
+            gen2,
+            gen1 + 1,
+            "Subsequent invalidation must increment generation"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_skin_generation_deterministic_race_protection() {
+        use std::sync::mpsc::channel;
+        let temp_dir = std::env::temp_dir().join(format!("vl-head-race-{}", uuid::Uuid::new_v4()));
+        let uuid = "2b650540-fb59-4d9d-a1d3-f8f7a67379a4";
+        let norm = normalize_uuid(uuid).unwrap();
+        let cache_file = skin_cache_path(&temp_dir, &norm);
+
+        // Ensure clean initial state
+        let initial_gen = get_skin_generation(&norm);
+
+        // Thread A simulates an in-flight network fetch:
+        // Controlled suspension points with mpsc channels (NO SLEEPS)
+        let (tx_fetch_started, rx_fetch_started) = channel();
+        let (tx_invalidate_done, rx_invalidate_done) = channel();
+
+        let temp_dir_clone = temp_dir.clone();
+        let norm_clone = norm.clone();
+
+        let fetch_thread = std::thread::spawn(move || {
+            // 1. Thread A samples the generation token BEFORE the slow fetch
+            let gen_before = get_skin_generation(&norm_clone);
+            assert_eq!(gen_before, initial_gen);
+
+            // Signal main thread: generation captured, simulated fetch in-flight
+            tx_fetch_started.send(()).unwrap();
+
+            // Wait for main thread to perform invalidation before committing
+            rx_invalidate_done.recv().unwrap();
+
+            // Thread A tries to commit stale bytes using the captured gen_before
+            commit_player_head_cache(&temp_dir_clone, &norm_clone, gen_before, b"STALE_PNG_BYTES")
+        });
+
+        // Main thread waits until Thread A has captured gen_before
+        rx_fetch_started.recv().unwrap();
+
+        // 2. While Thread A is "fetching", user updates skin (invalidation occurs)
+        let new_gen = invalidate_player_head_cache(&temp_dir, uuid);
+        assert!(
+            new_gen > initial_gen,
+            "Generation must advance on invalidation"
+        );
+
+        // Signal Thread A to resume and attempt its commit
+        tx_invalidate_done.send(()).unwrap();
+
+        // 3. Thread A finishes
+        let committed = fetch_thread.join().unwrap();
+
+        // 4. Assert: commit was rejected, stale bytes were discarded, file does NOT exist on disk!
+        assert!(
+            !committed,
+            "commit_player_head_cache must reject stale generation"
+        );
+        assert!(
+            !cache_file.exists(),
+            "Stale bytes must NOT be written to disk"
+        );
+
+        // 5. Subsequent fresh fetch with new_gen successfully commits
+        let fresh_committed =
+            commit_player_head_cache(&temp_dir, &norm, new_gen, b"FRESH_PNG_BYTES");
+        assert!(
+            fresh_committed,
+            "commit_player_head_cache must succeed for current generation"
+        );
+        assert!(cache_file.exists(), "Fresh bytes must be written to disk");
+        assert_eq!(std::fs::read(&cache_file).unwrap(), b"FRESH_PNG_BYTES");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn normalize_accepts_dashed_undashed_and_uppercase() {

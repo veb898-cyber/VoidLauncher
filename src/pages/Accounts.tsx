@@ -15,7 +15,7 @@ import { SkinPreview } from '../components/accounts/SkinPreview';
 import { addToast } from '../components/ui/Toast';
 import { Ban, Check, RefreshCw, Plus, Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
 import { t } from '../lib/i18n';
-import { Avatar } from '../lib/remoteImage';
+import { Avatar, invalidatePlayerHead } from '../lib/remoteImage';
 
 const ELYBY_SKINS_URL = 'https://ely.by/skins';
 
@@ -383,6 +383,22 @@ export function Accounts() {
                             onClick={(e) => { e.stopPropagation(); setShowElybySkinHelp(true); }}
                           >
                             <HelpCircle size={14} />
+                          </Button>
+                        </Tooltip>
+                      )}
+                      {acc.uuid && (
+                        <Tooltip content={t('accounts.refresh_skin_btn')}>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            aria-label={t('accounts.refresh_skin_btn')}
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              await invalidatePlayerHead(acc.uuid!);
+                              addToast(t('accounts.skin_refreshed'), 'info');
+                            }}
+                          >
+                            <RefreshCw size={14} />
                           </Button>
                         </Tooltip>
                       )}

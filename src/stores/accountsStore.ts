@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { logUiMessage } from '../lib/uiLog';
 import { useAuthStore } from './authStore';
+import { invalidatePlayerHead } from '../lib/remoteImage';
 
 /**
  * Public, token-free account metadata. The backend strips `access_token` and
@@ -194,6 +195,10 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       const accounts = await invoke<AccountEntry[]>('cmd_add_elyby_account', { username, password });
+      const added = accounts.find((a) => a.name.toLowerCase() === username.toLowerCase()) || accounts[accounts.length - 1];
+      if (added?.uuid) {
+        void invalidatePlayerHead(added.uuid);
+      }
       set({ accounts, isLoading: false });
     } catch (e: any) {
       set({ error: e.toString(), isLoading: false });
@@ -203,7 +208,11 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
 
   removeAccount: async (id: string) => {
     try {
+      const doomed = get().accounts.find((a) => a.id === id);
       const accounts = await invoke<AccountEntry[]>('cmd_remove_account', { id });
+      if (doomed?.uuid) {
+        void invalidatePlayerHead(doomed.uuid);
+      }
       // Drop every trace of the removed account so a future account that
       // reuses the id never shows stale capes.
       forgetPersistedCapes(id);
@@ -237,7 +246,13 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
 
   changeSkin: async (accountId: string, skinPath: string, variant = 'classic') => {
     try {
+      const account = get().accounts.find((a) => a.id === accountId);
       await invoke('cmd_change_skin', { accountId, skinPath, variant });
+      // The backend changed the texture; drop the old head/skin cache before
+      // the next render so the preview and every Avatar show the new skin.
+      if (account?.uuid) {
+        await invalidatePlayerHead(account.uuid);
+      }
       get().loadAccounts(true);
     } catch (e: any) {
       set({ error: e.toString() });

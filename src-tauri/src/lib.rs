@@ -307,6 +307,7 @@ pub fn run() {
             commands::misc::cmd_detect_system_ram,
             commands::misc::cmd_get_installer_language,
             commands::heads::cmd_get_player_head,
+            commands::heads::cmd_invalidate_player_head,
             commands::heads::cmd_get_player_capes,
             commands::heads::cmd_set_player_cape,
             commands::mods::cmd_search_modrinth,

@@ -204,24 +204,94 @@ export function RemoteImage({
 
 const playerHeadCache = new Map<string, string>();
 const playerHeadFailedAt = new Map<string, number>();
-const playerHeadInflight = new Set<string>();
+const playerHeadInflight = new Map<string, number>();
 const playerHeadSubs = new Map<string, ((v: string | null) => void)[]>();
+const playerHeadListeners = new Set<(key: string, head: string | null) => void>();
+const playerHeadRefreshListeners = new Set<(key: string) => void>();
+const playerHeadGenerations = new Map<string, number>();
 const PLAYER_HEAD_RETRY_MS = 60_000;
 
+function getHeadGeneration(key: string): number {
+  return playerHeadGenerations.get(key) ?? 0;
+}
+
+function bumpHeadGeneration(key: string): number {
+  const next = getHeadGeneration(key) + 1;
+  playerHeadGenerations.set(key, next);
+  return next;
+}
+
+/**
+ * Invalidate cached player head in renderer memory and on backend disk.
+ *
+ * All mounted Avatar instances for this UUID immediately re-fetch and re-render.
+ * Advances the frontend Generation Token so in-flight requests cannot overwrite fresh state.
+ */
+/**
+ * Subscribe to completed backend head invalidations. Used by views that need
+ * the raw skin (e.g. the 3D preview) rather than the cropped Avatar head.
+ */
+export function onPlayerHeadInvalidated(
+  listener: (key: string) => void,
+): () => void {
+  playerHeadRefreshListeners.add(listener);
+  return () => playerHeadRefreshListeners.delete(listener);
+}
+
+export async function invalidatePlayerHead(uuid: string): Promise<void> {
+  const key = uuid.replace(/-/g, '').toLowerCase();
+
+  // 1. Advance generation token so any in-flight fetch is discarded
+  bumpHeadGeneration(key);
+
+  // 2. Clear all cached state and inflight markers for this key
+  playerHeadCache.delete(key);
+  playerHeadFailedAt.delete(key);
+  playerHeadInflight.delete(key);
+  playerHeadSubs.delete(key);
+
+  // 3. Notify listeners that head is invalidated
+  playerHeadListeners.forEach((fn) => fn(key, null));
+
+  // 4. Invalidate on backend (disk + Rust generation token)
+  try {
+    await invoke('cmd_invalidate_player_head', { uuid: key });
+    // Raw-skin consumers (3D preview) must refetch after the backend cache
+    // is gone, otherwise they keep the old texture until remount.
+    playerHeadRefreshListeners.forEach((fn) => fn(key));
+  } catch (e) {
+    console.warn('Failed to invalidate player head on backend:', e);
+  }
+
+  // 5. Trigger fresh request under the new generation
+  requestPlayerHead(key);
+}
+
 function requestPlayerHead(uuid: string) {
-  if (playerHeadInflight.has(uuid)) return;
+  const gen = getHeadGeneration(uuid);
+  if (playerHeadInflight.get(uuid) === gen) return;
+
   const failedAt = playerHeadFailedAt.get(uuid);
   if (failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS) {
     setTimeout(() => {
-      (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(null));
-      playerHeadSubs.delete(uuid);
+      if (getHeadGeneration(uuid) === gen) {
+        (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(null));
+        playerHeadSubs.delete(uuid);
+      }
     }, 0);
     return;
   }
-  playerHeadInflight.add(uuid);
+
+  playerHeadInflight.set(uuid, gen);
   invoke<string | null>('cmd_get_player_head', { uuid })
     .then(async (skin) => {
+      // Discard if invalidated while awaiting backend
+      if (getHeadGeneration(uuid) !== gen) return;
+
       const head = skin ? await headFromSkin(uuid, skin) : null;
+      // Discard if invalidated while cropping head
+      if (getHeadGeneration(uuid) !== gen) return;
+
       if (head) {
         playerHeadCache.set(uuid, head);
         playerHeadFailedAt.delete(uuid);
@@ -229,14 +299,20 @@ function requestPlayerHead(uuid: string) {
         playerHeadFailedAt.set(uuid, Date.now());
       }
       (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(head));
+      playerHeadListeners.forEach((fn) => fn(uuid, head));
     })
     .catch(() => {
+      if (getHeadGeneration(uuid) !== gen) return;
       playerHeadFailedAt.set(uuid, Date.now());
       (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(null));
     })
     .finally(() => {
-      playerHeadInflight.delete(uuid);
-      playerHeadSubs.delete(uuid);
+      if (playerHeadInflight.get(uuid) === gen) {
+        playerHeadInflight.delete(uuid);
+      }
+      if (getHeadGeneration(uuid) === gen) {
+        playerHeadSubs.delete(uuid);
+      }
     });
 }
 
@@ -268,9 +344,18 @@ function usePlayerHead(uuid: string | null | undefined): {
       if (alive) setValue({ key, src: v });
     });
     playerHeadSubs.set(key, subs);
+
+    const onHeadEvent = (changedKey: string, newHead: string | null) => {
+      if (alive && changedKey === key) {
+        setValue({ key, src: newHead });
+      }
+    };
+    playerHeadListeners.add(onHeadEvent);
+
     requestPlayerHead(key);
     return () => {
       alive = false;
+      playerHeadListeners.delete(onHeadEvent);
     };
   }, [key]);
 

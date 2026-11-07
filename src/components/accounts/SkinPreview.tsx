@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { SkinViewer } from 'skinview3d';
 import { invoke } from '@tauri-apps/api/core';
-import { IconShine } from '../../lib/remoteImage';
+import { IconShine, onPlayerHeadInvalidated } from '../../lib/remoteImage';
 import { useT } from '../../lib/i18n';
 
 const DEFAULT_WIDTH = 480;
@@ -66,6 +66,9 @@ export function SkinPreview({
   const [skinState, setSkinState] = useState<SkinState>({ status: 'loading' });
   const [viewerReady, setViewerReady] = useState(false);
   const [box, setBox] = useState<{ w: number; h: number } | null>(null);
+  // Bumped after a backend invalidation (refresh button/skin upload) so the
+  // raw-skin fetch below re-runs even though the account uuid did not change.
+  const [reloadToken, setReloadToken] = useState(0);
 
   // Measure the stage: the canvas is sized to whatever room the card gives,
   // preserving the 3:4 ratio (height first, then width).
@@ -92,7 +95,8 @@ export function SkinPreview({
   const sizeRef = useRef({ w: fitW, h: fitH });
   sizeRef.current = { w: fitW, h: fitH };
 
-  // Fetch the raw skin whenever the selected account changes.
+  // Fetch the raw skin whenever the selected account changes or its cache was
+  // invalidated elsewhere (the uuid stays the same in the refresh scenario).
   useEffect(() => {
     if (!uuid) {
       setSkinState({ status: 'error' });
@@ -113,6 +117,14 @@ export function SkinPreview({
     return () => {
       alive = false;
     };
+  }, [uuid, reloadToken]);
+
+  useEffect(() => {
+    const key = uuid?.replace(/-/g, '').toLowerCase();
+    if (!key) return;
+    return onPlayerHeadInvalidated((changedKey) => {
+      if (changedKey === key) setReloadToken((value) => value + 1);
+    });
   }, [uuid]);
 
   // Create the viewer on the first ready skin; later skins load in place.
