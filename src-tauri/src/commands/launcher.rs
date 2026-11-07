@@ -1656,6 +1656,31 @@ pub async fn cmd_read_game_log(
 }
 
 #[tauri::command]
+pub async fn cmd_read_game_log_incremental(
+    state: State<'_, AppState>,
+    path: String,
+    byte_offset: u64,
+    initial_max_lines: Option<usize>,
+    file_token: Option<String>,
+) -> Result<game_logs::IncrementalLogChunk, String> {
+    let data_dir = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.data_dir.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let safe_path = game_logs::validate_log_path(&data_dir, &path)?;
+        game_logs::read_game_log_incremental(
+            &safe_path,
+            byte_offset,
+            initial_max_lines,
+            file_token.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub fn cmd_get_current_game_log() -> Option<String> {
     game_logs::get_current_log_path()
 }

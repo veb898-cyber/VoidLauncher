@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { AlertTriangle, HelpCircle, XCircle, FileText, FileSearch, FolderOpen } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
@@ -58,7 +59,10 @@ export function GameLogs() {
   // Unified session log content: launcher setup messages AND the game's own
   // stdout/stderr interleaved in true chronological order (the backend pipes
   // are drained into the same file as they arrive — Prism-style console).
-  const [content, setContent] = useState('');
+  const [linesBuffer, setLinesBuffer] = useState<string[]>([]);
+  const byteOffsetRef = useRef<number>(0);
+  const fileTokenRef = useRef<string | null>(null);
+  const currentSessionPathRef = useRef<string | null>(null);
   const [loadingContent, setLoadingContent] = useState(true);
 
   // Recent runs (newest first), the path of the currently RUNNING run and
@@ -109,17 +113,46 @@ export function GameLogs() {
       target = target ?? all[0]?.path ?? null;
 
       if (!target) {
-        setContent('');
+        setLinesBuffer([]);
+        byteOffsetRef.current = 0;
+        fileTokenRef.current = null;
+        currentSessionPathRef.current = null;
         return;
       }
-      const text = await invoke<string>('cmd_read_game_log', {
-        path: target,
-        maxLines: MAX_DISPLAY_LINES,
-      });
+
+      if (currentSessionPathRef.current !== target) {
+        currentSessionPathRef.current = target;
+        byteOffsetRef.current = 0;
+        fileTokenRef.current = null;
+      }
+
+      const chunk = await invoke<{ lines: string[]; new_byte_offset: number; reset: boolean; file_token: string }>(
+        'cmd_read_game_log_incremental',
+        {
+          path: target,
+          byteOffset: byteOffsetRef.current,
+          initialMaxLines: MAX_DISPLAY_LINES,
+          fileToken: fileTokenRef.current,
+        }
+      );
       if (token !== loadTokenRef.current) return;
-      setContent(text);
+
+      byteOffsetRef.current = chunk.new_byte_offset;
+      fileTokenRef.current = chunk.file_token;
+
+      if (chunk.reset) {
+        setLinesBuffer(chunk.lines);
+      } else if (chunk.lines.length > 0) {
+        setLinesBuffer((prev) => {
+          const combined = prev.concat(chunk.lines);
+          if (combined.length > MAX_DISPLAY_LINES) {
+            return combined.slice(combined.length - MAX_DISPLAY_LINES);
+          }
+          return combined;
+        });
+      }
     } catch {
-      if (token === loadTokenRef.current) setContent('');
+      if (token === loadTokenRef.current) setLinesBuffer([]);
     } finally {
       if (showLoading && token === loadTokenRef.current) setLoadingContent(false);
     }
@@ -144,7 +177,9 @@ export function GameLogs() {
       atBottomRef.current = true;
       selectedSessionRef.current = null;
       setSelectedSessionPath(null);
-      setContent('');
+      byteOffsetRef.current = 0;
+      fileTokenRef.current = null;
+      setLinesBuffer([]);
       loadContent(false);
     });
 
@@ -164,7 +199,7 @@ export function GameLogs() {
       const el = logContainerRef.current;
       el.scrollTo({ top: el.scrollHeight });
     }
-  }, [content]);
+  }, [linesBuffer]);
 
   const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
@@ -189,9 +224,11 @@ export function GameLogs() {
   const selectSession = (path: string) => {
     selectedSessionRef.current = path;
     setSelectedSessionPath(path);
+    byteOffsetRef.current = 0;
+    fileTokenRef.current = null;
     atBottomRef.current = true;
     setRunsOpen(false);
-    loadContent(false);
+    loadContent(true);
   };
 
   useEffect(() => {
@@ -261,7 +298,7 @@ export function GameLogs() {
 
   // Chronological order (oldest → newest): render the file as-is, the view
   // auto-scrolls to the bottom. The backend already caps the tail.
-  const displayLines = useMemo(() => (content ? content.split('\n') : []), [content]);
+  const displayLines = linesBuffer;
 
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
@@ -284,6 +321,13 @@ export function GameLogs() {
       return needle === '' || line.toLowerCase().includes(needle);
     });
   }, [displayLines, filtering, levels, needle]);
+
+  const rowVirtualizer = useVirtualizer({
+    count: visibleLines.length,
+    getScrollElement: () => logContainerRef.current,
+    estimateSize: () => 22,
+    overscan: 15,
+  });
 
   const toggleLevel = (level: LogLevelFilter) => {
     setLevels((prev) => ({ ...prev, [level]: !prev[level] }));
@@ -498,26 +542,41 @@ export function GameLogs() {
             {t('terminal.no_matches')}
           </div>
         ) : (
-          visibleLines.map((line, i) => {
-            const level = getLineLevel(line);
-            return (
-              <div key={i} className="log-line" style={{
-                padding: '1px var(--space-sm)',
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-all',
-                color: getLineColor(level),
-                borderRadius: 'var(--radius-sm)',
-                userSelect: 'text',
-                background: level === 'error' ? 'rgba(255, 60, 60, 0.06)' : level === 'warn' ? 'rgba(255, 180, 40, 0.06)' : 'transparent',
-                // Skip layout/paint for off-screen lines so a 100k-line
-                // log (Prism-sized) doesn't freeze the UI.
-                contentVisibility: 'auto',
-                containIntrinsicSize: 'auto 19px',
-              }}>
-                {line}
-              </div>
-            );
-          })
+          <div style={{ height: `${rowVirtualizer.getTotalSize()}px`, width: '100%', position: 'relative' }}>
+            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+              const line = visibleLines[virtualRow.index];
+              const level = getLineLevel(line);
+              return (
+                <div
+                  key={virtualRow.key}
+                  ref={rowVirtualizer.measureElement}
+                  data-index={virtualRow.index}
+                  className="log-line"
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    transform: `translateY(${virtualRow.start}px)`,
+                    padding: '1px var(--space-sm)',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-all',
+                    color: getLineColor(level),
+                    borderRadius: 'var(--radius-sm)',
+                    userSelect: 'text',
+                    background:
+                      level === 'error'
+                        ? 'rgba(255, 60, 60, 0.06)'
+                        : level === 'warn'
+                        ? 'rgba(255, 180, 40, 0.06)'
+                        : 'transparent',
+                  }}
+                >
+                  {line}
+                </div>
+              );
+            })}
+          </div>
         )}
         {filtering && visibleLines.length > 0 && (
           <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-sm)' }}>

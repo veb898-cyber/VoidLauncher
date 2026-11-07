@@ -340,6 +340,7 @@ pub fn run() {
             commands::launcher::cmd_emit_log,
             commands::launcher::cmd_list_game_logs,
             commands::launcher::cmd_read_game_log,
+            commands::launcher::cmd_read_game_log_incremental,
             commands::launcher::cmd_get_current_game_log,
             commands::launcher::cmd_delete_game_log,
             commands::launcher::cmd_open_instance_logs_folder,
