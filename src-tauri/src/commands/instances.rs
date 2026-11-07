@@ -797,6 +797,99 @@ pub async fn cmd_list_packs(
     .map_err(|e| e.to_string())?
 }
 
+/// RAII guard that reserves an instance for a config/options modification so
+/// a game launch cannot start concurrently (and vice versa).
+struct InstanceConfigGuard<'a> {
+    state: &'a AppState,
+    instance_name: String,
+    token: crate::launch_state::LaunchToken,
+}
+
+impl<'a> InstanceConfigGuard<'a> {
+    fn acquire(
+        state: &'a AppState,
+        data_dir: &std::path::Path,
+        instance_name: &str,
+    ) -> Result<Self, String> {
+        // A game orphaned by a launcher restart has no in-memory entry: adopt
+        // it from its pid file first, so the launch registry refuses the edit.
+        // Only verified identities are adopted; an unverifiable record blocks
+        // the edit instead (its world could be live).
+        let scan = crate::running_state::scan_games(data_dir);
+        for game in &scan.confirmed {
+            state
+                .launches
+                .adopt_running(&game.instance, game.identity());
+        }
+        if scan.unverified.iter().any(|g| g.instance == instance_name) {
+            return Err(
+                "Cannot modify resource packs: the launcher cannot verify the game process recorded for this instance"
+                    .to_string(),
+            );
+        }
+        let token = state
+            .launches
+            .begin_edit(instance_name)
+            .map_err(|_| "Cannot modify resource packs while Minecraft is running".to_string())?;
+        Ok(Self {
+            state,
+            instance_name: instance_name.to_string(),
+            token,
+        })
+    }
+}
+
+impl Drop for InstanceConfigGuard<'_> {
+    fn drop(&mut self) {
+        self.state.launches.release(&self.instance_name, self.token);
+    }
+}
+
+#[tauri::command]
+pub async fn cmd_set_resource_pack_enabled(
+    state: State<'_, AppState>,
+    instance_name: String,
+    filename: String,
+    enabled: bool,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    let (data_dir, instances_dir) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (config.data_dir.clone(), config.instances_dir())
+    };
+
+    let _guard = InstanceConfigGuard::acquire(state.inner(), &data_dir, &instance_name)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::set_resource_pack_enabled(&instances_dir, &instance_name, &filename, enabled)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cmd_set_resource_packs_order(
+    state: State<'_, AppState>,
+    instance_name: String,
+    filenames: Vec<String>,
+) -> Result<(), String> {
+    validate_instance_name(&instance_name)?;
+    let (data_dir, instances_dir) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (config.data_dir.clone(), config.instances_dir())
+    };
+
+    let _guard = InstanceConfigGuard::acquire(state.inner(), &data_dir, &instance_name)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        instances::set_resource_packs_order(&instances_dir, &instance_name, &filenames)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub async fn cmd_get_pack_icon(
     state: State<'_, AppState>,
@@ -1079,6 +1172,50 @@ mod instance_name_tests {
             instance_name: instance_name.to_string(),
             _debouncer: debouncer,
         }
+    }
+
+    #[test]
+    fn instance_config_guard_mutually_exclusive_with_running_instances() {
+        let temp = temp_dir("guard_test");
+        let config = crate::AppConfig::default();
+        let state = crate::AppState {
+            config: std::sync::Mutex::new(config),
+            auth_state: std::sync::Mutex::new(crate::auth::AuthState::default()),
+            launches: crate::launch_state::LaunchRegistry::new(),
+            pack_watcher: std::sync::Mutex::new(None),
+            active_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            room_state: std::sync::Arc::new(crate::rooms::room_state::RoomStateManager::new(&temp)),
+            tailscale: crate::rooms::tailscale::TailscaleManager::new(temp.clone()),
+        };
+        let instance = "test_guard_inst";
+
+        // 1. Acquire config guard
+        let guard = super::InstanceConfigGuard::acquire(&state, &temp, instance)
+            .expect("should acquire guard");
+
+        // 2. While guard is held, the instance is reserved (as an edit)
+        assert!(state.launches.is_busy(instance));
+
+        // 3. Trying to acquire a second config guard or launch reservation should fail
+        let second_guard = super::InstanceConfigGuard::acquire(&state, &temp, instance);
+        assert!(
+            second_guard.is_err(),
+            "Second guard must be rejected while first is held"
+        );
+        assert!(
+            state.launches.begin_launch(instance).is_err(),
+            "A launch must not start while the instance is being modified"
+        );
+
+        // 4. Drop guard -> slot is released
+        drop(guard);
+        assert!(!state.launches.is_busy(instance));
+
+        // 5. Now it can be acquired again
+        let re_guard = super::InstanceConfigGuard::acquire(&state, &temp, instance);
+        assert!(re_guard.is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]

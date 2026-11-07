@@ -119,6 +119,7 @@ struct ModScan {
 fn scan_mod_files(
     packs_dir: &std::path::Path,
     is_mods: bool,
+    mc_version: Option<&str>,
     loader: Option<&str>,
     content_type: &str,
 ) -> ModScan {
@@ -194,7 +195,7 @@ fn scan_mod_files(
                 mod_files.push(ModFile {
                     filename,
                     name,
-                    version: sanitize_version(&meta.version),
+                    version: normalize_mod_version(&meta.version, mc_version, loader),
                     hash,
                     provider: ic.provider,
                     project_id: ic.project_id,
@@ -208,15 +209,11 @@ fn scan_mod_files(
                 }
 
                 let (name, version) = read_pack_name_and_version(&path).unwrap_or_else(|| {
-                    (
-                        instances::strip_minecraft_color_codes(
-                            std::path::Path::new(&filename)
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or(&filename),
-                        ),
-                        String::new(),
-                    )
+                    let fallback = match mc_version {
+                        Some(mc) => instances::clean_pack_stem_for_mc(&filename, mc),
+                        None => instances::clean_pack_stem(&filename),
+                    };
+                    (fallback, String::new())
                 });
 
                 let ic = content::InstalledContent::read(packs_dir, &filename, content_type);
@@ -369,10 +366,12 @@ pub async fn cmd_check_mod_updates(
     };
 
     let loader_for_scan = loader.clone();
+    let mc_version_for_scan = mc_version.clone();
     let scan = tokio::task::spawn_blocking(move || {
         scan_mod_files(
             &packs_dir,
             is_mods,
+            mc_version_for_scan.as_deref(),
             loader_for_scan.as_deref(),
             content_type,
         )
@@ -637,7 +636,9 @@ fn read_pack_name_and_version(path: &std::path::Path) -> Option<(String, String)
         }
     }
 
-    // Fallback to pack.mcmeta (name only, no version in standard format)
+    // Fallback to pack.mcmeta's explicit `pack.name` only. In Minecraft
+    // `pack.description` is prose, not a title; using it here made the
+    // Version column show a sentence instead of the pack name.
     if let Ok(file) = std::fs::File::open(path) {
         if let Ok(mut archive) = zip::ZipArchive::new(file) {
             if let Ok(mcmeta_file) = archive.by_name("pack.mcmeta") {
@@ -647,21 +648,9 @@ fn read_pack_name_and_version(path: &std::path::Path) -> Option<(String, String)
                     .collect();
                 if let Ok(content) = String::from_utf8(bytes) {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(name) = json["pack"]
-                            .as_object()
-                            .and_then(|p| p.get("description"))
-                            .and_then(|d| d.as_str())
-                            .or_else(|| {
-                                json["pack"]
-                                    .as_object()
-                                    .and_then(|p| p.get("name"))
-                                    .and_then(|n| n.as_str())
-                            })
-                        {
-                            return Some((
-                                instances::strip_minecraft_color_codes(name),
-                                String::new(),
-                            ));
+                        let (name, _) = instances::read_pack_meta_from_json(&json);
+                        if let Some(name) = name {
+                            return Some((name, String::new()));
                         }
                     }
                 }
@@ -851,6 +840,222 @@ fn local_path_from_uri(uri: &str) -> Result<std::path::PathBuf, String> {
     Ok(std::path::PathBuf::from(rest))
 }
 
+fn local_pack_marker(content_type: &str, name: &str) -> bool {
+    let name = name.trim_start_matches("./").trim_matches('/');
+    match content_type {
+        "resourcepack" => name == "pack.mcmeta",
+        "shader" => {
+            name == "shaderpack.mcmeta" || name == "shaders" || name.starts_with("shaders/")
+        }
+        _ => false,
+    }
+}
+
+/// Inspect a local pack archive. A valid pack has its marker at the ZIP root;
+/// a common bad download wraps everything in one top-level folder. Return that
+/// folder only when the archive can be safely flattened; return `None` for a
+/// valid root and an error for an unusable layout.
+fn local_archive_nested_prefix(
+    path: &std::path::Path,
+    content_type: &str,
+) -> Result<Option<String>, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Cannot open local archive {}: {e}", path.display()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Invalid local archive: {e}"))?;
+    let mut root_ok = false;
+    let mut prefixes = std::collections::BTreeSet::new();
+    let mut root_file = false;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Invalid local archive entry: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        let name = name.trim_start_matches("./");
+        if name.is_empty() {
+            continue;
+        }
+        if local_pack_marker(content_type, name) {
+            root_ok = true;
+            continue;
+        }
+        if let Some((prefix, rest)) = name.split_once('/') {
+            if local_pack_marker(content_type, rest) {
+                prefixes.insert(prefix.to_string());
+            }
+        } else {
+            root_file = true;
+        }
+    }
+    if root_ok {
+        return Ok(None);
+    }
+    if prefixes.len() == 1 && !root_file {
+        return Ok(prefixes.into_iter().next());
+    }
+    Err(format!(
+        "Local {} archive has no {} at its root",
+        content_type,
+        match content_type {
+            "resourcepack" => "pack.mcmeta",
+            "shader" => "shaders/ or shaderpack.mcmeta",
+            _ => "recognized metadata",
+        }
+    ))
+}
+
+fn validate_local_pack_archive(path: &std::path::Path, content_type: &str) -> Result<(), String> {
+    download::verify_zip_magic(path).map_err(|e| e.to_string())?;
+    if content_type == "resourcepack" || content_type == "shader" {
+        if let Some(prefix) = local_archive_nested_prefix(path, content_type)? {
+            repack_archive_under_prefix(path, &prefix)?;
+        }
+    }
+    Ok(())
+}
+
+fn repack_archive_under_prefix(path: &std::path::Path, prefix: &str) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Cannot open local archive {}: {e}", path.display()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Invalid local archive: {e}"))?;
+    let temp = path.with_file_name(format!(
+        ".{}.voidlauncher-normalize.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("archive")
+    ));
+    let _ = std::fs::remove_file(&temp);
+    let out = std::fs::File::create(&temp)
+        .map_err(|e| format!("Cannot create normalized archive: {e}"))?;
+    let mut writer = zip::ZipWriter::new(out);
+    let options = zip::write::SimpleFileOptions::default();
+    let expected = format!("{prefix}/");
+    let mut copied = false;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Invalid local archive entry: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        let Some(relative) = name.strip_prefix(&expected) else {
+            continue;
+        };
+        if relative.is_empty() || download::is_unsafe_archive_path(relative) {
+            let _ = std::fs::remove_file(&temp);
+            return Err("Local archive contains an unsafe path".to_string());
+        }
+        writer
+            .start_file(relative, options)
+            .map_err(|e| format!("Cannot normalize archive: {e}"))?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = entry
+                .read(&mut buf)
+                .map_err(|e| format!("Cannot read local archive: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| format!("Cannot write normalized archive: {e}"))?;
+        }
+        copied = true;
+    }
+    if !copied {
+        let _ = std::fs::remove_file(&temp);
+        return Err("Local archive has no files at its root".to_string());
+    }
+    if let Err(e) = writer.finish() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("Cannot finish normalized archive: {e}"));
+    }
+    drop(archive);
+    std::fs::rename(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("Cannot replace local archive: {e}")
+    })
+}
+
+fn local_directory_has_marker(path: &std::path::Path, content_type: &str) -> bool {
+    match content_type {
+        "resourcepack" => path.join("pack.mcmeta").is_file(),
+        "shader" => path.join("shaderpack.mcmeta").is_file() || path.join("shaders").is_dir(),
+        _ => false,
+    }
+}
+
+fn local_directory_root(
+    source: &std::path::Path,
+    content_type: &str,
+) -> Result<std::path::PathBuf, String> {
+    if local_directory_has_marker(source, content_type) {
+        return Ok(source.to_path_buf());
+    }
+    let mut candidates = Vec::new();
+    let entries = std::fs::read_dir(source)
+        .map_err(|e| format!("Cannot read local directory {}: {e}", source.display()))?;
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            && local_directory_has_marker(&entry.path(), content_type)
+        {
+            candidates.push(entry.path());
+        }
+    }
+    if candidates.len() == 1 {
+        Ok(candidates.remove(0))
+    } else {
+        Err(format!(
+            "Local {content_type} folder has no {} at its root",
+            if content_type == "resourcepack" {
+                "pack.mcmeta"
+            } else {
+                "shaders/ or shaderpack.mcmeta"
+            }
+        ))
+    }
+}
+
+fn remove_local_path(path: &std::path::Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn copy_local_directory(source: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest).map_err(|e| format!("Cannot create {}: {e}", dest.display()))?;
+    let entries =
+        std::fs::read_dir(source).map_err(|e| format!("Cannot read {}: {e}", source.display()))?;
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Cannot inspect {}: {e}", from.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "Local content contains a symbolic link, refusing to copy: {}",
+                from.display()
+            ));
+        }
+        if file_type.is_dir() {
+            copy_local_directory(&from, &to)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&from, &to)
+                .map_err(|e| format!("Cannot copy {} to {}: {e}", from.display(), to.display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_install_mod(
@@ -908,26 +1113,113 @@ pub async fn cmd_install_mod(
     // remote downloads.
     if provider == "local" {
         let local_path = local_path_from_uri(&download_url)?;
+        let content_type = content::content_type_for_dir(&safe_subfolder);
+
+        // A resource/shader pack may be a folder (Resourcify and manual
+        // unpacked packs do this). Copy the folder itself, flattening one
+        // accidental wrapper directory when it is the only content.
+        if local_path.is_dir() {
+            if safe_subfolder == "mods" {
+                return Err("Mod files must be .jar archives, not folders".to_string());
+            }
+            let root = local_directory_root(&local_path, content_type)?;
+            if dest.exists() && dest.canonicalize().ok() == local_path.canonicalize().ok() {
+                // Already present at the target path: this is a no-op, not an
+                // error (Resourcify downloads directly into resourcepacks and
+                // the user may pick that same folder).
+                return Ok(safe_name);
+            }
+            if local_path.starts_with(&content_dir) || content_dir.starts_with(&local_path) {
+                return Err(
+                    "The selected folder is already inside this content directory".to_string(),
+                );
+            }
+            let staging = content_dir.join(format!(".{safe_name}.importing"));
+            let old = content_dir.join(format!(".{safe_name}.old"));
+            remove_local_path(&staging);
+            remove_local_path(&old);
+            if let Err(e) = copy_local_directory(&root, &staging) {
+                remove_local_path(&staging);
+                return Err(e);
+            }
+            let had_old = dest.exists();
+            if had_old && std::fs::rename(&dest, &old).is_err() {
+                remove_local_path(&staging);
+                return Err(format!(
+                    "Cannot replace existing content: {}",
+                    dest.display()
+                ));
+            }
+            if let Err(e) = std::fs::rename(&staging, &dest) {
+                if had_old {
+                    let _ = std::fs::rename(&old, &dest);
+                }
+                remove_local_path(&staging);
+                return Err(format!("Cannot install folder: {e}"));
+            }
+            if had_old {
+                remove_local_path(&old);
+            }
+            let _ = content::write_sidecar(
+                &content_dir,
+                &safe_name,
+                &content::SidecarWrite {
+                    provider: "local",
+                    content_type,
+                    project_id: None,
+                    project_name: None,
+                    version_id: None,
+                    version_number: None,
+                    file_id: None,
+                    hash: None,
+                },
+            );
+            return Ok(safe_name);
+        }
         if !local_path.is_file() {
             return Err(format!("Local file not found: {}", local_path.display()));
         }
-        std::fs::copy(&local_path, &dest).map_err(|e| e.to_string())?;
+        // Replacing a disabled file must keep it disabled.
+        let final_name = if content_dir.join(format!("{safe_name}.disabled")).is_file() {
+            format!("{safe_name}.disabled")
+        } else {
+            safe_name.clone()
+        };
+        let dest = content_dir.join(&final_name);
+        if dest.exists() && dest.canonicalize().ok() == local_path.canonicalize().ok() {
+            // Already downloaded into this content folder (Resourcify does
+            // exactly that). Validate/normalize it in place and report success
+            // instead of copying a file onto itself.
+            validate_local_pack_archive(&dest, content_type)?;
+            return Ok(final_name);
+        }
+        if local_path.starts_with(&content_dir) {
+            return Err("The selected file is already inside this content directory".to_string());
+        }
+        // Preserve the existing file while the replacement is validated.
+        let stashed = crate::instances::stash_old_content_files(&content_dir, &final_name)?;
+        std::fs::copy(&local_path, &dest).map_err(|e| {
+            crate::instances::restore_stashed_files(&stashed);
+            e.to_string()
+        })?;
         // Reject non-archives (a picked .txt renamed to .jar, a truncated
         // file) and do not leave the bad copy behind: it would show up in
         // the mods list as a broken entry forever.
-        if let Err(e) = download::verify_zip_magic(&dest) {
+        if let Err(e) = validate_local_pack_archive(&dest, content_type) {
             let _ = std::fs::remove_file(&dest);
-            return Err(e.to_string());
+            crate::instances::restore_stashed_files(&stashed);
+            return Err(e);
         }
+        crate::instances::discard_stashed_files(&stashed);
         // Unified sidecar so the Source column shows Local instead of a
-        // loader name from jar metadata (no project — nothing to update).
+        // loader name from jar metadata (no project - nothing to update).
         let hash = download::hash_file_sha1(&dest).ok();
         let _ = content::write_sidecar(
             &content_dir,
-            &safe_name,
+            &final_name,
             &content::SidecarWrite {
                 provider: "local",
-                content_type: content::content_type_for_dir(&safe_subfolder),
+                content_type,
                 project_id: None,
                 project_name: None,
                 version_id: None,
@@ -936,7 +1228,7 @@ pub async fn cmd_install_mod(
                 hash: hash.as_deref(),
             },
         );
-        return Ok(safe_name);
+        return Ok(final_name);
     }
 
     // Validate the URL is HTTPS and points to a known Modrinth / CurseForge CDN.
@@ -1470,7 +1762,7 @@ static META_CACHE_FILE: OnceLock<PathBuf> = OnceLock::new();
 /// Bump when jar parsing changes in a way that alters stored values:
 /// persisted entries are keyed only by path+mtime+size and would otherwise
 /// survive a parser change with stale results.
-const META_CACHE_VERSION: u32 = 4;
+const META_CACHE_VERSION: u32 = 5;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MetaCacheFile {
@@ -1689,6 +1981,13 @@ pub(crate) fn get_mod_metadata(
     if !mods_dir.exists() {
         return Ok(Vec::new());
     }
+    let mc_version = instance.mc_version.clone();
+    let loader = match &instance.loader {
+        instances::LoaderType::Fabric => Some("fabric"),
+        instances::LoaderType::Forge => Some("forge"),
+        instances::LoaderType::NeoForge => Some("neoforge"),
+        instances::LoaderType::Vanilla => None,
+    };
     // Roll back any file parked by an interrupted update before scanning —
     // otherwise the mod stays invisible (a parked name is not a .jar and is
     // skipped by this listing) until some other screen happens to recover it.
@@ -1784,6 +2083,7 @@ pub(crate) fn get_mod_metadata(
             .collect();
         let mods_dir_ref = &mods_dir;
         let project_names_ref = &project_names;
+        let mc_version_ref = &mc_version;
         std::thread::scope(|scope| {
             let handles: Vec<_> = start_indices
                 .iter()
@@ -1801,6 +2101,8 @@ pub(crate) fn get_mod_metadata(
                                         mods_dir_ref,
                                         pw_index,
                                         project_names_ref,
+                                        Some(mc_version_ref.as_str()),
+                                        loader,
                                         f,
                                     ),
                                 )
@@ -1818,7 +2120,14 @@ pub(crate) fn get_mod_metadata(
             .map(|(k, f)| {
                 (
                     k,
-                    build_mod_metadata(&mods_dir, &pw_index, &project_names, f),
+                    build_mod_metadata(
+                        &mods_dir,
+                        &pw_index,
+                        &project_names,
+                        Some(mc_version.as_str()),
+                        loader,
+                        f,
+                    ),
                 )
             })
             .collect()]
@@ -1865,6 +2174,8 @@ fn build_mod_metadata(
     mods_dir: &std::path::Path,
     pw_index: &std::collections::HashMap<String, instances::PackwizMeta>,
     project_names: &ProjectNameCache,
+    mc_version: Option<&str>,
+    loader: Option<&str>,
     f: &ModFileEntry,
 ) -> ModMetadata {
     let ModFileEntry {
@@ -1924,7 +2235,7 @@ fn build_mod_metadata(
     // (fabric.mod.json / mods.toml), not the provider's version name, the
     // packwiz metadata or a number guessed from the file name. "${version}"
     // and "Unknown" are build placeholders, not real versions.
-    let version = sanitize_version(&meta.version);
+    let version = normalize_mod_version(&meta.version, mc_version, loader);
     ModMetadata {
         filename: filename.clone(),
         name,
@@ -1980,6 +2291,58 @@ fn sanitize_version(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Remove only *known technical* tokens from a displayed mod version:
+/// an exact leading/trailing instance Minecraft version and the instance
+/// loader suffix. This is deliberately conservative: arbitrary suffixes,
+/// digits and dots are never stripped, because they may be the real version.
+fn normalize_mod_version(raw: &str, mc_version: Option<&str>, loader: Option<&str>) -> String {
+    let mut version = sanitize_version(raw);
+    if version.is_empty() {
+        return version;
+    }
+
+    if let Some(mc) = mc_version.map(str::trim).filter(|v| !v.is_empty()) {
+        // `1.20.1-1.5.2` -> `1.5.2` (only when the remainder is version-like).
+        if let Some(rest) = version.strip_prefix(mc) {
+            if let Some(rest) = rest
+                .strip_prefix(['-', '_', '+'])
+                .filter(|r| matches!(r.chars().next(), Some(c) if c.is_ascii_digit() || c == 'v' || c == 'V'))
+            {
+                version = rest.to_string();
+            }
+        }
+        // `1.4.8+1.21.1` / `1.4.8-1.21.1` -> `1.4.8`.
+        for separator in ['+', '-', '_'] {
+            let suffix = format!("{separator}{mc}");
+            if version.len() > suffix.len() && version.ends_with(&suffix) {
+                let rest =
+                    version[..version.len() - suffix.len()].trim_end_matches(['+', '-', '_', ' ']);
+                if !rest.is_empty() {
+                    version = rest.to_string();
+                }
+                break;
+            }
+        }
+    }
+
+    if let Some(loader) = loader.map(str::trim).filter(|v| !v.is_empty()) {
+        let lower = version.to_ascii_lowercase();
+        for separator in ['-', '+', '_', ' '] {
+            let suffix = format!("{separator}{}", loader.to_ascii_lowercase());
+            if version.len() > suffix.len() && lower.ends_with(&suffix) {
+                let rest =
+                    version[..version.len() - suffix.len()].trim_end_matches(['+', '-', '_', ' ']);
+                if !rest.is_empty() {
+                    version = rest.to_string();
+                }
+                break;
+            }
+        }
+    }
+
+    sanitize_version(&version)
 }
 
 /// Whether a JAR-declared version is concrete enough to stop looking at other
@@ -2924,6 +3287,8 @@ version="1.0.0"
             &dir,
             &pw,
             &ProjectNameCache::new(),
+            Some("1.21.1"),
+            Some("fabric"),
             &ModFileEntry {
                 path: jar,
                 filename: filename.into(),
@@ -2933,10 +3298,141 @@ version="1.0.0"
             },
         );
 
-        assert_eq!(meta.version, "1.4.8+1.21.1");
+        assert_eq!(meta.version, "1.4.8");
         assert_eq!(meta.provider, "Modrinth");
         assert_eq!(meta.name, "Sound Physics Remastered");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_file_uri_accepts_windows_paths_and_rejects_remote_urls() {
+        assert_eq!(
+            local_path_from_uri(r"file://C:\Temp\mod.jar").unwrap(),
+            std::path::PathBuf::from(r"C:\Temp\mod.jar")
+        );
+        assert_eq!(
+            local_path_from_uri("file:///C:/Temp/mod.jar").unwrap(),
+            std::path::PathBuf::from("C:/Temp/mod.jar")
+        );
+        assert!(local_path_from_uri("https://example.com/mod.jar").is_err());
+        assert!(local_path_from_uri("file://").is_err());
+    }
+
+    #[test]
+    fn pack_description_is_not_used_as_a_title() {
+        let dir = test_dir("pack-description-title");
+        let zip_path = dir.join("Faithful 32x - 26.3.zip");
+        write_jar(
+            &zip_path,
+            &[(
+                "pack.mcmeta",
+                r#"{"pack":{"pack_format":15,"description":"A long descriptive sentence"}}"#,
+            )],
+        );
+
+        // The caller must fall back to the cleaned filename, not the prose
+        // description, when pack.mcmeta has no explicit pack.name.
+        assert!(read_pack_name_and_version(&zip_path).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_resourcepack_nested_folder_is_flattened() {
+        let dir = test_dir("nested-resourcepack");
+        let zip_path = dir.join("wrapped.zip");
+        write_jar(
+            &zip_path,
+            &[
+                ("Wrapped/pack.mcmeta", r#"{"pack":{"pack_format":15}}"#),
+                ("Wrapped/pack.png", "png"),
+            ],
+        );
+
+        assert_eq!(
+            local_archive_nested_prefix(&zip_path, "resourcepack").unwrap(),
+            Some("Wrapped".to_string())
+        );
+        repack_archive_under_prefix(&zip_path, "Wrapped").unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert!(archive.by_name("pack.mcmeta").is_ok());
+        assert!(archive.by_name("pack.png").is_ok());
+        assert!(archive.by_name("Wrapped/pack.mcmeta").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_pack_directory_flattens_one_wrapper_folder() {
+        let dir = test_dir("nested-resourcepack-dir");
+        let source = dir.join("source");
+        let wrapper = source.join("Wrapped");
+        std::fs::create_dir_all(wrapper.join("assets")).unwrap();
+        std::fs::write(
+            wrapper.join("pack.mcmeta"),
+            r#"{"pack":{"pack_format":15}}"#,
+        )
+        .unwrap();
+        std::fs::write(wrapper.join("assets/icon.txt"), "x").unwrap();
+
+        let root = local_directory_root(&source, "resourcepack").unwrap();
+        assert_eq!(root, wrapper);
+        let dest = dir.join("dest");
+        copy_local_directory(&root, &dest).unwrap();
+        assert!(dest.join("pack.mcmeta").is_file());
+        assert!(dest.join("assets/icon.txt").is_file());
+        assert!(!dest.join("Wrapped").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_pack_validation_rejects_archives_without_root_marker() {
+        let dir = test_dir("bad-resourcepack");
+        let zip_path = dir.join("bad.zip");
+        write_jar(&zip_path, &[("assets/foo.txt", "x")]);
+
+        assert!(local_archive_nested_prefix(&zip_path, "resourcepack").is_err());
+        let valid = dir.join("valid.zip");
+        write_jar(&valid, &[("pack.mcmeta", r#"{"pack":{"pack_format":15}}"#)]);
+        assert_eq!(
+            local_archive_nested_prefix(&valid, "resourcepack").unwrap(),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mod_version_strips_only_known_mc_and_loader_tokens() {
+        assert_eq!(
+            normalize_mod_version("1.4.8+1.21.1", Some("1.21.1"), Some("fabric")),
+            "1.4.8"
+        );
+        assert_eq!(
+            normalize_mod_version("1.20.1-1.5.2-neoforge", Some("1.20.1"), Some("neoforge")),
+            "1.5.2"
+        );
+        assert_eq!(
+            normalize_mod_version("1.0.7+forge", Some("1.20.1"), Some("forge")),
+            "1.0.7"
+        );
+        // Different MC/loader: the text may be a genuine version component.
+        assert_eq!(
+            normalize_mod_version("1.4.8+1.21.1", Some("1.20.1"), Some("forge")),
+            "1.4.8+1.21.1"
+        );
+        assert_eq!(
+            normalize_mod_version("1.2.3-beta", Some("1.20.1"), Some("fabric")),
+            "1.2.3-beta"
+        );
+        assert_eq!(
+            normalize_mod_version("1.21.1", Some("1.21.1"), Some("fabric")),
+            "1.21.1",
+            "a version equal to the MC version is not a technical suffix"
+        );
     }
 
     #[test]
@@ -2963,6 +3459,8 @@ version="1.0.0"
             &dir,
             &pw,
             &ProjectNameCache::new(),
+            Some("26.3"),
+            Some("fabric"),
             &ModFileEntry {
                 path: jar,
                 filename: filename.into(),

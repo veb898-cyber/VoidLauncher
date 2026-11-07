@@ -718,13 +718,39 @@ pub fn delete_screenshot(instances_dir: &Path, instance_name: &str, filename: &s
 /// List resource packs or shader packs (returns entries without icon - fetch via cmd_get_pack_icon)
 pub fn list_packs(instances_dir: &Path, name: &str, pack_type: &str) -> Result<Vec<PackEntry>> {
     let instance = get_instance(instances_dir, name)?;
-    let packs_dir = instance.minecraft_dir(instances_dir).join(pack_type);
+    let mc_dir = instance.minecraft_dir(instances_dir);
+    let packs_dir = mc_dir.join(pack_type);
     let mut packs = Vec::new();
     if !packs_dir.exists() {
         return Ok(packs);
     }
     // Roll back any file parked by an interrupted update before listing.
     recover_stashed_content_files(&packs_dir);
+
+    // Auto-migration for resource packs: un-rename any *.disabled back to *.zip
+    // without activating them in options.txt, preserving disabled state cleanly.
+    if pack_type == "resourcepacks" {
+        if let Ok(entries) = std::fs::read_dir(&packs_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if let Some(clean) = fname.strip_suffix(".disabled") {
+                    let target = packs_dir.join(clean);
+                    if !target.exists() {
+                        let _ = std::fs::rename(&p, target);
+                    }
+                }
+            }
+        }
+    }
+
+    let active_resource_packs = if pack_type == "resourcepacks" {
+        let options_path = mc_dir.join("options.txt");
+        read_options_resource_packs(&options_path).0
+    } else {
+        Vec::new()
+    };
+
     // Load Prism metadata once for the whole listing (was re-read per file).
     let packwiz = load_packwiz_index_cached(&packs_dir);
     for entry in std::fs::read_dir(&packs_dir)? {
@@ -760,24 +786,34 @@ pub fn list_packs(instances_dir: &Path, name: &str, pack_type: &str) -> Result<V
         // or pack.mcmeta's pack_format, which are not the pack's own version.
         let (provider, version, project_id, project_name) =
             read_pack_sidecar(&path, &packwiz).unwrap_or_default();
-        // Name resolution: sidecar project_name > pack.mcmeta pack.name/description > filename
-        let name = if !project_name.is_empty() {
-            Some(project_name)
+
+        let (explicit_name, pack_desc) = if is_dir {
+            read_pack_meta_from_dir(&path)
         } else {
-            if is_dir {
-                read_pack_name_from_dir(&path)
-            } else {
-                read_pack_name_from_zip(&path)
-            }
-        }
-        .unwrap_or_else(|| {
-            let stem = Path::new(&filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&filename);
-            let stem = stem.strip_suffix(".disabled").unwrap_or(stem);
-            strip_minecraft_color_codes(stem)
-        });
+            read_pack_meta_from_zip(&path)
+        };
+
+        // Name resolution priority:
+        // 1. Sidecar project_name (Modrinth/CurseForge display name)
+        // 2. Explicit pack.name in pack.mcmeta (if provided)
+        // 3. Clean filename stem without .zip/.disabled
+        // Note: pack.description is NEVER used as the pack's name.
+        let name = if !project_name.is_empty() {
+            project_name
+        } else if let Some(n) = explicit_name {
+            n
+        } else {
+            clean_pack_stem_for_mc(&filename, &instance.mc_version)
+        };
+
+        let description = pack_desc.unwrap_or_default();
+
+        let enabled = if pack_type == "resourcepacks" {
+            is_pack_enabled_in_list(&filename, &active_resource_packs)
+        } else {
+            !filename.ends_with(".disabled")
+        };
+
         packs.push(PackEntry {
             filename,
             name,
@@ -786,10 +822,323 @@ pub fn list_packs(instances_dir: &Path, name: &str, pack_type: &str) -> Result<V
             provider,
             version,
             project_id,
+            description,
+            enabled,
         });
     }
-    packs.sort_by(|a, b| a.name.cmp(&b.name));
+    if pack_type == "resourcepacks" {
+        // options.txt stores resource packs from lowest to highest priority;
+        // the game UI (and this list) shows the highest priority first.
+        packs.sort_by(|a, b| {
+            let pa = active_resource_pack_priority(&a.filename, &active_resource_packs);
+            let pb = active_resource_pack_priority(&b.filename, &active_resource_packs);
+            match (pa, pb) {
+                (Some(pa), Some(pb)) => pb.cmp(&pa).then_with(|| a.name.cmp(&b.name)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.cmp(&b.name),
+            }
+        });
+    } else {
+        packs.sort_by(|a, b| a.name.cmp(&b.name));
+    }
     Ok(packs)
+}
+
+/// Position of `filename` in the active resource-pack list (0 = lowest
+/// priority). Returns `None` for a pack that is not active.
+fn active_resource_pack_priority(filename: &str, active: &[String]) -> Option<usize> {
+    let clean = filename.strip_suffix(".disabled").unwrap_or(filename);
+    active.iter().position(|id| {
+        let id = id.strip_prefix("file/").unwrap_or(id);
+        id == clean
+    })
+}
+
+/// Write file contents atomically with retry and safe rollback on Windows.
+/// Ensures the target file is never left truncated or missing if replacement fails.
+fn atomic_write_file_impl<R>(target: &Path, content: &str, mut rename_fn: R) -> std::io::Result<()>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = target.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+
+    let mut last_err = None;
+    // 1. Direct atomic replace
+    for _ in 0..5 {
+        match rename_fn(&tmp, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+
+    // 2. Safe fallback:
+    // If target exists, move target -> old, move tmp -> target, then delete old.
+    // If moving tmp -> target fails, immediately restore old -> target so original is untouched.
+    if target.exists() {
+        let old = target.with_extension("old");
+        let _ = std::fs::remove_file(&old);
+        if rename_fn(target, &old).is_ok() {
+            if rename_fn(&tmp, target).is_ok() {
+                let _ = std::fs::remove_file(&old);
+                return Ok(());
+            } else {
+                let _ = rename_fn(&old, target);
+                let _ = std::fs::remove_file(&tmp);
+                return Err(last_err
+                    .unwrap_or_else(|| std::io::Error::other("Failed to replace target file")));
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&tmp);
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("Failed to atomically write file")))
+}
+
+pub(crate) fn atomic_write_file(target: &Path, content: &str) -> std::io::Result<()> {
+    atomic_write_file_impl(target, content, |from, to| std::fs::rename(from, to))
+}
+
+/// Read active resource packs from options.txt.
+/// Returns (active_pack_identifiers, line_ending).
+pub fn read_options_resource_packs(path: &Path) -> (Vec<String>, String) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return (Vec::new(), "\n".to_string());
+    };
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+    .to_string();
+    for line in content.lines() {
+        if let Some(val_str) = line.strip_prefix("resourcePacks:") {
+            if let Ok(packs) = serde_json::from_str::<Vec<String>>(val_str.trim()) {
+                return (packs, line_ending);
+            }
+        }
+    }
+    (Vec::new(), line_ending)
+}
+
+/// Check if a pack filename is active in the given list of identifiers.
+pub fn is_pack_enabled_in_list(filename: &str, active_packs: &[String]) -> bool {
+    let clean_target = filename.strip_suffix(".disabled").unwrap_or(filename);
+    active_packs.iter().any(|id| {
+        if id == clean_target {
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("file/") {
+            if rest == clean_target {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Modify options.txt to enable or disable a resource pack.
+pub fn set_options_resource_pack_enabled(path: &Path, filename: &str, enabled: bool) -> Result<()> {
+    let clean_target = filename.strip_suffix(".disabled").unwrap_or(filename);
+    if clean_target.is_empty() || clean_target.contains(['/', '\\']) {
+        return Err(LauncherError::Instance(
+            "Invalid resource pack filename".to_string(),
+        ));
+    }
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    let mut lines: Vec<String> = if content.is_empty() {
+        Vec::new()
+    } else {
+        content.lines().map(|s| s.to_string()).collect()
+    };
+
+    let mut pack_line_idx = None;
+    let mut current_packs: Vec<String> = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(val_str) = line.strip_prefix("resourcePacks:") {
+            pack_line_idx = Some(idx);
+            if let Ok(packs) = serde_json::from_str::<Vec<String>>(val_str.trim()) {
+                current_packs = packs;
+            }
+            break;
+        }
+    }
+
+    if current_packs.is_empty() && pack_line_idx.is_none() {
+        current_packs.push("vanilla".to_string());
+    }
+
+    if enabled {
+        let is_already_enabled = current_packs.iter().any(|id| {
+            id == clean_target || id.strip_prefix("file/").is_some_and(|s| s == clean_target)
+        });
+        if !is_already_enabled {
+            current_packs.push(format!("file/{}", clean_target));
+        }
+    } else {
+        current_packs.retain(|id| {
+            let is_match =
+                id == clean_target || id.strip_prefix("file/").is_some_and(|s| s == clean_target);
+            !is_match
+        });
+    }
+
+    let json_packs = serde_json::to_string(&current_packs).map_err(|e| {
+        LauncherError::Instance(format!("Failed to serialize resource packs: {}", e))
+    })?;
+    let new_pack_line = format!("resourcePacks:{}", json_packs);
+
+    if let Some(idx) = pack_line_idx {
+        lines[idx] = new_pack_line;
+    } else {
+        lines.push(new_pack_line);
+    }
+
+    let mut new_content = lines.join(line_ending);
+    new_content.push_str(line_ending);
+
+    if path.exists() {
+        let bak_path = path.with_extension("txt.bak");
+        let _ = std::fs::copy(path, bak_path);
+    }
+
+    atomic_write_file(path, &new_content)
+        .map_err(|e| LauncherError::Instance(format!("Failed to write options.txt: {}", e)))
+}
+
+/// Reorder the active resource packs in options.txt.
+///
+/// `filenames` follows the on-disk contract: lowest priority first, highest
+/// priority last (the UI shows the reverse order and reverses it before
+/// calling). Only packs that are already active are touched: a name that is
+/// currently disabled is ignored instead of being silently enabled. Non-file
+/// system packs (`vanilla`, `mod_resources`, ...) keep their order.
+pub fn set_options_resource_packs_order(path: &Path, filenames: &[String]) -> Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    let mut lines: Vec<String> = if content.is_empty() {
+        Vec::new()
+    } else {
+        content.lines().map(|s| s.to_string()).collect()
+    };
+
+    let mut pack_line_idx = None;
+    let mut current_packs: Vec<String> = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(val_str) = line.strip_prefix("resourcePacks:") {
+            pack_line_idx = Some(idx);
+            if let Ok(packs) = serde_json::from_str::<Vec<String>>(val_str.trim()) {
+                current_packs = packs;
+            }
+            break;
+        }
+    }
+
+    // Nothing to reorder and no line to preserve: never invent an empty
+    // resource-pack list for an instance whose options.txt is absent.
+    if pack_line_idx.is_none() && current_packs.is_empty() {
+        return Ok(());
+    }
+
+    let mut system_packs = Vec::new();
+    let mut active_files: Vec<(String, String)> = Vec::new();
+    for id in current_packs {
+        if let Some(clean) = id.strip_prefix("file/") {
+            active_files.push((clean.to_string(), id));
+        } else {
+            system_packs.push(id);
+        }
+    }
+
+    let mut ordered_files = Vec::new();
+    let mut used = vec![false; active_files.len()];
+    for filename in filenames {
+        let clean = filename.strip_suffix(".disabled").unwrap_or(filename);
+        if clean.is_empty() || clean.contains(['/', '\\']) {
+            return Err(LauncherError::Instance(
+                "Invalid resource pack filename".to_string(),
+            ));
+        }
+        if let Some(pos) = active_files.iter().position(|(name, _)| name == clean) {
+            if !used[pos] {
+                used[pos] = true;
+                ordered_files.push(active_files[pos].1.clone());
+            }
+        }
+    }
+    // An active pack omitted from the request is kept: the command reorders,
+    // it does not enable or disable packs as a side effect.
+    for (pos, (_, id)) in active_files.iter().enumerate() {
+        if !used[pos] {
+            ordered_files.push(id.clone());
+        }
+    }
+
+    let mut new_packs = system_packs;
+    new_packs.extend(ordered_files);
+
+    let json_packs = serde_json::to_string(&new_packs).map_err(|e| {
+        LauncherError::Instance(format!("Failed to serialize resource packs: {}", e))
+    })?;
+    let new_pack_line = format!("resourcePacks:{}", json_packs);
+
+    if let Some(idx) = pack_line_idx {
+        lines[idx] = new_pack_line;
+    } else {
+        lines.push(new_pack_line);
+    }
+
+    let mut new_content = lines.join(line_ending);
+    new_content.push_str(line_ending);
+
+    if path.exists() {
+        let bak_path = path.with_extension("txt.bak");
+        let _ = std::fs::copy(path, bak_path);
+    }
+
+    atomic_write_file(path, &new_content)
+        .map_err(|e| LauncherError::Instance(format!("Failed to write options.txt: {}", e)))
+}
+
+pub fn set_resource_pack_enabled(
+    instances_dir: &Path,
+    instance_name: &str,
+    filename: &str,
+    enabled: bool,
+) -> Result<()> {
+    let instance = get_instance(instances_dir, instance_name)?;
+    let options_path = instance.minecraft_dir(instances_dir).join("options.txt");
+    set_options_resource_pack_enabled(&options_path, filename, enabled)
+}
+
+pub fn set_resource_packs_order(
+    instances_dir: &Path,
+    instance_name: &str,
+    filenames: &[String],
+) -> Result<()> {
+    let instance = get_instance(instances_dir, instance_name)?;
+    let options_path = instance.minecraft_dir(instances_dir).join("options.txt");
+    set_options_resource_packs_order(&options_path, filenames)
 }
 
 /// Read the icon for a single pack (mirrors mod icon approach)
@@ -1051,7 +1400,7 @@ fn packwiz_index_stamp(content_dir: &Path) -> u64 {
 /// Cached variant used by the content listings. `list_packs` alone calls
 /// `read_pack_sidecar` once per file; without this cache every file re-read and
 /// re-parsed the whole `.index/` directory (O(N²) on large Prism packs).
-fn load_packwiz_index_cached(content_dir: &Path) -> HashMap<String, PackwizMeta> {
+pub(crate) fn load_packwiz_index_cached(content_dir: &Path) -> HashMap<String, PackwizMeta> {
     let stamp = packwiz_index_stamp(content_dir);
     let cache = PACKWIZ_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock() {
@@ -1122,6 +1471,13 @@ pub(crate) fn load_packwiz_index(content_dir: &Path) -> HashMap<String, PackwizM
             {
                 meta.version = ver.to_string();
             } else if let Some(ver) = v.get("version").and_then(|n| n.as_str()) {
+                meta.version = ver.to_string();
+            } else if let Some(ver) = v
+                .get("update")
+                .and_then(|u| u.get("modrinth"))
+                .and_then(|m| m.get("version"))
+                .and_then(|m| m.as_str())
+            {
                 meta.version = ver.to_string();
             }
             if let Some(pid) = v
@@ -1495,6 +1851,14 @@ pub struct PackEntry {
     pub version: String,
     #[serde(default)]
     pub project_id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_pack_enabled")]
+    pub enabled: bool,
+}
+
+fn default_pack_enabled() -> bool {
+    true
 }
 
 fn read_pack_icon_from_dir(path: &std::path::Path) -> Option<String> {
@@ -1595,69 +1959,146 @@ fn try_read_zip_image<R: std::io::Read + std::io::Seek>(
     Some(format!("data:{};base64,{}", mime, base64_encode(&buf)))
 }
 
-fn extract_pack_name_from_json(json: &serde_json::Value) -> Option<String> {
-    // Prefer pack.name (human-readable) over pack.description (often an internal identifier).
-    let raw = extract_text_field(&json["pack"]["name"])
-        .or_else(|| extract_text_field(&json["pack"]["description"]))?;
+/// Extract a clean stem name from a pack filename, properly stripping `.disabled`
+/// before stripping archive extensions (`.zip` / `.jar`) and removing Minecraft color codes.
+pub(crate) fn clean_pack_stem(filename: &str) -> String {
+    let mut s = filename;
+    if let Some(without_disabled) = s.strip_suffix(".disabled") {
+        s = without_disabled;
+    }
+    if let Some(without_zip) = s.strip_suffix(".zip") {
+        s = without_zip;
+    } else if let Some(without_jar) = s.strip_suffix(".jar") {
+        s = without_jar;
+    }
+    strip_minecraft_color_codes(s).trim().to_string()
+}
 
-    let stripped = strip_minecraft_color_codes(&raw);
-    // Strip common HTML tags used in descriptions
+/// Filename fallback for a pack title. Metadata (`pack.name` / sidecar) still
+/// wins; when only the filename exists, drop an exact trailing instance
+/// Minecraft-version suffix such as `"Faithful 32x - 26.3"`. Only the current
+/// instance version is removed, so a genuine version in the pack name stays.
+pub(crate) fn clean_pack_stem_for_mc(filename: &str, mc_version: &str) -> String {
+    let stem = clean_pack_stem(filename);
+    strip_mc_version_suffix(&stem, mc_version).unwrap_or(stem)
+}
+
+fn strip_mc_version_suffix(stem: &str, mc_version: &str) -> Option<String> {
+    let mc_version = mc_version.trim();
+    if mc_version.is_empty() {
+        return None;
+    }
+    for suffix in [
+        format!(" - {mc_version}"),
+        format!(" ({mc_version})"),
+        format!(" [{mc_version}]"),
+        format!("_{mc_version}"),
+        format!("-{mc_version}"),
+    ] {
+        if let Some(rest) = stem.strip_suffix(&suffix) {
+            let rest = rest.trim_end_matches([' ', '-', '_']).trim();
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Recursively extract text from Minecraft JSON text components (strings, objects with "text" / "extra", or arrays).
+pub(crate) fn extract_minecraft_text(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(s) => {
+            out.push_str(s);
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(text)) = map.get("text") {
+                out.push_str(text);
+            }
+            if let Some(extra) = map.get("extra") {
+                extract_minecraft_text(extra, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                extract_minecraft_text(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse Minecraft text component into clean plain text stripped of color codes and HTML tags.
+pub(crate) fn parse_minecraft_text(value: &serde_json::Value) -> Option<String> {
+    let mut out = String::new();
+    extract_minecraft_text(value, &mut out);
+    let stripped = strip_minecraft_color_codes(&out);
     let clean = stripped
         .replace("<br>", " ")
         .replace("<br/>", " ")
         .replace("</br>", " ");
-    let clean = clean.trim().to_string();
-    if clean.is_empty() {
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
         None
     } else {
-        Some(clean)
+        Some(trimmed.to_string())
     }
 }
 
-/// Extract text from a Minecraft JSON text component (string, object with "text", or array).
-fn extract_text_field(value: &serde_json::Value) -> Option<String> {
-    if let Some(s) = value.as_str() {
-        Some(s.to_string())
-    } else if let Some(obj) = value.as_object() {
-        obj.get("text")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    } else if let Some(arr) = value.as_array() {
-        let mut result = String::new();
-        for item in arr {
-            if let Some(obj) = item.as_object() {
-                if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                    result.push_str(text);
-                }
-            } else if let Some(s) = item.as_str() {
-                result.push_str(s);
-            }
-        }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    } else {
-        None
+/// Read pack explicit name and description from pack.mcmeta JSON.
+///
+/// In Minecraft, `pack.description` is NOT a title/name — it is descriptive text.
+/// `explicit_name` is only returned if `pack.name` is present; otherwise None.
+pub(crate) fn read_pack_meta_from_json(
+    json: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    let pack = &json["pack"];
+    let explicit_name = pack.get("name").and_then(parse_minecraft_text);
+    let description = pack.get("description").and_then(parse_minecraft_text);
+    (explicit_name, description)
+}
+
+fn read_pack_meta_from_dir(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    const MAX_MCMETA_BYTES: u64 = 1024 * 1024;
+    let Ok(mut file) = std::fs::File::open(path.join("pack.mcmeta")) else {
+        return (None, None);
+    };
+    if file.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_MCMETA_BYTES {
+        return (None, None);
     }
+    let mut content = String::new();
+    if std::io::Read::read_to_string(&mut file, &mut content).is_err() {
+        return (None, None);
+    }
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return (None, None);
+    };
+    read_pack_meta_from_json(&json)
 }
 
-fn read_pack_name_from_dir(path: &std::path::Path) -> Option<String> {
-    let content = std::fs::read_to_string(path.join("pack.mcmeta")).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    extract_pack_name_from_json(&json)
-}
-
-fn read_pack_name_from_zip(path: &std::path::Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
-    let mcmeta = archive.by_name("pack.mcmeta").ok()?;
+fn read_pack_meta_from_zip(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return (None, None);
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return (None, None);
+    };
+    let Ok(mcmeta) = archive.by_name("pack.mcmeta") else {
+        return (None, None);
+    };
+    const MAX_MCMETA_BYTES: u64 = 1024 * 1024;
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut std::io::BufReader::new(mcmeta), &mut bytes).ok()?;
-    let content = String::from_utf8(bytes).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    extract_pack_name_from_json(&json)
+    let mut reader = std::io::BufReader::new(mcmeta).take(MAX_MCMETA_BYTES);
+    if std::io::Read::read_to_end(&mut reader, &mut bytes).is_err() {
+        return (None, None);
+    }
+    let Ok(content) = String::from_utf8(bytes) else {
+        return (None, None);
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return (None, None);
+    };
+    read_pack_meta_from_json(&json)
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {
@@ -1685,7 +2126,7 @@ fn read_image_as_base64(path: &std::path::Path) -> Option<String> {
     Some(format!("data:image/png;base64,{}", base64_encode(&buf)))
 }
 
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -3734,6 +4175,27 @@ version = '1.2.3'
         dir
     }
 
+    fn vanilla_instance(name: &str) -> Instance {
+        Instance {
+            name: name.into(),
+            mc_version: "1.20.1".into(),
+            loader: LoaderType::Vanilla,
+            loader_version: None,
+            loader_profile: None,
+            memory_mb: None,
+            jvm_args: None,
+            gc_preset: None,
+            java_path: None,
+            resolution: None,
+            icon: None,
+            banner: None,
+            created_at: Utc::now().to_rfc3339(),
+            last_played: None,
+            play_time_seconds: 0,
+            notes: String::new(),
+        }
+    }
+
     #[test]
     fn delete_screenshot_rejects_path_traversal() {
         let dir = temp_dir("shots");
@@ -4371,7 +4833,8 @@ version = 'hIibTfxn'
 
         let packs = list_packs(&instances_dir, "P", "resourcepacks").unwrap();
         assert_eq!(packs.len(), 1);
-        assert_eq!(packs[0].filename, "Faithful 32x - 26.3.zip.disabled");
+        assert_eq!(packs[0].filename, "Faithful 32x - 26.3.zip");
+        assert!(!packs[0].enabled);
         assert_eq!(packs[0].name, "Faithful 32x");
         assert_eq!(packs[0].version, "26.3");
         assert_eq!(packs[0].provider, "Modrinth");
@@ -5859,6 +6322,517 @@ version = 'hIibTfxn'
         assert_eq!(copy.name, "Copy");
         assert_eq!(copy.mc_version, "1.21.1");
         assert!(instances_dir.join("Source").exists(), "original untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_options_resource_packs_roundtrip_and_preserve_settings() {
+        let dir = temp_dir("options_test");
+        let options_path = dir.join("options.txt");
+
+        let initial_content = "fov:70.0\r\nsoundCategory_master:1.0\r\nresourcePacks:[\"vanilla\",\"mod_resources\"]\r\ngamma:1.0\r\n";
+        std::fs::write(&options_path, initial_content).unwrap();
+
+        // 1. Enable pack
+        set_options_resource_pack_enabled(&options_path, "Faithful.zip", true).unwrap();
+
+        let (packs, _) = read_options_resource_packs(&options_path);
+        assert_eq!(packs, vec!["vanilla", "mod_resources", "file/Faithful.zip"]);
+
+        // Check settings preserved and backup created
+        let new_content = std::fs::read_to_string(&options_path).unwrap();
+        assert!(new_content.contains("fov:70.0"));
+        assert!(new_content.contains("soundCategory_master:1.0"));
+        assert!(new_content.contains("gamma:1.0"));
+
+        let bak_path = dir.join("options.txt.bak");
+        assert!(bak_path.exists());
+        let bak_content = std::fs::read_to_string(&bak_path).unwrap();
+        assert_eq!(bak_content, initial_content);
+
+        // 2. Disable pack
+        set_options_resource_pack_enabled(&options_path, "Faithful.zip", false).unwrap();
+        let (packs_after_disable, _) = read_options_resource_packs(&options_path);
+        assert_eq!(packs_after_disable, vec!["vanilla", "mod_resources"]);
+
+        // 3. Disable with .disabled suffix argument (should also match)
+        set_options_resource_pack_enabled(&options_path, "Faithful.zip", true).unwrap();
+        set_options_resource_pack_enabled(&options_path, "Faithful.zip.disabled", false).unwrap();
+        let (packs_disabled_again, _) = read_options_resource_packs(&options_path);
+        assert_eq!(packs_disabled_again, vec!["vanilla", "mod_resources"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_options_resource_packs_order_preserves_system_packs() {
+        let dir = temp_dir("options_order_test");
+        let options_path = dir.join("options.txt");
+
+        let initial_content =
+            "resourcePacks:[\"vanilla\",\"mod_resources\",\"file/PackA.zip\",\"file/PackB.zip\"]\n";
+        std::fs::write(&options_path, initial_content).unwrap();
+
+        set_options_resource_packs_order(&options_path, &["PackB.zip".into(), "PackA.zip".into()])
+            .unwrap();
+
+        let (packs, _) = read_options_resource_packs(&options_path);
+        assert_eq!(
+            packs,
+            vec![
+                "vanilla",
+                "mod_resources",
+                "file/PackB.zip",
+                "file/PackA.zip"
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_options_resource_packs_order_ignores_inactive_and_duplicate_names() {
+        let dir = temp_dir("options_order_active_only");
+        let options_path = dir.join("options.txt");
+
+        std::fs::write(
+            &options_path,
+            "resourcePacks:[\"vanilla\",\"file/PackA.zip\",\"file/PackB.zip\"]\n",
+        )
+        .unwrap();
+
+        set_options_resource_packs_order(
+            &options_path,
+            &[
+                "Disabled.zip".into(),
+                "PackB.zip".into(),
+                "PackB.zip".into(),
+                "PackA.zip".into(),
+            ],
+        )
+        .unwrap();
+
+        let (packs, _) = read_options_resource_packs(&options_path);
+        assert_eq!(packs, vec!["vanilla", "file/PackB.zip", "file/PackA.zip"]);
+        assert!(
+            !is_pack_enabled_in_list("Disabled.zip", &packs),
+            "a disabled pack must never be enabled by a reorder"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_options_resource_packs_order_keeps_unmentioned_active_packs() {
+        let dir = temp_dir("options_order_keep_unmentioned");
+        let options_path = dir.join("options.txt");
+
+        std::fs::write(
+            &options_path,
+            "resourcePacks:[\"vanilla\",\"file/A.zip\",\"file/B.zip\",\"file/C.zip\"]\n",
+        )
+        .unwrap();
+
+        set_options_resource_packs_order(&options_path, &["C.zip".into()]).unwrap();
+
+        let (packs, _) = read_options_resource_packs(&options_path);
+        assert_eq!(
+            packs,
+            vec!["vanilla", "file/C.zip", "file/A.zip", "file/B.zip"],
+            "an active pack omitted from the request must stay active"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resource_pack_commands_reject_path_separators() {
+        let dir = temp_dir("options_reject_paths");
+        let options_path = dir.join("options.txt");
+        std::fs::write(
+            &options_path,
+            "resourcePacks:[\"vanilla\",\"file/Valid.zip\"]\n",
+        )
+        .unwrap();
+
+        assert!(set_options_resource_pack_enabled(&options_path, "../Evil.zip", true).is_err());
+        assert!(set_options_resource_packs_order(&options_path, &["../Evil.zip".into()]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&options_path).unwrap(),
+            "resourcePacks:[\"vanilla\",\"file/Valid.zip\"]\n",
+            "rejected input must not modify options.txt"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_options_resource_packs_order_does_not_create_missing_options_file() {
+        let dir = temp_dir("options_order_missing");
+        let options_path = dir.join("options.txt");
+
+        set_options_resource_packs_order(&options_path, &["A.zip".into()]).unwrap();
+
+        assert!(
+            !options_path.exists(),
+            "reordering must not invent options.txt"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_packs_resourcepacks_sorted_by_options_priority() {
+        let dir = temp_dir("list_packs_priority");
+        let instances_dir = dir.join("instances");
+        let instance_name = "PriorityTest";
+        save_instance(&instances_dir, &vanilla_instance(instance_name), None).unwrap();
+
+        let mc_dir = instances_dir.join(instance_name).join(".minecraft");
+        let rp_dir = mc_dir.join("resourcepacks");
+        std::fs::create_dir_all(&rp_dir).unwrap();
+        for name in ["A.zip", "B.zip", "C.zip", "D.zip"] {
+            std::fs::write(rp_dir.join(name), b"dummy").unwrap();
+        }
+
+        // options.txt is low -> high priority: B, C, A. D is not active.
+        std::fs::write(
+            mc_dir.join("options.txt"),
+            "resourcePacks:[\"vanilla\",\"file/B.zip\",\"file/C.zip\",\"file/A.zip\"]\n",
+        )
+        .unwrap();
+
+        let packs = list_packs(&instances_dir, instance_name, "resourcepacks").unwrap();
+        let filenames: Vec<&str> = packs.iter().map(|p| p.filename.as_str()).collect();
+        assert_eq!(
+            filenames,
+            vec!["A.zip", "C.zip", "B.zip", "D.zip"],
+            "highest-priority active pack must be listed first"
+        );
+        assert!(packs[0].enabled && packs[1].enabled && packs[2].enabled);
+        assert!(!packs[3].enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_packs_fallback_name_drops_only_instance_mc_suffix() {
+        let dir = temp_dir("list_packs_mc_name");
+        let instances_dir = dir.join("instances");
+        let instance_name = "NameTest";
+        save_instance(&instances_dir, &vanilla_instance(instance_name), None).unwrap();
+
+        let mc_dir = instances_dir.join(instance_name).join(".minecraft");
+        let rp_dir = mc_dir.join("resourcepacks");
+        std::fs::create_dir_all(&rp_dir).unwrap();
+        std::fs::write(rp_dir.join("Faithful 32x - 1.20.1.zip"), b"PK\x03\x04dummy").unwrap();
+        std::fs::write(rp_dir.join("Faithful 32x - 26.3.zip"), b"PK\x03\x04dummy").unwrap();
+
+        let packs = list_packs(&instances_dir, instance_name, "resourcepacks").unwrap();
+        let names: Vec<(&str, &str)> = packs
+            .iter()
+            .map(|p| (p.filename.as_str(), p.name.as_str()))
+            .collect();
+        assert!(names.contains(&("Faithful 32x - 1.20.1.zip", "Faithful 32x")));
+        // A suffix for another MC version may be part of the real pack name.
+        assert!(names.contains(&("Faithful 32x - 26.3.zip", "Faithful 32x - 26.3")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_pack_enabled_in_list_matching() {
+        let list = vec![
+            "vanilla".to_string(),
+            "mod_resources".to_string(),
+            "file/FreshAnimations.zip".to_string(),
+            "BareBones.zip".to_string(),
+        ];
+
+        assert!(is_pack_enabled_in_list("FreshAnimations.zip", &list));
+        assert!(is_pack_enabled_in_list(
+            "FreshAnimations.zip.disabled",
+            &list
+        ));
+        assert!(is_pack_enabled_in_list("BareBones.zip", &list));
+        assert!(!is_pack_enabled_in_list("OtherPack.zip", &list));
+    }
+
+    #[test]
+    fn clean_pack_stem_strips_extensions_and_color_codes() {
+        assert_eq!(clean_pack_stem("Faithful 32x.zip"), "Faithful 32x");
+        assert_eq!(clean_pack_stem("Faithful 32x.zip.disabled"), "Faithful 32x");
+        assert_eq!(clean_pack_stem("Bare_Bones.jar"), "Bare_Bones");
+        assert_eq!(clean_pack_stem("Bare_Bones.jar.disabled"), "Bare_Bones");
+        assert_eq!(clean_pack_stem("§6Fancy Pack§r.zip"), "Fancy Pack");
+        assert_eq!(clean_pack_stem("FolderPack"), "FolderPack");
+    }
+
+    #[test]
+    fn pack_filename_fallback_removes_only_the_instance_mc_version() {
+        assert_eq!(
+            clean_pack_stem_for_mc("Faithful 32x - 26.3.zip", "26.3"),
+            "Faithful 32x"
+        );
+        assert_eq!(
+            clean_pack_stem_for_mc("Faithful 32x (1.20.1).zip", "1.20.1"),
+            "Faithful 32x"
+        );
+        assert_eq!(
+            clean_pack_stem_for_mc("Faithful 32x - 1.20.1.zip", "26.3"),
+            "Faithful 32x - 1.20.1",
+            "a suffix for another MC version may be part of the pack name"
+        );
+        assert_eq!(
+            clean_pack_stem_for_mc("Faithful 32x.zip", "26.3"),
+            "Faithful 32x"
+        );
+        assert_eq!(
+            clean_pack_stem_for_mc("26.3.zip", "26.3"),
+            "26.3",
+            "never reduce a name to an empty string"
+        );
+    }
+
+    #[test]
+    fn parse_minecraft_text_handles_strings_objects_and_recursive_extra() {
+        // String
+        let v1 = serde_json::json!("Simple description");
+        assert_eq!(
+            parse_minecraft_text(&v1).as_deref(),
+            Some("Simple description")
+        );
+
+        // Object with text and nested extra
+        let v2 = serde_json::json!({
+            "text": "Root",
+            "extra": [
+                {
+                    "text": " Child",
+                    "extra": [
+                        { "text": " Leaf", "color": "green" }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(
+            parse_minecraft_text(&v2).as_deref(),
+            Some("Root Child Leaf")
+        );
+
+        // Array with color codes
+        let v3 = serde_json::json!([
+            { "text": "§eWarning: " },
+            { "text": "§aAll good!" }
+        ]);
+        assert_eq!(
+            parse_minecraft_text(&v3).as_deref(),
+            Some("Warning: All good!")
+        );
+    }
+
+    #[test]
+    fn read_pack_meta_tolerates_corrupt_archives_and_missing_files() {
+        let dir = temp_dir("pack_meta_corrupt");
+        let broken_zip = dir.join("broken.zip");
+        std::fs::write(&broken_zip, b"not a zip archive").unwrap();
+
+        assert_eq!(read_pack_meta_from_zip(&broken_zip), (None, None));
+        assert_eq!(read_pack_meta_from_dir(&dir), (None, None));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pack_meta_from_json_separates_name_and_description() {
+        // Standard vanilla pack.mcmeta (only description)
+        let standard = serde_json::json!({
+            "pack": {
+                "pack_format": 15,
+                "description": "§6A nice pack description§r\nBy Dev"
+            }
+        });
+        let (name, desc) = read_pack_meta_from_json(&standard);
+        assert_eq!(
+            name, None,
+            "Vanilla pack.mcmeta has no pack.name, name must be None"
+        );
+        assert_eq!(desc.as_deref(), Some("A nice pack description\nBy Dev"));
+
+        // Extended pack.mcmeta with explicit pack.name
+        let extended = serde_json::json!({
+            "pack": {
+                "name": "Custom Pack Name",
+                "pack_format": 15,
+                "description": "Some description"
+            }
+        });
+        let (name2, desc2) = read_pack_meta_from_json(&extended);
+        assert_eq!(name2.as_deref(), Some("Custom Pack Name"));
+        assert_eq!(desc2.as_deref(), Some("Some description"));
+    }
+
+    #[test]
+    fn test_list_packs_resourcepacks_auto_migrates_and_reads_options() {
+        let dir = temp_dir("list_packs_test");
+        let instances_dir = dir.join("instances");
+        let instance_name = "PackTest";
+
+        let inst = Instance {
+            name: instance_name.into(),
+            mc_version: "1.20.1".into(),
+            loader: LoaderType::Vanilla,
+            loader_version: None,
+            loader_profile: None,
+            memory_mb: None,
+            jvm_args: None,
+            gc_preset: None,
+            java_path: None,
+            resolution: None,
+            icon: None,
+            banner: None,
+            created_at: Utc::now().to_rfc3339(),
+            last_played: None,
+            play_time_seconds: 0,
+            notes: String::new(),
+        };
+        save_instance(&instances_dir, &inst, None).unwrap();
+
+        let mc_dir = instances_dir.join(instance_name).join(".minecraft");
+        let rp_dir = mc_dir.join("resourcepacks");
+        std::fs::create_dir_all(&rp_dir).unwrap();
+
+        // Create one pack as .disabled and one pack as active
+        std::fs::write(rp_dir.join("OldDisabledPack.zip.disabled"), b"dummy").unwrap();
+        std::fs::write(rp_dir.join("ActivePack.zip"), b"dummy").unwrap();
+
+        // Write options.txt with only ActivePack enabled
+        let options_content = "resourcePacks:[\"vanilla\",\"file/ActivePack.zip\"]\n";
+        std::fs::write(mc_dir.join("options.txt"), options_content).unwrap();
+
+        let packs = list_packs(&instances_dir, instance_name, "resourcepacks").unwrap();
+
+        // Verify OldDisabledPack was migrated on disk
+        assert!(
+            rp_dir.join("OldDisabledPack.zip").exists(),
+            "Migrated to .zip"
+        );
+        assert!(
+            !rp_dir.join("OldDisabledPack.zip.disabled").exists(),
+            "Old .disabled removed"
+        );
+
+        // Verify active statuses
+        let active = packs
+            .iter()
+            .find(|p| p.filename == "ActivePack.zip")
+            .expect("ActivePack found");
+        assert!(active.enabled, "ActivePack should be enabled");
+
+        let old = packs
+            .iter()
+            .find(|p| p.filename == "OldDisabledPack.zip")
+            .expect("OldDisabledPack found");
+        assert!(
+            !old.enabled,
+            "OldDisabledPack should be disabled in options.txt"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_atomic_write_file_roundtrip_and_safety() {
+        let dir = temp_dir("atomic_test");
+        let target = dir.join("options.txt");
+
+        // 1. Initial write
+        atomic_write_file(&target, "version:1\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "version:1\n");
+
+        // 2. Replacement
+        atomic_write_file(&target, "version:2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "version:2\n");
+        assert!(
+            !dir.join("options.tmp").exists(),
+            "tmp file must be cleaned up"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_atomic_write_file_failure_leaves_original_intact() {
+        let dir = temp_dir("atomic_fail_test");
+        let target = dir.join("options.txt");
+        let original_content = "original:true\n";
+        atomic_write_file(&target, original_content).unwrap();
+
+        // Simulate write failure by creating options.tmp as a directory so std::fs::write(&tmp, ...) fails
+        let tmp = target.with_extension("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let res = atomic_write_file(&target, "corrupted:true\n");
+        assert!(res.is_err(), "Must return error when tmp cannot be written");
+
+        // Verify original file is 100% intact and was not lost or truncated
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original_content);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_atomic_write_file_rollback_when_replace_fails() {
+        let dir = temp_dir("atomic_rollback_test");
+        let target = dir.join("options.txt");
+        let old = target.with_extension("old");
+        let tmp = target.with_extension("tmp");
+        let original_content = "original:true\ngameplay:smooth\n";
+        atomic_write_file(&target, original_content).unwrap();
+
+        // Custom rename function to simulate:
+        // 1. Direct replace (tmp -> target) fails (e.g. Windows sharing violation)
+        // 2. Safe fallback: rename target -> old succeeds
+        // 3. Rename tmp -> target fails (e.g. AV scan / permission denied on new destination)
+        // 4. Rollback: rename old -> target succeeds
+        let rename_mock = |from: &Path, to: &Path| -> std::io::Result<()> {
+            if from == tmp && to == target {
+                // Fail any attempt to rename tmp -> target
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Simulated rename tmp -> target failure",
+                ))
+            } else {
+                // Allow target -> old and old -> target
+                std::fs::rename(from, to)
+            }
+        };
+
+        let res = atomic_write_file_impl(&target, "new_broken_content:true\n", rename_mock);
+
+        // 1. Operation must return an error
+        assert!(
+            res.is_err(),
+            "Must report error when replacing target fails"
+        );
+
+        // 2. Original options.txt must be restored from .old and be 100% intact
+        assert!(target.exists(), "Target file options.txt must exist");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            original_content,
+            "Target file options.txt must contain original content intact"
+        );
+
+        // 3. options.old must no longer exist (moved back to options.txt)
+        assert!(
+            !old.exists(),
+            "options.old must be moved back to options.txt"
+        );
+
+        // 4. Temporary file options.tmp must be cleaned up
+        assert!(!tmp.exists(), "Temporary file options.tmp must be removed");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

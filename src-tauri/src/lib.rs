@@ -371,6 +371,8 @@ pub fn run() {
             commands::instances::cmd_delete_screenshot,
             commands::instances::cmd_read_screenshot,
             commands::instances::cmd_list_packs,
+            commands::instances::cmd_set_resource_pack_enabled,
+            commands::instances::cmd_set_resource_packs_order,
             commands::instances::cmd_get_pack_icon,
             commands::instances::cmd_watch_instance,
             commands::instances::cmd_unwatch_instance,
