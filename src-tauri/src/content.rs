@@ -41,6 +41,47 @@ pub fn normalize_provider(raw: Option<&str>) -> String {
     }
 }
 
+/// Provider part of a project identity: trimmed, lowercase, and legacy
+/// empty strings are treated as Modrinth (the graph's historical default).
+pub fn normalize_project_provider(raw: &str) -> String {
+    let provider = raw.trim().to_ascii_lowercase();
+    if provider.is_empty() {
+        "modrinth".to_string()
+    } else {
+        provider
+    }
+}
+
+/// Identity of a project across catalogs.
+///
+/// A project id is only unique inside its provider: CurseForge `12345` and
+/// Modrinth `12345` are different projects. All project-level maps in the
+/// resolver must key on this type, never on `project_id` alone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProjectKey {
+    provider: String,
+    project_id: String,
+}
+
+impl ProjectKey {
+    pub fn new(provider: &str, project_id: impl Into<String>) -> Self {
+        Self {
+            provider: normalize_project_provider(provider),
+            project_id: project_id.into(),
+        }
+    }
+
+    /// Normalized provider (`modrinth`, `curseforge`, `local`, ...).
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// Provider-local project identifier.
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+}
+
 /// One installed content file with its sidecar metadata normalized into a
 /// single shape (roadmap item 13). Files without any sidecar (manual drops)
 /// still produce a record with `provider: "unknown"`.
@@ -75,6 +116,7 @@ pub struct InstalledContent {
 impl InstalledContent {
     /// Read and normalize the sidecar for `filename`. Missing fields become
     /// `None`; a sidecar-less file still yields a usable record.
+    /// Falls back to Prism / packwiz `.pw.toml` metadata in `.index/`.
     pub fn read(content_dir: &Path, filename: &str, content_type: &str) -> Self {
         let meta = crate::instances::read_sidecar_meta(content_dir, filename);
         let field = |key: &str| {
@@ -82,15 +124,38 @@ impl InstalledContent {
                 .and_then(|m| m[key].as_str())
                 .map(str::to_string)
         };
+
+        let (pw_provider, pw_version, pw_project_id, pw_name) = if meta.is_none() {
+            let pw_index = crate::instances::load_packwiz_index_cached(content_dir);
+            crate::instances::packwiz_meta(&pw_index, filename)
+                .map(|p| {
+                    (
+                        Some(p.provider.clone()),
+                        Some(p.version.clone()),
+                        Some(p.project_id.clone()),
+                        Some(p.name.clone()),
+                    )
+                })
+                .unwrap_or((None, None, None, None))
+        } else {
+            (None, None, None, None)
+        };
+
+        let provider_str = meta
+            .as_ref()
+            .and_then(|m| m["provider"].as_str())
+            .map(|s| s.to_string())
+            .or(pw_provider);
+
         Self {
             filename: filename.to_string(),
             content_type: content_type.to_string(),
-            provider: normalize_provider(meta.as_ref().and_then(|m| m["provider"].as_str())),
-            project_id: field("project_id"),
+            provider: normalize_provider(provider_str.as_deref()),
+            project_id: field("project_id").or(pw_project_id),
             version_id: field("version_id"),
             file_id: field("file_id"),
-            project_name: field("project_name"),
-            version_number: field("version_number"),
+            project_name: field("project_name").or(pw_name),
+            version_number: field("version_number").or(pw_version),
             // Pre-1.0 installers wrote the verified download hash as "sha1".
             hash: field("hash").or_else(|| field("sha1")),
             enabled: !filename.ends_with(".disabled"),
@@ -225,17 +290,6 @@ pub fn normalize_cf_dep_type(relation_type: u32) -> Option<&'static str> {
     }
 }
 
-/// Normalize a project display name for cross-provider installed matching:
-/// lowercase, `-`/`_` treated as word breaks, whitespace collapsed. "JEI",
-/// "jei-1.20.1" style prefixes stay comparable to the provider's title.
-pub fn normalize_project_name(raw: &str) -> String {
-    raw.to_lowercase()
-        .replace(['-', '_'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The downloadable file of a planned version — everything the frontend
 /// needs to call `cmd_download_to_folder`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,8 +344,14 @@ pub struct VersionNode {
 /// the user as a warning; it does not block installation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnresolvedItem {
+    /// Provider of the unresolved target project.
+    #[serde(default)]
+    pub provider: String,
     pub project_id: String,
     pub project_name: String,
+    /// Provider of the project that declared the edge.
+    #[serde(default)]
+    pub source_provider: String,
     pub source_project_id: String,
     pub source_name: String,
     /// Machine-readable reason: `no_compatible_version` / `unavailable`.
@@ -301,6 +361,8 @@ pub struct UnresolvedItem {
 /// A project already present on disk (per its sidecar).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledProject {
+    #[serde(default)]
+    pub provider: String,
     pub project_id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -319,10 +381,21 @@ pub struct GraphInput {
     /// resolver itself discovers).
     #[serde(default)]
     pub unresolved: Vec<UnresolvedItem>,
-    /// Project title cache (`project_id` → title) covering projects without
-    /// a node (optional/incompatible targets, unresolved reports).
+    /// Project title cache covering projects without a node
+    /// (optional/incompatible targets, unresolved reports). A list, not a
+    /// `project_id` map: the same id may exist in both catalogs.
     #[serde(default)]
-    pub project_names: HashMap<String, String>,
+    pub project_names: Vec<ProjectNameEntry>,
+}
+
+/// One cached project title. `provider` is normalized through
+/// [`ProjectKey`] by the resolver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectNameEntry {
+    #[serde(default)]
+    pub provider: String,
+    pub project_id: String,
+    pub name: String,
 }
 
 /// One entry of the ordered install plan. Post-order: dependencies always
@@ -351,6 +424,9 @@ pub struct PlanItem {
 /// Why a dependency blocks installation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictReason {
+    /// Provider of the project that declared the conflicting edge.
+    #[serde(default)]
+    pub source_provider: String,
     pub source_project_id: String,
     pub source_name: String,
     /// The other version's label for `version_mismatch`; empty for
@@ -362,6 +438,9 @@ pub struct ConflictReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conflict {
+    /// Provider of the conflicting target project.
+    #[serde(default)]
+    pub provider: String,
     pub project_id: String,
     pub project_name: String,
     pub reasons: Vec<ConflictReason>,
@@ -370,6 +449,8 @@ pub struct Conflict {
 /// Optional dependencies, surfaced for the UI but never auto-installed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OptionalItem {
+    #[serde(default)]
+    pub provider: String,
     pub project_id: String,
     pub name: String,
     pub source_name: String,
@@ -378,6 +459,8 @@ pub struct OptionalItem {
 /// Required dependencies already on disk — skipped, not re-downloaded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedItem {
+    #[serde(default)]
+    pub provider: String,
     pub project_id: String,
     pub name: String,
 }
@@ -426,23 +509,31 @@ pub fn build_resolution(input: &GraphInput, installed: &[InstalledProject]) -> R
     walk.finish()
 }
 
+#[derive(Debug)]
+struct DeferredIncompatible {
+    target: ProjectKey,
+    source: ProjectKey,
+    source_name: String,
+}
+
 struct Walk<'a> {
     input: &'a GraphInput,
-    installed: HashMap<String, &'a InstalledProject>,
-    /// Normalized project name → installed entry, for cross-provider
-    /// matching (a CF dependency satisfied by a Modrinth-installed mod and
-    /// vice versa: the ids differ, the display name usually does not).
-    installed_by_name: HashMap<String, &'a InstalledProject>,
-    entered: HashMap<String, Entered>,
-    sources: HashMap<String, Vec<String>>,
-    order: Vec<String>,
-    skipped: HashMap<String, SkippedItem>,
-    optional: HashMap<String, OptionalItem>,
+    installed: HashMap<ProjectKey, &'a InstalledProject>,
+    /// Titles for projects that may not have a node (optional/incompatible
+    /// targets, unresolved reports), keyed by the full project identity.
+    project_names: HashMap<ProjectKey, String>,
+    entered: HashMap<ProjectKey, Entered>,
+    sources: HashMap<ProjectKey, Vec<String>>,
+    order: Vec<ProjectKey>,
+    skipped: HashMap<ProjectKey, SkippedItem>,
+    optional: HashMap<ProjectKey, OptionalItem>,
     unresolved: Vec<UnresolvedItem>,
-    conflicts: HashMap<String, Conflict>,
-    /// (target project id, source project id, source name) collected during
-    /// traversal, evaluated once the final plan is known.
-    deferred_incompatible: Vec<(String, String, String)>,
+    conflicts: HashMap<ProjectKey, Conflict>,
+    deferred_incompatible: Vec<DeferredIncompatible>,
+}
+
+fn key_of_node(node: &VersionNode) -> ProjectKey {
+    ProjectKey::new(&node.provider, node.project_id.as_str())
 }
 
 impl<'a> Walk<'a> {
@@ -451,12 +542,17 @@ impl<'a> Walk<'a> {
             input,
             installed: installed
                 .iter()
-                .map(|p| (p.project_id.clone(), p))
+                .map(|p| (ProjectKey::new(&p.provider, p.project_id.as_str()), p))
                 .collect(),
-            installed_by_name: installed
+            project_names: input
+                .project_names
                 .iter()
-                .map(|p| (normalize_project_name(&p.name), p))
-                .filter(|(k, _)| !k.is_empty())
+                .map(|e| {
+                    (
+                        ProjectKey::new(&e.provider, e.project_id.as_str()),
+                        e.name.clone(),
+                    )
+                })
                 .collect(),
             entered: HashMap::new(),
             sources: HashMap::new(),
@@ -473,41 +569,61 @@ impl<'a> Walk<'a> {
         let Some(node) = self.input.nodes.get(version_id).cloned() else {
             return;
         };
-        if let Some(e) = self.entered.get(&node.project_id) {
+        let key = key_of_node(&node);
+        if let Some(e) = self.entered.get(&key) {
             if e.version_id == version_id {
-                self.push_source(&node.project_id, source_name);
+                self.push_source(&key, source_name);
             }
             return;
         }
         self.entered.insert(
-            node.project_id.clone(),
+            key.clone(),
             Entered {
                 version_id: version_id.to_string(),
                 depth,
             },
         );
-        self.push_source(&node.project_id, source_name);
+        self.push_source(&key, source_name);
         for dep in node.deps.clone() {
             self.process_dep(&dep, &node);
         }
-        self.order.push(node.project_id.clone());
+        self.order.push(key);
+    }
+
+    /// Resolve the target project identity for an edge. Edges do not carry a
+    /// provider field: a known target version is authoritative, otherwise the
+    /// edge inherits the declaring node's provider.
+    fn dep_key(&self, dep: &DepEdge, source: &VersionNode) -> Option<ProjectKey> {
+        let pid = dep.project_id.as_deref().or_else(|| {
+            dep.version_id
+                .as_deref()
+                .and_then(|vid| self.input.nodes.get(vid).map(|n| n.project_id.as_str()))
+        })?;
+        let provider = dep
+            .version_id
+            .as_deref()
+            .and_then(|vid| self.input.nodes.get(vid))
+            .map(|n| n.provider.as_str())
+            .unwrap_or(&source.provider);
+        Some(ProjectKey::new(provider, pid))
     }
 
     fn process_dep(&mut self, dep: &DepEdge, source: &VersionNode) {
         match dep.dep_type.as_str() {
             DEP_REQUIRED => self.process_required(dep, source),
             DEP_OPTIONAL => {
-                let Some(pid) = dep.project_id.as_deref() else {
+                let Some(key) = self.dep_key(dep, source) else {
                     return;
                 };
-                if self.optional.contains_key(pid) {
+                if self.optional.contains_key(&key) {
                     return;
                 }
-                let name = self.name_for(pid);
+                let name = self.name_for(&key);
                 self.optional.insert(
-                    pid.to_string(),
+                    key.clone(),
                     OptionalItem {
-                        project_id: pid.to_string(),
+                        provider: key.provider().to_string(),
+                        project_id: key.project_id().to_string(),
                         name,
                         source_name: source.name.clone(),
                     },
@@ -515,73 +631,63 @@ impl<'a> Walk<'a> {
             }
             _ => {
                 // incompatible (embedded edges are dropped before the graph)
-                let target = dep.project_id.clone().or_else(|| {
-                    dep.version_id
-                        .as_deref()
-                        .and_then(|vid| self.input.nodes.get(vid).map(|n| n.project_id.clone()))
+                let Some(target) = self.dep_key(dep, source) else {
+                    return;
+                };
+                self.deferred_incompatible.push(DeferredIncompatible {
+                    target,
+                    source: key_of_node(source),
+                    source_name: source.name.clone(),
                 });
-                if let Some(pid) = target {
-                    self.deferred_incompatible.push((
-                        pid,
-                        source.project_id.clone(),
-                        source.name.clone(),
-                    ));
-                }
             }
         }
     }
 
-    /// The installed entry a required target matches: by project id first
-    /// (same provider), then by normalized display name (cross-provider).
-    fn installed_for(&self, pid: &str) -> Option<&'a InstalledProject> {
-        if let Some(inst) = self.installed.get(pid) {
-            return Some(inst);
-        }
-        let name = self.input.project_names.get(pid)?;
-        self.installed_by_name
-            .get(&normalize_project_name(name))
-            .copied()
+    fn installed_for(&self, key: &ProjectKey) -> Option<&'a InstalledProject> {
+        self.installed.get(key).copied()
     }
 
     fn process_required(&mut self, dep: &DepEdge, source: &VersionNode) {
-        let Some(pid) = dep.project_id.as_deref() else {
+        let Some(key) = self.dep_key(dep, source) else {
             return;
         };
+        let source_key = key_of_node(source);
         // Self-dependency: nothing to plan.
-        if pid == source.project_id {
+        if key == source_key {
             return;
         }
-        if let Some(inst) = self.installed_for(pid) {
+        if let Some(inst) = self.installed_for(&key) {
             self.skipped
-                .entry(pid.to_string())
+                .entry(key.clone())
                 .or_insert_with(|| SkippedItem {
-                    project_id: pid.to_string(),
+                    provider: key.provider().to_string(),
+                    project_id: key.project_id().to_string(),
                     name: inst.name.clone(),
                 });
             return;
         }
         match dep.version_id.as_deref() {
-            Some(vid) => self.plan_target(pid, vid, source),
+            Some(vid) => self.plan_target(&key, vid, source),
             None => {
                 // Project-only reference: accept whatever version of the
                 // project is already planned; otherwise adopt the project's
                 // node from the graph, or report it unresolved.
-                if self.entered.contains_key(pid) {
-                    self.push_source(pid, &source.name);
+                if self.entered.contains_key(&key) {
+                    self.push_source(&key, &source.name);
                     return;
                 }
-                match self.node_for_pid(pid) {
-                    Some(vid) => self.plan_target(pid, &vid, source),
-                    None => self.add_unresolved(pid, source, "unavailable"),
+                match self.node_for_key(&key) {
+                    Some(vid) => self.plan_target(&key, &vid, source),
+                    None => self.add_unresolved(&key, source, "unavailable"),
                 }
             }
         }
     }
 
-    fn plan_target(&mut self, pid: &str, vid: &str, source: &VersionNode) {
-        if let Some(e) = self.entered.get(pid) {
+    fn plan_target(&mut self, key: &ProjectKey, vid: &str, source: &VersionNode) {
+        if let Some(e) = self.entered.get(key) {
             if e.version_id == vid {
-                self.push_source(pid, &source.name);
+                self.push_source(key, &source.name);
             } else {
                 // Two explicit pins of the same project disagree.
                 let requirement = self
@@ -590,11 +696,12 @@ impl<'a> Walk<'a> {
                     .get(vid)
                     .map(|n| n.version_label.clone())
                     .unwrap_or_else(|| vid.to_string());
-                let name = self.name_for(pid);
+                let name = self.name_for(key);
                 self.add_conflict(
-                    pid,
+                    key,
                     &name,
                     ConflictReason {
+                        source_provider: normalize_project_provider(&source.provider),
                         source_project_id: source.project_id.clone(),
                         source_name: source.name.clone(),
                         requirement,
@@ -605,22 +712,22 @@ impl<'a> Walk<'a> {
             return;
         }
         if !self.input.nodes.contains_key(vid) {
-            self.add_unresolved(pid, source, "unavailable");
+            self.add_unresolved(key, source, "unavailable");
             return;
         }
         let depth = self
             .entered
-            .get(&source.project_id)
+            .get(&key_of_node(source))
             .map(|e| e.depth + 1)
             .unwrap_or(1);
         self.visit(vid, depth, &source.name);
     }
 
     fn finish_incompatible(&mut self) {
-        for (target_pid, source_pid, source_name) in std::mem::take(&mut self.deferred_incompatible)
-        {
-            let planned = self.entered.get(&target_pid);
-            if planned.is_none() && self.installed_for(&target_pid).is_none() {
+        for deferred in std::mem::take(&mut self.deferred_incompatible) {
+            let target = deferred.target;
+            let planned = self.entered.get(&target);
+            if planned.is_none() && self.installed_for(&target).is_none() {
                 continue;
             }
             let name = match planned {
@@ -629,15 +736,16 @@ impl<'a> Walk<'a> {
                     .nodes
                     .get(&e.version_id)
                     .map(|n| n.name.clone())
-                    .unwrap_or_else(|| self.name_for(&target_pid)),
-                None => self.name_for(&target_pid),
+                    .unwrap_or_else(|| self.name_for(&target)),
+                None => self.name_for(&target),
             };
             self.add_conflict(
-                &target_pid,
+                &target,
                 &name,
                 ConflictReason {
-                    source_project_id: source_pid,
-                    source_name,
+                    source_provider: deferred.source.provider().to_string(),
+                    source_project_id: deferred.source.project_id().to_string(),
+                    source_name: deferred.source_name,
                     requirement: String::new(),
                     kind: CONFLICT_INCOMPATIBLE.to_string(),
                 },
@@ -646,35 +754,31 @@ impl<'a> Walk<'a> {
     }
 
     fn finish(self) -> Resolution {
-        let root_pids: HashSet<String> = self
+        let root_keys: HashSet<ProjectKey> = self
             .input
             .roots
             .iter()
             .filter_map(|vid| self.input.nodes.get(vid))
-            .map(|n| n.project_id.clone())
+            .map(key_of_node)
             .collect();
 
         let install = self
             .order
             .iter()
-            .filter_map(|pid| {
-                let e = self.entered.get(pid)?;
+            .filter_map(|key| {
+                let e = self.entered.get(key)?;
                 let node = self.input.nodes.get(&e.version_id)?;
                 Some(PlanItem {
-                    project_id: pid.clone(),
+                    project_id: key.project_id().to_string(),
                     version_id: e.version_id.clone(),
                     name: node.name.clone(),
                     version_label: node.version_label.clone(),
                     icon_url: node.icon_url.clone(),
                     file: node.file.clone(),
                     depth: e.depth,
-                    required_by: self.sources.get(pid).cloned().unwrap_or_default(),
-                    is_root: root_pids.contains(pid),
-                    provider: if node.provider.is_empty() {
-                        "modrinth".to_string()
-                    } else {
-                        node.provider.clone()
-                    },
+                    required_by: self.sources.get(key).cloned().unwrap_or_default(),
+                    is_root: root_keys.contains(key),
+                    provider: key.provider().to_string(),
                 })
             })
             .collect();
@@ -686,21 +790,33 @@ impl<'a> Walk<'a> {
             .unresolved
             .into_iter()
             .filter(|u| {
-                if self.entered.contains_key(&u.project_id)
-                    || self.skipped.contains_key(&u.project_id)
-                {
+                let key = ProjectKey::new(&u.provider, u.project_id.as_str());
+                if self.entered.contains_key(&key) || self.skipped.contains_key(&key) {
                     return false;
                 }
-                seen.insert((u.project_id.clone(), u.source_project_id.clone()))
+                seen.insert((
+                    key,
+                    normalize_project_provider(&u.source_provider),
+                    u.source_project_id.clone(),
+                ))
             })
             .collect();
 
         let mut conflicts: Vec<Conflict> = self.conflicts.into_values().collect();
-        conflicts.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        conflicts.sort_by(|a, b| {
+            (a.provider.as_str(), a.project_id.as_str())
+                .cmp(&(b.provider.as_str(), b.project_id.as_str()))
+        });
         let mut optional: Vec<OptionalItem> = self.optional.into_values().collect();
-        optional.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        optional.sort_by(|a, b| {
+            (a.provider.as_str(), a.project_id.as_str())
+                .cmp(&(b.provider.as_str(), b.project_id.as_str()))
+        });
         let mut skipped: Vec<SkippedItem> = self.skipped.into_values().collect();
-        skipped.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        skipped.sort_by(|a, b| {
+            (a.provider.as_str(), a.project_id.as_str())
+                .cmp(&(b.provider.as_str(), b.project_id.as_str()))
+        });
 
         Resolution {
             install,
@@ -711,75 +827,79 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn node_for_pid(&self, pid: &str) -> Option<String> {
+    fn node_for_key(&self, key: &ProjectKey) -> Option<String> {
         self.input
             .nodes
             .values()
-            .filter(|n| n.project_id == pid)
+            .filter(|n| key_of_node(n) == *key)
             .map(|n| n.version_id.clone())
             .min()
     }
 
-    fn name_for(&self, pid: &str) -> String {
-        if let Some(e) = self.entered.get(pid) {
+    fn name_for(&self, key: &ProjectKey) -> String {
+        if let Some(e) = self.entered.get(key) {
             if let Some(n) = self.input.nodes.get(&e.version_id) {
                 return n.name.clone();
             }
         }
-        if let Some(n) = self.input.project_names.get(pid) {
+        if let Some(n) = self.project_names.get(key) {
             return n.clone();
         }
         if let Some(n) = self
             .input
             .nodes
             .values()
-            .filter(|n| n.project_id == pid)
+            .filter(|n| key_of_node(n) == *key)
             .map(|n| n.name.clone())
             .min()
         {
             return n;
         }
-        if let Some(inst) = self.installed.get(pid) {
+        if let Some(inst) = self.installed.get(key) {
             return inst.name.clone();
         }
-        pid.to_string()
+        key.project_id().to_string()
     }
 
-    fn push_source(&mut self, pid: &str, name: &str) {
+    fn push_source(&mut self, key: &ProjectKey, name: &str) {
         if name.is_empty() {
             return;
         }
-        let entry = self.sources.entry(pid.to_string()).or_default();
+        let entry = self.sources.entry(key.clone()).or_default();
         if !entry.iter().any(|s| s == name) {
             entry.push(name.to_string());
         }
     }
 
-    fn add_unresolved(&mut self, pid: &str, source: &VersionNode, reason: &str) {
-        let project_name = self.name_for(pid);
+    fn add_unresolved(&mut self, key: &ProjectKey, source: &VersionNode, reason: &str) {
+        let project_name = self.name_for(key);
         self.unresolved.push(UnresolvedItem {
-            project_id: pid.to_string(),
+            provider: key.provider().to_string(),
+            project_id: key.project_id().to_string(),
             project_name,
+            source_provider: normalize_project_provider(&source.provider),
             source_project_id: source.project_id.clone(),
             source_name: source.name.clone(),
             reason: reason.to_string(),
         });
     }
 
-    fn add_conflict(&mut self, pid: &str, name: &str, reason: ConflictReason) {
+    fn add_conflict(&mut self, key: &ProjectKey, name: &str, reason: ConflictReason) {
         let entry = self
             .conflicts
-            .entry(pid.to_string())
+            .entry(key.clone())
             .or_insert_with(|| Conflict {
-                project_id: pid.to_string(),
+                provider: key.provider().to_string(),
+                project_id: key.project_id().to_string(),
                 project_name: name.to_string(),
                 reasons: Vec::new(),
             });
-        if entry.project_name == entry.project_id && name != pid {
+        if entry.project_name == entry.project_id && name != key.project_id() {
             entry.project_name = name.to_string();
         }
         let dup = entry.reasons.iter().any(|r| {
-            r.source_project_id == reason.source_project_id
+            normalize_project_provider(&r.source_provider) == reason.source_provider
+                && r.source_project_id == reason.source_project_id
                 && r.requirement == reason.requirement
                 && r.kind == reason.kind
         });
@@ -979,6 +1099,19 @@ mod tests {
         }
     }
 
+    fn provider_node(
+        vid: &str,
+        pid: &str,
+        provider: &str,
+        name: &str,
+        label: &str,
+        deps: Vec<DepEdge>,
+    ) -> VersionNode {
+        let mut n = node(vid, pid, name, label, deps);
+        n.provider = provider.to_string();
+        n
+    }
+
     fn req(source: &str, pid: &str, vid: Option<&str>) -> DepEdge {
         DepEdge {
             source_version_id: source.to_string(),
@@ -1005,12 +1138,21 @@ mod tests {
                 .collect(),
             roots: roots.iter().map(|s| s.to_string()).collect(),
             unresolved: Vec::new(),
-            project_names: HashMap::new(),
+            project_names: Vec::new(),
+        }
+    }
+
+    fn project_name(provider: &str, pid: &str, name: &str) -> ProjectNameEntry {
+        ProjectNameEntry {
+            provider: provider.to_string(),
+            project_id: pid.to_string(),
+            name: name.to_string(),
         }
     }
 
     fn installed(pid: &str, name: &str) -> InstalledProject {
         InstalledProject {
+            provider: "modrinth".to_string(),
             project_id: pid.to_string(),
             name: name.to_string(),
             version_id: None,
@@ -1220,7 +1362,7 @@ mod tests {
             ],
             &["va"],
         );
-        g.project_names.insert("x".to_string(), "X-Ray".to_string());
+        g.project_names.push(project_name("modrinth", "x", "X-Ray"));
         let res = build_resolution(&g, &[]);
         assert_eq!(plan_ids(&res), vec!["b", "a"]);
         assert_eq!(res.optional.len(), 1);
@@ -1232,15 +1374,19 @@ mod tests {
     #[test]
     fn unresolved_entries_pass_through_deduped_and_stale_ones_drop() {
         let stale = UnresolvedItem {
+            provider: "modrinth".to_string(),
             project_id: "c".to_string(),
             project_name: "Cache".to_string(),
+            source_provider: "modrinth".to_string(),
             source_project_id: "z".to_string(),
             source_name: "Zeta".to_string(),
             reason: "no_compatible_version".to_string(),
         };
         let keep = UnresolvedItem {
+            provider: "modrinth".to_string(),
             project_id: "y".to_string(),
             project_name: "Why".to_string(),
+            source_provider: "modrinth".to_string(),
             source_project_id: "a".to_string(),
             source_name: "Alpha".to_string(),
             reason: "no_compatible_version".to_string(),
@@ -1310,49 +1456,45 @@ mod tests {
     }
 
     #[test]
-    fn project_name_normalization_folds_case_and_separators() {
-        assert_eq!(
-            normalize_project_name("Just Enough Items (JEI)"),
-            "just enough items (jei)"
-        );
-        assert_eq!(normalize_project_name("JEI"), "jei");
-        assert_eq!(normalize_project_name("sodium_fabric"), "sodium fabric");
-        assert_eq!(normalize_project_name("  Multi   Space "), "multi space");
-        assert_eq!(normalize_project_name(""), "");
-    }
-
-    #[test]
-    fn installed_required_dependency_matches_by_name_across_providers() {
-        // The root requires project "42" (a CurseForge id) but the same
-        // mod is installed from Modrinth under slug "jei" — the display
-        // names agree, so the target must be skipped, not re-planned.
-        let required_42 = DepEdge {
+    fn test_different_projects_with_same_name_do_not_satisfy_dependency_without_matching_id() {
+        // Project "proj-a" requires project "proj-b" (display name "Zoom").
+        // An existing installed mod is "proj-c" (also named "Zoom").
+        // Because proj-c != proj-b, proj-b must NOT be skipped by name; it must be planned.
+        let required_dep = DepEdge {
             source_version_id: "v-root".to_string(),
             dep_type: DEP_REQUIRED.to_string(),
-            project_id: Some("42".to_string()),
+            project_id: Some("proj-b".to_string()),
             version_id: None,
         };
         let mut g = graph(
             vec![
-                node("v-root", "root", "Root Mod", "1.0", vec![required_42]),
-                node("cf:42:7", "42", "Just Enough Items (JEI)", "15.2", vec![]),
+                node("v-root", "proj-a", "Root Mod", "1.0", vec![required_dep]),
+                node("v-dep", "proj-b", "Zoom", "1.0", vec![]),
             ],
             &["v-root"],
         );
         g.project_names
-            .insert("42".to_string(), "Just Enough Items (JEI)".to_string());
+            .push(project_name("modrinth", "proj-b", "Zoom"));
+
         let res = build_resolution(
             &g,
             &[InstalledProject {
-                project_id: "jei".to_string(),
-                name: "Just Enough Items (JEI)".to_string(),
+                provider: "modrinth".to_string(),
+                project_id: "proj-c".to_string(),
+                name: "Zoom".to_string(),
                 version_id: None,
             }],
         );
-        assert_eq!(plan_ids(&res), vec!["root"]);
-        assert_eq!(res.skipped.len(), 1);
-        assert_eq!(res.skipped[0].project_id, "42");
-        assert_eq!(res.skipped[0].name, "Just Enough Items (JEI)");
+
+        // proj-b must be planned to install, NOT skipped by name match
+        assert!(
+            res.skipped.is_empty(),
+            "Different project with same name must NOT be skipped"
+        );
+        assert!(
+            res.install.iter().any(|item| item.project_id == "proj-b"),
+            "Required dependency must be planned"
+        );
     }
 
     #[test]
@@ -1371,11 +1513,405 @@ mod tests {
     }
 
     #[test]
+    fn mixed_provider_roots_with_same_project_id_are_both_planned() {
+        let cf = provider_node(
+            "cf:12345:1",
+            "12345",
+            "curseforge",
+            "CF Root",
+            "1.0",
+            vec![],
+        );
+        let mr = provider_node(
+            "mr-version-12345",
+            "12345",
+            "modrinth",
+            "MR Root",
+            "2.0",
+            vec![],
+        );
+        let g = graph(vec![cf, mr], &["cf:12345:1", "mr-version-12345"]);
+
+        let res = build_resolution(&g, &[]);
+
+        assert_eq!(res.install.len(), 2, "both roots must be installed");
+        assert!(res.conflicts.is_empty());
+        assert!(res.install.iter().all(|item| item.is_root));
+        assert!(res
+            .install
+            .iter()
+            .any(|item| item.provider == "curseforge" && item.project_id == "12345"));
+        assert!(res
+            .install
+            .iter()
+            .any(|item| item.provider == "modrinth" && item.project_id == "12345"));
+    }
+
+    #[test]
+    fn mixed_provider_required_dependencies_with_same_id_do_not_conflict() {
+        let cf_root = provider_node(
+            "cf:root:1",
+            "cf-root",
+            "curseforge",
+            "CF Root",
+            "1.0",
+            vec![req("cf:root:1", "12345", Some("cf:dep:1"))],
+        );
+        let mr_root = provider_node(
+            "mr-root-v",
+            "mr-root",
+            "modrinth",
+            "MR Root",
+            "1.0",
+            vec![req("mr-root-v", "12345", Some("mr-dep-v"))],
+        );
+        let cf_dep = provider_node("cf:dep:1", "12345", "curseforge", "CF Dep", "1.0", vec![]);
+        let mr_dep = provider_node("mr-dep-v", "12345", "modrinth", "MR Dep", "1.0", vec![]);
+        let g = graph(
+            vec![cf_root, mr_root, cf_dep, mr_dep],
+            &["cf:root:1", "mr-root-v"],
+        );
+
+        let res = build_resolution(&g, &[]);
+
+        assert_eq!(
+            res.install.len(),
+            4,
+            "both dependency trees must be planned"
+        );
+        assert!(
+            res.conflicts.is_empty(),
+            "different providers must not version-conflict"
+        );
+        assert!(res.skipped.is_empty());
+        assert_eq!(
+            res.install
+                .iter()
+                .filter(|item| item.project_id == "12345")
+                .count(),
+            2,
+            "the dependency ID must appear once per provider"
+        );
+        assert!(res
+            .install
+            .iter()
+            .any(|item| item.provider == "curseforge" && item.name == "CF Dep"));
+        assert!(res
+            .install
+            .iter()
+            .any(|item| item.provider == "modrinth" && item.name == "MR Dep"));
+    }
+
+    #[test]
+    fn same_id_optional_and_skipped_entries_keep_provider() {
+        let cf_root = provider_node(
+            "cf:root:1",
+            "cf-root",
+            "curseforge",
+            "CF Root",
+            "1.0",
+            vec![
+                edge_of_kind("cf:root:1", DEP_OPTIONAL, "12345"),
+                req("cf:root:1", "12345", None),
+            ],
+        );
+        let mr_root = provider_node(
+            "mr-root-v",
+            "mr-root",
+            "modrinth",
+            "MR Root",
+            "1.0",
+            vec![
+                edge_of_kind("mr-root-v", DEP_OPTIONAL, "12345"),
+                req("mr-root-v", "12345", None),
+            ],
+        );
+        let mut g = graph(vec![cf_root, mr_root], &["cf:root:1", "mr-root-v"]);
+        g.project_names = vec![
+            project_name("curseforge", "12345", "CF Shared"),
+            project_name("modrinth", "12345", "MR Shared"),
+        ];
+        let installed = vec![
+            InstalledProject {
+                provider: "curseforge".to_string(),
+                project_id: "12345".to_string(),
+                name: "CF Installed".to_string(),
+                version_id: None,
+            },
+            InstalledProject {
+                provider: "modrinth".to_string(),
+                project_id: "12345".to_string(),
+                name: "MR Installed".to_string(),
+                version_id: None,
+            },
+        ];
+
+        let res = build_resolution(&g, &installed);
+
+        assert_eq!(res.optional.len(), 2);
+        assert_eq!(
+            res.optional
+                .iter()
+                .find(|item| item.provider == "curseforge")
+                .map(|item| item.name.as_str()),
+            Some("CF Shared")
+        );
+        assert_eq!(
+            res.optional
+                .iter()
+                .find(|item| item.provider == "modrinth")
+                .map(|item| item.name.as_str()),
+            Some("MR Shared")
+        );
+        assert_eq!(res.skipped.len(), 2);
+        assert_eq!(
+            res.skipped
+                .iter()
+                .find(|item| item.provider == "curseforge")
+                .map(|item| item.name.as_str()),
+            Some("CF Installed")
+        );
+        assert_eq!(
+            res.skipped
+                .iter()
+                .find(|item| item.provider == "modrinth")
+                .map(|item| item.name.as_str()),
+            Some("MR Installed")
+        );
+    }
+
+    #[test]
+    fn result_items_carry_provider_for_all_sections() {
+        let root = provider_node(
+            "cf:root:1",
+            "cf-root",
+            "curseforge",
+            "CF Root",
+            "1.0",
+            vec![
+                edge_of_kind("cf:root:1", DEP_OPTIONAL, "opt"),
+                req("cf:root:1", "inst", None),
+                req("cf:root:1", "missing", None),
+                edge_of_kind("cf:root:1", DEP_INCOMPATIBLE, "planned"),
+                req("cf:root:1", "planned", Some("cf:planned:1")),
+            ],
+        );
+        let planned = provider_node(
+            "cf:planned:1",
+            "planned",
+            "curseforge",
+            "Planned",
+            "1.0",
+            vec![],
+        );
+        let g = graph(vec![root, planned], &["cf:root:1"]);
+        let installed = vec![InstalledProject {
+            provider: "curseforge".to_string(),
+            project_id: "inst".to_string(),
+            name: "Installed".to_string(),
+            version_id: None,
+        }];
+
+        let res = build_resolution(&g, &installed);
+
+        assert!(res.install.iter().all(|item| item.provider == "curseforge"));
+        assert_eq!(res.skipped.len(), 1);
+        assert_eq!(res.skipped[0].provider, "curseforge");
+        assert_eq!(res.optional.len(), 1);
+        assert_eq!(res.optional[0].provider, "curseforge");
+        assert_eq!(res.conflicts.len(), 1);
+        assert_eq!(res.conflicts[0].provider, "curseforge");
+        assert_eq!(res.conflicts[0].reasons[0].source_provider, "curseforge");
+        assert!(res
+            .unresolved
+            .iter()
+            .any(|item| item.provider == "curseforge" && item.project_id == "missing"));
+        assert!(res
+            .unresolved
+            .iter()
+            .filter(|item| item.project_id == "missing")
+            .all(|item| item.source_provider == "curseforge"));
+    }
+
+    #[test]
+    fn project_key_normalizes_legacy_empty_and_case() {
+        assert_eq!(ProjectKey::new("", "x").provider(), "modrinth");
+        assert_eq!(
+            ProjectKey::new("CurseForge", "12345").provider(),
+            "curseforge"
+        );
+        assert_eq!(ProjectKey::new(" modrinth ", "x").project_id(), "x");
+        assert_eq!(
+            ProjectKey::new(" Modrinth ", "x"),
+            ProjectKey::new("modrinth", "x")
+        );
+        assert_eq!(ProjectKey::new("", "x"), ProjectKey::new("modrinth", "x"));
+        assert_ne!(
+            ProjectKey::new("curseforge", "12345"),
+            ProjectKey::new("modrinth", "12345")
+        );
+    }
+
+    #[test]
     fn classify_compat_produces_all_four_states() {
         assert_eq!(classify_compat(true, 12, None), COMPAT_COMPATIBLE);
         assert_eq!(classify_compat(true, 0, Some(7)), COMPAT_UNVERIFIED);
         assert_eq!(classify_compat(true, 0, Some(0)), COMPAT_INCOMPATIBLE);
         assert_eq!(classify_compat(true, 0, None), COMPAT_INCOMPATIBLE);
         assert_eq!(classify_compat(false, 9, Some(9)), COMPAT_UNKNOWN);
+    }
+
+    #[test]
+    fn test_manual_jar_with_local_stem_never_satisfies_catalog_dependency_by_name() {
+        let required_dep = DepEdge {
+            source_version_id: "v-root".to_string(),
+            dep_type: DEP_REQUIRED.to_string(),
+            project_id: Some("P-CATALOG-DEP".to_string()),
+            version_id: None,
+        };
+        let mut g = graph(
+            vec![
+                node("v-root", "P-ROOT", "Root Mod", "1.0", vec![required_dep]),
+                node("v-dep", "P-CATALOG-DEP", "Sodium", "0.5", vec![]),
+            ],
+            &["v-root"],
+        );
+        g.project_names
+            .push(project_name("modrinth", "P-CATALOG-DEP", "Sodium"));
+
+        // An unknown local jar with the same display name "Sodium" but project_id "local:sodium"
+        let res = build_resolution(
+            &g,
+            &[InstalledProject {
+                provider: "local".to_string(),
+                project_id: "local:sodium".to_string(),
+                name: "Sodium".to_string(),
+                version_id: None,
+            }],
+        );
+
+        // Must NOT skip P-CATALOG-DEP based on name! It must plan the required dependency.
+        assert!(
+            res.skipped.is_empty(),
+            "Local unverified jar must NOT be skipped as matching dependency"
+        );
+        assert!(
+            res.install
+                .iter()
+                .any(|item| item.project_id == "P-CATALOG-DEP"),
+            "Catalog dependency must be planned"
+        );
+    }
+
+    #[test]
+    fn test_installed_content_reads_packwiz_metadata_fallback() {
+        let dir = temp_dir("pw_fallback");
+        let mods_dir = dir.join("mods");
+        let index_dir = mods_dir.join(".index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+
+        let pw_content = "filename = 'sodium-0.5.jar'\nname = 'Sodium'\n[update.modrinth]\nmod-id = 'AANobbMI'\nversion = 'v0.5.11'\n";
+        std::fs::write(index_dir.join("sodium.pw.toml"), pw_content).unwrap();
+        std::fs::write(mods_dir.join("sodium-0.5.jar"), b"PKdummy").unwrap();
+
+        let installed = InstalledContent::read(&mods_dir, "sodium-0.5.jar", "mod");
+        assert_eq!(installed.project_id.as_deref(), Some("AANobbMI"));
+        assert_eq!(installed.project_name.as_deref(), Some("Sodium"));
+        assert_eq!(installed.provider, "modrinth");
+        assert_eq!(installed.version_number.as_deref(), Some("v0.5.11"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolver_skips_when_dep_edge_has_null_project_id_but_target_is_installed() {
+        // Root A requires B, but the Modrinth DepEdge has project_id: None and version_id: Some("vb").
+        // Node vb has project_id: "mod-b".
+        // The installed list has "mod-b" installed.
+        // The resolver MUST resolve the target project from vb, find it installed, and NOT plan vb!
+        let dep_without_pid = DepEdge {
+            source_version_id: "va".to_string(),
+            dep_type: DEP_REQUIRED.to_string(),
+            project_id: None,
+            version_id: Some("vb".to_string()),
+        };
+
+        let g = graph(
+            vec![
+                node("va", "mod-a", "Mod A", "1.0", vec![dep_without_pid]),
+                node("vb", "mod-b", "Mod B", "2.0", vec![]),
+            ],
+            &["va"],
+        );
+
+        let res = build_resolution(
+            &g,
+            &[InstalledProject {
+                provider: "modrinth".to_string(),
+                project_id: "mod-b".to_string(),
+                name: "Mod B".to_string(),
+                version_id: None,
+            }],
+        );
+
+        // Only mod-a should be planned for install; mod-b is already installed!
+        assert_eq!(plan_ids(&res), vec!["mod-a"]);
+        assert_eq!(res.skipped.len(), 1);
+        assert_eq!(res.skipped[0].project_id, "mod-b");
+        assert_eq!(res.skipped[0].name, "Mod B");
+    }
+
+    #[test]
+    fn test_curseforge_and_modrinth_identical_project_ids_do_not_collide() {
+        // CurseForge project 50000 is installed on disk
+        let cf_installed = InstalledProject {
+            provider: "curseforge".to_string(),
+            project_id: "50000".to_string(),
+            name: "CF Mod".to_string(),
+            version_id: None,
+        };
+
+        // Modrinth root version requiring Modrinth project 50000
+        let mut root = node(
+            "mr:root:1",
+            "mr-root",
+            "Modrinth Root",
+            "1.0",
+            vec![req("mr:root:1", "50000", Some("mr:dep:1"))],
+        );
+        root.provider = "modrinth".to_string();
+
+        let mut dep_node = node("mr:dep:1", "50000", "Modrinth Dep", "1.0", vec![]);
+        dep_node.provider = "modrinth".to_string();
+
+        let g = graph(vec![root, dep_node], &["mr:root:1"]);
+
+        // 1. With ONLY the CurseForge mod installed, Modrinth dependency 50000 must NOT be satisfied!
+        let res1 = build_resolution(&g, std::slice::from_ref(&cf_installed));
+        assert_eq!(
+            res1.skipped.len(),
+            0,
+            "CurseForge mod 50000 must not satisfy Modrinth dependency 50000"
+        );
+        assert!(
+            res1.install.iter().any(|item| item.project_id == "50000"),
+            "Modrinth dep must be installed"
+        );
+
+        // 2. When the Modrinth mod 50000 is installed, it correctly satisfies the Modrinth dependency
+        let mr_installed = InstalledProject {
+            provider: "modrinth".to_string(),
+            project_id: "50000".to_string(),
+            name: "MR Mod".to_string(),
+            version_id: None,
+        };
+        let res2 = build_resolution(&g, &[cf_installed, mr_installed]);
+        assert_eq!(
+            res2.skipped.len(),
+            1,
+            "Modrinth mod 50000 satisfies Modrinth dependency"
+        );
+        assert_eq!(res2.skipped[0].project_id, "50000");
+        assert!(!res2.install.iter().any(|item| item.project_id == "50000"));
     }
 }

@@ -8,6 +8,20 @@ import { invoke } from '@tauri-apps/api/core';
 
 export type ProviderId = 'modrinth' | 'curseforge';
 
+/** Identity of an async catalog request: provider plus a switch generation. */
+export interface ProviderRequestToken {
+  provider: ProviderId;
+  generation: number;
+}
+
+/** True only while both the provider and its generation are unchanged. */
+export function isCurrentProviderRequest(
+  request: ProviderRequestToken,
+  current: ProviderRequestToken,
+): boolean {
+  return request.provider === current.provider && request.generation === current.generation;
+}
+
 /** Normalized compatibility states returned by the backend classifier. */
 export type CompatState = 'compatible' | 'unverified' | 'incompatible' | 'unknown';
 

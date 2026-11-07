@@ -14,7 +14,10 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
 import { RemoteIcon } from '../../lib/remoteImage';
-import { getProvider, type ProviderId, type ProviderProject } from '../../lib/contentProviders';
+import {
+  getProvider, isCurrentProviderRequest,
+  type ProviderId, type ProviderProject, type ProviderRequestToken,
+} from '../../lib/contentProviders';
 import { useSettingsStore } from '../../stores/settingsStore';
 
 type Hit = ProviderProject;
@@ -39,19 +42,23 @@ export interface SelectedItem {
 
 /** Backend dependency-resolution payloads (cmd_resolve_dependencies). */
 interface DepConflictReason {
+  source_provider?: string;
   source_project_id: string;
   source_name: string;
   requirement: string;
   kind: string;
 }
 interface DepConflict {
+  provider?: string;
   project_id: string;
   project_name: string;
   reasons: DepConflictReason[];
 }
 interface UnresolvedDep {
+  provider?: string;
   project_id: string;
   project_name: string;
+  source_provider?: string;
   source_project_id: string;
   source_name: string;
   reason: string;
@@ -69,11 +76,22 @@ interface PlanEntry {
   /** `modrinth` / `curseforge` — set by the backend resolver. */
   provider?: string;
 }
+interface OptionalDep {
+  provider?: string;
+  project_id: string;
+  name: string;
+  source_name: string;
+}
+interface SkippedDep {
+  provider?: string;
+  project_id: string;
+  name: string;
+}
 interface Resolution {
   install: PlanEntry[];
   conflicts: DepConflict[];
-  optional: unknown[];
-  skipped: unknown[];
+  optional: OptionalDep[];
+  skipped: SkippedDep[];
   unresolved: UnresolvedDep[];
 }
 
@@ -129,6 +147,17 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     return saved === 'curseforge' ? 'curseforge' : 'modrinth';
   });
   const provider = getProvider(providerId);
+  // Provider switches advance a generation so an `addLatest` request that was
+  // started against the old catalog can never mutate the new selection.
+  const providerIdRef = useRef(providerId);
+  providerIdRef.current = providerId;
+  const providerGenRef = useRef(0);
+  const changeProvider = useCallback((next: ProviderId) => {
+    if (next === providerIdRef.current) return;
+    providerIdRef.current = next;
+    providerGenRef.current += 1;
+    setProviderId(next);
+  }, []);
   const curseforgeApiKey = useSettingsStore((s) => s.config?.curseforge_api_key);
   const [sortMode, setSortMode] = useState<SortMode>('downloads');
   // Modrinth has no "oldest" index; we request newest and page backwards.
@@ -224,6 +253,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setSelected(null);
     setVersions([]);
     setModDetail(null);
+    setAddingId(null);
     commitSelectedItems([]);
     setConflicts([]);
     setUnresolved([]);
@@ -267,7 +297,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setPopularOffset(0);
     setHasMorePopular(true);
     try {
-      const base = { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
+      const base = { projectType: contentType, mcVersion: mcVersion ?? null, loader: versionLoader, offset: 0, limit: PAGE_SIZE, index: sortIndex };
       let res = await provider.popular(base);
       if (reqId !== popularReqRef.current) return;
       if (emulateOldest) {
@@ -289,7 +319,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       }
     } catch { }
     if (reqId === popularReqRef.current) setLoading(false);
-  }, [contentType, mcVersion, loader, sortIndex, emulateOldest, providerId]);
+  }, [contentType, mcVersion, versionLoader, sortIndex, emulateOldest, providerId]);
 
   const popularOffsetRef = useRef(0);
   popularOffsetRef.current = popularOffset;
@@ -300,7 +330,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setLoadingMore(true);
     const offset = popularOffsetRef.current;
     try {
-      const res = await provider.popular({ projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
+      const res = await provider.popular({ projectType: contentType, mcVersion: mcVersion ?? null, loader: versionLoader, offset, limit: PAGE_SIZE, index: sortIndex });
       if (reqId !== popularReqRef.current) { setLoadingMore(false); return; }
       const raw: Hit[] = res.hits || [];
       const hits: Hit[] = emulateOldest ? [...raw].reverse() : raw;
@@ -319,7 +349,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       }
     } catch { }
     setLoadingMore(false);
-  }, [contentType, mcVersion, loader, hasMorePopular, loadingMore, sortIndex, emulateOldest, providerId]);
+  }, [contentType, mcVersion, versionLoader, hasMorePopular, loadingMore, sortIndex, emulateOldest, providerId]);
 
   useEffect(() => { loadPopular(); }, [loadPopular]);
 
@@ -349,7 +379,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setHasMoreResults(true);
     setSelected(null);
     try {
-      const base = { query: q, projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset: 0, limit: PAGE_SIZE, index: sortIndex };
+      const base = { query: q, projectType: contentType, mcVersion: mcVersion ?? null, loader: versionLoader, offset: 0, limit: PAGE_SIZE, index: sortIndex };
       let res = await provider.search(q, base);
       if (reqId !== searchReqRef.current) return;
       if (emulateOldest) {
@@ -371,7 +401,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       }
     } catch (e: any) { addToast(t('content.search_error', { error: e.toString() }), 'error'); }
     if (reqId === searchReqRef.current) setLoading(false);
-  }, [contentType, mcVersion, loader, sortIndex, emulateOldest, provider, resetToPopular, t]);
+  }, [contentType, mcVersion, versionLoader, sortIndex, emulateOldest, provider, resetToPopular, t]);
 
   const handleSearch = () => {
     if (searchTimerRef.current !== null) {
@@ -426,7 +456,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setLoadingMore(true);
     const offset = resultsOffsetRef.current;
     try {
-      const res = await provider.search(query, { projectType: contentType, mcVersion: mcVersion ?? null, loader: loader ?? null, offset, limit: PAGE_SIZE, index: sortIndex });
+      const res = await provider.search(query, { projectType: contentType, mcVersion: mcVersion ?? null, loader: versionLoader, offset, limit: PAGE_SIZE, index: sortIndex });
       if (reqId !== searchReqRef.current) { setLoadingMore(false); return; }
       const raw: Hit[] = res.hits || [];
       const hits: Hit[] = emulateOldest ? [...raw].reverse() : raw;
@@ -445,7 +475,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       }
     } catch { }
     setLoadingMore(false);
-  }, [contentType, mcVersion, loader, query, hasMoreResults, loadingMore, sortIndex, emulateOldest, providerId]);
+  }, [contentType, mcVersion, versionLoader, query, hasMoreResults, loadingMore, sortIndex, emulateOldest, providerId]);
 
   const prevSortModeRef = useRef(sortMode);
   useEffect(() => {
@@ -508,15 +538,23 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     if (reqId === detailReqRef.current) setLoadingDetail(false);
   };
 
+  const isInstalledInProvider = (id: string, slug?: string, title?: string) => {
+    const installed = (key: string) => installedProjectIds?.has(key) ?? false;
+    if (installed(`provider:${providerId}:${normalizeSlug(id)}`)) return true;
+    if (slug && installed(`provider:${providerId}:${normalizeSlug(slug)}`)) return true;
+    if (title) {
+      if (installed(`name:${providerId}:${normalizeName(title)}`)) return true;
+      if (installed(`name:${providerId}:${normalizeSlug(title)}`)) return true;
+    }
+    return false;
+  };
   const isAdded = (id: string, slug?: string, title?: string) =>
-    selectedItems.some((m) => m.projectId === id)
-    || (installedProjectIds?.has(normalizeSlug(id)) ?? false)
-    || (slug ? (installedProjectIds?.has(normalizeSlug(slug)) ?? false) : false)
-    || (title ? (installedProjectIds?.has(`name:${normalizeName(title)}`) ?? false) : false);
+    selectedItems.some(
+      (m) => m.projectId === id && (m.source || 'modrinth') === providerId,
+    )
+    || isInstalledInProvider(id, slug, title);
   const isInstalled = (id: string, slug?: string, title?: string) =>
-    (installedProjectIds?.has(normalizeSlug(id)) ?? false)
-    || (slug ? (installedProjectIds?.has(normalizeSlug(slug)) ?? false) : false)
-    || (title ? (installedProjectIds?.has(`name:${normalizeName(title)}`) ?? false) : false);
+    isInstalledInProvider(id, slug, title);
 
   // Re-resolve the whole selection through the backend (stage 3, items 14-15):
   // the ordered plan replaces the list (projects deduplicated, dependencies
@@ -589,21 +627,47 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   };
 
   // When an item is removed by hand, drop the conflict/warning entries it
-  // caused instead of re-resolving the whole graph over the network.
-  const pruneResolution = (projectId: string) => {
+  // caused instead of re-resolving the whole graph over the network. Project
+  // ids are only unique inside a provider, so both halves must match.
+  const pruneResolution = (projectId: string, provider: string) => {
     setConflicts((prev) => prev
-      .map((c) => ({ ...c, reasons: c.reasons.filter((r) => r.source_project_id !== projectId) }))
-      .filter((c) => c.project_id !== projectId && c.reasons.length > 0));
-    setUnresolved((prev) => prev.filter((u) => u.source_project_id !== projectId));
+      .map((c) => ({
+        ...c,
+        reasons: c.reasons.filter((r) =>
+          !(r.source_project_id === projectId
+            && (r.source_provider || 'modrinth') === provider)),
+      }))
+      .filter((c) =>
+        !(c.project_id === projectId && (c.provider || 'modrinth') === provider)
+        && c.reasons.length > 0));
+    setUnresolved((prev) => prev.filter((u) =>
+      !(u.source_project_id === projectId
+        && (u.source_provider || 'modrinth') === provider)));
   };
 
   const addLatest = async (hit: Hit) => {
-    if (selectedItemsRef.current.some((m) => m.projectId === hit.project_id) || isInstalled(hit.project_id, hit.slug, hit.title)) {
+    const request: ProviderRequestToken = {
+      provider: providerId,
+      generation: providerGenRef.current,
+    };
+    if (
+      selectedItemsRef.current.some(
+        (m) => m.projectId === hit.project_id && (m.source || 'modrinth') === providerId,
+      )
+      || isInstalled(hit.project_id, hit.slug, hit.title)
+    ) {
       return;
     }
     setAddingId(hit.project_id);
     try {
       const vers = await provider.getVersions(hit.project_id, mcVersion ?? null, versionLoader);
+      if (!isCurrentProviderRequest(request, {
+        provider: providerIdRef.current,
+        generation: providerGenRef.current,
+      })) {
+        setAddingId((current) => (current === hit.project_id ? null : current));
+        return;
+      }
       if (vers.length === 0) {
         addToast(t('content.no_compatible_version'), 'warning');
         setAddingId(null);
@@ -629,7 +693,9 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         // render snapshot would silently drop it.
         const latest = selectedItemsRef.current;
         if (
-          latest.some((m) => m.projectId === hit.project_id)
+          latest.some(
+            (m) => m.projectId === hit.project_id && (m.source || 'modrinth') === providerId,
+          )
           || latest.some((m) => m.filename === item.filename)
         ) {
           return;
@@ -646,12 +712,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     const removed = selectedItemsRef.current[idx];
     const next = selectedItemsRef.current.filter((_, i) => i !== idx);
     commitSelectedItems(next);
-    if (removed) pruneResolution(removed.projectId);
+    if (removed) pruneResolution(removed.projectId, removed.source || 'modrinth');
   };
 
   const removeByProjectId = (projectId: string) => {
-    commitSelectedItems(selectedItemsRef.current.filter((m) => m.projectId !== projectId));
-    pruneResolution(projectId);
+    commitSelectedItems(selectedItemsRef.current.filter(
+      (m) => !(m.projectId === projectId && (m.source || 'modrinth') === providerId),
+    ));
+    pruneResolution(projectId, providerId);
   };
 
   const handleDownloadAll = async () => {
@@ -742,7 +810,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                 <X size={14} /> {t('content.deps_conflict_heading')}
               </div>
               {conflicts.map((c) => (
-                <div key={c.project_id} style={{ marginBottom: 6 }}>
+                <div key={`${c.provider || 'modrinth'}:${c.project_id}`} style={{ marginBottom: 6 }}>
                   <div style={{ fontWeight: 600, fontSize: 'var(--font-size-xs)' }}>{c.project_name || c.project_id}</div>
                   {c.reasons.map((r, i) => (
                     <div key={i} style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)' }}>
@@ -834,7 +902,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             { id: 'curseforge', label: t('content.provider_curseforge') },
           ]}
           active={providerId}
-          onChange={setProviderId}
+          onChange={changeProvider}
           ariaLabel={t('content.provider_label')}
           className="catalog-switch"
           style={{ flexShrink: 0, marginBottom: 0, borderBottom: 'none' }}

@@ -343,11 +343,13 @@ pub struct CfSearchQuery<'a> {
     pub limit: u32,
 }
 
-/// Search with optional classId (e.g. 4471 = modpacks), categoryId and sort.
-pub async fn search_mods_filtered(
-    query: &CfSearchQuery<'_>,
-    api_key: &str,
-) -> Result<CfSearchResponse> {
+/// Constructs the search query URL for CurseForge API.
+///
+/// For categories that do not use mod loaders (such as Resource Packs [class 12],
+/// Shaders [class 6552], Worlds [class 17], Data Packs [class 6945]), the `modLoaderType`
+/// filter is omitted even if provided, because CurseForge will return zero results
+/// when `modLoaderType` is applied to non-mod categories.
+pub fn build_search_url(query: &CfSearchQuery<'_>) -> String {
     let CfSearchQuery {
         query,
         mc_version,
@@ -378,13 +380,29 @@ pub async fn search_mods_filtered(
     if let Some(v) = mc_version {
         params.push(format!("gameVersion={}", urlencoding::encode(v)));
     }
-    if let Some(l) = loader {
+
+    // Resource packs (12), shaders (6552), worlds (17), datapacks (6945) do not have a mod loader.
+    // Specifying modLoaderType for these classes causes CurseForge API to return 0 hits.
+    let effective_loader = match class_id {
+        Some(12) | Some(6552) | Some(17) | Some(6945) => None,
+        _ => loader,
+    };
+
+    if let Some(l) = effective_loader {
         if let Some(id) = loader_type_id(l) {
             params.push(format!("modLoaderType={}", id));
         }
     }
 
-    let url = format!("{}/v1/mods/search?{}", BASE_URL, params.join("&"));
+    format!("{}/v1/mods/search?{}", BASE_URL, params.join("&"))
+}
+
+/// Search with optional classId (e.g. 4471 = modpacks), categoryId and sort.
+pub async fn search_mods_filtered(
+    query: &CfSearchQuery<'_>,
+    api_key: &str,
+) -> Result<CfSearchResponse> {
+    let url = build_search_url(query);
     api_get(&url, api_key).await
 }
 
@@ -664,6 +682,63 @@ mod tests {
             hashes: vec![],
             is_available: available,
         }
+    }
+
+    #[test]
+    fn build_search_url_omits_mod_loader_for_resourcepacks_and_shaders() {
+        // Class 6 (mods): modLoaderType should be included
+        let mod_q = CfSearchQuery {
+            query: "sodium",
+            mc_version: Some("1.21.1"),
+            loader: Some("fabric"),
+            class_id: Some(6),
+            category_id: None,
+            index: None,
+            offset: 0,
+            limit: 20,
+        };
+        let mod_url = build_search_url(&mod_q);
+        assert!(
+            mod_url.contains("modLoaderType=4"),
+            "Mods must have modLoaderType"
+        );
+        assert!(mod_url.contains("classId=6"));
+
+        // Class 12 (resourcepack): modLoaderType must be omitted even if loader is specified
+        let rp_q = CfSearchQuery {
+            query: "faithful",
+            mc_version: Some("1.21.1"),
+            loader: Some("fabric"),
+            class_id: Some(12),
+            category_id: None,
+            index: None,
+            offset: 0,
+            limit: 20,
+        };
+        let rp_url = build_search_url(&rp_q);
+        assert!(
+            !rp_url.contains("modLoaderType"),
+            "Resource packs must NOT include modLoaderType"
+        );
+        assert!(rp_url.contains("classId=12"));
+
+        // Class 6552 (shader): modLoaderType must be omitted
+        let shader_q = CfSearchQuery {
+            query: "complementary",
+            mc_version: Some("1.21.1"),
+            loader: Some("forge"),
+            class_id: Some(6552),
+            category_id: None,
+            index: None,
+            offset: 0,
+            limit: 20,
+        };
+        let shader_url = build_search_url(&shader_q);
+        assert!(
+            !shader_url.contains("modLoaderType"),
+            "Shaders must NOT include modLoaderType"
+        );
+        assert!(shader_url.contains("classId=6552"));
     }
 
     #[test]
