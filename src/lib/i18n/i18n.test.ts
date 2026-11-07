@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { formatPlayTime, formatRelativeTime } from './index';
+import { formatPlayTime, formatRelativeTime, t } from './index';
 import { useLanguageStore } from '../../stores/languageStore';
 
 const setLanguage = (language: 'en' | 'ru') =>
@@ -20,6 +20,18 @@ describe('formatPlayTime', () => {
     expect(formatPlayTime(2 * 3600 + 3 * 60)).toBe('2 часа 3 минуты');
     expect(formatPlayTime(5 * 3600)).toBe('5 часов');
     expect(formatPlayTime(11 * 3600 + 11 * 60)).toBe('11 часов 11 минут');
+  });
+});
+
+describe('Ely.by fallback dialog strings', () => {
+  it('switches the localized dialog text with the interface language', () => {
+    setLanguage('en');
+    expect(t('elyby_skins.error_title')).toBe('Could not prepare Ely.by skins');
+    expect(t('elyby_skins.bypass')).toContain('without Ely.by');
+
+    setLanguage('ru');
+    expect(t('elyby_skins.error_title')).toBe('Не удалось подготовить скины Ely.by');
+    expect(t('elyby_skins.bypass')).toContain('без поддержки Ely.by');
   });
 });
 
