@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, AlertTriangle, X } from 'lucide-react';
+import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, AlertTriangle, X, ChevronUp, ChevronDown } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Modal } from '../ui/Modal';
 import { Tooltip } from '../ui/Tooltip';
@@ -17,6 +17,7 @@ import { useContentViewStore } from '../../stores/contentViewStore';
 import { EMPTY_UPDATE_CHECK, useUpdateCheckStore, type UpdateInfo } from '../../stores/updateCheckStore';
 import { RemoteIcon } from '../../lib/remoteImage';
 import type { CompatState } from '../../lib/contentProviders';
+import { moveActiveContent, resourcePacksOptionsOrder } from '../../lib/contentOrder';
 
 /// Strip a trailing version like "_v1.2.3", "-1.0", " v3.2" from a name
 function strip_version_suffix(name: string): string {
@@ -61,6 +62,7 @@ async function runPool<T>(items: T[], limit: number, fn: (item: T) => Promise<vo
 interface ContentItem {
   filename: string;
   name: string;
+  description?: string;
   version: string;
   provider: string;
   enabled: boolean;
@@ -69,6 +71,11 @@ interface ContentItem {
   slug?: string | null;
   slug_verified?: boolean;
   project_id?: string;
+}
+
+/** Match the backend's name ordering for disabled entries. */
+function compareContentNames(a: ContentItem, b: ContentItem): number {
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 }
 
 /**
@@ -175,7 +182,7 @@ const ContentRow = memo(function ContentRow({
           pending={iconsResolving && !iconSrc}
         />
       </div>
-      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }}>
+      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }} title={item.description || item.name}>
         {item.name}
       </div>
       <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -229,8 +236,15 @@ const ContentCardRow = memo(function ContentCardRow({
         />
       </div>
       <div style={{ flex: 1, minWidth: 0, display: 'grid', gridTemplateColumns: '1fr 1fr 80px', gap: 'var(--space-sm)', alignItems: 'center' }}>
-        <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {item.name}
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.description || item.name}>
+            {item.name}
+          </div>
+          {item.description ? (
+            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.description}>
+              {item.description}
+            </div>
+          ) : null}
         </div>
         <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {item.version}
@@ -259,6 +273,8 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const [hasLoaded, setHasLoaded] = useState(() => cachedList !== undefined);
   const [skeletonVisible, setSkeletonVisible] = useState(false);
   const [iconsResolving, setIconsResolving] = useState(false);
+  const [reordering, setReordering] = useState(false);
+  const reorderingRef = useRef(false);
   const [search, setSearch] = useState('');
   // Selected by filename (NOT by filtered index) so changing the search
   // query doesn't shift the selection onto the wrong items. `Set<string>`
@@ -492,7 +508,8 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           provider: !p.provider || p.provider === 'Local' ? t('manager.provider_local') : p.provider,
           project_id: p.project_id || '',
           slug: p.project_id || undefined,
-          enabled: !p.filename.endsWith('.disabled'),
+          enabled: typeof p.enabled === 'boolean' ? p.enabled : !p.filename.endsWith('.disabled'),
+          description: p.description || '',
           icon: null,
           size: p.file_size,
         })));
@@ -704,6 +721,32 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
   const toggleEnabled = useCallback(async (item: ContentItem) => {
     try {
+      if (subfolder === 'resourcepacks') {
+        const newEnabled = !item.enabled;
+        await invoke('cmd_set_resource_pack_enabled', {
+          instanceName,
+          filename: item.filename,
+          enabled: newEnabled,
+        });
+        setItems((prev) => {
+          const next = prev.map((it) =>
+            it.filename === item.filename ? { ...it, enabled: newEnabled } : it
+          );
+          const changed = next.find((it) => it.filename === item.filename);
+          if (!changed) return next;
+          const rest = next.filter((it) => it.filename !== item.filename);
+          const active = newEnabled
+            ? [changed, ...rest.filter((it) => it.enabled)]
+            : rest.filter((it) => it.enabled);
+          const disabled = [
+            ...rest.filter((it) => !it.enabled),
+            ...(newEnabled ? [] : [changed]),
+          ].sort(compareContentNames);
+          return [...active, ...disabled];
+        });
+        return;
+      }
+
       const dir = await invoke<string>('cmd_get_instance_dir', { instanceName });
       const itemDir = `${dir}/${subfolder}`;
       const newEnabled = !item.enabled;
@@ -727,6 +770,29 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       }
     } catch (e: any) { addToast(t('manager.toggle_error', { error: e.toString() }), 'error'); }
   }, [instanceName, subfolder, getIcon, setIcon, t]);
+
+  const moveResourcePack = useCallback(async (item: ContentItem, direction: 'up' | 'down') => {
+    if (reorderingRef.current) return;
+    const reordered = moveActiveContent(items, item.filename, direction);
+    if (!reordered) return;
+    reorderingRef.current = true;
+    setReordering(true);
+    const previous = items;
+    setItems(reordered);
+    try {
+      // options.txt stores low -> high priority; the UI shows high -> low.
+      await invoke('cmd_set_resource_packs_order', {
+        instanceName,
+        filenames: resourcePacksOptionsOrder(reordered),
+      });
+    } catch (e: any) {
+      setItems(previous);
+      addToast(t('manager.reorder_error', { error: e.toString() }), 'error');
+    } finally {
+      reorderingRef.current = false;
+      setReordering(false);
+    }
+  }, [items, instanceName, t]);
 
   const toggleSelectedEnabled = async () => {
     const selected = getSelectedItems();
@@ -777,6 +843,29 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       } catch (e: any) { addToast(t('manager.add_error', { name: filename, error: e.toString() }), 'error'); }
     }
     loadItems();
+  };
+
+  const handleAddLocalFolder = async () => {
+    const selected = await openFileDialog({
+      title: t('manager.add_folder_dialog', { label }),
+      directory: true,
+      multiple: false,
+    });
+    if (!selected || Array.isArray(selected)) return;
+    const folderPath = selected.replace(/[\\/]+$/, '');
+    const filename = folderPath.split(/[/\\]/).pop() || '';
+    try {
+      await invoke('cmd_install_mod', {
+        instanceName,
+        downloadUrl: `file://${folderPath}`,
+        fileName: filename,
+        provider: 'local',
+        subfolder,
+      });
+      loadItems();
+    } catch (e: any) {
+      addToast(t('manager.add_error', { name: filename, error: e.toString() }), 'error');
+    }
   };
 
   const handleCheckUpdates = async () => {
@@ -952,6 +1041,11 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
   const selectedItems = useMemo(getSelectedItems, [items, selectedFilenames]);
   const hasSelection = selectedFilenames.size > 0;
+  const activeResourcePacks = useMemo(() => items.filter((it) => it.enabled), [items]);
+  const selectedResourcePackPos =
+    subfolder === 'resourcepacks' && selectedItems.length === 1 && selectedItems[0].enabled
+      ? activeResourcePacks.findIndex((it) => it.filename === selectedItems[0].filename)
+      : -1;
   const compatTarget = useMemo(
     () => [mcVersion ? `MC ${mcVersion}` : '', loader && loader !== 'Vanilla' ? loader : ''].filter(Boolean).join(' / '),
     [mcVersion, loader]
@@ -965,20 +1059,31 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     // For name matching, also treat dashes as spaces so a filename-derived name
     // like "3d-skin-layers" matches the Modrinth title "3D Skin Layers".
     const normalizeName = (s: string) => s.toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+    // Provider-aware installed keys: a project id/name is only unique inside
+    // its catalog. The display provider is localized for local files, which
+    // deliberately maps to "unknown" and never matches a catalog project.
+    const normalizeProvider = (provider: string) => {
+      const p = provider.toLowerCase();
+      return p === 'modrinth' || p === 'curseforge' || p === 'local' ? p : 'unknown';
+    };
     const installedIds = new Set(
       items.flatMap((it) => {
+        const provider = normalizeProvider(it.provider);
         const ids: string[] = [];
-        if (it.slug) {
-          const n = normalizeSlug(it.slug);
-          ids.push(it.slug);
-          if (n !== it.slug) ids.push(n);
+        const values = [it.project_id, it.slug].filter(
+          (value): value is string => Boolean(value),
+        );
+        for (const value of values) {
+          ids.push(`provider:${provider}:${normalizeSlug(value)}`);
         }
         if (it.name) {
-          ids.push(`name:${normalizeName(it.name)}`);
+          ids.push(`name:${provider}:${normalizeName(it.name)}`);
           // Also add narrower variants: just slug-normalized name helps when
           // Modrinth slug and item slug happen to match space-for-dash.
           const slugForm = normalizeSlug(it.name);
-          if (slugForm !== normalizeName(it.name)) ids.push(`name:${slugForm}`);
+          if (slugForm !== normalizeName(it.name)) {
+            ids.push(`name:${provider}:${slugForm}`);
+          }
         }
         return ids;
       })
@@ -1125,6 +1230,11 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         <Button size="sm" variant="ghost" onClick={handleAddLocalFile} style={{ width: '100%', whiteSpace: 'normal' }}>
           <Package size={14} style={{ flexShrink: 0 }} /> {t('manager.add_file_btn')}
         </Button>
+        {contentType !== 'mod' && (
+          <Button size="sm" variant="ghost" onClick={handleAddLocalFolder} style={{ width: '100%', whiteSpace: 'normal' }}>
+            <FolderOpen size={14} style={{ flexShrink: 0 }} /> {t('manager.add_folder_btn')}
+          </Button>
+        )}
         <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
         <Button size="sm" variant="ghost" onClick={handleCheckUpdates} disabled={checkingUpdates} style={{ width: '100%', whiteSpace: 'normal' }}>
           <RefreshCw size={14} className={checkingUpdates ? 'icon-spin' : undefined} style={{ flexShrink: 0 }} />
@@ -1139,6 +1249,33 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
               <Trash2 size={14} style={{ flexShrink: 0 }} /> {t('common.remove')}{selectedFilenames.size > 1 ? ` (${selectedFilenames.size})` : ''}
             </Button>
           </>)}
+        {subfolder === 'resourcepacks' && selectedResourcePackPos >= 0 && (
+          <>
+            <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
+            <div style={{ display: 'flex', gap: 4 }}>
+              <Button
+                size="sm"
+                variant="ghost"
+                style={{ flex: 1, minWidth: 0, whiteSpace: 'normal' }}
+                disabled={reordering || selectedResourcePackPos <= 0}
+                onClick={() => moveResourcePack(selectedItems[0], 'up')}
+                title={t('manager.move_up')}
+              >
+                <ChevronUp size={14} style={{ flexShrink: 0 }} /> {t('manager.move_up')}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                style={{ flex: 1, minWidth: 0, whiteSpace: 'normal' }}
+                disabled={reordering || selectedResourcePackPos >= activeResourcePacks.length - 1}
+                onClick={() => moveResourcePack(selectedItems[0], 'down')}
+                title={t('manager.move_down')}
+              >
+                <ChevronDown size={14} style={{ flexShrink: 0 }} /> {t('manager.move_down')}
+              </Button>
+            </div>
+          </>
+        )}
         {hasSelection && selectedItems.length === 1 && (
           <>
             <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
@@ -1159,6 +1296,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       {/* Context menu */}
       {contextMenu && (() => {
         const ctxItem = items.find((it) => it.filename === contextMenu.filename);
+        const ctxActive = items.filter((it) => it.enabled);
+        const ctxPos = ctxItem
+          ? ctxActive.findIndex((it) => it.filename === ctxItem.filename)
+          : -1;
         return (
         <div style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y, zIndex: 9999, background: 'var(--surface-elevated)', border: '1px solid var(--surface-border)', borderRadius: 'var(--radius-md)', padding: 4, minWidth: 160, boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}>
           <button style={{ display: 'block', width: '100%', padding: '6px 12px', border: 'none', background: 'none', color: 'var(--text-primary)', fontSize: 'var(--font-size-sm)', textAlign: 'left', cursor: 'pointer', borderRadius: 'var(--radius-sm)' }}
@@ -1168,6 +1309,24 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
             disabled={!ctxItem}>
             {ctxItem?.enabled ? t('common.disable') : t('common.enable')}
           </button>
+          {subfolder === 'resourcepacks' && ctxItem?.enabled && (
+            <>
+              <button style={{ display: 'block', width: '100%', padding: '6px 12px', border: 'none', background: 'none', color: 'var(--text-primary)', fontSize: 'var(--font-size-sm)', textAlign: 'left', cursor: 'pointer', borderRadius: 'var(--radius-sm)' }}
+                onMouseEnter={(e) => e.currentTarget.style.background = 'var(--bg-secondary)'}
+                onMouseLeave={(e) => e.currentTarget.style.background = 'none'}
+                onClick={() => { moveResourcePack(ctxItem, 'up'); setContextMenu(null); }}
+                disabled={reordering || ctxPos <= 0}>
+                <ChevronUp size={12} style={{ marginRight: 6 }} /> {t('manager.move_up')}
+              </button>
+              <button style={{ display: 'block', width: '100%', padding: '6px 12px', border: 'none', background: 'none', color: 'var(--text-primary)', fontSize: 'var(--font-size-sm)', textAlign: 'left', cursor: 'pointer', borderRadius: 'var(--radius-sm)' }}
+                onMouseEnter={(e) => e.currentTarget.style.background = 'var(--bg-secondary)'}
+                onMouseLeave={(e) => e.currentTarget.style.background = 'none'}
+                onClick={() => { moveResourcePack(ctxItem, 'down'); setContextMenu(null); }}
+                disabled={reordering || ctxPos < 0 || ctxPos >= ctxActive.length - 1}>
+                <ChevronDown size={12} style={{ marginRight: 6 }} /> {t('manager.move_down')}
+              </button>
+            </>
+          )}
           <button style={{ display: 'block', width: '100%', padding: '6px 12px', border: 'none', background: 'none', color: 'var(--color-danger)', fontSize: 'var(--font-size-sm)', textAlign: 'left', cursor: 'pointer', borderRadius: 'var(--radius-sm)' }}
             onMouseEnter={(e) => e.currentTarget.style.background = 'var(--bg-secondary)'}
             onMouseLeave={(e) => e.currentTarget.style.background = 'none'}
