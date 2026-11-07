@@ -7,6 +7,7 @@ import { ToastContainer } from './components/ui/Toast';
 import { InstallOverlay } from './components/install/InstallOverlay';
 import { UpdaterModal } from './components/UpdaterModal';
 import { JavaSetupModal } from './components/launch/JavaSetupModal';
+import { ElybySkinsErrorDialog } from './components/launch/ElybySkinsErrorDialog';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ConfirmDialog } from './components/ui/ConfirmDialog';
 import { SnakeSpinner } from './components/ui/SnakeSpinner';
@@ -185,6 +186,7 @@ function App() {
         open={javaSetupVisible}
         onClose={() => setJavaSetupVisible(false)}
       />
+      <ElybySkinsErrorDialog />
 
       {/* Leave guard: navigating away would discard the content browser
           selection or unsaved settings changes. Shared confirm modal —

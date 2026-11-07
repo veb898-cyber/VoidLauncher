@@ -66,6 +66,12 @@ pub struct AppConfig {
     /// CurseForge API key
     #[serde(default)]
     pub curseforge_api_key: String,
+    /// Load the pinned authlib-injector Java agent for Ely.by accounts so
+    /// skins work inside Minecraft. Has no effect on Microsoft/offline
+    /// accounts. Defaults to true for configs written before this field
+    /// existed.
+    #[serde(default = "default_elyby_skins_in_game")]
+    pub elyby_skins_in_game: bool,
 }
 
 fn default_client_id() -> String {
@@ -74,6 +80,10 @@ fn default_client_id() -> String {
 
 fn default_gc_preset() -> String {
     "g1gc".to_string()
+}
+
+fn default_elyby_skins_in_game() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -132,6 +142,7 @@ impl Default for AppConfig {
             // as an identifier, not a credential).
             curseforge_api_key: "$2a$10$wuAJuNZuted3NORVmpgUC.m8sI.pv1tOPKZyBgLFGjxFp/br0lZCC"
                 .into(),
+            elyby_skins_in_game: true,
         }
     }
 }
@@ -368,6 +379,29 @@ mod tests {
     #[test]
     fn proxy_url_disabled_by_default() {
         assert_eq!(base().proxy_url(), None);
+    }
+
+    #[test]
+    fn elyby_skins_are_enabled_by_default() {
+        assert!(base().elyby_skins_in_game);
+    }
+
+    #[test]
+    fn legacy_config_without_elyby_setting_defaults_to_true() {
+        // Every field that has no serde default; the new Ely.by flag is
+        // intentionally absent, exactly as in configs written before 1.5.x.
+        let legacy = serde_json::json!({
+            "data_dir": "C:\\VoidLauncher",
+            "default_memory_mb": 4096,
+            "max_memory_mb": 8192,
+            "default_jvm_args": ["-XX:+DisableExplicitGC"],
+            "java_path": null,
+            "close_on_launch": false,
+            "show_snapshots": false,
+            "show_old_versions": false
+        });
+        let config: AppConfig = serde_json::from_value(legacy).expect("legacy config parses");
+        assert!(config.elyby_skins_in_game);
     }
 
     #[test]

@@ -4,6 +4,47 @@ import { logUiMessage } from '../lib/uiLog';
 import { t } from '../lib/i18n';
 import { friendlyErrorMessage } from '../lib/errors';
 
+export type ElybySkinsChoice = 'retry' | 'bypass' | 'cancel';
+
+export interface ElybySkinsPrompt {
+  kind: string;
+  resolve: (choice: ElybySkinsChoice) => void;
+}
+
+export interface LaunchOptions {
+  /** One-shot: the dialog's "launch without Ely.by support" choice. */
+  skipElybySkins?: boolean;
+}
+
+type ElybySkinsPrepareResult =
+  | { status: 'not_applicable' }
+  | { status: 'unsupported'; min_version: string }
+  | { status: 'ready'; version: string }
+  | { status: 'failed'; kind: string; detail: string };
+
+interface ElybySkinsFailure {
+  kind: string;
+  detail: string;
+}
+
+/** Tauri returns the untagged `LaunchCommandError::Elyby` object as-is. */
+function elybyFailureFrom(error: unknown): ElybySkinsFailure | null {
+  let value: unknown = error;
+  if (typeof error === 'string' && error.trim().startsWith('{')) {
+    try {
+      value = JSON.parse(error);
+    } catch {
+      return null;
+    }
+  }
+  if (!value || typeof value !== 'object' || !('elyby_skins' in value)) return null;
+  const failure = (value as { elyby_skins?: unknown }).elyby_skins;
+  if (!failure || typeof failure !== 'object') return null;
+  const { kind, detail } = failure as { kind?: unknown; detail?: unknown };
+  if (typeof kind !== 'string') return null;
+  return { kind, detail: typeof detail === 'string' ? detail : '' };
+}
+
 export interface LoaderLibrary {
   name: string;
   url: string;
@@ -46,6 +87,8 @@ interface InstanceState {
   error: string | null;
   isLaunching: boolean;
   launchStatus: string | null;
+  /** Non-null while the localized Ely.by preparation dialog is open. */
+  elybySkinsPrompt: ElybySkinsPrompt | null;
 
   loadInstances: () => Promise<void>;
   createInstance: (name: string, mcVersion: string, loader?: string, loaderVersion?: string) => Promise<void>;
@@ -53,7 +96,14 @@ interface InstanceState {
   selectInstance: (name: string | null) => void;
   /** Launches the instance. Resolves `true` when the launch was accepted,
    *  `false` when it failed (error is set). */
-  launchGame: (instanceName: string, serverAddress?: string, serverPort?: number) => Promise<boolean>;
+  launchGame: (
+    instanceName: string,
+    serverAddress?: string,
+    serverPort?: number,
+    options?: LaunchOptions,
+  ) => Promise<boolean>;
+  /** Resolve the currently open Ely.by dialog and continue/cancel the launch. */
+  resolveElybySkins: (choice: ElybySkinsChoice) => void;
   installVersion: (versionUrl: string, instanceId?: string) => Promise<string>;
   checkInstalled: (instanceName: string) => Promise<boolean>;
   saveInstance: (instance: Instance) => Promise<void>;
@@ -76,13 +126,14 @@ function reportLaunchStatus(message: string | null) {
  */
 const launchingInstances = new Set<string>();
 
-export const useInstanceStore = create<InstanceState>((set) => ({
+export const useInstanceStore = create<InstanceState>((set, get) => ({
   instances: [],
   selectedInstance: null,
   isLoading: false,
   error: null,
   isLaunching: false,
   launchStatus: null,
+  elybySkinsPrompt: null,
 
   loadInstances: async () => {
     set({ isLoading: true });
@@ -124,7 +175,12 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     set({ selectedInstance: name });
   },
 
-  launchGame: async (instanceName: string, serverAddress?: string, serverPort?: number) => {
+  launchGame: async (
+    instanceName: string,
+    serverAddress?: string,
+    serverPort?: number,
+    options?: LaunchOptions,
+  ) => {
     if (launchingInstances.has(instanceName)) return false;
     launchingInstances.add(instanceName);
 
@@ -135,17 +191,63 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     reportLaunchStatus('Launching...');
 
     try {
-      // The window is NOT minimized here. It gets minimized only when the
-      // `game_started` event arrives from the backend (see useGameEvents),
-      // i.e. when the Minecraft process is actually running.
-      const result = await invoke<string>('cmd_launch_game', {
-        instanceName,
-        serverAddress: serverAddress ?? null,
-        serverPort: serverPort ?? null,
-      });
-      reportLaunchStatus(result);
-      set({ isLaunching: false, launchStatus: result });
-      return true;
+      let skipElybySkins = options?.skipElybySkins ?? false;
+
+      const ask = (kind: string) =>
+        new Promise<ElybySkinsChoice>((resolve) => {
+          set({ elybySkinsPrompt: { kind, resolve } });
+        });
+
+      // Preflight lets the renderer show a localized retry/bypass/cancel
+      // dialog before the long launch preparation. The actual launch still
+      // re-verifies the cache; if that second check fails, its structured
+      // `elyby_skins` error reopens the same dialog instead of degrading to
+      // a toast.
+      while (true) {
+        if (!skipElybySkins) {
+          const prepared = await invoke<ElybySkinsPrepareResult>(
+            'cmd_prepare_elyby_skins',
+            { instanceName },
+          );
+          if (prepared.status === 'failed') {
+            const choice = await ask(prepared.kind);
+            if (choice === 'cancel') {
+              set({ isLaunching: false, launchStatus: null });
+              return false;
+            }
+            if (choice === 'retry') continue;
+            // One-shot only: no AppConfig/account update is written.
+            skipElybySkins = true;
+          }
+        }
+
+        try {
+          // The window is NOT minimized here. It gets minimized only when the
+          // `game_started` event arrives from the backend (see useGameEvents),
+          // i.e. when the Minecraft process is actually running.
+          const result = await invoke<string>('cmd_launch_game', {
+            instanceName,
+            serverAddress: serverAddress ?? null,
+            serverPort: serverPort ?? null,
+            skipElybySkins,
+          });
+          reportLaunchStatus(result);
+          set({ isLaunching: false, launchStatus: result });
+          return true;
+        } catch (e) {
+          const failure = skipElybySkins ? null : elybyFailureFrom(e);
+          if (!failure) throw e;
+
+          const choice = await ask(failure.kind);
+          if (choice === 'cancel') {
+            set({ isLaunching: false, launchStatus: null });
+            return false;
+          }
+          if (choice === 'retry') continue;
+          // One-shot bypass: retry the same launch without the agent.
+          skipElybySkins = true;
+        }
+      }
     } catch (e: any) {
       const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);
@@ -154,6 +256,12 @@ export const useInstanceStore = create<InstanceState>((set) => ({
     } finally {
       launchingInstances.delete(instanceName);
     }
+  },
+
+  resolveElybySkins: (choice) => {
+    const prompt = get().elybySkinsPrompt;
+    set({ elybySkinsPrompt: null });
+    prompt?.resolve(choice);
   },
 
   installVersion: async (versionUrl: string, instanceId?: string) => {

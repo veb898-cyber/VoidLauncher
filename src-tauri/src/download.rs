@@ -1527,6 +1527,31 @@ pub fn verify_zip_magic(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Compute SHA-256 hash of a file and return a lowercase hex string.
+///
+/// Used for pinned third-party runtime components (authlib-injector): their
+/// origin publishes a SHA-256, not the SHA-1 used by Minecraft metadata.
+pub fn hash_file_sha256(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Verify a SHA-256 hex digest without loading the whole file into memory.
+pub fn verify_sha256(path: &std::path::Path, expected: &str) -> Result<bool> {
+    Ok(hash_file_sha256(path)?.eq_ignore_ascii_case(expected))
+}
+
 /// Compute SHA1 hash of a file and return hex string
 pub fn hash_file_sha1(path: &std::path::Path) -> Result<String> {
     use std::io::Read;
@@ -1568,6 +1593,33 @@ pub(crate) fn is_unsafe_archive_path(relative: &str) -> bool {
 /// when the proxy setting changes.
 pub fn global_http_client() -> reqwest::Result<reqwest::Client> {
     http_client()
+}
+
+/// Client whose redirects are restricted to a small, module-owned host list.
+///
+/// Security-sensitive downloads (pinned third-party runtime components and
+/// Ely.by API discovery) must not inherit the launcher-wide allowlist: a
+/// redirect from the expected host to any other allowlisted domain would be
+/// accepted by the global policy. The caller still verifies the final URL and
+/// payload (SHA-256 / JSON schema).
+pub(crate) fn http_client_for_hosts(hosts: &[&str]) -> reqwest::Result<reqwest::Client> {
+    let proxy = resolved_proxy_url(active_proxy_raw());
+    let allowed: Vec<String> = hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        let url = attempt.url();
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let host_ok = allowed
+            .iter()
+            .any(|h| host == *h || host.ends_with(&format!(".{}", h)));
+        if url.scheme() == "https" && host_ok {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    });
+    base_client_builder(proxy.as_deref())
+        .redirect(policy)
+        .build()
 }
 
 #[cfg(test)]

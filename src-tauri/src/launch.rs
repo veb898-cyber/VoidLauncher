@@ -80,6 +80,14 @@ pub struct LaunchAuth<'a> {
     pub access_token: &'a str,
     pub uuid: &'a str,
     pub username: &'a str,
+    /// Minecraft's `--userType`: `msa` for Microsoft, `mojang` for Ely.by,
+    /// `legacy` for offline accounts. Passing `msa` for a Yggdrasil/Ely.by
+    /// session makes the client choose the wrong user API.
+    pub user_type: &'a str,
+    /// Ely.by-only in-game skin integration. Prepared by the launcher before
+    /// the profile is built; `None` for Microsoft/offline accounts and when
+    /// the setting is disabled or the MC version is unsupported.
+    pub authlib_injector: Option<&'a crate::authlib_injector::AuthlibInjector>,
 }
 
 /// Fully composed Java invocation for one launch: paths resolved, arguments
@@ -246,12 +254,57 @@ pub struct LaunchProfileRequest<'a> {
     pub default_jvm_args: &'a [String],
 }
 
+/// Build the two JVM arguments required by authlib-injector.
+///
+/// The path is passed as one argv element, so spaces are safe. `=` is not:
+/// the JVM treats the first `=` after `-javaagent:` as the options separator.
+/// The managed cache path never contains one, but a corrupt/unexpected value
+/// must fail loudly instead of silently loading the wrong path.
+fn authlib_agent_args(agent: &crate::authlib_injector::AuthlibInjector) -> Result<Vec<String>> {
+    let jar = agent
+        .jar
+        .to_str()
+        .ok_or_else(|| LauncherError::Launch("authlib-injector path is not valid UTF-8".into()))?;
+    if jar.is_empty() || jar.contains('=') || jar.contains('\n') || jar.contains('\r') {
+        return Err(LauncherError::Launch(
+            "authlib-injector path contains an unsupported character".into(),
+        ));
+    }
+    if !agent.api_root.starts_with("https://")
+        || agent.api_root.contains('=')
+        || agent.api_root.chars().any(char::is_whitespace)
+    {
+        return Err(LauncherError::Launch(
+            "authlib-injector API root is invalid".into(),
+        ));
+    }
+    if agent.prefetched_metadata.is_empty()
+        || !agent
+            .prefetched_metadata
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+    {
+        return Err(LauncherError::Launch(
+            "authlib-injector prefetched metadata is invalid".into(),
+        ));
+    }
+
+    Ok(vec![
+        format!("-javaagent:{jar}={}", agent.api_root),
+        format!(
+            "-Dauthlibinjector.yggdrasil.prefetched={}",
+            agent.prefetched_metadata
+        ),
+    ])
+}
+
 /// Expand every placeholder the launcher knows about.
 struct PlaceholderContext<'a> {
     username: &'a str,
     uuid: &'a str,
     access_token: &'a str,
     auth_session: &'a str,
+    user_type: &'a str,
     version_name: &'a str,
     version_type: &'a str,
     game_dir: &'a Path,
@@ -276,7 +329,7 @@ impl PlaceholderContext<'_> {
             .replace("${auth_uuid}", self.uuid)
             .replace("${auth_access_token}", self.access_token)
             .replace("${auth_session}", self.auth_session)
-            .replace("${user_type}", "msa")
+            .replace("${user_type}", self.user_type)
             .replace("${version_type}", self.version_type)
             .replace("${auth_xuid}", "0")
             .replace("${clientid}", "")
@@ -573,6 +626,7 @@ pub fn build_launch_profile(
         uuid: request.auth.uuid,
         access_token: request.auth.access_token,
         auth_session: &auth_session,
+        user_type: request.auth.user_type,
         version_name: &version_info.id,
         version_type: &version_info.version_type,
         game_dir: request.game_dir,
@@ -653,6 +707,22 @@ pub fn build_launch_profile(
     // was removed in Java 23+/24 (JEP 474) where it only prints an
     // "Ignoring option" warning on every launch.
     strip_removed_jvm_flags(&mut jvm_args, request.java_major);
+
+    // Ely.by in-game skins: authlib-injector is a JVM agent, not a classpath
+    // entry and not a mod. It is only present for Ely.by accounts when the
+    // launcher prepared a verified JAR and metadata; Microsoft/offline
+    // launches keep their argument list unchanged. Prepending keeps the
+    // arguments before `-cp` and the main class.
+    if let Some(agent) = request.auth.authlib_injector {
+        let agent_args = authlib_agent_args(agent)?;
+        let mut unique = Vec::with_capacity(agent_args.len());
+        for arg in agent_args {
+            if !jvm_args.iter().any(|existing| existing == &arg) {
+                unique.push(arg);
+            }
+        }
+        jvm_args.splice(0..0, unique);
+    }
 
     // Game arguments.
     //
@@ -1395,6 +1465,8 @@ mod tests {
             access_token: "token",
             uuid: "uuid",
             username: "Player",
+            user_type: "msa",
+            authlib_injector: None,
         };
         let default_jvm_args = vec!["-XX:+DisableExplicitGC".to_string()];
         let versions_dir = root.join("versions");
@@ -1450,6 +1522,8 @@ mod tests {
             access_token: "token",
             uuid: "uuid",
             username: "Player",
+            user_type: "msa",
+            authlib_injector: None,
         };
         let default_jvm_args = Vec::new();
         let root = PathBuf::from("missing");
@@ -1549,6 +1623,8 @@ mod tests {
             access_token: "token",
             uuid: "uuid",
             username: "Player",
+            user_type: "msa",
+            authlib_injector: None,
         };
         let default_jvm_args = vec![];
 

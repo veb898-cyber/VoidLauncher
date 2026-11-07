@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { create } from 'zustand';
+import { addToast } from '../components/ui/Toast';
 import { useLogStore } from '../stores/logStore';
 import type { LogEntry } from '../stores/logStore';
 import { useFocusStore, adjustRunningCount } from '../stores/focusStore';
@@ -169,6 +170,21 @@ export function useGameEvents() {
       const level = (p.level === 'warning' ? 'warn' : p.level) as LogEntry['level'];
       addLog({ level, source: p.source, message: p.message });
     }));
+
+    register(
+      listen<{ kind: string; min_version?: string | null }>('launch_warning', (event) => {
+        if (event.payload.kind === 'elyby_skins_unsupported_mc') {
+          addToast(
+            t('errors.elyby_skins_unsupported_mc', {
+              version: event.payload.min_version ?? '1.7.2',
+            }),
+            'warning',
+          );
+        } else if (event.payload.kind === 'elyby_skins_bypassed') {
+          addToast(t('errors.elyby_skins_bypassed'), 'warning');
+        }
+      }),
+    );
 
     // Window focus tracking via Tauri events.
     // These fire on the webview window when OS focus or visibility changes.

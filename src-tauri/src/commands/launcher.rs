@@ -376,6 +376,113 @@ impl Drop for LaunchReservation<'_> {
     }
 }
 
+/// The account the launcher would use for a normal launch: the explicit
+/// default, or the first stored account as the existing fallback.
+fn should_bypass_elyby_skins(is_elyby: bool, enabled: bool, skip: bool) -> bool {
+    skip && is_elyby && enabled
+}
+
+fn active_account(data_dir: &std::path::Path) -> Option<accounts::AccountEntry> {
+    let list = accounts::list_accounts(data_dir);
+    list.iter()
+        .find(|a| a.default)
+        .or_else(|| list.first())
+        .cloned()
+}
+
+/// Result of the UI preflight. Expected preparation failures are returned as
+/// `Failed` instead of a command error so the renderer can show the retry /
+/// one-time bypass / cancel dialog without parsing backend strings.
+#[derive(Debug, serde::Serialize)]
+pub struct ElybySkinsFailure {
+    pub kind: crate::authlib_injector::PrepareErrorKind,
+    pub detail: String,
+}
+
+/// `cmd_launch_game` keeps returning plain strings for ordinary failures, but
+/// an Ely.by preparation failure is a structured object so the renderer can
+/// reopen the retry/bypass/cancel dialog even when the second preparation
+/// (inside the launch command) fails.
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum LaunchCommandError {
+    Elyby { elyby_skins: ElybySkinsFailure },
+    Message(String),
+}
+
+impl From<String> for LaunchCommandError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ElybySkinsPrepareResult {
+    NotApplicable,
+    Unsupported {
+        min_version: String,
+    },
+    Ready {
+        version: String,
+    },
+    Failed {
+        kind: crate::authlib_injector::PrepareErrorKind,
+        detail: String,
+    },
+}
+
+/// Prepare Ely.by skins before the launch command so a failure can be shown
+/// as a localized dialog with explicit retry/bypass/cancel choices. The
+/// actual launch still re-verifies the agent; this command only warms and
+/// validates the same cache.
+#[tauri::command]
+pub async fn cmd_prepare_elyby_skins(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    instance_name: String,
+) -> Result<ElybySkinsPrepareResult, String> {
+    validate_instance_name(&instance_name)?;
+    let config = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.clone()
+    };
+    let Some(account) = active_account(&config.data_dir) else {
+        return Ok(ElybySkinsPrepareResult::NotApplicable);
+    };
+    let is_elyby = matches!(&account.account_type, accounts::AccountType::ElyBy);
+    if !is_elyby || !config.elyby_skins_in_game {
+        return Ok(ElybySkinsPrepareResult::NotApplicable);
+    }
+    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
+        .map_err(|e| e.to_string())?;
+    if !crate::authlib_injector::is_supported_mc_version(&instance.mc_version) {
+        return Ok(ElybySkinsPrepareResult::Unsupported {
+            min_version: crate::authlib_injector::MIN_MC_VERSION.to_string(),
+        });
+    }
+    match crate::authlib_injector::prepare(&config.data_dir).await {
+        Ok(_) => Ok(ElybySkinsPrepareResult::Ready {
+            version: crate::authlib_injector::VERSION.to_string(),
+        }),
+        Err(e) => {
+            events::emit_log(
+                &app,
+                "warn",
+                "launch",
+                &format!(
+                    "Ely.by Skin Integration preflight failed ({:?}): {}",
+                    e.kind, e.detail
+                ),
+            );
+            Ok(ElybySkinsPrepareResult::Failed {
+                kind: e.kind,
+                detail: e.detail,
+            })
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_launch_game(
     app: AppHandle,
@@ -383,7 +490,8 @@ pub async fn cmd_launch_game(
     instance_name: String,
     server_address: Option<String>,
     server_port: Option<u16>,
-) -> Result<(), String> {
+    skip_elyby_skins: Option<bool>,
+) -> Result<(), LaunchCommandError> {
     validate_instance_name(&instance_name)?;
 
     // Guard against launching the same instance twice concurrently — a
@@ -423,7 +531,7 @@ pub async fn cmd_launch_game(
             instance_name, stale.pid
         );
         events::emit_log(&app, "warn", "launch", &msg);
-        return Err(msg);
+        return Err(msg.into());
     }
 
     // Guard against launching the same instance twice concurrently — a
@@ -436,7 +544,7 @@ pub async fn cmd_launch_game(
         Ok(r) => r,
         Err(msg) => {
             events::emit_log(&app, "warn", "launch", &msg);
-            return Err(msg);
+            return Err(msg.into());
         }
     };
 
@@ -455,21 +563,15 @@ pub async fn cmd_launch_game(
     // Launch strictly as the active account (the one marked "active" on the
     // Accounts page). Each account type resolves its own credentials;
     // Microsoft accounts use their per-account stored session.
-    let accounts_list = accounts::list_accounts(&data_dir);
-    let default_account = accounts_list
-        .iter()
-        .find(|a| a.default)
-        .or_else(|| accounts_list.first())
-        .cloned();
-
-    let Some(account) = default_account else {
+    let Some(account) = active_account(&data_dir) else {
         let msg =
             "No account available to launch the game. Please add an account first.".to_string();
         events::emit_log(&app, "error", "launch", &msg);
-        return Err(msg);
+        return Err(msg.into());
     };
 
-    let (access_token, uuid, username) = match account.account_type {
+    let is_elyby = matches!(&account.account_type, accounts::AccountType::ElyBy);
+    let (access_token, uuid, username, user_type) = match account.account_type {
         accounts::AccountType::Offline => {
             events::emit_log(
                 &app,
@@ -481,7 +583,12 @@ pub async fn cmd_launch_game(
                 .uuid
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            (String::new(), uuid_val, account.name.clone())
+            (
+                String::new(),
+                uuid_val,
+                account.name.clone(),
+                "legacy".to_string(),
+            )
         }
         accounts::AccountType::ElyBy => {
             events::emit_log(
@@ -509,6 +616,7 @@ pub async fn cmd_launch_game(
                 token,
                 account.uuid.clone().unwrap_or_default(),
                 account.name.clone(),
+                "mojang".to_string(),
             )
         }
         accounts::AccountType::Microsoft => {
@@ -527,6 +635,7 @@ pub async fn cmd_launch_game(
                             mc_token.access_token.clone(),
                             profile.id.clone(),
                             profile.name.clone(),
+                            "msa".to_string(),
                         )
                     } else {
                         let msg = format!(
@@ -534,12 +643,12 @@ pub async fn cmd_launch_game(
                             account.name
                         );
                         events::emit_log(&app, "error", "launch", &msg);
-                        return Err(msg);
+                        return Err(msg.into());
                     }
                 }
                 Err(e) => {
                     events::emit_log(&app, "error", "launch", &e);
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }
@@ -550,7 +659,7 @@ pub async fn cmd_launch_game(
         Err(e) => {
             let msg = format!("Failed to load instance '{}': {}", instance_name, e);
             events::emit_log(&app, "error", "launch", &msg);
-            return Err(e.to_string());
+            return Err(e.to_string().into());
         }
     };
 
@@ -566,7 +675,7 @@ pub async fn cmd_launch_game(
     {
         let msg = "Instance settings contain an invalid Minecraft or loader version.".to_string();
         events::emit_log(&app, "error", "launch", &msg);
-        return Err(msg);
+        return Err(msg.into());
     }
 
     // Auto-install the loader if it's set but not installed yet
@@ -585,7 +694,7 @@ pub async fn cmd_launch_game(
                     loader_str
                 );
                 events::emit_log(&app, "error", "launch", &msg);
-                return Err(msg);
+                return Err(msg.into());
             }
         };
         events::emit_log(
@@ -611,14 +720,14 @@ pub async fn cmd_launch_game(
             Err(e) => {
                 let msg = format!("Failed to auto-install {} loader: {}", loader_str, e);
                 events::emit_log(&app, "error", "launch", &msg);
-                return Err(msg);
+                return Err(msg.into());
             }
         };
         instance.loader_profile = Some(profile);
         if let Err(e) = instances::save_instance(&config.instances_dir(), &instance, None) {
             let msg = format!("Failed to save installed {} loader: {}", loader_str, e);
             events::emit_log(&app, "error", "launch", &msg);
-            return Err(msg);
+            return Err(msg.into());
         }
         events::emit_log(
             &app,
@@ -637,7 +746,7 @@ pub async fn cmd_launch_game(
         Err(e) => {
             let msg = format!("Failed to fetch version manifest: {}", e);
             events::emit_log(&app, "error", "launch", &msg);
-            return Err(msg);
+            return Err(msg.into());
         }
     };
 
@@ -667,7 +776,7 @@ pub async fn cmd_launch_game(
                 instance.mc_version, e
             );
             events::emit_log(&app, "error", "launch", &msg);
-            return Err(msg);
+            return Err(msg.into());
         }
     };
 
@@ -682,6 +791,87 @@ pub async fn cmd_launch_game(
         events::emit_log(&app, "error", "launch", &msg);
         msg
     })?;
+
+    // Ely.by in-game skins: prepare the pinned Java agent only for the active
+    // Ely.by account. The agent is optional for every other account type and
+    // must never change their launch command. A failure here is fatal instead
+    // of silently launching with a feature the user asked for.
+    let skip_elyby_skins = skip_elyby_skins.unwrap_or(false);
+    let authlib_injector = if should_bypass_elyby_skins(
+        is_elyby,
+        config.elyby_skins_in_game,
+        skip_elyby_skins,
+    ) {
+        events::emit_log(
+            &app,
+            "warn",
+            "launch",
+            "Ely.by Skin Integration skipped for this launch at the user's request.",
+        );
+        events::emit_launch_warning(&app, "elyby_skins_bypassed", None);
+        None
+    } else if crate::authlib_injector::should_attach(
+        is_elyby,
+        config.elyby_skins_in_game,
+        &instance.mc_version,
+    ) {
+        events::emit_log(
+            &app,
+            "info",
+            "launch",
+            "Preparing Ely.by Skin Integration (authlib-injector)...",
+        );
+        match crate::authlib_injector::prepare(&config.data_dir).await {
+            Ok(agent) => {
+                events::emit_log(
+                    &app,
+                    "info",
+                    "launch",
+                    &format!(
+                        "Ely.by Skin Integration: authlib-injector {} verified (build {}).",
+                        crate::authlib_injector::VERSION,
+                        crate::authlib_injector::BUILD_NUMBER
+                    ),
+                );
+                Some(agent)
+            }
+            Err(e) => {
+                events::emit_log(
+                    &app,
+                    "error",
+                    "launch",
+                    &format!(
+                        "Ely.by Skin Integration could not be prepared ({:?}): {}",
+                        e.kind, e.detail
+                    ),
+                );
+                return Err(LaunchCommandError::Elyby {
+                    elyby_skins: ElybySkinsFailure {
+                        kind: e.kind,
+                        detail: e.detail,
+                    },
+                });
+            }
+        }
+    } else {
+        if is_elyby && config.elyby_skins_in_game {
+            events::emit_log(
+                &app,
+                "warn",
+                "launch",
+                &format!(
+                    "Ely.by Skin Integration requires Minecraft {} or newer; launching without in-game Ely.by skins.",
+                    crate::authlib_injector::MIN_MC_VERSION
+                ),
+            );
+            events::emit_launch_warning(
+                &app,
+                "elyby_skins_unsupported_mc",
+                Some(crate::authlib_injector::MIN_MC_VERSION),
+            );
+        }
+        None
+    };
 
     // Ensure a usable Java installation exists (download + verify through the
     // unified policy if missing). The returned installation — probed by M3.1,
@@ -755,7 +945,7 @@ pub async fn cmd_launch_game(
                 version_info.asset_index.url
             );
             events::emit_log(&app, "error", "launch", &msg);
-            return Err(msg);
+            return Err(msg.into());
         }
         let asset_index = versions::fetch_asset_index(&version_info.asset_index.url)
             .await
@@ -803,7 +993,7 @@ pub async fn cmd_launch_game(
                 {
                     let msg = format!("Failed to prepare Forge launch files: {}", e);
                     events::emit_log(&app, "error", "launch", &msg);
-                    return Err(msg);
+                    return Err(msg.into());
                 }
             }
         }
@@ -819,7 +1009,7 @@ pub async fn cmd_launch_game(
                 {
                     let msg = format!("Failed to prepare NeoForge launch files: {}", e);
                     events::emit_log(&app, "error", "launch", &msg);
-                    return Err(msg);
+                    return Err(msg.into());
                 }
             }
         }
@@ -853,7 +1043,7 @@ pub async fn cmd_launch_game(
             {
                 let msg = format!("Failed to repair loader library {}: {}", lib.name, e);
                 events::emit_log(&app, "error", "launch", &msg);
-                return Err(msg);
+                return Err(msg.into());
             }
         }
     }
@@ -868,7 +1058,7 @@ pub async fn cmd_launch_game(
     {
         let msg = format!("Failed to prepare native libraries: {}", e);
         events::emit_log(&app, "error", "launch", &msg);
-        return Err(msg);
+        return Err(msg.into());
     }
 
     // Ensure virtual/legacy assets exist for old versions (1.6.x and
@@ -905,6 +1095,8 @@ pub async fn cmd_launch_game(
         let launch_token = access_token.clone();
         let launch_uuid = uuid.clone();
         let launch_username = username.clone();
+        let launch_user_type = user_type.clone();
+        let launch_authlib_injector = authlib_injector.clone();
         let launch_server = server_address.clone();
         let launch_session_log = session_log.clone();
         let launch_java = prepared_java.clone();
@@ -917,6 +1109,8 @@ pub async fn cmd_launch_game(
                     access_token: &launch_token,
                     uuid: &launch_uuid,
                     username: &launch_username,
+                    user_type: &launch_user_type,
+                    authlib_injector: launch_authlib_injector.as_ref(),
                 },
                 launch_server.as_deref().map(|h| (h, server_port)),
                 launch_session_log.as_deref(),
@@ -958,7 +1152,7 @@ pub async fn cmd_launch_game(
             game_logs::clear_current_log_path_if(p);
         }
         // The reservation is still `Starting`; returning drops it.
-        return Err(msg);
+        return Err(msg.into());
     }
     let child_handle: Arc<std::sync::Mutex<Option<std::process::Child>>> =
         Arc::new(std::sync::Mutex::new(Some(child)));
@@ -986,7 +1180,7 @@ pub async fn cmd_launch_game(
                 if let Some(p) = session_log.as_deref() {
                     game_logs::clear_current_log_path_if(p);
                 }
-                return Err(format!("Failed to start playtime session: {}", e));
+                return Err(format!("Failed to start playtime session: {}", e).into());
             }
         };
         sessions.insert(
@@ -2037,6 +2231,53 @@ mod tests {
             room_state: std::sync::Arc::new(crate::rooms::room_state::RoomStateManager::new(&dir)),
             tailscale: crate::rooms::tailscale::TailscaleManager::new(dir),
         }
+    }
+
+    #[test]
+    fn skip_flag_only_bypasses_an_enabled_elyby_account() {
+        assert!(should_bypass_elyby_skins(true, true, true));
+        assert!(!should_bypass_elyby_skins(true, true, false));
+        assert!(!should_bypass_elyby_skins(true, false, true));
+        assert!(!should_bypass_elyby_skins(false, true, true));
+        assert!(!should_bypass_elyby_skins(false, false, true));
+    }
+
+    #[test]
+    fn launch_elyby_error_is_a_structured_object() {
+        let error = LaunchCommandError::Elyby {
+            elyby_skins: ElybySkinsFailure {
+                kind: crate::authlib_injector::PrepareErrorKind::Checksum,
+                detail: "bad hash".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&error).expect("serialize launch error");
+        assert_eq!(json["elyby_skins"]["kind"], "checksum");
+        assert_eq!(json["elyby_skins"]["detail"], "bad hash");
+
+        let ordinary = LaunchCommandError::from("No account available".to_string());
+        assert_eq!(
+            serde_json::to_value(&ordinary).unwrap(),
+            serde_json::Value::String("No account available".to_string())
+        );
+    }
+
+    #[test]
+    fn elyby_preflight_result_uses_stable_status_and_kind() {
+        let failed = serde_json::to_value(ElybySkinsPrepareResult::Failed {
+            kind: crate::authlib_injector::PrepareErrorKind::Checksum,
+            detail: "bad hash".to_string(),
+        })
+        .expect("serialize failed preflight");
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["kind"], "checksum");
+        assert_eq!(failed["detail"], "bad hash");
+
+        let unsupported = serde_json::to_value(ElybySkinsPrepareResult::Unsupported {
+            min_version: "1.7.2".to_string(),
+        })
+        .expect("serialize unsupported preflight");
+        assert_eq!(unsupported["status"], "unsupported");
+        assert_eq!(unsupported["min_version"], "1.7.2");
     }
 
     #[test]

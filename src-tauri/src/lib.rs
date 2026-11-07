@@ -1,6 +1,7 @@
 mod accounts;
 mod atlauncher;
 mod auth;
+pub mod authlib_injector;
 mod commands;
 pub mod config;
 mod content;
@@ -288,6 +289,7 @@ pub fn run() {
             commands::versions::cmd_list_managed_java,
             commands::versions::cmd_remove_managed_java,
             commands::launcher::cmd_install_version,
+            commands::launcher::cmd_prepare_elyby_skins,
             commands::launcher::cmd_launch_game,
             commands::launcher::cmd_get_fabric_versions,
             commands::launcher::cmd_get_forge_versions,

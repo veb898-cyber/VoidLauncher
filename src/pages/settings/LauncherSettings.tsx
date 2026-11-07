@@ -38,6 +38,31 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
       </section>
 
       <section className="settings-section">
+        <h2 className="settings-section__title">{t('settings.group_elyby')}</h2>
+
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.elyby_skins_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.elyby_skins_desc')}
+            </div>
+            <div
+              className="settings-row__desc"
+              style={{ marginTop: 6, maxWidth: 720 }}
+            >
+              {t('settings.elyby_skins_note')}
+            </div>
+          </div>
+          <div className="settings-row__control">
+            <Toggle
+              checked={config.elyby_skins_in_game}
+              onChange={(v) => updateConfig('elyby_skins_in_game', v)}
+            />
+          </div>
+        </div>
+      </section>
+
+      <section className="settings-section">
         <h2 className="settings-section__title">{t('settings.group_storage')}</h2>
 
         <div className="settings-row">

@@ -176,6 +176,8 @@ pub fn auth() -> LaunchAuth<'static> {
         access_token: TEST_TOKEN,
         uuid: TEST_UUID,
         username: TEST_USERNAME,
+        user_type: "msa",
+        authlib_injector: None,
     }
 }
 
@@ -224,6 +226,21 @@ impl Fixture {
 
     pub fn build(&self) -> LaunchCommand {
         self.build_with_target(None, None, test_target_arch())
+    }
+
+    pub fn build_with_auth(&self, auth: &LaunchAuth) -> LaunchCommand {
+        build_launch_command(
+            &self.config,
+            &self.instance,
+            &self.version,
+            auth,
+            None,
+            None,
+            self.java_path(),
+            self.java_major(),
+            test_target_arch(),
+        )
+        .unwrap_or_else(|e| panic!("build launch command: {}", e))
     }
 
     pub fn build_with(

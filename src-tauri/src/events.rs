@@ -197,6 +197,18 @@ pub fn emit_launch_event(app: &AppHandle, level: &str, message: &str) {
     );
 }
 
+/// Non-fatal launch notice that the UI should surface as a toast. `kind` is a
+/// stable machine-readable code so the renderer can localize the message.
+pub fn emit_launch_warning(app: &AppHandle, kind: &str, min_version: Option<&str>) {
+    let _ = app.emit(
+        "launch_warning",
+        serde_json::json!({
+            "kind": kind,
+            "min_version": min_version,
+        }),
+    );
+}
+
 /// Spawn a background task that bridges broadcast channel → Tauri events
 pub fn spawn_event_bridge(
     app: AppHandle,

@@ -1319,6 +1319,8 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
             access_token: token,
             uuid,
             username,
+            user_type: "legacy",
+            authlib_injector: None,
         },
         None,
         None,
