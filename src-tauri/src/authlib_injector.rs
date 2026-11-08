@@ -284,6 +284,7 @@ fn install_verified_jar(part: &Path, dest: &Path, spec: &AgentSpec) -> Result<()
 }
 
 async fn download_jar(url: &str, part: &Path) -> Result<(), PrepareError> {
+    crate::download::ensure_proxy_resolved().await;
     let client = crate::download::http_client_for_hosts(&[INJECTOR_HOST]).map_err(|e| {
         PrepareError::new(
             PrepareErrorKind::Internal,
@@ -565,6 +566,7 @@ fn metadata_http_client() -> Result<reqwest::Client, PrepareError> {
 /// Direct metadata fetch: the canonical API root, no dependency on the
 /// `https://ely.by/` HTML page or its ALI header.
 async fn fetch_metadata_direct() -> Result<(String, Value), PrepareError> {
+    crate::download::ensure_proxy_resolved().await;
     let client = metadata_http_client()?;
     let api_root = Url::parse(ELYBY_API_ROOT).map_err(|_| {
         PrepareError::new(
@@ -581,6 +583,7 @@ async fn fetch_metadata_direct() -> Result<(String, Value), PrepareError> {
 /// ALI discovery fallback for the case where the direct endpoint is blocked
 /// but the main Ely.by page still advertises a reachable API root.
 async fn fetch_metadata_via_ali() -> Result<(String, Value), PrepareError> {
+    crate::download::ensure_proxy_resolved().await;
     let client = metadata_http_client()?;
     let base = Url::parse(ELYBY_ORIGIN).map_err(|_| {
         PrepareError::new(

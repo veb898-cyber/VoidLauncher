@@ -11,7 +11,10 @@
 //!      stored Minecraft token (covers sessionserver rate-limit windows)
 //!   3. skinsystem.ely.by for Ely.by accounts (their own skin delivery, which
 //!      also proxies skins of premium Minecraft users)
-//!   4. mc-heads.net/skin as the last resort
+//!
+//! There is no third-party last resort: mc-heads' `/skin` returns a generic
+//! placeholder for unknown UUIDs, which is indistinguishable from a real skin
+//! and previously overwrote a valid cache.
 //!
 //! The frontend crops the square head out of the skin PNG (canvas), so every
 //! surface (Home, Settings, Sidebar, Accounts) renders the SAME cached image
@@ -47,9 +50,12 @@ use crate::AppState;
 /// Skin files are a few KB; a hard cap keeps a hostile/broken host from
 /// forcing large allocations through the renderer bridge.
 const MAX_SKIN_BYTES: u64 = 512 * 1024;
-/// Cached skins revalidate after a week — fresh enough for skin changes,
-/// stable enough that a transient Mojang outage never blanks avatars.
-const CACHE_TTL_SECS: u64 = 7 * 24 * 3600;
+/// Cached skins revalidate after an hour. A skin is a small PNG and the cache
+/// is only consulted when an avatar actually mounts (or the user presses
+/// refresh), so the network cost is low. One hour keeps an externally changed
+/// Ely.by skin reasonably fresh while the explicit refresh path always
+/// bypasses the cache. The renderer uses the same TTL.
+const CACHE_TTL_SECS: u64 = 60 * 60;
 
 const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -89,20 +95,60 @@ pub fn get_skin_generation(norm: &str) -> u64 {
 ///
 /// Any in-flight fetch that started before this invalidation will observe a mismatched
 /// generation and will discard its stale bytes instead of overwriting the newly cleared state.
-pub fn invalidate_player_head_cache(data_dir: &std::path::Path, uuid: &str) -> u64 {
+///
+/// The generation is advanced only after the old file is gone (deleted, moved
+/// aside or truncated). If the file cannot be removed, the old generation
+/// stays current and an error is returned: the caller must not report a
+/// successful refresh and the next cache read must not see a half-invalidated
+/// state.
+pub fn invalidate_player_head_cache(data_dir: &std::path::Path, uuid: &str) -> Result<u64, String> {
     let Some(norm) = normalize_uuid(uuid) else {
-        return 0;
+        return Ok(0);
     };
     let mut map = get_skin_generations()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = skin_cache_path(data_dir, &norm);
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
+    remove_cached_head_file(&path)?;
     let next_gen = map.get(&norm).copied().unwrap_or(0) + 1;
     map.insert(norm, next_gen);
-    next_gen
+    Ok(next_gen)
+}
+
+/// Remove the cached PNG before the generation is advanced. The generation
+/// write lock is held by the caller, so no reader can observe a file from the
+/// old generation while this runs.
+fn remove_cached_head_file(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(remove_err) => {
+            // On Windows another process may briefly hold the file open.
+            // Moving it aside removes it from the cache path without relying
+            // on delete access; truncating is the last-resort tombstone so
+            // `png_bytes_ok` rejects it.
+            let trash = path.with_file_name(format!(
+                ".{}.stale-{}",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("head"),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&trash);
+            if std::fs::rename(path, &trash).is_ok() {
+                let _ = std::fs::remove_file(&trash);
+                return Ok(());
+            }
+            if std::fs::write(path, []).is_ok() {
+                return Ok(());
+            }
+            Err(format!(
+                "Cannot remove cached head {}: {}",
+                path.display(),
+                remove_err
+            ))
+        }
+    }
 }
 
 /// Commit skin bytes to disk cache only if generation token matches expected.
@@ -147,6 +193,82 @@ fn cache_is_fresh(path: &std::path::Path) -> bool {
         Ok(age) => age.as_secs() < CACHE_TTL_SECS,
         Err(_) => false,
     }
+}
+
+/// Test-only pause point inside the cache read. It runs while the generation
+/// read guard is held, so the lock-ordering test can prove that invalidation
+/// waits for an in-progress read instead of deleting the file underneath it.
+#[cfg(test)]
+type CacheReadHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static CACHE_READ_HOOK: Mutex<Option<CacheReadHook>> = Mutex::new(None);
+
+#[cfg(test)]
+fn run_cache_read_hook() {
+    let hook = CACHE_READ_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_cache_read_hook() {}
+
+/// Read a fresh cached head only if `expected_gen` is still current.
+///
+/// The generation read guard is held across the freshness check and the file
+/// read. Invalidation takes the write guard, so the two operations have a
+/// single order: either invalidation finishes first and this returns `None`,
+/// or this read finishes first and invalidation waits until the old bytes have
+/// been returned. The file cannot be deleted between the generation check and
+/// the read.
+fn read_cached_head(data_dir: &std::path::Path, norm: &str, expected_gen: u64) -> Option<Vec<u8>> {
+    read_cached_head_inner(data_dir, norm, expected_gen, true)
+}
+
+/// Fallback read used only after a failed network refresh. It still enforces
+/// the current generation and the PNG/size checks, but accepts an expired
+/// file: an old working head is better than the bundled default when Mojang
+/// is temporarily unreachable.
+fn read_cached_head_any_age(
+    data_dir: &std::path::Path,
+    norm: &str,
+    expected_gen: u64,
+) -> Option<Vec<u8>> {
+    read_cached_head_inner(data_dir, norm, expected_gen, false)
+}
+
+fn read_cached_head_inner(
+    data_dir: &std::path::Path,
+    norm: &str,
+    expected_gen: u64,
+    require_fresh: bool,
+) -> Option<Vec<u8>> {
+    let generations = get_skin_generations();
+    let map = generations
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if map.get(norm).copied().unwrap_or(0) != expected_gen {
+        return None;
+    }
+    run_cache_read_hook();
+    let path = skin_cache_path(data_dir, norm);
+    if require_fresh && !cache_is_fresh(&path) {
+        return None;
+    }
+    let len = std::fs::metadata(&path).ok()?.len();
+    if len > MAX_SKIN_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    if !png_bytes_ok(&bytes) {
+        return None;
+    }
+    Some(bytes)
 }
 
 fn png_bytes_ok(bytes: &[u8]) -> bool {
@@ -370,11 +492,9 @@ async fn fetch_skin_elyby(name: &str) -> Option<Vec<u8>> {
     fetch_skin_capped(&upgrade_texture_url(&skin_url)).await
 }
 
-/// Last resort: mc-heads' RAW SKIN endpoint (not /avatar, which renders a
-/// head and falls back to Steve silently).
-async fn fetch_skin_mcheads(norm: &str) -> Option<Vec<u8>> {
-    fetch_skin_capped(&format!("https://mc-heads.net/skin/{}", norm)).await
-}
+// Last resort mc-heads `/skin` is intentionally not used: it returns a generic
+// placeholder for unknown UUIDs, which would be indistinguishable from a real
+// skin and could overwrite a valid cache.
 
 async fn fetch_skin_fresh(norm: &str, account: Option<&AccountEntry>) -> Option<Vec<u8>> {
     if let Some(a) = account {
@@ -394,7 +514,11 @@ async fn fetch_skin_fresh(norm: &str, account: Option<&AccountEntry>) -> Option<
             }
         }
     }
-    fetch_skin_mcheads(norm).await
+    // No last-resort third-party source. mc-heads' `/skin` silently returns a
+    // generic placeholder for unknown UUIDs, which previously overwrote a
+    // valid cached skin and made a failed refresh look successful. A missing
+    // authoritative skin falls through to the any-age cache/default skin.
+    None
 }
 
 /// Return the account entry whose stored uuid matches the given one.
@@ -415,7 +539,7 @@ pub fn cmd_invalidate_player_head(state: State<'_, AppState>, uuid: String) -> R
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.data_dir.clone()
     };
-    Ok(invalidate_player_head_cache(&data_dir, &uuid))
+    invalidate_player_head_cache(&data_dir, &uuid)
 }
 
 /// Fetch (or serve from the disk cache) the raw skin of an account as a
@@ -432,7 +556,6 @@ pub async fn cmd_get_player_head(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.data_dir.clone()
     };
-    let path = skin_cache_path(&data_dir, &norm);
 
     let account_list = accounts::list_accounts(&data_dir);
     let account = find_account_by_uuid(&account_list, &norm);
@@ -443,16 +566,14 @@ pub async fn cmd_get_player_head(
         return Ok(bundled_default_skin(&norm));
     }
 
-    // Capture generation token before cache checks or async fetch
+    // Capture generation token before cache checks or async fetch. The
+    // generation-aware read below re-checks it under the read guard; it never
+    // returns bytes from a generation that was already invalidated.
     let gen_before = get_skin_generation(&norm);
 
     // Fresh cache: instant answer, no network.
-    if cache_is_fresh(&path) {
-        if let Ok(bytes) = std::fs::read(&path) {
-            if png_bytes_ok(&bytes) {
-                return Ok(Some(data_url(&bytes)));
-            }
-        }
+    if let Some(bytes) = read_cached_head(&data_dir, &norm, gen_before) {
+        return Ok(Some(data_url(&bytes)));
     }
 
     if let Some(bytes) = fetch_skin_fresh(&norm, account).await {
@@ -469,11 +590,12 @@ pub async fn cmd_get_player_head(
     }
 
     // Refresh failed (Mojang down, rate-limited, offline): a possibly
-    // outdated cached head still beats a blank/Steve avatar.
-    if let Ok(bytes) = std::fs::read(&path) {
-        if png_bytes_ok(&bytes) {
-            return Ok(Some(data_url(&bytes)));
-        }
+    // outdated cached head still beats a blank/Steve avatar. Read against the
+    // CURRENT generation: an invalidation during the fetch deleted the old
+    // file, and a concurrent fresh request may have written a newer one.
+    let current_gen = get_skin_generation(&norm);
+    if let Some(bytes) = read_cached_head_any_age(&data_dir, &norm, current_gen) {
+        return Ok(Some(data_url(&bytes)));
     }
 
     // Nothing cached either: the vanilla default by uuid is the honest
@@ -970,14 +1092,14 @@ mod tests {
         std::fs::write(&head_file, b"fake png bytes").unwrap();
         assert!(head_file.exists());
 
-        let gen1 = invalidate_player_head_cache(&temp_dir, uuid);
+        let gen1 = invalidate_player_head_cache(&temp_dir, uuid).unwrap();
         assert!(
             !head_file.exists(),
             "Cache file must be deleted on invalidation"
         );
         assert_eq!(gen1, get_skin_generation(&norm));
 
-        let gen2 = invalidate_player_head_cache(&temp_dir, uuid);
+        let gen2 = invalidate_player_head_cache(&temp_dir, uuid).unwrap();
         assert_eq!(
             gen2,
             gen1 + 1,
@@ -1025,7 +1147,7 @@ mod tests {
         rx_fetch_started.recv().unwrap();
 
         // 2. While Thread A is "fetching", user updates skin (invalidation occurs)
-        let new_gen = invalidate_player_head_cache(&temp_dir, uuid);
+        let new_gen = invalidate_player_head_cache(&temp_dir, uuid).unwrap();
         assert!(
             new_gen > initial_gen,
             "Generation must advance on invalidation"
@@ -1056,6 +1178,162 @@ mod tests {
         );
         assert!(cache_file.exists(), "Fresh bytes must be written to disk");
         assert_eq!(std::fs::read(&cache_file).unwrap(), b"FRESH_PNG_BYTES");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Serializes tests that install the process-wide cache-read pause hook.
+    static HEAD_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn write_cached_png(temp_dir: &std::path::Path, norm: &str) -> std::path::PathBuf {
+        let path = skin_cache_path(temp_dir, norm);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = PNG_MAGIC.to_vec();
+        bytes.extend_from_slice(b"cache-body");
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn fresh_disk_cache_is_used_for_the_current_generation() {
+        let _guard = HEAD_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = std::env::temp_dir().join(format!("vl-head-fresh-{}", uuid::Uuid::new_v4()));
+        let uuid = "3c650540-fb59-4d9d-a1d3-f8f7a67379a5";
+        let norm = normalize_uuid(uuid).unwrap();
+        write_cached_png(&temp_dir, &norm);
+
+        let gen = get_skin_generation(&norm);
+        let bytes = read_cached_head(&temp_dir, &norm, gen).expect("fresh cache");
+        assert!(png_bytes_ok(&bytes));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn cached_head_from_an_old_generation_is_never_returned() {
+        let _guard = HEAD_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = std::env::temp_dir().join(format!("vl-head-gen-{}", uuid::Uuid::new_v4()));
+        let uuid = "4c650540-fb59-4d9d-a1d3-f8f7a67379a6";
+        let norm = normalize_uuid(uuid).unwrap();
+        write_cached_png(&temp_dir, &norm);
+
+        let old_gen = get_skin_generation(&norm);
+        let new_gen = invalidate_player_head_cache(&temp_dir, uuid).unwrap();
+        assert!(new_gen > old_gen);
+
+        // Simulate a concurrent fresh request writing a cache file while a
+        // caller still holds the old generation token: the old caller must
+        // not consume bytes, while the current generation may.
+        write_cached_png(&temp_dir, &norm);
+        assert!(read_cached_head(&temp_dir, &norm, old_gen).is_none());
+        assert!(read_cached_head(&temp_dir, &norm, new_gen).is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn invalidation_waits_for_an_in_progress_cache_read() {
+        use std::sync::mpsc::channel;
+
+        let _guard = HEAD_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = std::env::temp_dir().join(format!("vl-head-lock-{}", uuid::Uuid::new_v4()));
+        let uuid = "5c650540-fb59-4d9d-a1d3-f8f7a67379a7";
+        let norm = normalize_uuid(uuid).unwrap();
+        let cache_file = write_cached_png(&temp_dir, &norm);
+        let gen = get_skin_generation(&norm);
+
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        *CACHE_READ_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+
+        let reader_dir = temp_dir.clone();
+        let reader_norm = norm.clone();
+        let reader = std::thread::spawn(move || read_cached_head(&reader_dir, &reader_norm, gen));
+        entered_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = channel();
+        let invalidation_dir = temp_dir.clone();
+        let invalidation_uuid = uuid.to_string();
+        let invalidator = std::thread::spawn(move || {
+            let result = invalidate_player_head_cache(&invalidation_dir, &invalidation_uuid);
+            done_tx.send(result).unwrap();
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "invalidation must block while a cache read holds the generation read guard"
+        );
+
+        release_tx.send(()).unwrap();
+        assert!(reader.join().unwrap().is_some());
+        let new_gen = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("invalidation completes after the read")
+            .unwrap();
+        invalidator.join().unwrap();
+        assert!(new_gen > gen);
+        assert!(!cache_file.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn fallback_read_accepts_an_expired_file_but_fast_path_does_not() {
+        let _guard = HEAD_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = std::env::temp_dir().join(format!("vl-head-ttl-{}", uuid::Uuid::new_v4()));
+        let uuid = "8c650540-fb59-4d9d-a1d3-f8f7a67379aa";
+        let norm = normalize_uuid(uuid).unwrap();
+        let path = write_cached_png(&temp_dir, &norm);
+        let old = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(CACHE_TTL_SECS + 60))
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let gen = get_skin_generation(&norm);
+        assert!(read_cached_head(&temp_dir, &norm, gen).is_none());
+        assert!(read_cached_head_any_age(&temp_dir, &norm, gen).is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn invalidation_of_one_uuid_does_not_touch_another_cache() {
+        let _guard = HEAD_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = std::env::temp_dir().join(format!("vl-head-uuid-{}", uuid::Uuid::new_v4()));
+        let uuid_a = "6c650540-fb59-4d9d-a1d3-f8f7a67379a8";
+        let uuid_b = "7c650540-fb59-4d9d-a1d3-f8f7a67379a9";
+        let norm_a = normalize_uuid(uuid_a).unwrap();
+        let norm_b = normalize_uuid(uuid_b).unwrap();
+        write_cached_png(&temp_dir, &norm_a);
+        write_cached_png(&temp_dir, &norm_b);
+
+        let gen_a = get_skin_generation(&norm_a);
+        let gen_b = get_skin_generation(&norm_b);
+        invalidate_player_head_cache(&temp_dir, uuid_a).unwrap();
+
+        assert!(read_cached_head(&temp_dir, &norm_a, gen_a).is_none());
+        assert!(read_cached_head(&temp_dir, &norm_b, gen_b).is_some());
+        assert_eq!(get_skin_generation(&norm_b), gen_b);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -6,10 +6,29 @@ use tokio::sync::broadcast;
 /// Progress payload sent from backend → frontend
 #[derive(Debug, Clone, Serialize)]
 pub struct InstallProgressPayload {
+    /// Unique identity of this install operation. Events for another install
+    /// must never be merged into this one in the UI.
+    pub install_id: String,
     pub instance_id: String,
+    /// `(prepared_bytes + in_progress_bytes) / total_bytes`, capped below
+    /// 100 until `done`.
     pub percent: f64,
-    pub downloaded_bytes: u64,
+    /// Bytes already prepared for this install: validated cache files plus
+    /// files fully downloaded and verified during this operation. Partial
+    /// downloads are deliberately excluded.
+    pub prepared_bytes: u64,
+    /// Current partial bytes of files that are still downloading and have not
+    /// passed their final integrity check. Mutually exclusive with
+    /// `prepared_bytes` for the same file.
+    pub in_progress_bytes: u64,
+    /// Bytes actually transferred over the network during this operation,
+    /// including retries. Cached files contribute 0 here.
+    pub network_downloaded_bytes: u64,
     pub total_bytes: u64,
+    /// True when the total download size is not known yet (or not every
+    /// planned file has a trustworthy size). The UI must not invent a
+    /// percentage from a partial total in this state.
+    pub indeterminate: bool,
     pub stage: String,
     pub message: String,
 }
@@ -210,26 +229,16 @@ pub fn emit_launch_warning(app: &AppHandle, kind: &str, min_version: Option<&str
 }
 
 /// Spawn a background task that bridges broadcast channel → Tauri events
-pub fn spawn_event_bridge(
-    app: AppHandle,
-    mut rx: broadcast::Receiver<InstallProgressPayload>,
-    instance_id: String,
-) {
+/// Spawn a background task that bridges the install-progress broadcast
+/// channel to Tauri events.
+///
+/// The bridge must NOT synthesise a `done` event when the channel closes: an
+/// install that returned an error also closes the sender, and emitting 100%
+/// in that case is a lie. Completion/error is sent explicitly by the caller.
+pub fn spawn_event_bridge(app: AppHandle, mut rx: broadcast::Receiver<InstallProgressPayload>) {
     tokio::spawn(async move {
         while let Ok(payload) = rx.recv().await {
             let _ = app.emit("install_progress", &payload);
         }
-        // Signal completion
-        let _ = app.emit(
-            "install_progress",
-            &InstallProgressPayload {
-                instance_id,
-                percent: 100.0,
-                downloaded_bytes: 0,
-                total_bytes: 0,
-                stage: "done".into(),
-                message: "Installation complete".into(),
-            },
-        );
     });
 }

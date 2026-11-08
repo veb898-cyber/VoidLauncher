@@ -19,6 +19,7 @@ import {
   type ProviderId, type ProviderProject, type ProviderRequestToken,
 } from '../../lib/contentProviders';
 import { useSettingsStore } from '../../stores/settingsStore';
+import { batchImportToastType } from '../../lib/localImport';
 
 type Hit = ProviderProject;
 
@@ -748,7 +749,10 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     }
     setInstalling(false);
     setDownloadProgress(0);
-    addToast(t('content.install_result', { success: success.toString(), failed: failed.toString() }), success > 0 ? 'success' : 'error');
+    addToast(
+      t('content.install_result', { success: success.toString(), failed: failed.toString() }),
+      batchImportToastType(success, failed),
+    );
     commitSelectedItems([]);
     setSubView('search');
     onInstalled();

@@ -4,8 +4,9 @@
 
 use crate::commands::instances::validate_instance_name;
 use crate::download;
-use crate::events::{self, InstallProgressPayload, ProgressSender};
+use crate::events::{self, ProgressSender};
 use crate::game_logs;
+use crate::install_progress::{self, InstallProgressTracker};
 use crate::instances;
 use crate::is_allowed_download_host;
 use crate::java_download;
@@ -31,162 +32,183 @@ pub async fn cmd_install_version(
     state: State<'_, AppState>,
     version_url: String,
     instance_id: String,
+    install_id: Option<String>,
 ) -> Result<String, String> {
     let config = {
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.clone()
     };
 
-    // Create progress channel and bridge
+    let install_id = install_id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Create progress channel and bridge. The bridge only forwards events;
+    // `done`/`error` are explicit so a failed install can never emit 100%.
     let (progress_tx, rx) = ProgressSender::new();
-    events::spawn_event_bridge(app.clone(), rx, instance_id.clone());
+    events::spawn_event_bridge(app.clone(), rx);
+    let tracker = InstallProgressTracker::new(install_id, instance_id.clone(), progress_tx);
 
-    let send_progress = |percent: f64, stage: &str, message: &str| {
-        progress_tx.send(InstallProgressPayload {
-            instance_id: instance_id.clone(),
-            percent,
-            downloaded_bytes: 0,
-            total_bytes: 0,
-            stage: stage.to_string(),
-            message: message.to_string(),
-        });
-    };
+    let outcome: Result<String, String> = async {
+        tracker.set_stage("manifest", "Fetching version info...");
+        events::emit_log(&app, "info", "install", "Fetching version info...");
 
-    events::emit_log(&app, "info", "install", "Fetching version info...");
-    send_progress(0.0, "manifest", "Fetching version info...");
+        // Verify the URL is from an allowed host (SSRF protection)
+        if !is_allowed_download_host(&version_url) {
+            return Err("Access denied: download host not allowed".to_string());
+        }
 
-    // Verify the URL is from an allowed host (SSRF protection)
-    if !is_allowed_download_host(&version_url) {
-        return Err("Access denied: download host not allowed".to_string());
-    }
+        // Fetch version info
+        let version_info = versions::fetch_version_info(&version_url)
+            .await
+            .map_err(|e| e.to_string())?;
 
-    // Fetch version info
-    let version_info = versions::fetch_version_info(&version_url)
-        .await
-        .map_err(|e| e.to_string())?;
+        events::emit_log(
+            &app,
+            "info",
+            "install",
+            &format!("Version {} fetched", version_info.id),
+        );
 
-    events::emit_log(
-        &app,
-        "info",
-        "install",
-        &format!("Version {} fetched", version_info.id),
-    );
+        // The id and asset-index name are remote metadata used as directory and
+        // file names — they must be plain components, never a path.
+        crate::import::check_safe_file_name(&version_info.id)
+            .map_err(|_| "Invalid version id in remote metadata".to_string())?;
+        crate::import::check_safe_file_name(&version_info.assets)
+            .map_err(|_| "Invalid asset index name in remote metadata".to_string())?;
 
-    // The id and asset-index name are remote metadata used as directory and
-    // file names — they must be plain components, never a path.
-    crate::import::check_safe_file_name(&version_info.id)
-        .map_err(|_| "Invalid version id in remote metadata".to_string())?;
-    crate::import::check_safe_file_name(&version_info.assets)
-        .map_err(|_| "Invalid asset index name in remote metadata".to_string())?;
+        tracker.set_stage("manifest", "Collecting files to download...");
 
-    send_progress(5.0, "manifest", "Collecting files to download...");
+        // Full plan (cached files included): the downloader validates cache
+        // entries and counts valid ones as completed work.
+        let files = versions::collect_download_plan(
+            &version_info,
+            &config.libraries_dir(),
+            &config.versions_dir(),
+        )
+        .map_err(|e| format!("Invalid version metadata: {}", e))?;
 
-    // Collect files to download
-    let files = versions::collect_downloads(
-        &version_info,
-        &config.libraries_dir(),
-        &config.versions_dir(),
-    )
-    .map_err(|e| format!("Invalid version metadata: {}", e))?;
+        events::emit_log(
+            &app,
+            "info",
+            "install",
+            &format!("Downloading {} game files...", files.len()),
+        );
 
-    let progress_tx_clone = progress_tx.clone();
-    let instance_id_clone = instance_id.clone();
+        tracker.add_files(
+            "libraries",
+            "Downloading libraries...",
+            install_progress::planned_files(&files),
+        );
 
-    // Download all files with real progress
-    events::emit_log(
-        &app,
-        "info",
-        "install",
-        &format!("Downloading {} libraries...", files.len()),
-    );
-    send_progress(10.0, "libraries", "Downloading libraries...");
-    download::download_files(
-        files,
-        move |completed, total, bytes_done, bytes_total, _msg| {
-            let frac = if bytes_total > 0 {
-                bytes_done as f64 / bytes_total as f64
-            } else if total > 0 {
-                completed as f64 / total as f64
-            } else {
-                1.0
+        let progress_tracker = tracker.clone();
+        let file_progress =
+            move |path: &std::path::Path, prepared: u64, total: Option<u64>, network: u64| {
+                progress_tracker.file_progress(
+                    &install_progress::file_key(path),
+                    prepared,
+                    total,
+                    network,
+                );
             };
-            let pct = 10.0 + frac * 60.0;
-            progress_tx_clone.send(InstallProgressPayload {
-                instance_id: instance_id_clone.clone(),
-                percent: pct,
-                downloaded_bytes: bytes_done,
-                total_bytes: bytes_total,
-                stage: "libraries".to_string(),
-                message: format!("Downloading libraries ({}/{})", completed, total),
-            });
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    send_progress(70.0, "libraries", "Saving version metadata...");
-
-    // Save version JSON
-    let version_dir = config.versions_dir().join(&version_info.id);
-    std::fs::create_dir_all(&version_dir).map_err(|e| e.to_string())?;
-    let version_json_path = version_dir.join(format!("{}.json", version_info.id));
-    let json = serde_json::to_string_pretty(&version_info).map_err(|e| e.to_string())?;
-    std::fs::write(version_json_path, json).map_err(|e| e.to_string())?;
-
-    send_progress(75.0, "assets", "Downloading asset index...");
-
-    // Download and save asset index
-    if !is_allowed_download_host(&version_info.asset_index.url) {
-        return Err("Access denied: asset index host not allowed".to_string());
-    }
-    let asset_index = versions::fetch_asset_index(&version_info.asset_index.url)
+        let done_tracker = tracker.clone();
+        let file_done = move |path: &std::path::Path, actual_size: u64| {
+            done_tracker.file_completed(&install_progress::file_key(path), actual_size);
+        };
+        download::download_files_observed(
+            files,
+            download::DownloadCachePolicy::VerifySha1,
+            |_completed, _total, _bytes_done, _bytes_total, _message| {},
+            file_progress,
+            file_done,
+        )
         .await
         .map_err(|e| e.to_string())?;
 
-    let indexes_dir = config.assets_dir().join("indexes");
-    std::fs::create_dir_all(&indexes_dir).map_err(|e| e.to_string())?;
-    let index_path = indexes_dir.join(format!("{}.json", version_info.assets));
-    let index_json = serde_json::to_string_pretty(&asset_index).map_err(|e| e.to_string())?;
-    std::fs::write(index_path, index_json).map_err(|e| e.to_string())?;
+        tracker.set_stage("libraries", "Saving version metadata...");
 
-    events::emit_log(
-        &app,
-        "info",
-        "install",
-        &format!("Downloading assets for {}...", version_info.assets),
-    );
-    send_progress(78.0, "assets", "Downloading assets...");
+        // Save version JSON
+        let version_dir = config.versions_dir().join(&version_info.id);
+        std::fs::create_dir_all(&version_dir).map_err(|e| e.to_string())?;
+        let version_json_path = version_dir.join(format!("{}.json", version_info.id));
+        let json = serde_json::to_string_pretty(&version_info).map_err(|e| e.to_string())?;
+        std::fs::write(version_json_path, json).map_err(|e| e.to_string())?;
 
-    // Download assets with progress
-    let progress_tx_assets = progress_tx.clone();
-    let instance_id_assets = instance_id.clone();
-    download::download_assets(
-        &asset_index,
-        &config.assets_dir(),
-        move |completed, total, bytes_done, bytes_total, _msg| {
-            let pct = 78.0 + (completed as f64 / total as f64) * 20.0;
-            progress_tx_assets.send(InstallProgressPayload {
-                instance_id: instance_id_assets.clone(),
-                percent: pct,
-                downloaded_bytes: bytes_done,
-                total_bytes: bytes_total,
-                stage: "assets".to_string(),
-                message: format!("Downloading assets ({}/{})", completed, total),
-            });
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+        tracker.set_stage("assets", "Downloading asset index...");
 
-    // Mirror objects into virtual/legacy for old versions (1.6.x and older
-    // read flat files from --assetsDir; 1.7.x/1.8.x use it as legacy layout).
-    download::ensure_virtual_assets(&version_info.assets, &asset_index, &config.assets_dir())
+        // Download and save asset index
+        if !is_allowed_download_host(&version_info.asset_index.url) {
+            return Err("Access denied: asset index host not allowed".to_string());
+        }
+        let asset_index = versions::fetch_asset_index(&version_info.asset_index.url)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let indexes_dir = config.assets_dir().join("indexes");
+        std::fs::create_dir_all(&indexes_dir).map_err(|e| e.to_string())?;
+        let index_path = indexes_dir.join(format!("{}.json", version_info.assets));
+        let index_json = serde_json::to_string_pretty(&asset_index).map_err(|e| e.to_string())?;
+        std::fs::write(index_path, index_json).map_err(|e| e.to_string())?;
+
+        events::emit_log(
+            &app,
+            "info",
+            "install",
+            &format!("Downloading assets for {}...", version_info.assets),
+        );
+
+        // Now that the index is known, the full download plan exists. Cached
+        // asset objects are counted as completed by the downloader.
+        let asset_files = download::collect_asset_download_plan(&asset_index, &config.assets_dir())
+            .map_err(|e| e.to_string())?;
+        tracker.add_files(
+            "assets",
+            "Downloading assets...",
+            install_progress::planned_files(&asset_files),
+        );
+        tracker.mark_plan_complete();
+
+        let progress_tracker = tracker.clone();
+        let asset_progress =
+            move |path: &std::path::Path, prepared: u64, total: Option<u64>, network: u64| {
+                progress_tracker.file_progress(
+                    &install_progress::file_key(path),
+                    prepared,
+                    total,
+                    network,
+                );
+            };
+        let done_tracker = tracker.clone();
+        let asset_done = move |path: &std::path::Path, actual_size: u64| {
+            done_tracker.file_completed(&install_progress::file_key(path), actual_size);
+        };
+        download::download_files_observed(
+            asset_files,
+            download::DownloadCachePolicy::VerifySha1,
+            |_completed, _total, _bytes_done, _bytes_total, _message| {},
+            asset_progress,
+            asset_done,
+        )
+        .await
         .map_err(|e| e.to_string())?;
 
-    events::emit_log(&app, "info", "install", "Installation complete!");
-    send_progress(100.0, "done", "Installation complete!");
+        // Mirror objects into virtual/legacy for old versions (1.6.x and older
+        // read flat files from --assetsDir; 1.7.x/1.8.x use it as legacy layout).
+        tracker.set_stage("finalizing", "Preparing assets...");
+        download::ensure_virtual_assets(&version_info.assets, &asset_index, &config.assets_dir())
+            .map_err(|e| e.to_string())?;
 
-    Ok(version_info.id)
+        events::emit_log(&app, "info", "install", "Installation complete!");
+        tracker.done();
+        Ok(version_info.id)
+    }
+    .await;
+
+    if let Err(error) = &outcome {
+        tracker.fail("error", error);
+    }
+    outcome
 }
 
 /// Ensure a usable Java executable exists and return it. The unified
@@ -906,7 +928,10 @@ pub async fn cmd_launch_game(
     })?;
     let missing = files
         .into_iter()
-        .filter(|(_, path, _, _)| !path.exists())
+        // `collect_downloads_for` already drops valid files. Maven fallback
+        // artifacts without checksum/size are kept when their integrity
+        // manifest is missing/stale, so do not filter them out by existence.
+        .filter(|(_, path, sha1, size)| !path.exists() || (sha1.is_empty() && *size == 0))
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         events::emit_log(
@@ -1170,8 +1195,22 @@ pub async fn cmd_launch_game(
             Err(e) => {
                 if let Ok(mut guard) = child_handle.lock() {
                     if let Some(mut c) = guard.take() {
-                        let _ = c.kill();
-                        let _ = c.wait();
+                        let outcome = stop_unpersisted_child(&mut c, process_identity.as_ref());
+                        if matches!(outcome, StopOutcome::StillRunning(_)) {
+                            let msg = unpersisted_launch_error(
+                                &instance_name,
+                                pid,
+                                "failed to start playtime session",
+                                &outcome,
+                            );
+                            events::emit_log(&app, "error", "launch", &msg);
+                            // Keep the pid record: the game is still running
+                            // and must remain discoverable/recoverable.
+                            if let Some(p) = session_log.as_deref() {
+                                game_logs::clear_current_log_path_if(p);
+                            }
+                            return Err(msg.into());
+                        }
                     }
                 }
                 crate::running_state::remove_pid_file(&data_dir, &instance_name);
@@ -1332,6 +1371,18 @@ pub async fn cmd_launch_game(
                 );
             }
         }
+        // Emit the completion before releasing the registry entry. Otherwise
+        // a new launch can acquire the slot and emit `game_started` first,
+        // and the older completion would remove the new run from the UI.
+        let _ = app_clone.emit(
+            "launch_complete",
+            events::LaunchEventPayload {
+                instance_id: instance_clone.clone(),
+                status: "exited".into(),
+                pid: Some(pid_for_exit),
+                exit_code: Some(exit_code),
+            },
+        );
         // Release exactly this run's entry: a newer launch of the same
         // instance (if one ever follows) is never freed by a stale watcher.
         app_clone
@@ -1348,15 +1399,6 @@ pub async fn cmd_launch_game(
         if let Some(p) = session_log_for_exit.as_deref() {
             game_logs::clear_current_log_path_if(p);
         }
-        let _ = app_clone.emit(
-            "launch_complete",
-            events::LaunchEventPayload {
-                instance_id: instance_clone,
-                status: "exited".into(),
-                pid: None,
-                exit_code: Some(exit_code),
-            },
-        );
     });
 
     events::emit_log(
@@ -1823,7 +1865,10 @@ pub async fn cmd_list_game_logs(
         // matching uses the same filename-sanitization scheme as creation).
         if let Some(name) = instance_name {
             let wanted = game_logs::sanitize_instance_name(&name);
-            sessions.retain(|s| s.instance_name == wanted);
+            // `GameLogSession::instance_name` is the real header name when
+            // available and the sanitized filename stem otherwise. Sanitize
+            // both sides so instances with spaces/brackets match too.
+            sessions.retain(|s| game_logs::sanitize_instance_name(&s.instance_name) == wanted);
         }
         sessions
     })
@@ -2192,17 +2237,19 @@ pub fn cmd_stop_game(
         // Orphaned game: no exit watcher exists to clean up after it, so do
         // the bookkeeping here. (The playtime session from the previous app
         // run was already flushed when that app closed.)
-        crate::running_state::remove_pid_file(&data_dir, &instance_name);
-        state.launches.clear_running(&instance_name);
+        // Emit before clearing the registry so a completion can never remove
+        // a newer run that starts immediately after this one is released.
         let _ = app.emit(
             "launch_complete",
             events::LaunchEventPayload {
-                instance_id: instance_name,
+                instance_id: instance_name.clone(),
                 status: "exited".into(),
-                pid: None,
+                pid: Some(identity.pid),
                 exit_code: None,
             },
         );
+        crate::running_state::remove_pid_file(&data_dir, &instance_name);
+        state.launches.clear_running(&instance_name);
     }
     Ok(())
 }

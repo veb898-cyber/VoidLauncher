@@ -157,7 +157,7 @@ function App() {
           <ErrorBoundary>
             <Suspense
               fallback={
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 'var(--space-3xl)' }}>
+                <div className="page-loading">
                   <SnakeSpinner size={28} />
                 </div>
               }

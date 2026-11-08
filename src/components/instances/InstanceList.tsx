@@ -16,6 +16,7 @@ import { DuplicateInstanceModal } from './DuplicateInstanceModal';
 import { VerifyRepairModal } from './VerifyRepairModal';
 import { PackModal } from './PackModal';
 import { useEventStore } from '../../hooks/useGameEvents';
+import { isTerminalInstallStage } from '../../lib/installProgress';
 
 interface InstanceListProps {
   onCreateClick: () => void;
@@ -47,7 +48,9 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const [backupBusy, setBackupBusy] = useState<string | null>(null);
   const editorInstance = editorName ? instances.find((i) => i.name === editorName) ?? null : null;
 
-  const installingName = installProgress?.instance_id || null;
+  const installingName = installProgress && !isTerminalInstallStage(installProgress.stage)
+    ? installProgress.instance_id
+    : null;
 
   // Close the context menu on any click outside of it.
   useEffect(() => {
@@ -208,7 +211,10 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
                   </div>
                   {isInstalling && (
                     <div style={{ marginTop: 4 }}>
-                      <ProgressBar percent={installProgress?.percent || 0} />
+                      <ProgressBar
+                        percent={installProgress?.percent || 0}
+                        indeterminate={!installProgress || installProgress.indeterminate || installProgress.total_bytes <= 0}
+                      />
                     </div>
                   )}
                 </div>

@@ -394,7 +394,9 @@ pub async fn cmd_add_elyby_account(
         .map(|a| a.id.clone())
         .ok_or("Account not saved")?;
     accounts::store_elyby_token(&account_id, &access_token).map_err(|e| e.to_string())?;
-    crate::commands::heads::invalidate_player_head_cache(&data_dir, &uuid);
+    if let Err(e) = crate::commands::heads::invalidate_player_head_cache(&data_dir, &uuid) {
+        tracing::warn!(target: "launcher", "Could not invalidate head cache for new Ely.by account: {}", e);
+    }
     let config = state.config.lock().map_err(|e| e.to_string())?;
     Ok(public_account_entries(&config))
 }
@@ -427,7 +429,10 @@ pub fn cmd_remove_account(
     // still there and the active session must stay untouched.
     accounts::remove_account(&config.data_dir, &id)?;
     if let Some(uuid) = account.as_ref().and_then(|a| a.uuid.as_deref()) {
-        crate::commands::heads::invalidate_player_head_cache(&config.data_dir, uuid);
+        if let Err(e) = crate::commands::heads::invalidate_player_head_cache(&config.data_dir, uuid)
+        {
+            tracing::warn!(target: "launcher", "Could not invalidate head cache for removed account: {}", e);
+        }
     }
 
     // Removing the active account must also clear its global cached session;

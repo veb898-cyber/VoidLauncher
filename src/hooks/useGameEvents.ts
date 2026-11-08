@@ -5,18 +5,21 @@ import { create } from 'zustand';
 import { addToast } from '../components/ui/Toast';
 import { useLogStore } from '../stores/logStore';
 import type { LogEntry } from '../stores/logStore';
-import { useFocusStore, adjustRunningCount } from '../stores/focusStore';
+import { useFocusStore } from '../stores/focusStore';
 import { t } from '../lib/i18n';
 import { CRASH_KEYS, type CrashAnalysis } from '../lib/diagnostics';
-
-interface InstallProgress {
-  instance_id: string;
-  percent: number;
-  downloaded_bytes: number;
-  total_bytes: number;
-  stage: string;
-  message: string;
-}
+import {
+  applyRunningGameEvent,
+  runningSnapshotIsCurrent,
+} from '../lib/runningGames';
+import {
+  applyInstallProgress as reduceInstallProgress,
+  beginInstall as beginInstallState,
+  clearInstall as clearInstallState,
+  EMPTY_INSTALL_PROGRESS_STATE,
+  isTerminalInstallStage,
+  type InstallProgressEvent,
+} from '../lib/installProgress';
 
 interface LaunchEvent {
   instance_id: string;
@@ -32,34 +35,80 @@ interface LogPayload {
 }
 
 interface EventState {
-  installProgress: InstallProgress | null;
+  installProgress: InstallProgressEvent | null;
+  activeInstallId: string | null;
+  finishedInstallIds: string[];
+  beginInstall: (installId: string) => void;
+  applyInstallProgress: (event: InstallProgressEvent) => void;
+  clearInstall: (installId: string) => void;
   /** Names of the instances whose games are currently running (may be several). */
   runningGameIds: string[];
-  setInstallProgress: (p: InstallProgress | null) => void;
-  /** Add or remove a single instance from the running set. */
-  setRunningGameId: (id: string, running: boolean) => void;
-  /** Replace the whole running set (used when seeding from backend state). */
-  seedRunningGameIds: (ids: string[]) => void;
+  /** PID of each tracked run; guards against an older completion clearing a newer run. */
+  runningGamePids: Record<string, number>;
+  /** Incremented on every event so an older backend snapshot cannot overwrite it. */
+  runningStateVersion: number;
+  /** Add or remove a single instance from the running set; a stale completion PID is ignored. */
+  setRunningGameId: (id: string, running: boolean, pid?: number | null) => void;
+  /** Replace the whole set only if no event arrived since the request started. */
+  seedRunningGameIdsIfCurrent: (ids: string[], requestVersion: number) => boolean;
 }
 
 export const useEventStore = create<EventState>((set) => ({
-  installProgress: null,
+  ...EMPTY_INSTALL_PROGRESS_STATE,
+  beginInstall: (installId) =>
+    set((state) => beginInstallState(state, installId)),
+  applyInstallProgress: (event) =>
+    set((state) => reduceInstallProgress(state, event)),
+  clearInstall: (installId) =>
+    set((state) => clearInstallState(state, installId)),
   runningGameIds: [],
-  setInstallProgress: (p) => set({ installProgress: p }),
-  setRunningGameId: (id, running) =>
+  runningGamePids: {},
+  runningStateVersion: 0,
+  setRunningGameId: (id, running, pid) =>
     set((state) => {
-      if (!running) {
-        return { runningGameIds: state.runningGameIds.filter((g) => g !== id) };
-      }
-      return state.runningGameIds.includes(id)
-        ? state
-        : { runningGameIds: [...state.runningGameIds, id] };
+      const next = applyRunningGameEvent(
+        state.runningGameIds,
+        state.runningGamePids,
+        id,
+        running,
+        pid,
+      );
+      if (!next.changed) return state;
+      return {
+        runningGameIds: next.ids,
+        runningGamePids: next.pids,
+        runningStateVersion: state.runningStateVersion + 1,
+      };
     }),
-  seedRunningGameIds: (ids) => set({ runningGameIds: [...ids] }),
+  seedRunningGameIdsIfCurrent: (ids, requestVersion) => {
+    let applied = false;
+    set((state) => {
+      if (!runningSnapshotIsCurrent(requestVersion, state.runningStateVersion)) {
+        return state;
+      }
+      applied = true;
+      const pids: Record<string, number> = {};
+      for (const id of ids) {
+        const pid = state.runningGamePids[id];
+        if (pid != null) pids[id] = pid;
+      }
+      return {
+        runningGameIds: [...ids],
+        runningGamePids: pids,
+        runningStateVersion: state.runningStateVersion + 1,
+      };
+    });
+    return applied;
+  },
 }));
 
 export function useGameEvents() {
-  const { setInstallProgress, setRunningGameId, seedRunningGameIds } = useEventStore();
+  const {
+    applyInstallProgress,
+    clearInstall,
+    setRunningGameId,
+    seedRunningGameIdsIfCurrent,
+  } = useEventStore();
   const addLog = useLogStore((s) => s.addLog);
   const setWindowFocused = useFocusStore((s) => s.setWindowFocused);
   const setMinimized = useFocusStore((s) => s.setMinimized);
@@ -79,10 +128,15 @@ export function useGameEvents() {
     // badges survive a frontend reload while a game is still up.
     (async () => {
       try {
+        const requestVersion = useEventStore.getState().runningStateVersion;
         const ids = await invoke<string[]>('cmd_get_launch_state');
         if (!cancelled) {
-          seedRunningGameIds(ids);
-          useFocusStore.getState().setRunningCount(ids.length);
+          const applied = useEventStore
+            .getState()
+            .seedRunningGameIdsIfCurrent(ids, requestVersion);
+          if (applied) {
+            useFocusStore.getState().setRunningCount(ids.length);
+          }
         }
       } catch { /* ignore */ }
     })();
@@ -104,19 +158,24 @@ export function useGameEvents() {
         .catch((e) => { if (onError) onError(e); });
     };
 
-    register(listen<InstallProgress>('install_progress', (event) => {
+    register(listen<InstallProgressEvent>('install_progress', (event) => {
       const p = event.payload;
-      setInstallProgress(p);
-      if (p.stage === 'done') {
-        setTimeout(() => setInstallProgress(null), 2000);
+      applyInstallProgress(p);
+      if (isTerminalInstallStage(p.stage)) {
+        // Keep the terminal snapshot briefly for the overlay/hide transition,
+        // then remove it so stale events cannot resurrect a finished install.
+        const installId = p.install_id;
+        setTimeout(() => clearInstall(installId), 1500);
       }
     }));
 
     register(listen<LaunchEvent>('game_started', async (event) => {
       const p = event.payload;
       if (p.status === 'running') {
-        setRunningGameId(p.instance_id, true);
-        adjustRunningCount(1);
+        setRunningGameId(p.instance_id, true, p.pid);
+        useFocusStore
+          .getState()
+          .setRunningCount(useEventStore.getState().runningGameIds.length);
         // Minimize the launcher only once the game process is actually
         // running. If the launch fails before this point, the window stays
         // visible so the user sees the error.
@@ -129,8 +188,10 @@ export function useGameEvents() {
 
     register(listen<LaunchEvent>('launch_complete', async (event) => {
       const p = event.payload;
-      setRunningGameId(p.instance_id, false);
-      adjustRunningCount(-1);
+      setRunningGameId(p.instance_id, false, p.pid);
+      useFocusStore
+        .getState()
+        .setRunningCount(useEventStore.getState().runningGameIds.length);
       // If the launcher minimized itself when the game started (see the
       // `game_started` handler), restore it on a crash so the user actually
       // sees the error. A non-zero exit code means the Java process died —
@@ -195,10 +256,15 @@ export function useGameEvents() {
     // the live process table, so it is always the source of truth.
     const resyncRunningState = async () => {
       try {
+        const requestVersion = useEventStore.getState().runningStateVersion;
         const ids = await invoke<string[]>('cmd_get_launch_state');
         if (!cancelled) {
-          seedRunningGameIds(ids);
-          useFocusStore.getState().setRunningCount(ids.length);
+          const applied = useEventStore
+            .getState()
+            .seedRunningGameIdsIfCurrent(ids, requestVersion);
+          if (applied) {
+            useFocusStore.getState().setRunningCount(ids.length);
+          }
         }
       } catch { /* ignore */ }
     };
@@ -233,7 +299,7 @@ export function useGameEvents() {
         try { fn(); } catch { /* ignore */ }
       }
     };
-  }, [setInstallProgress, setRunningGameId, seedRunningGameIds, addLog, setWindowFocused, setMinimized]);
+  }, [applyInstallProgress, clearInstall, setRunningGameId, seedRunningGameIdsIfCurrent, addLog, setWindowFocused, setMinimized]);
 }
 
 export function emitFrontendLog(level: string, source: string, message: string) {

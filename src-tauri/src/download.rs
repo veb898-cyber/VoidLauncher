@@ -1,8 +1,9 @@
 use crate::error::{LauncherError, Result};
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -721,12 +722,30 @@ pub fn is_valid_asset_hash(hash: &str) -> bool {
 /// subsequent requests use a `Range` header so interrupted transfers
 /// continue from the last byte instead of restarting from zero (important
 /// on flaky connections). Servers that ignore `Range` simply restart.
+/// Per-file chunk observer used by install progress. It receives the current
+/// downloaded bytes and the best known total for that single file. `None`
+/// means the total is genuinely unknown (the UI must stay indeterminate).
+pub type FileChunkObserver = Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>;
+type FileProgressCallback = Arc<dyn Fn(&Path, u64, Option<u64>, u64) + Send + Sync>;
+type FileDoneCallback = Arc<dyn Fn(&Path, u64) + Send + Sync>;
+
 pub(crate) async fn download_to_part(
     url: &str,
     path: &std::path::Path,
     expected_sha1: &str,
     expected_size: Option<u64>,
     timeout: Option<Duration>,
+) -> Result<()> {
+    download_to_part_observed(url, path, expected_sha1, expected_size, timeout, None).await
+}
+
+pub(crate) async fn download_to_part_observed(
+    url: &str,
+    path: &std::path::Path,
+    expected_sha1: &str,
+    expected_size: Option<u64>,
+    timeout: Option<Duration>,
+    observer: Option<&FileChunkObserver>,
 ) -> Result<()> {
     // Auto-upgrade http:// to https://
     let url = if url.to_ascii_lowercase().starts_with("http://") {
@@ -955,6 +974,14 @@ pub(crate) async fn download_to_part(
                 .map_err(|e| LauncherError::Download(format!("Failed to create .part: {}", e)))?
         };
 
+        // Reset the per-file prepared contribution for this attempt. On a
+        // resume this is the valid .part offset; on a retry it is 0. The
+        // network counter gets no delta for bytes received in an earlier
+        // operation/attempt.
+        if let Some(observer) = observer {
+            observer(offset, expected_size.or(total_hint), 0);
+        }
+
         // Stream the body chunk by chunk — flat memory usage even for large
         // files, and interrupted transfers keep their partial bytes.
         {
@@ -963,6 +990,7 @@ pub(crate) async fn download_to_part(
 
             let mut stream = response.bytes_stream();
             let mut received: u64 = 0;
+            let mut network_since_emit: u64 = 0;
             let mut broken = false;
             let mut last_emit = std::time::Instant::now() - Duration::from_secs(1);
             // No-data timeout: if the server goes silent for 30s (no chunk at
@@ -983,21 +1011,36 @@ pub(crate) async fn download_to_part(
                                     LauncherError::Download(format!("Failed to write .part: {}", e))
                                 })?;
                                 received += c.len() as u64;
+                                network_since_emit += c.len() as u64;
                                 if last_emit.elapsed() >= Duration::from_millis(300) {
                                     last_emit = std::time::Instant::now();
                                     let downloaded = offset + received;
-                                    // Keep the progress bar monotonic: a retry that
-                                    // restarts from zero (server ignoring Range) must
-                                    // not walk the bar backwards.
+                                    // Prefer the known file size (from the pack
+                                    // manifest) over the Content-Range header;
+                                    // never show "37/37 MB" when 100 MB is known.
+                                    let total_hint_value = expected_size.or(total_hint);
+                                    if let Some(observer) = observer {
+                                        if network_since_emit > 0 {
+                                            observer(
+                                                downloaded,
+                                                total_hint_value,
+                                                network_since_emit,
+                                            );
+                                            network_since_emit = 0;
+                                        }
+                                    }
+                                    // Keep the pack/mod progress bar monotonic:
+                                    // a retry that restarts from zero must not
+                                    // walk that global bar backwards. The install
+                                    // observer above deliberately receives the
+                                    // lower prepared value and the new network
+                                    // delta.
                                     if downloaded > last_downloaded {
                                         last_downloaded = downloaded;
                                         crate::events::emit_file_progress(
                                             &url,
                                             downloaded,
-                                            // Prefer the known file size (from the pack
-                                            // manifest) over the Content-Range header;
-                                            // never show "37/37 MB" when 100 MB is known.
-                                            expected_size.or(total_hint).unwrap_or(downloaded),
+                                            total_hint_value.unwrap_or(downloaded),
                                         );
                                     }
                                 }
@@ -1022,6 +1065,15 @@ pub(crate) async fn download_to_part(
             file.flush()
                 .await
                 .map_err(|e| LauncherError::Download(format!("Failed to flush .part: {}", e)))?;
+            if let Some(observer) = observer {
+                if network_since_emit > 0 {
+                    observer(
+                        offset + received,
+                        expected_size.or(total_hint),
+                        network_since_emit,
+                    );
+                }
+            }
             offset += received;
             // A clean EOF is not proof of a complete transfer when the
             // server announced a body length: a proxy can terminate the
@@ -1136,11 +1188,24 @@ fn mirror_alternates(url: &str) -> Vec<String> {
 /// Download a single file with SHA1 verification and retry.
 /// Writes to a .part temp file, validates, then atomically renames.
 pub async fn download_file(url: &str, path: &Path, expected_sha1: &str) -> Result<()> {
+    download_file_observed(url, path, expected_sha1, None).await
+}
+
+pub async fn download_file_observed(
+    url: &str,
+    path: &Path,
+    expected_sha1: &str,
+    observer: Option<FileChunkObserver>,
+) -> Result<()> {
     tracing::info!(target: "launcher", url = %url, "Downloading {}", path.display());
 
     // Check if file exists with correct hash
     if path.exists() && !expected_sha1.is_empty() && verify_sha1(path, expected_sha1)? {
         tracing::debug!(target: "launcher", "SHA1 verified: {}", path.display());
+        if let Some(observer) = observer.as_ref() {
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            observer(size, Some(size), 0);
+        }
         return Ok(());
     }
 
@@ -1166,12 +1231,13 @@ pub async fn download_file(url: &str, path: &Path, expected_sha1: &str) -> Resul
             MAX_RETRIES
         };
         for attempt in 1..=attempts {
-            match download_to_part(
+            match download_to_part_observed(
                 candidate,
                 path,
                 expected_sha1,
                 None,
                 Some(timeout_for_unknown_size()),
+                observer.as_ref(),
             )
             .await
             {
@@ -1215,7 +1281,28 @@ pub async fn download_file_sized(
     expected_sha1: &str,
     size_bytes: u64,
 ) -> Result<()> {
+    download_file_sized_observed(url, path, expected_sha1, size_bytes, None).await
+}
+
+pub async fn download_file_sized_observed(
+    url: &str,
+    path: &Path,
+    expected_sha1: &str,
+    size_bytes: u64,
+    observer: Option<FileChunkObserver>,
+) -> Result<()> {
     tracing::info!(target: "launcher", url = %url, size = size_bytes, "Downloading {} (sized)", path.display());
+
+    if path.exists() && !expected_sha1.is_empty() && verify_sha1(path, expected_sha1)? {
+        tracing::debug!(target: "launcher", "SHA1 verified: {}", path.display());
+        if let Some(observer) = observer.as_ref() {
+            let size = std::fs::metadata(path)
+                .map(|m| m.len())
+                .unwrap_or(size_bytes);
+            observer(size, Some(size), 0);
+        }
+        return Ok(());
+    }
 
     let timeout = timeout_for_size(size_bytes);
     let candidates: Vec<String> = std::iter::once(url.to_string())
@@ -1237,12 +1324,13 @@ pub async fn download_file_sized(
             MAX_RETRIES
         };
         for attempt in 1..=attempts {
-            match download_to_part(
+            match download_to_part_observed(
                 candidate,
                 path,
                 expected_sha1,
                 Some(size_bytes),
                 Some(timeout),
+                observer.as_ref(),
             )
             .await
             {
@@ -1293,6 +1381,121 @@ fn dedupe_download_targets(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadCachePolicy {
+    /// Content-addressed artifacts (libraries, client, assets): verify SHA1
+    /// when known, otherwise require the declared size. When neither is
+    /// available, use the local integrity manifest written after the original
+    /// HTTPS download.
+    VerifySha1,
+    /// Size-only cache proof, kept for callers where re-hashing a very large
+    /// content-addressed store would be prohibitively expensive. The install
+    /// pipeline uses `VerifySha1` for assets as well.
+    SizeOnly,
+}
+
+const INTEGRITY_MANIFEST_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IntegrityManifest {
+    version: u32,
+    url: String,
+    size: u64,
+    sha256: String,
+}
+
+fn integrity_manifest_path(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_string_lossy();
+    Some(path.with_file_name(format!(".{name}.voidlauncher-integrity.json")))
+}
+
+/// Record the identity/hash of an artifact downloaded without publisher
+/// checksum or size metadata. This detects later local corruption; it is not
+/// a publisher signature and does not independently prove provenance.
+pub(crate) fn write_integrity_manifest(path: &Path, source_url: &str) -> Result<()> {
+    let Some(manifest_path) = integrity_manifest_path(path) else {
+        return Ok(());
+    };
+    let size = std::fs::metadata(path)
+        .map_err(|error| {
+            LauncherError::Download(format!("Cannot stat {}: {error}", path.display()))
+        })?
+        .len();
+    let sha256 = hash_file_sha256(path)?;
+    let manifest = IntegrityManifest {
+        version: INTEGRITY_MANIFEST_VERSION,
+        url: source_url.to_string(),
+        size,
+        sha256,
+    };
+    let json = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        LauncherError::Download(format!("Cannot encode integrity manifest: {error}"))
+    })?;
+    crate::instances::write_file_atomic(&manifest_path, &json)?;
+    Ok(())
+}
+
+pub(crate) fn verify_integrity_manifest(path: &Path, source_url: &str) -> bool {
+    let Some(manifest_path) = integrity_manifest_path(path) else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<IntegrityManifest>(&raw) else {
+        return false;
+    };
+    if manifest.version != INTEGRITY_MANIFEST_VERSION
+        || manifest.url != source_url
+        || manifest.sha256.len() != 64
+        || !manifest.sha256.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() != manifest.size {
+        return false;
+    }
+    hash_file_sha256(path)
+        .map(|actual| actual.eq_ignore_ascii_case(&manifest.sha256))
+        .unwrap_or(false)
+}
+
+fn cached_download_size(
+    path: &Path,
+    expected_sha1: &str,
+    expected_size: u64,
+    policy: DownloadCachePolicy,
+    source_url: &str,
+) -> Option<u64> {
+    if !path.exists() {
+        return None;
+    }
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let actual = metadata.len();
+    let valid = match policy {
+        DownloadCachePolicy::VerifySha1 => {
+            if !expected_sha1.is_empty() {
+                verify_sha1(path, expected_sha1).unwrap_or(false)
+            } else if expected_size > 0 {
+                actual == expected_size
+            } else {
+                // Maven fallback: no publisher checksum or size. Only a local
+                // manifest recorded after an earlier successful HTTPS download
+                // can prove this file is still the bytes we received.
+                verify_integrity_manifest(path, source_url)
+            }
+        }
+        DownloadCachePolicy::SizeOnly => expected_size == 0 || actual == expected_size,
+    };
+    valid.then_some(actual)
+}
+
 /// Download up to CONCURRENT_LIMIT files in parallel with progress callback.
 ///
 /// The callback receives `(files_done, files_total, bytes_done, bytes_total,
@@ -1303,18 +1506,69 @@ pub async fn download_files(
     files: Vec<(String, PathBuf, String, u64)>,
     on_progress: impl Fn(usize, usize, u64, u64, &str) + Send + Sync,
 ) -> Result<()> {
+    download_files_observed(
+        files,
+        DownloadCachePolicy::VerifySha1,
+        on_progress,
+        |_, _, _, _| {},
+        |_, _| {},
+    )
+    .await
+}
+
+/// Same as [`download_files`], plus per-file chunk/completion observers and an
+/// explicit cache policy. Install progress uses this to aggregate real bytes
+/// across parallel files without changing the pack/mod update callers.
+pub async fn download_files_observed(
+    files: Vec<(String, PathBuf, String, u64)>,
+    cache_policy: DownloadCachePolicy,
+    on_progress: impl Fn(usize, usize, u64, u64, &str) + Send + Sync,
+    on_file_progress: impl Fn(&Path, u64, Option<u64>, u64) + Send + Sync + 'static,
+    on_file_done: impl Fn(&Path, u64) + Send + Sync + 'static,
+) -> Result<()> {
     let files = dedupe_download_targets(files);
     let total = files.len();
     let total_bytes: u64 = files.iter().map(|(_, _, _, s)| *s).sum();
     let mut completed = 0usize;
     let mut completed_bytes = 0u64;
     let mut errors = Vec::new();
+    let progress_cb: FileProgressCallback = Arc::new(on_file_progress);
+    let done_cb: FileDoneCallback = Arc::new(on_file_done);
 
-    // Emit once upfront so the UI can show real totals from the start
-    // instead of "0 / 0 MB".
-    on_progress(0, total, 0, total_bytes, "Downloading...");
+    // Cached files are part of the completed plan. Invalid caches are left in
+    // the pending list and will be downloaded/verified again. Hashing runs on
+    // the blocking pool so a large cache does not stall the async runtime.
+    let (cached, pending) = tokio::task::spawn_blocking(move || {
+        let mut cached = Vec::new();
+        let mut pending = Vec::new();
+        for (url, path, sha1, size) in files {
+            if let Some(actual) = cached_download_size(&path, &sha1, size, cache_policy, &url) {
+                cached.push((url, path, actual));
+            } else {
+                pending.push((url, path, sha1, size));
+            }
+        }
+        (cached, pending)
+    })
+    .await
+    .map_err(|error| LauncherError::Download(format!("Cache validation failed: {error}")))?;
 
-    for chunk in files.chunks(CONCURRENT_LIMIT) {
+    for (_url, path, actual) in cached {
+        completed += 1;
+        completed_bytes = completed_bytes.saturating_add(actual);
+        progress_cb(&path, actual, Some(actual), 0);
+        done_cb(&path, actual);
+    }
+
+    on_progress(
+        completed,
+        total,
+        completed_bytes,
+        total_bytes,
+        "Downloading...",
+    );
+
+    for chunk in pending.chunks(CONCURRENT_LIMIT) {
         let mut handles = Vec::with_capacity(chunk.len());
 
         for (url, path, sha1, size) in chunk {
@@ -1322,24 +1576,49 @@ pub async fn download_files(
             let path = path.clone();
             let sha1 = sha1.clone();
             let size = *size;
+            let progress_cb = progress_cb.clone();
+            let callback_path = path.clone();
+            let observer: FileChunkObserver = Arc::new(move |downloaded, total, network| {
+                progress_cb(&callback_path, downloaded, total, network);
+            });
 
             handles.push((
                 path.clone(),
+                url.clone(),
+                sha1.clone(),
+                size,
                 tokio::spawn(async move {
                     if size > 0 {
-                        download_file_sized(&url, &path, &sha1, size).await
+                        download_file_sized_observed(&url, &path, &sha1, size, Some(observer)).await
                     } else {
-                        download_file(&url, &path, &sha1).await
+                        download_file_observed(&url, &path, &sha1, Some(observer)).await
                     }
                 }),
             ));
         }
 
-        for (path, handle) in handles {
+        for (path, url, sha1, size, handle) in handles {
             match handle.await {
                 Ok(Ok(())) => {
+                    // Maven fallback artifacts have neither a publisher SHA-1
+                    // nor a declared size. Record the bytes we received so a
+                    // later cache check can detect local corruption instead of
+                    // trusting bare file existence.
+                    if sha1.is_empty() && size == 0 {
+                        if let Err(error) = write_integrity_manifest(&path, &url) {
+                            tracing::warn!(
+                                target: "launcher",
+                                "Could not write integrity manifest for {}: {}",
+                                path.display(),
+                                error
+                            );
+                        }
+                    }
+                    let actual = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     completed += 1;
-                    completed_bytes += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    completed_bytes = completed_bytes.saturating_add(actual);
+                    progress_cb(&path, actual, Some(actual), 0);
+                    done_cb(&path, actual);
                     on_progress(
                         completed,
                         total,
@@ -1390,16 +1669,15 @@ pub async fn download_files(
     Ok(())
 }
 
-/// Download assets from Mojang
-pub async fn download_assets(
+/// Build the complete asset download plan, including objects already present
+/// on disk. The caller decides which entries are cached; install progress needs
+/// the full plan so cached objects count in the cumulative total.
+pub fn collect_asset_download_plan(
     asset_index: &crate::versions::AssetIndexData,
     assets_dir: &Path,
-    on_progress: impl Fn(usize, usize, u64, u64, &str) + Send + Sync,
-) -> Result<()> {
+) -> Result<Vec<(String, PathBuf, String, u64)>> {
     let objects_dir = assets_dir.join("objects");
     std::fs::create_dir_all(&objects_dir)?;
-    tracing::info!(target: "launcher", count = asset_index.objects.len(), "Downloading game assets");
-
     let mut files: Vec<(String, PathBuf, String, u64)> = Vec::new();
 
     for obj in asset_index.objects.values() {
@@ -1411,15 +1689,29 @@ pub async fn download_assets(
         }
         let hash_prefix = &obj.hash[..2];
         let path = objects_dir.join(hash_prefix).join(&obj.hash);
-
-        if !path.exists() {
-            let url = format!(
-                "https://resources.download.minecraft.net/{}/{}",
-                hash_prefix, obj.hash
-            );
-            files.push((url, path, obj.hash.clone(), obj.size));
-        }
+        let url = format!(
+            "https://resources.download.minecraft.net/{}/{}",
+            hash_prefix, obj.hash
+        );
+        files.push((url, path, obj.hash.clone(), obj.size));
     }
+    Ok(files)
+}
+
+/// Download assets from Mojang
+pub async fn download_assets(
+    asset_index: &crate::versions::AssetIndexData,
+    assets_dir: &Path,
+    on_progress: impl Fn(usize, usize, u64, u64, &str) + Send + Sync,
+) -> Result<()> {
+    tracing::info!(target: "launcher", count = asset_index.objects.len(), "Downloading game assets");
+
+    let files = collect_asset_download_plan(asset_index, assets_dir)?
+        .into_iter()
+        .filter(|(url, path, _, size)| {
+            cached_download_size(path, "", *size, DownloadCachePolicy::SizeOnly, url).is_none()
+        })
+        .collect::<Vec<_>>();
 
     if files.is_empty() {
         tracing::info!(target: "launcher", "Game assets download complete");
@@ -2020,5 +2312,289 @@ mod tests {
         let fresh = PausableInstallScope::begin();
         assert!(!pause_requested());
         drop(fresh);
+    }
+
+    #[test]
+    fn maven_fallback_without_hash_or_size_requires_integrity_manifest() {
+        let path = temp_file("maven_no_meta.jar", b"artifact-bytes");
+        let url = "https://maven.example.invalid/releases/a.jar";
+        let manifest_path = integrity_manifest_path(&path).unwrap();
+
+        // No publisher checksum, no size, no local manifest: not a cache hit.
+        assert_eq!(
+            cached_download_size(&path, "", 0, DownloadCachePolicy::VerifySha1, url),
+            None
+        );
+
+        write_integrity_manifest(&path, url).unwrap();
+        assert_eq!(
+            cached_download_size(&path, "", 0, DownloadCachePolicy::VerifySha1, url),
+            Some(14)
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[test]
+    fn maven_fallback_rejects_a_changed_source_url() {
+        let path = temp_file("maven_url_change.jar", b"artifact-bytes");
+        let manifest_path = integrity_manifest_path(&path).unwrap();
+        write_integrity_manifest(&path, "https://maven.example.invalid/releases/a-1.0.jar")
+            .unwrap();
+
+        assert_eq!(
+            cached_download_size(
+                &path,
+                "",
+                0,
+                DownloadCachePolicy::VerifySha1,
+                "https://maven.example.invalid/releases/a-2.0.jar"
+            ),
+            None
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[test]
+    fn maven_fallback_rejects_a_corrupt_manifest_and_keeps_the_file() {
+        let path = temp_file("maven_corrupt_manifest.jar", b"artifact-bytes");
+        let manifest_path = integrity_manifest_path(&path).unwrap();
+        write_integrity_manifest(&path, "https://maven.example.invalid/releases/a.jar").unwrap();
+        std::fs::write(&manifest_path, b"{ this is not json").unwrap();
+
+        assert_eq!(
+            cached_download_size(
+                &path,
+                "",
+                0,
+                DownloadCachePolicy::VerifySha1,
+                "https://maven.example.invalid/releases/a.jar"
+            ),
+            None
+        );
+        // A failed validation must not delete or modify the old artifact.
+        assert_eq!(std::fs::read(&path).unwrap(), b"artifact-bytes");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[test]
+    fn maven_fallback_detects_local_corruption_and_keeps_the_file() {
+        let path = temp_file("maven_tampered.jar", b"artifact-bytes");
+        let manifest_path = integrity_manifest_path(&path).unwrap();
+        let url = "https://maven.example.invalid/releases/a.jar";
+        write_integrity_manifest(&path, url).unwrap();
+
+        std::fs::write(&path, vec![b'x'; 14]).unwrap();
+
+        assert_eq!(
+            cached_download_size(&path, "", 0, DownloadCachePolicy::VerifySha1, url),
+            None
+        );
+        assert!(path.is_file());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[test]
+    fn maven_fallback_without_hash_still_accepts_a_matching_declared_size() {
+        // Size-bearing artifacts keep the historical size-based proof; the
+        // manifest is only the fallback when neither hash nor size exists.
+        let path = temp_file("maven_size_only.jar", b"artifact-bytes");
+        assert_eq!(
+            cached_download_size(
+                &path,
+                "",
+                14,
+                DownloadCachePolicy::VerifySha1,
+                "https://maven.example.invalid/releases/a.jar"
+            ),
+            Some(14)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cached_download_requires_a_valid_hash_or_matching_size() {
+        let path = temp_file("cache_valid.bin", b"abc");
+        let sha = hash_file_sha1(&path).unwrap();
+
+        assert_eq!(
+            cached_download_size(
+                &path,
+                &sha,
+                3,
+                DownloadCachePolicy::VerifySha1,
+                "https://example.invalid/a.bin"
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            cached_download_size(
+                &path,
+                "0000000000000000000000000000000000000000",
+                3,
+                DownloadCachePolicy::VerifySha1,
+                "https://example.invalid/a.bin"
+            ),
+            None
+        );
+        assert_eq!(
+            cached_download_size(
+                &path,
+                "",
+                3,
+                DownloadCachePolicy::VerifySha1,
+                "https://example.invalid/a.bin"
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            cached_download_size(
+                &path,
+                "",
+                4,
+                DownloadCachePolicy::VerifySha1,
+                "https://example.invalid/a.bin"
+            ),
+            None
+        );
+        assert_eq!(
+            cached_download_size(
+                &path,
+                "",
+                3,
+                DownloadCachePolicy::SizeOnly,
+                "https://example.invalid/a.bin"
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            cached_download_size(
+                &path,
+                "",
+                4,
+                DownloadCachePolicy::SizeOnly,
+                "https://example.invalid/a.bin"
+            ),
+            None
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn download_files_observed_counts_valid_cached_files_without_network() {
+        let path = temp_file("cached_plan.bin", b"hello");
+        let sha = hash_file_sha1(&path).unwrap();
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(Mutex::new(Vec::new()));
+        let progress_sink = progress.clone();
+        let done_sink = done.clone();
+
+        download_files_observed(
+            vec![(
+                "https://example.invalid/cached.bin".to_string(),
+                path.clone(),
+                sha,
+                5,
+            )],
+            DownloadCachePolicy::VerifySha1,
+            |_completed, _total, _bytes, _total_bytes, _message| {},
+            move |file, downloaded, total, network| {
+                progress_sink.lock().unwrap().push((
+                    file.to_path_buf(),
+                    downloaded,
+                    total,
+                    network,
+                ));
+            },
+            move |file, size| {
+                done_sink.lock().unwrap().push((file.to_path_buf(), size));
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            progress.lock().unwrap().as_slice(),
+            &[(path.clone(), 5, Some(5), 0)]
+        );
+        assert_eq!(done.lock().unwrap().as_slice(), &[(path.clone(), 5)]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn asset_plan_includes_cached_objects_and_total_size() {
+        use crate::versions::{AssetIndexData, AssetObject};
+
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_asset_plan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cached_hash = "a".repeat(40);
+        let missing_hash = "b".repeat(40);
+        let cached_path = dir
+            .join("objects")
+            .join(&cached_hash[..2])
+            .join(&cached_hash);
+        std::fs::create_dir_all(cached_path.parent().unwrap()).unwrap();
+        std::fs::write(&cached_path, b"abc").unwrap();
+
+        let index = AssetIndexData {
+            objects: std::collections::HashMap::from([
+                (
+                    "cached".to_string(),
+                    AssetObject {
+                        hash: cached_hash.clone(),
+                        size: 3,
+                        is_virtual: false,
+                    },
+                ),
+                (
+                    "missing".to_string(),
+                    AssetObject {
+                        hash: missing_hash.clone(),
+                        size: 7,
+                        is_virtual: false,
+                    },
+                ),
+            ]),
+            map_to_resources: false,
+        };
+        let plan = collect_asset_download_plan(&index, &dir).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan.iter().map(|(_, _, _, size)| *size).sum::<u64>(), 10);
+        assert!(plan.iter().any(|(_, path, _, _)| path == &cached_path));
+        assert!(plan
+            .iter()
+            .any(|(_, path, _, _)| path.ends_with(&missing_hash)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_cached_file_is_not_accepted_as_complete() {
+        let path = temp_file("cache_corrupt.bin", b"corrupt");
+        let expected_sha = "a9993e364706816aba3e25717850c26c9cd0d89d"; // SHA1("abc")
+        assert_eq!(
+            cached_download_size(
+                &path,
+                expected_sha,
+                8,
+                DownloadCachePolicy::VerifySha1,
+                "https://example.invalid/a.bin"
+            ),
+            None
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

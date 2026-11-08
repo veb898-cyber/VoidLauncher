@@ -10,6 +10,8 @@ import { addToast } from '../ui/Toast';
 import { logUiMessage } from '../../lib/uiLog';
 import { ContentBrowser, type ContentType } from './ContentBrowser';
 import { useFocusStore } from '../../stores/focusStore';
+import { useEventStore } from '../../hooks/useGameEvents';
+import { isInstanceRunning } from '../../lib/runningGames';
 import { useT } from '../../lib/i18n';
 import { useIconCacheStore } from '../../stores/iconCacheStore';
 import { useThemeStore } from '../../stores/themeStore';
@@ -18,6 +20,18 @@ import { EMPTY_UPDATE_CHECK, useUpdateCheckStore, type UpdateInfo } from '../../
 import { RemoteIcon } from '../../lib/remoteImage';
 import type { CompatState } from '../../lib/contentProviders';
 import { moveActiveContent, resourcePacksOptionsOrder } from '../../lib/contentOrder';
+import { modLoadersLabel, modVersionLabel } from '../../lib/modDisplay';
+import {
+  contentStatusKey,
+  importPromptForResult,
+  importStatusMessage,
+  isLocalImportFailure,
+  localImportErrorKey,
+  localImportReloadHintKey,
+  shouldOfferEnable,
+  type LocalImportPrompt,
+  type LocalImportResult,
+} from '../../lib/localImport';
 
 /// Strip a trailing version like "_v1.2.3", "-1.0", " v3.2" from a name
 function strip_version_suffix(name: string): string {
@@ -64,7 +78,9 @@ interface ContentItem {
   name: string;
   description?: string;
   version: string;
+  version_known?: boolean;
   provider: string;
+  loaders?: string[];
   enabled: boolean;
   icon: string | null;
   size?: number;
@@ -152,6 +168,9 @@ const ContentRow = memo(function ContentRow({
   compatTarget,
   onRowClick, onContext, onToggle,
 }: ContentRowProps) {
+  const t = useT();
+  const versionLabel = modVersionLabel(item.version, item.version_known, t('manager.version_unknown'));
+  const loadersLabel = modLoadersLabel(item.loaders);
   return (
     <div
       className={`content-list-row content-list-row--table${idx % 2 === 1 ? ' content-list-row--alt' : ''}${isSelected ? ' content-list-row--selected' : ''}`}
@@ -185,8 +204,9 @@ const ContentRow = memo(function ContentRow({
       <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }} title={item.description || item.name}>
         {item.name}
       </div>
-      <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {item.version}
+      <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={loadersLabel ? `${versionLabel} · ${loadersLabel}` : versionLabel}>
+        {versionLabel}
+        {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
       </div>
       <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
         {item.provider || ''}
@@ -209,6 +229,9 @@ const ContentCardRow = memo(function ContentCardRow({
   compatTarget,
   onRowClick, onContext, onToggle,
 }: Omit<ContentRowProps, 'idx'>) {
+  const t = useT();
+  const versionLabel = modVersionLabel(item.version, item.version_known, t('manager.version_unknown'));
+  const loadersLabel = modLoadersLabel(item.loaders);
   return (
     <div
       className={`glass-card${isSelected ? ' glass-card--selected' : ''}`}
@@ -246,8 +269,9 @@ const ContentCardRow = memo(function ContentCardRow({
             </div>
           ) : null}
         </div>
-        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {item.version}
+        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={loadersLabel ? `${versionLabel} · ${loadersLabel}` : versionLabel}>
+          {versionLabel}
+          {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
         </div>
         <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {item.provider || ''}
@@ -293,12 +317,23 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const updates = updateCheck.updates;
   const [showBrowser, setShowBrowser] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [importPrompts, setImportPrompts] = useState<LocalImportPrompt[]>([]);
+  const [importBusy, setImportBusy] = useState(false);
+  const currentImportPrompt = importPrompts[0] ?? null;
+  const conflictPrompt = currentImportPrompt?.kind === 'conflict' ? currentImportPrompt : null;
+  const duplicatePrompt = currentImportPrompt?.kind === 'duplicate' ? currentImportPrompt : null;
+  const activationPrompt = currentImportPrompt?.kind === 'activation' ? currentImportPrompt : null;
   const [downloadingMods, setDownloadingMods] = useState<Set<string>>(new Set());
   const [updateProgress, setUpdateProgress] = useState<{ current: number; total: number } | null>(null);
   // Heavy effects (file watcher, compatibility checks) are skipped while the window
   // is unfocused AND a game is running — this is the "frozen" state. State and UI
   // remain mounted; only the network/CPU work is suspended.
   const isFrozen = useFocusStore((s) => s.isFrozen);
+  // Per-instance, not a global "some game is running" flag: a warning for a
+  // resource pack imported into instance B must not appear because instance A
+  // happens to be running.
+  const runningGameIds = useEventStore((s) => s.runningGameIds);
+  const isGameRunning = isInstanceRunning(runningGameIds, instanceName);
 
   // Card list mode: Liquid Glass material + the settings toggle (default on).
   // Normal themes keep the table, so the flag alone never switches the view.
@@ -448,7 +483,9 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           filename: m.filename,
           name: m.name,
           version: m.version || '',
+          version_known: typeof m.version_known === 'boolean' ? m.version_known : Boolean(m.version),
           provider: !m.provider || m.provider === 'Local' ? t('manager.provider_local') : m.provider,
+          loaders: Array.isArray(m.loaders) ? m.loaders : [],
           enabled: m.enabled,
           icon: m.icon,
           slug: m.slug,
@@ -505,6 +542,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           filename: p.filename,
           name: p.name,
           version: p.version || '',
+          version_known: Boolean(p.version),
           provider: !p.provider || p.provider === 'Local' ? t('manager.provider_local') : p.provider,
           project_id: p.project_id || '',
           slug: p.project_id || undefined,
@@ -672,38 +710,118 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     }
   }, [isFrozen, loadItems]);
 
-  // Drag-and-drop .jar/.zip files onto the mods/packs list
+  const handleImportResult = useCallback((result: LocalImportResult, sourcePath: string) => {
+    const prompt = importPromptForResult(result, sourcePath);
+    if (prompt) setImportPrompts((prev) => [...prev, prompt]);
+
+    if (result.status === 'installed' || result.status === 'alreadyInstalled') {
+      const message = importStatusMessage(result);
+      addToast(t(message.key as Parameters<typeof t>[0], { name: result.filename, folder: label }), message.type);
+      loadItems();
+      const hintKey = localImportReloadHintKey(result.contentType);
+      if (hintKey && !result.requiresActivation && (result.contentType !== 'resourcepack' || isGameRunning)) {
+        addToast(t(hintKey as Parameters<typeof t>[0]), 'info');
+      }
+    }
+  }, [isGameRunning, label, loadItems, t]);
+
+  const runLocalImport = useCallback(async (
+    sourcePath: string,
+    options?: { conflict?: 'replace' | 'keepBoth'; expectedExistingSha256?: string },
+  ) => {
+    const name = sourcePath.split(/[/\\]/).pop() || sourcePath;
+    try {
+      const result = await invoke<LocalImportResult>('cmd_install_local_content', {
+        instanceName,
+        sourcePath,
+        subfolder,
+        conflict: options?.conflict ?? null,
+        expectedExistingSha256: options?.expectedExistingSha256 ?? null,
+      });
+      handleImportResult(result, sourcePath);
+    } catch (error: any) {
+      const failure = isLocalImportFailure(error) ? error : { message: String(error) };
+      addToast(t(localImportErrorKey(failure.code) as Parameters<typeof t>[0], {
+        name,
+        error: failure.message ?? failure.code ?? String(error),
+      }), 'error');
+    }
+  }, [handleImportResult, instanceName, subfolder, t]);
+
+  const dismissImportPrompt = useCallback(() => {
+    setImportPrompts((prev) => prev.slice(1));
+  }, []);
+
+  const resolveImportPrompt = useCallback(async (mode: 'replace' | 'keepBoth' | 'enable') => {
+    const prompt = currentImportPrompt;
+    if (!prompt || importBusy) return;
+    setImportBusy(true);
+    try {
+      if (prompt.kind === 'activation') {
+        await invoke('cmd_set_resource_pack_enabled', {
+          instanceName,
+          filename: prompt.filename,
+          enabled: true,
+        });
+        addToast(t('manager.local_activation_enabled', { name: prompt.name }), 'success');
+        loadItems();
+        if (isGameRunning) addToast(t('manager.local_reload_hint'), 'info');
+      } else if (prompt.kind === 'conflict') {
+        await runLocalImport(prompt.sourcePath, {
+          conflict: mode === 'replace' ? 'replace' : 'keepBoth',
+          expectedExistingSha256: prompt.result.existingSha256,
+        });
+      } else {
+        await runLocalImport(prompt.sourcePath, {
+          conflict: 'keepBoth',
+          expectedExistingSha256: prompt.result.existingSha256,
+        });
+      }
+      setImportPrompts((prev) => prev.slice(1));
+    } catch (error: any) {
+      addToast(t('manager.toggle_error', { error: String(error) }), 'error');
+    } finally {
+      setImportBusy(false);
+    }
+  }, [currentImportPrompt, importBusy, instanceName, isGameRunning, loadItems, runLocalImport, t]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let cancelled = false;
     (async () => {
       try {
         const w = getCurrentWindow();
-        unlisten = await w.onDragDropEvent((event) => {
+        const fn = await w.onDragDropEvent((event) => {
           const e = event.payload;
           if (e.type === 'drop') {
             setDragOver(false);
             if (!e.paths || e.paths.length === 0) return;
-            const validExt = contentType === 'mod' ? '.jar' : '.zip';
-            for (const filePath of e.paths) {
-              const filename = filePath.split(/[/\\]/).pop() || '';
-              if (!filename.toLowerCase().endsWith(validExt)) continue;
-              (async () => {
-                try {
-                  await invoke('cmd_install_mod', { instanceName, downloadUrl: `file://${filePath}`, fileName: filename, provider: 'local', subfolder });
-                  loadItems();
-                } catch (e: any) { addToast(t('manager.dragdrop_error', { name: filename, error: e.toString() }), 'error'); }
-              })();
-            }
+            (async () => {
+              // The backend validates the extension/type and rejects folders
+              // for mods. Sending every dropped path keeps directory drops
+              // working for resource packs and shaders.
+              for (const filePath of e.paths) {
+                await runLocalImport(filePath);
+              }
+            })();
           } else if (e.type === 'over') {
             setDragOver(true);
           } else if (e.type === 'leave') {
             setDragOver(false);
           }
         });
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
       } catch { }
     })();
-    return () => { if (unlisten) unlisten(); };
-  }, [instanceName, contentType, loadItems]);
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [runLocalImport]);
 
   useEffect(() => {
     const handler = () => setContextMenu(null);
@@ -744,6 +862,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           ].sort(compareContentNames);
           return [...active, ...disabled];
         });
+        if (newEnabled && isGameRunning) addToast(t('manager.local_reload_hint'), 'info');
         return;
       }
 
@@ -769,7 +888,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         setIcon(`file:${newName}`, cachedIcon);
       }
     } catch (e: any) { addToast(t('manager.toggle_error', { error: e.toString() }), 'error'); }
-  }, [instanceName, subfolder, getIcon, setIcon, t]);
+  }, [instanceName, subfolder, getIcon, setIcon, isGameRunning, t]);
 
   const moveResourcePack = useCallback(async (item: ContentItem, direction: 'up' | 'down') => {
     if (reorderingRef.current) return;
@@ -837,12 +956,8 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     if (!selected || selected.length === 0) return;
     const files = Array.isArray(selected) ? selected : [selected];
     for (const filePath of files) {
-      const filename = filePath.split(/[/\\]/).pop() || '';
-      try {
-        await invoke('cmd_install_mod', { instanceName, downloadUrl: `file://${filePath}`, fileName: filename, provider: 'local', subfolder });
-      } catch (e: any) { addToast(t('manager.add_error', { name: filename, error: e.toString() }), 'error'); }
+      await runLocalImport(filePath);
     }
-    loadItems();
   };
 
   const handleAddLocalFolder = async () => {
@@ -853,19 +968,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     });
     if (!selected || Array.isArray(selected)) return;
     const folderPath = selected.replace(/[\\/]+$/, '');
-    const filename = folderPath.split(/[/\\]/).pop() || '';
-    try {
-      await invoke('cmd_install_mod', {
-        instanceName,
-        downloadUrl: `file://${folderPath}`,
-        fileName: filename,
-        provider: 'local',
-        subfolder,
-      });
-      loadItems();
-    } catch (e: any) {
-      addToast(t('manager.add_error', { name: filename, error: e.toString() }), 'error');
-    }
+    await runLocalImport(folderPath);
   };
 
   const handleCheckUpdates = async () => {
@@ -1281,8 +1384,15 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
             <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
             <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
               <div><strong>{t('manager.detail_file')}</strong> {selectedItems[0].filename}</div>
-              {selectedItems[0].version && <div><strong>{t('manager.detail_version')}</strong> {selectedItems[0].version}</div>}
+              <div><strong>{t('manager.detail_version')}</strong> {modVersionLabel(selectedItems[0].version, selectedItems[0].version_known, t('manager.version_unknown'))}</div>
               {selectedItems[0].provider && <div><strong>{t('manager.detail_provider')}</strong> {selectedItems[0].provider}</div>}
+              {modLoadersLabel(selectedItems[0].loaders) && <div><strong>{t('manager.detail_loaders')}</strong> {modLoadersLabel(selectedItems[0].loaders)}</div>}
+              <div><strong>{t('manager.detail_status')}</strong> {t('manager.local_status_installed_only')} · {t(contentStatusKey(contentType, selectedItems[0].enabled) as Parameters<typeof t>[0])}</div>
+              {shouldOfferEnable(contentType, selectedItems[0].enabled) && (
+                <Button size="sm" variant="ghost" onClick={() => toggleEnabled(selectedItems[0])} style={{ marginTop: 4 }}>
+                  {t('common.enable')}
+                </Button>
+              )}
             </div>
           </>
         )}
@@ -1361,7 +1471,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{u.name}</div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 2 }}>
-                  <span style={{ textDecoration: 'line-through', opacity: 0.6 }}>{u.oldVersion}</span>
+                  <span style={{ textDecoration: 'line-through', opacity: 0.6 }}>{modVersionLabel(u.oldVersion, undefined, t('manager.version_unknown'))}</span>
                   <ArrowRight size={10} color="var(--success)" />
                   <span style={{ color: 'var(--success)', fontWeight: 500 }}>{u.newVersion}</span>
                 </div>
@@ -1381,6 +1491,80 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
             <div style={{ height: 6, background: 'var(--bg-secondary)', borderRadius: 3, overflow: 'hidden' }}>
               <div style={{ height: '100%', width: `${(updateProgress.current / updateProgress.total) * 100}%`, background: 'var(--primary)', borderRadius: 3, transition: 'width 0.3s ease' }} />
             </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Local import: a name conflict is never resolved silently. */}
+      <Modal
+        open={!!conflictPrompt}
+        onClose={() => { if (!importBusy) dismissImportPrompt(); }}
+        title={t('manager.local_conflict_title')}
+        maxWidth={520}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+            <Button variant="ghost" onClick={dismissImportPrompt} disabled={importBusy}>{t('common.cancel')}</Button>
+            <Button variant="ghost" onClick={() => resolveImportPrompt('keepBoth')} disabled={importBusy}>
+              {t('manager.local_conflict_keep_both')}
+            </Button>
+            <Button onClick={() => resolveImportPrompt('replace')} disabled={importBusy}>
+              {t('manager.local_conflict_replace')}
+            </Button>
+          </div>
+        }
+      >
+        {conflictPrompt && (
+          <div style={{ fontSize: 'var(--font-size-sm)', lineHeight: 1.5 }}>
+            {t('manager.local_conflict_body', {
+              name: conflictPrompt.result.conflictWith ?? conflictPrompt.result.filename,
+            })}
+          </div>
+        )}
+      </Modal>
+
+      {/* Local import: same content under a different name. */}
+      <Modal
+        open={!!duplicatePrompt}
+        onClose={() => { if (!importBusy) dismissImportPrompt(); }}
+        title={t('manager.local_duplicate_title')}
+        maxWidth={520}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+            <Button variant="ghost" onClick={dismissImportPrompt} disabled={importBusy}>{t('common.cancel')}</Button>
+            <Button onClick={() => resolveImportPrompt('keepBoth')} disabled={importBusy}>
+              {t('manager.local_duplicate_install')}
+            </Button>
+          </div>
+        }
+      >
+        {duplicatePrompt && (
+          <div style={{ fontSize: 'var(--font-size-sm)', lineHeight: 1.5 }}>
+            {t('manager.local_duplicate_body', {
+              name: duplicatePrompt.result.duplicateOf ?? duplicatePrompt.result.filename,
+            })}
+          </div>
+        )}
+      </Modal>
+
+      {/* Resource pack installed but absent from options.txt. */}
+      <Modal
+        open={!!activationPrompt}
+        onClose={() => { if (!importBusy) dismissImportPrompt(); }}
+        title={t('manager.local_activation_title')}
+        maxWidth={520}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+            <Button variant="ghost" onClick={dismissImportPrompt} disabled={importBusy}>{t('manager.local_activation_later')}</Button>
+            <Button onClick={() => resolveImportPrompt('enable')} disabled={importBusy}>{t('common.enable')}</Button>
+          </div>
+        }
+      >
+        {activationPrompt && (
+          <div style={{ fontSize: 'var(--font-size-sm)', lineHeight: 1.5 }}>
+            <div>{t('manager.local_activation_body', { name: activationPrompt.name })}</div>
+            {isGameRunning && (
+              <div style={{ marginTop: 8, color: 'var(--text-tertiary)' }}>{t('manager.local_reload_hint')}</div>
+            )}
           </div>
         )}
       </Modal>

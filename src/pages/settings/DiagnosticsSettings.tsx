@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AlertTriangle, CheckCircle2, Circle, XCircle } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
@@ -10,6 +10,7 @@ import {
   type DiagReport,
 } from '../../lib/diagnostics';
 import { friendlyErrorMessage } from '../../lib/errors';
+import { BugReportModal } from '../../components/settings/BugReportModal';
 
 export function DiagnosticsSettings() {
   const t = useT();
@@ -23,6 +24,8 @@ export function DiagnosticsSettings() {
   // to follow the global selection only, with no way to choose by hand.
   const [diagInstance, setDiagInstance] = useState<string | null>(selectedInstance);
   const [diagInstanceTouched, setDiagInstanceTouched] = useState(false);
+  const [bugReportOpen, setBugReportOpen] = useState(false);
+  const diagRunSeq = useRef(0);
 
   const instanceExists = useCallback(
     (name: string | null): name is string =>
@@ -43,17 +46,33 @@ export function DiagnosticsSettings() {
     }
   }, [selectedInstance, instanceExists, diagInstanceTouched, diagInstance]);
 
-  const runDiagnostics = useCallback(async () => {
+  // A report belongs to the instance it was produced for. Switching the
+  // selector must not leave A's file/network results attached to B's bug
+  // report, and an in-flight A run must not overwrite B's state.
+  useEffect(() => {
+    diagRunSeq.current += 1;
+    setDiagReport(null);
+    setDiagError(null);
+    setDiagRunning(false);
+  }, [diagInstance]);
+
+  const runDiagnostics = useCallback(async (): Promise<DiagReport | null> => {
+    const seq = ++diagRunSeq.current;
     setDiagRunning(true);
     setDiagError(null);
     try {
-      setDiagReport(await invoke<DiagReport>('cmd_run_diagnostics', {
+      const report = await invoke<DiagReport>('cmd_run_diagnostics', {
         instanceName: instanceExists(diagInstance) ? diagInstance : null,
-      }));
+      });
+      if (seq !== diagRunSeq.current) return null;
+      setDiagReport(report);
+      return report;
     } catch (e) {
+      if (seq !== diagRunSeq.current) return null;
       setDiagError(friendlyErrorMessage(e, t));
+      return null;
     } finally {
-      setDiagRunning(false);
+      if (seq === diagRunSeq.current) setDiagRunning(false);
     }
   }, [diagInstance, instanceExists, t]);
 
@@ -71,6 +90,9 @@ export function DiagnosticsSettings() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', marginBottom: 'var(--space-md)', flexWrap: 'wrap' }}>
         <Button onClick={runDiagnostics} disabled={diagRunning}>
           {diagRunning ? t('diag.running') : t('diag.run')}
+        </Button>
+        <Button variant="secondary" onClick={() => setBugReportOpen(true)}>
+          {t('bug.open')}
         </Button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', minWidth: 0 }}>
           <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
@@ -188,6 +210,14 @@ export function DiagnosticsSettings() {
           </div>
         </div>
       )}
+
+      <BugReportModal
+        open={bugReportOpen}
+        onClose={() => setBugReportOpen(false)}
+        instanceName={instanceExists(diagInstance) ? diagInstance : null}
+        diagReport={diagReport}
+        onRunDiagnostics={runDiagnostics}
+      />
     </section>
   );
 }

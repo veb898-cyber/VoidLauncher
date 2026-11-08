@@ -24,6 +24,22 @@ async function waitForPrompt() {
   });
 }
 
+describe('instance list loading lifecycle', () => {
+  beforeEach(() => {
+    resetStore();
+    invokeMock.mockReset();
+  });
+
+  it('clears loading and stores the error when the list request fails', async () => {
+    invokeMock.mockRejectedValue(new Error('backend unavailable'));
+    await useInstanceStore.getState().loadInstances();
+    const state = useInstanceStore.getState();
+    expect(state.isLoading).toBe(false);
+    expect(state.error).toBeTruthy();
+    expect(state.instances).toEqual([]);
+  });
+});
+
 describe('Ely.by skin preparation fallback', () => {
   beforeEach(() => {
     resetStore();
@@ -54,6 +70,29 @@ describe('Ely.by skin preparation fallback', () => {
       expect.objectContaining({ instanceName: 'Test', skipElybySkins: false }),
     );
     expect(useInstanceStore.getState().elybySkinsPrompt).toBeNull();
+  });
+
+  it('queues concurrent Ely.by prompts instead of hanging the first launch', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'cmd_prepare_elyby_skins') {
+        return { status: 'failed', kind: 'network', detail: 'offline' };
+      }
+      if (command === 'cmd_launch_game') return 'Launching...';
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    const first = useInstanceStore.getState().launchGame('First');
+    const second = useInstanceStore.getState().launchGame('Second');
+    await waitForPrompt();
+    expect(useInstanceStore.getState().isLaunching).toBe(true);
+    useInstanceStore.getState().resolveElybySkins('bypass');
+    await expect(first).resolves.toBe(true);
+
+    await waitForPrompt();
+    useInstanceStore.getState().resolveElybySkins('bypass');
+    await expect(second).resolves.toBe(true);
+    expect(useInstanceStore.getState().elybySkinsPrompt).toBeNull();
+    expect(useInstanceStore.getState().isLaunching).toBe(false);
   });
 
   it('launches once without the agent and does not persist the choice', async () => {

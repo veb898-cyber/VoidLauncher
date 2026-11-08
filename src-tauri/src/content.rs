@@ -209,9 +209,11 @@ pub fn write_sidecar(
         }
     }
     let path = crate::instances::sidecar_meta_path(content_dir, filename);
+    crate::import::ensure_no_reparse_points(content_dir, &path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    crate::import::ensure_no_reparse_points(content_dir, &path)?;
     std::fs::write(&path, sidecar.to_string())?;
     let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(content_dir, filename));
     Ok(())
@@ -951,6 +953,22 @@ pub fn classify_compat(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn create_junction(link: &std::path::Path, target: &std::path::Path) -> bool {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("cmd");
+        command.arg("/C");
+        command.raw_arg(format!(
+            "mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ));
+        command
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "voidlauncher_content_{}_{}",
@@ -1048,6 +1066,47 @@ mod tests {
         assert!(got.enabled);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_sidecar_rejects_an_index_junction() {
+        let dir = temp_dir("sidecar_junction");
+        let mods = dir.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        let outside = temp_dir("sidecar_junction_outside");
+        let index = mods.join(".index");
+        if !create_junction(&index, &outside) {
+            eprintln!("skipping junction test: mklink /J failed");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+
+        let error = write_sidecar(
+            &mods,
+            "foo.jar",
+            &SidecarWrite {
+                provider: "local",
+                content_type: "mod",
+                project_id: None,
+                project_name: None,
+                version_id: None,
+                version_number: None,
+                file_id: None,
+                hash: None,
+            },
+        )
+        .expect_err("the `.index` junction must be rejected");
+        assert!(error.to_string().contains("reparse point"), "{error}");
+        assert!(
+            !outside.join("foo.voidlauncher.json").exists(),
+            "sidecar must not be written through the junction"
+        );
+
+        let _ = std::fs::remove_dir(&index);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

@@ -40,7 +40,7 @@ export function t(key: MessageKey, vars?: Record<string, string | number>): stri
   let str = dict[key] ?? en[key] ?? key;
   if (vars) {
     for (const [name, val] of Object.entries(vars)) {
-      str = str.replace(new RegExp(`\\{${name}\\}`, 'g'), String(val));
+      str = str.replace(new RegExp(`\\{${name}\\}`, 'g'), () => String(val));
     }
   }
   return str;
@@ -138,7 +138,7 @@ export function useT(): (key: MessageKey, vars?: Record<string, string | number>
     let str = dict[key] ?? en[key] ?? key;
     if (vars) {
       for (const [name, val] of Object.entries(vars)) {
-        str = str.replace(new RegExp(`\\{${name}\\}`, 'g'), String(val));
+        str = str.replace(new RegExp(`\\{${name}\\}`, 'g'), () => String(val));
       }
     }
     return str;

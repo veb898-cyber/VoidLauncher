@@ -111,11 +111,14 @@ fn diag_packs_what_ui_sees() {
         crate::instances::read_sidecar_meta(&mods_dir, probe)
     );
     let meta = crate::commands::mods::read_mod_meta_from_jar_pub(&mods_dir.join(probe));
+    let (jar_version, _) = meta.version_for(None, None);
     println!(
-        "  jar meta: name=[{}] version=[{}] provider=[{}]",
-        meta.name, meta.version, meta.provider
+        "  jar meta: name=[{}] version=[{}] loaders=[{}]",
+        meta.name,
+        jar_version,
+        meta.loaders.join(",")
     );
-    let mut v = crate::commands::mods::sanitize_version_pub(&meta.version);
+    let mut v = crate::commands::mods::sanitize_version_pub(&jar_version);
     println!("  sanitized: [{}]", v);
     if v.is_empty() {
         v = crate::instances::read_sidecar_meta(&mods_dir, probe)
@@ -133,15 +136,27 @@ fn diag_packs_what_ui_sees() {
     }
     let probe2 = "recipeessentials-1.20.1-4.7.jar";
     let meta2 = crate::commands::mods::read_mod_meta_from_jar_pub(&mods_dir.join(probe2));
+    let (version2, _) = meta2.version_for(None, None);
     println!(
-        "  {} jar meta: name=[{}] version=[{}] provider=[{}] icon=[{:?}] slug=[{:?}]",
-        probe2, meta2.name, meta2.version, meta2.provider, meta2.icon, meta2.slug
+        "  {} jar meta: name=[{}] version=[{}] loaders=[{}] icon=[{:?}] slug=[{:?}]",
+        probe2,
+        meta2.name,
+        version2,
+        meta2.loaders.join(","),
+        meta2.icon,
+        meta2.slug
     );
     let probe3 = "smoothchunk-1.20.1-4.1.jar";
     let meta3 = crate::commands::mods::read_mod_meta_from_jar_pub(&mods_dir.join(probe3));
+    let (version3, _) = meta3.version_for(None, None);
     println!(
-        "  {} jar meta: name=[{}] version=[{}] provider=[{}] icon=[{:?}] slug=[{:?}]",
-        probe3, meta3.name, meta3.version, meta3.provider, meta3.icon, meta3.slug
+        "  {} jar meta: name=[{}] version=[{}] loaders=[{}] icon=[{:?}] slug=[{:?}]",
+        probe3,
+        meta3.name,
+        version3,
+        meta3.loaders.join(","),
+        meta3.icon,
+        meta3.slug
     );
 
     if !config.curseforge_api_key.is_empty() {

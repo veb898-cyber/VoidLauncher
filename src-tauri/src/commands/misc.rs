@@ -413,6 +413,20 @@ pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Vec<String>, S
         config.data_dir.clone()
     };
     let mut running = state.launches.running_instances();
+    // A registry entry can outlive its process when the exit watcher missed an
+    // event. Re-verify the recorded identity before reporting it; a provably
+    // dead/reused PID is healed here instead of keeping the UI stuck.
+    running.retain(|name| {
+        let Some(identity) = state.launches.process_identity(name) else {
+            return true;
+        };
+        if crate::running_state::identity_is_dead(&identity) {
+            state.launches.clear_running(name);
+            false
+        } else {
+            true
+        }
+    });
     // Only games whose recorded process identity matches the live process are
     // adopted; a legacy or mismatched record is not presented as a running
     // game (and could be an unrelated process that received a recycled pid).

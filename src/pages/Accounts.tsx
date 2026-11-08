@@ -168,6 +168,8 @@ export function Accounts() {
     setSwitching(true);
     try {
       await setDefaultAccount(selected.id);
+    } catch (e) {
+      addToast(t('accounts.make_active_error', { error: String(e) }), 'error');
     } finally {
       setSwitching(false);
     }
@@ -193,7 +195,7 @@ export function Accounts() {
   // (no toast — the picker itself shows the result); failure rolls the
   // marker back and surfaces the error.
   const handleSetCape = async (capeId: string | null) => {
-    if (!selected || capeSaving) return;
+    if (!selected || capeSaving || capesLoading) return;
     const accountId = selected.id;
     const prev = capes;
     applyCapes(accountId, prev.map((c) => ({ ...c, active: capeId !== null && c.id === capeId })));
@@ -206,7 +208,7 @@ export function Accounts() {
       const pngById = new Map(prev.map((c) => [c.id, c.png]));
       applyCapes(accountId, list.map((c) => ({ ...c, png: c.png || pngById.get(c.id) || '' })));
     } catch (e) {
-      if (selectedIdRef.current === accountId) applyCapes(accountId, prev);
+      applyCapes(accountId, prev);
       addToast(t('accounts.cape_update_error', { error: String(e) }), 'error');
     } finally {
       setCapeSaving(false);
@@ -229,8 +231,12 @@ export function Accounts() {
   const confirmSkinChange = async () => {
     if (!skinModalAccount) return;
     try {
-      await changeSkin(skinModalAccount.id, skinModalPath, skinVariant);
-      addToast(t('accounts.skin_updated_toast'), 'success');
+      const refreshed = await changeSkin(skinModalAccount.id, skinModalPath, skinVariant);
+      if (refreshed) {
+        addToast(t('accounts.skin_updated_toast'), 'success');
+      } else {
+        addToast(t('accounts.skin_refresh_error'), 'error');
+      }
       setSkinModalAccount(null);
       setSkinModalPath('');
     } catch (e) {
@@ -394,8 +400,19 @@ export function Accounts() {
                             aria-label={t('accounts.refresh_skin_btn')}
                             onClick={async (e) => {
                               e.stopPropagation();
-                              await invalidatePlayerHead(acc.uuid!);
-                              addToast(t('accounts.skin_refreshed'), 'info');
+                              try {
+                                const refreshed = await invalidatePlayerHead(acc.uuid!);
+                                if (refreshed) {
+                                  addToast(t('accounts.skin_refreshed'), 'info');
+                                } else {
+                                  addToast(t('accounts.skin_refresh_error'), 'error');
+                                }
+                              } catch (err) {
+                                addToast(
+                                  t('accounts.skin_update_error', { error: String(err) }),
+                                  'error',
+                                );
+                              }
                             }}
                           >
                             <RefreshCw size={14} />
@@ -458,7 +475,7 @@ export function Accounts() {
                       type="button"
                       className={`cape-tile${!capes.some((c) => c.active) ? ' cape-tile--active' : ''}`}
                       onClick={() => handleSetCape(null)}
-                      disabled={capeSaving}
+                      disabled={capeSaving || capesLoading}
                       title={t('accounts.cape_none')}
                     >
                       <span className="cape-thumb cape-thumb--none"><Ban size={18} /></span>
@@ -470,7 +487,7 @@ export function Accounts() {
                         type="button"
                         className={`cape-tile${c.active ? ' cape-tile--active' : ''}`}
                         onClick={() => { if (!c.active) handleSetCape(c.id); }}
-                        disabled={capeSaving}
+                        disabled={capeSaving || capesLoading}
                         title={c.alias}
                       >
                         {c.png ? (

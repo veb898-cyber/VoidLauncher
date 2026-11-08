@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { logUiMessage } from '../lib/uiLog';
 import { useAuthStore } from './authStore';
-import { invalidatePlayerHead } from '../lib/remoteImage';
+import { forgetPlayerHead, invalidatePlayerHead } from '../lib/remoteImage';
 
 /**
  * Public, token-free account metadata. The backend strips `access_token` and
@@ -52,6 +52,12 @@ const CAPES_TTL_MS = 45_000;
  * from the network in the background; this is only the instant first paint.
  */
 const CAPES_STORAGE_PREFIX = 'voidlauncher-capes:';
+
+/**
+ * Per-account mutation generation. A cape list response that started before an
+ * optimistic cape change must not overwrite the newer local state.
+ */
+const capesMutationVersion = new Map<string, number>();
 
 function readPersistedCapes(accountId: string): CapeEntry[] | null {
   try {
@@ -127,7 +133,7 @@ interface AccountsState {
   addElybyAccount: (username: string, password: string) => Promise<void>;
   removeAccount: (id: string) => Promise<void>;
   setDefaultAccount: (id: string) => Promise<void>;
-  changeSkin: (accountId: string, skinPath: string, variant?: string) => Promise<void>;
+  changeSkin: (accountId: string, skinPath: string, variant?: string) => Promise<boolean>;
   /** Load (or silently refresh) the cape list of one account. */
   fetchCapes: (accountId: string, force?: boolean) => Promise<void>;
   /** Replace the cached cape list (optimistic updates and server answers). */
@@ -197,7 +203,9 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       const accounts = await invoke<AccountEntry[]>('cmd_add_elyby_account', { username, password });
       const added = accounts.find((a) => a.name.toLowerCase() === username.toLowerCase()) || accounts[accounts.length - 1];
       if (added?.uuid) {
-        void invalidatePlayerHead(added.uuid);
+        void invalidatePlayerHead(added.uuid).catch((e) => {
+          console.warn('Failed to invalidate player head for new account:', e);
+        });
       }
       set({ accounts, isLoading: false });
     } catch (e: any) {
@@ -211,10 +219,11 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       const doomed = get().accounts.find((a) => a.id === id);
       const accounts = await invoke<AccountEntry[]>('cmd_remove_account', { id });
       if (doomed?.uuid) {
-        void invalidatePlayerHead(doomed.uuid);
+        forgetPlayerHead(doomed.uuid);
       }
       // Drop every trace of the removed account so a future account that
       // reuses the id never shows stale capes.
+      capesMutationVersion.set(id, (capesMutationVersion.get(id) ?? 0) + 1);
       forgetPersistedCapes(id);
       set((s) => {
         const capesByAccount = { ...s.capesByAccount };
@@ -241,6 +250,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       set({ accounts });
     } catch (e: any) {
       set({ error: e.toString() });
+      throw e;
     }
   },
 
@@ -248,12 +258,20 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
     try {
       const account = get().accounts.find((a) => a.id === accountId);
       await invoke('cmd_change_skin', { accountId, skinPath, variant });
-      // The backend changed the texture; drop the old head/skin cache before
-      // the next render so the preview and every Avatar show the new skin.
+      // The backend changed the texture; drop the old head/skin cache so the
+      // preview and every Avatar show the new skin. A failed refresh is
+      // reported to the caller instead of claiming success.
+      let refreshed = true;
       if (account?.uuid) {
-        await invalidatePlayerHead(account.uuid);
+        try {
+          refreshed = await invalidatePlayerHead(account.uuid);
+        } catch (e: any) {
+          refreshed = false;
+          set({ error: e.toString() });
+        }
       }
       get().loadAccounts(true);
+      return refreshed;
     } catch (e: any) {
       set({ error: e.toString() });
       throw e;
@@ -286,12 +304,17 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
     if (fresh && !force) return;
     if (capesInflight.has(accountId)) return;
     capesInflight.add(accountId);
+    const mutationVersion = capesMutationVersion.get(accountId) ?? 0;
     set((s) => ({
       capesLoadingByAccount: { ...s.capesLoadingByAccount, [accountId]: true },
       capesErrorByAccount: { ...s.capesErrorByAccount, [accountId]: null },
     }));
     try {
       const capes = await invoke<CapeEntry[]>('cmd_get_player_capes', { accountId, force });
+      // A local optimistic change (or account removal) happened while this
+      // request was in flight: its response is stale.
+      if ((capesMutationVersion.get(accountId) ?? 0) !== mutationVersion) return;
+      if (!get().accounts.some((account) => account.id === accountId)) return;
       const merged = withPreservedPngs(capes, get().capesByAccount[accountId]?.capes);
       persistCapes(accountId, merged);
       set((s) => ({
@@ -301,6 +324,9 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
         },
       }));
     } catch (e: any) {
+      // A stale failed refresh must not surface an error over a newer
+      // optimistic cape selection.
+      if ((capesMutationVersion.get(accountId) ?? 0) !== mutationVersion) return;
       const message = String(e);
       // The inline picker shows this too, but the user explicitly expects
       // cape failures in the launcher log as well.
@@ -317,6 +343,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
   },
 
   applyCapes: (accountId: string, capes: CapeEntry[]) => {
+    capesMutationVersion.set(accountId, (capesMutationVersion.get(accountId) ?? 0) + 1);
     const merged = withPreservedPngs(capes, get().capesByAccount[accountId]?.capes);
     persistCapes(accountId, merged);
     set((s) => ({

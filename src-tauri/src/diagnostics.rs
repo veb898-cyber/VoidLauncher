@@ -408,6 +408,13 @@ fn collect_instance(
 
 // ══════════════════════════ entry point ══════════════════════════
 
+/// System inventory checks for the bug-report screen. Unlike
+/// `run_diagnostics`, this does not run the full instance file verification
+/// or network probes.
+pub(crate) fn system_checks(config: &AppConfig) -> Vec<DiagCheck> {
+    collect_system(config).checks
+}
+
 /// Gather the full diagnostics report. Instance checks run on a worker
 /// thread (the verify scan walks thousands of files); the network probes
 /// run concurrently with a 5 s per-host timeout.

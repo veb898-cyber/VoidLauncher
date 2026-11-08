@@ -1133,6 +1133,19 @@ a {
   position: relative;
 }
 
+/* Lazy-page Suspense fallback: fill the content viewport (not the whole
+   window, not the sidebar) and center the spinner in both axes. The parent
+   flex item has a definite height, so min-height:100% resolves against it. */
+.page-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 100%;
+  padding: var(--space-3xl);
+  box-sizing: border-box;
+}
+
 /* Ambient background glow */
 .main-content::before {
   content: '';
@@ -1939,6 +1952,17 @@ select option {
   border-radius: var(--radius-full);
   transition: width var(--transition-normal);
   box-shadow: var(--glow-primary);
+}
+
+.progress--indeterminate .progress__bar {
+  width: 34%;
+  min-width: 48px;
+  animation: progress-indeterminate 1.15s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(320%); }
 }
 
 /* Subtle moving highlight over the filled part of any progress bar.

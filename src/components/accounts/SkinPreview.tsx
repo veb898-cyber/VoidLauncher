@@ -1,18 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import type { SkinViewer } from 'skinview3d';
-import { invoke } from '@tauri-apps/api/core';
-import { IconShine, onPlayerHeadInvalidated } from '../../lib/remoteImage';
+import { IconShine, usePlayerSkin } from '../../lib/remoteImage';
 import { useT } from '../../lib/i18n';
 
 const DEFAULT_WIDTH = 480;
 const DEFAULT_HEIGHT = 640;
 /** Room for the one-line hint under the canvas (font-xs + gap). */
 const HINT_RESERVE = 26;
-
-type SkinState =
-  | { status: 'loading' }
-  | { status: 'ready'; skin: string }
-  | { status: 'error' };
 
 /**
  * One shared dynamic import for the whole module. The Accounts page is
@@ -63,12 +57,12 @@ export function SkinPreview({
   // Latest desired cape. The viewer may not exist yet when the cape arrives
   // (it is created on the first ready skin), so creation reads this ref.
   const capeRef = useRef<string | null>(null);
-  const [skinState, setSkinState] = useState<SkinState>({ status: 'loading' });
+  const { skin, status: skinStatus } = usePlayerSkin(uuid);
   const [viewerReady, setViewerReady] = useState(false);
+  const [renderedUuid, setRenderedUuid] = useState<string | null>(null);
+  const [viewerError, setViewerError] = useState(false);
   const [box, setBox] = useState<{ w: number; h: number } | null>(null);
-  // Bumped after a backend invalidation (refresh button/skin upload) so the
-  // raw-skin fetch below re-runs even though the account uuid did not change.
-  const [reloadToken, setReloadToken] = useState(0);
+  const displayReady = Boolean(viewerReady && renderedUuid === uuid);
 
   // Measure the stage: the canvas is sized to whatever room the card gives,
   // preserving the 3:4 ratio (height first, then width).
@@ -95,44 +89,15 @@ export function SkinPreview({
   const sizeRef = useRef({ w: fitW, h: fitH });
   sizeRef.current = { w: fitW, h: fitH };
 
-  // Fetch the raw skin whenever the selected account changes or its cache was
-  // invalidated elsewhere (the uuid stays the same in the refresh scenario).
-  useEffect(() => {
-    if (!uuid) {
-      setSkinState({ status: 'error' });
-      return;
-    }
-    let alive = true;
-    setSkinState({ status: 'loading' });
-    invoke<string | null>('cmd_get_player_head', {
-      uuid: uuid.replace(/-/g, '').toLowerCase(),
-    })
-      .then((skin) => {
-        if (!alive) return;
-        setSkinState(skin ? { status: 'ready', skin } : { status: 'error' });
-      })
-      .catch(() => {
-        if (alive) setSkinState({ status: 'error' });
-      });
-    return () => {
-      alive = false;
-    };
-  }, [uuid, reloadToken]);
-
-  useEffect(() => {
-    const key = uuid?.replace(/-/g, '').toLowerCase();
-    if (!key) return;
-    return onPlayerHeadInvalidated((changedKey) => {
-      if (changedKey === key) setReloadToken((value) => value + 1);
-    });
-  }, [uuid]);
-
   // Create the viewer on the first ready skin; later skins load in place.
+  // The shared player-head store already re-fetches after an invalidation, so
+  // this component never issues a second independent backend request.
   useEffect(() => {
-    if (skinState.status !== 'ready') return;
+    if (skinStatus !== 'ready' || !skin) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     let disposed = false;
+    setViewerError(false);
     (async () => {
       try {
         if (!viewerRef.current) {
@@ -157,7 +122,7 @@ export function SkinPreview({
           // read as a black rectangle flash on Liquid Glass. `render()` then
           // guarantees a painted frame sits in the buffer before opacity
           // flips to 1, so the fade-in never starts from a blank canvas.
-          await v.loadSkin(skinState.skin, { model: 'auto-detect' });
+          await v.loadSkin(skin, { model: 'auto-detect' });
           if (disposed) return;
           if (capeRef.current) {
             v.loadCape(capeRef.current).catch((e) =>
@@ -166,17 +131,21 @@ export function SkinPreview({
           }
           v.render();
           setViewerReady(true);
+          setRenderedUuid(uuid);
         } else {
-          await viewerRef.current.loadSkin(skinState.skin, { model: 'auto-detect' });
+          await viewerRef.current.loadSkin(skin, { model: 'auto-detect' });
+          if (disposed) return;
+          setRenderedUuid(uuid);
         }
       } catch (e) {
         console.error('skin preview failed:', e);
+        if (!disposed) setViewerError(true);
       }
     })();
     return () => {
       disposed = true;
     };
-  }, [skinState]);
+  }, [skin, skinStatus, uuid]);
 
   // Resize the existing viewer in place when the stage changes.
   useEffect(() => {
@@ -247,13 +216,13 @@ export function SkinPreview({
               display: 'block',
               width: fitW,
               height: fitH,
-              opacity: viewerReady ? 1 : 0,
+              opacity: displayReady ? 1 : 0,
               transition: 'opacity 0.25s ease-out',
             }}
           />
-          {!viewerReady && (
+          {!displayReady && (
             <div style={{ position: 'absolute', inset: 0 }}>
-              {skinState.status === 'error' ? (
+              {skinStatus === 'failed' || viewerError ? (
                 <div
                   style={{
                     position: 'absolute',
@@ -279,7 +248,7 @@ export function SkinPreview({
             </div>
           )}
         </div>
-        {viewerReady && (
+        {displayReady && (
           <p
             style={{
               margin: 0,

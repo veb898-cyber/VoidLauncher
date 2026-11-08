@@ -321,7 +321,7 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
           <WorldsManager instanceName={instance.name} onOpenFolder={() => handleOpenFolder('saves')} />
         )}
         {tab === 'servers' && (
-          <ServersManager instanceName={instance.name} />
+          <ServersManager key={instance.name} instanceName={instance.name} />
         )}
         {tab === 'screenshots' && (
           <ScreenshotsGallery instanceName={instance.name} onOpenFolder={() => handleOpenFolder('screenshots')} />

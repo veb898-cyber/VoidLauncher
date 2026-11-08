@@ -253,10 +253,11 @@ pub fn save_instance(
 /// can never leave a truncated/half-written config behind — the old file
 /// stays intact until the final rename.
 ///
-/// If the direct rename is blocked (Windows sharing violation), the old
-/// file is parked as `.bak` instead of being deleted: the new file is
-/// swapped in, and the backup is removed only after that succeeds. If the
-/// swap fails too, the backup is restored — the config is never lost.
+/// If the direct rename is blocked (Windows sharing violation), a `.bak`
+/// copy is made while the original stays in place; the new file is swapped
+/// in and the backup is removed only after that succeeds. A concurrent
+/// reader therefore never observes a missing file, and a failed swap leaves
+/// the original untouched.
 pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -282,8 +283,12 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
                 let _ = std::fs::remove_file(&tmp_path);
                 return Err(first_err.into());
             }
+            // Keep the original in place while the replacement is prepared:
+            // a concurrent reader must never observe the file missing. A copy
+            // (not a rename) also leaves the live file usable if the second
+            // rename still fails.
             let _ = std::fs::remove_file(&bak_path);
-            if let Err(e) = std::fs::rename(path, &bak_path) {
+            if let Err(e) = std::fs::copy(path, &bak_path) {
                 let _ = std::fs::remove_file(&tmp_path);
                 return Err(e.into());
             }
@@ -293,16 +298,9 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
                     Ok(())
                 }
                 Err(e) => {
-                    // Put the original back; keep .bak if even that fails so
-                    // the data is still recoverable manually.
-                    if let Err(restore_err) = std::fs::rename(&bak_path, path) {
-                        tracing::error!(
-                            target: "launcher",
-                            "Failed to restore config backup {:?}: {} (backup kept)",
-                            bak_path, restore_err
-                        );
-                    }
+                    // The original was never moved, so it is still intact.
                     let _ = std::fs::remove_file(&tmp_path);
+                    let _ = std::fs::remove_file(&bak_path);
                     Err(e.into())
                 }
             }
@@ -1210,8 +1208,14 @@ pub(crate) fn read_sidecar_meta(
 
 /// Remove sidecar metadata in both layouts (used when a content file is deleted).
 pub(crate) fn remove_sidecar_meta(content_dir: &std::path::Path, filename: &str) {
-    let _ = std::fs::remove_file(sidecar_meta_path(content_dir, filename));
-    let _ = std::fs::remove_file(legacy_sidecar_path(content_dir, filename));
+    let meta = sidecar_meta_path(content_dir, filename);
+    if crate::import::ensure_no_reparse_points(content_dir, &meta).is_ok() {
+        let _ = std::fs::remove_file(meta);
+    }
+    let legacy = legacy_sidecar_path(content_dir, filename);
+    if crate::import::ensure_no_reparse_points(content_dir, &legacy).is_ok() {
+        let _ = std::fs::remove_file(legacy);
+    }
 }
 
 /// Suffix for a content file parked aside while its replacement downloads.
@@ -1228,6 +1232,10 @@ pub(crate) fn stash_old_content_files(
     content_dir: &std::path::Path,
     old_filename: &str,
 ) -> std::result::Result<Vec<(PathBuf, PathBuf)>, String> {
+    if let Some(base) = content_dir.parent() {
+        crate::import::ensure_no_reparse_points(base, content_dir)
+            .map_err(|e| format!("Refusing to park content through a junction/symlink: {e}"))?;
+    }
     // `old_filename` is untrusted frontend input: strip any path components
     // so it can never escape the content directory.
     let old = std::path::Path::new(old_filename)
@@ -1235,15 +1243,17 @@ pub(crate) fn stash_old_content_files(
         .and_then(|n| n.to_str())
         .filter(|n| !n.is_empty() && *n != "." && *n != "..")
         .ok_or("Invalid old file name")?;
-    let base = content_stem(old);
+    // Park only this exact file and its enabled/disabled twin. A same-stem
+    // file of the other extension (e.g. `Foo.zip` next to `Foo.jar`) is a
+    // different content item and must never be deleted by a successful
+    // replacement of `Foo.jar`.
+    let enabled = old.strip_suffix(".disabled").unwrap_or(old).to_string();
+    let disabled = format!("{enabled}.disabled");
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for c in [
-        content_dir.join(old),
-        content_dir.join(format!("{}.jar", base)),
-        content_dir.join(format!("{}.zip", base)),
-    ] {
-        if !candidates.contains(&c) {
-            candidates.push(c);
+    for name in [&enabled, &disabled] {
+        let candidate = content_dir.join(name);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
         }
     }
     let mut stashed = Vec::new();
@@ -1306,6 +1316,11 @@ pub(crate) fn discard_stashed_files(stashed: &[(PathBuf, PathBuf)]) {
 /// if the original name is free the park is restored, if it is taken the park
 /// is stale and gets removed.
 pub(crate) fn recover_stashed_content_files(content_dir: &std::path::Path) {
+    if let Some(base) = content_dir.parent() {
+        if crate::import::ensure_no_reparse_points(base, content_dir).is_err() {
+            return;
+        }
+    }
     let Ok(entries) = std::fs::read_dir(content_dir) else {
         return;
     };
@@ -1320,7 +1335,11 @@ pub(crate) fn recover_stashed_content_files(content_dir: &std::path::Path) {
         let park = entry.path();
         let orig = content_dir.join(base);
         if orig.exists() {
-            let _ = std::fs::remove_file(&park);
+            if park.is_dir() {
+                let _ = std::fs::remove_dir_all(&park);
+            } else {
+                let _ = std::fs::remove_file(&park);
+            }
         } else {
             let _ = std::fs::rename(&park, &orig);
         }
@@ -1548,14 +1567,16 @@ fn read_pack_sidecar(
 }
 
 /// Normalize a raw provider string from sidecar/packwiz metadata to the
-/// display form used in the UI (mods and packs alike).
+/// display form used in the UI (mods and packs alike). Unknown historical
+/// values are loader names (`Fabric`, `Forge`, ...), never download sources;
+/// they must not leak into the provider/source column.
 pub(crate) fn normalize_provider(raw: &str) -> String {
     match raw.to_lowercase().as_str() {
         "modrinth" => "Modrinth".to_string(),
         "curseforge" => "CurseForge".to_string(),
         "local" => "Local".to_string(),
         "atlauncher" => "ATLauncher".to_string(),
-        other => other.to_string(),
+        _ => "Local".to_string(),
     }
 }
 
@@ -1943,11 +1964,17 @@ fn try_read_zip_image<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> Option<String> {
-    let mut file = archive.by_name(name).ok()?;
+    const MAX_PACK_ICON_BYTES: u64 = 8 * 1024 * 1024;
+    let file = archive.by_name(name).ok()?;
+    if file.size() > MAX_PACK_ICON_BYTES {
+        return None;
+    }
     let mut buf = Vec::new();
     use std::io::Read;
-    file.read_to_end(&mut buf).ok()?;
-    if buf.is_empty() {
+    file.take(MAX_PACK_ICON_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.is_empty() || buf.len() as u64 > MAX_PACK_ICON_BYTES {
         return None;
     }
     let lower = name.to_lowercase();
@@ -2117,10 +2144,14 @@ fn dir_size(path: &std::path::Path) -> u64 {
 }
 
 fn read_image_as_base64(path: &std::path::Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
+    const MAX_ICON_BYTES: u64 = 8 * 1024 * 1024;
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_ICON_BYTES {
+        return None;
+    }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    if buf.is_empty() {
+    file.take(MAX_ICON_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.is_empty() || buf.len() as u64 > MAX_ICON_BYTES {
         return None;
     }
     Some(format!("data:image/png;base64,{}", base64_encode(&buf)))
@@ -2607,6 +2638,7 @@ fn import_prism_pack_into(
     {
         let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)
             .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
+        let mut extract_budget = crate::import::ExtractBudget::new();
 
         for i in 0..archive.len() {
             let mut entry = archive
@@ -2658,7 +2690,12 @@ fn import_prism_pack_into(
             };
 
             let Some(relative) = relative else { continue };
-            crate::import::write_extracted(&target_dir, &relative, &mut entry)?;
+            crate::import::write_extracted_budgeted(
+                &target_dir,
+                &relative,
+                &mut entry,
+                &mut extract_budget,
+            )?;
         }
     }
 
@@ -3359,6 +3396,13 @@ pub fn restore_world(
     };
 
     let target_dir = saves_dir.join(&target_world);
+    let mc_dir = instance.minecraft_dir(instances_dir);
+    crate::import::ensure_no_reparse_points(&mc_dir, &target_dir).map_err(|e| {
+        LauncherError::Instance(format!(
+            "Refusing to restore a world through a junction/symlink: {}",
+            e
+        ))
+    })?;
     if mode != "replace" && target_dir.exists() {
         return Err(LauncherError::Instance(format!(
             "A world named '{}' already exists",
@@ -3378,6 +3422,13 @@ pub fn restore_world(
         .join(instance_name)
         .join(".backups")
         .join(format!(".restore-tmp-{}", restore_token));
+    let instance_dir = instance.dir(instances_dir);
+    crate::import::ensure_no_reparse_points(&instance_dir, &tmp_dir).map_err(|e| {
+        LauncherError::Instance(format!(
+            "Refusing to extract a world backup through a junction/symlink: {}",
+            e
+        ))
+    })?;
     if tmp_dir.exists() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -3475,6 +3526,7 @@ fn extract_zip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Res
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| LauncherError::Instance(format!("Invalid backup archive: {}", e)))?;
     std::fs::create_dir_all(dest)?;
+    let mut extract_budget = crate::import::ExtractBudget::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -3494,18 +3546,7 @@ fn extract_zip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Res
                 name
             )));
         }
-        let out_path = dest.join(&name);
-        if !out_path.starts_with(dest) {
-            return Err(LauncherError::Instance(format!(
-                "Backup entry escapes the restore directory: {}",
-                name
-            )));
-        }
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut out = std::fs::File::create(&out_path)?;
-        std::io::copy(&mut entry, &mut out)?;
+        crate::import::write_extracted_budgeted(dest, &name, &mut entry, &mut extract_budget)?;
     }
     Ok(())
 }
@@ -4728,6 +4769,16 @@ version = 'hIibTfxn'
     }
 
     #[test]
+    fn legacy_loader_names_are_not_shown_as_download_providers() {
+        assert_eq!(normalize_provider("Fabric"), "Local");
+        assert_eq!(normalize_provider("forge"), "Local");
+        assert_eq!(normalize_provider("NeoForge"), "Local");
+        assert_eq!(normalize_provider("modrinth"), "Modrinth");
+        assert_eq!(normalize_provider("curseforge"), "CurseForge");
+        assert_eq!(normalize_provider("atlauncher"), "ATLauncher");
+    }
+
+    #[test]
     fn sidecar_meta_uses_index_folder_with_legacy_fallback() {
         let dir = temp_dir("sidecar");
         let mods = dir.join("mods");
@@ -4953,6 +5004,29 @@ version = 'hIibTfxn'
             b"old-bytes"
         );
         assert!(!dir.join("sodium-0.5.8.jar.voidlauncher-old").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replacing_a_jar_never_deletes_a_same_stem_zip_sibling() {
+        let dir = temp_dir("stash_sibling_extension");
+        std::fs::write(dir.join("Foo.jar"), b"old-jar").unwrap();
+        std::fs::write(dir.join("Foo.zip"), b"unrelated-zip").unwrap();
+
+        let stashed = stash_old_content_files(&dir, "Foo.jar").unwrap();
+        assert_eq!(stashed.len(), 1, "only the replaced jar is parked");
+        assert!(dir.join("Foo.zip").exists());
+
+        std::fs::write(dir.join("Foo.jar"), b"new-jar").unwrap();
+        discard_stashed_files(&stashed);
+
+        assert_eq!(std::fs::read(dir.join("Foo.jar")).unwrap(), b"new-jar");
+        assert_eq!(
+            std::fs::read(dir.join("Foo.zip")).unwrap(),
+            b"unrelated-zip",
+            "a different content item with the same stem must survive"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

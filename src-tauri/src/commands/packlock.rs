@@ -2,18 +2,21 @@
 //! transactional update and manifest repair for CurseForge and Modrinth pack
 //! instances, driven by the `<instance>/pack-lock.json` lock file.
 //!
-//! Update safety model: everything new is staged first (downloaded beside
-//! the instance, never in it), then applied with park-aside renames — the
-//! old file is only parked, and every park is discarded after the new lock
-//! is committed. Any failure before the commit restores the parks and the
-//! sidecars, so a failed update never deletes the old file nor leaves the
-//! instance broken.
+//! Safety model (update and repair): everything new is staged first
+//! (downloaded beside the instance, never in it), then applied with
+//! park-aside renames — the old file is only parked, and every park is
+//! discarded after the operation commits. Any failure restores the parks and
+//! sidecars in reverse order. A failed rollback reports both errors and
+//! leaves recovery data in staging instead of claiming success.
+//!
+//! The rollback is an error-handling mechanism, not crash recovery: a power
+//! loss between two applied files still leaves a partially applied instance.
 
 use crate::commands::instances::validate_instance_name;
 use crate::content::{self, SidecarWrite};
 use crate::curseforge::{self, CfFile};
 use crate::import::{
-    check_safe_file_name, check_safe_relative, write_extracted, write_override_sidecar,
+    check_safe_file_name, check_safe_relative, write_extracted_budgeted, write_override_sidecar,
     ImportProgressPayload,
 };
 use crate::instances;
@@ -145,25 +148,76 @@ fn take_sidecar_snapshot(dir: &Path, filename: &str) -> SidecarSnapshot {
     }
 }
 
-fn restore_sidecar(snap: &SidecarSnapshot) {
+fn restore_sidecar(snap: &SidecarSnapshot) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let base = snap.dir.parent().unwrap_or(&snap.dir);
     let meta_path = instances::sidecar_meta_path(&snap.dir, &snap.filename);
-    match &snap.meta {
-        Some(text) => {
-            let _ = std::fs::write(&meta_path, text);
-        }
-        None => {
-            let _ = std::fs::remove_file(meta_path);
+    if let Err(e) = crate::import::ensure_no_reparse_points(base, &meta_path) {
+        errors.push(format!(
+            "cannot safely restore {}: {}",
+            meta_path.display(),
+            e
+        ));
+    } else {
+        match &snap.meta {
+            Some(text) => {
+                if let Err(e) = std::fs::write(&meta_path, text) {
+                    errors.push(format!("cannot restore {}: {}", meta_path.display(), e));
+                }
+            }
+            None => match std::fs::remove_file(&meta_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => errors.push(format!("cannot remove {}: {}", meta_path.display(), e)),
+            },
         }
     }
     let legacy_path = instances::legacy_sidecar_path(&snap.dir, &snap.filename);
-    match &snap.legacy {
-        Some(text) => {
-            let _ = std::fs::write(&legacy_path, text);
-        }
-        None => {
-            let _ = std::fs::remove_file(legacy_path);
+    if let Err(e) = crate::import::ensure_no_reparse_points(base, &legacy_path) {
+        errors.push(format!(
+            "cannot safely restore {}: {}",
+            legacy_path.display(),
+            e
+        ));
+    } else {
+        match &snap.legacy {
+            Some(text) => {
+                if let Err(e) = std::fs::write(&legacy_path, text) {
+                    errors.push(format!("cannot restore {}: {}", legacy_path.display(), e));
+                }
+            }
+            None => match std::fs::remove_file(&legacy_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => errors.push(format!("cannot remove {}: {}", legacy_path.display(), e)),
+            },
         }
     }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only fault injection: make the next rollback fail before it
+    /// touches anything, so the "rollback failed" path can be exercised.
+    static FAIL_NEXT_ROLLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only fault injection: fail the next sidecar write after the
+    /// content file has already been moved into place.
+    static FAIL_NEXT_SIDECAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_rollback() {
+    FAIL_NEXT_ROLLBACK.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn fail_next_sidecar() {
+    FAIL_NEXT_SIDECAR.with(|flag| flag.set(true));
 }
 
 #[derive(Default)]
@@ -174,6 +228,9 @@ struct ApplyRollback {
     /// Parked originals: (original path, parked path).
     stashes: Vec<(PathBuf, PathBuf)>,
     sidecars: Vec<SidecarSnapshot>,
+    /// Directories the apply phase created (removed again on rollback when
+    /// they are empty).
+    created_dirs: Vec<PathBuf>,
 }
 
 impl ApplyRollback {
@@ -187,21 +244,170 @@ impl ApplyRollback {
         }
     }
 
-    /// Undo every applied operation. Idempotent: the recorded operations are
-    /// cleared, so calling it again (defensive retry) cannot delete files that
-    /// the first call already restored.
-    fn rollback(&mut self, staging: &Path, temp_zip: &Path) {
-        for dest in self.moved.drain(..) {
-            let _ = std::fs::remove_file(dest);
+    /// Undo every applied operation in reverse order.
+    ///
+    /// Files installed by the operation are removed first, then the parked
+    /// originals are put back, then the sidecars are restored. An operation
+    /// that fails is kept in the journal (with its recovery data) so a later
+    /// retry can finish it; staging is deleted only when every step succeeded.
+    /// Returns all errors instead of hiding them: a partial rollback is a
+    /// partial instance and must never be reported as a successful rollback.
+    fn rollback(&mut self, staging: &Path, temp_zip: &Path) -> Result<(), String> {
+        #[cfg(test)]
+        if FAIL_NEXT_ROLLBACK.with(|flag| flag.replace(false)) {
+            // Simulate a rollback that cannot undo anything: every journal
+            // entry and every on-disk recovery file stays intact.
+            let _ = self.preserve_recovery(staging);
+            return Err("injected rollback failure (test)".to_string());
         }
-        instances::restore_stashed_files(&self.stashes);
-        self.stashes.clear();
-        for snap in &self.sidecars {
-            restore_sidecar(snap);
+
+        let mut errors = Vec::new();
+
+        while let Some(dest) = self.moved.pop() {
+            match std::fs::remove_file(&dest) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    errors.push(format!("cannot remove {}: {}", dest.display(), e));
+                    self.moved.push(dest);
+                }
+            }
         }
-        self.sidecars.clear();
+
+        while let Some((orig, park)) = self.stashes.pop() {
+            if !park.exists() {
+                errors.push(format!(
+                    "recovery file is missing: {} (needed for {})",
+                    park.display(),
+                    orig.display()
+                ));
+                self.stashes.push((orig, park));
+                continue;
+            }
+            if orig.exists() {
+                if let Err(e) = std::fs::remove_file(&orig) {
+                    errors.push(format!("cannot clear {}: {}", orig.display(), e));
+                    self.stashes.push((orig, park));
+                    continue;
+                }
+            }
+            if let Err(e) = std::fs::rename(&park, &orig) {
+                errors.push(format!(
+                    "cannot restore {} from {}: {}",
+                    orig.display(),
+                    park.display(),
+                    e
+                ));
+                self.stashes.push((orig, park));
+            }
+        }
+
+        while let Some(snap) = self.sidecars.pop() {
+            if let Err(e) = restore_sidecar(&snap) {
+                errors.push(e);
+                self.sidecars.push(snap);
+            }
+        }
+
+        // Best effort: a directory the apply created is removed only when it
+        // is empty. A non-empty one contains restored/user content and stays.
+        while let Some(dir) = self.created_dirs.pop() {
+            let _ = std::fs::remove_dir(&dir);
+        }
+
+        if !errors.is_empty() {
+            // Recovery data must survive both this process and the content
+            // listing's stale-park cleanup (which deletes parks whose original
+            // name is occupied again). Copy the remaining parks and sidecar
+            // snapshots into staging before reporting the failure.
+            match self.preserve_recovery(staging) {
+                Ok(path) => errors.push(format!("recovery data was saved to '{}'", path.display())),
+                Err(e) => errors.push(format!("recovery data could not be saved: {}", e)),
+            }
+            return Err(errors.join("; "));
+        }
+
         let _ = std::fs::remove_dir_all(staging);
         let _ = std::fs::remove_file(temp_zip);
+        Ok(())
+    }
+
+    /// Copy everything a manual recovery still needs into the staging folder.
+    /// Parks are copied, not moved: the in-place originals stay available for
+    /// an immediate retry. The manifest names every original path and every
+    /// new file the failed operation left behind.
+    fn preserve_recovery(&self, staging: &Path) -> Result<PathBuf, String> {
+        let recovery_dir = staging.join("recovery");
+        std::fs::create_dir_all(&recovery_dir)
+            .map_err(|e| format!("cannot create {}: {}", recovery_dir.display(), e))?;
+        let mut lines = Vec::new();
+        let mut copy_no = 0usize;
+
+        for (orig, park) in &self.stashes {
+            if !park.exists() {
+                lines.push(format!(
+                    "missing backup: {} (original: {})",
+                    park.display(),
+                    orig.display()
+                ));
+                continue;
+            }
+            copy_no += 1;
+            let name = park
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("parked-file");
+            let target = recovery_dir.join(format!("{:04}-{}", copy_no, name));
+            std::fs::copy(park, &target)
+                .map_err(|e| format!("cannot copy recovery file {}: {}", park.display(), e))?;
+            lines.push(format!(
+                "original: {} | parked: {} | backup: {}",
+                orig.display(),
+                park.display(),
+                target.display()
+            ));
+        }
+
+        for dest in &self.moved {
+            lines.push(format!(
+                "installed by the failed operation: {}",
+                dest.display()
+            ));
+        }
+
+        for (index, snap) in self.sidecars.iter().enumerate() {
+            let stem = std::path::Path::new(&snap.filename)
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("content");
+            for (kind, text) in [("meta", &snap.meta), ("legacy", &snap.legacy)] {
+                let Some(text) = text else { continue };
+                let target = recovery_dir.join(format!(
+                    "{:04}-{:04}-{}-{}.json",
+                    copy_no, index, stem, kind
+                ));
+                std::fs::write(&target, text).map_err(|e| {
+                    format!("cannot write recovery sidecar {}: {}", target.display(), e)
+                })?;
+                lines.push(format!(
+                    "sidecar {} | {} | {}: {}",
+                    snap.dir.display(),
+                    snap.filename,
+                    kind,
+                    target.display()
+                ));
+            }
+        }
+
+        let manifest = staging.join("recovery.txt");
+        std::fs::write(&manifest, lines.join("\n")).map_err(|e| {
+            format!(
+                "cannot write recovery manifest {}: {}",
+                manifest.display(),
+                e
+            )
+        })?;
+        Ok(staging.to_path_buf())
     }
 }
 
@@ -210,9 +416,45 @@ fn cleanup_files(staging: &Path, temp_zip: &Path) {
     let _ = std::fs::remove_file(temp_zip);
 }
 
+/// Stable per-instance token for temp archive names: two instances of the
+/// same pack must not share (and delete) one download, while a retry of the
+/// same instance can still resume its `.part` file.
+fn instance_temp_token(instance_name: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    instance_name.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+/// Cheap process-local uniqueness for staging and temp names (two instances
+/// of the same pack may be updated concurrently).
+fn unique_nonce() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+static OPERATION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Hidden, per-operation staging directory beside the instance. A unique name
+/// means a staging folder kept after a failed rollback (recovery data) is
+/// never silently deleted by the next update or repair.
+fn operation_staging_dir(instance_dir: &Path, tag: &str) -> PathBuf {
+    let counter = OPERATION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    instance_dir.join(format!(
+        ".{}-{}-{}-{}",
+        tag,
+        std::process::id(),
+        unique_nonce(),
+        counter
+    ))
+}
+
 // ==================== Apply plan (shared by both providers) ====================
 
 /// Owned form of [`SidecarWrite`] for a plan built before the apply phase.
+#[derive(Debug)]
 struct SidecarWriteOwned {
     provider: String,
     content_type: String,
@@ -240,6 +482,7 @@ impl SidecarWriteOwned {
 }
 
 /// Sidecar to write after a file has been installed.
+#[derive(Debug)]
 enum SidecarPlan {
     /// Full metadata for a file listed by the pack manifest.
     Content(SidecarWriteOwned),
@@ -249,6 +492,7 @@ enum SidecarPlan {
 }
 
 /// One file the apply phase installs.
+#[derive(Debug)]
 struct PlannedInstall {
     /// Staged file, already downloaded/extracted beside the instance.
     staged: PathBuf,
@@ -256,6 +500,9 @@ struct PlannedInstall {
     dest: PathBuf,
     /// The replaced file was disabled: the new file must stay disabled.
     preserve_disabled: bool,
+    /// Repair only installs missing content: if something appeared at the
+    /// destination after the prepare phase, fail instead of replacing it.
+    expect_absent: bool,
     /// Old file name whose sidecar is dropped when the stem changed.
     previous_name: Option<String>,
     sidecar: SidecarPlan,
@@ -359,6 +606,63 @@ fn path_key(path: &Path, mc_dir: &Path) -> String {
     }
 }
 
+/// Sidecar identity of a content file: two files with the same stem in one
+/// content folder (e.g. `Foo.jar` and `Foo.zip`) share one metadata file, so
+/// installing both would silently overwrite the first one's metadata.
+fn sidecar_key(path: &Path, mc_dir: &Path) -> Option<String> {
+    if !in_content_dir(path, mc_dir) {
+        return None;
+    }
+    let parent = path.parent()?;
+    let name = path.file_name()?.to_str()?;
+    Some(format!(
+        "{}/{}",
+        parent.to_string_lossy().replace('\\', "/").to_lowercase(),
+        instances::content_stem(name).to_lowercase()
+    ))
+}
+
+/// Reject a plan that would silently lose content: duplicate destinations,
+/// a file that is also an ancestor directory of another install, or two files
+/// sharing one sidecar. Update plans already resolve intentional
+/// shadowing (overrides on top of manifest files) before this check.
+fn validate_apply_plan(plan: &ApplyPlan, mc_dir: &Path) -> Result<(), String> {
+    let mut destinations: Vec<(String, &Path)> = Vec::with_capacity(plan.installs.len());
+    let mut sidecars: HashMap<String, &Path> = HashMap::new();
+    for install in &plan.installs {
+        let key = path_key(&install.dest, mc_dir);
+        for (existing_key, existing) in &destinations {
+            if *existing_key == key {
+                return Err(format!(
+                    "Conflicting destinations in one operation: {} and {}",
+                    existing.display(),
+                    install.dest.display()
+                ));
+            }
+            if key.starts_with(&format!("{}/", existing_key))
+                || existing_key.starts_with(&format!("{}/", key))
+            {
+                return Err(format!(
+                    "A file and a directory collide in one operation: {} and {}",
+                    existing.display(),
+                    install.dest.display()
+                ));
+            }
+        }
+        if let Some(sidecar) = sidecar_key(&install.dest, mc_dir) {
+            if let Some(previous) = sidecars.insert(sidecar, &install.dest) {
+                return Err(format!(
+                    "Two files share one metadata entry: {} and {}",
+                    previous.display(),
+                    install.dest.display()
+                ));
+            }
+        }
+        destinations.push((key, &install.dest));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ApplyOutcome {
     mods_installed: usize,
@@ -370,6 +674,17 @@ struct ApplyOutcome {
 /// Is `parent/name` currently installed as a disabled file?
 fn is_disabled_at(parent: &Path, name: &str) -> bool {
     parent.join(format!("{}.disabled", name)).is_file()
+}
+
+/// Is any on-disk variant of `path` present, including its `.disabled` twin?
+fn content_present(path: &Path) -> bool {
+    if path.exists() {
+        return true;
+    }
+    path.parent()
+        .zip(path.file_name().and_then(|n| n.to_str()))
+        .map(|(parent, name)| is_disabled_at(parent, name))
+        .unwrap_or(false)
 }
 
 /// Actual on-disk path of a content file: `path` or its `.disabled` twin.
@@ -393,11 +708,11 @@ fn existing_content_path(path: &Path) -> Option<PathBuf> {
 ///
 /// The target path is declared by the pack manifest, so the pack owns it: a
 /// fresh install would overwrite that file too.
-fn park_occupied(rb: &mut ApplyRollback, parent: &Path, name: &str) -> Result<(), String> {
+fn park_occupied(rb: &mut ApplyRollback, parent: &Path, name: &str) -> Result<bool, String> {
     let disabled_name = format!("{}.disabled", name);
     let disabled_exists = parent.join(&disabled_name).is_file();
     if !disabled_exists && !parent.join(name).is_file() {
-        return Ok(());
+        return Ok(false);
     }
     rb.snapshot_sidecar(parent, name);
     // Parking by the disabled name parks the plain twin as well (the stash
@@ -409,6 +724,28 @@ fn park_occupied(rb: &mut ApplyRollback, parent: &Path, name: &str) -> Result<()
     };
     let stashed = instances::stash_old_content_files(parent, &target).map_err(|e| e.to_string())?;
     rb.stashes.extend(stashed);
+    Ok(true)
+}
+
+/// Create `dir` and any missing ancestors, remembering which directories did
+/// not exist so a rollback can remove them again when they end up empty.
+fn ensure_dir_tracked(rb: &mut ApplyRollback, dir: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut current = dir;
+    while !current.exists() {
+        missing.push(current.to_path_buf());
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    for path in missing.into_iter().rev() {
+        match std::fs::create_dir(&path) {
+            Ok(()) => rb.created_dirs.push(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }
 
@@ -423,10 +760,34 @@ fn install_one(
     let Some(name) = install.dest.file_name().and_then(|n| n.to_str()) else {
         return Err(format!("Invalid destination {}", install.dest.display()));
     };
+    // Lexical containment is not enough: `mods` (or any parent below the
+    // instance) can be a junction/symlink to another directory. Reject before
+    // parking or renaming anything.
+    crate::import::ensure_no_reparse_points(mc_dir, &install.dest)
+        .map_err(|e| format!("Unsafe destination {}: {}", install.dest.display(), e))?;
+    // Repair only restores files that are known to be missing. Re-check right
+    // before the mutation: if another process/user created the file after the
+    // prepare phase, replacing it would destroy data that is not ours.
+    if install.expect_absent && existing_content_path(&install.dest).is_some() {
+        return Err(format!(
+            "{} appeared while the repair was preparing; refusing to replace it",
+            install.dest.display()
+        ));
+    }
+    // Snapshot metadata before any mutation, including for brand-new files:
+    // a rollback must remove the sidecar this operation creates.
+    rb.snapshot_sidecar(parent, name);
+    if let Some(previous) = &install.previous_name {
+        if previous != name {
+            rb.snapshot_sidecar(parent, previous);
+        }
+    }
     park_occupied(rb, parent, name)?;
-    if let Err(e) = std::fs::create_dir_all(parent) {
+    if let Err(e) = ensure_dir_tracked(rb, parent) {
         return Err(format!("Cannot create folder for {}: {}", name, e));
     }
+    crate::import::ensure_no_reparse_points(mc_dir, &install.dest)
+        .map_err(|e| format!("Unsafe destination {}: {}", install.dest.display(), e))?;
     let final_dest = if install.preserve_disabled {
         parent.join(format!("{}.disabled", name))
     } else {
@@ -436,6 +797,10 @@ fn install_one(
         return Err(format!("Cannot install {}: {}", name, e));
     }
     rb.moved.push(final_dest);
+    #[cfg(test)]
+    if FAIL_NEXT_SIDECAR.with(|flag| flag.replace(false)) {
+        return Err("injected sidecar failure (test)".to_string());
+    }
     match &install.sidecar {
         SidecarPlan::Content(fields) => {
             if let Err(e) = content::write_sidecar(parent, name, &fields.as_write()) {
@@ -454,6 +819,9 @@ fn install_one(
             // old content metadata (e.g. the removed mod's project id) no
             // longer describes it. The rollback snapshot restores the old
             // sidecar if the update fails.
+            let sidecar = instances::sidecar_meta_path(parent, name);
+            crate::import::ensure_no_reparse_points(mc_dir, &sidecar)
+                .map_err(|e| format!("Unsafe metadata path {}: {}", sidecar.display(), e))?;
             instances::remove_sidecar_meta(parent, name);
             write_override_sidecar(mc_dir, &rel, provider);
         }
@@ -466,17 +834,99 @@ fn install_one(
     Ok(())
 }
 
-fn remove_one(rb: &mut ApplyRollback, path: &Path) -> Result<(), String> {
+fn remove_one(rb: &mut ApplyRollback, mc_dir: &Path, path: &Path) -> Result<(), String> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return Ok(());
     };
+    crate::import::ensure_no_reparse_points(mc_dir, path)
+        .map_err(|e| format!("Unsafe removal {}: {}", path.display(), e))?;
     rb.snapshot_sidecar(parent, name);
     let stashed = instances::stash_old_content_files(parent, name).map_err(|e| e.to_string())?;
     rb.stashes.extend(stashed);
     Ok(())
+}
+
+fn apply_ops(
+    rb: &mut ApplyRollback,
+    mc_dir: &Path,
+    plan: &ApplyPlan,
+) -> Result<ApplyOutcome, String> {
+    let mut outcome = ApplyOutcome::default();
+    for install in &plan.installs {
+        install_one(rb, mc_dir, install)?;
+        if install.is_mod {
+            outcome.mods_installed += 1;
+        } else {
+            outcome.overrides_written += 1;
+        }
+    }
+    for removal in &plan.removals {
+        remove_one(rb, mc_dir, &removal.path)?;
+        if removal.counted {
+            if removal.is_mod {
+                outcome.mods_removed += 1;
+            } else {
+                outcome.overrides_removed += 1;
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Turn a failed apply into the error returned to the UI. The original cause is
+/// always preserved. If the rollback also failed, both errors are reported and
+/// the recovery staging is intentionally left on disk.
+fn apply_failure_message(
+    what: &str,
+    cause: String,
+    rb: &mut ApplyRollback,
+    staging: &Path,
+    temp_zip: &Path,
+) -> String {
+    match rb.rollback(staging, temp_zip) {
+        Ok(()) => format!("{}: {}. The instance was rolled back.", what, cause),
+        Err(rollback) => format!(
+            "{}: {}. Rollback also failed: {}. The instance may be partially modified \
+             and may need manual recovery.",
+            what, cause, rollback
+        ),
+    }
+}
+
+/// Apply a prepared plan without writing a pack lock (repair). On success the
+/// parks are discarded and staging is removed; any failure rolls the whole
+/// plan back.
+fn apply_plan(
+    mc_dir: &Path,
+    plan: &ApplyPlan,
+    staging: &Path,
+    temp_zip: &Path,
+) -> Result<ApplyOutcome, String> {
+    if let Err(e) = validate_apply_plan(plan, mc_dir) {
+        cleanup_files(staging, temp_zip);
+        return Err(format!(
+            "Repair plan rejected, the instance was not modified: {}",
+            e
+        ));
+    }
+    let mut rb = ApplyRollback::default();
+    match apply_ops(&mut rb, mc_dir, plan) {
+        Ok(outcome) => {
+            instances::discard_stashed_files(&rb.stashes);
+            cleanup_files(staging, temp_zip);
+            Ok(outcome)
+        }
+        Err(e) => Err(apply_failure_message(
+            "Repair failed before any change could be committed",
+            e,
+            &mut rb,
+            staging,
+            temp_zip,
+        )),
+    }
 }
 
 /// Apply the whole plan, then commit the new lock. Any failure (apply or lock
@@ -490,38 +940,33 @@ fn apply_and_commit(
     temp_zip: &Path,
     new_lock: &PackLock,
 ) -> Result<ApplyOutcome, String> {
-    let mut rb = ApplyRollback::default();
-    let mut outcome = ApplyOutcome::default();
-    let apply: Result<(), String> = (|| {
-        for install in &plan.installs {
-            install_one(&mut rb, mc_dir, install)?;
-            if install.is_mod {
-                outcome.mods_installed += 1;
-            } else {
-                outcome.overrides_written += 1;
-            }
-        }
-        for removal in &plan.removals {
-            remove_one(&mut rb, &removal.path)?;
-            if removal.counted {
-                if removal.is_mod {
-                    outcome.mods_removed += 1;
-                } else {
-                    outcome.overrides_removed += 1;
-                }
-            }
-        }
-        Ok(())
-    })();
-    if let Err(e) = apply {
-        rb.rollback(staging, temp_zip);
-        return Err(format!("Update failed and was rolled back: {}", e));
-    }
-    if let Err(e) = new_lock.write(instance_dir) {
-        rb.rollback(staging, temp_zip);
+    if let Err(e) = validate_apply_plan(plan, mc_dir) {
+        cleanup_files(staging, temp_zip);
         return Err(format!(
-            "Cannot save pack metadata, update was rolled back: {}",
+            "Update plan rejected, the instance was not modified: {}",
             e
+        ));
+    }
+    let mut rb = ApplyRollback::default();
+    let outcome = match apply_ops(&mut rb, mc_dir, plan) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            return Err(apply_failure_message(
+                "Update failed",
+                e,
+                &mut rb,
+                staging,
+                temp_zip,
+            ))
+        }
+    };
+    if let Err(e) = new_lock.write(instance_dir) {
+        return Err(apply_failure_message(
+            "Cannot save pack metadata",
+            e.to_string(),
+            &mut rb,
+            staging,
+            temp_zip,
         ));
     }
     instances::discard_stashed_files(&rb.stashes);
@@ -555,6 +1000,7 @@ fn plan_override_installs(
             staged,
             dest,
             preserve_disabled,
+            expect_absent: false,
             previous_name: None,
             sidecar: SidecarPlan::Override(provider),
             is_mod: false,
@@ -642,6 +1088,7 @@ fn plan_curseforge_update(
             staged: staged_mods_dir.join(&cf_file.file_name),
             dest: mods_dir.join(&cf_file.file_name),
             preserve_disabled,
+            expect_absent: false,
             previous_name,
             sidecar: SidecarPlan::Content(SidecarWriteOwned {
                 provider: "curseforge".to_string(),
@@ -757,6 +1204,7 @@ fn plan_modrinth_update(mc_dir: &Path, staging: &Path, input: &MrApplyInput<'_>)
             staged: staging.join(&new_path),
             dest,
             preserve_disabled,
+            expect_absent: false,
             previous_name,
             sidecar: SidecarPlan::Content(SidecarWriteOwned {
                 provider: "modrinth".to_string(),
@@ -899,6 +1347,9 @@ pub async fn cmd_update_modpack(
     instance_name: String,
 ) -> Result<PackUpdateReport, String> {
     let _pause_scope = crate::download::PausableInstallScope::begin();
+    validate_instance_name(&instance_name)?;
+    let _guard =
+        crate::commands::instances::InstanceMutationGuard::acquire(state.inner(), &instance_name)?;
     let ctx = pack_ctx(&state, &instance_name)?;
     let lock = PackLock::read(&ctx.instance_dir)
         .ok_or_else(|| "This instance is not a tracked modpack.".to_string())?;
@@ -918,8 +1369,10 @@ pub struct PackRepairReport {
 }
 
 /// Re-install anything the manifest lists but the instance is missing
-/// (mods by identity, overrides only when the file is gone). Never deletes,
-/// never touches existing files, never rewrites the lock.
+/// (mods by identity, overrides only when the file is gone). Everything is
+/// downloaded/extracted into staging first; the instance is modified only by
+/// the shared apply/rollback path. Never deletes unrelated files and never
+/// rewrites the lock.
 #[tauri::command]
 pub async fn cmd_repair_modpack(
     app: AppHandle,
@@ -927,6 +1380,9 @@ pub async fn cmd_repair_modpack(
     instance_name: String,
 ) -> Result<PackRepairReport, String> {
     let _pause_scope = crate::download::PausableInstallScope::begin();
+    validate_instance_name(&instance_name)?;
+    let _guard =
+        crate::commands::instances::InstanceMutationGuard::acquire(state.inner(), &instance_name)?;
     let ctx = pack_ctx(&state, &instance_name)?;
     let lock = PackLock::read(&ctx.instance_dir)
         .ok_or_else(|| "This instance is not a tracked modpack.".to_string())?;
@@ -971,8 +1427,10 @@ async fn update_curseforge(
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
     let temp_zip = std::env::temp_dir().join(format!(
-        "voidlauncher-cfpack-{}-{}.zip",
-        safe_instance, latest.id
+        "voidlauncher-cfpack-{}-{}-{}.zip",
+        safe_instance,
+        instance_temp_token(&ctx.instance.name),
+        latest.id
     ));
     if let Err(e) =
         curseforge::download_mod_file(pack_pid, latest.id, &file, &ctx.api_key, &temp_zip).await
@@ -981,7 +1439,7 @@ async fn update_curseforge(
         return Err(format!("Pack download failed: {}", e));
     }
 
-    let staging = ctx.instance_dir.join(".pack-update");
+    let staging = operation_staging_dir(&ctx.instance_dir, "pack-update");
     let (new_manifest, new_overrides) = match packlock::pack_zip_info(&temp_zip) {
         Ok(v) => v,
         Err(e) => {
@@ -1073,6 +1531,7 @@ async fn update_curseforge(
             .map_err(|e| format!("Cannot reopen pack archive: {}", e))?;
         let mut archive =
             zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
+        let mut extract_budget = crate::import::ExtractBudget::new();
         for i in 0..archive.len() {
             let mut entry = archive
                 .by_index(i)
@@ -1091,7 +1550,8 @@ async fn update_curseforge(
                 continue;
             }
             check_safe_relative(rel).map_err(|e| e.to_string())?;
-            write_extracted(&stage_ov, rel, &mut entry).map_err(|e| e.to_string())?;
+            write_extracted_budgeted(&stage_ov, rel, &mut entry, &mut extract_budget)
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     })();
@@ -1154,8 +1614,87 @@ async fn update_curseforge(
     })
 }
 
+/// Override source layout inside a pack archive.
+#[derive(Clone, Copy)]
+enum OverridePrefix {
+    CurseForge,
+    Modrinth,
+}
+
+impl OverridePrefix {
+    fn relative(self, name: &str) -> Option<&str> {
+        match self {
+            Self::CurseForge => name.strip_prefix("overrides/"),
+            Self::Modrinth => crate::import::extract_mrpack_override(name),
+        }
+    }
+}
+
+/// Extract only the requested (missing) overrides into staging and build the
+/// install entries for them. The target instance is not touched here.
+#[allow(clippy::too_many_arguments)]
+fn stage_repair_overrides(
+    zip_path: &Path,
+    prefix: OverridePrefix,
+    missing: &[String],
+    staging_overrides: &Path,
+    mc_dir: &Path,
+    provider: &'static str,
+    budget: &mut crate::import::ExtractBudget,
+) -> Result<Vec<PlannedInstall>, String> {
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
+    let mut installs = Vec::new();
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+        let name = entry.name().to_string();
+        let Some(rel) = prefix.relative(&name) else {
+            continue;
+        };
+        if rel.is_empty() || entry.is_dir() || !missing.iter().any(|m| m == rel) {
+            continue;
+        }
+        check_safe_relative(rel).map_err(|e| e.to_string())?;
+        write_extracted_budgeted(staging_overrides, rel, &mut entry, budget)
+            .map_err(|e| e.to_string())?;
+        installs.push(PlannedInstall {
+            staged: staging_overrides.join(rel),
+            dest: mc_dir.join(rel),
+            preserve_disabled: false,
+            expect_absent: true,
+            previous_name: None,
+            sidecar: SidecarPlan::Override(provider),
+            is_mod: false,
+        });
+    }
+    Ok(installs)
+}
+
+/// Unique temp archive for a repair. The instance name keeps two instances of
+/// the same pack from sharing (and deleting) one download.
+fn repair_temp_zip(tag: &str, instance_name: &str, file_id: &str, extension: &str) -> PathBuf {
+    let safe_instance: String = instance_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    std::env::temp_dir().join(format!(
+        "voidlauncher-{}-repair-{}-{}-{}.{}",
+        tag,
+        safe_instance,
+        instance_temp_token(instance_name),
+        file_id,
+        extension
+    ))
+}
+
 /// CF manifest repair: identity checks against the sidecar index, pack zip
-/// re-download for missing overrides.
+/// re-download for missing overrides. Everything is downloaded/extracted into
+/// a staging folder first; the instance is modified only by the shared
+/// apply/rollback path.
 async fn repair_curseforge(
     app: &AppHandle,
     ctx: &PackCtx,
@@ -1171,157 +1710,145 @@ async fn repair_curseforge(
         failed: Vec::new(),
     };
 
-    // ---- Mods listed by the manifest but missing here ----
-    for (i, (pid_str, fid_str)) in manifest_files.iter().enumerate() {
-        report.checked += 1;
-        if installed.iter().any(|ic| {
-            ic.provider == "curseforge"
-                && ic.project_id.as_deref() == Some(pid_str.as_str())
-                && ic.file_id.as_deref() == Some(fid_str.as_str())
-        }) {
-            report.skipped += 1;
-            continue;
-        }
-        emit(
-            app,
-            "repairing",
-            i,
-            total,
-            &format!("Restoring mod {}/{}...", i + 1, total),
-        );
-        if i > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        }
-        let (Ok(pid), Ok(fid)) = (pid_str.parse::<u64>(), fid_str.parse::<u64>()) else {
-            report.failed.push(format!("{}: invalid id", pid_str));
-            continue;
-        };
-        let restored: Result<(), String> = async {
+    let staging = operation_staging_dir(&ctx.instance_dir, "pack-repair");
+    let stage_mods = staging.join("mods");
+    let stage_overrides = staging.join("overrides");
+    let temp_zip = repair_temp_zip("cfpack", &ctx.instance.name, &lock.file_id, "zip");
+    let mut plan = ApplyPlan::default();
+    let mut extract_budget = crate::import::ExtractBudget::new();
+
+    let prepare: Result<(), String> = async {
+        std::fs::create_dir_all(&stage_mods)
+            .map_err(|e| format!("Cannot create staging folder: {}", e))?;
+
+        // ---- Mods listed by the manifest but missing here ----
+        for (i, (pid_str, fid_str)) in manifest_files.iter().enumerate() {
+            report.checked += 1;
+            if installed.iter().any(|ic| {
+                ic.provider == "curseforge"
+                    && ic.project_id.as_deref() == Some(pid_str.as_str())
+                    && ic.file_id.as_deref() == Some(fid_str.as_str())
+            }) {
+                report.skipped += 1;
+                continue;
+            }
+            emit(
+                app,
+                "repairing",
+                i,
+                total,
+                &format!("Restoring mod {}/{}...", i + 1, total),
+            );
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            let pid = pid_str
+                .parse::<u64>()
+                .map_err(|_| format!("Invalid CurseForge project id '{}'", pid_str))?;
+            let fid = fid_str
+                .parse::<u64>()
+                .map_err(|_| format!("Invalid CurseForge file id '{}'", fid_str))?;
             let cf_file = curseforge::get_mod_file(pid, fid, &ctx.api_key)
                 .await
-                .map_err(|e| format!("CurseForge info failed: {}", e))?;
+                .map_err(|e| format!("CurseForge info for {} failed: {}", pid_str, e))?;
             check_safe_file_name(&cf_file.file_name).map_err(|e| e.to_string())?;
-            let dest = ctx.mods_dir.join(&cf_file.file_name);
-            curseforge::download_mod_file(pid, fid, &cf_file, &ctx.api_key, &dest)
+            let rel = format!("mods/{}", cf_file.file_name);
+            extract_budget.claim_path(&rel).map_err(|e| e.to_string())?;
+            let staged = stage_mods.join(&cf_file.file_name);
+            curseforge::download_mod_file(pid, fid, &cf_file, &ctx.api_key, &staged)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Download of {} failed: {}", cf_file.file_name, e))?;
+            let preserve_disabled = staged
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|name| is_disabled_at(&ctx.mods_dir, name))
+                .unwrap_or(false);
             let display = cf_file.display_name.clone();
-            let hash = cf_file.sha1_hash().map(|s| s.to_string());
-            let pid_s = pid_str.clone();
-            let fid_s = fid_str.clone();
-            content::write_sidecar(
-                &ctx.mods_dir,
-                &cf_file.file_name,
-                &SidecarWrite {
-                    provider: "curseforge",
-                    content_type: "mod",
-                    project_id: Some(&pid_s),
-                    project_name: Some(&display),
+            plan.installs.push(PlannedInstall {
+                staged,
+                dest: ctx.mods_dir.join(&cf_file.file_name),
+                preserve_disabled,
+                // CF repair is identity-based: a file with the same name but a
+                // wrong identity is pack-owned by path and is replaced.
+                expect_absent: false,
+                previous_name: None,
+                sidecar: SidecarPlan::Content(SidecarWriteOwned {
+                    provider: "curseforge".to_string(),
+                    content_type: "mod".to_string(),
+                    project_id: Some(pid_str.clone()),
+                    project_name: Some(display.clone()),
                     version_id: None,
-                    version_number: Some(&display),
-                    file_id: Some(&fid_s),
-                    hash: hash.as_deref(),
-                },
-            )
-            .map_err(|e| e.to_string())
+                    version_number: Some(display),
+                    file_id: Some(fid_str.clone()),
+                    hash: cf_file.sha1_hash().map(|s| s.to_string()),
+                }),
+                is_mod: true,
+            });
         }
-        .await;
-        match restored {
-            Ok(()) => report.restored += 1,
-            Err(e) => report
-                .failed
-                .push(format!("{}: {}", cf_display_hint(pid_str), e)),
-        }
-    }
 
-    // ---- Overrides whose file is gone (protected/user files stay out) ----
-    let missing: Vec<String> = lock
-        .overrides
-        .iter()
-        .filter(|rel| !packlock::is_protected_path(rel) && !ctx.mc_dir.join(rel).exists())
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        emit(
-            app,
-            "repairing",
-            total,
-            total + 1,
-            "Restoring pack overrides...",
-        );
-        let (Ok(pid), Ok(fid)) = (
-            parse_id(&lock.file_id, "file"),
-            parse_id(&lock.pack_project_id, "pack"),
-        ) else {
-            report.failed.push("Invalid pack file id".to_string());
-            return Ok(report);
-        };
-        let (file_id, pack_id) = (fid, pid);
-        let file = match curseforge::get_mod_file(pack_id, file_id, &ctx.api_key).await {
-            Ok(f) => f,
-            Err(e) => {
-                report
-                    .failed
-                    .push(format!("Pack archive info failed: {}", e));
-                return Ok(report);
-            }
-        };
-        let temp_zip =
-            std::env::temp_dir().join(format!("voidlauncher-cfpack-repair-{}.zip", pack_id));
-        if let Err(e) =
-            curseforge::download_mod_file(pack_id, file_id, &file, &ctx.api_key, &temp_zip).await
-        {
-            let _ = std::fs::remove_file(&temp_zip);
-            report
-                .failed
-                .push(format!("Pack archive download failed: {}", e));
-            return Ok(report);
+        // ---- Overrides whose file is gone (protected/user files stay out) ----
+        let missing: Vec<String> = lock
+            .overrides
+            .iter()
+            .filter(|rel| {
+                !packlock::is_protected_path(rel) && !content_present(&ctx.mc_dir.join(rel))
+            })
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            emit(
+                app,
+                "repairing",
+                total,
+                total + 1,
+                "Restoring pack overrides...",
+            );
+            let pack_pid = parse_id(&lock.pack_project_id, "pack")?;
+            let file_id = parse_id(&lock.file_id, "file")?;
+            let file = curseforge::get_mod_file(pack_pid, file_id, &ctx.api_key)
+                .await
+                .map_err(|e| format!("Pack archive info failed: {}", e))?;
+            curseforge::download_mod_file(pack_pid, file_id, &file, &ctx.api_key, &temp_zip)
+                .await
+                .map_err(|e| format!("Pack archive download failed: {}", e))?;
+            let installs = stage_repair_overrides(
+                &temp_zip,
+                OverridePrefix::CurseForge,
+                &missing,
+                &stage_overrides,
+                &ctx.mc_dir,
+                "curseforge",
+                &mut extract_budget,
+            )?;
+            report.checked += installs.len();
+            plan.installs.extend(installs);
         }
-        let extract: Result<(), String> = (|| {
-            let f = std::fs::File::open(&temp_zip)
-                .map_err(|e| format!("Cannot open pack archive: {}", e))?;
-            let mut archive =
-                zip::ZipArchive::new(f).map_err(|e| format!("Cannot read pack archive: {}", e))?;
-            for i in 0..archive.len() {
-                let mut entry = archive
-                    .by_index(i)
-                    .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-                let name = entry.name().to_string();
-                let Some(rel) = name.strip_prefix("overrides/") else {
-                    continue;
-                };
-                if rel.is_empty() || entry.is_dir() || !missing.iter().any(|m| m == rel) {
-                    continue;
-                }
-                check_safe_relative(rel).map_err(|e| e.to_string())?;
-                write_extracted(&ctx.mc_dir, rel, &mut entry).map_err(|e| e.to_string())?;
-                write_override_sidecar(&ctx.mc_dir, rel, "curseforge");
-                report.checked += 1;
-                report.restored += 1;
-            }
-            Ok(())
-        })();
-        let _ = std::fs::remove_file(&temp_zip);
-        if let Err(e) = extract {
-            report
-                .failed
-                .push(format!("Overrides restore failed: {}", e));
-        }
+        Ok(())
     }
+    .await;
 
+    let report = match prepare {
+        Ok(()) => report,
+        Err(e) => {
+            cleanup_files(&staging, &temp_zip);
+            return Err(format!(
+                "Repair preparation failed, the instance was not modified: {}",
+                e
+            ));
+        }
+    };
+
+    emit(app, "applying", 0, 1, "Applying repair...");
+    let outcome = apply_plan(&ctx.mc_dir, &plan, &staging, &temp_zip)?;
     emit(app, "done", 1, 1, "Repair finished.");
-    Ok(report)
+    Ok(PackRepairReport {
+        restored: outcome.mods_installed + outcome.overrides_written,
+        ..report
+    })
 }
-
-/// Short label for failure lists when the CF project name is unavailable.
-fn cf_display_hint(pid: &str) -> String {
-    format!("project {}", pid)
-}
-
-// ==================== Modrinth (mrpack) ====================
 
 /// Root-level (non-override) files of an mrpack zip, keyed by normalized
-/// path — the same embedded payload the importer holds in memory during a
+/// path тАФ the same embedded payload the importer holds in memory during a
 /// fresh install. Staging reuses it so embedded files need no network.
 fn read_embedded_files(zip_path: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
     let file =
@@ -1395,8 +1922,10 @@ async fn update_modrinth(
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
     let temp_zip = std::env::temp_dir().join(format!(
-        "voidlauncher-mrpack-{}-{}.mrpack",
-        safe_instance, latest.id
+        "voidlauncher-mrpack-{}-{}-{}.mrpack",
+        safe_instance,
+        instance_temp_token(&ctx.instance.name),
+        latest.id
     ));
     let sha1 = file.hashes.get("sha1").map(|s| s.as_str()).unwrap_or("");
     if let Err(e) =
@@ -1406,7 +1935,7 @@ async fn update_modrinth(
         return Err(format!("Pack download failed: {}", e));
     }
 
-    let staging = ctx.instance_dir.join(".pack-update");
+    let staging = operation_staging_dir(&ctx.instance_dir, "pack-update");
     let (new_manifest, new_overrides) = match packlock::mrpack_zip_info(&temp_zip) {
         Ok(v) => v,
         Err(e) => {
@@ -1415,7 +1944,7 @@ async fn update_modrinth(
         }
     };
 
-    // The pack's target Minecraft/loader must match this instance — a bump
+    // The pack's target Minecraft/loader must match this instance тАФ a bump
     // means a new instance, not an in-place migration (same rule as CF).
     let new_mc = new_manifest["dependencies"]["minecraft"]
         .as_str()
@@ -1501,6 +2030,7 @@ async fn update_modrinth(
             .map_err(|e| format!("Cannot reopen pack archive: {}", e))?;
         let mut archive =
             zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
+        let mut extract_budget = crate::import::ExtractBudget::new();
         for i in 0..archive.len() {
             let mut entry = archive
                 .by_index(i)
@@ -1519,7 +2049,8 @@ async fn update_modrinth(
                 continue;
             }
             check_safe_relative(rel).map_err(|e| e.to_string())?;
-            write_extracted(&stage_ov, rel, &mut entry).map_err(|e| e.to_string())?;
+            write_extracted_budgeted(&stage_ov, rel, &mut entry, &mut extract_budget)
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     })();
@@ -1531,7 +2062,7 @@ async fn update_modrinth(
         ));
     }
 
-    // ---- Phase 3: apply (sync — all network work is done) ----
+    // ---- Phase 3: apply (sync тАФ all network work is done) ----
     emit(app, "applying", 0, 1, "Applying update...");
     let plan = plan_modrinth_update(
         &ctx.mc_dir,
@@ -1580,9 +2111,9 @@ async fn update_modrinth(
 }
 
 /// mrpack repair: every client file the index lists but the instance is
-/// missing gets re-downloaded (embedded lookups are skipped — the pack zip
-/// is not held; the index's own URLs / version ids resolve the files).
-/// Missing overrides are restored from a fresh pack zip download.
+/// missing is re-downloaded into staging; missing overrides are restored from
+/// a fresh pack zip. The instance is modified only by the shared
+/// apply/rollback path.
 async fn repair_modrinth(
     app: &AppHandle,
     ctx: &PackCtx,
@@ -1598,126 +2129,140 @@ async fn repair_modrinth(
     };
     let no_embedded: Arc<HashMap<String, Vec<u8>>> = Arc::new(HashMap::new());
 
-    for (i, (key, entry)) in map.iter().enumerate() {
-        report.checked += 1;
-        let path = packlock::mrpack_entry_path(entry);
-        if path.is_empty() || check_safe_relative(&path).is_err() {
-            report.skipped += 1;
-            continue;
-        }
-        let dest = ctx.mc_dir.join(&path);
-        let disabled = dest
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| format!("{}.disabled", n))
-            .and_then(|n| dest.parent().map(|p| p.join(n)));
-        let present = dest.is_file() || disabled.map(|d| d.is_file()).unwrap_or(false);
-        if present {
-            report.skipped += 1;
-            continue;
-        }
-        emit(
-            app,
-            "repairing",
-            i,
-            total,
-            &format!("Restoring file {}/{}...", i + 1, total),
-        );
-        match crate::import::install_mrpack_file(&path, entry, &ctx.mc_dir, &no_embedded, true)
-            .await
-        {
-            Ok(()) => report.restored += 1,
-            Err(e) => report.failed.push(format!("{}: {}", key, e)),
-        }
-    }
+    let staging = operation_staging_dir(&ctx.instance_dir, "pack-repair");
+    let stage_overrides = staging.join("overrides");
+    let temp_zip = repair_temp_zip("mrpack", &ctx.instance.name, &lock.file_id, "mrpack");
+    let mut plan = ApplyPlan::default();
+    let mut extract_budget = crate::import::ExtractBudget::new();
 
-    // ---- Overrides whose file is gone (protected/user files stay out) ----
-    let missing: Vec<String> = lock
-        .overrides
-        .iter()
-        .filter(|rel| !packlock::is_protected_path(rel) && !ctx.mc_dir.join(rel).exists())
-        .cloned()
-        .collect();
-    if !missing.is_empty() {
-        emit(
-            app,
-            "repairing",
-            total,
-            total + 1,
-            "Restoring pack overrides...",
-        );
-        let version = match modrinth::get_version_by_id(&lock.file_id).await {
-            Ok(v) => v,
-            Err(e) => {
-                report
-                    .failed
-                    .push(format!("Pack version info failed: {}", e));
-                return Ok(report);
+    let prepare: Result<(), String> = async {
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| format!("Cannot create staging folder: {}", e))?;
+
+        for (i, (key, entry)) in map.iter().enumerate() {
+            report.checked += 1;
+            let path = packlock::mrpack_entry_path(entry);
+            if path.is_empty() || check_safe_relative(&path).is_err() {
+                report.skipped += 1;
+                continue;
             }
-        };
-        let file = version
-            .files
+            let dest = ctx.mc_dir.join(&path);
+            let disabled = dest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| format!("{}.disabled", n))
+                .and_then(|n| dest.parent().map(|p| p.join(n)));
+            let present = dest.is_file() || disabled.map(|d| d.is_file()).unwrap_or(false);
+            if present {
+                report.skipped += 1;
+                continue;
+            }
+            emit(
+                app,
+                "repairing",
+                i,
+                total,
+                &format!("Restoring file {}/{}...", i + 1, total),
+            );
+            extract_budget
+                .claim_path(&path)
+                .map_err(|e| e.to_string())?;
+            crate::import::install_mrpack_file(&path, entry, &staging, &no_embedded, false)
+                .await
+                .map_err(|e| format!("{}: {}", key, e))?;
+            plan.installs.push(PlannedInstall {
+                staged: staging.join(&path),
+                dest,
+                preserve_disabled: false,
+                expect_absent: true,
+                previous_name: None,
+                sidecar: SidecarPlan::Content(SidecarWriteOwned {
+                    provider: "modrinth".to_string(),
+                    content_type: packlock::content_type_for_rel(&path).to_string(),
+                    project_id: Some(
+                        entry["project_id"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| key.clone()),
+                    ),
+                    project_name: None,
+                    version_id: Some(packlock::mrpack_entry_version(entry)),
+                    version_number: None,
+                    file_id: None,
+                    hash: packlock::mrpack_entry_sha1(entry),
+                }),
+                is_mod: true,
+            });
+        }
+
+        // ---- Overrides whose file is gone (protected/user files stay out) ----
+        let missing: Vec<String> = lock
+            .overrides
             .iter()
-            .find(|f| f.primary)
-            .or_else(|| version.files.first());
-        let Some(file) = file else {
-            report.failed.push("Pack version has no files".to_string());
-            return Ok(report);
-        };
-        if !file.url.starts_with("https://") || !crate::is_allowed_download_host(&file.url) {
-            report
-                .failed
-                .push("Pack file URL is not allowed".to_string());
-            return Ok(report);
-        }
-        let temp_zip = std::env::temp_dir().join(format!(
-            "voidlauncher-mrpack-repair-{}.mrpack",
-            lock.file_id
-        ));
-        let sha1 = file.hashes.get("sha1").map(|s| s.as_str()).unwrap_or("");
-        if let Err(e) =
-            crate::download::download_file_sized(&file.url, &temp_zip, sha1, file.size).await
-        {
-            let _ = std::fs::remove_file(&temp_zip);
-            report
-                .failed
-                .push(format!("Pack archive download failed: {}", e));
-            return Ok(report);
-        }
-        let extract: Result<(), String> = (|| {
-            let f = std::fs::File::open(&temp_zip)
-                .map_err(|e| format!("Cannot open pack archive: {}", e))?;
-            let mut archive =
-                zip::ZipArchive::new(f).map_err(|e| format!("Cannot read pack archive: {}", e))?;
-            for i in 0..archive.len() {
-                let mut entry = archive
-                    .by_index(i)
-                    .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-                let name = entry.name().to_string();
-                let Some(rel) = crate::import::extract_mrpack_override(&name) else {
-                    continue;
-                };
-                if rel.is_empty() || entry.is_dir() || !missing.iter().any(|m| m == rel) {
-                    continue;
-                }
-                check_safe_relative(rel).map_err(|e| e.to_string())?;
-                write_extracted(&ctx.mc_dir, rel, &mut entry).map_err(|e| e.to_string())?;
-                write_override_sidecar(&ctx.mc_dir, rel, "modrinth");
-                report.checked += 1;
-                report.restored += 1;
+            .filter(|rel| {
+                !packlock::is_protected_path(rel) && !content_present(&ctx.mc_dir.join(rel))
+            })
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            emit(
+                app,
+                "repairing",
+                total,
+                total + 1,
+                "Restoring pack overrides...",
+            );
+            let version = modrinth::get_version_by_id(&lock.file_id)
+                .await
+                .map_err(|e| format!("Pack version info failed: {}", e))?;
+            let file = version
+                .files
+                .iter()
+                .find(|f| f.primary)
+                .or_else(|| version.files.first())
+                .ok_or_else(|| "Pack version has no files".to_string())?;
+            if !file.url.starts_with("https://") || !crate::is_allowed_download_host(&file.url) {
+                return Err("Pack file URL is not allowed".to_string());
             }
-            Ok(())
-        })();
-        let _ = std::fs::remove_file(&temp_zip);
-        if let Err(e) = extract {
-            report
-                .failed
-                .push(format!("Overrides restore failed: {}", e));
+            let sha1 = file.hashes.get("sha1").map(|s| s.as_str()).unwrap_or("");
+            crate::download::download_file_sized(&file.url, &temp_zip, sha1, file.size)
+                .await
+                .map_err(|e| format!("Pack archive download failed: {}", e))?;
+            let installs = stage_repair_overrides(
+                &temp_zip,
+                OverridePrefix::Modrinth,
+                &missing,
+                &stage_overrides,
+                &ctx.mc_dir,
+                "modrinth",
+                &mut extract_budget,
+            )?;
+            report.checked += installs.len();
+            plan.installs.extend(installs);
         }
+        Ok(())
     }
+    .await;
 
+    let report = match prepare {
+        Ok(()) => report,
+        Err(e) => {
+            cleanup_files(&staging, &temp_zip);
+            return Err(format!(
+                "Repair preparation failed, the instance was not modified: {}",
+                e
+            ));
+        }
+    };
+
+    emit(app, "applying", 0, 1, "Applying repair...");
+    let outcome = apply_plan(&ctx.mc_dir, &plan, &staging, &temp_zip)?;
     emit(app, "done", 1, 1, "Repair finished.");
-    Ok(report)
+    Ok(PackRepairReport {
+        restored: outcome.mods_installed + outcome.overrides_written,
+        ..report
+    })
 }
 
 #[cfg(test)]
@@ -1865,6 +2410,7 @@ mod update_integrity_tests {
             staged,
             dest,
             preserve_disabled: false,
+            expect_absent: false,
             previous_name: None,
             sidecar: SidecarPlan::Content(SidecarWriteOwned {
                 provider: "curseforge".to_string(),
@@ -2152,8 +2698,8 @@ mod update_integrity_tests {
         write(&pack.mods().join("sodium.jar"), b"new");
         rb.moved.push(pack.mods().join("sodium.jar"));
 
-        rb.rollback(&pack.staging, &pack.temp_zip);
-        rb.rollback(&pack.staging, &pack.temp_zip);
+        rb.rollback(&pack.staging, &pack.temp_zip).unwrap();
+        rb.rollback(&pack.staging, &pack.temp_zip).unwrap();
 
         assert_eq!(
             std::fs::read(pack.mods().join("sodium.jar")).unwrap(),
@@ -2614,6 +3160,7 @@ mod update_integrity_tests {
                 staged: mc.join("config/settings.disabled"),
                 dest: mc.join("config/settings.disabled"),
                 preserve_disabled: false,
+                expect_absent: false,
                 previous_name: None,
                 sidecar: SidecarPlan::Override("curseforge"),
                 is_mod: false,
@@ -2638,6 +3185,7 @@ mod update_integrity_tests {
                 staged: mc.join("mods/example.jar"),
                 dest: mc.join("mods/example.jar"),
                 preserve_disabled: false,
+                expect_absent: false,
                 previous_name: None,
                 sidecar: SidecarPlan::Override("curseforge"),
                 is_mod: true,
@@ -2820,5 +3368,842 @@ mod update_integrity_tests {
         assert_eq!(rec.provider, "curseforge");
         assert!(!rec.enabled);
         assert!(rec.filename.ends_with(".disabled"));
+    }
+
+    // ---- repair prepare/apply/rollback ----------------------------------
+
+    fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write as _;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, bytes) in entries {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn repair_install(
+        staged: PathBuf,
+        dest: PathBuf,
+        is_mod: bool,
+        expect_absent: bool,
+    ) -> PlannedInstall {
+        PlannedInstall {
+            staged,
+            dest,
+            preserve_disabled: false,
+            expect_absent,
+            previous_name: None,
+            sidecar: SidecarPlan::Content(SidecarWriteOwned {
+                provider: "curseforge".to_string(),
+                content_type: "mod".to_string(),
+                project_id: Some("10".to_string()),
+                project_name: Some("Sodium".to_string()),
+                version_id: None,
+                version_number: Some("new".to_string()),
+                file_id: Some("6".to_string()),
+                hash: None,
+            }),
+            is_mod,
+        }
+    }
+
+    fn repair_override_install(staged: PathBuf, dest: PathBuf) -> PlannedInstall {
+        PlannedInstall {
+            staged,
+            dest,
+            preserve_disabled: false,
+            expect_absent: true,
+            previous_name: None,
+            sidecar: SidecarPlan::Override("curseforge"),
+            is_mod: false,
+        }
+    }
+
+    #[test]
+    fn repair_override_staging_extracts_only_requested_files() {
+        let pack = TestPack::new("repair_stage");
+        let zip_path = pack.root.join("repair-pack.zip");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("manifest.json", b"{}"),
+                ("overrides/mods/a.jar", b"a"),
+                ("overrides/config/b.toml", b"b"),
+                ("overrides/mods/skip.jar", b"skip"),
+            ],
+        );
+
+        let mut budget = crate::import::ExtractBudget::new();
+        let staging = pack.staging.join("overrides");
+        let installs = stage_repair_overrides(
+            &zip_path,
+            OverridePrefix::CurseForge,
+            &["mods/a.jar".to_string(), "config/b.toml".to_string()],
+            &staging,
+            &pack.mc,
+            "curseforge",
+            &mut budget,
+        )
+        .expect("only the requested files are extracted");
+
+        assert_eq!(installs.len(), 2);
+        assert_eq!(std::fs::read(staging.join("mods/a.jar")).unwrap(), b"a");
+        assert_eq!(std::fs::read(staging.join("config/b.toml")).unwrap(), b"b");
+        assert!(!staging.join("mods/skip.jar").exists());
+        assert!(
+            !pack.mc.join("mods/a.jar").exists(),
+            "prepare must not write into the instance"
+        );
+        assert!(installs.iter().all(|i| i.expect_absent && !i.is_mod));
+    }
+
+    #[test]
+    fn repair_override_staging_rejects_a_destination_claimed_by_an_index_file() {
+        let pack = TestPack::new("repair_cross_collision");
+        let zip_path = pack.root.join("repair-pack.zip");
+        write_test_zip(&zip_path, &[("overrides/mods/foo.jar", b"override")]);
+
+        let mut budget = crate::import::ExtractBudget::new();
+        budget
+            .claim_path("mods/Foo.jar")
+            .expect("the staged index file reserves its destination");
+
+        let staging = pack.staging.join("overrides");
+        let err = stage_repair_overrides(
+            &zip_path,
+            OverridePrefix::CurseForge,
+            &["mods/foo.jar".to_string()],
+            &staging,
+            &pack.mc,
+            "curseforge",
+            &mut budget,
+        )
+        .expect_err("the override collides with the index file");
+        assert!(err.contains("conflicting"), "got: {err}");
+        assert!(!staging.join("mods/foo.jar").exists());
+        assert!(!pack.mc.join("mods/foo.jar").exists());
+    }
+
+    #[test]
+    fn repair_override_staging_rejects_duplicates_and_file_directory_conflicts() {
+        let pack = TestPack::new("repair_dup");
+        let zip_path = pack.root.join("repair-pack.zip");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("overrides/mods/A.jar", b"first"),
+                ("overrides/mods/a.jar", b"second"),
+            ],
+        );
+        let mut budget = crate::import::ExtractBudget::new();
+        let err = stage_repair_overrides(
+            &zip_path,
+            OverridePrefix::CurseForge,
+            &["mods/A.jar".to_string(), "mods/a.jar".to_string()],
+            &pack.staging.join("overrides"),
+            &pack.mc,
+            "curseforge",
+            &mut budget,
+        )
+        .expect_err("case-insensitive duplicates are conflicting destinations");
+        assert!(err.contains("conflicting"), "got: {err}");
+        assert!(!pack.mc.join("mods/A.jar").exists());
+
+        let zip_path = pack.root.join("file-dir.zip");
+        write_test_zip(
+            &zip_path,
+            &[
+                ("overrides/mods/A", b"file"),
+                ("overrides/mods/A/inner.txt", b"nested"),
+            ],
+        );
+        let mut budget = crate::import::ExtractBudget::new();
+        let err = stage_repair_overrides(
+            &zip_path,
+            OverridePrefix::CurseForge,
+            &["mods/A".to_string(), "mods/A/inner.txt".to_string()],
+            &pack.staging.join("overrides2"),
+            &pack.mc,
+            "curseforge",
+            &mut budget,
+        )
+        .expect_err("a file cannot also be a directory");
+        assert!(err.contains("conflicting"), "got: {err}");
+    }
+
+    #[test]
+    fn repair_override_staging_budget_failure_does_not_touch_the_instance() {
+        let pack = TestPack::new("repair_budget");
+        write(&pack.mods().join("keep.jar"), b"user-content");
+        let zip_path = pack.root.join("repair-pack.zip");
+        write_test_zip(&zip_path, &[("overrides/mods/big.jar", b"0123456789")]);
+
+        let mut budget = crate::import::ExtractBudget::with_limits(3, 3);
+        let staging = pack.staging.join("overrides");
+        let err = stage_repair_overrides(
+            &zip_path,
+            OverridePrefix::CurseForge,
+            &["mods/big.jar".to_string()],
+            &staging,
+            &pack.mc,
+            "curseforge",
+            &mut budget,
+        )
+        .expect_err("the override exceeds the total budget");
+        assert!(err.contains("limit"), "got: {err}");
+        assert_eq!(
+            std::fs::read(pack.mods().join("keep.jar")).unwrap(),
+            b"user-content"
+        );
+        assert!(!staging.join("mods/big.jar").exists());
+        assert!(!pack.mc.join("mods/big.jar").exists());
+    }
+
+    #[test]
+    fn apply_plan_installs_content_and_overrides_and_cleans_staging() {
+        let pack = TestPack::new("repair_apply");
+        write(&pack.mc.join("config/user.toml"), b"user-config");
+
+        let plan = ApplyPlan {
+            installs: vec![
+                repair_install(
+                    staged(&pack, "mods/new.jar", b"new-mod"),
+                    pack.mods().join("new.jar"),
+                    true,
+                    true,
+                ),
+                repair_override_install(
+                    staged(&pack, "overrides/mods/pack.jar", b"pack-override"),
+                    pack.mods().join("pack.jar"),
+                ),
+            ],
+            removals: vec![],
+        };
+
+        let outcome = apply_plan(&pack.mc, &plan, &pack.staging, &pack.temp_zip)
+            .expect("a prepared plan applies");
+        assert_eq!(outcome.mods_installed, 1);
+        assert_eq!(outcome.overrides_written, 1);
+        assert_eq!(
+            std::fs::read(pack.mods().join("new.jar")).unwrap(),
+            b"new-mod"
+        );
+        assert_eq!(
+            std::fs::read(pack.mods().join("pack.jar")).unwrap(),
+            b"pack-override"
+        );
+        assert!(pack.index().join("new.voidlauncher.json").is_file());
+        assert!(pack.index().join("pack.voidlauncher.json").is_file());
+        assert_eq!(
+            std::fs::read(pack.mc.join("config/user.toml")).unwrap(),
+            b"user-config"
+        );
+        assert!(!pack.staging.exists(), "successful apply cleans staging");
+    }
+
+    #[test]
+    fn apply_plan_rolls_back_a_partial_repair_and_keeps_unrelated_files() {
+        let pack = TestPack::new("repair_rb");
+        write(&pack.mods().join("unrelated.jar"), b"user-mod");
+        write(&pack.mc.join("saves/world/level.dat"), b"world");
+
+        let plan = ApplyPlan {
+            installs: vec![
+                repair_install(
+                    staged(&pack, "mods/new.jar", b"new-mod"),
+                    pack.mods().join("new.jar"),
+                    true,
+                    true,
+                ),
+                repair_install(
+                    pack.staging.join("mods/missing.jar"),
+                    pack.mods().join("missing.jar"),
+                    true,
+                    true,
+                ),
+            ],
+            removals: vec![],
+        };
+
+        let err = apply_plan(&pack.mc, &plan, &pack.staging, &pack.temp_zip)
+            .expect_err("the missing staged file fails the repair");
+        assert!(err.contains("rolled back"), "got: {err}");
+        assert!(!pack.mods().join("new.jar").exists());
+        assert!(
+            !pack.index().join("new.voidlauncher.json").exists(),
+            "metadata of a rolled-back new file must be removed"
+        );
+        assert!(!pack.mods().join("missing.jar").exists());
+        assert_eq!(
+            std::fs::read(pack.mods().join("unrelated.jar")).unwrap(),
+            b"user-mod"
+        );
+        assert_eq!(
+            std::fs::read(pack.mc.join("saves/world/level.dat")).unwrap(),
+            b"world"
+        );
+        assert!(!pack.staging.exists());
+    }
+
+    #[test]
+    fn content_present_recognizes_the_disabled_twin() {
+        let pack = TestPack::new("content_present");
+        write(&pack.mods().join("late.jar.disabled"), b"disabled");
+        assert!(content_present(&pack.mods().join("late.jar")));
+        assert!(!content_present(&pack.mods().join("other.jar")));
+    }
+
+    #[test]
+    fn rollback_removes_directories_created_by_the_operation() {
+        let pack = TestPack::new("repair_dirs");
+        let created_dir = pack.mc.join("config/new-section");
+
+        let plan = ApplyPlan {
+            installs: vec![
+                repair_override_install(
+                    staged(&pack, "overrides/config/new-section/a.toml", b"a"),
+                    created_dir.join("a.toml"),
+                ),
+                repair_install(
+                    pack.staging.join("mods/missing.jar"),
+                    pack.mods().join("missing.jar"),
+                    true,
+                    true,
+                ),
+            ],
+            removals: vec![],
+        };
+
+        apply_plan(&pack.mc, &plan, &pack.staging, &pack.temp_zip)
+            .expect_err("the last file is missing");
+        assert!(
+            !created_dir.exists(),
+            "an empty directory created by the failed operation must be removed"
+        );
+    }
+
+    #[test]
+    fn repair_refuses_to_replace_content_that_appeared_after_prepare() {
+        let pack = TestPack::new("repair_race");
+        write(&pack.mods().join("late.jar"), b"user-created");
+
+        let plan = ApplyPlan {
+            installs: vec![repair_install(
+                staged(&pack, "mods/late.jar", b"repair-content"),
+                pack.mods().join("late.jar"),
+                true,
+                true,
+            )],
+            removals: vec![],
+        };
+
+        let err = apply_plan(&pack.mc, &plan, &pack.staging, &pack.temp_zip)
+            .expect_err("a file that appeared after prepare is not replaced");
+        assert!(
+            err.contains("appeared while the repair was preparing"),
+            "got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(pack.mods().join("late.jar")).unwrap(),
+            b"user-created"
+        );
+        assert!(!pack.staging.exists());
+    }
+
+    #[test]
+    fn sidecar_failure_rolls_back_the_installed_file() {
+        let pack = TestPack::new("repair_sidecar");
+        let plan = ApplyPlan {
+            installs: vec![repair_install(
+                staged(&pack, "mods/new.jar", b"new-mod"),
+                pack.mods().join("new.jar"),
+                true,
+                true,
+            )],
+            removals: vec![],
+        };
+
+        fail_next_sidecar();
+        let err = apply_plan(&pack.mc, &plan, &pack.staging, &pack.temp_zip)
+            .expect_err("the injected sidecar failure aborts the repair");
+        assert!(err.contains("injected sidecar failure"), "got: {err}");
+        assert!(err.contains("rolled back"), "got: {err}");
+        assert!(!pack.mods().join("new.jar").exists());
+        assert!(!pack.index().join("new.voidlauncher.json").exists());
+        assert!(!pack.staging.exists());
+    }
+
+    #[test]
+    fn failed_park_keeps_the_original_and_reports_a_rollback() {
+        let pack = TestPack::new("repair_park_fail");
+        write(&pack.mods().join("old.jar"), b"old-content");
+        // A non-empty directory at the park name makes the rename fail after
+        // the operation has started.
+        write(
+            &pack.mods().join("old.jar.voidlauncher-old/blocker"),
+            b"block",
+        );
+
+        let plan = ApplyPlan {
+            installs: vec![repair_install(
+                staged(&pack, "mods/old.jar", b"new-content"),
+                pack.mods().join("old.jar"),
+                true,
+                false,
+            )],
+            removals: vec![],
+        };
+
+        let err = apply_plan(&pack.mc, &plan, &pack.staging, &pack.temp_zip)
+            .expect_err("the blocked park fails the apply");
+        assert!(err.contains("rolled back"), "got: {err}");
+        assert_eq!(
+            std::fs::read(pack.mods().join("old.jar")).unwrap(),
+            b"old-content"
+        );
+    }
+
+    #[test]
+    fn failed_rollback_reports_both_errors_and_preserves_recovery_data() {
+        let pack = TestPack::new("rb_failure");
+        write(&pack.mods().join("sodium.jar"), b"old-sodium");
+        write_sidecar(&pack, "sodium.jar", "curseforge", "5");
+
+        let plan = ApplyPlan {
+            installs: vec![
+                content_install(
+                    staged(&pack, "mods/sodium.jar", b"new-sodium"),
+                    pack.mods().join("sodium.jar"),
+                    true,
+                ),
+                content_install(
+                    pack.staging.join("mods/missing.jar"),
+                    pack.mods().join("missing.jar"),
+                    true,
+                ),
+            ],
+            removals: vec![],
+        };
+
+        fail_next_rollback();
+        let err = apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan,
+            &pack.staging,
+            &pack.temp_zip,
+            &sample_lock("6"),
+        )
+        .expect_err("the injected rollback failure is reported");
+
+        assert!(err.contains("Rollback also failed"), "got: {err}");
+        assert!(err.contains("injected rollback failure"), "got: {err}");
+        assert!(err.contains("partially modified"), "got: {err}");
+        assert!(
+            !err.contains("was rolled back"),
+            "a failed rollback must not be reported as success: {err}"
+        );
+
+        // The injected rollback did nothing: this is exactly the partial state
+        // that must not be hidden from the caller.
+        assert_eq!(
+            std::fs::read(pack.mods().join("sodium.jar")).unwrap(),
+            b"new-sodium"
+        );
+        assert_eq!(
+            std::fs::read(pack.mods().join("sodium.jar.voidlauncher-old")).unwrap(),
+            b"old-sodium"
+        );
+        assert!(
+            pack.staging.exists(),
+            "staging with recovery data must survive a failed rollback"
+        );
+        let manifest =
+            std::fs::read_to_string(pack.staging.join("recovery.txt")).expect("recovery manifest");
+        assert!(manifest.contains("sodium.jar"), "got: {manifest}");
+        let copies: Vec<PathBuf> = std::fs::read_dir(pack.staging.join("recovery"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("sodium.jar.voidlauncher-old"))
+            })
+            .collect();
+        assert_eq!(
+            copies.len(),
+            1,
+            "the old content must be copied for recovery"
+        );
+        assert_eq!(std::fs::read(&copies[0]).unwrap(), b"old-sodium");
+    }
+
+    #[test]
+    fn validate_apply_plan_rejects_duplicate_destinations_and_sidecar_collisions() {
+        let pack = TestPack::new("plan_validate");
+        let duplicate = ApplyPlan {
+            installs: vec![
+                repair_install(
+                    staged(&pack, "mods/a.jar", b"a"),
+                    pack.mods().join("a.jar"),
+                    true,
+                    true,
+                ),
+                repair_install(
+                    staged(&pack, "mods/A.jar", b"b"),
+                    pack.mods().join("A.jar"),
+                    true,
+                    true,
+                ),
+            ],
+            removals: vec![],
+        };
+        let err = validate_apply_plan(&duplicate, &pack.mc).expect_err("case-only duplicate");
+        assert!(err.contains("Conflicting destinations"), "got: {err}");
+
+        let file_dir = ApplyPlan {
+            installs: vec![
+                repair_install(
+                    pack.staging.join("mods/A"),
+                    pack.mods().join("A"),
+                    true,
+                    true,
+                ),
+                repair_install(
+                    pack.staging.join("mods/a/inner.jar"),
+                    pack.mods().join("a/inner.jar"),
+                    true,
+                    true,
+                ),
+            ],
+            removals: vec![],
+        };
+        let err = validate_apply_plan(&file_dir, &pack.mc)
+            .expect_err("case-only ancestor paths still collide on Windows");
+        assert!(err.contains("file and a directory"), "got: {err}");
+
+        let sidecar_collision = ApplyPlan {
+            installs: vec![
+                repair_install(
+                    staged(&pack, "mods/Foo.jar", b"jar"),
+                    pack.mods().join("Foo.jar"),
+                    true,
+                    true,
+                ),
+                repair_install(
+                    staged(&pack, "mods/Foo.zip", b"zip"),
+                    pack.mods().join("Foo.zip"),
+                    true,
+                    true,
+                ),
+            ],
+            removals: vec![],
+        };
+        let err = validate_apply_plan(&sidecar_collision, &pack.mc)
+            .expect_err("two content files cannot share one sidecar");
+        assert!(err.contains("metadata entry"), "got: {err}");
+
+        let independent = ApplyPlan {
+            installs: vec![
+                repair_install(
+                    staged(&pack, "mods/a.jar", b"a"),
+                    pack.mods().join("a.jar"),
+                    true,
+                    true,
+                ),
+                repair_install(
+                    staged(&pack, "config/b.toml", b"b"),
+                    pack.mc.join("config/b.toml"),
+                    false,
+                    true,
+                ),
+            ],
+            removals: vec![],
+        };
+        validate_apply_plan(&independent, &pack.mc).expect("independent paths are fine");
+    }
+
+    #[test]
+    fn later_updates_never_delete_a_previous_failed_rollback_recovery() {
+        let pack = TestPack::new("recovery_sequence");
+        write(&pack.mods().join("sodium.jar"), b"old-sodium");
+        write_sidecar(&pack, "sodium.jar", "curseforge", "5");
+        write(&pack.mods().join("other.jar"), b"old-other");
+
+        // First operation: fails during apply, then its rollback is injected
+        // to fail. The recovery copy must stay in its own staging folder.
+        let staging1 = operation_staging_dir(&pack.instance, "pack-update");
+        write(&staging1.join("mods/sodium.jar"), b"new-sodium");
+        let plan1 = ApplyPlan {
+            installs: vec![
+                content_install(
+                    staging1.join("mods/sodium.jar"),
+                    pack.mods().join("sodium.jar"),
+                    true,
+                ),
+                content_install(
+                    staging1.join("mods/missing.jar"),
+                    pack.mods().join("missing.jar"),
+                    true,
+                ),
+            ],
+            removals: vec![],
+        };
+        fail_next_rollback();
+        let err1 = apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan1,
+            &staging1,
+            &pack.temp_zip,
+            &sample_lock("6"),
+        )
+        .expect_err("the first rollback is injected to fail");
+        assert!(err1.contains("Rollback also failed"), "got: {err1}");
+        let manifest1 = std::fs::read_to_string(staging1.join("recovery.txt"))
+            .expect("first recovery manifest");
+        assert!(manifest1.contains("sodium.jar"));
+
+        // Second operation: also fails its rollback. It must use a different
+        // staging folder and must not overwrite the first recovery data.
+        let staging2 = operation_staging_dir(&pack.instance, "pack-update");
+        assert_ne!(staging1, staging2, "staging names must be unique");
+        write(&staging2.join("mods/other.jar"), b"new-other");
+        let plan2 = ApplyPlan {
+            installs: vec![
+                content_install(
+                    staging2.join("mods/other.jar"),
+                    pack.mods().join("other.jar"),
+                    true,
+                ),
+                content_install(
+                    staging2.join("mods/missing2.jar"),
+                    pack.mods().join("missing2.jar"),
+                    true,
+                ),
+            ],
+            removals: vec![],
+        };
+        fail_next_rollback();
+        let err2 = apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan2,
+            &staging2,
+            &pack.temp_zip,
+            &sample_lock("7"),
+        )
+        .expect_err("the second rollback is injected to fail");
+        assert!(err2.contains("Rollback also failed"), "got: {err2}");
+        assert_eq!(
+            std::fs::read_to_string(staging1.join("recovery.txt")).unwrap(),
+            manifest1,
+            "the first recovery manifest must not change"
+        );
+        assert!(staging2.join("recovery.txt").is_file());
+        assert!(staging1.join("recovery").is_dir());
+        assert!(staging2.join("recovery").is_dir());
+
+        // Third operation succeeds and replaces the same file that the first
+        // failed operation left partially updated. This also reclaims the
+        // in-place park, so only the preserved recovery copy can still hold
+        // the original content.
+        let staging3 = operation_staging_dir(&pack.instance, "pack-update");
+        write(&staging3.join("mods/sodium.jar"), b"final-sodium");
+        let plan3 = ApplyPlan {
+            installs: vec![content_install(
+                staging3.join("mods/sodium.jar"),
+                pack.mods().join("sodium.jar"),
+                true,
+            )],
+            removals: vec![],
+        };
+        apply_and_commit(
+            &pack.mc,
+            &pack.instance,
+            &plan3,
+            &staging3,
+            &pack.temp_zip,
+            &sample_lock("8"),
+        )
+        .expect("the third operation succeeds");
+        assert_eq!(
+            std::fs::read(pack.mods().join("sodium.jar")).unwrap(),
+            b"final-sodium"
+        );
+        assert!(!staging3.exists(), "successful staging is removed");
+        assert!(
+            staging1.join("recovery.txt").is_file(),
+            "first recovery must survive later updates"
+        );
+        assert!(
+            staging2.join("recovery.txt").is_file(),
+            "second recovery must survive later updates"
+        );
+        assert_eq!(
+            std::fs::read_to_string(staging1.join("recovery.txt")).unwrap(),
+            manifest1,
+            "later updates must not rewrite the first recovery manifest"
+        );
+        let recovery_copies: Vec<PathBuf> = std::fs::read_dir(staging1.join("recovery"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("sodium.jar.voidlauncher-old"))
+            })
+            .collect();
+        assert_eq!(recovery_copies.len(), 1);
+        assert_eq!(
+            std::fs::read(&recovery_copies[0]).unwrap(),
+            b"old-sodium",
+            "the recovery copy must keep the original content even after the \
+             in-place park was reclaimed"
+        );
+    }
+
+    #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) -> bool {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("cmd");
+        command.arg("/C");
+        command.raw_arg(format!(
+            "mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ));
+        command
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn apply_plan_rejects_a_junction_content_folder() {
+        let pack = TestPack::new("junction_apply");
+        let outside = std::env::temp_dir().join(format!(
+            "vl_packlock_junction_outside_{}_{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = pack.mc.join("linked-mods");
+        if !create_junction(&link, &outside) {
+            eprintln!("skipping junction test: mklink /J failed");
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+
+        let plan = ApplyPlan {
+            installs: vec![repair_install(
+                staged(&pack, "linked-mods/example.jar", b"payload"),
+                link.join("example.jar"),
+                true,
+                true,
+            )],
+            removals: vec![],
+        };
+        let err = apply_plan(&pack.mc, &plan, &pack.staging, &pack.temp_zip)
+            .expect_err("a junction content folder must be rejected");
+        assert!(err.contains("reparse point"), "got: {err}");
+        assert!(
+            !outside.join("example.jar").exists(),
+            "nothing may be written through the junction"
+        );
+
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn apply_plan_rejects_removing_through_a_junction_content_folder() {
+        let pack = TestPack::new("junction_remove");
+        let outside = std::env::temp_dir().join(format!(
+            "vl_packlock_junction_remove_{}_{}",
+            std::process::id(),
+            unique_nonce()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        write(&outside.join("old.jar"), b"outside-data");
+        let link = pack.mc.join("linked-mods");
+        if !create_junction(&link, &outside) {
+            eprintln!("skipping junction test: mklink /J failed");
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+
+        let plan = ApplyPlan {
+            installs: vec![],
+            removals: vec![PlannedRemoval {
+                path: link.join("old.jar"),
+                is_mod: true,
+                counted: true,
+            }],
+        };
+        let err = apply_plan(&pack.mc, &plan, &pack.staging, &pack.temp_zip)
+            .expect_err("removal through a junction must be rejected");
+        assert!(err.contains("reparse point"), "got: {err}");
+        assert_eq!(
+            std::fs::read(outside.join("old.jar")).unwrap(),
+            b"outside-data"
+        );
+
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn two_mutations_cannot_reserve_the_same_instance() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_packlock_guard_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::AppConfig {
+            data_dir: dir.clone(),
+            ..Default::default()
+        };
+        let state = crate::AppState {
+            config: std::sync::Mutex::new(config),
+            auth_state: std::sync::Mutex::new(crate::auth::AuthState::default()),
+            launches: crate::launch_state::LaunchRegistry::new(),
+            pack_watcher: std::sync::Mutex::new(None),
+            active_sessions: std::sync::Mutex::new(HashMap::new()),
+            room_state: std::sync::Arc::new(crate::rooms::room_state::RoomStateManager::new(&dir)),
+            tailscale: crate::rooms::tailscale::TailscaleManager::new(dir.clone()),
+        };
+
+        let first =
+            crate::commands::instances::InstanceMutationGuard::acquire(&state, "Pack").unwrap();
+        let second = crate::commands::instances::InstanceMutationGuard::acquire(&state, "Pack");
+        assert!(
+            second.is_err(),
+            "a second content mutation must not enter the apply phase"
+        );
+        assert_eq!(
+            state.launches.phase("Pack"),
+            Some(crate::launch_state::LaunchPhase::Editing)
+        );
+        drop(first);
+        assert_eq!(state.launches.phase("Pack"), None);
+        crate::commands::instances::InstanceMutationGuard::acquire(&state, "Pack")
+            .expect("the reservation is released");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

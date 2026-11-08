@@ -9,10 +9,10 @@ use crate::modrinth::ModrinthFile;
 use crate::versions;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::Read;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Semaphore;
@@ -247,7 +247,130 @@ pub(crate) fn check_safe_remote_path(relative: &str) -> Result<()> {
 /// Stream a zip entry to disk under `base`, verifying no path traversal.
 /// File-backed writer: large entries are copied in chunks instead of being
 /// buffered in memory (`std::io::copy`).
+/// Per-entry and per-operation limits for extraction of untrusted archives.
+/// Same order of magnitude as the existing local-import limits; these are
+/// deliberately enforced on *actual* bytes read, not on metadata sizes.
+pub(crate) const MAX_EXTRACT_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const MAX_EXTRACT_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+static EXTRACT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Canonical collision key for a destination path. Removes `.`/empty
+/// components, folds case, and strips trailing dots/spaces that Windows
+/// ignores, so two names that resolve to the same file share one key.
+fn destination_key(relative: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in relative.replace('\\', "/").split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return None;
+        }
+        let part = part.trim_end_matches(['.', ' ']).to_lowercase();
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Shared extraction budget for one logical import/update operation.
+#[derive(Debug)]
+pub(crate) struct ExtractBudget {
+    total: u64,
+    total_limit: u64,
+    entry_limit: u64,
+    paths: HashSet<String>,
+}
+
+impl ExtractBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(MAX_EXTRACT_TOTAL_BYTES, MAX_EXTRACT_ENTRY_BYTES)
+    }
+
+    pub(crate) fn with_limits(total_limit: u64, entry_limit: u64) -> Self {
+        Self {
+            total: 0,
+            total_limit,
+            entry_limit,
+            paths: HashSet::new(),
+        }
+    }
+    pub(crate) fn claim_path(&mut self, relative: &str) -> Result<()> {
+        let key = destination_key(relative).ok_or_else(|| {
+            LauncherError::Instance(format!(
+                "Invalid or empty archive destination path: {relative}"
+            ))
+        })?;
+        if self.paths.contains(&key)
+            || self
+                .paths
+                .iter()
+                .any(|path| key.starts_with(&format!("{path}/")))
+            || self
+                .paths
+                .iter()
+                .any(|path| path.starts_with(&format!("{key}/")))
+        {
+            return Err(LauncherError::Instance(format!(
+                "Duplicate or conflicting archive destination: {relative}"
+            )));
+        }
+        self.paths.insert(key);
+        Ok(())
+    }
+
+    fn reserve_bytes(&self, entry_bytes: u64) -> Result<()> {
+        if entry_bytes > self.entry_limit {
+            return Err(LauncherError::Instance(format!(
+                "Archive entry exceeds the safe extraction limit ({} bytes)",
+                self.entry_limit
+            )));
+        }
+        if self.total.saturating_add(entry_bytes) > self.total_limit {
+            return Err(LauncherError::Instance(
+                "Archive extraction exceeds the safe total limit".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, bytes: u64) {
+        self.total = self.total.saturating_add(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total(&self) -> u64 {
+        self.total
+    }
+}
+
+fn extraction_temp_path(target: &Path) -> PathBuf {
+    let unique = EXTRACT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    target.with_file_name(format!(
+        ".voidlauncher-extract-{}-{unique}.tmp",
+        std::process::id()
+    ))
+}
+
+#[cfg(test)]
 pub(crate) fn write_extracted(base: &Path, entry_name: &str, reader: &mut dyn Read) -> Result<()> {
+    let mut budget = ExtractBudget::new();
+    write_extracted_budgeted(base, entry_name, reader, &mut budget)
+}
+
+/// Stream one entry to disk with actual-byte limits and a destination
+/// collision guard. The file is written to a sibling temp path and renamed
+/// only after the entire entry passed the budget, so a rejected entry never
+/// leaves a partial file in the instance.
+pub(crate) fn write_extracted_budgeted(
+    base: &Path,
+    entry_name: &str,
+    reader: &mut dyn Read,
+    budget: &mut ExtractBudget,
+) -> Result<()> {
     check_safe_relative(entry_name)?;
     let target = base.join(entry_name);
     // Defense in depth: joined path must stay under base
@@ -258,11 +381,39 @@ pub(crate) fn write_extracted(base: &Path, entry_name: &str, reader: &mut dyn Re
             entry_name
         )));
     }
+    budget.claim_path(entry_name)?;
+    ensure_no_reparse_points(base, &target)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&target)?);
-    std::io::copy(reader, &mut out)?;
+    // Re-check after directory creation: a component could have appeared as a
+    // junction between the first check and `create_dir_all`.
+    ensure_no_reparse_points(base, &target)?;
+    let temp = extraction_temp_path(&target);
+    let mut written = 0u64;
+    let result = (|| -> Result<()> {
+        let file = std::fs::File::create(&temp)?;
+        let mut out = std::io::BufWriter::new(file);
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            written = written.saturating_add(read as u64);
+            budget.reserve_bytes(written)?;
+            out.write_all(&buffer[..read])?;
+        }
+        out.flush()?;
+        drop(out);
+        std::fs::rename(&temp, &target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return result;
+    }
+    budget.commit(written);
     Ok(())
 }
 
@@ -274,6 +425,66 @@ fn extract_entry(base: &Path, entry_name: &str, data: &[u8]) -> Result<()> {
 
 pub(crate) fn normalize_zip_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+#[cfg(windows)]
+fn is_unsafe_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // FILE_ATTRIBUTE_REPARSE_POINT. Directory reparse points (junctions,
+    // mount points, directory symlinks) can redirect a whole subtree.
+    // File symlinks are rejected too. Cloud placeholders are file reparse
+    // points but are not followed by rename/write of the file itself, so
+    // they are allowed (a synced instance must keep working).
+    if meta.file_attributes() & 0x400 == 0 {
+        return false;
+    }
+    meta.is_dir() || meta.file_type().is_symlink()
+}
+
+#[cfg(not(windows))]
+fn is_unsafe_reparse_point(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+}
+
+/// Reject a write that would pass through an existing reparse point
+/// (Windows junction / mount point / symlink, or a symlink elsewhere).
+///
+/// The lexical `starts_with(base)` checks cannot see that `mods` is a
+/// junction to another directory. Every existing component between `base` and
+/// `target` is inspected with `symlink_metadata`, which does not follow links.
+/// `base` itself may be a reparse point: it is the operation boundary (for
+/// example an instance directory moved by the user), and its resolved target
+/// is accepted as the instance.
+pub(crate) fn ensure_no_reparse_points(base: &Path, target: &Path) -> std::io::Result<()> {
+    let relative = target.strip_prefix(base).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Path is outside the target directory: {}", target.display()),
+        )
+    })?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if is_unsafe_reparse_point(&meta) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Refusing to write through a reparse point (junction/symlink): {}",
+                            current.display()
+                        ),
+                    ));
+                }
+            }
+            // A missing component ends the existing part of the path; the
+            // directories created below it cannot contain a pre-existing
+            // reparse point.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Provider-only sidecar for a file extracted from a pack override into a
@@ -311,6 +522,11 @@ pub(crate) fn write_override_sidecar(mc_dir: &Path, relative: &str, provider: &s
         "downloaded_from_pack": true,
     });
     let path = crate::instances::sidecar_meta_path(&content_dir, rest);
+    // A content folder or `.index` junction must never redirect this write
+    // outside the instance.
+    if ensure_no_reparse_points(mc_dir, &path).is_err() {
+        return;
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -321,6 +537,7 @@ pub(crate) fn write_override_sidecar(mc_dir: &Path, relative: &str, provider: &s
 pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
+    let mut budget = ExtractBudget::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -329,7 +546,7 @@ pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
         if entry.is_dir() {
             continue;
         }
-        write_extracted(dest, &entry_name, &mut entry)?;
+        write_extracted_budgeted(dest, &entry_name, &mut entry, &mut budget)?;
     }
     Ok(())
 }
@@ -433,9 +650,8 @@ async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> 
     urls
 }
 
-fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) {
+fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) -> std::io::Result<()> {
     let filename = dest_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let stem = filename.trim_end_matches(".jar").trim_end_matches(".zip");
     let sidecar = serde_json::json!({
         "provider": "modrinth",
         "project_id": file_entry["project_id"].as_str(),
@@ -447,14 +663,18 @@ fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) {
         "downloaded_from_mrpack": true,
     });
     if let Some(parent) = dest_path.parent() {
-        let sidecar_path = parent
-            .join(".index")
-            .join(format!("{}.voidlauncher.json", stem));
+        // Use the central sidecar naming rule: `.disabled` is stripped before
+        // the extension, so a disabled MRPACK file is still discoverable by
+        // `read_sidecar_meta`/update checks.
+        let sidecar_path = crate::instances::sidecar_meta_path(parent, filename);
+        ensure_no_reparse_points(parent, &sidecar_path)?;
         if let Some(index_dir) = sidecar_path.parent() {
-            let _ = std::fs::create_dir_all(index_dir);
+            std::fs::create_dir_all(index_dir)?;
         }
-        let _ = std::fs::write(sidecar_path, sidecar.to_string());
+        ensure_no_reparse_points(parent, &sidecar_path)?;
+        std::fs::write(sidecar_path, sidecar.to_string())?;
     }
+    Ok(())
 }
 
 /// Validate an mrpack index path and resolve its destination under `mc_dir`,
@@ -488,9 +708,11 @@ pub(crate) async fn install_mrpack_file(
     with_sidecar: bool,
 ) -> Result<()> {
     let dest_path = mrpack_dest(mc_dir, path_str)?;
+    ensure_no_reparse_points(mc_dir, &dest_path)?;
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    ensure_no_reparse_points(mc_dir, &dest_path)?;
 
     let expected_sha1 = file_entry["hashes"]["sha1"].as_str().unwrap_or("");
     let norm_path = normalize_zip_path(path_str);
@@ -510,7 +732,7 @@ pub(crate) async fn install_mrpack_file(
             }
         }
         if with_sidecar {
-            write_mrpack_sidecar(&dest_path, file_entry);
+            write_mrpack_sidecar(&dest_path, file_entry)?;
         }
         return Ok(());
     }
@@ -519,7 +741,7 @@ pub(crate) async fn install_mrpack_file(
         let path_buf = dest_path.clone();
         if crate::download::verify_sha1(&path_buf, expected_sha1).unwrap_or(false) {
             if with_sidecar {
-                write_mrpack_sidecar(&dest_path, file_entry);
+                write_mrpack_sidecar(&dest_path, file_entry)?;
             }
             return Ok(());
         }
@@ -540,7 +762,7 @@ pub(crate) async fn install_mrpack_file(
             .is_ok()
         {
             if with_sidecar {
-                write_mrpack_sidecar(&dest_path, file_entry);
+                write_mrpack_sidecar(&dest_path, file_entry)?;
             }
             return Ok(());
         }
@@ -553,12 +775,29 @@ pub(crate) async fn install_mrpack_file(
 }
 
 pub(crate) fn extract_mrpack_override(entry_name: &str) -> Option<&str> {
-    for prefix in ["overrides/", "overrides-client/"] {
+    for prefix in ["overrides/", "client-overrides/", "overrides-client/"] {
         if let Some(relative) = entry_name.strip_prefix(prefix) {
             return Some(relative);
         }
     }
     None
+}
+
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_zip_entry_text(entry: &mut zip::read::ZipFile<'_>, limit: u64) -> Option<String> {
+    if entry.size() > limit {
+        return None;
+    }
+    let mut text = String::new();
+    (&mut *entry)
+        .take(limit + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > limit {
+        return None;
+    }
+    Some(text)
 }
 
 /// Detect modpack format from a zip file by peeking at known manifest files.
@@ -580,7 +819,7 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
                 if entry.name() == "instance.cfg" {
-                    let _ = entry.read_to_string(&mut cfg);
+                    cfg = read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
                     break;
                 }
             }
@@ -606,7 +845,8 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
                 if entry.name() == "modrinth.index.json" {
-                    let _ = entry.read_to_string(&mut index_str);
+                    index_str =
+                        read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
                     break;
                 }
             }
@@ -638,7 +878,8 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
                 if entry.name() == "manifest.json" {
-                    let _ = entry.read_to_string(&mut manifest_str);
+                    manifest_str =
+                        read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
                     break;
                 }
             }
@@ -675,7 +916,8 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
                 if entry.name() == "instance.json" {
-                    let _ = entry.read_to_string(&mut inst_str);
+                    inst_str =
+                        read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
                     break;
                 }
             }
@@ -1407,7 +1649,7 @@ pub(crate) async fn import_mrpack(
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
         if entry.name() == "modrinth.index.json" {
-            entry.read_to_string(&mut index_str).ok();
+            index_str = read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
             found = true;
             break;
         }
@@ -1445,13 +1687,19 @@ pub(crate) async fn import_mrpack(
     // Extract overrides/ + overrides-client/; collect embedded pack files
     let mut extracted_any = false;
     let mut embedded: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut embedded_budget = ExtractBudget::with_limits(MAX_EMBEDDED_BYTES, MAX_EMBEDDED_BYTES);
+    let mut extract_budget = ExtractBudget::new();
+    const MAX_EMBEDDED_BYTES: u64 = 1024 * 1024 * 1024;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
         let entry_name = entry.name().to_string();
 
-        if entry_name == "modrinth.index.json" || entry_name.starts_with("overrides-server/") {
+        if entry_name == "modrinth.index.json"
+            || entry_name.starts_with("overrides-server/")
+            || entry_name.starts_with("server-overrides/")
+        {
             continue;
         }
 
@@ -1465,7 +1713,7 @@ pub(crate) async fn import_mrpack(
             if entry.is_dir() {
                 std::fs::create_dir_all(mc_dir.join(relative))?;
             } else {
-                write_extracted(&mc_dir, relative, &mut entry)?;
+                write_extracted_budgeted(&mc_dir, relative, &mut entry, &mut extract_budget)?;
                 write_override_sidecar(&mc_dir, relative, "modrinth");
             }
             continue;
@@ -1478,11 +1726,20 @@ pub(crate) async fn import_mrpack(
         check_safe_relative(&entry_name)?;
         // Embedded files stay in memory: the per-file install tasks below run
         // concurrently against a shared map, and file-backed lookup would
-        // require re-architecting the concurrency model. Pack payloads are
-        // typically small mod jars; keeping this bounded is preferable to
-        // loosening the hash-checked install path.
+        // require re-architecting the concurrency model. Bound both a single
+        // entry and the total so a malicious pack cannot exhaust RAM.
+        let size = entry.size();
+        if size > MAX_EMBEDDED_BYTES {
+            return Err(LauncherError::Instance(
+                "The modpack embeds too much data to install safely".to_string(),
+            ));
+        }
         let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
+        (&mut entry)
+            .take(MAX_EMBEDDED_BYTES + 1)
+            .read_to_end(&mut buf)?;
+        embedded_budget.reserve_bytes(buf.len() as u64)?;
+        embedded_budget.commit(buf.len() as u64);
         embedded.insert(normalize_zip_path(&entry_name), buf);
     }
 
@@ -1494,7 +1751,30 @@ pub(crate) async fn import_mrpack(
 
     // Install files listed in modrinth.index.json (embedded, overrides, or download)
     let files = index["files"].as_array().cloned().unwrap_or_default();
-    let client_files: Vec<_> = files.iter().filter(|f| mrpack_client_required(f)).collect();
+    // A malformed pack can list the same destination twice (or with different
+    // case on Windows). Concurrent writers would truncate each other, so keep
+    // the first entry per normalized, case-folded path.
+    let mut seen_paths = std::collections::HashSet::new();
+    let client_files: Vec<_> = files
+        .iter()
+        .filter(|f| mrpack_client_required(f))
+        .filter(|f| {
+            let path = f["path"].as_str().unwrap_or("");
+            if path.is_empty() {
+                return true;
+            }
+            seen_paths.insert(normalize_zip_path(path).to_ascii_lowercase())
+        })
+        .collect();
+
+    // Index files and extracted overrides share the real Windows destination
+    // space. Reject a collision before any concurrent install task starts.
+    for file_entry in &client_files {
+        if let Some(path) = file_entry["path"].as_str().filter(|path| !path.is_empty()) {
+            extract_budget.claim_path(path)?;
+        }
+    }
+
     let total = client_files.len();
     let mod_count = client_files
         .iter()
@@ -1625,6 +1905,7 @@ pub(crate) async fn install_curseforge_file(
     pid: u64,
     fid: u64,
     api_key: &str,
+    claims: Option<&Mutex<ExtractBudget>>,
 ) -> std::result::Result<String, (String, String)> {
     let fallback = format!("{}:{}", pid, fid);
     let cf_file = crate::curseforge::get_mod_file(pid, fid, api_key)
@@ -1641,7 +1922,25 @@ pub(crate) async fn install_curseforge_file(
     if let Err(e) = check_safe_file_name(&cf_file.file_name) {
         return Err((display, format!("Unsafe file name: {}", e)));
     }
+    // The manifest filename is only known from remote metadata, so claim it
+    // here: a mod that lands on the same destination as an extracted override
+    // (or another manifest entry) must be reported, not silently overwrite it.
+    if let Some(claims) = claims {
+        let rel = format!("mods/{}", cf_file.file_name);
+        let mut guard = claims.lock().map_err(|_| {
+            (
+                display.clone(),
+                "Destination registry lock failed".to_string(),
+            )
+        })?;
+        if let Err(e) = guard.claim_path(&rel) {
+            return Err((display, e.to_string()));
+        }
+    }
     let dest_path = mods_dir.join(&cf_file.file_name);
+    let base = mods_dir.parent().unwrap_or(mods_dir);
+    ensure_no_reparse_points(base, &dest_path)
+        .map_err(|e| (display.clone(), format!("Unsafe destination: {}", e)))?;
     if let Err(e) =
         crate::curseforge::download_mod_file(pid, fid, &cf_file, api_key, &dest_path).await
     {
@@ -1699,7 +1998,7 @@ pub(crate) async fn retry_curseforge_import_files(
     let total = files.len();
     let mut report = ImportReport::complete(total, 0);
     for (pid, fid) in files {
-        match install_curseforge_file(&mods_dir, *pid, *fid, api_key).await {
+        match install_curseforge_file(&mods_dir, *pid, *fid, api_key, None).await {
             Ok(_) => report.installed += 1,
             Err((name, reason)) => report.failed.push(FailedImportFile {
                 file_name: name,
@@ -1736,7 +2035,7 @@ pub(crate) async fn import_curseforge_pack(
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
         if entry.name() == "manifest.json" {
-            entry.read_to_string(&mut manifest_str).ok();
+            manifest_str = read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
             found = true;
             break;
         }
@@ -1783,6 +2082,7 @@ pub(crate) async fn import_curseforge_pack(
     std::fs::create_dir_all(&config_dir)?;
 
     // Extract overrides/ with path traversal protection
+    let mut extract_budget = ExtractBudget::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -1802,11 +2102,17 @@ pub(crate) async fn import_curseforge_pack(
             if entry.is_dir() {
                 std::fs::create_dir_all(mc_dir.join(relative))?;
             } else {
-                write_extracted(&mc_dir, relative, &mut entry)?;
+                write_extracted_budgeted(&mc_dir, relative, &mut entry, &mut extract_budget)?;
                 write_override_sidecar(&mc_dir, relative, "curseforge");
             }
         }
     }
+
+    // Override destinations and downloaded mod destinations share the real
+    // Windows filesystem. One registry handles both: a download that resolves
+    // to an existing override path is reported as a conflict instead of
+    // silently replacing the override.
+    let claims = Arc::new(Mutex::new(extract_budget));
 
     // Download mods listed in the files array via CurseForge API (concurrent)
     let files = manifest["files"].as_array().cloned().unwrap_or_default();
@@ -1843,6 +2149,7 @@ pub(crate) async fn import_curseforge_pack(
                 let in_progress = in_progress.clone();
                 let succeeded = succeeded.clone();
                 let failed_ids = failed_ids.clone();
+                let claims = claims.clone();
 
                 tasks.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.map_err(|e| format!("Semaphore error: {}", e))?;
@@ -1860,7 +2167,9 @@ pub(crate) async fn import_curseforge_pack(
                         });
                     }
 
-                    let result = install_curseforge_file(&mods_dir, pid, fid, &api_key).await;
+                    let result =
+                        install_curseforge_file(&mods_dir, pid, fid, &api_key, Some(claims.as_ref()))
+                            .await;
 
                     in_progress.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -2006,7 +2315,7 @@ fn import_atlauncher_pack(
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
         if entry.name() == "instance.json" {
-            entry.read_to_string(&mut inst_str).ok();
+            inst_str = read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
             break;
         }
     }
@@ -2039,6 +2348,7 @@ fn import_atlauncher_pack(
     std::fs::create_dir_all(&mc_dir)?;
 
     // Extract all files with path traversal protection
+    let mut extract_budget = ExtractBudget::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -2049,7 +2359,7 @@ fn import_atlauncher_pack(
         }
         check_safe_relative(&entry_name)?;
 
-        write_extracted(&mc_dir, &entry_name, &mut entry)?;
+        write_extracted_budgeted(&mc_dir, &entry_name, &mut entry, &mut extract_budget)?;
         write_override_sidecar(&mc_dir, &entry_name, "atlauncher");
     }
 
@@ -2149,6 +2459,290 @@ mod tests {
         assert!(check_safe_relative("mods/a.jar:evil").is_err());
     }
 
+    fn extraction_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_extract_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn extract_bytes(
+        base: &Path,
+        budget: &mut ExtractBudget,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        write_extracted_budgeted(base, name, &mut std::io::Cursor::new(bytes), budget)
+    }
+
+    #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) -> bool {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("cmd");
+        command.arg("/C");
+        command.raw_arg(format!(
+            "mklink /J \"{}\" \"{}\"",
+            link.display(),
+            target.display()
+        ));
+        command
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn temp_extract_files(root: &Path) -> Vec<PathBuf> {
+        fn collect(root: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(root) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".voidlauncher-extract-"))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        collect(root, &mut out);
+        out
+    }
+
+    #[test]
+    fn extraction_budget_counts_actual_bytes_and_rejects_over_total() {
+        let dir = extraction_test_dir("total");
+        let mut budget = ExtractBudget::with_limits(10, 6);
+        extract_bytes(&dir, &mut budget, "mods/a.jar", &[1u8; 5]).unwrap();
+        extract_bytes(&dir, &mut budget, "mods/b.jar", &[2u8; 5]).unwrap();
+        assert_eq!(budget.total(), 10);
+        assert!(extract_bytes(&dir, &mut budget, "mods/c.jar", &[3u8; 1]).is_err());
+        assert!(dir.join("mods/a.jar").is_file());
+        assert!(dir.join("mods/b.jar").is_file());
+        assert!(!dir.join("mods/c.jar").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extraction_budget_rejects_large_entry_without_touching_old_file() {
+        let dir = extraction_test_dir("entry");
+        let target = dir.join("mods").join("foo.jar");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old-content").unwrap();
+        let mut budget = ExtractBudget::with_limits(100, 5);
+        let error = extract_bytes(&dir, &mut budget, "mods/foo.jar", &[9u8; 6]).unwrap_err();
+        assert!(error.to_string().contains("limit"), "got: {error}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old-content");
+        assert!(
+            temp_extract_files(&dir).is_empty(),
+            "a rejected entry must not leave a temp file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extraction_rejects_case_insensitive_destination_collisions() {
+        let dir = extraction_test_dir("case");
+        let mut budget = ExtractBudget::with_limits(1000, 1000);
+        extract_bytes(&dir, &mut budget, "mods/Foo.jar", b"first").unwrap();
+        let error = extract_bytes(&dir, &mut budget, "mods/foo.jar", b"second").unwrap_err();
+        assert!(error.to_string().contains("conflicting"), "got: {error}");
+        assert_eq!(std::fs::read(dir.join("mods/Foo.jar")).unwrap(), b"first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn override_prefixes_cannot_silently_overwrite_the_same_destination() {
+        let dir = extraction_test_dir("prefix-collision");
+        let mut budget = ExtractBudget::with_limits(1000, 1000);
+        let first = extract_mrpack_override("overrides/mods/Foo.jar").expect("first override");
+        let second =
+            extract_mrpack_override("client-overrides/mods/foo.jar").expect("second override");
+        extract_bytes(&dir, &mut budget, first, b"first").unwrap();
+        let error = extract_bytes(&dir, &mut budget, second, b"second").unwrap_err();
+        assert!(error.to_string().contains("conflicting"), "got: {error}");
+        assert_eq!(std::fs::read(dir.join("mods/Foo.jar")).unwrap(), b"first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_and_override_paths_share_one_collision_registry() {
+        let dir = extraction_test_dir("index-vs-override");
+        let mut budget = ExtractBudget::with_limits(1000, 1000);
+        // The override is extracted first; the MRPACK/CF index path is claimed
+        // before downloads start, against the same registry.
+        extract_bytes(&dir, &mut budget, "mods/Foo.jar", b"override").unwrap();
+        let error = budget.claim_path("mods/foo.jar").unwrap_err();
+        assert!(error.to_string().contains("conflicting"), "got: {error}");
+        assert_eq!(
+            std::fs::read(dir.join("mods/Foo.jar")).unwrap(),
+            b"override"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extraction_replaces_an_existing_file_only_after_success() {
+        let dir = extraction_test_dir("replace");
+        let target = dir.join("mods").join("foo.jar");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old").unwrap();
+        let mut budget = ExtractBudget::with_limits(100, 100);
+        extract_bytes(&dir, &mut budget, "mods/foo.jar", b"new-content").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-content");
+        assert!(temp_extract_files(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extraction_rejects_a_pre_existing_junction_destination() {
+        let base = extraction_test_dir("junction");
+        let outside = std::env::temp_dir().join(format!(
+            "vl_extract_junction_outside_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = base.join("mods");
+        if !create_junction(&link, &outside) {
+            eprintln!("skipping junction test: mklink /J failed");
+            let _ = std::fs::remove_dir_all(&outside);
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let mut budget = ExtractBudget::with_limits(1000, 1000);
+        let error = extract_bytes(&base, &mut budget, "mods/example.jar", b"payload").unwrap_err();
+        assert!(error.to_string().contains("reparse point"), "got: {error}");
+        assert!(
+            !outside.join("example.jar").exists(),
+            "extraction must not follow the junction"
+        );
+
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn extraction_does_not_reject_hard_links() {
+        let dir = extraction_test_dir("hardlink");
+        let original = dir.join("original.bin");
+        std::fs::write(&original, b"old").unwrap();
+        std::fs::create_dir_all(dir.join("mods")).unwrap();
+        let link = dir.join("mods/link.jar");
+        if std::fs::hard_link(&original, &link).is_err() {
+            eprintln!("skipping hard-link test: filesystem does not support hard links");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let mut budget = ExtractBudget::with_limits(1000, 1000);
+        extract_bytes(&dir, &mut budget, "mods/link.jar", b"new").unwrap();
+        assert_eq!(std::fs::read(&link).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(&original).unwrap(),
+            b"old",
+            "replacing the hard link must not rewrite the other link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn override_sidecar_does_not_follow_an_index_junction() {
+        let base = extraction_test_dir("sidecar-junction");
+        std::fs::create_dir_all(base.join("mods")).unwrap();
+        let outside = std::env::temp_dir().join(format!(
+            "vl_extract_sidecar_junction_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        let index = base.join("mods/.index");
+        if !create_junction(&index, &outside) {
+            eprintln!("skipping junction test: mklink /J failed");
+            let _ = std::fs::remove_dir_all(&outside);
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        write_override_sidecar(&base, "mods/example.jar", "curseforge");
+        assert!(
+            !outside.join("example.voidlauncher.json").exists(),
+            "the sidecar must not be written through the `.index` junction"
+        );
+
+        let _ = std::fs::remove_dir(&index);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn extraction_collapses_dot_segments_and_windows_trailing_dots() {
+        let dir = extraction_test_dir("dot-segments");
+        let mut budget = ExtractBudget::with_limits(1000, 1000);
+        extract_bytes(&dir, &mut budget, "mods/Foo.jar", b"first").unwrap();
+        let error = extract_bytes(&dir, &mut budget, "mods/./Foo.jar", b"second").unwrap_err();
+        assert!(error.to_string().contains("conflicting"), "got: {error}");
+        let error = extract_bytes(&dir, &mut budget, "mods/Foo.jar.", b"third").unwrap_err();
+        assert!(error.to_string().contains("conflicting"), "got: {error}");
+        assert_eq!(std::fs::read(dir.join("mods/Foo.jar")).unwrap(), b"first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extraction_rejects_duplicate_and_file_directory_conflicts() {
+        let dir = extraction_test_dir("dir-conflict");
+        let mut budget = ExtractBudget::with_limits(1000, 1000);
+        extract_bytes(&dir, &mut budget, "mods/A", b"file").unwrap();
+        let error = extract_bytes(&dir, &mut budget, "mods/A/inner.txt", b"nested").unwrap_err();
+        assert!(error.to_string().contains("conflicting"), "got: {error}");
+        assert_eq!(std::fs::read(dir.join("mods/A")).unwrap(), b"file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extraction_allows_independent_paths() {
+        let dir = extraction_test_dir("independent");
+        let mut budget = ExtractBudget::with_limits(1000, 1000);
+        extract_bytes(&dir, &mut budget, "mods/a.jar", b"a").unwrap();
+        extract_bytes(&dir, &mut budget, "config/b.cfg", b"b").unwrap();
+        assert_eq!(std::fs::read(dir.join("mods/a.jar")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dir.join("config/b.cfg")).unwrap(), b"b");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedded_style_budget_uses_actual_bytes_not_declared_size() {
+        let mut budget = ExtractBudget::with_limits(10, 6);
+        budget.reserve_bytes(5).unwrap();
+        budget.commit(5);
+        budget.reserve_bytes(5).unwrap();
+        budget.commit(5);
+        assert!(budget.reserve_bytes(1).is_err());
+        assert!(ExtractBudget::with_limits(100, 5).reserve_bytes(6).is_err());
+    }
+
     #[test]
     fn mrpack_detect_fabric_loader_key() {
         let deps: serde_json::Map<String, serde_json::Value> =
@@ -2239,7 +2833,60 @@ mod tests {
     }
 
     #[test]
-    fn install_mrpack_file_rejects_unsafe_path() {
+    fn mrpack_client_overrides_are_extracted_and_server_overrides_are_not() {
+        assert_eq!(
+            extract_mrpack_override("overrides/config/test.cfg"),
+            Some("config/test.cfg")
+        );
+        assert_eq!(
+            extract_mrpack_override("client-overrides/config/test.cfg"),
+            Some("config/test.cfg")
+        );
+        assert_eq!(
+            extract_mrpack_override("overrides-client/config/test.cfg"),
+            Some("config/test.cfg")
+        );
+        assert_eq!(
+            extract_mrpack_override("server-overrides/config/test.cfg"),
+            None
+        );
+        assert_eq!(
+            extract_mrpack_override("overrides-server/config/test.cfg"),
+            None
+        );
+    }
+
+    #[test]
+    fn disabled_mrpack_sidecar_uses_the_shared_stem() {
+        let base = std::env::temp_dir().join(format!(
+            "vl_mrpack_sidecar_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dest = base.join("mods").join("foo.jar.disabled");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"jar").unwrap();
+        let entry = serde_json::json!({"project_id": "abc"});
+        write_mrpack_sidecar(&dest, &entry).unwrap();
+        let expected = base
+            .join("mods")
+            .join(".index")
+            .join("foo.voidlauncher.json");
+        assert!(
+            expected.is_file(),
+            "disabled sidecar must use the content stem"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&expected).unwrap()).unwrap();
+        assert_eq!(parsed["project_id"], "abc");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mrpack_install_rejects_unsafe_path() {
         // Regression: a malicious mrpack index entry must fail before any file
         // is written or any download is attempted.
         let base = std::env::temp_dir().join(format!("vl_mrpack_inst_{}", std::process::id()));

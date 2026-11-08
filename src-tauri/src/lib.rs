@@ -2,6 +2,7 @@ mod accounts;
 mod atlauncher;
 mod auth;
 pub mod authlib_injector;
+mod bug_report;
 mod commands;
 pub mod config;
 mod content;
@@ -12,9 +13,11 @@ mod download;
 mod entry;
 mod error;
 mod events;
+mod external_minecraft;
 mod game_logs;
 mod i18n;
 mod import;
+mod install_progress;
 pub mod instances;
 mod java;
 mod java_download;
@@ -317,6 +320,7 @@ pub fn run() {
             commands::mods::cmd_get_modrinth_versions,
             commands::mods::cmd_get_curseforge_files,
             commands::mods::cmd_install_mod,
+            commands::mods::cmd_install_local_content,
             commands::mods::cmd_get_modrinth_project,
             commands::mods::cmd_get_modrinth_version_by_id,
             commands::mods::cmd_popular_modrinth,
@@ -418,6 +422,9 @@ pub fn run() {
             commands::verify::cmd_repair_instance,
             commands::diagnostics::cmd_run_diagnostics,
             commands::diagnostics::cmd_analyze_crash,
+            bug_report::cmd_prepare_bug_report,
+            bug_report::cmd_get_bug_report_log,
+            bug_report::cmd_get_bug_report_crash,
             commands::servers::cmd_list_servers,
             commands::servers::cmd_add_server,
             commands::servers::cmd_update_server,

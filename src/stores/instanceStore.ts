@@ -3,6 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { logUiMessage } from '../lib/uiLog';
 import { t } from '../lib/i18n';
 import { friendlyErrorMessage } from '../lib/errors';
+import { createInstallId } from '../lib/installProgress';
+import { useEventStore } from '../hooks/useGameEvents';
 
 export type ElybySkinsChoice = 'retry' | 'bypass' | 'cancel';
 
@@ -126,7 +128,30 @@ function reportLaunchStatus(message: string | null) {
  */
 const launchingInstances = new Set<string>();
 
-export const useInstanceStore = create<InstanceState>((set, get) => ({
+interface QueuedElybyPrompt {
+  kind: string;
+  resolve: (choice: ElybySkinsChoice) => void;
+}
+
+/**
+ * Two launches can hit an Ely.by preflight failure at the same time. The UI
+ * renders one prompt at a time; queue additional prompts instead of replacing
+ * the previous callback (which used to leave the first launch pending
+ * forever).
+ */
+const elybyPromptQueue: QueuedElybyPrompt[] = [];
+let activeElybyPrompt: QueuedElybyPrompt | null = null;
+
+function pumpElybyPrompt() {
+  if (activeElybyPrompt || elybyPromptQueue.length === 0) return;
+  const next = elybyPromptQueue.shift()!;
+  activeElybyPrompt = next;
+  useInstanceStore.setState({
+    elybySkinsPrompt: { kind: next.kind, resolve: next.resolve },
+  });
+}
+
+export const useInstanceStore = create<InstanceState>((set) => ({
   instances: [],
   selectedInstance: null,
   isLoading: false,
@@ -143,7 +168,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     } catch (e: any) {
       const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);
-      set({ error: msg });
+      set({ error: msg, isLoading: false });
     }
   },
 
@@ -195,7 +220,8 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
 
       const ask = (kind: string) =>
         new Promise<ElybySkinsChoice>((resolve) => {
-          set({ elybySkinsPrompt: { kind, resolve } });
+          elybyPromptQueue.push({ kind, resolve });
+          pumpElybyPrompt();
         });
 
       // Preflight lets the renderer show a localized retry/bypass/cancel
@@ -212,7 +238,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
           if (prepared.status === 'failed') {
             const choice = await ask(prepared.kind);
             if (choice === 'cancel') {
-              set({ isLaunching: false, launchStatus: null });
+              set({ launchStatus: null });
               return false;
             }
             if (choice === 'retry') continue;
@@ -232,7 +258,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
             skipElybySkins,
           });
           reportLaunchStatus(result);
-          set({ isLaunching: false, launchStatus: result });
+          set({ launchStatus: result });
           return true;
         } catch (e) {
           const failure = skipElybySkins ? null : elybyFailureFrom(e);
@@ -240,7 +266,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
 
           const choice = await ask(failure.kind);
           if (choice === 'cancel') {
-            set({ isLaunching: false, launchStatus: null });
+            set({ launchStatus: null });
             return false;
           }
           if (choice === 'retry') continue;
@@ -251,30 +277,41 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     } catch (e: any) {
       const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);
-      set({ isLaunching: false, launchStatus: null, error: msg });
+      set({ launchStatus: null, error: msg });
       return false;
     } finally {
       launchingInstances.delete(instanceName);
+      set({ isLaunching: launchingInstances.size > 0 });
     }
   },
 
   resolveElybySkins: (choice) => {
-    const prompt = get().elybySkinsPrompt;
+    const prompt = activeElybyPrompt;
+    if (!prompt) return;
+    activeElybyPrompt = null;
     set({ elybySkinsPrompt: null });
-    prompt?.resolve(choice);
+    prompt.resolve(choice);
+    pumpElybyPrompt();
   },
 
   installVersion: async (versionUrl: string, instanceId?: string) => {
     set({ isLoading: true, launchStatus: 'Downloading version...' });
     reportLaunchStatus('Downloading version...');
+    const installId = createInstallId();
+    useEventStore.getState().beginInstall(installId);
     try {
       const versionId = await invoke<string>('cmd_install_version', {
         versionUrl,
         instanceId: instanceId || '',
+        installId,
       });
       set({ isLoading: false, launchStatus: null });
+      // Normally the terminal event clears this; the timeout is a fallback
+      // for a command that returned before its last event was processed.
+      setTimeout(() => useEventStore.getState().clearInstall(installId), 1500);
       return versionId;
     } catch (e: any) {
+      useEventStore.getState().clearInstall(installId);
       const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);
       set({ error: msg, isLoading: false, launchStatus: null });

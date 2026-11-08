@@ -7,6 +7,17 @@ const setLanguage = (language: 'en' | 'ru') =>
 
 afterEach(() => setLanguage('en'));
 
+describe('translation interpolation', () => {
+  it('treats replacement-pattern characters in values literally', () => {
+    setLanguage('en');
+    const value = t('install.progress', { prepared: '$&', total: "$' and $1" });
+    expect(value).toContain('$&');
+    expect(value).toContain("$' and $1");
+    expect(value).not.toContain('{prepared}');
+    expect(value).not.toContain('{total}');
+  });
+});
+
 describe('formatPlayTime', () => {
   it('formats hours and minutes in English', () => {
     expect(formatPlayTime(3661)).toBe('1 hour 1 minute');

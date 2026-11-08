@@ -567,7 +567,7 @@ pub async fn cmd_restore_world(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
-    ensure_instance_not_running(state.inner(), &instance_name)?;
+    let _guard = InstanceMutationGuard::acquire(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -658,7 +658,7 @@ pub async fn cmd_restore_instance(
     new_name: Option<String>,
 ) -> Result<(), String> {
     validate_instance_name(&name)?;
-    ensure_instance_not_running(state.inner(), &name)?;
+    let _guard = InstanceMutationGuard::acquire(state.inner(), &name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -795,6 +795,88 @@ pub async fn cmd_list_packs(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// RAII guard that reserves an instance for any content mutation (pack
+/// update/repair, backup restore). Uses the same launch registry as launching
+/// and server/config edits, so two conflicting operations cannot apply files
+/// at the same time.
+///
+/// The registry is process-local and cannot see another program editing the
+/// instance; a game started outside VoidLauncher is only detected through the
+/// best-effort running-state scan, which is why an unverifiable record blocks
+/// the operation instead of being ignored.
+pub(crate) struct InstanceMutationGuard<'a> {
+    state: &'a AppState,
+    instance_name: String,
+    token: crate::launch_state::LaunchToken,
+}
+
+impl<'a> InstanceMutationGuard<'a> {
+    pub(crate) fn acquire(state: &'a AppState, instance_name: &str) -> Result<Self, String> {
+        let data_dir = state
+            .config
+            .lock()
+            .map_err(|e| e.to_string())?
+            .data_dir
+            .clone();
+
+        // A `Running` entry whose recorded process is gone is stale and must
+        // not block edits forever. An identity that cannot be read counts as
+        // live (fail closed).
+        if state.launches.phase(instance_name) == Some(crate::launch_state::LaunchPhase::Running) {
+            if let Some(identity) = state.launches.process_identity(instance_name) {
+                if crate::running_state::identity_is_dead(&identity) {
+                    state.launches.clear_running(instance_name);
+                }
+            }
+        }
+
+        // A game orphaned by a launcher restart has no in-memory entry.
+        let scan = crate::running_state::scan_games(&data_dir);
+        if scan
+            .unverified
+            .iter()
+            .any(|game| game.instance == instance_name)
+        {
+            return Err(format!(
+                "Cannot modify instance '{}': the launcher cannot verify the game process recorded for it. Close the game manually, then try again.",
+                instance_name
+            ));
+        }
+        for game in &scan.confirmed {
+            state
+                .launches
+                .adopt_running(&game.instance, game.identity());
+        }
+
+        let token = state
+            .launches
+            .begin_edit(instance_name)
+            .map_err(|busy| {
+                use crate::launch_state::LaunchBusy;
+                let reason = match busy {
+                    LaunchBusy::Running => "Minecraft is currently running",
+                    LaunchBusy::Starting => "Minecraft is still starting",
+                    LaunchBusy::Editing => "another operation is already modifying it",
+                };
+                format!(
+                    "Cannot modify instance '{}': {}. Close the game or wait for the other operation to finish.",
+                    instance_name, reason
+                )
+            })?;
+        Ok(Self {
+            state,
+            instance_name: instance_name.to_string(),
+            token,
+        })
+    }
+}
+
+impl Drop for InstanceMutationGuard<'_> {
+    fn drop(&mut self) {
+        self.state.launches.release(&self.instance_name, self.token);
+    }
 }
 
 /// RAII guard that reserves an instance for a config/options modification so

@@ -8,6 +8,7 @@
 use crate::error::{LauncherError, Result};
 use crate::instances;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -43,6 +44,10 @@ pub struct ServerEntry {
     /// `acceptTextures` flag; `None` when the game has not decided yet.
     pub accept_textures: Option<bool>,
     pub hidden: bool,
+    /// SHA-256 of the canonical full NBT compound (all fields, including
+    /// unknown ones). Used to identify the exact row the user saw.
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 /// Minimal generic NBT value tree (all vanilla tag types).
@@ -99,7 +104,97 @@ fn read_string(r: &mut impl Read) -> std::io::Result<String> {
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
-    String::from_utf8(buf).map_err(|_| invalid("invalid UTF-8 string"))
+    decode_modified_utf8(&buf).map_err(|_| invalid("invalid modified UTF-8 string"))
+}
+
+/// Java `DataInput.readUTF` uses modified UTF-8 (CESU-8 for non-BMP code
+/// points, NUL as C0 80), not standard UTF-8. `servers.dat` is written by the
+/// game with `DataOutput.writeUTF`, so a name with an emoji must be decoded
+/// as two surrogate code units rather than a four-byte UTF-8 sequence.
+fn decode_modified_utf8(bytes: &[u8]) -> std::result::Result<String, ()> {
+    let mut units: Vec<u16> = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let first = bytes[index];
+        let (unit, advance) = match first {
+            0x00..=0x7F => (first as u16, 1),
+            0xC0..=0xDF => {
+                if index + 1 >= bytes.len() || bytes[index + 1] & 0xC0 != 0x80 {
+                    return Err(());
+                }
+                let unit = ((first as u16 & 0x1F) << 6) | (bytes[index + 1] as u16 & 0x3F);
+                if unit != 0 && unit < 0x80 {
+                    return Err(());
+                }
+                (unit, 2)
+            }
+            0xE0..=0xEF => {
+                if index + 2 >= bytes.len()
+                    || bytes[index + 1] & 0xC0 != 0x80
+                    || bytes[index + 2] & 0xC0 != 0x80
+                {
+                    return Err(());
+                }
+                let unit = ((first as u16 & 0x0F) << 12)
+                    | ((bytes[index + 1] as u16 & 0x3F) << 6)
+                    | (bytes[index + 2] as u16 & 0x3F);
+                if unit < 0x800 {
+                    return Err(());
+                }
+                (unit, 3)
+            }
+            // Tolerate standard UTF-8 four-byte sequences produced by external
+            // tools, converting the code point to a surrogate pair.
+            0xF0..=0xF4 => {
+                if index + 3 >= bytes.len()
+                    || bytes[index + 1] & 0xC0 != 0x80
+                    || bytes[index + 2] & 0xC0 != 0x80
+                    || bytes[index + 3] & 0xC0 != 0x80
+                {
+                    return Err(());
+                }
+                let code = ((first as u32 & 0x07) << 18)
+                    | ((bytes[index + 1] as u32 & 0x3F) << 12)
+                    | ((bytes[index + 2] as u32 & 0x3F) << 6)
+                    | (bytes[index + 3] as u32 & 0x3F);
+                if !(0x10000..=0x10FFFF).contains(&code) {
+                    return Err(());
+                }
+                let code = code - 0x10000;
+                units.push(0xD800 | ((code >> 10) as u16));
+                units.push(0xDC00 | ((code & 0x3FF) as u16));
+                index += 4;
+                continue;
+            }
+            _ => return Err(()),
+        };
+        units.push(unit);
+        index += advance;
+    }
+    String::from_utf16(&units).map_err(|_| ())
+}
+
+fn encode_modified_utf8(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for unit in s.encode_utf16() {
+        match unit {
+            0 => {
+                out.push(0xC0);
+                out.push(0x80);
+            }
+            0x01..=0x7F => out.push(unit as u8),
+            0x80..=0x7FF => {
+                out.push(0xC0 | ((unit >> 6) as u8));
+                out.push(0x80 | ((unit & 0x3F) as u8));
+            }
+            _ => {
+                out.push(0xE0 | ((unit >> 12) as u8));
+                out.push(0x80 | (((unit >> 6) & 0x3F) as u8));
+                out.push(0x80 | ((unit & 0x3F) as u8));
+            }
+        }
+    }
+    out
 }
 
 /// Parse a full GZip-compressed NBT document (root must be a compound).
@@ -204,12 +299,12 @@ fn tag_of(v: &Nbt) -> u8 {
 }
 
 fn write_string(out: &mut Vec<u8>, s: &str) -> std::io::Result<()> {
-    let bytes = s.as_bytes();
+    let bytes = encode_modified_utf8(s);
     if bytes.len() > u16::MAX as usize {
         return Err(invalid("string too long for NBT"));
     }
     out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    out.extend_from_slice(bytes);
+    out.extend_from_slice(&bytes);
     Ok(())
 }
 
@@ -257,6 +352,45 @@ fn write_payload(v: &Nbt, out: &mut Vec<u8>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Deterministic compound encoding for row fingerprints. Compound fields are
+/// sorted by name (NBT treats their order as insignificant), while list order
+/// is preserved because it may carry meaning. Every field, including unknown
+/// ones, participates in the hash.
+fn write_canonical_compound(fields: &[(String, Nbt)], out: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut sorted: Vec<&(String, Nbt)> = fields.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, value) in sorted {
+        out.push(tag_of(value));
+        write_string(out, name)?;
+        write_canonical_value(value, out)?;
+    }
+    out.push(TAG_END);
+    Ok(())
+}
+
+fn write_canonical_value(value: &Nbt, out: &mut Vec<u8>) -> std::io::Result<()> {
+    match value {
+        Nbt::Compound(inner) => write_canonical_compound(inner, out),
+        Nbt::List { elem_type, items } => {
+            out.push(*elem_type);
+            out.extend_from_slice(&(items.len() as i32).to_be_bytes());
+            for item in items {
+                write_canonical_value(item, out)?;
+            }
+            Ok(())
+        }
+        _ => write_payload(value, out),
+    }
+}
+
+fn server_entry_fingerprint(fields: &[(String, Nbt)]) -> String {
+    let mut out = Vec::new();
+    if write_canonical_compound(fields, &mut out).is_err() {
+        return String::new();
+    }
+    hex::encode(Sha256::digest(&out))
+}
+
 fn serialize_document(root: &Nbt) -> std::io::Result<Vec<u8>> {
     let mut plain = Vec::new();
     plain.push(TAG_COMPOUND);
@@ -280,19 +414,87 @@ pub fn servers_file(instances_dir: &Path, instance_name: &str) -> Result<PathBuf
 /// be able to balloon memory during parse).
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-fn load_root(path: &Path) -> Result<Nbt> {
-    if !path.exists() {
-        return Ok(empty_root());
+/// Exact content version used for optimistic concurrency. The byte hash is
+/// used instead of a timestamp because Windows file times can have coarse
+/// resolution and are not a reliable way to distinguish two writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileVersion {
+    exists: bool,
+    len: u64,
+    sha256: [u8; 32],
+}
+
+fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn version_of(bytes: &[u8], exists: bool) -> FileVersion {
+    FileVersion {
+        exists,
+        len: bytes.len() as u64,
+        sha256: hash_bytes(bytes),
     }
-    let meta = std::fs::metadata(path)?;
-    if meta.len() == 0 {
-        // The game treats an empty file like a missing one.
-        return Ok(empty_root());
-    }
+}
+
+fn file_version(path: &Path) -> Result<FileVersion> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(version_of(&[], false));
+        }
+        Err(e) => return Err(e.into()),
+    };
     if meta.len() > MAX_FILE_BYTES {
+        return Err(LauncherError::Conflict(
+            "servers.dat grew beyond the safe size while being edited".to_string(),
+        ));
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(version_of(&bytes, true)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(version_of(&[], false)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read `servers.dat` together with the exact version that was parsed.
+///
+/// `add`, `update` and `delete` pass that version to `save_if_unchanged`, so
+/// an external write between the read and the replacement cannot be silently
+/// overwritten.
+fn load_root_versioned(path: &Path) -> Result<(Nbt, FileVersion)> {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => Some(meta),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(meta) = &meta {
+        if meta.len() == 0 {
+            // The game treats an empty file like a missing one.
+            let bytes = std::fs::read(path)?;
+            return Ok((empty_root(), version_of(&bytes, true)));
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            return Err(LauncherError::Instance("servers.dat is too large".into()));
+        }
+    }
+    let Some(_) = meta else {
+        return Ok((empty_root(), version_of(&[], false)));
+    };
+
+    let bytes = std::fs::read(path)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(LauncherError::Instance("servers.dat is too large".into()));
     }
-    let bytes = std::fs::read(path)?;
+    let version = version_of(&bytes, true);
+    if bytes.is_empty() {
+        return Ok((empty_root(), version));
+    }
+
     let parsed: std::io::Result<Nbt> = if bytes.starts_with(&[0x1f, 0x8b]) {
         // What the game itself writes: gzip-compressed NBT.
         let mut plain = Vec::new();
@@ -307,7 +509,13 @@ fn load_root(path: &Path) -> Result<Nbt> {
         // Some third-party tools write plain, uncompressed NBT.
         parse_document(&mut bytes.as_slice())
     };
-    parsed.map_err(|e| LauncherError::Instance(format!("servers.dat is unreadable: {}", e)))
+    let root =
+        parsed.map_err(|e| LauncherError::Instance(format!("servers.dat is unreadable: {}", e)))?;
+    Ok((root, version))
+}
+
+fn load_root(path: &Path) -> Result<Nbt> {
+    Ok(load_root_versioned(path)?.0)
 }
 
 fn empty_root() -> Nbt {
@@ -387,6 +595,7 @@ fn entry_from_nbt(v: &Nbt) -> Option<ServerEntry> {
         icon,
         accept_textures,
         hidden,
+        fingerprint: server_entry_fingerprint(fields),
     })
 }
 
@@ -442,6 +651,7 @@ fn validate_entry(name: &str, ip: &str) -> Result<(String, String)> {
     Ok((name.to_string(), ip.to_string()))
 }
 
+#[cfg(test)]
 fn save(path: &Path, root: &Nbt) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -450,6 +660,38 @@ fn save(path: &Path, root: &Nbt) -> Result<()> {
     }
     let bytes = serialize_document(root)
         .map_err(|e| LauncherError::Instance(format!("Failed to encode servers.dat: {}", e)))?;
+    instances::write_file_atomic(path, &bytes)
+}
+
+/// Write a mutated tree only if the file still matches the version that was
+/// read. The check is repeated immediately before the atomic replacement to
+/// shrink the external-write window. A conflict is reported and the newer
+/// file is left untouched; no merge and no blind retry are performed.
+///
+/// A residual window between the last hash check and the final rename is
+/// unavoidable: Windows has no atomic compare-and-swap rename, and a real
+/// byte-range lock would block Minecraft's own save (or fail it), risking
+/// data loss. The window is therefore kept to the shortest possible sequence
+/// of operations and is documented rather than "protected" by a lock the game
+/// does not cooperate with.
+fn save_if_unchanged(path: &Path, root: &Nbt, expected: &FileVersion) -> Result<()> {
+    if &file_version(path)? != expected {
+        return Err(LauncherError::Conflict(
+            "servers.dat was changed by another program".to_string(),
+        ));
+    }
+    let bytes = serialize_document(root)
+        .map_err(|e| LauncherError::Instance(format!("Failed to encode servers.dat: {}", e)))?;
+    if &file_version(path)? != expected {
+        return Err(LauncherError::Conflict(
+            "servers.dat was changed by another program".to_string(),
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     instances::write_file_atomic(path, &bytes)
 }
 
@@ -462,7 +704,7 @@ pub fn list(path: &Path) -> Result<Vec<ServerEntry>> {
 /// Append a server and return the updated list.
 pub fn add(path: &Path, name: &str, ip: &str) -> Result<Vec<ServerEntry>> {
     let (name, ip) = validate_entry(name, ip)?;
-    let mut root = load_root(path)?;
+    let (mut root, version) = load_root_versioned(path)?;
     let items = servers_list_mut(&mut root)?;
     let mut fields = vec![
         ("name".to_string(), Nbt::String(name)),
@@ -470,15 +712,70 @@ pub fn add(path: &Path, name: &str, ip: &str) -> Result<Vec<ServerEntry>> {
     ];
     fields.push(("acceptTextures".to_string(), Nbt::Byte(1)));
     items.push(Nbt::Compound(fields));
-    save(path, &root)?;
+    save_if_unchanged(path, &root, &version)?;
     Ok(list_from_root(&root))
 }
 
 /// Rename/repoint the server at `index` (icon and flags are preserved).
+/// Test-only: production callers must supply a row identity.
+#[cfg(test)]
 pub fn update(path: &Path, index: usize, name: &str, ip: &str) -> Result<Vec<ServerEntry>> {
+    update_impl(path, index, None, name, ip)
+}
+
+/// Update only when the current row still matches the name/address the user
+/// saw. Kept for callers that predate full-row fingerprints.
+pub fn update_checked(
+    path: &Path,
+    index: usize,
+    expected_name: &str,
+    expected_ip: &str,
+    name: &str,
+    ip: &str,
+) -> Result<Vec<ServerEntry>> {
+    update_impl(
+        path,
+        index,
+        Some(ExpectedIdentity::NameIp(expected_name, expected_ip)),
+        name,
+        ip,
+    )
+}
+
+/// Update only when the complete NBT compound (all fields, including unknown
+/// ones) still matches the fingerprint shown by the UI.
+pub fn update_fingerprint(
+    path: &Path,
+    index: usize,
+    expected_fingerprint: &str,
+    name: &str,
+    ip: &str,
+) -> Result<Vec<ServerEntry>> {
+    update_impl(
+        path,
+        index,
+        Some(ExpectedIdentity::Fingerprint(expected_fingerprint)),
+        name,
+        ip,
+    )
+}
+
+enum ExpectedIdentity<'a> {
+    NameIp(&'a str, &'a str),
+    Fingerprint(&'a str),
+}
+
+fn update_impl(
+    path: &Path,
+    index: usize,
+    expected: Option<ExpectedIdentity<'_>>,
+    name: &str,
+    ip: &str,
+) -> Result<Vec<ServerEntry>> {
     let (name, ip) = validate_entry(name, ip)?;
-    let mut root = load_root(path)?;
+    let (mut root, version) = load_root_versioned(path)?;
     let items = servers_list_mut(&mut root)?;
+    ensure_expected_identity(items, index, expected)?;
     let Some(Nbt::Compound(fields)) = items.get_mut(index) else {
         return Err(LauncherError::Instance(format!(
             "Server #{} does not exist",
@@ -487,13 +784,52 @@ pub fn update(path: &Path, index: usize, name: &str, ip: &str) -> Result<Vec<Ser
     };
     set_string_field(fields, "name", name);
     set_string_field(fields, "ip", ip);
-    save(path, &root)?;
+    save_if_unchanged(path, &root, &version)?;
     Ok(list_from_root(&root))
 }
 
 /// Remove the server at `index` and return the updated list.
+/// Test-only: production callers must supply a row identity.
+#[cfg(test)]
 pub fn delete(path: &Path, index: usize) -> Result<Vec<ServerEntry>> {
-    let mut root = load_root(path)?;
+    delete_impl(path, index, None)
+}
+
+/// Delete only when the current row still matches the name/address the user
+/// saw. Kept for callers that predate full-row fingerprints.
+pub fn delete_checked(
+    path: &Path,
+    index: usize,
+    expected_name: &str,
+    expected_ip: &str,
+) -> Result<Vec<ServerEntry>> {
+    delete_impl(
+        path,
+        index,
+        Some(ExpectedIdentity::NameIp(expected_name, expected_ip)),
+    )
+}
+
+/// Delete only when the complete NBT compound still matches the fingerprint
+/// shown by the UI.
+pub fn delete_fingerprint(
+    path: &Path,
+    index: usize,
+    expected_fingerprint: &str,
+) -> Result<Vec<ServerEntry>> {
+    delete_impl(
+        path,
+        index,
+        Some(ExpectedIdentity::Fingerprint(expected_fingerprint)),
+    )
+}
+
+fn delete_impl(
+    path: &Path,
+    index: usize,
+    expected: Option<ExpectedIdentity<'_>>,
+) -> Result<Vec<ServerEntry>> {
+    let (mut root, version) = load_root_versioned(path)?;
     let items = servers_list_mut(&mut root)?;
     if index >= items.len() {
         return Err(LauncherError::Instance(format!(
@@ -501,9 +837,75 @@ pub fn delete(path: &Path, index: usize) -> Result<Vec<ServerEntry>> {
             index
         )));
     }
+    ensure_expected_identity(items, index, expected)?;
     items.remove(index);
-    save(path, &root)?;
+    save_if_unchanged(path, &root, &version)?;
     Ok(list_from_root(&root))
+}
+
+fn entry_name_ip(item: &Nbt) -> (String, String) {
+    let Nbt::Compound(fields) = item else {
+        return (String::new(), String::new());
+    };
+    let field = |key: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, value)| match value {
+                Nbt::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    };
+    (field("name"), field("ip"))
+}
+
+fn entry_fingerprint(item: &Nbt) -> Option<String> {
+    let Nbt::Compound(fields) = item else {
+        return None;
+    };
+    Some(server_entry_fingerprint(fields))
+}
+
+/// The target row must be the unique row matching the identity the user saw.
+/// A missing or duplicated match is a conflict: silently editing/deleting one
+/// of several identical rows would be unpredictable.
+fn ensure_expected_identity(
+    items: &[Nbt],
+    index: usize,
+    expected: Option<ExpectedIdentity<'_>>,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if index >= items.len() {
+        return Err(LauncherError::Instance(format!(
+            "Server #{} does not exist",
+            index
+        )));
+    }
+
+    let matches: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| match &expected {
+            ExpectedIdentity::NameIp(expected_name, expected_ip) => {
+                let (name, ip) = entry_name_ip(item);
+                name == *expected_name && ip == *expected_ip
+            }
+            ExpectedIdentity::Fingerprint(expected_fingerprint) => {
+                entry_fingerprint(item).as_deref() == Some(*expected_fingerprint)
+            }
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if matches.len() != 1 || matches[0] != index {
+        return Err(LauncherError::Conflict(
+            "the selected server entry is stale or ambiguous".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Set (or append) a string field on a server compound; a field with a
@@ -527,6 +929,44 @@ mod tests {
             std::process::id(),
             name
         ))
+    }
+
+    #[test]
+    fn modified_utf8_round_trips_emoji_and_nul() {
+        for value in ["Test 😀", "nul\0inside", "обычное имя", ""] {
+            let encoded = encode_modified_utf8(value);
+            assert_eq!(
+                decode_modified_utf8(&encoded).expect("modified UTF-8 decodes"),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn modified_utf8_uses_cesu8_for_non_bmp_characters() {
+        let encoded = encode_modified_utf8("😀");
+        // High and low surrogate, six bytes total; never a four-byte UTF-8
+        // sequence (the game's readUTF would reject that).
+        assert_eq!(encoded.len(), 6);
+        assert_eq!(&encoded[..3], &[0xED, 0xA0, 0xBD]);
+        assert_eq!(&encoded[3..], &[0xED, 0xB8, 0x80]);
+        assert!(!encoded.iter().any(|byte| *byte >= 0xF0));
+    }
+
+    #[test]
+    fn modified_utf8_tolerates_standard_four_byte_utf8() {
+        let decoded = decode_modified_utf8("😀".as_bytes()).expect("standard UTF-8 is accepted");
+        assert_eq!(decoded, "😀");
+    }
+
+    #[test]
+    fn server_name_with_emoji_round_trips_through_servers_dat() {
+        let path = temp_path("emoji");
+        add(&path, "Test 😀", "example.com").expect("server with emoji added");
+        let listed = list(&path).expect("servers.dat readable");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Test 😀");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -624,6 +1064,11 @@ mod tests {
         assert_eq!(servers.len(), 2);
         assert!(servers[0].hidden);
 
+        let servers = update(&path, 0, "A2", "a2.example.com").unwrap();
+        assert_eq!(servers[0].name, "A2");
+        let servers = delete(&path, 1).unwrap();
+        assert_eq!(servers.len(), 1);
+
         let stem = std::fs::File::open(&path).unwrap();
         let mut decoder = flate2::read::GzDecoder::new(stem);
         let parsed = parse_document(&mut decoder).unwrap();
@@ -641,6 +1086,184 @@ mod tests {
         assert!(first
             .iter()
             .any(|(k, v)| k == "futureField" && *v == Nbt::String("keep".into())));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn external_change_between_read_and_write_is_detected() {
+        let path = temp_path("conflict");
+        let _ = std::fs::remove_file(&path);
+        add(&path, "A", "a.example.com").unwrap();
+
+        // The caller parses the current file and keeps its exact version.
+        let (root, version) = load_root_versioned(&path).unwrap();
+
+        // Another process writes a newer list between that read and the save.
+        add(&path, "External", "external.example.com").unwrap();
+
+        let err = save_if_unchanged(&path, &root, &version).unwrap_err();
+        assert!(
+            matches!(err, LauncherError::Conflict(_)),
+            "expected a structured conflict, got: {err}"
+        );
+
+        // The newer file is intact; the stale tree was not written.
+        let names: Vec<String> = list(&path).unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["A", "External"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fingerprints_distinguish_rows_with_the_same_name_and_address() {
+        let path = temp_path("fingerprint_distinct");
+        let _ = std::fs::remove_file(&path);
+        let root = Nbt::Compound(vec![(
+            "servers".to_string(),
+            Nbt::List {
+                elem_type: TAG_COMPOUND,
+                items: vec![
+                    Nbt::Compound(vec![
+                        ("name".into(), Nbt::String("Same".into())),
+                        ("ip".into(), Nbt::String("same.example.com".into())),
+                        ("futureField".into(), Nbt::String("one".into())),
+                    ]),
+                    Nbt::Compound(vec![
+                        ("name".into(), Nbt::String("Same".into())),
+                        ("ip".into(), Nbt::String("same.example.com".into())),
+                        ("futureField".into(), Nbt::String("two".into())),
+                    ]),
+                ],
+            },
+        )]);
+        save(&path, &root).unwrap();
+        let entries = list(&path).unwrap();
+        assert_eq!(entries[0].name, entries[1].name);
+        assert_eq!(entries[0].ip, entries[1].ip);
+        assert_ne!(entries[0].fingerprint, entries[1].fingerprint);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fingerprint_change_in_an_unknown_field_rejects_a_stale_update() {
+        let path = temp_path("fingerprint_changed");
+        let _ = std::fs::remove_file(&path);
+        let mut root = Nbt::Compound(vec![(
+            "servers".to_string(),
+            Nbt::List {
+                elem_type: TAG_COMPOUND,
+                items: vec![Nbt::Compound(vec![
+                    ("name".into(), Nbt::String("A".into())),
+                    ("ip".into(), Nbt::String("a.example.com".into())),
+                    ("futureField".into(), Nbt::String("old".into())),
+                ])],
+            },
+        )]);
+        save(&path, &root).unwrap();
+        let old_fingerprint = list(&path).unwrap()[0].fingerprint.clone();
+
+        // Simulate another writer changing only an unknown field.
+        let Nbt::Compound(fields) = &mut root else {
+            panic!()
+        };
+        let Nbt::List { items, .. } = &mut fields[0].1 else {
+            panic!()
+        };
+        let Nbt::Compound(server) = &mut items[0] else {
+            panic!()
+        };
+        for (key, value) in server.iter_mut() {
+            if key == "futureField" {
+                *value = Nbt::String("new".into());
+            }
+        }
+        save(&path, &root).unwrap();
+
+        let err =
+            update_fingerprint(&path, 0, &old_fingerprint, "A2", "a2.example.com").unwrap_err();
+        assert!(matches!(err, LauncherError::Conflict(_)));
+        let entries = list(&path).unwrap();
+        assert_eq!(entries[0].name, "A");
+        assert_eq!(entries[0].ip, "a.example.com");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn identical_duplicate_rows_are_ambiguous_and_not_modified() {
+        let path = temp_path("fingerprint_duplicate");
+        let _ = std::fs::remove_file(&path);
+        let server = || {
+            Nbt::Compound(vec![
+                ("name".into(), Nbt::String("Same".into())),
+                ("ip".into(), Nbt::String("same.example.com".into())),
+            ])
+        };
+        let root = Nbt::Compound(vec![(
+            "servers".to_string(),
+            Nbt::List {
+                elem_type: TAG_COMPOUND,
+                items: vec![server(), server()],
+            },
+        )]);
+        save(&path, &root).unwrap();
+        let fingerprint = list(&path).unwrap()[0].fingerprint.clone();
+        assert_eq!(list(&path).unwrap()[0].fingerprint, fingerprint);
+
+        let err = update_fingerprint(&path, 0, &fingerprint, "Changed", "changed.example.com")
+            .unwrap_err();
+        assert!(matches!(err, LauncherError::Conflict(_)));
+        let err = delete_fingerprint(&path, 0, &fingerprint).unwrap_err();
+        assert!(matches!(err, LauncherError::Conflict(_)));
+        assert_eq!(list(&path).unwrap().len(), 2);
+        assert_eq!(list(&path).unwrap()[0].name, "Same");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn checked_edit_rejects_a_stale_row_identity() {
+        let path = temp_path("checked");
+        let _ = std::fs::remove_file(&path);
+        add(&path, "A", "a.example.com").unwrap();
+        add(&path, "B", "b.example.com").unwrap();
+
+        // The user selected row 0 when it was B, but the file now has A first.
+        let err = update_checked(
+            &path,
+            0,
+            "B",
+            "b.example.com",
+            "Renamed",
+            "renamed.example.com",
+        )
+        .unwrap_err();
+        assert!(matches!(err, LauncherError::Conflict(_)));
+
+        let err = delete_checked(&path, 0, "B", "b.example.com").unwrap_err();
+        assert!(matches!(err, LauncherError::Conflict(_)));
+
+        let names: Vec<String> = list(&path).unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["A", "B"]);
+
+        let updated =
+            update_checked(&path, 0, "A", "a.example.com", "A2", "a2.example.com").unwrap();
+        assert_eq!(updated[0].name, "A2");
+        delete_checked(&path, 1, "B", "b.example.com").unwrap();
+        assert_eq!(list(&path).unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deleted_entries_are_not_restored_by_a_later_write() {
+        let path = temp_path("no_resurrect");
+        let _ = std::fs::remove_file(&path);
+        add(&path, "A", "a.example.com").unwrap();
+        add(&path, "B", "b.example.com").unwrap();
+        delete(&path, 0).unwrap();
+        add(&path, "C", "c.example.com").unwrap();
+
+        let names: Vec<String> = list(&path).unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["B", "C"]);
         let _ = std::fs::remove_file(&path);
     }
 

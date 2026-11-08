@@ -1,6 +1,21 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { headFromSkin } from './skinHead';
+import {
+  getPlayerHeadState,
+  getPlayerSkinState,
+  normalizePlayerKey,
+  requestPlayerHead,
+  subscribePlayerHead,
+  subscribePlayerSkin,
+  type PlayerHeadState,
+  type PlayerSkinState,
+} from './playerHeadStore';
+
+export {
+  forgetPlayerHead,
+  invalidatePlayerHead,
+  onPlayerHeadInvalidated,
+} from './playerHeadStore';
 
 // ---- Remote images via cmd_fetch_icon_url -----------------------------------
 // CDN images (mod icon, thumbnails) are never handed to
@@ -202,180 +217,68 @@ export function RemoteImage({
 // /avatar endpoint is deliberately NOT used: it silently substitutes a
 // default Steve head when its own Mojang lookup fails.
 
-const playerHeadCache = new Map<string, string>();
-const playerHeadFailedAt = new Map<string, number>();
-const playerHeadInflight = new Map<string, number>();
-const playerHeadSubs = new Map<string, ((v: string | null) => void)[]>();
-const playerHeadListeners = new Set<(key: string, head: string | null) => void>();
-const playerHeadRefreshListeners = new Set<(key: string) => void>();
-const playerHeadGenerations = new Map<string, number>();
-const PLAYER_HEAD_RETRY_MS = 60_000;
-
-function getHeadGeneration(key: string): number {
-  return playerHeadGenerations.get(key) ?? 0;
-}
-
-function bumpHeadGeneration(key: string): number {
-  const next = getHeadGeneration(key) + 1;
-  playerHeadGenerations.set(key, next);
-  return next;
-}
-
-/**
- * Invalidate cached player head in renderer memory and on backend disk.
- *
- * All mounted Avatar instances for this UUID immediately re-fetch and re-render.
- * Advances the frontend Generation Token so in-flight requests cannot overwrite fresh state.
- */
-/**
- * Subscribe to completed backend head invalidations. Used by views that need
- * the raw skin (e.g. the 3D preview) rather than the cropped Avatar head.
- */
-export function onPlayerHeadInvalidated(
-  listener: (key: string) => void,
-): () => void {
-  playerHeadRefreshListeners.add(listener);
-  return () => playerHeadRefreshListeners.delete(listener);
-}
-
-export async function invalidatePlayerHead(uuid: string): Promise<void> {
-  const key = uuid.replace(/-/g, '').toLowerCase();
-
-  // 1. Advance generation token so any in-flight fetch is discarded
-  bumpHeadGeneration(key);
-
-  // 2. Clear all cached state and inflight markers for this key
-  playerHeadCache.delete(key);
-  playerHeadFailedAt.delete(key);
-  playerHeadInflight.delete(key);
-  playerHeadSubs.delete(key);
-
-  // 3. Notify listeners that head is invalidated
-  playerHeadListeners.forEach((fn) => fn(key, null));
-
-  // 4. Invalidate on backend (disk + Rust generation token)
-  try {
-    await invoke('cmd_invalidate_player_head', { uuid: key });
-    // Raw-skin consumers (3D preview) must refetch after the backend cache
-    // is gone, otherwise they keep the old texture until remount.
-    playerHeadRefreshListeners.forEach((fn) => fn(key));
-  } catch (e) {
-    console.warn('Failed to invalidate player head on backend:', e);
-  }
-
-  // 5. Trigger fresh request under the new generation
-  requestPlayerHead(key);
-}
-
-function requestPlayerHead(uuid: string) {
-  const gen = getHeadGeneration(uuid);
-  if (playerHeadInflight.get(uuid) === gen) return;
-
-  const failedAt = playerHeadFailedAt.get(uuid);
-  if (failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS) {
-    setTimeout(() => {
-      if (getHeadGeneration(uuid) === gen) {
-        (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(null));
-        playerHeadSubs.delete(uuid);
-      }
-    }, 0);
-    return;
-  }
-
-  playerHeadInflight.set(uuid, gen);
-  invoke<string | null>('cmd_get_player_head', { uuid })
-    .then(async (skin) => {
-      // Discard if invalidated while awaiting backend
-      if (getHeadGeneration(uuid) !== gen) return;
-
-      const head = skin ? await headFromSkin(uuid, skin) : null;
-      // Discard if invalidated while cropping head
-      if (getHeadGeneration(uuid) !== gen) return;
-
-      if (head) {
-        playerHeadCache.set(uuid, head);
-        playerHeadFailedAt.delete(uuid);
-      } else {
-        playerHeadFailedAt.set(uuid, Date.now());
-      }
-      (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(head));
-      playerHeadListeners.forEach((fn) => fn(uuid, head));
-    })
-    .catch(() => {
-      if (getHeadGeneration(uuid) !== gen) return;
-      playerHeadFailedAt.set(uuid, Date.now());
-      (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(null));
-    })
-    .finally(() => {
-      if (playerHeadInflight.get(uuid) === gen) {
-        playerHeadInflight.delete(uuid);
-      }
-      if (getHeadGeneration(uuid) === gen) {
-        playerHeadSubs.delete(uuid);
-      }
-    });
-}
-
-function usePlayerHead(uuid: string | null | undefined): {
-  src: string | null;
-  status: 'ready' | 'loading' | 'failed';
-} {
-  const key = uuid ? uuid.replace(/-/g, '').toLowerCase() : null;
-  const [value, setValue] = useState<{ key: string; src: string | null } | null>(null);
+function usePlayerHead(uuid: string | null | undefined): PlayerHeadState {
+  const key = uuid ? normalizePlayerKey(uuid) : null;
+  const [view, setView] = useState<{ key: string; state: PlayerHeadState } | null>(null);
 
   useEffect(() => {
     if (!key) return;
-
-    const cached = playerHeadCache.get(key);
-    if (cached) {
-      setValue({ key, src: cached });
-      return;
-    }
-
-    const failedAt = playerHeadFailedAt.get(key);
-    if (failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS) {
-      setValue({ key, src: null });
-      return;
-    }
-
     let alive = true;
-    const subs = playerHeadSubs.get(key) ?? [];
-    subs.push((v) => {
-      if (alive) setValue({ key, src: v });
-    });
-    playerHeadSubs.set(key, subs);
-
-    const onHeadEvent = (changedKey: string, newHead: string | null) => {
-      if (alive && changedKey === key) {
-        setValue({ key, src: newHead });
-      }
+    const push = (state: PlayerHeadState) => {
+      if (alive) setView({ key, state });
     };
-    playerHeadListeners.add(onHeadEvent);
 
-    requestPlayerHead(key);
+    push(getPlayerHeadState(key));
+    // Subscribe even when an entry is already cached: an explicit refresh
+    // must update every mounted Avatar, not only the ones that happened to
+    // miss the cache when they mounted.
+    const unsub = subscribePlayerHead(key, (head) => {
+      if (!alive) return;
+      push(head ? { src: head, status: 'ready' } : getPlayerHeadState(key));
+    });
+    void requestPlayerHead(key);
+
     return () => {
       alive = false;
-      playerHeadListeners.delete(onHeadEvent);
+      unsub();
     };
   }, [key]);
 
-  if (!key) {
-    return { src: null, status: 'failed' };
-  }
-  const f = value && value.key === key ? value : null;
-  if (f) {
-    return f.src
-      ? { src: f.src, status: 'ready' }
-      : { src: null, status: 'failed' };
-  }
-  const cached = playerHeadCache.get(key);
-  if (cached) return { src: cached, status: 'ready' };
-  const failedAt = playerHeadFailedAt.get(key);
-  return {
-    src: null,
-    status:
-      failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS ? 'failed' : 'loading',
-  };
+  if (!key) return { src: null, status: 'failed' };
+  if (view?.key === key) return view.state;
+  return getPlayerHeadState(key);
+}
+
+/** Raw skin (full PNG) for the 3D preview, sharing the Avatar request/cache. */
+export function usePlayerSkin(
+  uuid: string | null | undefined,
+): PlayerSkinState {
+  const key = uuid ? normalizePlayerKey(uuid) : null;
+  const [view, setView] = useState<{ key: string; state: PlayerSkinState } | null>(null);
+
+  useEffect(() => {
+    if (!key) return;
+    let alive = true;
+    const push = (state: PlayerSkinState) => {
+      if (alive) setView({ key, state });
+    };
+
+    push(getPlayerSkinState(key));
+    const unsub = subscribePlayerSkin(key, (skin) => {
+      if (!alive) return;
+      push(skin ? { skin, status: 'ready' } : getPlayerSkinState(key));
+    });
+    void requestPlayerHead(key);
+
+    return () => {
+      alive = false;
+      unsub();
+    };
+  }, [key]);
+
+  if (!key) return { skin: null, status: 'failed' };
+  if (view?.key === key) return view.state;
+  return getPlayerSkinState(key);
 }
 
 export function Avatar({

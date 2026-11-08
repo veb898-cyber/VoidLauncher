@@ -2,6 +2,7 @@ import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { ProgressBar } from '../ui/ProgressBar';
 import { useEventStore } from '../../hooks/useGameEvents';
 import { useT } from '../../lib/i18n';
+import { installDisplay, isTerminalInstallStage } from '../../lib/installProgress';
 
 export function InstallOverlay() {
   const t = useT();
@@ -11,16 +12,15 @@ export function InstallOverlay() {
     manifest: t('install.stage_fetching'),
     libraries: t('install.stage_libraries'),
     assets: t('install.stage_assets'),
+    finalizing: t('install.stage_finalizing'),
     java: t('install.stage_java'),
     done: t('install.stage_complete'),
   };
 
-  if (!progress || progress.stage === 'done') return null;
+  if (!progress || isTerminalInstallStage(progress.stage)) return null;
 
   const stageLabel = stageLabels[progress.stage] || progress.stage;
-  const displayMb = progress.total_bytes > 0;
-  const downloadedMb = (progress.downloaded_bytes / 1024 / 1024).toFixed(1);
-  const totalMb = (progress.total_bytes / 1024 / 1024).toFixed(1);
+  const display = installDisplay(progress);
 
   return (
     <div className="install-overlay">
@@ -57,7 +57,7 @@ export function InstallOverlay() {
         </div>
 
         <div style={{ marginBottom: 'var(--space-lg)' }}>
-          <ProgressBar percent={progress.percent} />
+          <ProgressBar percent={display.percent} indeterminate={display.indeterminate} />
         </div>
 
         <div
@@ -70,17 +70,32 @@ export function InstallOverlay() {
           }}
         >
           <span>{stageLabel}</span>
-          <span>{Math.round(progress.percent)}%</span>
+          {display.showPercent && <span>{Math.round(display.percent)}%</span>}
         </div>
 
-        {displayMb && (
+        {display.showBytes && (
           <div
             style={{
               fontSize: 'var(--font-size-xs)',
               color: 'var(--text-tertiary)',
             }}
           >
-            {t('install.progress', { downloaded: downloadedMb, total: totalMb })}
+            {t('install.progress', {
+              prepared: display.preparedMb,
+              total: display.totalMb,
+            })}
+            {display.showInProgress && (
+              <>
+                {' · '}
+                {t('install.in_progress', { inProgress: display.inProgressMb })}
+              </>
+            )}
+            {display.showNetworkBytes && (
+              <>
+                {' · '}
+                {t('install.network_progress', { network: display.networkMb })}
+              </>
+            )}
           </div>
         )}
 
