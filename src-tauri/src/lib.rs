@@ -126,7 +126,12 @@ pub fn run() {
     // renderer memory for the session (same as Prism Launcher).
     let _ = std::fs::remove_file(data_dir.join("icon_cache.json"));
 
-    download::set_global_proxy(config.proxy_url());
+    download::set_global_proxy_policy(
+        config.proxy_enabled,
+        config.use_system_proxy(),
+        config.proxy_url(),
+        config.proxy_only,
+    );
     atlauncher::set_atl_cache_dir(config.data_dir.clone());
     modloaders::prism_meta::set_cache_dir(config.data_dir.clone());
 
@@ -307,6 +312,9 @@ pub fn run() {
             commands::misc::cmd_read_image_file,
             commands::misc::cmd_fetch_page_asset,
             commands::misc::cmd_check_latest_version,
+            commands::misc::cmd_apply_proxy_policy,
+            commands::misc::cmd_updater_proxy_policy,
+            commands::misc::cmd_updater_check,
             commands::misc::cmd_get_launch_state,
             commands::instances::cmd_check_instance_installed,
             commands::misc::cmd_detect_system_ram,

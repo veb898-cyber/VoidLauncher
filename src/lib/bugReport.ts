@@ -30,6 +30,34 @@ export interface BugReportLabels {
   extra: string;
 }
 
+export type BugReportField = keyof BugReportFields;
+export type BugReportFieldErrors = Partial<Record<BugReportField, 'required'>>;
+
+/**
+ * Fields required by the repository's `.github/ISSUE_TEMPLATE/bug_report.yml`
+ * (description, steps, expected and actual behavior). `extra` stays optional:
+ * it is free-form context and automatic sections already cover the environment.
+ */
+export const REQUIRED_BUG_REPORT_FIELDS = [
+  'summary',
+  'steps',
+  'expected',
+  'actual',
+] as const satisfies readonly BugReportField[];
+
+/** Empty strings and whitespace-only values count as missing. */
+export function bugReportFieldErrors(fields: BugReportFields): BugReportFieldErrors {
+  const errors: BugReportFieldErrors = {};
+  for (const field of REQUIRED_BUG_REPORT_FIELDS) {
+    if (!fields[field].trim()) errors[field] = 'required';
+  }
+  return errors;
+}
+
+export function isBugReportComplete(fields: BugReportFields): boolean {
+  return REQUIRED_BUG_REPORT_FIELDS.every((field) => fields[field].trim().length > 0);
+}
+
 const SECRET_KEY_PATTERN =
   'access_?token|refresh_?token|session_?id|client_?secret|api[._-]?key|apikey|password|passwd|authorization|cookie|set-cookie|prefetched|token|secret|credential|private_key';
 
@@ -212,9 +240,9 @@ export function buildBugReport(
 
 /**
  * Resolve exactly what "Copy report" publishes. A manually edited preview
- * wins; otherwise the report is rebuilt from the current fields/sections so
- * disabling a section cannot leave stale sensitive text in the copied report.
- * `null` means the required summary is missing.
+ * wins, but only after the same required-field validation as the form: an
+ * incomplete form must never reach the copy/open-issue mechanism, even if the
+ * preview text itself is non-empty. `null` means the report cannot be built.
  */
 export function resolveReportForCopy(
   preview: string,
@@ -223,8 +251,8 @@ export function resolveReportForCopy(
   labels: BugReportLabels,
   previewEdited = true,
 ): string | null {
+  if (!isBugReportComplete(fields)) return null;
   if (previewEdited && preview.trim()) return preview;
-  if (!fields.summary.trim()) return null;
   return buildBugReport(fields, sections, labels);
 }
 

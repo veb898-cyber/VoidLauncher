@@ -73,9 +73,9 @@ type JavaListSlot = OnceLock<Mutex<Option<(Instant, Vec<AvailableJavaVersion>)>>
 /// HTTP client without auto-decompression — prevents "error decoding response body"
 /// when the server sends brotli/deflate despite us not requesting it.
 /// Rebuilt automatically when the proxy setting changes.
-fn download_client() -> reqwest::Result<reqwest::Client> {
+fn download_client() -> Result<reqwest::Client> {
     static CLIENT: ClientSlot = OnceLock::new();
-    let proxy = crate::download::resolved_proxy_url(crate::download::active_proxy_raw());
+    let proxy = crate::download::proxy_client_url()?;
     let mut slot = CLIENT
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -91,9 +91,9 @@ fn download_client() -> reqwest::Result<reqwest::Client> {
             .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")));
         match &proxy {
             Some(p) => {
-                if let Ok(pp) = reqwest::Proxy::all(p.clone()) {
-                    builder = builder.proxy(pp);
-                }
+                // A malformed proxy must fail loudly: silently dropping it
+                // would turn a proxied request into a direct one.
+                builder = builder.proxy(reqwest::Proxy::all(p.clone())?);
             }
             None => {
                 // Truly direct: ignore HTTP_PROXY-style env variables so the

@@ -2,9 +2,11 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, AlertTriangle, X, ChevronUp, ChevronDown } from 'lucide-react';
+import { Package, FolderOpen, Download, Search, Check, Trash2, ArrowRight, AlertTriangle, X, ChevronUp, ChevronDown } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { Modal } from '../ui/Modal';
+import { RefreshIcon } from '../ui/RefreshIcon';
 import { Tooltip } from '../ui/Tooltip';
 import { addToast } from '../ui/Toast';
 import { logUiMessage } from '../../lib/uiLog';
@@ -16,22 +18,38 @@ import { useT } from '../../lib/i18n';
 import { useIconCacheStore } from '../../stores/iconCacheStore';
 import { useThemeStore } from '../../stores/themeStore';
 import { useContentViewStore } from '../../stores/contentViewStore';
-import { EMPTY_UPDATE_CHECK, useUpdateCheckStore, type UpdateInfo } from '../../stores/updateCheckStore';
+import {
+  EMPTY_UPDATE_CHECK,
+  updateCheckFiles,
+  useUpdateCheckStore,
+  type UpdateInfo,
+} from '../../stores/updateCheckStore';
 import { RemoteIcon } from '../../lib/remoteImage';
 import type { CompatState } from '../../lib/contentProviders';
 import { moveActiveContent, resourcePacksOptionsOrder } from '../../lib/contentOrder';
-import { modLoadersLabel, modVersionLabel } from '../../lib/modDisplay';
 import {
-  contentStatusKey,
+  modLoadersLabel,
+  modVersionLabel,
+  normalizeModLoaders,
+} from '../../lib/modDisplay';
+import {
   importPromptForResult,
   importStatusMessage,
   isLocalImportFailure,
   localImportErrorKey,
   localImportReloadHintKey,
-  shouldOfferEnable,
   type LocalImportPrompt,
   type LocalImportResult,
 } from '../../lib/localImport';
+
+/**
+ * Builds tab feedback is intentionally snappier than the shared 600 ms: list
+ * refreshes and update checks in this tab are often near-instant, so the
+ * spinner should not linger after the result is already on screen. Long
+ * operations still spin until they actually finish (the hook only keeps the
+ * icon class on; it never delays the operation).
+ */
+const BUILDS_REFRESH_MIN_SPIN_MS = 300;
 
 /// Strip a trailing version like "_v1.2.3", "-1.0", " v3.2" from a name
 function strip_version_suffix(name: string): string {
@@ -325,6 +343,9 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const activationPrompt = currentImportPrompt?.kind === 'activation' ? currentImportPrompt : null;
   const [downloadingMods, setDownloadingMods] = useState<Set<string>>(new Set());
   const [updateProgress, setUpdateProgress] = useState<{ current: number; total: number } | null>(null);
+  const [confirmCloseUpdates, setConfirmCloseUpdates] = useState(false);
+  const [stoppingUpdates, setStoppingUpdates] = useState(false);
+  const abortUpdatesRef = useRef(false);
   // Heavy effects (file watcher, compatibility checks) are skipped while the window
   // is unfocused AND a game is running — this is the "frozen" state. State and UI
   // remain mounted; only the network/CPU work is suspended.
@@ -973,14 +994,21 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
   const handleCheckUpdates = async () => {
     if (checkingUpdates) return;
+    const files = updateCheckFiles(selectedFilenames);
     startUpdateCheck(updateCheckKey);
-    addToast(t('manager.checking_updates', { count: items.length.toString() }), 'info');
+    addToast(
+      t('manager.checking_updates', {
+        count: (files?.length ?? items.length).toString(),
+      }),
+      'info',
+    );
     try {
       const results = await invoke<any[]>('cmd_check_mod_updates', {
         instanceName,
         mcVersion: mcVersion ?? null,
         loader: contentType === 'mod' ? (loader ?? null) : null,
         packType: subfolder,
+        files,
       });
       const found: UpdateInfo[] = (results || []).map((r: any) => ({
         name: r.name,
@@ -1057,11 +1085,14 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
   const handleApplyAllUpdates = async () => {
     if (!updates) return;
+    abortUpdatesRef.current = false;
+    setStoppingUpdates(false);
     const total = updates.length;
     setUpdateProgress({ current: 0, total });
     const successes: string[] = [];
     const errors: { name: string; error: string }[] = [];
     for (const u of updates) {
+      if (abortUpdatesRef.current) break;
       try {
         await invoke('cmd_download_to_folder', {
           instanceName,
@@ -1081,9 +1112,16 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       } catch (e: any) { errors.push({ name: u.name, error: e.toString() }); }
       setUpdateProgress((prev) => prev ? { ...prev, current: prev.current + 1 } : null);
     }
+    const aborted = abortUpdatesRef.current;
+    abortUpdatesRef.current = false;
+    setStoppingUpdates(false);
     setUpdateProgress(null);
     dismissUpdateCheck(updateCheckKey);
     loadItems();
+    if (aborted) {
+      addToast(t('manager.updates_cancelled'), 'info');
+      return;
+    }
     if (errors.length === 0) {
       addToast(t('manager.updated_all_success', { count: successes.length.toString() }), 'success');
     } else {
@@ -1096,6 +1134,33 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         ? t('manager.updated_all_failed')
         : t('manager.updated_all_partial', { success: successes.length.toString(), failed: errors.length.toString() }), 'error');
     }
+  };
+
+  const updatesBusy = updateProgress !== null || downloadingMods.size > 0;
+
+  // The operation may finish while the confirmation is open. Do not leave a
+  // stale "close and interrupt?" dialog over an already completed update.
+  useEffect(() => {
+    if (!updatesBusy) setConfirmCloseUpdates(false);
+  }, [updatesBusy]);
+
+  const requestCloseUpdates = () => {
+    if (stoppingUpdates) return;
+    if (updatesBusy) {
+      setConfirmCloseUpdates(true);
+    } else {
+      dismissUpdateCheck(updateCheckKey);
+    }
+  };
+
+  const confirmAbortUpdates = () => {
+    // There is no safe way to abort an in-flight Tauri command from the
+    // renderer. Stop before the next file and keep the modal/progress visible
+    // until that current file has actually finished — never claim an instant
+    // cancellation while bytes are still arriving.
+    abortUpdatesRef.current = true;
+    setStoppingUpdates(true);
+    setConfirmCloseUpdates(false);
   };
 
   const getItemIcon = (item: ContentItem): string | null => {
@@ -1318,7 +1383,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           )}
           <div style={{ flex: 1 }} />
           <Button size="sm" variant="ghost" onClick={loadItems} disabled={loading} style={{ minWidth: 80 }}>
-            <RefreshCw size={14} className={loading ? 'icon-spin' : undefined} />
+            <RefreshIcon spinning={loading} minimumMs={BUILDS_REFRESH_MIN_SPIN_MS} />
             {t('common.refresh')}
           </Button>
         </div>
@@ -1340,7 +1405,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         )}
         <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
         <Button size="sm" variant="ghost" onClick={handleCheckUpdates} disabled={checkingUpdates} style={{ width: '100%', whiteSpace: 'normal' }}>
-          <RefreshCw size={14} className={checkingUpdates ? 'icon-spin' : undefined} style={{ flexShrink: 0 }} />
+          <RefreshIcon spinning={checkingUpdates} minimumMs={BUILDS_REFRESH_MIN_SPIN_MS} style={{ flexShrink: 0 }} />
           {t('common.check_updates')}
         </Button>
         {hasSelection && (
@@ -1386,13 +1451,18 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
               <div><strong>{t('manager.detail_file')}</strong> {selectedItems[0].filename}</div>
               <div><strong>{t('manager.detail_version')}</strong> {modVersionLabel(selectedItems[0].version, selectedItems[0].version_known, t('manager.version_unknown'))}</div>
               {selectedItems[0].provider && <div><strong>{t('manager.detail_provider')}</strong> {selectedItems[0].provider}</div>}
-              {modLoadersLabel(selectedItems[0].loaders) && <div><strong>{t('manager.detail_loaders')}</strong> {modLoadersLabel(selectedItems[0].loaders)}</div>}
-              <div><strong>{t('manager.detail_status')}</strong> {t('manager.local_status_installed_only')} · {t(contentStatusKey(contentType, selectedItems[0].enabled) as Parameters<typeof t>[0])}</div>
-              {shouldOfferEnable(contentType, selectedItems[0].enabled) && (
-                <Button size="sm" variant="ghost" onClick={() => toggleEnabled(selectedItems[0])} style={{ marginTop: 4 }}>
-                  {t('common.enable')}
-                </Button>
-              )}
+              {(() => {
+                const loaders = normalizeModLoaders(selectedItems[0].loaders);
+                if (loaders.length === 0) return null;
+                return (
+                  <div>
+                    <strong>
+                      {t(loaders.length === 1 ? 'manager.detail_loader' : 'manager.detail_loaders')}
+                    </strong>{' '}
+                    {loaders.join(' / ')}
+                  </div>
+                );
+              })()}
             </div>
           </>
         )}
@@ -1453,12 +1523,12 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           stays disabled while the batch is running. */}
       <Modal
         open={!!updates}
-        onClose={() => dismissUpdateCheck(updateCheckKey)}
+        onClose={requestCloseUpdates}
         title={updates ? t('manager.updates_title', { count: updates.length.toString() }) : ''}
         maxWidth={600}
         footer={
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-            <Button variant="ghost" onClick={() => dismissUpdateCheck(updateCheckKey)} disabled={!!updateProgress} style={{ opacity: updateProgress ? 0.5 : 1 }}>{t('common.cancel')}</Button>
+            <Button variant="ghost" onClick={requestCloseUpdates} disabled={stoppingUpdates}>{t('common.cancel')}</Button>
             <Button onClick={handleApplyAllUpdates} disabled={!!updateProgress}>
               {updateProgress ? '...' : t('manager.update_all', { count: (updates?.length ?? 0).toString() })}
             </Button>
@@ -1485,7 +1555,11 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         {updateProgress && (
           <div style={{ marginBottom: 'var(--space-md)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 4 }}>
-              <span>{t('manager.updating_progress', { current: updateProgress.current.toString(), total: updateProgress.total.toString() })}</span>
+              <span>
+                {stoppingUpdates
+                  ? t('manager.updates_stopping')
+                  : t('manager.updating_progress', { current: updateProgress.current.toString(), total: updateProgress.total.toString() })}
+              </span>
               <span>{Math.round((updateProgress.current / updateProgress.total) * 100)}%</span>
             </div>
             <div style={{ height: 6, background: 'var(--bg-secondary)', borderRadius: 3, overflow: 'hidden' }}>
@@ -1494,6 +1568,15 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           </div>
         )}
       </Modal>
+
+      <ConfirmDialog
+        open={confirmCloseUpdates}
+        title={t('manager.close_updates_title')}
+        description={t('manager.close_updates_desc')}
+        confirmLabel={t('manager.close_updates_confirm')}
+        onConfirm={confirmAbortUpdates}
+        onCancel={() => setConfirmCloseUpdates(false)}
+      />
 
       {/* Local import: a name conflict is never resolved silently. */}
       <Modal

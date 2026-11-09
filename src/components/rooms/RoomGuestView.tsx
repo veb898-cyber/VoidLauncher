@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Copy, Check, Play, RefreshCw, LogOut, Globe, WifiOff } from 'lucide-react';
+import { Copy, Check, Play, LogOut, Globe, WifiOff } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { RefreshIcon } from '../ui/RefreshIcon';
 import { CustomSelect } from '../ui/CustomSelect';
 import type { SelectOption } from '../ui/CustomSelect';
 import { SnakeSpinner } from '../ui/SnakeSpinner';
@@ -39,6 +40,7 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
   const [autoJoin, setAutoJoin] = useState<boolean | null>(null);
   const [copied, setCopied] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     if (!selected && instances.length > 0) setSelected(instances[0].name);
@@ -186,8 +188,19 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
       )}
 
       <div style={{ display: 'flex', gap: 'var(--space-md)', flexWrap: 'wrap' }}>
-        <Button variant="secondary" onClick={() => { refresh(); }}>
-          <RefreshCw size={16} style={{ marginRight: 6 }} />
+        <Button
+          variant="secondary"
+          disabled={refreshing}
+          onClick={async () => {
+            setRefreshing(true);
+            try {
+              await refresh();
+            } finally {
+              setRefreshing(false);
+            }
+          }}
+        >
+          <RefreshIcon spinning={refreshing} size={16} />
           {t('rooms.refresh')}
         </Button>
         <Button variant="danger" onClick={() => { setConfirmLeave(true); }} disabled={busy}>

@@ -2146,7 +2146,8 @@ select option {
 }
 
 .modpacks-overlay__body > .page {
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   /* The page itself never scrolls: the results list and the detail panel
@@ -2547,6 +2548,12 @@ html:not([data-theme='lg']) .settings-page--active {
 
 .settings-row__control {
   flex-shrink: 0;
+}
+
+/* Child settings that only apply while their parent switch is on. The indent
+   shows the hierarchy; the row keeps the same layout when active. */
+.settings-row--dependent {
+  padding-left: var(--space-lg);
 }
 
 /* Rows whose control is a small form (e.g. proxy host/port) read better with
@@ -3893,6 +3900,31 @@ input[type="range"]:active::-moz-range-thumb {
   top: 0;
   align-self: flex-start;
   max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Narrow catalog: the fixed 340px detail column would collide with the
+   results list. Stack it under the list and let the overlay page scroll. */
+@media (max-width: 900px) {
+  .modpacks-overlay__body > .page {
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+  }
+  .modpacks-overlay__body .modpacks-main {
+    flex-direction: column;
+    height: auto !important;
+    min-height: 0;
+  }
+  .modpacks-results {
+    max-height: 60vh;
+  }
+  .modpack-detail-panel {
+    position: static;
+    width: 100% !important;
+    max-height: none;
+  }
 }
 
 /* Bottom card with the mod selection count (add-mods browser): quiet elevated panel. */
@@ -3921,6 +3953,70 @@ input[type="range"]:active::-moz-range-thumb {
 .account-card:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
+}
+
+/* Per-account actions: compact hit targets with a soft glow on hover. The
+   wider default .btn--sm padding made a row of icon buttons look like
+   scattered pills and left the card's hover tint as the only feedback. */
+.account-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.account-card__actions .btn {
+  min-width: 28px;
+  height: 28px;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+}
+.account-card__actions .btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  /* Soft light filling the whole button instead of a hard inset outline. */
+  box-shadow:
+    inset 0 0 10px rgba(255, 255, 255, 0.18),
+    0 0 6px rgba(255, 255, 255, 0.10);
+}
+.account-card__actions .btn--danger {
+  color: var(--color-danger);
+}
+.account-card__actions .btn--danger:hover:not(:disabled) {
+  /* Keep destructive actions red-tinted; the icon colour still carries the
+     warning. No border — only a soft glow in the same shape. */
+  background: var(--danger-bg);
+  box-shadow:
+    inset 0 0 10px var(--danger-bg),
+    0 0 7px var(--danger-bg);
+}
+
+/* Small icon-only row actions (worlds/servers tables). The destructive one
+   uses the shared danger colour and a matching hover tint. */
+.icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.icon-action:hover:not(:disabled) {
+  background: var(--surface-glass-hover);
+  color: var(--text-primary);
+}
+.icon-action--danger {
+  color: var(--color-danger);
+}
+.icon-action--danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  color: var(--error);
+}
+.icon-action:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* Account rows are outline-only: the dark plate backing plus the hover
@@ -3999,7 +4095,10 @@ input[type="range"]:active::-moz-range-thumb {
   display: flex;
   flex-direction: column;
   gap: var(--space-md);
-  padding-right: 2px;
+  /* Room for the first/last card's -1px hover lift and 2px focus outline;
+     the list itself is the scroll container, so without this padding the
+     top edge clips the hovered card. */
+  padding: 6px 4px 8px;
 }
 
 /* Accounts page: cape picker tiles. The thumbnail shows the FRONT face of

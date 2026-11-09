@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { create } from 'zustand';
@@ -6,7 +6,9 @@ import { addToast } from '../components/ui/Toast';
 import { useLogStore } from '../stores/logStore';
 import type { LogEntry } from '../stores/logStore';
 import { useFocusStore } from '../stores/focusStore';
+import { useSettingsStore, type AppConfig } from '../stores/settingsStore';
 import { t } from '../lib/i18n';
+import { afterLaunchWindowAction, applyAfterLaunchAction, type AfterLaunchWindowAction } from '../lib/afterLaunch';
 import { CRASH_KEYS, type CrashAnalysis } from '../lib/diagnostics';
 import {
   applyRunningGameEvent,
@@ -112,6 +114,7 @@ export function useGameEvents() {
   const addLog = useLogStore((s) => s.addLog);
   const setWindowFocused = useFocusStore((s) => s.setWindowFocused);
   const setMinimized = useFocusStore((s) => s.setMinimized);
+  const lastWindowAction = useRef<AfterLaunchWindowAction>('none');
 
   useEffect(() => {
     // Race-safe event subscription. `listen()` is async — the returned
@@ -176,13 +179,29 @@ export function useGameEvents() {
         useFocusStore
           .getState()
           .setRunningCount(useEventStore.getState().runningGameIds.length);
-        // Minimize the launcher only once the game process is actually
-        // running. If the launch fails before this point, the window stays
-        // visible so the user sees the error.
-        try {
-          const { getCurrentWindow } = await import('@tauri-apps/api/window');
-          await getCurrentWindow().minimize();
-        } catch { /* best-effort */ }
+        // Apply the configured after-launch action only once the game process
+        // is actually running. A failed launch never reaches this point, so
+        // the window stays visible with the error. Settings may not have been
+        // opened yet in this session, so read the config directly if needed.
+        let config = useSettingsStore.getState().config;
+        if (!config) {
+          try {
+            config = await invoke<AppConfig>('cmd_get_config');
+          } catch {
+            config = null;
+          }
+        }
+        const action = afterLaunchWindowAction(
+          p.status,
+          config?.after_launch_action,
+        );
+        lastWindowAction.current = action;
+        if (action !== 'none') {
+          try {
+            const { getCurrentWindow } = await import('@tauri-apps/api/window');
+            await applyAfterLaunchAction(action, getCurrentWindow());
+          } catch { /* best-effort */ }
+        }
       }
     }));
 
@@ -192,17 +211,19 @@ export function useGameEvents() {
       useFocusStore
         .getState()
         .setRunningCount(useEventStore.getState().runningGameIds.length);
-      // If the launcher minimized itself when the game started (see the
-      // `game_started` handler), restore it on a crash so the user actually
-      // sees the error. A non-zero exit code means the Java process died —
-      // surface it in the launcher log so users can find the cause without
-      // having to dig through Minecraft's own logs.
+      // If the launcher minimized itself when the game started, restore it on
+      // a crash so the user actually sees the error. "Do nothing" must not
+      // steal focus, and "close" means the launcher is already gone.
+      // A non-zero exit code means the Java process died — surface it in the
+      // launcher log even when the window action was "do nothing".
       if (p.exit_code !== null && p.exit_code !== undefined && p.exit_code !== 0) {
-        try {
-          const { getCurrentWindow } = await import('@tauri-apps/api/window');
-          await getCurrentWindow().unminimize();
-          await getCurrentWindow().setFocus();
-        } catch { /* best-effort */ }
+        if (lastWindowAction.current === 'minimize') {
+          try {
+            const { getCurrentWindow } = await import('@tauri-apps/api/window');
+            await getCurrentWindow().unminimize();
+            await getCurrentWindow().setFocus();
+          } catch { /* best-effort */ }
+        }
         addLog({
           level: 'error',
           source: 'launch',

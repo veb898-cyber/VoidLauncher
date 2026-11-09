@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Coffee, Globe, Info, Palette, RefreshCw, ScanSearch, SlidersHorizontal } from 'lucide-react';
+import { Coffee, Globe, Info, Palette, ScanSearch, SlidersHorizontal } from 'lucide-react';
 import { useSettingsStore, type AppConfig } from '../stores/settingsStore';
 import { useBrowserGuardStore } from '../stores/browserGuardStore';
 import { useLanguageStore } from '../stores/languageStore';
 import { useFontStore } from '../stores/fontStore';
 import { Button } from '../components/ui/Button';
+import { RefreshIcon } from '../components/ui/RefreshIcon';
 import { SlidingTabs, type SlidingTabDef } from '../components/ui/SlidingTabs';
 import { addToast } from '../components/ui/Toast';
 import { useT } from '../lib/i18n';
@@ -98,7 +99,7 @@ export function Settings() {
               {t('settings.load_error_desc', { error: loadError })}
             </div>
             <Button variant="secondary" onClick={() => loadConfig()}>
-              <RefreshCw size={14} style={{ marginRight: 6 }} />
+              <RefreshIcon spinning={configLoading} />
               {t('common.retry')}
             </Button>
           </div>

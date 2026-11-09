@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { Check, Download, RefreshCw } from 'lucide-react';
+import { Check, Download } from 'lucide-react';
 import { useSettingsStore, type AppConfig } from '../../stores/settingsStore';
 import { useJavaDownloadStore } from '../../stores/javaDownloadStore';
 import { Button } from '../../components/ui/Button';
+import { RefreshIcon } from '../../components/ui/RefreshIcon';
 import { CustomSelect } from '../../components/ui/CustomSelect';
 import { SnakeSpinner } from '../../components/ui/SnakeSpinner';
 import { Tooltip } from '../../components/ui/Tooltip';
@@ -117,7 +118,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               }}
               disabled={javaRefreshing}
             >
-              <RefreshCw size={14} className={javaRefreshing ? 'icon-spin' : undefined} />
+              <RefreshIcon spinning={javaRefreshing} />
               {t('settings.java_refresh')}
             </Button>
           </div>

@@ -8,6 +8,36 @@ import { invoke } from '@tauri-apps/api/core';
 
 export type ProviderId = 'modrinth' | 'curseforge';
 
+/** Catalog provider preference is per content type, so opening resource packs
+ *  cannot inherit a CurseForge choice made in the mods catalog. */
+export const CONTENT_PROVIDER_STORAGE_PREFIX = 'voidlauncher.contentProvider';
+
+export function contentProviderStorageKey(contentType: string): string {
+  return `${CONTENT_PROVIDER_STORAGE_PREFIX}.${contentType}`;
+}
+
+/** Every catalog starts on Modrinth; only an explicit user choice persists. */
+export function readContentProviderPreference(contentType: string): ProviderId {
+  try {
+    return localStorage.getItem(contentProviderStorageKey(contentType)) === 'curseforge'
+      ? 'curseforge'
+      : 'modrinth';
+  } catch {
+    return 'modrinth';
+  }
+}
+
+export function writeContentProviderPreference(
+  contentType: string,
+  provider: ProviderId,
+): void {
+  try {
+    localStorage.setItem(contentProviderStorageKey(contentType), provider);
+  } catch {
+    /* preference is optional */
+  }
+}
+
 /** Identity of an async catalog request: provider plus a switch generation. */
 export interface ProviderRequestToken {
   provider: ProviderId;

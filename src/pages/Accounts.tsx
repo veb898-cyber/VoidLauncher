@@ -8,12 +8,13 @@ import { Modal } from '../components/ui/Modal';
 import { CustomSelect } from '../components/ui/CustomSelect';
 import { Tooltip } from '../components/ui/Tooltip';
 import { ConfirmDialog } from '../components/ui/ConfirmDialog';
+import { RefreshIcon } from '../components/ui/RefreshIcon';
 import { EmptyState } from '../components/ui/EmptyState';
 import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
 import { SkinPreview } from '../components/accounts/SkinPreview';
 import { addToast } from '../components/ui/Toast';
-import { Ban, Check, RefreshCw, Plus, Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
+import { Ban, Check, Plus, Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
 import { t } from '../lib/i18n';
 import { Avatar, invalidatePlayerHead } from '../lib/remoteImage';
 
@@ -82,6 +83,7 @@ export function Accounts() {
   const [addingElyby, setAddingElyby] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<AccountEntry | null>(null);
   const [removing, setRemoving] = useState(false);
+  const [refreshingHead, setRefreshingHead] = useState<string | null>(null);
 
   useEffect(() => { loadAccounts(); }, [loadAccounts]);
 
@@ -367,7 +369,7 @@ export function Accounts() {
                     </div>
                     {/* Per-account actions live on the card itself — the same
                         quick icon row the list had before the redesign. */}
-                    <div style={{ display: 'flex', gap: 'var(--space-xs)', flexShrink: 0 }}>
+                    <div className="account-card__actions">
                       {acc.account_type === 'Microsoft' && (
                         <Tooltip content={t('accounts.btn_change_skin')}>
                           <Button
@@ -398,8 +400,10 @@ export function Accounts() {
                             size="sm"
                             variant="ghost"
                             aria-label={t('accounts.refresh_skin_btn')}
+                            disabled={refreshingHead === acc.id}
                             onClick={async (e) => {
                               e.stopPropagation();
+                              setRefreshingHead(acc.id);
                               try {
                                 const refreshed = await invalidatePlayerHead(acc.uuid!);
                                 if (refreshed) {
@@ -412,10 +416,12 @@ export function Accounts() {
                                   t('accounts.skin_update_error', { error: String(err) }),
                                   'error',
                                 );
+                              } finally {
+                                setRefreshingHead(null);
                               }
                             }}
                           >
-                            <RefreshCw size={14} />
+                            <RefreshIcon spinning={refreshingHead === acc.id} />
                           </Button>
                         </Tooltip>
                       )}
@@ -465,7 +471,7 @@ export function Accounts() {
                       {t('accounts.capes_load_error', { error: capesError })}
                     </div>
                     <Button size="sm" variant="secondary" onClick={retryCapes}>
-                      <RefreshCw size={14} style={{ marginRight: 6 }} />
+                      <RefreshIcon spinning={capesLoading} />
                       {t('common.retry')}
                     </Button>
                   </div>

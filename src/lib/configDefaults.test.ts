@@ -11,8 +11,7 @@ const base = {
   default_jvm_args: [],
   java_path: null,
   close_on_launch: false,
-  proxy_enabled: false,
-  proxy_addr: '',
+  proxy_enabled: false,  proxy_addr: '',
   proxy_port: 0,
   show_snapshots: false,
   show_old_versions: false,
@@ -34,5 +33,38 @@ describe('withConfigDefaults', () => {
     expect(
       withConfigDefaults({ ...base, elyby_skins_in_game: true }).elyby_skins_in_game,
     ).toBe(true);
+  });
+
+  it('enables proxy-only mode for a legacy config without the field', () => {
+    expect(withConfigDefaults(base).proxy_only).toBe(true);
+  });
+
+  it('keeps an explicit proxy-only opt-out', () => {
+    expect(withConfigDefaults({ ...base, proxy_only: false }).proxy_only).toBe(false);
+  });
+
+  it('maps the legacy close-on-launch flag to the new action selector', () => {
+    expect(
+      withConfigDefaults({ ...base, close_on_launch: true } as unknown as AppConfig)
+        .after_launch_action,
+    ).toBe('close');
+    expect(
+      withConfigDefaults({ ...base, close_on_launch: false } as unknown as AppConfig)
+        .after_launch_action,
+    ).toBe('do_nothing');
+    expect(withConfigDefaults(base).after_launch_action).toBe('do_nothing');
+  });
+
+  it('keeps an explicit after-launch action', () => {
+    expect(
+      withConfigDefaults({ ...base, after_launch_action: 'minimize' }).after_launch_action,
+    ).toBe('minimize');
+  });
+
+  it('defaults the system-proxy source on for legacy payloads and keeps an explicit choice', () => {
+    expect(withConfigDefaults(base).use_system_proxy).toBe(true);
+    expect(
+      withConfigDefaults({ ...base, use_system_proxy: false }).use_system_proxy,
+    ).toBe(false);
   });
 });

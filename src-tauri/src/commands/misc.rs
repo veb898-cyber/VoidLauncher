@@ -5,7 +5,135 @@
 use crate::config::AppConfig;
 use crate::events;
 use crate::AppState;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, Runtime, State, Webview};
+
+/// Metadata shape expected by the JS `Update` class from
+/// `@tauri-apps/plugin-updater`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdaterCheckMetadata {
+    pub rid: tauri::ResourceId,
+    pub current_version: String,
+    pub version: String,
+    pub body: Option<String>,
+    pub raw_json: serde_json::Value,
+}
+
+/// Check for an update using exactly the requested connection policy.
+///
+/// The plugin's JS API only exposes a proxy URL and cannot force a direct
+/// connection, so the renderer calls this command instead of the plugin's
+/// `check` for both attempts. It uses the plugin's public `UpdaterExt` API and
+/// returns the same metadata/resource the plugin's own command would; the
+/// returned `Update` still performs the plugin's normal signature and
+/// installer validation.
+#[tauri::command]
+pub async fn cmd_updater_check<R: Runtime>(
+    webview: Webview<R>,
+    mode: String,
+) -> Result<Option<UpdaterCheckMetadata>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    // The renderer only chooses between the allowed attempt types; the
+    // backend still enforces the master switch and strict mode so a direct
+    // request cannot slip through even if the renderer asks for one.
+    let proxy_enabled = crate::download::proxy_enabled();
+    let proxy_only = crate::download::proxy_only_enabled();
+    let effective_mode = resolve_updater_mode(proxy_enabled, proxy_only, &mode)?;
+
+    let mut builder = webview.updater_builder();
+    match effective_mode {
+        "direct" => {
+            if proxy_enabled && proxy_only {
+                return Err("Proxy-only mode forbids a direct updater request".to_string());
+            }
+            builder = builder.no_proxy();
+        }
+        "proxy" => {
+            let url = crate::download::proxy_client_url()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "Updater proxy is not configured or usable".to_string())?;
+            let parsed =
+                reqwest::Url::parse(&url).map_err(|e| format!("Invalid updater proxy URL: {e}"))?;
+            builder = builder.proxy(parsed);
+        }
+        other => return Err(format!("Unknown updater mode: {other}")),
+    }
+
+    let updater = builder.build().map_err(|e| e.to_string())?;
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+
+    let metadata = UpdaterCheckMetadata {
+        rid: 0,
+        current_version: update.current_version.clone(),
+        version: update.version.clone(),
+        body: update.body.clone(),
+        raw_json: update.raw_json.clone(),
+    };
+    let rid = webview.resources_table().add(update);
+    Ok(Some(UpdaterCheckMetadata { rid, ..metadata }))
+}
+
+/// Resolve the attempt type the updater is allowed to use. Kept separate from
+/// the webview command so the parent/child proxy rules can be unit-tested:
+/// a disabled master switch always means direct, and strict mode rejects any
+/// direct attempt even if the renderer asks for one.
+fn resolve_updater_mode(
+    proxy_enabled: bool,
+    proxy_only: bool,
+    requested: &str,
+) -> Result<&str, String> {
+    if !proxy_enabled {
+        return Ok("direct");
+    }
+    match requested {
+        "proxy" => Ok("proxy"),
+        "direct" if proxy_only => {
+            Err("Proxy-only mode forbids a direct updater request".to_string())
+        }
+        "direct" => Ok("direct"),
+        other => Err(format!("Unknown updater mode: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod updater_mode_tests {
+    use super::resolve_updater_mode;
+
+    #[test]
+    fn master_switch_off_forces_direct_even_with_proxy_only_saved() {
+        assert_eq!(
+            resolve_updater_mode(false, true, "proxy").unwrap(),
+            "direct"
+        );
+        assert_eq!(
+            resolve_updater_mode(false, false, "proxy").unwrap(),
+            "direct"
+        );
+    }
+
+    #[test]
+    fn strict_mode_rejects_direct_but_allows_proxy() {
+        assert!(resolve_updater_mode(true, true, "direct").is_err());
+        assert_eq!(resolve_updater_mode(true, true, "proxy").unwrap(), "proxy");
+    }
+
+    #[test]
+    fn fallback_mode_allows_both_attempts() {
+        assert_eq!(
+            resolve_updater_mode(true, false, "direct").unwrap(),
+            "direct"
+        );
+        assert_eq!(resolve_updater_mode(true, false, "proxy").unwrap(), "proxy");
+    }
+
+    #[test]
+    fn unknown_modes_are_rejected() {
+        assert!(resolve_updater_mode(true, false, "bogus").is_err());
+    }
+}
 
 #[tauri::command]
 pub async fn cmd_rename_file(
@@ -266,7 +394,10 @@ async fn send_pinned(
     match client.get(url).send().await {
         Ok(r) => Ok(r),
         Err(e) => {
-            if crate::download::configured_proxy().is_some() {
+            if crate::download::proxy_enabled()
+                && !crate::download::proxy_only_enabled()
+                && crate::download::active_proxy_raw().is_some()
+            {
                 let direct = crate::download::pinned_http_client_direct(host, addrs)
                     .map_err(|e2| e2.to_string())?;
                 match direct.get(url).send().await {
@@ -369,11 +500,27 @@ pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String>
     Ok(Some(format!("data:{};base64,{}", mime, b64)))
 }
 
+/// Apply the proxy policy from the still-unsaved Network settings values.
+/// Persistence remains `cmd_save_config`; this lets the parent/child switches
+/// take effect immediately while the user is editing them.
+#[tauri::command]
+pub fn cmd_apply_proxy_policy(
+    proxy_enabled: bool,
+    use_system_proxy: bool,
+    proxy_addr: String,
+    proxy_port: u16,
+    proxy_only: bool,
+) {
+    let proxy = crate::config::proxy_url_from(proxy_enabled, &proxy_addr, proxy_port);
+    crate::download::set_global_proxy_policy(proxy_enabled, use_system_proxy, proxy, proxy_only);
+}
+
 /// Check for launcher updates by fetching `latest.json` from GitHub through
-/// the launcher's HTTP stack (proxy with direct fallback). The URL is
-/// hardcoded here so the renderer cannot abuse this as an SSRF proxy; doing
-/// it in the backend (instead of a webview `fetch`) means users behind
-/// proxies that block raw.githubusercontent.com still get update checks.
+/// the launcher's HTTP stack (proxy first, direct fallback unless proxy-only
+/// mode is enabled). The URL is hardcoded here so the renderer cannot abuse
+/// this as an SSRF proxy; doing it in the backend (instead of a webview
+/// `fetch`) means users behind proxies that block raw.githubusercontent.com
+/// still get update checks.
 #[tauri::command]
 pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
     const LATEST_JSON_URL: &str =
@@ -394,6 +541,48 @@ pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
         .ok()
         .and_then(|j| j.get("version").and_then(|v| v.as_str()).map(String::from));
     Ok(v)
+}
+
+/// Proxy policy the Tauri updater plugin must follow.
+///
+/// The plugin's JS API accepts a proxy URL but cannot force a direct
+/// connection, so the renderer orchestrates the attempts:
+/// - `enabled=false`: direct only, regardless of `proxy_only`.
+/// - `enabled=true`, `proxy_url=Some`: proxy first; retry direct only when
+///   `proxy_only=false`.
+/// - `enabled=true`, `proxy_only=true`, `proxy_url=None`: refuse the request
+///   without calling the plugin (no proxy configured/unusable).
+/// - `enabled=true`, `proxy_only=false`, `proxy_url=None`: direct only — the
+///   proxy attempt is treated as already failed.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdaterProxyPolicy {
+    pub enabled: bool,
+    pub proxy_only: bool,
+    pub proxy_url: Option<String>,
+}
+
+/// Effective proxy policy for HTTP clients outside `download.rs` — currently
+/// the Tauri updater plugin, which has its own HTTP stack and accepts a proxy
+/// option. The scheme is resolved first so a SOCKS proxy is passed correctly.
+#[tauri::command]
+pub async fn cmd_updater_proxy_policy() -> UpdaterProxyPolicy {
+    crate::download::ensure_proxy_resolved().await;
+    let enabled = crate::download::proxy_enabled();
+    if !enabled {
+        return UpdaterProxyPolicy {
+            enabled: false,
+            proxy_only: false,
+            proxy_url: None,
+        };
+    }
+    let proxy_only = crate::download::proxy_only_enabled();
+    let proxy_url = crate::download::proxy_client_url().ok().flatten();
+    UpdaterProxyPolicy {
+        enabled: true,
+        proxy_only,
+        proxy_url,
+    }
 }
 
 // ==================== Launch State Commands ====================
@@ -586,7 +775,12 @@ pub fn cmd_save_config(
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     *config = new_config;
     config.save().map_err(|e| e.to_string())?;
-    crate::download::set_global_proxy(config.proxy_url());
+    crate::download::set_global_proxy_policy(
+        config.proxy_enabled,
+        config.use_system_proxy(),
+        config.proxy_url(),
+        config.proxy_only,
+    );
     events::emit_log(&app, "info", "config", "Configuration saved");
     Ok(())
 }

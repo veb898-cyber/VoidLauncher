@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { AlertTriangle, CheckCircle2, Circle, XCircle } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Circle, Search, XCircle } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
 import { CustomSelect } from '../../components/ui/CustomSelect';
 import { useT } from '../../lib/i18n';
@@ -10,7 +10,6 @@ import {
   type DiagReport,
 } from '../../lib/diagnostics';
 import { friendlyErrorMessage } from '../../lib/errors';
-import { BugReportModal } from '../../components/settings/BugReportModal';
 
 export function DiagnosticsSettings() {
   const t = useT();
@@ -24,7 +23,6 @@ export function DiagnosticsSettings() {
   // to follow the global selection only, with no way to choose by hand.
   const [diagInstance, setDiagInstance] = useState<string | null>(selectedInstance);
   const [diagInstanceTouched, setDiagInstanceTouched] = useState(false);
-  const [bugReportOpen, setBugReportOpen] = useState(false);
   const diagRunSeq = useRef(0);
 
   const instanceExists = useCallback(
@@ -89,10 +87,8 @@ export function DiagnosticsSettings() {
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', marginBottom: 'var(--space-md)', flexWrap: 'wrap' }}>
         <Button onClick={runDiagnostics} disabled={diagRunning}>
+          <Search size={16} aria-hidden="true" />
           {diagRunning ? t('diag.running') : t('diag.run')}
-        </Button>
-        <Button variant="secondary" onClick={() => setBugReportOpen(true)}>
-          {t('bug.open')}
         </Button>
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', minWidth: 0 }}>
           <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
@@ -211,13 +207,6 @@ export function DiagnosticsSettings() {
         </div>
       )}
 
-      <BugReportModal
-        open={bugReportOpen}
-        onClose={() => setBugReportOpen(false)}
-        instanceName={instanceExists(diagInstance) ? diagInstance : null}
-        diagReport={diagReport}
-        onRunDiagnostics={runDiagnostics}
-      />
     </section>
   );
 }

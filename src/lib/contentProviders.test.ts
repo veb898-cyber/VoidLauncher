@@ -1,5 +1,13 @@
-import { describe, expect, it } from 'vitest';
-import { isCurrentProviderRequest, type ProviderRequestToken } from './contentProviders';
+import { beforeEach, describe, expect, it } from 'vitest';
+import {
+  contentProviderStorageKey,
+  isCurrentProviderRequest,
+  readContentProviderPreference,
+  writeContentProviderPreference,
+  type ProviderRequestToken,
+} from './contentProviders';
+
+beforeEach(() => localStorage.clear());
 
 describe('isCurrentProviderRequest', () => {
   it('stale_add_latest_after_provider_switch_is_rejected', () => {
@@ -21,5 +29,22 @@ describe('isCurrentProviderRequest', () => {
     const current: ProviderRequestToken = { provider: 'curseforge', generation: 4 };
 
     expect(isCurrentProviderRequest(started, current)).toBe(false);
+  });
+});
+
+describe('content provider preference', () => {
+  it('starts every catalog on Modrinth, independently of the others', () => {
+    expect(readContentProviderPreference('mod')).toBe('modrinth');
+    expect(readContentProviderPreference('resourcepack')).toBe('modrinth');
+    expect(readContentProviderPreference('shader')).toBe('modrinth');
+
+    writeContentProviderPreference('mod', 'curseforge');
+
+    expect(readContentProviderPreference('mod')).toBe('curseforge');
+    expect(readContentProviderPreference('resourcepack')).toBe('modrinth');
+    expect(readContentProviderPreference('shader')).toBe('modrinth');
+    expect(contentProviderStorageKey('mod')).not.toBe(
+      contentProviderStorageKey('resourcepack'),
+    );
   });
 });

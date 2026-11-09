@@ -63,6 +63,8 @@ fn emit(app: &AppHandle, stage: &str, current: usize, total: usize, message: &st
             current,
             total,
             message: message.to_string(),
+            bytes_done: 0,
+            bytes_total: 0,
         },
     );
 }

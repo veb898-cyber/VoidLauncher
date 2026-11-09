@@ -1,8 +1,9 @@
-import { ShieldCheck, ExternalLink, CheckCircle2, Download, RefreshCw } from 'lucide-react';
+import { ShieldCheck, ExternalLink, Download, Network } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
 import { LoadingSpinner } from '../ui/LoadingSpinner';
+import { RefreshIcon } from '../ui/RefreshIcon';
 import type { RoomStatus, RoomProgress } from '../../stores/roomStore';
 import { useT } from '../../lib/i18n';
 
@@ -22,17 +23,93 @@ export function RoomSetupView({ status, progress, busy, onCheck }: RoomSetupView
   const t = useT();
   const ts = status.tailscale;
   const waitingLogin = ts.installed && !ts.logged_in;
+  const steps = [
+    { title: t('rooms.setup_step1_title'), desc: t('rooms.setup_step1_desc') },
+    { title: t('rooms.setup_step2_title'), desc: t('rooms.setup_step2_desc') },
+    { title: t('rooms.setup_step3_title'), desc: t('rooms.setup_step3_desc') },
+  ];
 
   return (
-    <div className="glass-card animate-slide-up" style={{ maxWidth: 720, marginInline: 'auto' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', marginBottom: 'var(--space-lg)' }}>
-        <ShieldCheck size={28} color="var(--primary)" />
-        <h2 style={{ margin: 0, fontSize: 'var(--font-size-xl)' }}>{t('rooms.setup_title')}</h2>
+    <div
+      className="glass-card animate-slide-up"
+      style={{ maxWidth: 760, width: '100%', marginInline: 'auto' }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: 'var(--space-lg)',
+          marginBottom: 'var(--space-xl)',
+        }}
+      >
+        <div
+          aria-hidden
+          style={{
+            width: 56,
+            height: 56,
+            borderRadius: 'var(--radius-full)',
+            background: 'var(--primary-dim)',
+            color: 'var(--primary)',
+            display: 'grid',
+            placeItems: 'center',
+            flexShrink: 0,
+          }}
+        >
+          <Network size={28} />
+        </div>
+        <div style={{ minWidth: 0 }}>
+          <h2 style={{ margin: '0 0 var(--space-sm)', fontSize: 'var(--font-size-xl)' }}>
+            {t('rooms.setup_title')}
+          </h2>
+          <p style={{ margin: 0, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            {t('rooms.setup_why_desc')}
+          </p>
+        </div>
       </div>
 
-      <p style={{ color: 'var(--text-secondary)', lineHeight: 1.6, marginBottom: 'var(--space-xl)' }}>
-        {t('rooms.setup_desc')}
-      </p>
+      <div style={{ marginBottom: 'var(--space-xl)' }}>
+        <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600, marginBottom: 'var(--space-md)' }}>
+          {t('rooms.setup_steps_title')}
+        </div>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))',
+            gap: 'var(--space-md)',
+          }}
+        >
+          {steps.map((step, index) => (
+            <div key={step.title} style={{ display: 'flex', gap: 'var(--space-sm)', minWidth: 0 }}>
+              <span
+                aria-hidden
+                style={{
+                  flexShrink: 0,
+                  width: 24,
+                  height: 24,
+                  borderRadius: 'var(--radius-full)',
+                  background: 'var(--primary-dim)',
+                  color: 'var(--primary)',
+                  fontSize: 'var(--font-size-xs)',
+                  fontWeight: 700,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                {index + 1}
+              </span>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600, marginBottom: 2 }}>
+                  {step.title}
+                </div>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                  {step.desc}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
 
       <div
         style={{
@@ -46,18 +123,28 @@ export function RoomSetupView({ status, progress, busy, onCheck }: RoomSetupView
           gap: 'var(--space-md)',
         }}
       >
-        {ts.installed && ts.logged_in ? (
-          <CheckCircle2 size={22} color="var(--success)" style={{ flexShrink: 0, marginTop: 2 }} />
+        {ts.installed ? (
+          <ShieldCheck size={22} color="var(--primary)" style={{ flexShrink: 0, marginTop: 2 }} />
         ) : (
           <Download size={22} color="var(--primary)" style={{ flexShrink: 0, marginTop: 2 }} />
         )}
-        <div style={{ flex: 1 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
           {!ts.installed && (
-            <p style={{ margin: 0 }}>{t('rooms.setup_not_installed')}</p>
+            <>
+              <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                {t('rooms.setup_not_installed_title')}
+              </div>
+              <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
+                {t('rooms.setup_not_installed')}
+              </p>
+            </>
           )}
           {ts.installed && !ts.logged_in && (
             <>
-              <p style={{ margin: 0 }}>
+              <div style={{ fontWeight: 600, marginBottom: 2 }}>
+                {t('rooms.setup_login_title')}
+              </div>
+              <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
                 {t('rooms.setup_not_logged_in')}
               </p>
               {ts.version && (
@@ -86,13 +173,13 @@ export function RoomSetupView({ status, progress, busy, onCheck }: RoomSetupView
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-md)', alignItems: 'center' }}>
         <Button onClick={onCheck} loading={busy} disabled={busy}>
-          <RefreshCw size={15} className={busy ? 'icon-spin' : undefined} />
+          <RefreshIcon spinning={busy} size={15} />
           {busy ? t('rooms.setup_checking') : t('rooms.setup_check')}
         </Button>
 
         {waitingLogin && ts.auth_url && (
           <Button variant="secondary" onClick={() => { openUrl(ts.auth_url!); }}>
-            <ExternalLink size={16} style={{ marginRight: 6 }} />
+            <ExternalLink size={16} />
             {t('rooms.setup_open_login')}
           </Button>
         )}
@@ -106,6 +193,7 @@ export function RoomSetupView({ status, progress, busy, onCheck }: RoomSetupView
       </div>
 
       <p style={{ marginTop: 'var(--space-xl)', marginBottom: 0, fontSize: 'var(--font-size-sm)', color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+        <ShieldCheck size={14} aria-hidden style={{ verticalAlign: 'text-bottom', marginRight: 6 }} />
         {t('rooms.setup_secure')}
       </p>
     </div>

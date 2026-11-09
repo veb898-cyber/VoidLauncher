@@ -11,6 +11,8 @@ interface ToggleProps {
    * invalid HTML, and the outer one keeps forwarding clicks to the input.
    */
   as?: 'label' | 'span';
+  /** Accessible name when the switch has no visible <label> of its own. */
+  ariaLabel?: string;
 }
 
 /**
@@ -18,7 +20,7 @@ interface ToggleProps {
  * gooey option can wrap it in a liquid group: the blob hides under the crisp
  * knob at rest and stretches into a trail while it slides.
  */
-export function Toggle({ checked, onChange, disabled, as = 'label' }: ToggleProps) {
+export function Toggle({ checked, onChange, disabled, as = 'label', ariaLabel }: ToggleProps) {
   const gooey = useGooey();
   const Tag = as;
 
@@ -28,6 +30,7 @@ export function Toggle({ checked, onChange, disabled, as = 'label' }: ToggleProp
         type="checkbox"
         checked={checked}
         disabled={disabled}
+        aria-label={ariaLabel}
         onChange={(e) => onChange(e.target.checked)}
       />
       <span className="toggle__slider">

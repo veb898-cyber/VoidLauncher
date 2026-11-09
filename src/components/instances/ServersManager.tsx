@@ -1,7 +1,8 @@
 ﻿import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Server, Plus, Pencil, Trash2, RefreshCw, Play, X, Lock } from 'lucide-react';
+import { Server, Plus, Pencil, Trash2, Play, X, Lock } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { RefreshIcon } from '../ui/RefreshIcon';
 import { Modal } from '../ui/Modal';
 import { Input } from '../ui/Input';
 import { Tooltip } from '../ui/Tooltip';
@@ -433,7 +434,7 @@ export function ServersManager({ instanceName }: Props) {
           </span>
         </h2>
         <Button size="sm" variant="ghost" onClick={handleRefresh} disabled={anyChecking || loading} style={{ flexShrink: 0 }}>
-          <RefreshCw size={14} className={anyChecking ? 'icon-spin' : undefined} /> {t('common.refresh')}
+          <RefreshIcon spinning={anyChecking} /> {t('common.refresh')}
         </Button>
         <Button
           size="sm"
@@ -571,7 +572,15 @@ export function ServersManager({ instanceName }: Props) {
                   <button disabled={instanceRunning} onClick={() => openEdit(index, server)} style={{ background: 'none', border: 'none', padding: 4, cursor: instanceRunning ? 'not-allowed' : 'pointer', opacity: instanceRunning ? 0.4 : 1, color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Pencil size={14} /></button>
                 </Tooltip>
                 <Tooltip content={t('servers.delete')}>
-                  <button disabled={instanceRunning} onClick={() => setDeleteTarget({ index, name: server.name, ip: server.ip, fingerprint: server.fingerprint })} style={{ background: 'none', border: 'none', padding: 4, cursor: instanceRunning ? 'not-allowed' : 'pointer', opacity: instanceRunning ? 0.4 : 1, color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Trash2 size={14} /></button>
+                  <button
+                    type="button"
+                    disabled={instanceRunning}
+                    onClick={() => setDeleteTarget({ index, name: server.name, ip: server.ip, fingerprint: server.fingerprint })}
+                    className="icon-action icon-action--danger"
+                    aria-label={t('servers.delete')}
+                  >
+                    <Trash2 size={14} />
+                  </button>
                 </Tooltip>
               </div>
             </div>

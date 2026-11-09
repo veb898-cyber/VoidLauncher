@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Camera, FolderOpen, RefreshCw, Trash2 } from 'lucide-react';
+import { Camera, FolderOpen, Trash2 } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { RefreshIcon } from '../ui/RefreshIcon';
 import { Tooltip } from '../ui/Tooltip';
 import { Modal } from '../ui/Modal';
 import { addToast } from '../ui/Toast';
@@ -121,7 +122,7 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
           </span>
         </h2>
         <Button size="sm" variant="ghost" onClick={loadScreenshots} disabled={loading}>
-          <RefreshCw size={14} className={loading ? 'icon-spin' : undefined} /> {t('common.refresh')}
+          <RefreshIcon spinning={loading} /> {t('common.refresh')}
         </Button>
       </div>
 

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { Copy, Check, Play, Radio, RefreshCw, ExternalLink, LogOut, Users } from 'lucide-react';
+import { Copy, Check, Play, Radio, ExternalLink, LogOut, Users } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { RefreshIcon } from '../ui/RefreshIcon';
 import { CustomSelect } from '../ui/CustomSelect';
 import type { SelectOption } from '../ui/CustomSelect';
 import { RoomShareHelpModal } from './RoomShareHelpModal';
@@ -32,6 +33,7 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
   const [copied, setCopied] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
+  const [detectingPort, setDetectingPort] = useState(false);
 
   // Instances this component has positively seen running (fed by the
   // game_started/launch_complete events in useGameEvents). Used to distinguish
@@ -159,8 +161,19 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
         </div>
 
         <div style={{ display: 'flex', gap: 'var(--space-md)', alignItems: 'center', marginTop: 'var(--space-lg)', flexWrap: 'wrap' }}>
-          <Button variant="secondary" onClick={() => { detectMinecraftPort(); }}>
-            <RefreshCw size={16} style={{ marginRight: 6 }} />
+          <Button
+            variant="secondary"
+            disabled={detectingPort}
+            onClick={async () => {
+              setDetectingPort(true);
+              try {
+                await detectMinecraftPort();
+              } finally {
+                setDetectingPort(false);
+              }
+            }}
+          >
+            <RefreshIcon spinning={detectingPort} size={16} />
             {t('rooms.host_detect')}
           </Button>
           <span style={{ color: portReady ? 'var(--success)' : 'var(--text-tertiary)', fontSize: 'var(--font-size-sm)' }}>

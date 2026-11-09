@@ -11,10 +11,14 @@ export interface AppConfig {
   default_gc_preset: 'standard' | 'g1gc' | 'zgc';
   default_jvm_args: string[];
   java_path: string | null;
-  close_on_launch: boolean;
+  after_launch_action: 'do_nothing' | 'minimize' | 'close';
   proxy_enabled: boolean;
   proxy_addr: string;
   proxy_port: number;
+  /** Use the Windows system proxy instead of the manual address. */
+  use_system_proxy: boolean;
+  /** Never fall back to a direct connection after a proxy failure. */
+  proxy_only: boolean;
   // Kept for config save/load compatibility with the Rust struct
   // (fields are no longer editable in the UI).
   show_snapshots: boolean;

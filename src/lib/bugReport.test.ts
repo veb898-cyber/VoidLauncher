@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { t } from './i18n';
 import { useLanguageStore } from '../stores/languageStore';
+import { useToastSettingsStore } from '../stores/toastSettingsStore';
 import {
   buildBugReport,
   BUG_REPORT_ISSUE_URL,
+  bugReportFieldErrors,
+  isBugReportComplete,
   redactReportText,
   resolveReportForCopy,
   type BugReportFields,
@@ -214,6 +217,24 @@ describe('bug report composition', () => {
     ).toBeNull();
   });
 
+  it('requires steps, expected and actual behavior as well', () => {
+    for (const field of ['steps', 'expected', 'actual'] as const) {
+      expect(resolveReportForCopy('', { ...fields, [field]: ' \n\t ' }, [], labels)).toBeNull();
+    }
+  });
+
+  it('allows a complete report with the optional extra field empty', () => {
+    const report = resolveReportForCopy('', { ...fields, extra: '' }, [], labels);
+    expect(report).toContain('## Summary');
+    expect(report).not.toContain('## Additional info');
+  });
+
+  it('does not accept an edited preview while required fields are missing', () => {
+    expect(
+      resolveReportForCopy('manually edited text', { ...fields, steps: '' }, [], labels, true),
+    ).toBeNull();
+  });
+
   it('does not include a secret pasted into a user field', () => {
     const report = buildBugReport(
       { ...fields, summary: '--accessToken synthetic-secret' },
@@ -227,6 +248,32 @@ describe('bug report composition', () => {
   it('opens the bug-report issue template without sending anything', () => {
     expect(BUG_REPORT_ISSUE_URL).toContain('/issues/new');
     expect(BUG_REPORT_ISSUE_URL).toContain('template=bug_report.yml');
+  });
+});
+
+describe('bug report validation', () => {
+  it('reports every empty required field, including whitespace-only values', () => {
+    expect(
+      bugReportFieldErrors({
+        summary: ' ',
+        steps: '\n\t',
+        expected: 'The game should start',
+        actual: '',
+        extra: 'kept as optional',
+      }),
+    ).toEqual({ summary: 'required', steps: 'required', actual: 'required' });
+    expect(isBugReportComplete(fields)).toBe(true);
+    expect(isBugReportComplete({ ...fields, actual: '   ' })).toBe(false);
+  });
+
+  it('does not depend on Toast settings or any UI notification state', () => {
+    // Pure validation: no toast/store imports and no side effects.
+    useToastSettingsStore.setState({ success: false, warning: false, error: false });
+    expect(isBugReportComplete({ ...fields, expected: '' })).toBe(false);
+    expect(
+      bugReportFieldErrors({ ...fields, expected: '' }).expected,
+    ).toBe('required');
+    useToastSettingsStore.setState({ success: true, warning: true, error: true });
   });
 });
 

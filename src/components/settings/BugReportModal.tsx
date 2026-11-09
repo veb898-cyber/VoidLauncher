@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type TextareaHTMLAttributes,
+} from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { Copy, ExternalLink, RefreshCw } from 'lucide-react';
@@ -11,7 +18,11 @@ import { friendlyErrorMessage } from '../../lib/errors';
 import {
   buildBugReport,
   BUG_REPORT_ISSUE_URL,
+  bugReportFieldErrors,
+  isBugReportComplete,
+  REQUIRED_BUG_REPORT_FIELDS,
   resolveReportForCopy,
+  type BugReportField,
   type BugReportFields,
   type BugReportSection,
 } from '../../lib/bugReport';
@@ -78,6 +89,59 @@ async function copyText(text: string) {
   area.remove();
 }
 
+/**
+ * Text field that never shows a manual resize handle: its height follows the
+ * wrapped content (including soft line breaks) and shrinks back when text is
+ * deleted. `rows` is kept as the minimum height, so an empty field still has
+ * the same comfortable size as before. Width is untouched (100% of the
+ * form); the modal body provides the scrollbar when the report gets long.
+ *
+ * `useLayoutEffect` runs on every render: the textarea is controlled, so a
+ * value change (typing, deleting, or resetting the form on open) always has a
+ * fresh `scrollHeight` to measure before the browser paints.
+ */
+function AutoResizeTextarea({
+  rows = 2,
+  style,
+  ...props
+}: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    // `height: auto` first, otherwise scrollHeight is clamped to the current
+    // height and the field could never shrink.
+    el.style.height = 'auto';
+    const computed = window.getComputedStyle(el);
+    const borderY =
+      (parseFloat(computed.borderTopWidth) || 0) +
+      (parseFloat(computed.borderBottomWidth) || 0);
+    const paddingY =
+      (parseFloat(computed.paddingTop) || 0) +
+      (parseFloat(computed.paddingBottom) || 0);
+    const lineHeight = parseFloat(computed.lineHeight) || 20;
+    const minHeight = lineHeight * rows + paddingY + borderY;
+    // scrollHeight includes padding but not borders; add them back because
+    // `.input` uses border-box. The extra pixel absorbs fractional rounding.
+    el.style.height = `${Math.max(minHeight, Math.ceil(el.scrollHeight) + borderY + 1)}px`;
+  });
+
+  return (
+    <textarea
+      ref={ref}
+      rows={rows}
+      {...props}
+      style={{
+        resize: 'none',
+        overflowX: 'hidden',
+        overflowY: 'hidden',
+        ...style,
+      }}
+    />
+  );
+}
+
 export function BugReportModal({
   open,
   onClose,
@@ -98,6 +162,24 @@ export function BugReportModal({
   const [preparing, setPreparing] = useState(false);
   const [prepareError, setPrepareError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState(false);
+  const [touched, setTouched] = useState<Partial<Record<BugReportField, boolean>>>({});
+  const errors = bugReportFieldErrors(fields);
+  const complete = isBugReportComplete(fields);
+
+  const markTouched = (field: BugReportField) => {
+    setTouched((previous) => (previous[field] ? previous : { ...previous, [field]: true }));
+  };
+
+  const markAllRequiredTouched = () => {
+    setTouched((previous) => {
+      const next = { ...previous };
+      for (const field of REQUIRED_BUG_REPORT_FIELDS) next[field] = true;
+      return next;
+    });
+  };
+
+  const fieldError = (field: BugReportField): string | null =>
+    touched[field] && errors[field] ? t('bug.field_required') : null;
 
   useEffect(() => {
     if (!open) return;
@@ -110,6 +192,7 @@ export function BugReportModal({
     setLogs({});
     setPrepareError(null);
     setDiagnostics(diagReport);
+    setTouched({});
     let cancelled = false;
     setPreparing(true);
     (async () => {
@@ -281,8 +364,8 @@ export function BugReportModal({
   });
 
   const generate = (): string | null => {
-    if (!fields.summary.trim()) {
-      addToast(t('bug.summary_required'), 'error');
+    if (!complete) {
+      markAllRequiredTouched();
       return null;
     }
     const report = buildBugReport(fields, allSections(), reportLabels());
@@ -291,7 +374,12 @@ export function BugReportModal({
     return report;
   };
 
-  const copyReport = async () => {
+  /**
+   * The one place that actually copies/builds the report. Both the Copy button
+   * and the “Open GitHub issue” flow go through it, so an incomplete form can
+   * never reach the clipboard or the external issue page.
+   */
+  const performCopy = async (): Promise<boolean> => {
     const report = resolveReportForCopy(
       reportText,
       fields,
@@ -300,7 +388,7 @@ export function BugReportModal({
       previewEditedRef.current,
     );
     if (!report) {
-      addToast(t('bug.summary_required'), 'error');
+      markAllRequiredTouched();
       return false;
     }
     if (!previewEditedRef.current) setReportText(report);
@@ -314,11 +402,21 @@ export function BugReportModal({
     }
   };
 
+  const copyReport = async (): Promise<boolean> => {
+    if (busyAction) return false;
+    setBusyAction(true);
+    try {
+      return await performCopy();
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
   const openIssue = async () => {
     if (busyAction) return;
     setBusyAction(true);
     try {
-      const copied = await copyReport();
+      const copied = await performCopy();
       if (!copied) return;
       await openUrl(BUG_REPORT_ISSUE_URL);
     } catch (error) {
@@ -345,6 +443,15 @@ export function BugReportModal({
     }
   };
 
+  const requiredMark = (
+    <span aria-hidden="true" style={{ color: 'var(--error)' }}> *</span>
+  );
+  const optionalMark = (
+    <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>
+      {' '}({t('bug.optional')})
+    </span>
+  );
+
   return (
     <Modal
       open={open}
@@ -354,10 +461,10 @@ export function BugReportModal({
       footer={
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
           <Button variant="ghost" onClick={onClose} disabled={busyAction}>{t('common.cancel')}</Button>
-          <Button variant="secondary" onClick={copyReport} disabled={busyAction || preparing}>
+          <Button variant="secondary" onClick={copyReport} disabled={busyAction || preparing || !complete}>
             <Copy size={14} /> {t('bug.copy')}
           </Button>
-          <Button onClick={openIssue} disabled={busyAction || preparing}>
+          <Button onClick={openIssue} disabled={busyAction || preparing || !complete}>
             <ExternalLink size={14} /> {t('bug.open_github')}
           </Button>
         </div>
@@ -375,6 +482,10 @@ export function BugReportModal({
           {t('bug.privacy_warning')}
         </div>
 
+        <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
+          {t('bug.required_hint')}
+        </div>
+
         {prepareError && (
           <div style={{ color: 'var(--color-danger)', fontSize: 'var(--font-size-sm)' }}>
             {t('bug.prepare_error', { error: prepareError })}
@@ -382,24 +493,71 @@ export function BugReportModal({
         )}
 
         <div style={{ display: 'grid', gap: 'var(--space-sm)' }}>
-          <label className="input__label" htmlFor="bug-summary">{t('bug.summary')}</label>
-          <textarea id="bug-summary" className="input" rows={3}
+          <label className="input__label" htmlFor="bug-summary">
+            {t('bug.summary')}{requiredMark}
+          </label>
+          <AutoResizeTextarea id="bug-summary" className="input" rows={3}
+            aria-required="true"
+            aria-invalid={touched.summary && !!errors.summary}
+            aria-describedby={fieldError('summary') ? 'bug-summary-error' : undefined}
             placeholder={t('bug.summary_placeholder')}
+            onBlur={() => markTouched('summary')}
             value={fields.summary} onChange={(e) => setField('summary', e.target.value)} />
-          <label className="input__label" htmlFor="bug-steps">{t('bug.steps')}</label>
-          <textarea id="bug-steps" className="input" rows={3}
+          {fieldError('summary') && (
+            <div id="bug-summary-error" role="alert" style={{ color: 'var(--error)', fontSize: 'var(--font-size-sm)' }}>
+              {t('bug.field_required')}
+            </div>
+          )}
+          <label className="input__label" htmlFor="bug-steps">
+            {t('bug.steps')}{requiredMark}
+          </label>
+          <AutoResizeTextarea id="bug-steps" className="input" rows={3}
+            aria-required="true"
+            aria-invalid={touched.steps && !!errors.steps}
+            aria-describedby={fieldError('steps') ? 'bug-steps-error' : undefined}
             placeholder={t('bug.steps_placeholder')}
+            onBlur={() => markTouched('steps')}
             value={fields.steps} onChange={(e) => setField('steps', e.target.value)} />
-          <label className="input__label" htmlFor="bug-expected">{t('bug.expected')}</label>
-          <textarea id="bug-expected" className="input" rows={2}
+          {fieldError('steps') && (
+            <div id="bug-steps-error" role="alert" style={{ color: 'var(--error)', fontSize: 'var(--font-size-sm)' }}>
+              {t('bug.field_required')}
+            </div>
+          )}
+          <label className="input__label" htmlFor="bug-expected">
+            {t('bug.expected')}{requiredMark}
+          </label>
+          <AutoResizeTextarea id="bug-expected" className="input" rows={2}
+            aria-required="true"
+            aria-invalid={touched.expected && !!errors.expected}
+            aria-describedby={fieldError('expected') ? 'bug-expected-error' : undefined}
             placeholder={t('bug.expected_placeholder')}
+            onBlur={() => markTouched('expected')}
             value={fields.expected} onChange={(e) => setField('expected', e.target.value)} />
-          <label className="input__label" htmlFor="bug-actual">{t('bug.actual')}</label>
-          <textarea id="bug-actual" className="input" rows={2}
+          {fieldError('expected') && (
+            <div id="bug-expected-error" role="alert" style={{ color: 'var(--error)', fontSize: 'var(--font-size-sm)' }}>
+              {t('bug.field_required')}
+            </div>
+          )}
+          <label className="input__label" htmlFor="bug-actual">
+            {t('bug.actual')}{requiredMark}
+          </label>
+          <AutoResizeTextarea id="bug-actual" className="input" rows={2}
+            aria-required="true"
+            aria-invalid={touched.actual && !!errors.actual}
+            aria-describedby={fieldError('actual') ? 'bug-actual-error' : undefined}
             placeholder={t('bug.actual_placeholder')}
+            onBlur={() => markTouched('actual')}
             value={fields.actual} onChange={(e) => setField('actual', e.target.value)} />
-          <label className="input__label" htmlFor="bug-extra">{t('bug.extra')}</label>
-          <textarea id="bug-extra" className="input" rows={2}
+          {fieldError('actual') && (
+            <div id="bug-actual-error" role="alert" style={{ color: 'var(--error)', fontSize: 'var(--font-size-sm)' }}>
+              {t('bug.field_required')}
+            </div>
+          )}
+          <label className="input__label" htmlFor="bug-extra">
+            {t('bug.extra')}{optionalMark}
+          </label>
+          <AutoResizeTextarea id="bug-extra" className="input" rows={2}
+            aria-required="false"
             placeholder={t('bug.extra_placeholder')}
             value={fields.extra} onChange={(e) => setField('extra', e.target.value)} />
         </div>
@@ -478,17 +636,22 @@ export function BugReportModal({
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
-          <Button size="sm" onClick={() => generate()} disabled={preparing}>
+          <Button
+            size="sm"
+            onClick={() => generate()}
+            disabled={preparing || !complete}
+            title={!complete ? t('bug.required_hint') : undefined}
+          >
             {t('bug.generate')}
           </Button>
           <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
-            {t('bug.preview_hint')}
+            {!complete ? t('bug.required_hint') : t('bug.preview_hint')}
           </span>
         </div>
 
         <label className="input__label" htmlFor="bug-preview">{t('bug.preview')}</label>
         <textarea id="bug-preview" className="input" rows={14}
-          style={{ fontFamily: 'var(--font-mono, monospace)', resize: 'vertical' }}
+          style={{ fontFamily: 'var(--font-mono, monospace)', resize: 'none' }}
           value={reportText}
           placeholder={t('bug.preview_placeholder')}
           onChange={(e) => {

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, X, Check, Download, AlertTriangle } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
@@ -15,11 +16,23 @@ import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { renderMarkdownToHtml, hydrateRemoteImages } from '../../lib/markdown';
 import { RemoteIcon } from '../../lib/remoteImage';
 import {
-  getProvider, isCurrentProviderRequest,
-  type ProviderId, type ProviderProject, type ProviderRequestToken,
+  getProvider,
+  isCurrentProviderRequest,
+  readContentProviderPreference,
+  writeContentProviderPreference,
+  type ProviderId,
+  type ProviderProject,
+  type ProviderRequestToken,
 } from '../../lib/contentProviders';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { batchImportToastType } from '../../lib/localImport';
+import { formatBytes } from '../../lib/format';
+import {
+  countProgressPercent,
+  fileProgressPercent,
+  weightedProgressPercent,
+  type FileProgressPayload,
+} from '../../lib/downloadProgress';
 
 type Hit = ProviderProject;
 
@@ -39,6 +52,8 @@ export interface SelectedItem {
   sha1?: string;
   /** CurseForge file id — required for the id-chain download. */
   fileId?: string;
+  /** Provider-reported size when available (bytes). */
+  size?: number;
 }
 
 /** Backend dependency-resolution payloads (cmd_resolve_dependencies). */
@@ -70,7 +85,7 @@ interface PlanEntry {
   name: string;
   version_label: string;
   icon_url?: string | null;
-  file: { url: string; filename: string; sha1?: string | null; file_id?: string | null };
+  file: { url: string; filename: string; sha1?: string | null; file_id?: string | null; size?: number | null };
   depth: number;
   required_by: string[];
   is_root: boolean;
@@ -95,8 +110,6 @@ interface Resolution {
   skipped: SkippedDep[];
   unresolved: UnresolvedDep[];
 }
-
-const PROVIDER_STORAGE_KEY = 'voidlauncher.contentProvider';
 
 /** A hung resolver must not block the confirm view forever: after this
  *  budget the Install button unlocks with an error toast (owner wave 25). */
@@ -142,11 +155,12 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     if (!loadingDetail) hydrateRemoteImages(mdBodyRef.current);
   }, [loadingDetail, modDetail]);
   const [versions, setVersions] = useState<any[]>([]);
-  // Catalog provider (Modrinth / CurseForge), persisted across sessions.
-  const [providerId, setProviderId] = useState<ProviderId>(() => {
-    const saved = localStorage.getItem(PROVIDER_STORAGE_KEY);
-    return saved === 'curseforge' ? 'curseforge' : 'modrinth';
-  });
+  // Catalog provider (Modrinth / CurseForge). Each content type has its own
+  // preference and starts on Modrinth; a CurseForge choice made in the mods
+  // catalog must not leak into resource packs or shaders.
+  const [providerId, setProviderId] = useState<ProviderId>(() =>
+    readContentProviderPreference(contentType),
+  );
   const provider = getProvider(providerId);
   // Provider switches advance a generation so an `addLatest` request that was
   // started against the old catalog can never mutate the new selection.
@@ -158,7 +172,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     providerIdRef.current = next;
     providerGenRef.current += 1;
     setProviderId(next);
-  }, []);
+    writeContentProviderPreference(contentType, next);
+  }, [contentType]);
   const curseforgeApiKey = useSettingsStore((s) => s.config?.curseforge_api_key);
   const [sortMode, setSortMode] = useState<SortMode>('downloads');
   // Modrinth has no "oldest" index; we request newest and page backwards.
@@ -182,7 +197,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const [addingId, setAddingId] = useState<string | null>(null);
   const [subView, setSubView] = useState<'search' | 'confirm'>('search');
   const [installing, setInstalling] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadProgress, setDownloadProgress] = useState<number | null>(0);
+  const [fileProgress, setFileProgress] = useState<FileProgressPayload | null>(null);
+  const activeFileRef = useRef<{ filename: string; url: string } | null>(null);
+  const completedBytesRef = useRef(0);
+  const completedFilesRef = useRef(0);
+  const totalBytesRef = useRef(0);
+  const totalFilesRef = useRef(0);
+  const sizesKnownRef = useRef(false);
   const [popularOffset, setPopularOffset] = useState(0);
   const [resultsOffset, setResultsOffset] = useState(0);
   const [hasMorePopular, setHasMorePopular] = useState(true);
@@ -231,7 +253,53 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     return () => setPending(0);
   }, [selectedItems, setPending]);
 
+  // Real byte progress for the file currently being installed. The backend
+  // emits this for every download; matching the destination file name keeps
+  // unrelated background downloads out of this pane.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    listen<FileProgressPayload>('modpack_file_progress', (event) => {
+      if (disposed) return;
+      const active = activeFileRef.current;
+      if (!active) return;
+      const payload = event.payload;
+      if (payload.file_name && payload.file_name !== active.filename) return;
+      setFileProgress(payload);
+
+      if (sizesKnownRef.current && totalBytesRef.current > 0) {
+        const percent = weightedProgressPercent(
+          completedBytesRef.current,
+          payload.downloaded,
+          totalBytesRef.current,
+        );
+        setDownloadProgress(percent == null ? null : Math.round(percent));
+        return;
+      }
+      if (payload.total != null && payload.total > 0) {
+        const currentFraction = Math.min(1, payload.downloaded / payload.total);
+        const total = Math.max(1, totalFilesRef.current);
+        const percent = ((completedFilesRef.current + currentFraction) / total) * 100;
+        setDownloadProgress(Math.min(99, Math.round(percent)));
+      } else if (totalFilesRef.current <= 1) {
+        // No trustworthy total for a single file: keep the bar indeterminate
+        // instead of pretending it is at 100%.
+        setDownloadProgress(null);
+      }
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   const requestLeave = () => {
+    if (installing) return;
     if (selectedItems.length > 0) {
       setShowLeaveConfirm(true);
     } else {
@@ -239,11 +307,20 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     }
   };
 
+  // Follow the per-content-type preference when the catalog changes (the
+  // component may be reused while its parent switches tabs).
+  useEffect(() => {
+    const next = readContentProviderPreference(contentType);
+    if (next === providerIdRef.current) return;
+    providerIdRef.current = next;
+    providerGenRef.current += 1;
+    setProviderId(next);
+  }, [contentType]);
+
   // Switching catalog: drop everything keyed by the old provider (ids,
   // selections, resolved plan) and start a fresh popular list. The reload
   // itself happens through loadPopular's own effect (providerId is a dep).
   useEffect(() => {
-    localStorage.setItem(PROVIDER_STORAGE_KEY, providerId);
     ++popularReqRef.current;
     ++searchReqRef.current;
     ++resolveReqRef.current;
@@ -267,7 +344,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setLoading(false);
     setLoadingMore(false);
     hadSearchRef.current = false;
-  }, [providerId, commitSelectedItems]);
+  }, [contentType, providerId, commitSelectedItems]);
 
   // Sequence guards: a slow response from an outdated request (fast sort /
   // filter switching) must never overwrite fresher results.
@@ -606,6 +683,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         versionName: p.version_label,
         sha1: p.file.sha1 ?? undefined,
         fileId: p.file.file_id ?? undefined,
+        size: p.file.size ?? undefined,
         isDependency: !p.is_root,
         parentMod: p.is_root ? undefined : (p.required_by[0] || undefined),
       })));
@@ -688,6 +766,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           versionName: v.name || v.version_number,
           sha1: file.hashes?.sha1,
           fileId: file.file_id,
+          size: file.size,
         };
         // Re-read the selection after the await: another add may have landed
         // while this one was fetching versions, and appending to the old
@@ -724,12 +803,36 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   };
 
   const handleDownloadAll = async () => {
+    const items = selectedItemsRef.current;
+    if (items.length === 0) return;
+
     setInstalling(true);
+    setFileProgress(null);
+    activeFileRef.current = null;
+    const sizes = items.map((item) => item.size && item.size > 0 ? item.size : 0);
+    const allSizesKnown = sizes.every((size) => size > 0);
+    const totalBytes = allSizesKnown ? sizes.reduce((sum, size) => sum + size, 0) : 0;
+    totalBytesRef.current = totalBytes;
+    totalFilesRef.current = items.length;
+    completedBytesRef.current = 0;
+    completedFilesRef.current = 0;
+    sizesKnownRef.current = allSizesKnown;
+    setDownloadProgress(0);
+
     let success = 0;
     let failed = 0;
-    for (let i = 0; i < selectedItems.length; i++) {
-      const item = selectedItems[i];
-      setDownloadProgress(Math.round(((i + 1) / selectedItems.length) * 100));
+    for (const item of items) {
+      activeFileRef.current = { filename: item.filename, url: item.downloadUrl };
+      setFileProgress({
+        url: item.downloadUrl,
+        file_name: item.filename,
+        downloaded: 0,
+        total: item.size && item.size > 0 ? item.size : null,
+      });
+      const startPercent = allSizesKnown
+        ? weightedProgressPercent(completedBytesRef.current, 0, totalBytes)
+        : countProgressPercent(completedFilesRef.current, items.length);
+      setDownloadProgress(startPercent == null ? null : Math.round(startPercent));
       try {
         await invoke('cmd_download_to_folder', {
           instanceName,
@@ -745,10 +848,31 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           fileId: item.fileId ?? null,
         });
         success++;
-      } catch (e: any) { failed++; addToast(t('content.install_error', { name: item.name, error: e.toString() }), 'error'); }
+        completedFilesRef.current += 1;
+        if (item.size && item.size > 0) completedBytesRef.current += item.size;
+      } catch (e: any) {
+        failed++;
+        completedFilesRef.current += 1;
+        addToast(t('content.install_error', { name: item.name, error: e.toString() }), 'error');
+      }
+      activeFileRef.current = null;
+
+      if (allSizesKnown) {
+        const percent = weightedProgressPercent(
+          completedBytesRef.current,
+          0,
+          totalBytes,
+        );
+        setDownloadProgress(percent == null ? null : Math.round(percent));
+      } else {
+        const percent = countProgressPercent(completedFilesRef.current, items.length);
+        setDownloadProgress(percent == null ? null : Math.round(percent));
+      }
     }
+
+    setFileProgress(null);
     setInstalling(false);
-    setDownloadProgress(0);
+    setDownloadProgress(failed === 0 ? 100 : 99);
     addToast(
       t('content.install_result', { success: success.toString(), failed: failed.toString() }),
       batchImportToastType(success, failed),
@@ -791,7 +915,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     return (
       <div className="content-confirm" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <div style={{ padding: 'var(--space-md) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', flexShrink: 0 }}>
-          <Button variant="ghost" size="sm" onClick={() => setSubView('search')}><ArrowLeft size={16} /> {t('common.back')}</Button>
+          <Button variant="ghost" size="sm" onClick={() => setSubView('search')} disabled={installing}><ArrowLeft size={16} /> {t('common.back')}</Button>
           <h2 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700, flex: 1 }}>{t('content.confirm_heading', { label, count: selectedItems.length.toString() })}</h2>
           <Button onClick={handleDownloadAll} disabled={installing || resolving || selectedItems.length === 0 || conflicts.length > 0} loading={installing || resolving}>
             <Download size={14} /> {t('common.install')}
@@ -799,9 +923,37 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         </div>
         {installing && (
           <div className="content-confirm__progress" style={{ margin: 'var(--space-md) var(--space-xl)', borderRadius: 'var(--radius-md)', padding: 'var(--space-md)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, fontSize: 'var(--font-size-sm)' }}><span>{t('common.installing')}</span><span>{downloadProgress}%</span></div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, fontSize: 'var(--font-size-sm)' }}>
+              <span>{t('common.installing')}</span>
+              <span>{downloadProgress != null ? `${downloadProgress}%` : ''}</span>
+            </div>
             <div style={{ height: 4, background: 'var(--bg-tertiary)', borderRadius: 2, overflow: 'hidden' }}>
-              <div style={{ height: '100%', width: `${downloadProgress}%`, background: 'var(--primary)', borderRadius: 2, transition: 'width 0.3s' }} />
+              <div style={{
+                height: '100%',
+                width: downloadProgress != null ? `${downloadProgress}%` : '100%',
+                background: 'var(--primary)',
+                borderRadius: 2,
+                transition: 'width 0.3s',
+                animation: downloadProgress == null ? 'indeterminate 1.2s ease-in-out infinite' : undefined,
+              }} />
+            </div>
+            {fileProgress && (
+              <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 4 }}>
+                {fileProgress.total != null && fileProgress.total > 0
+                  ? t('content.file_progress', {
+                      bytes: formatBytes(fileProgress.downloaded),
+                      total: formatBytes(fileProgress.total),
+                      percent: String(Math.round(
+                        fileProgressPercent(fileProgress.downloaded, fileProgress.total) ?? 0,
+                      )),
+                    })
+                  : t('content.file_progress_unknown', {
+                      bytes: formatBytes(fileProgress.downloaded),
+                    })}
+              </div>
+            )}
+            <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 4 }}>
+              {t('content.install_keep_open')}
             </div>
           </div>
         )}
@@ -851,7 +1003,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
                     <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{item.versionName} · {item.source}</div>
                   </div>
-                  <Button size="sm" variant="ghost" onClick={() => removeItem(selectedItems.indexOf(item))}><X size={12} /></Button>
+                  <Button size="sm" variant="ghost" onClick={() => removeItem(selectedItems.indexOf(item))} disabled={installing}><X size={12} /></Button>
                 </div>
               ))}
             </div>
@@ -866,7 +1018,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                     <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
                     <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('content.dep_required_by', { parent: item.parentMod ?? '' })}</div>
                   </div>
-                  <Button size="sm" variant="ghost" onClick={() => removeItem(selectedItems.indexOf(item))}><X size={12} /></Button>
+                  <Button size="sm" variant="ghost" onClick={() => removeItem(selectedItems.indexOf(item))} disabled={installing}><X size={12} /></Button>
                 </div>
               ))}
             </div>
@@ -1063,6 +1215,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                                 versionName: v.name || v.version_number,
                                 sha1: file.hashes?.sha1,
                                 fileId: file.file_id,
+                                size: file.size,
                               };
                               const next = [...selectedItemsRef.current, item];
                               commitSelectedItems(next);

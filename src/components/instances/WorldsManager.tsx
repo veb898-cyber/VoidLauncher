@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Globe, FolderOpen, Pencil, Copy, Trash2, RefreshCw, Archive, RotateCcw } from 'lucide-react';
+import { Globe, FolderOpen, Pencil, Copy, Trash2, Archive, RotateCcw } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { RefreshIcon } from '../ui/RefreshIcon';
 import { CopyButton } from '../ui/CopyButton';
 import { Tooltip } from '../ui/Tooltip';
 import { Modal } from '../ui/Modal';
@@ -207,7 +208,7 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
           </span>
         </h2>
         <Button size="sm" variant="ghost" onClick={loadSaves} disabled={loading}>
-          <RefreshCw size={14} className={loading ? 'icon-spin' : undefined} /> {t('common.refresh')}
+          <RefreshIcon spinning={loading} /> {t('common.refresh')}
         </Button>
       </div>
 
@@ -298,7 +299,7 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
                 </Tooltip>
                 <Tooltip content={t('worlds.rename')}><button onClick={() => { setRenameTarget(save); setRenameValue(save.name); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Pencil size={14} /></button></Tooltip>
                 <Tooltip content={t('worlds.copy')}><button onClick={() => { setCopyTarget(save); setCopyValue(`${save.name} ${t('worlds.copy_suffix')}`); }} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Copy size={14} /></button></Tooltip>
-                <Tooltip content={t('worlds.delete')}><button onClick={() => setDeleteTarget(save)} style={{ background: 'none', border: 'none', padding: 4, cursor: 'pointer', color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Trash2 size={14} /></button></Tooltip>
+                <Tooltip content={t('worlds.delete')}><button type="button" onClick={() => setDeleteTarget(save)} className="icon-action icon-action--danger" aria-label={t('worlds.delete')}><Trash2 size={14} /></button></Tooltip>
                 {save.seed != null && (
                   <Tooltip content={t('worlds.copy_seed')}>
                     <CopyButton

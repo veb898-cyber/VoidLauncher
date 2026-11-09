@@ -1253,13 +1253,9 @@ pub async fn cmd_launch_game(
         },
     );
 
-    // "Close on launch": the window close triggers the playtime flush
-    // (WindowEvent::CloseRequested), then the app exits, leaving only the game.
-    if config.close_on_launch {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.close();
-        }
-    }
+    // The window action (do nothing / minimize / close) is performed by the
+    // frontend's `game_started` handler using the saved preference. It only
+    // runs after this event, i.e. after the process is confirmed running.
 
     // The process exists: publish this instance as `Running` (it stops being
     // `Starting`) together with the verified process identity, and keep it

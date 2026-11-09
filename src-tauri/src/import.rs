@@ -41,6 +41,10 @@ pub struct ImportProgressPayload {
     pub current: usize,
     pub total: usize,
     pub message: String,
+    /// Real bytes completed for the current byte-aware stage (0 = unknown).
+    pub bytes_done: u64,
+    /// Real byte total when every file size is known (0 = indeterminate).
+    pub bytes_total: u64,
 }
 
 /// One file that could not be installed during a pack import.
@@ -129,6 +133,21 @@ pub(crate) fn emit_progress(
     total: usize,
     message: &str,
 ) {
+    emit_progress_bytes(app, stage, current, total, 0, 0, message);
+}
+
+/// Same as [`emit_progress`], with byte counters for stages where the real
+/// downloaded size is known. The UI uses bytes for a weighted bar instead of
+/// treating every file as equally large.
+pub(crate) fn emit_progress_bytes(
+    app: Option<&AppHandle>,
+    stage: &str,
+    current: usize,
+    total: usize,
+    bytes_done: u64,
+    bytes_total: u64,
+    message: &str,
+) {
     if let Some(app) = app {
         let _ = app.emit(
             "import-progress",
@@ -137,6 +156,8 @@ pub(crate) fn emit_progress(
                 current,
                 total,
                 message: message.to_string(),
+                bytes_done,
+                bytes_total,
             },
         );
     }
@@ -1335,12 +1356,14 @@ async fn prepare_version_and_assets(
         );
         if let Err(e) = download::download_files(
             missing,
-            |completed, total, _bytes_done, _bytes_total, _msg| {
-                emit_progress(
+            |completed, total, bytes_done, bytes_total, _msg| {
+                emit_progress_bytes(
                     app,
                     "files",
                     completed,
                     total,
+                    bytes_done,
+                    bytes_total,
                     &format!("Downloading game files ({}/{})", completed, total),
                 );
             },
@@ -1453,12 +1476,14 @@ async fn prepare_version_and_assets(
     if let Err(e) = download::download_assets(
         &asset_index,
         &config.assets_dir(),
-        |completed, total, _bytes_done, _bytes_total, _msg| {
-            emit_progress(
+        |completed, total, bytes_done, bytes_total, _msg| {
+            emit_progress_bytes(
                 app,
                 "assets",
                 completed,
                 total,
+                bytes_done,
+                bytes_total,
                 &format!("Downloading assets ({}/{})", completed, total),
             );
         },
@@ -1837,6 +1862,8 @@ pub(crate) async fn import_mrpack(
                             current: done,
                             total,
                             message: format!("Installed {}/{} files ({} mods in pack)", ok, total, mod_count),
+                            bytes_done: 0,
+                            bytes_total: 0,
                         },
                     );
                 }
@@ -2164,6 +2191,8 @@ pub(crate) async fn import_curseforge_pack(
                             current: done,
                             total,
                             message: format!("Downloading {} mods ({} active)...", total, inflight),
+                            bytes_done: 0,
+                            bytes_total: 0,
                         });
                     }
 
@@ -2208,6 +2237,8 @@ pub(crate) async fn import_curseforge_pack(
                             current: done,
                             total,
                             message: msg,
+                            bytes_done: 0,
+                            bytes_total: 0,
                         });
                     }
 

@@ -3,6 +3,7 @@ import { X, CheckCircle, AlertCircle, AlertTriangle, Info } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { logUiMessage, toastTypeToLogLevel } from '../../lib/uiLog';
 import { useT } from '../../lib/i18n';
+import { useToastSettingsStore, isToastCategoryEnabled } from '../../stores/toastSettingsStore';
 
 type ToastType = 'success' | 'error' | 'warning' | 'info';
 
@@ -83,27 +84,56 @@ let toasts: ToastData[] = [];
 let idCounter = 0;
 
 /**
+ * Whether a toast of this type may be shown. `info` is intentionally not
+ * user-configurable, so it always stays visible.
+ */
+function isCategoryEnabled(type: ToastType): boolean {
+  return isToastCategoryEnabled(type, useToastSettingsStore.getState());
+}
+
+/**
  * Show a toast. An identical one (same text AND type) that is still on
  * screen is NOT duplicated into a second bubble: its counter bumps — the
  * text becomes "… (2)", "… (3)" — and its lifetime restarts, so the latest
  * occurrence always gets a full reading time. A NEW toast appears when the
  * previous identical one has already faded away.
+ *
+ * A category switched off in Settings only hides the bubble: the call is
+ * still written to the launcher log, and the operation/error handling that
+ * produced it is untouched.
  */
 export function addToast(message: string, type: ToastType = 'info') {
-  const existing = toasts.find((t) => t.message === message && t.type === type);
-  if (existing) {
-    toasts = toasts.map((t) =>
-      t.id === existing.id ? { ...t, count: t.count + 1 } : t
-    );
-  } else {
-    const id = `toast-${++idCounter}`;
-    toasts = [...toasts, { id, message, type, count: 1 }];
+  if (isCategoryEnabled(type)) {
+    const existing = toasts.find((t) => t.message === message && t.type === type);
+    if (existing) {
+      toasts = toasts.map((t) =>
+        t.id === existing.id ? { ...t, count: t.count + 1 } : t
+      );
+    } else {
+      const id = `toast-${++idCounter}`;
+      toasts = [...toasts, { id, message, type, count: 1 }];
+    }
+    toastListeners.forEach((l) => l(toasts));
   }
-  toastListeners.forEach((l) => l(toasts));
   invoke('cmd_log_toast', { level: type, message }).catch(() => {
     logUiMessage(message, toastTypeToLogLevel(type), 'toast');
   });
 }
+
+/** Hide already-visible bubbles as soon as their category is switched off. */
+useToastSettingsStore.subscribe((state, previous) => {
+  if (
+    state.success === previous.success &&
+    state.warning === previous.warning &&
+    state.error === previous.error
+  ) {
+    return;
+  }
+  const next = toasts.filter((toast) => isCategoryEnabled(toast.type));
+  if (next.length === toasts.length) return;
+  toasts = next;
+  toastListeners.forEach((l) => l(toasts));
+});
 
 export function dismissToast(id: string) {
   toasts = toasts.filter((t) => t.id !== id);

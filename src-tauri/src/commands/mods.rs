@@ -122,6 +122,7 @@ fn scan_mod_files(
     mc_version: Option<&str>,
     loader: Option<&str>,
     content_type: &str,
+    only_files: Option<&std::collections::HashSet<String>>,
 ) -> ModScan {
     let mut mod_files: Vec<ModFile> = Vec::new();
     let mut hash_to_mod: std::collections::HashMap<String, usize> =
@@ -136,6 +137,13 @@ fn scan_mod_files(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
+            // Scoped update check: skip unselected files before reading and
+            // hashing the JAR, not merely after the network phase.
+            if let Some(only) = only_files {
+                if !only.contains(&filename.to_lowercase()) {
+                    continue;
+                }
+            }
             if filename.starts_with('.')
                 || filename.ends_with(".voidlauncher.json")
                 || filename.ends_with(".pw.toml")
@@ -334,8 +342,15 @@ pub async fn cmd_check_mod_updates(
     mc_version: Option<String>,
     loader: Option<String>,
     pack_type: String,
+    files: Option<Vec<String>>,
 ) -> Result<Vec<ModUpdateResult>, String> {
     validate_instance_name(&instance_name)?;
+
+    // An explicit selection limits the check to those files; an empty
+    // selection keeps the original whole-catalog behavior. Case-fold here
+    // because Windows filenames are case-insensitive.
+    let only_files: Option<std::collections::HashSet<String>> =
+        files.map(|files| files.into_iter().map(|file| file.to_lowercase()).collect());
 
     let packs_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -368,6 +383,7 @@ pub async fn cmd_check_mod_updates(
             mc_version_for_scan.as_deref(),
             loader_for_scan.as_deref(),
             content_type,
+            only_files.as_ref(),
         )
     })
     .await
@@ -5667,6 +5683,41 @@ displayName="Autochef's Delight"
     }
 
     #[test]
+    fn scan_mod_files_honors_a_selected_file_subset() {
+        let dir = test_dir("scan-selected");
+        let source = fabric_json("1.0.0");
+        for name in ["a.jar", "b.jar", "c.jar"] {
+            write_jar(&dir.join(name), &[("fabric.mod.json", source.as_str())]);
+        }
+
+        let names = |only: Option<&std::collections::HashSet<String>>| {
+            let mut names: Vec<String> =
+                scan_mod_files(&dir, true, Some("1.21.1"), Some("Fabric"), "mod", only)
+                    .mod_files
+                    .into_iter()
+                    .map(|file| file.filename)
+                    .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(names(None), vec!["a.jar", "b.jar", "c.jar"]);
+
+        let one = std::collections::HashSet::from(["a.jar".to_string()]);
+        assert_eq!(names(Some(&one)), vec!["a.jar"]);
+
+        // The command lowercases the incoming selection; the scan accepts
+        // that canonical set and matches Windows filenames case-insensitively.
+        let many = std::collections::HashSet::from(["a.jar".to_string(), "b.jar".to_string()]);
+        assert_eq!(names(Some(&many)), vec!["a.jar", "b.jar"]);
+
+        let none = std::collections::HashSet::from(["missing.jar".to_string()]);
+        assert!(names(Some(&none)).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn scan_mod_files_includes_multi_loader_mods_for_each_supported_loader() {
         let dir = test_dir("scan-multi-loader");
 
@@ -5705,7 +5756,7 @@ displayName="Autochef's Delight"
 
         let names = |loader: &str| {
             let mut names: Vec<String> =
-                scan_mod_files(&dir, true, Some("1.21.1"), Some(loader), "mod")
+                scan_mod_files(&dir, true, Some("1.21.1"), Some(loader), "mod", None)
                     .mod_files
                     .into_iter()
                     .map(|file| file.filename)
@@ -5734,7 +5785,7 @@ displayName="Autochef's Delight"
 
         // The multi-loader mod must carry the version of the descriptor that
         // matches the scanned loader, never the other loader's version.
-        let fabric_scan = scan_mod_files(&dir, true, Some("1.21.1"), Some("Fabric"), "mod");
+        let fabric_scan = scan_mod_files(&dir, true, Some("1.21.1"), Some("Fabric"), "mod", None);
         let multi = fabric_scan
             .mod_files
             .iter()
@@ -5742,7 +5793,7 @@ displayName="Autochef's Delight"
             .expect("multi-loader mod must be visible to Fabric");
         assert_eq!(multi.version, "2.0.0");
 
-        let neo_scan = scan_mod_files(&dir, true, Some("1.21.1"), Some("NeoForge"), "mod");
+        let neo_scan = scan_mod_files(&dir, true, Some("1.21.1"), Some("NeoForge"), "mod", None);
         let multi = neo_scan
             .mod_files
             .iter()

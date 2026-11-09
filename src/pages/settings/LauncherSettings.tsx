@@ -1,10 +1,12 @@
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '../../components/ui/Button';
+import { CustomSelect } from '../../components/ui/CustomSelect';
 import { Toggle } from '../../components/ui/Toggle';
 import { addToast } from '../../components/ui/Toast';
 import { useT } from '../../lib/i18n';
 import type { AppConfig } from '../../stores/settingsStore';
+import { useToastSettingsStore } from '../../stores/toastSettingsStore';
 import type { UpdateConfig } from './types';
 
 interface LauncherSettingsProps {
@@ -15,6 +17,31 @@ interface LauncherSettingsProps {
 export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps) {
   const t = useT();
   const [clearingCache, setClearingCache] = useState(false);
+  const toastSuccess = useToastSettingsStore((s) => s.success);
+  const toastWarning = useToastSettingsStore((s) => s.warning);
+  const toastError = useToastSettingsStore((s) => s.error);
+  const setToastCategory = useToastSettingsStore((s) => s.setCategory);
+
+  const toastRows = [
+    {
+      key: 'success' as const,
+      checked: toastSuccess,
+      title: t('settings.toast_success_title'),
+      desc: t('settings.toast_success_desc'),
+    },
+    {
+      key: 'warning' as const,
+      checked: toastWarning,
+      title: t('settings.toast_warning_title'),
+      desc: t('settings.toast_warning_desc'),
+    },
+    {
+      key: 'error' as const,
+      checked: toastError,
+      title: t('settings.toast_error_title'),
+      desc: t('settings.toast_error_desc'),
+    },
+  ];
 
   return (
     <>
@@ -23,18 +50,43 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
 
         <div className="settings-row">
           <div className="settings-row__info">
-            <div className="settings-row__title">{t('settings.close_on_launch_title')}</div>
+            <div className="settings-row__title">{t('settings.after_launch_title')}</div>
             <div className="settings-row__desc">
-              {t('settings.close_on_launch_desc')}
+              {t('settings.after_launch_desc')}
             </div>
           </div>
-          <div className="settings-row__control">
-            <Toggle
-              checked={config.close_on_launch}
-              onChange={(v) => updateConfig('close_on_launch', v)}
+          <div className="settings-row__control" style={{ width: 240 }}>
+            <CustomSelect
+              value={config.after_launch_action}
+              options={[
+                { value: 'do_nothing', label: t('settings.after_launch_nothing') },
+                { value: 'minimize', label: t('settings.after_launch_minimize') },
+                { value: 'close', label: t('settings.after_launch_close') },
+              ]}
+              onChange={(v) => updateConfig('after_launch_action', v as AppConfig['after_launch_action'])}
             />
           </div>
         </div>
+      </section>
+
+      <section className="settings-section">
+        <h2 className="settings-section__title">{t('settings.group_notifications')}</h2>
+
+        {toastRows.map((row) => (
+          <div className="settings-row" key={row.key}>
+            <div className="settings-row__info">
+              <div className="settings-row__title">{row.title}</div>
+              <div className="settings-row__desc">{row.desc}</div>
+            </div>
+            <div className="settings-row__control">
+              <Toggle
+                checked={row.checked}
+                onChange={(v) => setToastCategory(row.key, v)}
+                ariaLabel={row.title}
+              />
+            </div>
+          </div>
+        ))}
       </section>
 
       <section className="settings-section">

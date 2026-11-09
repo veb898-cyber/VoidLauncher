@@ -86,16 +86,20 @@ pub fn emit_fetch_retry(source: &str, attempt: usize, total: usize, message: &st
 #[derive(Debug, Clone, Serialize)]
 pub struct FileProgressPayload {
     pub url: String,
+    /// Destination file name, used by the UI to tell concurrent downloads apart.
+    pub file_name: String,
     pub downloaded: u64,
-    pub total: u64,
+    /// `None` when the server did not provide a trustworthy total size.
+    pub total: Option<u64>,
 }
 
-pub fn emit_file_progress(url: &str, downloaded: u64, total: u64) {
+pub fn emit_file_progress(url: &str, file_name: &str, downloaded: u64, total: Option<u64>) {
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.emit(
             "modpack_file_progress",
             FileProgressPayload {
                 url: url.to_string(),
+                file_name: file_name.to_string(),
                 downloaded,
                 total,
             },

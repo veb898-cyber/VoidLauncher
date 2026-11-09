@@ -137,14 +137,14 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
 }
 
 type CachedClient = Mutex<Option<(Option<String>, reqwest::Client)>>;
+static HTTP_CLIENT: OnceLock<CachedClient> = OnceLock::new();
 
 /// Global HTTP client with connection pooling. On failure (rare: TLS backend
 /// trouble) returns the error instead of panicking; nothing is cached, so the
 /// next call retries the build.
-fn http_client() -> reqwest::Result<reqwest::Client> {
-    static CLIENT: OnceLock<CachedClient> = OnceLock::new();
-    let proxy = resolved_proxy_url(active_proxy_raw());
-    let mut slot = CLIENT
+fn http_client() -> Result<reqwest::Client> {
+    let proxy = proxy_client_url()?;
+    let mut slot = HTTP_CLIENT
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -156,13 +156,15 @@ fn http_client() -> reqwest::Result<reqwest::Client> {
     Ok(slot.as_ref().unwrap().1.clone())
 }
 
-fn build_client(proxy: Option<&str>) -> reqwest::Result<reqwest::Client> {
-    base_client_builder(proxy).build()
+fn build_client(proxy: Option<&str>) -> Result<reqwest::Client> {
+    Ok(base_client_builder(proxy)?.build()?)
 }
 
 /// The shared request settings (timeouts, pooling, proxy handling, user
 /// agent) used by both the global client and the per-request pinned clients.
-fn base_client_builder(proxy: Option<&str>) -> reqwest::ClientBuilder {
+/// A malformed proxy URL is an error, not a silent direct client: in
+/// proxy-only mode that would leak traffic outside the proxy.
+fn base_client_builder(proxy: Option<&str>) -> Result<reqwest::ClientBuilder> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .connect_timeout(Duration::from_secs(5))
@@ -176,9 +178,10 @@ fn base_client_builder(proxy: Option<&str>) -> reqwest::ClientBuilder {
         .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")));
     match proxy {
         Some(proxy) => {
-            if let Ok(p) = reqwest::Proxy::all(proxy.to_string()) {
-                builder = builder.proxy(p);
-            }
+            let parsed = reqwest::Proxy::all(proxy.to_string()).map_err(|e| {
+                LauncherError::Download(format!("Invalid proxy address '{}': {}", proxy, e))
+            })?;
+            builder = builder.proxy(parsed);
         }
         None => {
             // A truly direct client: without `.no_proxy()` reqwest would still
@@ -189,7 +192,7 @@ fn base_client_builder(proxy: Option<&str>) -> reqwest::ClientBuilder {
             builder = builder.no_proxy();
         }
     }
-    builder
+    Ok(builder)
 }
 
 /// Build a client that pins `host` to the given pre-validated IP addresses
@@ -199,18 +202,30 @@ fn base_client_builder(proxy: Option<&str>) -> reqwest::ClientBuilder {
 pub(crate) fn pinned_http_client(
     host: &str,
     addrs: &[std::net::IpAddr],
-) -> reqwest::Result<reqwest::Client> {
-    let proxy = resolved_proxy_url(active_proxy_raw());
-    finish_pinned_client(base_client_builder(proxy.as_deref()), host, addrs)
+) -> Result<reqwest::Client> {
+    let proxy = proxy_client_url()?;
+    Ok(finish_pinned_client(
+        base_client_builder(proxy.as_deref())?,
+        host,
+        addrs,
+    )?)
 }
 
 /// Same as [`pinned_http_client`] but bypasses the proxy — the "proxy ->
-/// direct" retry path for pinned requests.
+/// direct" retry path for pinned requests. Refuses to build a direct client
+/// while proxy-only mode is enabled.
 pub(crate) fn pinned_http_client_direct(
     host: &str,
     addrs: &[std::net::IpAddr],
-) -> reqwest::Result<reqwest::Client> {
-    finish_pinned_client(base_client_builder(None), host, addrs)
+) -> Result<reqwest::Client> {
+    if proxy_enabled() && proxy_only_enabled() {
+        return Err(proxy_only_error());
+    }
+    Ok(finish_pinned_client(
+        base_client_builder(None)?,
+        host,
+        addrs,
+    )?)
 }
 
 fn finish_pinned_client(
@@ -227,8 +242,39 @@ fn finish_pinned_client(
     builder.build()
 }
 
-/// Proxy URL configured in the settings (None = direct connection).
+/// Proxy URL configured in the settings (None = no explicit proxy).
 static PROXY_CFG: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Master switch: when false, every client connects directly regardless of
+/// the proxy-only checkbox. Defaults to false, matching `AppConfig::default`.
+static PROXY_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// When true, use the Windows system proxy; when false, the manual address.
+/// The manual address is kept in `PROXY_CFG` either way.
+static PROXY_USE_SYSTEM: AtomicBool = AtomicBool::new(false);
+
+/// When true, a failed proxied request must never be retried directly.
+/// Defaults to true, including for configs written before the field existed.
+static PROXY_ONLY: AtomicBool = AtomicBool::new(true);
+
+#[cfg(test)]
+static SYSTEM_PROXY_TEST_OVERRIDE: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_system_proxy_override(value: Option<String>) {
+    *SYSTEM_PROXY_TEST_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some(value);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_system_proxy_override() {
+    *SYSTEM_PROXY_TEST_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = None;
+}
 
 #[cfg(windows)]
 type SystemProxyCache = Mutex<Option<(std::time::Instant, Option<String>)>>;
@@ -295,6 +341,12 @@ fn parse_win_proxy_server(value: &str) -> Option<String> {
 
 /// Read the Windows system proxy (WinINET settings used by browsers/WebView).
 /// Returns the raw `host:port`, or None when disabled/unreadable/non-Windows.
+///
+/// Supported: the static `ProxyEnable` + `ProxyServer` pair (plain host:port
+/// or the `http=https=...` map). PAC/WPAD (`AutoConfigURL`) and `ProxyOverride`
+/// bypass rules are intentionally not applied: the launcher needs one explicit
+/// proxy for every request, and honouring bypass rules could turn a strict
+/// proxy-only request into a direct connection.
 #[cfg(windows)]
 fn system_proxy_hint() -> Option<String> {
     const TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -329,13 +381,104 @@ fn system_proxy_hint() -> Option<String> {
     None
 }
 
+/// Drop the cached Windows proxy when settings change so a source switch
+/// re-reads the registry instead of using a value up to 60 s old.
+#[cfg(windows)]
+fn clear_system_proxy_cache() {
+    if let Some(slot) = SYSTEM_PROXY_CACHE.get() {
+        *slot.lock().unwrap() = None;
+    }
+}
+
+#[cfg(not(windows))]
+fn clear_system_proxy_cache() {}
+
 /// The proxy the launcher should actively use: the explicit in-app setting
 /// when present, otherwise the Windows system proxy (VPN apps like v2rayN set
 /// it system-wide; WebView already follows it, so using it for backend traffic
-/// too keeps everything consistent and toggle-safe — an unreachable proxy is
-/// re-probed by `ensure_proxy_resolved` and degrades to direct).
+/// too keeps everything consistent and toggle-safe). The master “Use proxy”
+/// switch has priority: when it is off, this returns `None` even if a system
+/// proxy exists, so the child “Use proxy only” flag cannot force traffic
+/// through a proxy the user disabled. Non-strict mode re-probes an unreachable
+/// proxy and may degrade to direct; proxy-only mode never does.
 pub(crate) fn active_proxy_raw() -> Option<String> {
-    configured_proxy().or_else(system_proxy_hint)
+    if !proxy_enabled() {
+        return None;
+    }
+    if use_system_proxy() {
+        #[cfg(test)]
+        {
+            if let Some(value) = SYSTEM_PROXY_TEST_OVERRIDE
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap()
+                .clone()
+            {
+                return value;
+            }
+        }
+        return system_proxy_hint();
+    }
+    configured_proxy()
+}
+
+/// Whether the proxy source is the Windows system configuration.
+pub fn use_system_proxy() -> bool {
+    PROXY_USE_SYSTEM.load(Ordering::SeqCst)
+}
+
+/// Whether the master “Use proxy” setting is enabled.
+pub fn proxy_enabled() -> bool {
+    PROXY_ENABLED.load(Ordering::SeqCst)
+}
+
+/// Whether direct connections are forbidden after a proxy failure.
+pub fn proxy_only_enabled() -> bool {
+    PROXY_ONLY.load(Ordering::SeqCst)
+}
+
+fn proxy_only_error() -> LauncherError {
+    LauncherError::Download(
+        "Proxy-only mode is enabled, but no usable proxy is configured. \
+         Check the manual proxy/server settings or the Windows system proxy, \
+         or disable “Use proxy only”."
+            .to_string(),
+    )
+}
+
+/// Proxy URL the HTTP clients must use for the current policy.
+///
+/// The master switch wins: when the proxy is disabled the client is direct and
+/// the child flag is irrelevant. When it is enabled, strict mode always returns
+/// a proxy URL or an error (never a direct client); a proxy that failed the
+/// scheme probe still yields the HTTP guess, so the request stays on the proxy
+/// path and fails there instead of silently becoming a direct request.
+pub(crate) fn proxy_client_url() -> Result<Option<String>> {
+    if !proxy_enabled() {
+        return Ok(None);
+    }
+    let raw = active_proxy_raw();
+    if proxy_only_enabled() {
+        let raw = raw.ok_or_else(proxy_only_error)?;
+        return Ok(Some(resolved_proxy_url_strict(raw)));
+    }
+    Ok(resolved_proxy_url(raw))
+}
+
+fn resolved_proxy_url_strict(raw: String) -> String {
+    if let Some((cached_raw, url)) = PROXY_RESOLVED
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+    {
+        if cached_raw == raw {
+            if let Some(url) = url {
+                return url;
+            }
+        }
+    }
+    format!("http://{}", raw)
 }
 
 /// Best-known proxy URL for the configured `host:port`: the resolved scheme
@@ -398,12 +541,21 @@ pub async fn ensure_proxy_resolved() {
         }
     }
     if chosen.is_none() {
-        tracing::warn!(
-            target: "launcher",
-            "Proxy {}://{} unreachable — falling back to direct connection",
-            candidates[0],
-            raw
-        );
+        if proxy_only_enabled() {
+            tracing::warn!(
+                target: "launcher",
+                "Proxy {}://{} unreachable — direct fallback is disabled by proxy-only mode",
+                candidates[0],
+                raw
+            );
+        } else {
+            tracing::warn!(
+                target: "launcher",
+                "Proxy {}://{} unreachable — falling back to direct connection",
+                candidates[0],
+                raw
+            );
+        }
     }
     *PROXY_RESOLVED
         .get_or_init(|| Mutex::new(None))
@@ -415,10 +567,16 @@ pub async fn ensure_proxy_resolved() {
 /// level and a proxy is configured, retry the same request directly. VPN
 /// proxies often work for some hosts but not others (e.g. CurseForge, Mojang)
 /// — falling back keeps the launcher usable instead of showing a dead catalog
-/// or failing an install.
+/// or failing an install. In proxy-only mode the fallback is skipped entirely:
+/// the request fails on the proxy path instead of silently going direct.
 pub async fn send_with_fallback(
     req: reqwest::RequestBuilder,
 ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    // Proxy-only mode: the request is already bound to a proxy client; never
+    // clone/rebuild it against a direct client after a failure.
+    if proxy_only_enabled() {
+        return req.send().await;
+    }
     let Some(proxied) = req.try_clone() else {
         return req.send().await;
     };
@@ -572,12 +730,47 @@ fn is_cloudfront_block(server_cloudfront: bool, body: &str) -> bool {
 
 /// Update the global proxy used by every HTTP request. Called when the
 /// config is loaded and whenever the settings are saved.
-pub fn set_global_proxy(proxy: Option<String>) {
+pub fn set_global_proxy_policy(
+    proxy_enabled: bool,
+    use_system_proxy: bool,
+    proxy: Option<String>,
+    proxy_only: bool,
+) {
+    PROXY_ENABLED.store(proxy_enabled, Ordering::SeqCst);
+    // Child/source values are remembered even while the parent is off, but
+    // the manual address itself is not used until the parent is back on.
+    PROXY_USE_SYSTEM.store(use_system_proxy, Ordering::SeqCst);
+    PROXY_ONLY.store(proxy_only, Ordering::SeqCst);
+    let proxy = if proxy_enabled { proxy } else { None };
     *PROXY_CFG.get_or_init(|| Mutex::new(None)).lock().unwrap() = proxy;
     *PROXY_RESOLVED
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap() = None;
+    // Drop the cached client: it may have been built for the previous policy.
+    *HTTP_CLIENT.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
+    clear_system_proxy_cache();
+}
+
+/// The total shown to the UI for a download attempt.
+///
+/// Priority: manifest size → Content-Range total → Content-Length of a full
+/// 200 response. A 206's Content-Length is only the remaining range and must
+/// not be mistaken for the artifact size; a missing/chunked length yields an
+/// unknown (`None`) progress total.
+fn download_progress_total(
+    status: reqwest::StatusCode,
+    expected_size: Option<u64>,
+    range_total: Option<u64>,
+    content_length: Option<u64>,
+) -> Option<u64> {
+    expected_size
+        .or(range_total)
+        .or(if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            None
+        } else {
+            content_length
+        })
 }
 
 /// Validate a completed download file: SHA1 check or JSON-content rejection.
@@ -765,6 +958,11 @@ pub(crate) async fn download_to_part_observed(
         .find(['/', ':', '?', '#'])
         .unwrap_or(after_scheme.len());
     let host = after_scheme[..host_end].to_ascii_lowercase();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_string();
     if !is_host_allowed(&host) {
         return Err(LauncherError::Download(format!(
             "Download host '{}' is not in the allowlist",
@@ -804,6 +1002,10 @@ pub(crate) async fn download_to_part_observed(
         );
     }
 
+    // Probe the proxy scheme before the client is built so the first attempt
+    // already uses HTTP or SOCKS5 correctly. In proxy-only mode this matters
+    // even more: a wrong-scheme guess must not silently degrade to direct.
+    ensure_proxy_resolved().await;
     let client = http_client()?;
     let max_attempts = MAX_RETRIES as usize + 2;
     let mut last_err: Option<String> = None;
@@ -815,8 +1017,6 @@ pub(crate) async fn download_to_part_observed(
     let mut direct_only = false;
     let mut last_downloaded: u64 = 0;
     let mut known_total = expected_size;
-
-    ensure_proxy_resolved().await;
 
     for attempt in 1..=max_attempts {
         if pause_requested() {
@@ -930,13 +1130,19 @@ pub(crate) async fn download_to_part_observed(
             }
         }
 
-        let total_hint: Option<u64> = response
+        let range_total: Option<u64> = response
             .headers()
             .get("content-range")
             .and_then(|v| v.to_str().ok())
             .and_then(content_range_total);
-        known_total = expected_size.or(total_hint);
         let content_length = response.content_length();
+        // The final size check keeps using only manifest/Content-Range data.
+        // A 200 response's Content-Length is still the best progress hint (and
+        // its truncation detector below), but a 206's Content-Length describes
+        // only the remaining range and must never become the total.
+        known_total = expected_size.or(range_total);
+        let progress_total =
+            download_progress_total(status, expected_size, range_total, content_length);
 
         // A 206 response must start exactly where our .part ends; otherwise
         // appending would splice bytes from two different ranges together.
@@ -979,8 +1185,9 @@ pub(crate) async fn download_to_part_observed(
         // network counter gets no delta for bytes received in an earlier
         // operation/attempt.
         if let Some(observer) = observer {
-            observer(offset, expected_size.or(total_hint), 0);
+            observer(offset, progress_total, 0);
         }
+        crate::events::emit_file_progress(&url, &file_name, offset, progress_total);
 
         // Stream the body chunk by chunk — flat memory usage even for large
         // files, and interrupted transfers keep their partial bytes.
@@ -1015,15 +1222,11 @@ pub(crate) async fn download_to_part_observed(
                                 if last_emit.elapsed() >= Duration::from_millis(300) {
                                     last_emit = std::time::Instant::now();
                                     let downloaded = offset + received;
-                                    // Prefer the known file size (from the pack
-                                    // manifest) over the Content-Range header;
-                                    // never show "37/37 MB" when 100 MB is known.
-                                    let total_hint_value = expected_size.or(total_hint);
                                     if let Some(observer) = observer {
                                         if network_since_emit > 0 {
                                             observer(
                                                 downloaded,
-                                                total_hint_value,
+                                                progress_total,
                                                 network_since_emit,
                                             );
                                             network_since_emit = 0;
@@ -1039,8 +1242,9 @@ pub(crate) async fn download_to_part_observed(
                                         last_downloaded = downloaded;
                                         crate::events::emit_file_progress(
                                             &url,
+                                            &file_name,
                                             downloaded,
-                                            total_hint_value.unwrap_or(downloaded),
+                                            progress_total,
                                         );
                                     }
                                 }
@@ -1067,13 +1271,10 @@ pub(crate) async fn download_to_part_observed(
                 .map_err(|e| LauncherError::Download(format!("Failed to flush .part: {}", e)))?;
             if let Some(observer) = observer {
                 if network_since_emit > 0 {
-                    observer(
-                        offset + received,
-                        expected_size.or(total_hint),
-                        network_since_emit,
-                    );
+                    observer(offset + received, progress_total, network_since_emit);
                 }
             }
+            crate::events::emit_file_progress(&url, &file_name, offset + received, progress_total);
             offset += received;
             // A clean EOF is not proof of a complete transfer when the
             // server announced a body length: a proxy can terminate the
@@ -1528,7 +1729,16 @@ pub async fn download_files_observed(
 ) -> Result<()> {
     let files = dedupe_download_targets(files);
     let total = files.len();
-    let total_bytes: u64 = files.iter().map(|(_, _, _, s)| *s).sum();
+    // A sum that silently treats unknown sizes as zero would let a large
+    // unknown file look complete early. Report a byte total only when every
+    // planned file has a trustworthy size; otherwise the UI falls back to
+    // indeterminate/count progress.
+    let all_sizes_known = files.iter().all(|(_, _, _, size)| *size > 0);
+    let total_bytes: u64 = if all_sizes_known {
+        files.iter().map(|(_, _, _, s)| *s).sum()
+    } else {
+        0
+    };
     let mut completed = 0usize;
     let mut completed_bytes = 0u64;
     let mut errors = Vec::new();
@@ -1883,7 +2093,7 @@ pub(crate) fn is_unsafe_archive_path(relative: &str) -> bool {
 /// Expose global client for use by other modules (versions, modloaders).
 /// Returns a cheap clone; the underlying client is rebuilt automatically
 /// when the proxy setting changes.
-pub fn global_http_client() -> reqwest::Result<reqwest::Client> {
+pub fn global_http_client() -> Result<reqwest::Client> {
     http_client()
 }
 
@@ -1894,8 +2104,8 @@ pub fn global_http_client() -> reqwest::Result<reqwest::Client> {
 /// redirect from the expected host to any other allowlisted domain would be
 /// accepted by the global policy. The caller still verifies the final URL and
 /// payload (SHA-256 / JSON schema).
-pub(crate) fn http_client_for_hosts(hosts: &[&str]) -> reqwest::Result<reqwest::Client> {
-    let proxy = resolved_proxy_url(active_proxy_raw());
+pub(crate) fn http_client_for_hosts(hosts: &[&str]) -> Result<reqwest::Client> {
+    let proxy = proxy_client_url()?;
     let allowed: Vec<String> = hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
         let url = attempt.url();
@@ -1909,11 +2119,10 @@ pub(crate) fn http_client_for_hosts(hosts: &[&str]) -> reqwest::Result<reqwest::
             attempt.stop()
         }
     });
-    base_client_builder(proxy.as_deref())
+    Ok(base_client_builder(proxy.as_deref())?
         .redirect(policy)
-        .build()
+        .build()?)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2596,5 +2805,491 @@ mod tests {
             None
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn progress_total_uses_trustworthy_size_sources_only() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            download_progress_total(StatusCode::OK, Some(100), Some(200), Some(300)),
+            Some(100)
+        );
+        assert_eq!(
+            download_progress_total(StatusCode::PARTIAL_CONTENT, None, Some(200), Some(50)),
+            Some(200)
+        );
+        assert_eq!(
+            download_progress_total(StatusCode::OK, None, None, Some(300)),
+            Some(300)
+        );
+        assert_eq!(
+            download_progress_total(StatusCode::OK, None, None, None),
+            None,
+            "chunked responses have no trustworthy total"
+        );
+        assert_eq!(
+            download_progress_total(StatusCode::PARTIAL_CONTENT, None, None, Some(50)),
+            None,
+            "a 206 Content-Length is only the remaining range"
+        );
+    }
+
+    // ==================== Proxy-only network policy ====================
+    //
+    // Real local sockets: a tiny HTTP proxy and a separate "direct" origin.
+    // The working proxy answers the request itself, so the origin's hit
+    // counter only moves when a request actually bypasses the proxy. This is
+    // what proves the strict-mode "no direct fallback" guarantee.
+
+    static PROXY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn apply_test_proxy(enabled: bool, use_system: bool, proxy: Option<String>, proxy_only: bool) {
+        // Ignore the machine's real Windows proxy so the test controls the
+        // only proxy source that can be used.
+        set_system_proxy_override(None);
+        set_global_proxy_policy(enabled, use_system, proxy, proxy_only);
+    }
+
+    /// Select the (mocked) Windows system proxy while keeping a manual proxy
+    /// configured to prove it is not used as an accidental fallback.
+    fn apply_test_system_proxy(
+        enabled: bool,
+        system: Option<String>,
+        manual: Option<String>,
+        proxy_only: bool,
+    ) {
+        set_system_proxy_override(system);
+        set_global_proxy_policy(enabled, true, manual, proxy_only);
+    }
+
+    /// Restores the default policy even if an assertion panics.
+    struct ProxyTestReset;
+
+    impl Drop for ProxyTestReset {
+        fn drop(&mut self) {
+            set_global_proxy_policy(false, false, None, true);
+            clear_system_proxy_override();
+        }
+    }
+
+    struct TestOrigin {
+        url: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    async fn spawn_origin() -> TestOrigin {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let task_hits = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let hits = task_hits.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    if socket.read(&mut buf).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let body = b"origin-ok";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        TestOrigin {
+            url: format!("http://{}/test", addr),
+            hits,
+        }
+    }
+
+    struct TestProxy {
+        /// `host:port` exactly as `AppConfig::proxy_url()` returns it.
+        addr: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    async fn spawn_proxy(working: bool) -> TestProxy {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let task_hits = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let hits = task_hits.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if !working {
+                        // Accept then close: a network-level proxy failure.
+                        let _ = client.shutdown().await;
+                        return;
+                    }
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let n = match client.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        request.extend_from_slice(&chunk[..n]);
+                        if request.windows(4).any(|w| w == b"\r\n\r\n") || request.len() > 65536 {
+                            break;
+                        }
+                    }
+                    let body = b"proxy-ok";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = client.write_all(head.as_bytes()).await;
+                    let _ = client.write_all(body).await;
+                    let _ = client.shutdown().await;
+                });
+            }
+        });
+        TestProxy {
+            addr: format!("127.0.0.1:{}", port),
+            hits,
+        }
+    }
+
+    async fn send_test_request(url: &str) -> std::result::Result<String, String> {
+        let client = global_http_client().map_err(|e| e.to_string())?;
+        let response = send_with_fallback(client.get(url))
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| e.to_string())?;
+        Ok(format!("{} {}", status, body))
+    }
+
+    async fn timed_request(url: &str) -> std::result::Result<String, String> {
+        tokio::time::timeout(Duration::from_secs(10), send_test_request(url))
+            .await
+            .expect("proxy test request timed out")
+    }
+
+    #[tokio::test]
+    async fn proxy_only_mode_uses_the_working_proxy() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let proxy = spawn_proxy(true).await;
+        apply_test_proxy(true, false, Some(proxy.addr.clone()), true);
+
+        let result = timed_request(&origin.url).await.expect("proxied request");
+
+        assert!(result.contains("proxy-ok"), "unexpected response: {result}");
+        assert_eq!(proxy.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            origin.hits.load(Ordering::SeqCst),
+            0,
+            "strict mode must not touch the direct origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_only_mode_never_falls_back_to_direct() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let proxy = spawn_proxy(false).await;
+        apply_test_proxy(true, false, Some(proxy.addr.clone()), true);
+
+        let result = timed_request(&origin.url).await;
+
+        assert!(result.is_err(), "a failed proxy must fail the request");
+        assert!(proxy.hits.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            origin.hits.load(Ordering::SeqCst),
+            0,
+            "direct fallback is forbidden in proxy-only mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_mode_uses_the_working_proxy_first() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let proxy = spawn_proxy(true).await;
+        apply_test_proxy(true, false, Some(proxy.addr.clone()), false);
+
+        let result = timed_request(&origin.url).await.expect("proxied request");
+
+        assert!(result.contains("proxy-ok"), "unexpected response: {result}");
+        assert_eq!(proxy.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(origin.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_mode_retries_directly_after_proxy_failure() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let proxy = spawn_proxy(false).await;
+        apply_test_proxy(true, false, Some(proxy.addr.clone()), false);
+
+        let result = timed_request(&origin.url).await.expect("direct fallback");
+
+        assert!(
+            result.contains("origin-ok"),
+            "unexpected response: {result}"
+        );
+        assert!(proxy.hits.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            origin.hits.load(Ordering::SeqCst),
+            1,
+            "fallback mode should retry directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_only_mode_without_proxy_refuses_direct() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        apply_test_proxy(true, false, None, true);
+
+        let result = timed_request(&origin.url).await;
+
+        assert!(result.is_err(), "no proxy + strict mode must fail");
+        assert_eq!(
+            origin.hits.load(Ordering::SeqCst),
+            0,
+            "strict mode must not connect directly when no proxy is set"
+        );
+        let policy = crate::commands::misc::cmd_updater_proxy_policy().await;
+        assert!(policy.enabled);
+        assert!(policy.proxy_only);
+        assert!(
+            policy.proxy_url.is_none(),
+            "the updater must see no proxy and skip the network attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn master_proxy_switch_off_forces_direct_even_if_proxy_only_saved_on() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let proxy = spawn_proxy(true).await;
+
+        // The parent switch is off, but the child value was saved as on.
+        apply_test_proxy(false, false, Some(proxy.addr.clone()), true);
+
+        let result = timed_request(&origin.url).await.expect("direct request");
+
+        assert!(
+            result.contains("origin-ok"),
+            "unexpected response: {result}"
+        );
+        assert_eq!(
+            proxy.hits.load(Ordering::SeqCst),
+            0,
+            "the child flag must not force traffic through a disabled proxy"
+        );
+        assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
+
+        let policy = crate::commands::misc::cmd_updater_proxy_policy().await;
+        assert!(!policy.enabled);
+        assert!(!policy.proxy_only);
+        assert!(policy.proxy_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn system_proxy_is_used_instead_of_the_saved_manual_proxy() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let manual = spawn_proxy(true).await;
+        let system = spawn_proxy(true).await;
+        apply_test_system_proxy(
+            true,
+            Some(system.addr.clone()),
+            Some(manual.addr.clone()),
+            false,
+        );
+
+        let result = timed_request(&origin.url)
+            .await
+            .expect("system proxy request");
+        assert!(result.contains("proxy-ok"), "unexpected response: {result}");
+        assert_eq!(system.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manual.hits.load(Ordering::SeqCst),
+            0,
+            "the manual proxy must not be used while the system source is selected"
+        );
+        assert_eq!(origin.hits.load(Ordering::SeqCst), 0);
+
+        // The request itself proves the source; the policy command probes the
+        // proxy scheme over HTTPS, which the plain mock proxy cannot tunnel.
+    }
+
+    #[tokio::test]
+    async fn missing_system_proxy_in_strict_mode_refuses_direct() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let manual = spawn_proxy(true).await;
+        apply_test_system_proxy(true, None, Some(manual.addr.clone()), true);
+
+        let result = timed_request(&origin.url).await;
+        assert!(result.is_err(), "no system proxy + strict mode must fail");
+        assert_eq!(origin.hits.load(Ordering::SeqCst), 0);
+        assert_eq!(manual.hits.load(Ordering::SeqCst), 0);
+
+        let policy = crate::commands::misc::cmd_updater_proxy_policy().await;
+        assert!(policy.proxy_only);
+        assert!(policy.proxy_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_system_proxy_in_fallback_mode_uses_direct() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let manual = spawn_proxy(true).await;
+        apply_test_system_proxy(true, None, Some(manual.addr.clone()), false);
+
+        let result = timed_request(&origin.url).await.expect("direct fallback");
+        assert!(
+            result.contains("origin-ok"),
+            "unexpected response: {result}"
+        );
+        assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(manual.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_system_proxy_strict_mode_refuses_direct() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let manual = spawn_proxy(true).await;
+        let broken_system = spawn_proxy(false).await;
+        apply_test_system_proxy(
+            true,
+            Some(broken_system.addr.clone()),
+            Some(manual.addr.clone()),
+            true,
+        );
+
+        let result = timed_request(&origin.url).await;
+        assert!(
+            result.is_err(),
+            "broken system proxy + strict mode must fail"
+        );
+        assert!(broken_system.hits.load(Ordering::SeqCst) >= 1);
+        assert_eq!(origin.hits.load(Ordering::SeqCst), 0);
+        assert_eq!(manual.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_system_proxy_fallback_mode_retries_direct() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let manual = spawn_proxy(true).await;
+        let broken_system = spawn_proxy(false).await;
+        apply_test_system_proxy(
+            true,
+            Some(broken_system.addr.clone()),
+            Some(manual.addr.clone()),
+            false,
+        );
+
+        let result = timed_request(&origin.url).await.expect("direct fallback");
+        assert!(
+            result.contains("origin-ok"),
+            "unexpected response: {result}"
+        );
+        assert!(broken_system.hits.load(Ordering::SeqCst) >= 1);
+        assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(manual.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn updater_policy_follows_the_selected_system_source() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let manual = spawn_proxy(true).await;
+        let system = spawn_proxy(true).await;
+        apply_test_system_proxy(
+            true,
+            Some(system.addr.clone()),
+            Some(manual.addr.clone()),
+            true,
+        );
+        // Seed the resolved cache so the policy command does not need to
+        // perform the HTTPS probe against the plain mock proxy.
+        *PROXY_RESOLVED
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some((system.addr.clone(), Some(format!("http://{}", system.addr))));
+
+        let policy = crate::commands::misc::cmd_updater_proxy_policy().await;
+        assert!(policy.enabled);
+        assert!(policy.proxy_only);
+        assert_eq!(policy.proxy_url, Some(format!("http://{}", system.addr)));
+        assert_ne!(
+            policy.proxy_url,
+            Some(format!("http://{}", manual.addr)),
+            "the manual proxy must not leak into the system-source policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_only_setting_survives_save_and_reload() {
+        let _guard = PROXY_TEST_LOCK.lock().await;
+        let _reset = ProxyTestReset;
+        let origin = spawn_origin().await;
+        let proxy = spawn_proxy(true).await;
+
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_proxy_cfg_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = crate::config::AppConfig {
+            data_dir: dir.clone(),
+            proxy_enabled: true,
+            proxy_addr: "127.0.0.1".to_string(),
+            proxy_port: proxy.addr.rsplit(':').next().unwrap().parse().unwrap(),
+            use_system_proxy: Some(false),
+            proxy_only: true,
+            ..crate::config::AppConfig::default()
+        };
+        config.save().expect("save config");
+
+        // Simulate a restart: a fresh config object is read back from disk
+        // and applied to the network layer exactly like `lib.rs` does.
+        let loaded = crate::config::AppConfig::load(&dir);
+        assert!(loaded.proxy_only);
+        assert_eq!(loaded.proxy_url(), Some(proxy.addr.clone()));
+        set_system_proxy_override(None);
+        set_global_proxy_policy(
+            loaded.proxy_enabled,
+            loaded.use_system_proxy(),
+            loaded.proxy_url(),
+            loaded.proxy_only,
+        );
+
+        let result = timed_request(&origin.url).await.expect("proxied request");
+        assert!(result.contains("proxy-ok"), "unexpected response: {result}");
+        assert_eq!(origin.hits.load(Ordering::SeqCst), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

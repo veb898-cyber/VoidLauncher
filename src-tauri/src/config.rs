@@ -48,7 +48,12 @@ pub struct AppConfig {
     pub default_jvm_args: Vec<String>,
     /// Custom Java path (None = auto-detect)
     pub java_path: Option<PathBuf>,
-    /// Close launcher when game starts
+    /// What to do with the launcher window after the game process has
+    /// successfully started: "do_nothing" | "minimize" | "close".
+    #[serde(default = "default_after_launch_action")]
+    pub after_launch_action: String,
+    /// Deprecated pre-1.6 setting: migrated into `after_launch_action`.
+    #[serde(default, skip_serializing)]
     pub close_on_launch: bool,
     /// Route all launcher HTTP traffic through a proxy
     #[serde(default)]
@@ -59,6 +64,15 @@ pub struct AppConfig {
     /// Proxy port (e.g. 8080)
     #[serde(default)]
     pub proxy_port: u16,
+    /// Use the Windows system proxy instead of the manual address above.
+    /// `None` (field absent) is migrated from the old automatic behaviour:
+    /// system proxy only when no manual proxy was configured.
+    #[serde(default)]
+    pub use_system_proxy: Option<bool>,
+    /// Never fall back to a direct connection after a proxy failure.
+    /// Defaults to true, including for configs written before this field.
+    #[serde(default = "default_proxy_only")]
+    pub proxy_only: bool,
     /// Show snapshots in version list
     pub show_snapshots: bool,
     /// Show old versions (alpha/beta)
@@ -85,6 +99,16 @@ fn default_gc_preset() -> String {
 fn default_elyby_skins_in_game() -> bool {
     true
 }
+
+fn default_proxy_only() -> bool {
+    true
+}
+
+fn default_after_launch_action() -> String {
+    "do_nothing".to_string()
+}
+
+pub const AFTER_LAUNCH_ACTIONS: [&str; 3] = ["do_nothing", "minimize", "close"];
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -131,10 +155,13 @@ impl Default for AppConfig {
                 "-XX:+DisableExplicitGC".into(),
             ],
             java_path: None,
+            after_launch_action: default_after_launch_action(),
             close_on_launch: false,
             proxy_enabled: false,
             proxy_addr: String::new(),
             proxy_port: 0,
+            use_system_proxy: Some(true),
+            proxy_only: true,
             show_snapshots: false,
             show_old_versions: false,
             // CurseForge public API key taken from Prism Launcher's open-source
@@ -233,6 +260,34 @@ impl AppConfig {
                 target: "config",
                 "Migrated legacy default_jvm_args to slim preset-neutral set"
             );
+            changed = true;
+        }
+
+        // Pre-1.6 automatically used the Windows proxy when no manual proxy
+        // was configured. Preserve that, but make the source explicit: a
+        // configured manual proxy keeps manual mode, otherwise system mode.
+        if self.use_system_proxy.is_none() {
+            self.use_system_proxy = Some(!self.has_manual_proxy());
+            tracing::info!(
+                target: "config",
+                "Migrated proxy source to {}",
+                if self.use_system_proxy == Some(true) { "Windows system proxy" } else { "manual proxy" }
+            );
+            changed = true;
+        }
+
+        // Pre-1.6 had a single "close on launch" boolean. Keep the old
+        // preference: on -> close, off -> do nothing. The new selector value
+        // wins if it is already set (new configs never write the old field).
+        if self.close_on_launch {
+            if self.after_launch_action == "do_nothing" {
+                self.after_launch_action = "close".into();
+            }
+            self.close_on_launch = false;
+            changed = true;
+        }
+        if !AFTER_LAUNCH_ACTIONS.contains(&self.after_launch_action.as_str()) {
+            self.after_launch_action = default_after_launch_action();
             changed = true;
         }
 
@@ -360,11 +415,27 @@ impl AppConfig {
     /// Proxy `host:port` for reqwest (`None` when disabled). The scheme is
     /// resolved automatically (HTTP first, then SOCKS5) in `download.rs`.
     pub fn proxy_url(&self) -> Option<String> {
-        if self.proxy_enabled && !self.proxy_addr.trim().is_empty() && self.proxy_port > 0 {
-            Some(format!("{}:{}", self.proxy_addr.trim(), self.proxy_port))
-        } else {
-            None
-        }
+        proxy_url_from(self.proxy_enabled, &self.proxy_addr, self.proxy_port)
+    }
+
+    /// Effective system-proxy choice after migration.
+    pub fn use_system_proxy(&self) -> bool {
+        self.use_system_proxy.unwrap_or(true)
+    }
+
+    fn has_manual_proxy(&self) -> bool {
+        !self.proxy_addr.trim().is_empty() && self.proxy_port > 0
+    }
+}
+
+/// Format a proxy `host:port`, or `None` when the master switch is off or the
+/// address/port are incomplete. Shared by the persisted config and the
+/// immediate (unsaved) preview from the Network settings tab.
+pub fn proxy_url_from(enabled: bool, addr: &str, port: u16) -> Option<String> {
+    if enabled && !addr.trim().is_empty() && port > 0 {
+        Some(format!("{}:{}", addr.trim(), port))
+    } else {
+        None
     }
 }
 
@@ -387,6 +458,11 @@ mod tests {
     }
 
     #[test]
+    fn proxy_only_is_enabled_by_default() {
+        assert!(base().proxy_only);
+    }
+
+    #[test]
     fn legacy_config_without_elyby_setting_defaults_to_true() {
         // Every field that has no serde default; the new Ely.by flag is
         // intentionally absent, exactly as in configs written before 1.5.x.
@@ -402,6 +478,75 @@ mod tests {
         });
         let config: AppConfig = serde_json::from_value(legacy).expect("legacy config parses");
         assert!(config.elyby_skins_in_game);
+        assert!(config.proxy_only);
+    }
+
+    #[test]
+    fn legacy_proxy_source_migrates_from_manual_or_automatic_system_mode() {
+        let mut manual = base();
+        manual.use_system_proxy = None;
+        manual.proxy_addr = "127.0.0.1".into();
+        manual.proxy_port = 8080;
+        assert!(manual.migrate());
+        assert_eq!(manual.use_system_proxy, Some(false));
+
+        let mut automatic = base();
+        automatic.use_system_proxy = None;
+        automatic.proxy_addr = String::new();
+        automatic.proxy_port = 0;
+        assert!(automatic.migrate());
+        assert_eq!(automatic.use_system_proxy, Some(true));
+    }
+
+    #[test]
+    fn explicit_proxy_source_is_preserved_and_new_default_is_system() {
+        assert!(base().use_system_proxy());
+
+        let mut manual = base();
+        manual.proxy_enabled = true;
+        manual.use_system_proxy = Some(false);
+        manual.proxy_addr = "127.0.0.1".into();
+        manual.proxy_port = 8080;
+        let _ = manual.migrate();
+        assert_eq!(manual.use_system_proxy, Some(false));
+        assert_eq!(manual.proxy_url(), Some("127.0.0.1:8080".into()));
+        assert_eq!(manual.proxy_addr, "127.0.0.1");
+        assert_eq!(manual.proxy_port, 8080);
+
+        let mut system = base();
+        system.use_system_proxy = Some(true);
+        system.proxy_addr = "10.0.0.1".into();
+        system.proxy_port = 3128;
+        let _ = system.migrate();
+        assert_eq!(system.use_system_proxy, Some(true));
+        assert_eq!(
+            system.proxy_addr, "10.0.0.1",
+            "manual settings must be kept"
+        );
+        assert_eq!(system.proxy_port, 3128);
+    }
+
+    #[test]
+    fn legacy_close_on_launch_migrates_to_close_action() {
+        let mut c = base();
+        c.close_on_launch = true;
+        c.after_launch_action = "do_nothing".into();
+        assert!(c.migrate());
+        assert_eq!(c.after_launch_action, "close");
+        assert!(!c.close_on_launch);
+    }
+
+    #[test]
+    fn explicit_after_launch_action_survives_migration() {
+        let mut c = base();
+        c.after_launch_action = "minimize".into();
+        c.close_on_launch = false;
+        assert!(!c.migrate());
+        assert_eq!(c.after_launch_action, "minimize");
+
+        c.after_launch_action = "bogus".into();
+        assert!(c.migrate());
+        assert_eq!(c.after_launch_action, "do_nothing");
     }
 
     #[test]
