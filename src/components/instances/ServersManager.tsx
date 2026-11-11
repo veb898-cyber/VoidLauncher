@@ -481,7 +481,7 @@ export function ServersManager({ instanceName }: Props) {
         </div>
       )}
 
-      <div style={{ flex: 1, overflowY: 'auto', ...(liquidGlass ? { padding: 'var(--space-lg) var(--space-2xl)' } : {}) }}>
+      <div style={{ flex: 1, overflowY: 'auto', ...(liquidGlass ? { padding: 'var(--space-xs) var(--space-lg) var(--space-lg)' } : {}) }}>
         {viewState === 'loading' ? (
           <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>
         ) : viewState === 'error' ? (
@@ -502,38 +502,38 @@ export function ServersManager({ instanceName }: Props) {
              same icon-only ghost buttons the builds header uses (owner:
              В«РєРЅРѕРїРєРё СЃ РёРєРѕРЅРєРѕР№, РїРѕРґСЃРєР°Р·РєРѕР№, РЅР°РґРїРёСЃСЊ СѓР±РµСЂРё... РєР°Рє РІРѕ РІРєР»Р°РґРєРµ СЃРѕ
              СЃР±РѕСЂРєР°РјРё... СЃ СЂР°СЃСЃС‚РѕСЏРЅРёРµРј Рё РїСЂРё РЅР°РІРµРґРµРЅРёРё СЃРІРµС‚Р»Р°СЏ РѕР±Р»Р°СЃС‚СЊВ»). */
-          <div className="glass-row-list" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
+          <div className="glass-row-list" style={{ display: 'flex', flexDirection: 'column', gap: 'var(--row-card-gap)' }}>
             {servers.map((server, index) => (
               <div
                 key={`${server.name}-${index}`}
                 className="glass-card"
-                style={{ padding: 'var(--space-md)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)' }}
+                style={{ padding: 'var(--row-padding-y) var(--space-lg)', display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}
               >
                 {server.icon ? (
                   <img
                     src={`data:image/png;base64,${server.icon}`}
                     alt=""
-                    style={{ width: 36, height: 36, borderRadius: 'var(--radius-sm)', objectFit: 'cover', flexShrink: 0, imageRendering: 'pixelated' }}
+                    style={{ width: 'var(--row-icon-size)', height: 'var(--row-icon-size)', borderRadius: 'var(--radius-sm)', objectFit: 'cover', flexShrink: 0, imageRendering: 'pixelated' }}
                   />
                 ) : (
-                  <div style={{ width: 36, height: 36, borderRadius: 'var(--radius-sm)', background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <Server size={18} style={{ color: 'var(--text-tertiary)' }} />
+                  <div style={{ width: 'var(--row-icon-size)', height: 'var(--row-icon-size)', borderRadius: 'var(--radius-sm)', background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                    <Server size={16} style={{ color: 'var(--text-tertiary)' }} />
                   </div>
                 )}
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontWeight: 600, fontSize: 'var(--font-size-sm)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{server.name}</div>
-                  <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{server.ip}</div>
+                  <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{server.name}</div>
+                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{server.ip}</div>
                 </div>
                 <ServerStatusCell status={statuses[server.ip.trim()]} />
-                <div style={{ display: 'flex', gap: 'var(--space-sm)', flexShrink: 0, alignItems: 'center' }}>
+                <div style={{ display: 'flex', gap: 2, flexShrink: 0, alignItems: 'center' }}>
                   {renderPlayButton(server)}
                   <Tooltip content={t('servers.edit')}>
-                    <Button size="sm" variant="ghost" onClick={() => openEdit(index, server)} disabled={instanceRunning}>
+                    <Button className="btn--icon-only" size="sm" variant="ghost" aria-label={t('servers.edit')} onClick={() => openEdit(index, server)} disabled={instanceRunning}>
                       <Pencil size={14} />
                     </Button>
                   </Tooltip>
                   <Tooltip content={t('servers.delete')}>
-                    <Button size="sm" variant="ghost" onClick={() => setDeleteTarget({ index, name: server.name, ip: server.ip, fingerprint: server.fingerprint })} disabled={instanceRunning} style={{ color: 'var(--color-danger)' }}>
+                    <Button className="btn--icon-only" size="sm" variant="ghost" aria-label={t('servers.delete')} onClick={() => setDeleteTarget({ index, name: server.name, ip: server.ip, fingerprint: server.fingerprint })} disabled={instanceRunning} style={{ color: 'var(--color-danger)' }}>
                       <Trash2 size={14} />
                     </Button>
                   </Tooltip>
@@ -545,7 +545,7 @@ export function ServersManager({ instanceName }: Props) {
           servers.map((server, index) => (
             <div key={`${server.name}-${index}`} style={{
               display: 'grid', gridTemplateColumns: '1fr auto auto',
-              padding: '8px var(--space-2xl)', alignItems: 'center',
+              padding: 'var(--row-padding-y) var(--space-2xl)', alignItems: 'center',
               borderBottom: '1px solid var(--surface-border)', gap: 'var(--space-sm)',
             }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', minWidth: 0 }}>
@@ -553,10 +553,10 @@ export function ServersManager({ instanceName }: Props) {
                   <img
                     src={`data:image/png;base64,${server.icon}`}
                     alt=""
-                    style={{ width: 32, height: 32, borderRadius: 'var(--radius-sm)', objectFit: 'cover', flexShrink: 0, imageRendering: 'pixelated' }}
+                    style={{ width: 'var(--row-icon-size)', height: 'var(--row-icon-size)', borderRadius: 'var(--radius-sm)', objectFit: 'cover', flexShrink: 0, imageRendering: 'pixelated' }}
                   />
                 ) : (
-                  <div style={{ width: 32, height: 32, borderRadius: 'var(--radius-sm)', background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                  <div style={{ width: 'var(--row-icon-size)', height: 'var(--row-icon-size)', borderRadius: 'var(--radius-sm)', background: 'var(--surface-glass)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                     <Server size={16} style={{ color: 'var(--text-tertiary)' }} />
                   </div>
                 )}
@@ -569,7 +569,7 @@ export function ServersManager({ instanceName }: Props) {
               <div style={{ display: 'flex', gap: 2, justifyContent: 'flex-end', alignItems: 'center' }}>
                 {renderPlayButton(server)}
                 <Tooltip content={t('servers.edit')}>
-                  <button disabled={instanceRunning} onClick={() => openEdit(index, server)} style={{ background: 'none', border: 'none', padding: 4, cursor: instanceRunning ? 'not-allowed' : 'pointer', opacity: instanceRunning ? 0.4 : 1, color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Pencil size={14} /></button>
+                  <button disabled={instanceRunning} onClick={() => openEdit(index, server)} aria-label={t('servers.edit')} style={{ background: 'none', border: 'none', padding: 4, cursor: instanceRunning ? 'not-allowed' : 'pointer', opacity: instanceRunning ? 0.4 : 1, color: 'var(--text-tertiary)', borderRadius: 'var(--radius-sm)' }}><Pencil size={14} /></button>
                 </Tooltip>
                 <Tooltip content={t('servers.delete')}>
                   <button

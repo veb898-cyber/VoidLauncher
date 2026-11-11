@@ -548,10 +548,12 @@ pub fn cmd_invalidate_player_head(state: State<'_, AppState>, uuid: String) -> R
 pub async fn cmd_get_player_head(
     state: State<'_, AppState>,
     uuid: String,
+    force: Option<bool>,
 ) -> Result<Option<String>, String> {
     let Some(norm) = normalize_uuid(&uuid) else {
         return Ok(None);
     };
+    let force = force.unwrap_or(false);
     let data_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.data_dir.clone()
@@ -571,9 +573,13 @@ pub async fn cmd_get_player_head(
     // returns bytes from a generation that was already invalidated.
     let gen_before = get_skin_generation(&norm);
 
-    // Fresh cache: instant answer, no network.
-    if let Some(bytes) = read_cached_head(&data_dir, &norm, gen_before) {
-        return Ok(Some(data_url(&bytes)));
+    // Fresh cache: instant answer, no network. A forced manual refresh skips
+    // it and asks the network for the current texture; the old cache remains
+    // available as a fallback if that request fails.
+    if !force {
+        if let Some(bytes) = read_cached_head(&data_dir, &norm, gen_before) {
+            return Ok(Some(data_url(&bytes)));
+        }
     }
 
     if let Some(bytes) = fetch_skin_fresh(&norm, account).await {
@@ -589,6 +595,13 @@ pub async fn cmd_get_player_head(
         }
     }
 
+    // A forced manual refresh must not pretend a stale cached texture is a
+    // successful update. Return None so the renderer keeps the previous image
+    // and reports the failure; the next automatic attempt can use the cache.
+    if force && account.is_some() {
+        return Ok(None);
+    }
+
     // Refresh failed (Mojang down, rate-limited, offline): a possibly
     // outdated cached head still beats a blank/Steve avatar. Read against the
     // CURRENT generation: an invalidation during the fetch deleted the old
@@ -599,8 +612,10 @@ pub async fn cmd_get_player_head(
     }
 
     // Nothing cached either: the vanilla default by uuid is the honest
-    // stand-in (a skinless profile renders exactly like this). Not written to
-    // the disk cache — a later successful fetch must be able to win.
+    // stand-in. A forced manual refresh already returned None above.
+    if force && account.is_some() {
+        return Ok(None);
+    }
     Ok(bundled_default_skin(&norm))
 }
 

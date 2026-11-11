@@ -6,6 +6,7 @@ mod bug_report;
 mod commands;
 pub mod config;
 mod content;
+mod crash_signals;
 mod curseforge;
 mod default_skin;
 mod diagnostics;
@@ -29,10 +30,12 @@ pub mod modloaders;
 mod modrinth;
 mod packlock;
 mod playtime;
+mod recovery;
 mod rooms;
 mod running_state;
 mod server_ping;
 mod servers;
+mod single_instance;
 mod verify;
 pub mod versions;
 
@@ -98,6 +101,23 @@ pub(crate) fn is_allowed_download_host(url: &str) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The launcher owns one shared data directory. Acquire the process-wide
+    // slot before the logger or config touches anything: a second process must
+    // not race repairs, downloads or instance edits. The guard lives until
+    // this function returns (i.e. for the whole Tauri event loop).
+    let _single_instance =
+        match single_instance::acquire_with_handoff(single_instance::APP_MUTEX_NAME) {
+            Ok(guard) => guard,
+            Err(single_instance::AcquireError::AlreadyRunning) => {
+                single_instance::show_already_running();
+                return;
+            }
+            Err(error) => {
+                single_instance::show_startup_error(&error.to_string());
+                return;
+            }
+        };
+
     // Panic hook: write to a known file so we can debug crashes
     let orig_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -430,6 +450,8 @@ pub fn run() {
             commands::verify::cmd_repair_instance,
             commands::diagnostics::cmd_run_diagnostics,
             commands::diagnostics::cmd_analyze_crash,
+            commands::diagnostics::cmd_apply_crash_action,
+            commands::diagnostics::cmd_open_official_url,
             bug_report::cmd_prepare_bug_report,
             bug_report::cmd_get_bug_report_log,
             bug_report::cmd_get_bug_report_crash,

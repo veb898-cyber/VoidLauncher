@@ -63,15 +63,12 @@ pub struct Resolution {
 }
 
 impl Instance {
-    /// Create a new vanilla instance with sensible memory/GC defaults.
-    /// `default_memory_mb` should be the tiered recommendation (4/6/8 GB) from
-    /// `config::recommended_memory_mb`.
-    /// `default_gc_preset` should be "standard" | "g1gc" | "zgc".
+    /// Create a new instance that inherits the launcher's global memory/GC
+    /// defaults. Explicit per-instance overrides are written only when the
+    /// user changes them in the editor.
     pub fn new(
         name: &str,
         mc_version: &str,
-        default_memory_mb: u32,
-        default_gc_preset: &str,
         loader: LoaderType,
         loader_version: Option<String>,
     ) -> Self {
@@ -81,12 +78,12 @@ impl Instance {
             loader,
             loader_version,
             loader_profile: None,
-            // Pre-fill with the recommended default so the slider sits at the
-            // optimal position the moment the instance is created, even if the
-            // user never opens the editor. The user can still override.
-            memory_mb: Some(default_memory_mb),
+            // None = inherit the current global default at launch time. Do
+            // not copy the value here: a copied value would freeze the old
+            // default and make later global changes invisible.
+            memory_mb: None,
             jvm_args: None,
-            gc_preset: Some(default_gc_preset.to_string()),
+            gc_preset: None,
             java_path: None,
             resolution: None,
             icon: None,
@@ -96,6 +93,18 @@ impl Instance {
             play_time_seconds: 0,
             notes: String::new(),
         }
+    }
+
+    /// Effective memory at launch: the explicit per-instance override wins,
+    /// otherwise the current global default is inherited.
+    pub fn effective_memory_mb(&self, default_memory_mb: u32) -> u32 {
+        self.memory_mb.unwrap_or(default_memory_mb)
+    }
+
+    /// Effective GC preset at launch: explicit override, otherwise the
+    /// current global default. Memory and GC inherit independently.
+    pub fn effective_gc_preset<'a>(&'a self, default_gc_preset: &'a str) -> &'a str {
+        self.gc_preset.as_deref().unwrap_or(default_gc_preset)
     }
 
     /// Get the instance directory path
@@ -4139,6 +4148,69 @@ mod tests {
     use super::*;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn new_instance_inherits_global_memory_and_gc() {
+        let instance = Instance::new("Inherited", "1.20.1", LoaderType::Vanilla, None);
+        assert_eq!(instance.memory_mb, None, "must inherit global memory");
+        assert_eq!(instance.gc_preset, None, "must inherit global GC");
+    }
+
+    #[test]
+    fn effective_memory_and_gc_inherit_independently() {
+        let mut instance = Instance::new("Inherited", "1.20.1", LoaderType::Vanilla, None);
+        assert_eq!(instance.effective_memory_mb(4096), 4096);
+        assert_eq!(instance.effective_gc_preset("g1gc"), "g1gc");
+
+        instance.memory_mb = Some(6144);
+        assert_eq!(instance.effective_memory_mb(4096), 6144);
+        assert_eq!(
+            instance.effective_gc_preset("g1gc"),
+            "g1gc",
+            "memory override must not pin the GC default"
+        );
+
+        instance.gc_preset = Some("zgc".into());
+        assert_eq!(instance.effective_memory_mb(4096), 6144);
+        assert_eq!(instance.effective_gc_preset("g1gc"), "zgc");
+
+        instance.memory_mb = None;
+        assert_eq!(instance.effective_memory_mb(8192), 8192);
+    }
+
+    #[test]
+    fn explicit_instance_memory_and_gc_survive_roundtrip() {
+        let mut instance = Instance::new("Custom", "1.20.1", LoaderType::Vanilla, None);
+        instance.memory_mb = Some(6144);
+        instance.gc_preset = Some("zgc".into());
+
+        let json = serde_json::to_string(&instance).unwrap();
+        let loaded: Instance = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.memory_mb, Some(6144));
+        assert_eq!(loaded.gc_preset.as_deref(), Some("zgc"));
+    }
+
+    #[test]
+    fn legacy_instance_without_memory_or_gc_fields_inherits() {
+        let json = r#"{
+            "name": "Legacy",
+            "mc_version": "1.20.1",
+            "loader": "Vanilla",
+            "loader_version": null,
+            "loader_profile": null,
+            "jvm_args": null,
+            "java_path": null,
+            "resolution": null,
+            "icon": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_played": null,
+            "play_time_seconds": 0,
+            "notes": ""
+        }"#;
+        let loaded: Instance = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.memory_mb, None);
+        assert_eq!(loaded.gc_preset, None);
+    }
 
     fn build_prism_zip(path: &Path) {
         let file = std::fs::File::create(path).unwrap();

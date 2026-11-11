@@ -219,10 +219,10 @@ const ContentRow = memo(function ContentRow({
           pending={iconsResolving && !iconSrc}
         />
       </div>
-      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }} title={item.description || item.name}>
+      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }}>
         {item.name}
       </div>
-      <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={loadersLabel ? `${versionLabel} · ${loadersLabel}` : versionLabel}>
+      <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {versionLabel}
         {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
       </div>
@@ -278,16 +278,16 @@ const ContentCardRow = memo(function ContentCardRow({
       </div>
       <div style={{ flex: 1, minWidth: 0, display: 'grid', gridTemplateColumns: '1fr 1fr 80px', gap: 'var(--space-sm)', alignItems: 'center' }}>
         <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.description || item.name}>
+          <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {item.name}
           </div>
           {item.description ? (
-            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.description}>
+            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {item.description}
             </div>
           ) : null}
         </div>
-        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={loadersLabel ? `${versionLabel} · ${loadersLabel}` : versionLabel}>
+        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {versionLabel}
           {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
         </div>
@@ -1263,7 +1263,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         mcVersion={mcVersion}
         loader={loader}
         onClose={() => setShowBrowser(false)}
-        onInstalled={() => { loadItems(); }}
+        onInstalled={loadItems}
         installedProjectIds={installedIds}
       />
     );
@@ -1371,7 +1371,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
         {/* Bottom bar */}
         <div style={{ padding: '6px var(--space-2xl)', borderTop: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
-          <div style={{ position: 'relative', flex: 1, maxWidth: 300 }}>
+          <div style={{ position: 'relative', flex: '1 1 300px', maxWidth: 300, minWidth: 0 }}>
             <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)', zIndex: 1, pointerEvents: 'none' }} />
             <input className="input" type="text" value={search} onChange={(e) => setSearch(e.target.value)}
               placeholder={SEARCH_PLACEHOLDERS[contentType]}
@@ -1379,10 +1379,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
               style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
           </div>
           {hasSelection && (
-            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('common.items_selected', { n: selectedFilenames.size.toString() })}</span>
+            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', flexShrink: 0, whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>{t('common.items_selected', { n: selectedFilenames.size.toString() })}</span>
           )}
           <div style={{ flex: 1 }} />
-          <Button size="sm" variant="ghost" onClick={loadItems} disabled={loading} style={{ minWidth: 80 }}>
+          <Button size="sm" variant="ghost" onClick={loadItems} disabled={loading} style={{ minWidth: 80, flexShrink: 0 }}>
             <RefreshIcon spinning={loading} minimumMs={BUILDS_REFRESH_MIN_SPIN_MS} />
             {t('common.refresh')}
           </Button>

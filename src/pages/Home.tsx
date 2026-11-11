@@ -142,7 +142,7 @@ export function Home({ onNavigate }: HomeProps) {
       {/* Top bar: greeting + quick play */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-lg)' }}>
         {activeId ? (
-          <Avatar uuid={activeId} name={activeName ?? ''} size={56} />
+          <Avatar uuid={activeId} name={activeName ?? ''} provider={defaultAccount?.account_type ?? 'Microsoft'} size={56} />
         ) : (
           <div style={{
             width: 56, height: 56,

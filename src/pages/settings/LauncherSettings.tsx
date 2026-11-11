@@ -7,6 +7,7 @@ import { addToast } from '../../components/ui/Toast';
 import { useT } from '../../lib/i18n';
 import type { AppConfig } from '../../stores/settingsStore';
 import { useToastSettingsStore } from '../../stores/toastSettingsStore';
+import { useSkinSettingsStore } from '../../stores/skinSettingsStore';
 import type { UpdateConfig } from './types';
 
 interface LauncherSettingsProps {
@@ -21,6 +22,8 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
   const toastWarning = useToastSettingsStore((s) => s.warning);
   const toastError = useToastSettingsStore((s) => s.error);
   const setToastCategory = useToastSettingsStore((s) => s.setCategory);
+  const skinRefreshMode = useSkinSettingsStore((s) => s.refreshMode);
+  const setSkinRefreshMode = useSkinSettingsStore((s) => s.setRefreshMode);
 
   const toastRows = [
     {
@@ -64,6 +67,25 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
                 { value: 'close', label: t('settings.after_launch_close') },
               ]}
               onChange={(v) => updateConfig('after_launch_action', v as AppConfig['after_launch_action'])}
+            />
+          </div>
+        </div>
+
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.skin_refresh_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.skin_refresh_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control" style={{ width: 240 }}>
+            <CustomSelect
+              value={skinRefreshMode}
+              options={[
+                { value: 'auto', label: t('settings.skin_refresh_auto') },
+                { value: 'manual', label: t('settings.skin_refresh_manual') },
+              ]}
+              onChange={(v) => setSkinRefreshMode(v === 'manual' ? 'manual' : 'auto')}
             />
           </div>
         </div>

@@ -1,10 +1,11 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Search, ArrowLeft, Package, ArrowUpDown, Star, Calendar, X, Check, Download, AlertTriangle } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
+import { Modal } from '../ui/Modal';
 import { SlidingTabs } from '../ui/SlidingTabs';
 import { addToast } from '../ui/Toast';
 import { SnakeSpinner } from '../ui/SnakeSpinner';
@@ -23,16 +24,45 @@ import {
   type ProviderId,
   type ProviderProject,
   type ProviderRequestToken,
+  type ProviderVersion,
 } from '../../lib/contentProviders';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { batchImportToastType } from '../../lib/localImport';
 import { formatBytes } from '../../lib/format';
 import {
-  countProgressPercent,
   fileProgressPercent,
-  weightedProgressPercent,
   type FileProgressPayload,
 } from '../../lib/downloadProgress';
+import {
+  applyCardChunk,
+  cardIsIndeterminate,
+  cardPercent,
+  completeCard,
+  downloadCardKey,
+  failCard,
+  initialDownloadCards,
+  overallDownloadPercent,
+  startCard,
+  type DownloadCardMap,
+} from '../../lib/downloadCards';
+import {
+  mergeResolvedSelection,
+  pinSameProjectVersion,
+  removeProject,
+} from '../../lib/contentSelection';
+import {
+  applyVersionChanges,
+  buildConflictIndex,
+  candidateDependencyStatus,
+  conflictItemKey,
+  conflictProjectKey,
+  planConflictResolution,
+  pruneConflicts,
+  withVersion,
+  type ConflictAutoPlan,
+  type ContentConflict,
+} from '../../lib/contentConflicts';
+import { installCompletionAction, returnToInstalledContent } from '../../lib/contentInstallFlow';
 
 type Hit = ProviderProject;
 
@@ -61,7 +91,9 @@ interface DepConflictReason {
   source_provider?: string;
   source_project_id: string;
   source_name: string;
+  source_version_id?: string | null;
   requirement: string;
+  requirement_version_id?: string | null;
   kind: string;
 }
 interface DepConflict {
@@ -123,7 +155,7 @@ interface Props {
   mcVersion?: string | null;
   loader?: string | null;
   onClose: () => void;
-  onInstalled: () => void;
+  onInstalled: () => void | Promise<void>;
   /** Project IDs of mods/packs already installed on disk (verified slugs only). */
   installedProjectIds?: Set<string>;
 }
@@ -199,12 +231,11 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const [installing, setInstalling] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<number | null>(0);
   const [fileProgress, setFileProgress] = useState<FileProgressPayload | null>(null);
-  const activeFileRef = useRef<{ filename: string; url: string } | null>(null);
-  const completedBytesRef = useRef(0);
-  const completedFilesRef = useRef(0);
-  const totalBytesRef = useRef(0);
-  const totalFilesRef = useRef(0);
-  const sizesKnownRef = useRef(false);
+  const [downloadCards, setDownloadCards] = useState<DownloadCardMap>({});
+  const downloadCardsRef = useRef<DownloadCardMap>({});
+  const [downloadSummary, setDownloadSummary] = useState<{ success: number; failed: number } | null>(null);
+  const activeFileRef = useRef<{ key: string; filename: string; url: string } | null>(null);
+  const installBusyRef = useRef(false);
   const [popularOffset, setPopularOffset] = useState(0);
   const [resultsOffset, setResultsOffset] = useState(0);
   const [hasMorePopular, setHasMorePopular] = useState(true);
@@ -225,6 +256,22 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   // until the graph arrives (owner wave 25 — the race used to let an install
   // start before its dependencies were known).
   const [resolving, setResolving] = useState(false);
+
+  // ----- Conflict resolution UI -----
+  const conflictIndex = useMemo(() => buildConflictIndex(conflicts), [conflicts]);
+  const versionCacheRef = useRef<Record<string, ProviderVersion[]>>({});
+  const [versionEditor, setVersionEditor] = useState<{
+    key: string;
+    item: SelectedItem;
+    versions: ProviderVersion[];
+    loading: boolean;
+    error: string | null;
+  } | null>(null);
+  const [versionSearch, setVersionSearch] = useState('');
+  const [autoFix, setAutoFix] = useState<ConflictAutoPlan<SelectedItem> | null>(null);
+  const [autoFixBusy, setAutoFixBusy] = useState(false);
+  const [autoFixError, setAutoFixError] = useState<string | null>(null);
+  const autoFixReqRef = useRef(0);
 
   const TYPE_LABELS: Record<ContentType, string> = {
     mod: t('content.type_mod'),
@@ -253,6 +300,13 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     return () => setPending(0);
   }, [selectedItems, setPending]);
 
+  const commitDownloadCards = useCallback((next: DownloadCardMap) => {
+    downloadCardsRef.current = next;
+    setDownloadCards(next);
+    const percent = overallDownloadPercent(next);
+    setDownloadProgress(percent == null ? null : Math.round(percent));
+  }, []);
+
   // Real byte progress for the file currently being installed. The backend
   // emits this for every download; matching the destination file name keeps
   // unrelated background downloads out of this pane.
@@ -265,27 +319,16 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       if (!active) return;
       const payload = event.payload;
       if (payload.file_name && payload.file_name !== active.filename) return;
+      if (active.url && payload.url && payload.url !== active.url) return;
       setFileProgress(payload);
-
-      if (sizesKnownRef.current && totalBytesRef.current > 0) {
-        const percent = weightedProgressPercent(
-          completedBytesRef.current,
+      commitDownloadCards(
+        applyCardChunk(
+          downloadCardsRef.current,
+          active.key,
           payload.downloaded,
-          totalBytesRef.current,
-        );
-        setDownloadProgress(percent == null ? null : Math.round(percent));
-        return;
-      }
-      if (payload.total != null && payload.total > 0) {
-        const currentFraction = Math.min(1, payload.downloaded / payload.total);
-        const total = Math.max(1, totalFilesRef.current);
-        const percent = ((completedFilesRef.current + currentFraction) / total) * 100;
-        setDownloadProgress(Math.min(99, Math.round(percent)));
-      } else if (totalFilesRef.current <= 1) {
-        // No trustworthy total for a single file: keep the bar indeterminate
-        // instead of pretending it is at 100%.
-        setDownloadProgress(null);
-      }
+          payload.total,
+        ),
+      );
     })
       .then((fn) => {
         if (disposed) fn();
@@ -296,7 +339,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [commitDownloadCards]);
 
   const requestLeave = () => {
     if (installing) return;
@@ -343,6 +386,15 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     setSubView('search');
     setLoading(false);
     setLoadingMore(false);
+    downloadCardsRef.current = {};
+    setDownloadCards({});
+    setDownloadSummary(null);
+    setDownloadProgress(0);
+    setFileProgress(null);
+    setVersionEditor(null);
+    setAutoFix(null);
+    setAutoFixError(null);
+    versionCacheRef.current = {};
     hadSearchRef.current = false;
   }, [contentType, providerId, commitSelectedItems]);
 
@@ -672,7 +724,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         }),
       ]);
       if (reqId !== resolveReqRef.current) return;
-      commitSelectedItems(res.install.map((p) => ({
+      const resolved = res.install.map((p) => ({
         name: p.name,
         iconUrl: p.icon_url ?? undefined,
         downloadUrl: p.file.url,
@@ -686,7 +738,11 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         size: p.file.size ?? undefined,
         isDependency: !p.is_root,
         parentMod: p.is_root ? undefined : (p.required_by[0] || undefined),
-      })));
+      }));
+      // A resolver response must never replace the version the user pinned.
+      // Dependencies are always taken from the plan; selected roots keep the
+      // exact version/file the user chose.
+      commitSelectedItems(mergeResolvedSelection(selectedItemsRef.current, resolved));
       setConflicts(res.conflicts);
       setUnresolved(res.unresolved);
     } catch (e: any) {
@@ -709,19 +765,155 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   // caused instead of re-resolving the whole graph over the network. Project
   // ids are only unique inside a provider, so both halves must match.
   const pruneResolution = (projectId: string, provider: string) => {
-    setConflicts((prev) => prev
-      .map((c) => ({
-        ...c,
-        reasons: c.reasons.filter((r) =>
-          !(r.source_project_id === projectId
-            && (r.source_provider || 'modrinth') === provider)),
-      }))
-      .filter((c) =>
-        !(c.project_id === projectId && (c.provider || 'modrinth') === provider)
-        && c.reasons.length > 0));
+    setConflicts((prev) => pruneConflicts(prev, provider, projectId));
     setUnresolved((prev) => prev.filter((u) =>
       !(u.source_project_id === projectId
         && (u.source_provider || 'modrinth') === provider)));
+  };
+
+  // ----- Conflict resolution actions -----
+  const canChangeItemVersion = (item: SelectedItem) =>
+    !item.isDependency && (item.source === 'modrinth' || item.source === 'curseforge');
+
+  const loadProjectVersions = async (item: SelectedItem): Promise<ProviderVersion[]> => {
+    const key = conflictItemKey(item);
+    const cached = versionCacheRef.current[key];
+    if (cached) return cached;
+    const versions = await getProvider(item.source as ProviderId).getVersions(
+      item.projectId,
+      mcVersion ?? null,
+      versionLoader,
+    );
+    versionCacheRef.current[key] = versions;
+    return versions;
+  };
+
+  const openVersionEditor = async (item: SelectedItem) => {
+    if (!canChangeItemVersion(item) || installing || resolving) return;
+    const key = conflictItemKey(item);
+    setVersionSearch('');
+    const cached = versionCacheRef.current[key];
+    setVersionEditor({
+      key,
+      item,
+      versions: cached ?? [],
+      loading: !cached,
+      error: null,
+    });
+    if (cached) return;
+    try {
+      const versions = await loadProjectVersions(item);
+      setVersionEditor((current) =>
+        current && current.key === key
+          ? { ...current, versions, loading: false }
+          : current,
+      );
+    } catch (e: any) {
+      setVersionEditor((current) =>
+        current && current.key === key
+          ? { ...current, loading: false, error: e?.toString?.() ?? String(e) }
+          : current,
+      );
+    }
+  };
+
+  const chooseVersion = (version: ProviderVersion) => {
+    if (!versionEditor) return;
+    const key = versionEditor.key;
+    const currentItem = selectedItemsRef.current.find(
+      (item) => conflictItemKey(item) === key && !item.isDependency,
+    );
+    if (!currentItem) {
+      setVersionEditor(null);
+      return;
+    }
+    const updated = withVersion(currentItem, version);
+    if (!updated) {
+      addToast(t('content.version_no_file'), 'error');
+      return;
+    }
+    const next = selectedItemsRef.current.map((item) =>
+      conflictItemKey(item) === key && !item.isDependency ? updated : item,
+    );
+    commitSelectedItems(next);
+    setVersionEditor(null);
+    setAutoFixError(null);
+    if (currentItem.versionId !== version.id) void applyResolution(next);
+  };
+
+  const removeSelectedProject = (provider: string | undefined, projectId: string) => {
+    const next = removeProject(selectedItemsRef.current, provider, projectId);
+    if (next.length === selectedItemsRef.current.length) return;
+    ++resolveReqRef.current;
+    commitSelectedItems(next);
+    pruneResolution(projectId, provider || 'modrinth');
+    setAutoFix(null);
+    setAutoFixError(null);
+    void applyResolution(next);
+  };
+
+  const prepareAutoFix = async () => {
+    if (autoFixBusy || resolving || conflicts.length === 0) return;
+    const requestId = ++autoFixReqRef.current;
+    const snapshot = selectedItemsRef.current;
+    setAutoFixBusy(true);
+    setAutoFixError(null);
+    setAutoFix(null);
+    try {
+      const versionsByProject: Record<string, ProviderVersion[]> = {};
+      const targets = new Set(
+        conflicts.map((conflict) => conflictProjectKey(conflict.provider, conflict.project_id)),
+      );
+      for (const key of targets) {
+        const item = snapshot.find(
+          (candidate) => conflictItemKey(candidate) === key && !candidate.isDependency,
+        );
+        if (!item) continue;
+        try {
+          versionsByProject[key] = await loadProjectVersions(item);
+        } catch {
+          // Missing provider data is reported by the planner, not guessed.
+        }
+      }
+      if (
+        requestId !== autoFixReqRef.current
+        || selectedItemsRef.current !== snapshot
+      ) {
+        return;
+      }
+      const plan = planConflictResolution(
+        conflicts as ContentConflict[],
+        snapshot,
+        versionsByProject,
+      );
+      if (plan.changes.length === 0 && plan.unresolved.length === 0) {
+        setAutoFixError(t('content.conflict_auto_none'));
+        return;
+      }
+      setAutoFix(plan);
+      if (plan.changes.length === 0) {
+        setAutoFixError(t('content.conflict_auto_none'));
+      }
+    } catch (e: any) {
+      if (requestId === autoFixReqRef.current) {
+        setAutoFixError(t('content.conflict_auto_error', { error: e?.toString?.() ?? String(e) }));
+      }
+    } finally {
+      if (requestId === autoFixReqRef.current) setAutoFixBusy(false);
+    }
+  };
+
+  const applyAutoFix = () => {
+    if (!autoFix || autoFix.changes.length === 0) return;
+    autoFixReqRef.current += 1;
+    const next = applyVersionChanges(
+      selectedItemsRef.current,
+      autoFix.changes.map((change) => ({ key: change.key, version: change.version })),
+    );
+    commitSelectedItems(next);
+    setAutoFix(null);
+    setAutoFixError(null);
+    void applyResolution(next);
   };
 
   const addLatest = async (hit: Hit) => {
@@ -791,48 +983,58 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const removeItem = (idx: number) => {
     const removed = selectedItemsRef.current[idx];
     const next = selectedItemsRef.current.filter((_, i) => i !== idx);
+    ++resolveReqRef.current;
     commitSelectedItems(next);
-    if (removed) pruneResolution(removed.projectId, removed.source || 'modrinth');
+    if (removed) {
+      pruneResolution(removed.projectId, removed.source || 'modrinth');
+    }
+    setAutoFixError(null);
+    void applyResolution(next);
   };
 
   const removeByProjectId = (projectId: string) => {
-    commitSelectedItems(selectedItemsRef.current.filter(
-      (m) => !(m.projectId === projectId && (m.source || 'modrinth') === providerId),
-    ));
-    pruneResolution(projectId, providerId);
+    removeSelectedProject(providerId, projectId);
+  };
+
+  const finishDownloadView = async () => {
+    commitSelectedItems([]);
+    downloadCardsRef.current = {};
+    setDownloadCards({});
+    setDownloadSummary(null);
+    setDownloadProgress(0);
+    setFileProgress(null);
+    setSubView('search');
+    await returnToInstalledContent(onInstalled, onClose);
   };
 
   const handleDownloadAll = async () => {
+    if (installBusyRef.current) return;
     const items = selectedItemsRef.current;
     if (items.length === 0) return;
+    installBusyRef.current = true;
 
     setInstalling(true);
+    setDownloadSummary(null);
     setFileProgress(null);
     activeFileRef.current = null;
-    const sizes = items.map((item) => item.size && item.size > 0 ? item.size : 0);
-    const allSizesKnown = sizes.every((size) => size > 0);
-    const totalBytes = allSizesKnown ? sizes.reduce((sum, size) => sum + size, 0) : 0;
-    totalBytesRef.current = totalBytes;
-    totalFilesRef.current = items.length;
-    completedBytesRef.current = 0;
-    completedFilesRef.current = 0;
-    sizesKnownRef.current = allSizesKnown;
-    setDownloadProgress(0);
+    const initialCards = initialDownloadCards(items);
+    downloadCardsRef.current = initialCards;
+    setDownloadCards(initialCards);
+    const initialPercent = overallDownloadPercent(initialCards);
+    setDownloadProgress(initialPercent == null ? null : Math.round(initialPercent));
 
     let success = 0;
     let failed = 0;
     for (const item of items) {
-      activeFileRef.current = { filename: item.filename, url: item.downloadUrl };
+      const key = downloadCardKey(item);
+      activeFileRef.current = { key, filename: item.filename, url: item.downloadUrl };
       setFileProgress({
         url: item.downloadUrl,
         file_name: item.filename,
         downloaded: 0,
         total: item.size && item.size > 0 ? item.size : null,
       });
-      const startPercent = allSizesKnown
-        ? weightedProgressPercent(completedBytesRef.current, 0, totalBytes)
-        : countProgressPercent(completedFilesRef.current, items.length);
-      setDownloadProgress(startPercent == null ? null : Math.round(startPercent));
+      commitDownloadCards(startCard(downloadCardsRef.current, key, item.size));
       try {
         await invoke('cmd_download_to_folder', {
           instanceName,
@@ -848,39 +1050,43 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           fileId: item.fileId ?? null,
         });
         success++;
-        completedFilesRef.current += 1;
-        if (item.size && item.size > 0) completedBytesRef.current += item.size;
+        commitDownloadCards(completeCard(downloadCardsRef.current, key));
       } catch (e: any) {
         failed++;
-        completedFilesRef.current += 1;
+        commitDownloadCards(failCard(downloadCardsRef.current, key));
         addToast(t('content.install_error', { name: item.name, error: e.toString() }), 'error');
       }
       activeFileRef.current = null;
-
-      if (allSizesKnown) {
-        const percent = weightedProgressPercent(
-          completedBytesRef.current,
-          0,
-          totalBytes,
-        );
-        setDownloadProgress(percent == null ? null : Math.round(percent));
-      } else {
-        const percent = countProgressPercent(completedFilesRef.current, items.length);
-        setDownloadProgress(percent == null ? null : Math.round(percent));
-      }
     }
 
     setFileProgress(null);
     setInstalling(false);
-    setDownloadProgress(failed === 0 ? 100 : 99);
     addToast(
       t('content.install_result', { success: success.toString(), failed: failed.toString() }),
       batchImportToastType(success, failed),
     );
-    commitSelectedItems([]);
-    setSubView('search');
-    onInstalled();
-    onClose();
+
+    // Every command above has fully resolved: the file was downloaded,
+    // verified (SHA1/zip magic), placed and its sidecar written. The list
+    // refresh must finish before the browser closes so the new files are
+    // already visible when the install pane disappears.
+    if (installCompletionAction(success, failed) === 'return') {
+      commitSelectedItems([]);
+      downloadCardsRef.current = {};
+      setDownloadCards({});
+      setDownloadSummary(null);
+      setDownloadProgress(0);
+      setSubView('search');
+      await returnToInstalledContent(onInstalled, onClose);
+      installBusyRef.current = false;
+      return;
+    }
+
+    // Partial/failed batch: keep the results (and per-card errors) on screen.
+    // The Done button remains as the explicit exit for this exceptional path.
+    setDownloadSummary({ success, failed });
+    installBusyRef.current = false;
+    void onInstalled();
   };
 
   const sortHits = (items: Hit[]): Hit[] => {
@@ -912,26 +1118,258 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   if (subView === 'confirm') {
     const direct = selectedItems.filter((m) => !m.isDependency);
     const deps = selectedItems.filter((m) => m.isDependency);
+    const renderCardProgress = (item: SelectedItem) => {
+      if (!installing && !downloadSummary) return null;
+      const state = downloadCards[downloadCardKey(item)];
+      if (!state) return null;
+      const percent = cardPercent(state);
+      const indeterminate = cardIsIndeterminate(state);
+      const statusLabel = state.status === 'queued'
+        ? t('content.download_queued')
+        : state.status === 'downloading'
+          ? t('content.download_active')
+          : state.status === 'done'
+            ? t('content.download_done')
+            : t('content.download_failed');
+      const color = state.status === 'error'
+        ? 'var(--color-danger)'
+        : state.status === 'done'
+          ? 'var(--success)'
+          : state.status === 'downloading'
+            ? 'var(--primary)'
+            : 'var(--text-tertiary)';
+      const bytesLabel = state.downloaded > 0
+        ? state.total != null && state.total > 0
+          ? t('content.file_progress', {
+              bytes: formatBytes(state.downloaded),
+              total: formatBytes(state.total),
+              percent: String(Math.round(percent ?? 0)),
+            })
+          : t('content.file_progress_unknown', { bytes: formatBytes(state.downloaded) })
+        : null;
+      return (
+        <div style={{ marginTop: 6 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 'var(--space-sm)', fontSize: 'var(--font-size-xs)', color, marginBottom: 3 }}>
+            <span>{statusLabel}</span>
+            <span>{percent != null && state.status !== 'queued' ? `${Math.round(percent)}%` : ''}</span>
+          </div>
+          <div style={{ height: 4, background: 'var(--bg-tertiary)', borderRadius: 2, overflow: 'hidden' }}>
+            <div style={{
+              height: '100%',
+              width: percent != null ? `${percent}%` : '100%',
+              background: color,
+              borderRadius: 2,
+              transition: 'width 0.25s ease',
+              animation: indeterminate ? 'indeterminate 1.2s ease-in-out infinite' : undefined,
+            }} />
+          </div>
+          {bytesLabel && (
+            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: 3 }}>
+              {bytesLabel}
+            </div>
+          )}
+        </div>
+      );
+    };
+    const renderSelectedCard = (item: SelectedItem, dependency: boolean) => {
+      const itemKey = conflictItemKey(item);
+      const link = conflictIndex[itemKey];
+      const targetReasons = link?.targetReasons ?? [];
+      const sourceLinks = link?.sourceLinks ?? [];
+      const hasConflict = targetReasons.length > 0 || sourceLinks.length > 0;
+      const conflictSourceOnly = sourceLinks.length > 0 && targetReasons.length === 0;
+      const classNames = [
+        'content-list-row',
+        'content-download-card',
+        dependency ? 'content-list-row--dep' : '',
+        hasConflict ? 'content-download-card--conflict' : '',
+        conflictSourceOnly ? 'content-download-card--conflict-source' : '',
+      ].filter(Boolean).join(' ');
+      return (
+        <div
+          key={itemKey}
+          className={classNames}
+          style={{
+            display: 'flex',
+            alignItems: 'flex-start',
+            gap: 'var(--space-sm)',
+            padding: '8px 12px',
+            borderRadius: 'var(--radius-md)',
+            marginBottom: 4,
+          }}
+        >
+          <RemoteIcon url={item.iconUrl} letter={item.name.charAt(0)} size={28} radius={4} fontSize={11} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="content-download-card__title">
+              <span style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</span>
+              {targetReasons.length > 0 && (
+                <span className="content-conflict-badge content-conflict-badge--target">
+                  <AlertTriangle size={10} aria-hidden="true" />
+                  {t('content.conflict_version_badge')}
+                </span>
+              )}
+              {sourceLinks.length > 0 && (
+                <span className="content-conflict-badge content-conflict-badge--source">
+                  <AlertTriangle size={10} aria-hidden="true" />
+                  {t('content.conflict_dependency_badge')}
+                </span>
+              )}
+            </div>
+            <div className="content-version-line">
+              <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                {item.versionName || item.versionId || item.filename} · {item.source}
+              </span>
+              {!dependency && !downloadSummary && canChangeItemVersion(item) && (
+                <button
+                  type="button"
+                  className="content-version-link"
+                  onClick={() => { void openVersionEditor(item); }}
+                  disabled={installing || resolving}
+                >
+                  {t('content.change_version_btn')}
+                </button>
+              )}
+            </div>
+            {dependency && (
+              <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+                {t('content.dep_required_by', { parent: item.parentMod ?? '' })}
+              </div>
+            )}
+            {renderCardProgress(item)}
+          </div>
+          {!downloadSummary && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => removeSelectedProject(item.source, item.projectId)}
+              disabled={installing}
+              style={{ alignSelf: 'center' }}
+              aria-label={t('content.remove_item', { name: item.name })}
+            >
+              <X size={12} />
+            </Button>
+          )}
+        </div>
+      );
+    };
+    const editorQuery = versionSearch.trim().toLowerCase();
+    const editorVersions = versionEditor
+      ? versionEditor.versions.filter((version) => {
+          if (!editorQuery) return true;
+          return `${version.name} ${version.version_number} ${version.id}`
+            .toLowerCase()
+            .includes(editorQuery);
+        })
+      : [];
+    const recommendedVersions = editorVersions.filter(
+      (version) => !version.version_type || version.version_type === 'release',
+    );
+    const otherVersions = editorVersions.filter(
+      (version) => !recommendedVersions.includes(version),
+    );
+    const editorConflictReasons = versionEditor
+      ? (conflictIndex[versionEditor.key]?.targetReasons ?? [])
+      : [];
+    const versionChannelLabel = (version: ProviderVersion) => {
+      if (version.version_type === 'beta') return t('content.version_channel_beta');
+      if (version.version_type === 'alpha') return t('content.version_channel_alpha');
+      if (version.version_type === 'release') return t('content.version_channel_release');
+      return '';
+    };
+    const renderVersionOption = (version: ProviderVersion) => {
+      const isCurrent = versionEditor?.item.versionId === version.id;
+      const channel = versionChannelLabel(version);
+      const dependencyStatus = candidateDependencyStatus(
+        version.id,
+        editorConflictReasons,
+      );
+      const requiredSources = dependencyStatus.kind === 'required'
+        ? dependencyStatus.sources
+        : [];
+      const conflictSources = dependencyStatus.kind === 'conflict'
+        ? dependencyStatus.sources
+        : [];
+      return (
+        <button
+          key={version.id}
+          type="button"
+          className={`content-version-row${isCurrent ? ' content-version-row--current' : ''}`}
+          onClick={() => chooseVersion(version)}
+          aria-pressed={isCurrent}
+        >
+          <span className="content-version-row__main">
+            <span className="content-version-row__name">
+              {version.name || version.version_number}
+            </span>
+            <span className="content-version-row__meta">
+              {version.version_number}
+              {version.game_versions?.length ? ` · ${version.game_versions.slice(0, 4).join(', ')}` : ''}
+              {version.loaders?.length ? ` · ${version.loaders.join(' / ')}` : ''}
+            </span>
+            <span className="content-version-row__id">{version.id}</span>
+            {conflictSources.length > 0 && (
+              <span className="content-version-row__note">
+                {t('content.version_conflict_note', {
+                  sources: conflictSources.join(', '),
+                })}
+              </span>
+            )}
+          </span>
+          <span className="content-version-row__badges">
+            {channel && <span className={`content-version-channel content-version-channel--${version.version_type}`}>{channel}</span>}
+            {dependencyStatus.kind === 'required' && (
+              <span className="content-version-required">
+                {requiredSources.length > 0
+                  ? t('content.version_required_by', { sources: requiredSources.join(', ') })
+                  : t('content.version_required_generic')}
+              </span>
+            )}
+            {dependencyStatus.kind === 'conflict' && (
+              <span className="content-version-conflict">
+                {t('content.version_dependency_conflict')}
+              </span>
+            )}
+            {isCurrent && <span className="content-version-current">{t('content.change_version_current')}</span>}
+          </span>
+        </button>
+      );
+    };
     return (
+      <>
       <div className="content-confirm" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <div style={{ padding: 'var(--space-md) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', alignItems: 'center', gap: 'var(--space-md)', flexShrink: 0 }}>
-          <Button variant="ghost" size="sm" onClick={() => setSubView('search')} disabled={installing}><ArrowLeft size={16} /> {t('common.back')}</Button>
+          <Button variant="ghost" size="sm" onClick={() => {
+            if (downloadSummary) finishDownloadView();
+            else setSubView('search');
+          }} disabled={installing}><ArrowLeft size={16} /> {t('common.back')}</Button>
           <h2 style={{ margin: 0, fontSize: 'var(--font-size-lg)', fontWeight: 700, flex: 1 }}>{t('content.confirm_heading', { label, count: selectedItems.length.toString() })}</h2>
-          <Button onClick={handleDownloadAll} disabled={installing || resolving || selectedItems.length === 0 || conflicts.length > 0} loading={installing || resolving}>
-            <Download size={14} /> {t('common.install')}
-          </Button>
+          {downloadSummary ? (
+            <Button onClick={finishDownloadView}>
+              <Check size={14} /> {t('content.download_finished_btn')}
+            </Button>
+          ) : (
+            <Button onClick={handleDownloadAll} disabled={installing || resolving || selectedItems.length === 0 || conflicts.length > 0} loading={installing || resolving}>
+              <Download size={14} /> {t('common.install')}
+            </Button>
+          )}
         </div>
-        {installing && (
+        {(installing || downloadSummary) && (
           <div className="content-confirm__progress" style={{ margin: 'var(--space-md) var(--space-xl)', borderRadius: 'var(--radius-md)', padding: 'var(--space-md)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, fontSize: 'var(--font-size-sm)' }}>
-              <span>{t('common.installing')}</span>
+              <span>{downloadSummary
+                ? (downloadSummary.failed > 0
+                  ? t('content.download_overall_partial')
+                  : t('content.download_overall_done'))
+                : t('common.installing')}</span>
               <span>{downloadProgress != null ? `${downloadProgress}%` : ''}</span>
             </div>
             <div style={{ height: 4, background: 'var(--bg-tertiary)', borderRadius: 2, overflow: 'hidden' }}>
               <div style={{
                 height: '100%',
                 width: downloadProgress != null ? `${downloadProgress}%` : '100%',
-                background: 'var(--primary)',
+                background: downloadSummary && downloadSummary.failed > 0
+                  ? 'var(--warning)'
+                  : 'var(--primary)',
                 borderRadius: 2,
                 transition: 'width 0.3s',
                 animation: downloadProgress == null ? 'indeterminate 1.2s ease-in-out infinite' : undefined,
@@ -953,31 +1391,65 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
               </div>
             )}
             <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 4 }}>
-              {t('content.install_keep_open')}
+              {!downloadSummary && t('content.install_keep_open')}
             </div>
+            {downloadSummary && (
+              <div style={{ fontSize: 'var(--font-size-xs)', color: downloadSummary.failed > 0 ? 'var(--warning)' : 'var(--success)', marginTop: 4 }}>
+                {t('content.install_result', {
+                  success: downloadSummary.success.toString(),
+                  failed: downloadSummary.failed.toString(),
+                })}
+              </div>
+            )}
           </div>
         )}
         <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-md) var(--space-xl)' }}>
           {/* Blocking conflict report (stage 3, item 15): installation is
               disabled until the conflicting item leaves the selection. */}
           {conflicts.length > 0 && (
-            <div style={{ marginBottom: 'var(--space-lg)', border: '1px solid var(--color-danger)', background: 'hsla(0, 85%, 60%, 0.08)', borderRadius: 'var(--radius-md)', padding: 'var(--space-md)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, fontSize: 'var(--font-size-sm)', color: 'var(--color-danger)', marginBottom: 6 }}>
-                <X size={14} /> {t('content.deps_conflict_heading')}
-              </div>
-              {conflicts.map((c) => (
-                <div key={`${c.provider || 'modrinth'}:${c.project_id}`} style={{ marginBottom: 6 }}>
-                  <div style={{ fontWeight: 600, fontSize: 'var(--font-size-xs)' }}>{c.project_name || c.project_id}</div>
-                  {c.reasons.map((r, i) => (
-                    <div key={i} style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)' }}>
-                      {r.kind === 'incompatible'
-                        ? t('content.conflict_incompatible', { name: c.project_name || c.project_id, source: r.source_name })
-                        : t('content.conflict_version', { source: r.source_name, name: c.project_name || c.project_id, requirement: r.requirement })}
-                    </div>
-                  ))}
+            <div className="content-conflict-report" role="region" aria-label={t('content.deps_conflict_heading')}>
+              <div className="content-conflict-report__head">
+                <span className="content-conflict-report__title">
+                  <AlertTriangle size={14} aria-hidden="true" />
+                  {t('content.deps_conflict_heading')}
+                </span>
+                <span className="content-conflict-count">
+                  {t('content.conflict_count', { count: conflicts.length.toString() })}
+                </span>
+                <div className="content-conflict-report__actions">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => { void prepareAutoFix(); }}
+                    loading={autoFixBusy}
+                    disabled={autoFixBusy || resolving || installing}
+                  >
+                    {t('content.conflict_auto_btn')}
+                  </Button>
                 </div>
-              ))}
-              <div style={{ fontWeight: 600, fontSize: 'var(--font-size-xs)' }}>{t('content.deps_conflict_blocked')}</div>
+              </div>
+              {autoFixError && (
+                <div className="content-conflict-auto-note" role="status">{autoFixError}</div>
+              )}
+              {conflicts.map((c) => {
+                const targetKey = conflictProjectKey(c.provider, c.project_id);
+                return (
+                  <div key={targetKey} className="content-conflict-entry">
+                    <div className="content-conflict-entry__title">
+                      {c.project_name || c.project_id}
+                    </div>
+                    {c.reasons.map((r, i) => (
+                      <div key={`${targetKey}-reason-${i}`} className="content-conflict-entry__reason">
+                        <span>
+                          {r.kind === 'incompatible'
+                            ? t('content.conflict_incompatible', { name: c.project_name || c.project_id, source: r.source_name })
+                            : t('content.conflict_version', { source: r.source_name, name: c.project_name || c.project_id, requirement: r.requirement })}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
             </div>
           )}
           {/* Unresolved required dependencies: warn, but do not block. */}
@@ -996,36 +1468,138 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           {direct.length > 0 && (
             <div style={{ marginBottom: 'var(--space-lg)' }}>
               <h3 style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, marginBottom: 'var(--space-sm)' }}>{t('content.mods_heading', { label, count: direct.length.toString() })}</h3>
-              {direct.map((item, i) => (
-                <div key={i} className="content-list-row" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', marginBottom: 4 }}>
-                  <RemoteIcon url={item.iconUrl} letter={item.name.charAt(0)} size={28} radius={4} fontSize={11} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
-                    <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{item.versionName} · {item.source}</div>
-                  </div>
-                  <Button size="sm" variant="ghost" onClick={() => removeItem(selectedItems.indexOf(item))} disabled={installing}><X size={12} /></Button>
-                </div>
-              ))}
+              {direct.map((item) => renderSelectedCard(item, false))}
             </div>
           )}
           {deps.length > 0 && (
             <div style={{ marginBottom: 'var(--space-lg)' }}>
               <h3 style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, marginBottom: 'var(--space-sm)', color: 'var(--warning)' }}>{t('content.deps_heading', { count: deps.length.toString() })}</h3>
-              {deps.map((item, i) => (
-                <div key={i} className="content-list-row content-list-row--dep" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: '8px 12px', borderRadius: 'var(--radius-md)', border: '1px solid hsla(35, 90%, 55%, 0.2)', marginBottom: 4 }}>
-                  <RemoteIcon url={item.iconUrl} letter={item.name.charAt(0)} size={28} radius={4} fontSize={11} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{item.name}</div>
-                    <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('content.dep_required_by', { parent: item.parentMod ?? '' })}</div>
-                  </div>
-                  <Button size="sm" variant="ghost" onClick={() => removeItem(selectedItems.indexOf(item))} disabled={installing}><X size={12} /></Button>
-                </div>
-              ))}
+              {deps.map((item) => renderSelectedCard(item, true))}
             </div>
           )}
           {selectedItems.length === 0 && <div style={{ textAlign: 'center', padding: 'var(--space-2xl)', color: 'var(--text-tertiary)' }}>{t('common.no_items')}</div>}
         </div>
       </div>
+      <Modal
+        open={versionEditor !== null}
+        onClose={() => setVersionEditor(null)}
+        title={versionEditor
+          ? t('content.change_version_title', { name: versionEditor.item.name })
+          : ''}
+        maxWidth={640}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <Button variant="ghost" onClick={() => setVersionEditor(null)}>{t('common.cancel')}</Button>
+          </div>
+        }
+      >
+        {versionEditor?.loading && (
+          <div style={{ display: 'flex', justifyContent: 'center', padding: 'var(--space-xl)' }}>
+            <SnakeSpinner size={24} />
+          </div>
+        )}
+        {versionEditor?.error && (
+          <div className="content-version-error" role="alert">
+            {t('content.change_version_error', { error: versionEditor.error })}
+          </div>
+        )}
+        {versionEditor && !versionEditor.loading && !versionEditor.error && (
+          <>
+            <div style={{ position: 'relative', marginBottom: 'var(--space-sm)' }}>
+              <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)', pointerEvents: 'none' }} />
+              <input
+                className="input"
+                type="text"
+                value={versionSearch}
+                onChange={(event) => setVersionSearch(event.target.value)}
+                placeholder={t('content.change_version_search')}
+                aria-label={t('content.change_version_search')}
+                autoFocus
+                style={{ paddingLeft: 32 }}
+              />
+            </div>
+            {recommendedVersions.length > 0 && (
+              <div className="content-version-group">
+                <div className="content-version-group__title">{t('content.change_version_recommended')}</div>
+                {recommendedVersions.map(renderVersionOption)}
+              </div>
+            )}
+            {otherVersions.length > 0 && (
+              <div className="content-version-group">
+                <div className="content-version-group__title">{t('content.change_version_other')}</div>
+                {otherVersions.map(renderVersionOption)}
+              </div>
+            )}
+            {recommendedVersions.length === 0 && otherVersions.length === 0 && (
+              <div style={{ padding: 'var(--space-lg)', textAlign: 'center', color: 'var(--text-tertiary)' }}>
+                {t('content.change_version_empty')}
+              </div>
+            )}
+          </>
+        )}
+      </Modal>
+      <Modal
+        open={autoFix !== null}
+        onClose={() => setAutoFix(null)}
+        title={t('content.conflict_auto_title')}
+        maxWidth={640}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+            <Button variant="ghost" onClick={() => setAutoFix(null)}>{t('common.cancel')}</Button>
+            <Button
+              onClick={applyAutoFix}
+              disabled={!autoFix || autoFix.changes.length === 0}
+            >
+              {t('content.conflict_auto_apply')}
+            </Button>
+          </div>
+        }
+      >
+        {autoFix && autoFix.changes.length > 0 && (
+          <div className="content-autofix-list">
+            {autoFix.changes.map((change) => (
+              <div key={change.key} className="content-autofix-row">
+                <div className="content-autofix-row__name">{change.targetName}</div>
+                <div className="content-autofix-row__line">
+                  {t('content.conflict_auto_current', { version: change.fromLabel })}
+                </div>
+                <div className="content-autofix-row__line content-autofix-row__line--next">
+                  {t('content.conflict_auto_next', { version: change.toLabel })}
+                </div>
+                {change.reasons.map((reason, index) => (
+                  <div key={`${change.key}-reason-${index}`} className="content-autofix-row__reason">
+                    {t('content.conflict_auto_reason', {
+                      source: reason.source_name,
+                      requirement: reason.requirement,
+                    })}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        )}
+        {autoFix && autoFix.unresolved.length > 0 && (
+          <div className="content-autofix-unresolved">
+            <div className="content-autofix-unresolved__title">
+              <AlertTriangle size={13} aria-hidden="true" />
+              {t('content.conflict_auto_unresolved')}
+            </div>
+            {autoFix.unresolved.map((entry, index) => (
+              <div key={`${conflictProjectKey(entry.conflict.provider, entry.conflict.project_id)}-${index}`} className="content-autofix-unresolved__row">
+                <strong>{entry.conflict.project_name || entry.conflict.project_id}</strong>
+                {' — '}
+                {entry.code === 'incompatible' && t('content.conflict_auto_unresolved_incompatible')}
+                {entry.code === 'ambiguous' && t('content.conflict_auto_unresolved_ambiguous')}
+                {entry.code === 'no_candidate' && t('content.conflict_auto_unresolved_no_candidate')}
+                {entry.code === 'dependency_managed' && t('content.conflict_auto_unresolved_dependency')}
+                {entry.code === 'missing_versions' && t('content.conflict_auto_unresolved_missing')}
+                {entry.code === 'not_selected' && t('content.conflict_auto_unresolved_not_selected')}
+              </div>
+            ))}
+          </div>
+        )}
+      </Modal>
+      </>
     );
   }
 
@@ -1039,16 +1613,37 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       </div>
 
       {/* Search + sort bar */}
-      <div style={{ padding: 'var(--space-sm) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
-        <div style={{ position: 'relative', flex: 1 }}>
-          <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)', zIndex: 1, pointerEvents: 'none' }} />
-          <input className="input" type="text" value={query} onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-            placeholder={SEARCH_PLACEHOLDERS[contentType]}
-            aria-label={SEARCH_PLACEHOLDERS[contentType]}
-            style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
+      <div style={{ padding: 'var(--space-sm) var(--space-xl)', borderBottom: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0, flexWrap: 'wrap' }}>
+        {/* The field and Find are one unit: the field may shrink on a narrow
+            window, the button never does. The selected counter is a separate
+            sibling, so it cannot take width away from either of them. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flex: '1 1 320px', minWidth: 0 }}>
+          <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
+            <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)', zIndex: 1, pointerEvents: 'none' }} />
+            <input className="input" type="text" value={query} onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+              placeholder={SEARCH_PLACEHOLDERS[contentType]}
+              aria-label={SEARCH_PLACEHOLDERS[contentType]}
+              style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
+          </div>
+          <Button size="sm" onClick={handleSearch} disabled={loading} loading={loading} style={{ flexShrink: 0 }}><Search size={14} /> {t('common.find')}</Button>
         </div>
-        <Button size="sm" onClick={handleSearch} disabled={loading} loading={loading}><Search size={14} /> {t('common.find')}</Button>
+        {/* Compact live count, right of Find. It wraps to its own line when
+            the pane is too narrow instead of squeezing the search controls. */}
+        {selectedItems.length > 0 && (
+          <span
+            role="status"
+            style={{
+              fontSize: 'var(--font-size-sm)',
+              color: 'var(--text-secondary)',
+              flexShrink: 0,
+              whiteSpace: 'nowrap',
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            {t('common.items_selected', { n: selectedItems.length.toString() })}
+          </span>
+        )}
         {/* Catalog provider switch: one browser for both catalogs. Same
             sliding-tab idiom as the terminal's log switcher (owner wave 25):
             the frame physically travels between the buttons. */}
@@ -1217,9 +1812,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                                 fileId: file.file_id,
                                 size: file.size,
                               };
-                              const next = [...selectedItemsRef.current, item];
+                              const next = pinSameProjectVersion(selectedItemsRef.current, item);
                               commitSelectedItems(next);
-                              addToast(t('content.added_toast', { name: selected.title }), 'success');
                               // A pinned version goes through the same backend
                               // resolution as "add latest" (item 14).
                               applyResolution(next);
@@ -1254,10 +1848,9 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         )}
       </div>
 
-      {/* Bottom bar with selected count + Confirm */}
+      {/* Bottom bar with selected chips + Confirm */}
       {selectedItems.length > 0 && (
         <div className="selection-bar" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', padding: 'var(--space-sm) var(--space-md)', flexShrink: 0, margin: '0 var(--space-xl) var(--space-md)' }}>
-          <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', flexShrink: 0 }}>{t('common.items_selected', { n: selectedItems.length.toString() })}</span>
           <div style={{ flex: 1, display: 'flex', gap: 4, overflowX: 'auto' }}>
             {selectedItems.map((m, i) => (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 999, background: m.isDependency ? 'var(--warning-dim)' : 'var(--primary-dim)', fontSize: 11, whiteSpace: 'nowrap', flexShrink: 0 }}>

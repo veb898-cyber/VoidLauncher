@@ -11,21 +11,22 @@ export interface ToastPreferences {
 
 export const TOAST_SETTINGS_STORAGE_KEY = 'voidlauncher-toast-settings';
 
-/** Visible by default: keeps the pre-setting behaviour unchanged. */
+/** Success and warning toasts are opt-in; errors stay visible by default. */
 export const DEFAULT_TOAST_PREFERENCES: ToastPreferences = {
-  success: true,
-  warning: true,
+  success: false,
+  warning: false,
   error: true,
 };
 
 function coercePreferences(value: unknown): ToastPreferences {
   if (!value || typeof value !== 'object') return DEFAULT_TOAST_PREFERENCES;
   const record = value as Partial<Record<keyof ToastPreferences, unknown>>;
-  // Missing or malformed fields stay enabled: an old/partial payload must
-  // never silently hide notifications the user did not switch off.
+  // Only an explicit `true` opts a silent-by-default category in. Errors are
+  // the opposite: an explicit `false` is required to hide them, so an old or
+  // partial payload never silently hides failures.
   return {
-    success: record.success !== false,
-    warning: record.warning !== false,
+    success: record.success === true,
+    warning: record.warning === true,
     error: record.error !== false,
   };
 }

@@ -527,6 +527,30 @@ mod tests {
     }
 
     #[test]
+    fn proxy_source_and_manual_values_survive_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("vl-config-proxy-{}", uuid::Uuid::new_v4()));
+        let mut config = base();
+        config.data_dir = dir.clone();
+        config.proxy_enabled = true;
+        config.use_system_proxy = Some(true);
+        config.proxy_addr = "10.0.0.7".into();
+        config.proxy_port = 3128;
+        config.proxy_only = true;
+        config.after_launch_action = "minimize".into();
+        config.save().unwrap();
+
+        let loaded = AppConfig::load(&dir);
+        assert!(loaded.proxy_enabled);
+        assert_eq!(loaded.use_system_proxy, Some(true));
+        assert_eq!(loaded.proxy_addr, "10.0.0.7");
+        assert_eq!(loaded.proxy_port, 3128);
+        assert!(loaded.proxy_only);
+        assert_eq!(loaded.after_launch_action, "minimize");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn legacy_close_on_launch_migrates_to_close_action() {
         let mut c = base();
         c.close_on_launch = true;

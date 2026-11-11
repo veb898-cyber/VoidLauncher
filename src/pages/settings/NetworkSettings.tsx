@@ -94,15 +94,13 @@ export function NetworkSettings({ config, updateConfig }: NetworkSettingsProps) 
         className="settings-row settings-row--stacked"
         style={{ opacity: manualDisabled ? 0.5 : 1 }}
       >
-        <div className="settings-row__info">
-          <div className="settings-row__title">{t('settings.proxy_server_title')}</div>
-          {config.use_system_proxy && (
-            <div className="settings-row__desc" style={{ marginTop: 4 }}>
+        {config.use_system_proxy && (
+          <div className="settings-row__info">
+            <div className="settings-row__desc">
               {t('settings.proxy_manual_ignored_hint')}
             </div>
-          )}
-        </div>
-        <div className="settings-row__control">
+          </div>
+        )}        <div className="settings-row__control">
           <div className="field-group field-group--grow">
             <label className="field-group__label" htmlFor="proxy-addr">
               {t('settings.proxy_addr_title')}
@@ -123,7 +121,7 @@ export function NetworkSettings({ config, updateConfig }: NetworkSettingsProps) 
             </label>
             <input
               id="proxy-port"
-              className="input"
+              className="input proxy-port-input"
               type="number"
               min={1}
               max={65535}
@@ -137,31 +135,39 @@ export function NetworkSettings({ config, updateConfig }: NetworkSettingsProps) 
         </div>
       </div>
 
-      <div
-        className="settings-row settings-row--dependent"
-        style={{ opacity: config.proxy_enabled ? 1 : 0.5 }}
-      >
-        <div className="settings-row__info">
-          <div className="settings-row__title">{t('settings.proxy_only_title')}</div>
-          <div className="settings-row__desc">
-            {t('settings.proxy_only_desc')}
-          </div>
-          {!config.proxy_enabled && (
-            <div className="settings-row__desc" style={{ marginTop: 4 }}>
-              {t('settings.proxy_only_disabled_hint')}
-            </div>
-          )}
+      {/* Proxy-only is a rule about how the proxy may be used, not a third
+          connection parameter: it sits below a divider so the primary source
+          settings stay compact. */}
+      <div className="settings-subsection settings-subsection--divided">
+        <div className="settings-subsection__head">
+          <div className="settings-subsection__title">{t('settings.proxy_advanced_title')}</div>
         </div>
-        <div className="settings-row__control">
-          <Toggle
-            checked={config.proxy_only}
-            onChange={(v) => {
-              updateConfig('proxy_only', v);
-              applyPolicy({ proxy_only: v });
-            }}
-            disabled={!config.proxy_enabled}
-            ariaLabel={t('settings.proxy_only_title')}
-          />
+        <div
+          className="settings-row settings-row--dependent"
+          style={{ opacity: config.proxy_enabled ? 1 : 0.5 }}
+        >
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.proxy_only_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.proxy_only_desc')}
+            </div>
+            {!config.proxy_enabled && (
+              <div className="settings-row__desc" style={{ marginTop: 4 }}>
+                {t('settings.proxy_only_disabled_hint')}
+              </div>
+            )}
+          </div>
+          <div className="settings-row__control">
+            <Toggle
+              checked={config.proxy_only}
+              onChange={(v) => {
+                updateConfig('proxy_only', v);
+                applyPolicy({ proxy_only: v });
+              }}
+              disabled={!config.proxy_enabled}
+              ariaLabel={t('settings.proxy_only_title')}
+            />
+          </div>
         </div>
       </div>
     </section>

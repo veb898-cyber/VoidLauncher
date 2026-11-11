@@ -8,6 +8,7 @@ import { Input } from '../ui/Input';
 import { Modal } from '../ui/Modal';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { Slider } from '../ui/Slider';
+import { Toggle } from '../ui/Toggle';
 import { addToast } from '../ui/Toast';
 import { CustomSelect, type SelectOption } from '../ui/CustomSelect';
 import {
@@ -17,6 +18,7 @@ import {
   resolveInitialMemoryMb,
 } from '../../lib/memory';
 import { useSettingsStore } from '../../stores/settingsStore';
+import { gcOverrideValue, memoryOverrideValue, type GcChoice } from '../../lib/instanceDefaults';
 import { LoaderVersionModal } from './LoaderVersionModal';
 import { useT, getLanguage } from '../../lib/i18n';
 
@@ -46,30 +48,43 @@ type GcPreset = 'standard' | 'g1gc' | 'zgc';
 export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const t = useT();
   const gb = getLanguage() === 'ru' ? 'ГБ' : 'GB';
-  const presetOptions: SelectOption<GcPreset>[] = [
+  const presetOptions: SelectOption<GcChoice>[] = [
+    {
+      value: 'inherit',
+      label: t('instance_editor.gc_use_default'),
+      description: t('instance_editor.gc_use_default_short'),
+    },
     { value: 'standard', label: t('instance_editor.gc_standard'), description: t('instance_editor.gc_standard_short') },
     { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: t('instance_editor.gc_g1gc_short') },
     { value: 'zgc', label: t('instance_editor.gc_zgc'), description: t('instance_editor.gc_zgc_req') },
   ];
   const globalConfig = useSettingsStore((s) => s.config);
+  const loadGlobalConfig = useSettingsStore((s) => s.loadConfig);
   const globalDefaultMemoryMb = globalConfig?.default_memory_mb ?? null;
   const globalDefaultGcPreset = (globalConfig?.default_gc_preset as GcPreset) ?? 'g1gc';
   const globalDefaultJvmArgs = globalConfig?.default_jvm_args ?? [];
   const defaultJvmArgsText = globalDefaultJvmArgs.join(' ');
+
+  // The instance editor can be opened before the Settings page ever loaded
+  // the config. Fetch it so the "global default" labels show real values.
+  useEffect(() => {
+    if (open && !globalConfig) void loadGlobalConfig();
+  }, [open, globalConfig, loadGlobalConfig]);
 
   const [name, setName] = useState(instance.name);
   const [notes, setNotes] = useState(instance.notes || '');
   const [memoryMb, setMemoryMb] = useState<number>(
     instance.memory_mb ?? globalDefaultMemoryMb ?? 4096
   );
+  const [useDefaultMemory, setUseDefaultMemory] = useState(instance.memory_mb == null);
   // No per-instance override means the launcher uses its global defaults:
   // show those exact args instead of an empty field, so the value the game
   // will actually receive is visible before editing.
   const [jvmArgs, setJvmArgs] = useState(
     instance.jvm_args != null ? instance.jvm_args.join(' ') : defaultJvmArgsText
   );
-  const [gcPreset, setGcPreset] = useState<GcPreset>(
-    (instance.gc_preset as GcPreset) ?? globalDefaultGcPreset
+  const [gcPreset, setGcPreset] = useState<GcChoice>(
+    (instance.gc_preset as GcPreset) ?? 'inherit'
   );
   const [javaPath, setJavaPath] = useState(instance.java_path || '');
   const [resWidth, setResWidth] = useState(instance.resolution?.width?.toString() || '');
@@ -96,7 +111,6 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
 
     const {
       globalDefaultMemoryMb: globalMemory,
-      globalDefaultGcPreset: globalGc,
       globalDefaultJvmArgs: globalJvm,
       systemRamMb: ram,
     } = defaultsRef.current;
@@ -110,11 +124,12 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     setName(instance.name);
     setNotes(instance.notes || '');
     setMemoryMb(resolvedMemory);
+    setUseDefaultMemory(instance.memory_mb == null);
     const initialJvmArgs = instance.jvm_args != null
       ? instance.jvm_args.join(' ')
       : globalJvm.join(' ');
     setJvmArgs(initialJvmArgs);
-    setGcPreset((instance.gc_preset as GcPreset) ?? globalGc);
+    setGcPreset((instance.gc_preset as GcPreset) ?? 'inherit');
     setJavaPath(instance.java_path || '');
     setResWidth(instance.resolution?.width?.toString() ?? '');
     setResHeight(instance.resolution?.height?.toString() ?? '');
@@ -124,8 +139,9 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
       name: instance.name,
       notes: instance.notes || '',
       memoryMb: resolvedMemory,
+      useDefaultMemory: instance.memory_mb == null,
       jvmArgs: initialJvmArgs,
-      gcPreset: (instance.gc_preset as GcPreset) ?? globalGc,
+      gcPreset: (instance.gc_preset as GcPreset) ?? 'inherit',
       javaPath: instance.java_path || '',
       resWidth: instance.resolution?.width?.toString() ?? '',
       resHeight: instance.resolution?.height?.toString() ?? '',
@@ -139,7 +155,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
 
   const dirty =
     baseline !== '' &&
-    JSON.stringify({ name, notes, memoryMb, jvmArgs, gcPreset, javaPath, resWidth, resHeight }) !== baseline;
+    JSON.stringify({ name, notes, memoryMb, useDefaultMemory, jvmArgs, gcPreset, javaPath, resWidth, resHeight }) !== baseline;
 
   /** Close via overlay click / Escape / Cancel — but ask first when dirty.
    *  While the loader version dialog is open, Escape belongs to it: both
@@ -194,9 +210,9 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
         ...instance,
         name,
         notes,
-        memory_mb: memoryMb,
+        memory_mb: memoryOverrideValue(useDefaultMemory, memoryMb),
         jvm_args: jvmArgsOverride,
-        gc_preset: gcPreset,
+        gc_preset: gcOverrideValue(gcPreset),
         java_path: javaPath.trim() || null,
         resolution: (() => {
           // parseInt('') returns NaN; parseInt('12px') returns 12 (silent
@@ -296,13 +312,33 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
               {t('instance_editor.memory_max_info', { maxGb, systemRamGb })}
             </span>
           </label>
-          <Slider
-            min={MIN_MEMORY_MB}
-            max={maxMemoryMb}
-            step={MEMORY_STEP_MB}
-            value={memoryMb}
-            onChange={(v) => setMemoryMb(v)}
-          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', marginBottom: 6 }}>
+            <Toggle
+              checked={useDefaultMemory}
+              onChange={(value) => {
+                setUseDefaultMemory(value);
+                if (value && globalDefaultMemoryMb) setMemoryMb(globalDefaultMemoryMb);
+              }}
+              ariaLabel={t('instance_editor.memory_use_default', {
+                gb: ((globalDefaultMemoryMb ?? 4096) / 1024).toFixed(1),
+              })}
+            />
+            <span style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)' }}>
+              {t('instance_editor.memory_use_default', {
+                gb: ((globalDefaultMemoryMb ?? 4096) / 1024).toFixed(1),
+              })}
+            </span>
+          </div>
+          <div style={{ opacity: useDefaultMemory ? 0.55 : 1 }}>
+            <Slider
+              min={MIN_MEMORY_MB}
+              max={maxMemoryMb}
+              step={MEMORY_STEP_MB}
+              value={memoryMb}
+              onChange={(v) => setMemoryMb(v)}
+              disabled={useDefaultMemory}
+            />
+          </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 2 }}>
             <span>{t('instance_editor.memory_min_label', { gb: (MIN_MEMORY_MB / 1024).toFixed(1) })}</span>
             <span>{t('instance_editor.memory_max_label', { maxGb })}</span>
@@ -327,7 +363,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
           <label className="input__label" style={{ display: 'block', marginBottom: 4 }}>
             {t('instance_editor.gc_label')}
           </label>
-          <CustomSelect<GcPreset>
+          <CustomSelect<GcChoice>
             value={gcPreset}
             options={presetOptions.map((o) =>
               o.value === 'zgc' && zgcDisabled ? { ...o, disabled: true } : o
@@ -335,6 +371,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
             onChange={setGcPreset}
           />
           <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 4 }}>
+            {gcPreset === 'inherit' && t('instance_editor.gc_default_desc', { preset: globalDefaultGcPreset.toUpperCase() })}
             {gcPreset === 'standard' && t('instance_editor.gc_standard_desc')}
             {gcPreset === 'g1gc' && t('instance_editor.gc_g1gc_desc')}
             {gcPreset === 'zgc' && (

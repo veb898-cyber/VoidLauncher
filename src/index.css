@@ -93,6 +93,14 @@
   --space-2xl: 32px;
   --space-3xl: 48px;
 
+  /* Shared list geometry. Normal tables and Liquid Glass card lists use the
+     same row padding, thumbnail and action-box sizes; the theme changes the
+     material around that geometry, not the geometry itself. */
+  --row-padding-y: var(--space-sm);
+  --row-icon-size: 32px;
+  --row-action-size: 22px;
+  --row-card-gap: var(--space-xs);
+
   /* Border Radius */
   --radius-sm: 6px;
   --radius-md: 10px;
@@ -1298,6 +1306,30 @@ a {
 .btn--sm {
   padding: var(--space-sm) var(--space-lg);
   font-size: var(--font-size-sm);
+}
+
+/* Diagnostics: keep the magnifier at the same distance from the left edge as
+   from the label, but size this one button to its content. The default 24px
+   horizontal padding plus the wider icon gap left too much empty space on the
+   right of the label. */
+.diagnostics-run-btn {
+  flex: 0 0 auto;
+  width: fit-content;
+  max-width: 100%;
+  gap: var(--space-lg);
+  padding-inline: var(--space-lg);
+}
+
+/* Icon-only action inside a material card. The flat list draws the same
+   action as a 14px glyph with 4px padding; the card must not inflate it into
+   a 34px chip just because it uses the button component. */
+.btn--icon-only {
+  width: var(--row-action-size);
+  height: var(--row-action-size);
+  min-width: var(--row-action-size);
+  padding: 0;
+  gap: 0;
+  flex-shrink: 0;
 }
 
 .btn--icon {
@@ -2508,6 +2540,14 @@ html:not([data-theme='lg']) .settings-page--active {
   margin-top: var(--space-lg);
 }
 
+/* Secondary settings separated from the primary block by a hairline: the
+   proxy-only rule applies to both proxy sources and should not read as
+   another primary connection parameter. */
+.settings-subsection--divided {
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--surface-border);
+}
+
 .settings-subsection__head {
   display: flex;
   align-items: center;
@@ -2593,6 +2633,20 @@ html:not([data-theme='lg']) .settings-page--active {
 .field-group__hint {
   font-size: var(--font-size-xs);
   color: var(--text-tertiary);
+}
+
+/* The proxy port is typed, not stepped. WebView2 draws native number
+   spinners; hide them only on this field instead of changing every numeric
+   input in the app. */
+.proxy-port-input::-webkit-outer-spin-button,
+.proxy-port-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.proxy-port-input {
+  -moz-appearance: textfield;
+  appearance: textfield;
 }
 
 /* ============================
@@ -2908,6 +2962,12 @@ html:not([data-theme='lg']) .settings-page--active {
   animation: icon-shine 1.6s ease-in-out infinite;
 }
 
+/* Revalidation overlay: the last good head stays visible underneath, the
+   sweep only signals that a fresh skin is being checked. */
+.icon-shine--overlay {
+  background: transparent;
+}
+
 @keyframes icon-shine {
   0% { transform: translateX(-100%); }
   100% { transform: translateX(100%); }
@@ -2918,6 +2978,338 @@ html:not([data-theme='lg']) .settings-page--active {
 .content-list-row {
   content-visibility: auto;
   contain-intrinsic-size: auto 40px;
+}
+
+/* ============================
+   Content install: conflict cards and resolver UI
+   ============================ */
+
+.content-download-card {
+  border: 1px solid transparent;
+  transition: background 160ms ease-out, border-color 160ms ease-out, box-shadow 160ms ease-out;
+}
+
+.content-download-card.content-list-row--dep:not(.content-download-card--conflict) {
+  border-color: hsla(35, 90%, 55%, 0.2);
+  background: hsla(35, 90%, 55%, 0.04);
+}
+
+.content-download-card--conflict {
+  --content-conflict-accent: var(--warning);
+  border-color: transparent;
+  background: transparent;
+  box-shadow: inset 2px 0 0 var(--content-conflict-accent);
+}
+
+.content-download-card--conflict-source {
+  --content-conflict-accent: var(--color-danger);
+}
+
+.content-download-card__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.content-conflict-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 15px;
+  white-space: nowrap;
+}
+
+.content-conflict-badge--target {
+  color: var(--warning);
+  background: hsla(35, 90%, 55%, 0.08);
+}
+
+.content-conflict-badge--source {
+  color: var(--color-danger);
+  background: var(--danger-bg);
+}
+
+.content-version-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 1px;
+}
+
+.content-version-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--primary);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.content-version-link:hover:not(:disabled) {
+  color: var(--primary-light);
+  text-decoration-thickness: 2px;
+}
+
+.content-version-link:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.content-conflict-report {
+  margin-bottom: var(--space-md);
+  padding: 10px 12px;
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-md);
+  background: var(--danger-bg);
+}
+
+.content-conflict-report__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.content-conflict-report__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.content-conflict-count {
+  padding: 0 7px;
+  border: 1px solid var(--danger-border);
+  border-radius: 999px;
+  color: var(--color-danger);
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.content-conflict-report__actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.content-conflict-auto-note {
+  margin: 4px 0 8px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.content-conflict-entry {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--danger-border);
+}
+
+.content-conflict-entry__title {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.content-conflict-entry__reason {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.content-autofix-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.content-autofix-row {
+  padding: 10px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-active);
+}
+
+.content-autofix-row__name {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.content-autofix-row__line {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.content-autofix-row__line--next {
+  color: var(--success);
+  font-weight: 500;
+}
+
+.content-autofix-row__reason {
+  margin-top: 4px;
+  color: var(--warning);
+  font-size: 11px;
+}
+
+.content-autofix-unresolved {
+  margin-top: var(--space-md);
+  padding: var(--space-md);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-md);
+  background: hsla(35, 90%, 55%, 0.08);
+}
+
+.content-autofix-unresolved__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  color: var(--warning);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.content-autofix-unresolved__row {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.content-version-group {
+  margin-top: var(--space-md);
+}
+
+.content-version-group__title {
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.content-version-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-md);
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-bottom-color: var(--surface-border);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 150ms ease-out, border-color 150ms ease-out;
+}
+
+.content-version-row:hover {
+  background: var(--surface-active);
+}
+
+.content-version-row--current {
+  border-color: var(--primary);
+  background: var(--primary-dim);
+}
+
+.content-version-row__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.content-version-row__name {
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+}
+
+.content-version-row__meta,
+.content-version-row__id {
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.content-version-row__id {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.content-version-row__badges {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.content-version-channel,
+.content-version-required,
+.content-version-conflict,
+.content-version-current {
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 17px;
+  white-space: nowrap;
+}
+
+.content-version-channel {
+  border: 1px solid var(--surface-border);
+  color: var(--text-secondary);
+}
+
+.content-version-channel--beta,
+.content-version-channel--alpha {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.content-version-required {
+  border: 1px solid var(--warning);
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.content-version-conflict {
+  border: 1px solid var(--danger-border);
+  color: var(--color-danger);
+  font-weight: 600;
+}
+
+.content-version-row__note {
+  margin-top: 2px;
+  color: var(--warning);
+  font-size: 11px;
+}
+
+.content-version-current {
+  border: 1px solid var(--primary);
+  color: var(--primary);
+}
+
+.content-version-error {
+  padding: var(--space-md);
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
 }
 
 /* ============================
@@ -4755,7 +5147,7 @@ input[type="range"]:active::-moz-range-thumb {
       .selection-bar, .game-logs-picker-panel, .floating-menu, .floating-menu .btn--ghost,
       .game-logs-picker-trigger,
       .glass-card, .empty-state, .instance-list, .tabs__indicator,
-      .install-overlay__sheet, .content-detail-panel,
+      .install-overlay__sheet, .content-detail-panel, .content-conflict-report,
       .settings-section, .log-container,
       .content-manager__pane, .content-manager__pane .btn--ghost, .content-actions .btn--ghost,
       .btn--secondary, .btn--danger, .segmented, .input, .search-bar,
@@ -4794,7 +5186,7 @@ input[type="range"]:active::-moz-range-thumb {
       .selection-bar, .game-logs-picker-panel, .floating-menu, .floating-menu .btn--ghost,
       .game-logs-picker-trigger,
       .glass-card, .empty-state, .instance-list, .tabs__indicator,
-      .install-overlay__sheet, .content-detail-panel,
+      .install-overlay__sheet, .content-detail-panel, .content-conflict-report,
       .settings-section, .log-container,
       .content-manager__pane, .content-manager__pane .btn--ghost, .content-actions .btn--ghost,
       .btn--secondary, .btn--danger, .segmented, .input, .search-bar,
@@ -4991,6 +5383,24 @@ input[type="range"]:active::-moz-range-thumb {
     /* Tint, not --bg-tertiary: an opaque hover drops the card out of the
        material for exactly as long as the pointer is over it. */
     background: var(--surface-glass-hover);
+  }
+
+  /* The shared Liquid Glass material rule above paints every modpack card
+     with the neutral fill and divider edge, which used to swallow the
+     primary border and tint of the selected card. Restore the same selection
+     reading the normal themes have, but keep the glass fill underneath: a
+     primary-tinted sheet plus the same 3px ring used by selected glass cards. */
+  [data-theme='lg'] .modpack-card--selected,
+  [data-theme='lg'] .modpack-card--selected:hover {
+    background:
+      linear-gradient(var(--primary-dim), var(--primary-dim)),
+      var(--lg-fill);
+    border-color: var(--primary);
+    box-shadow:
+      var(--lg-rim-ring),
+      var(--lg-inner-depth),
+      var(--lg-depth-shadow),
+      0 0 0 3px var(--primary-dim);
   }
 
   [data-theme='lg'] .experimental-block {
@@ -5820,6 +6230,44 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
 [data-theme='lg'] .content-confirm .content-list-row--dep {
   background: hsla(28, 80%, 34%, 0.46);
   box-shadow: var(--lg-rim-ring), inset 0 0 0 1px hsla(35, 90%, 55%, 0.24);
+}
+
+/* Blocking conflict report: the flat danger film in normal themes becomes a
+   red-tinted glass sheet under Liquid Glass. The tint stays translucent so
+   the wallpaper is still part of the material; the red border, title and
+   counter keep the conflict semantics, and the local text tokens stay light
+   enough to read over bright parts of the animated backdrop. */
+[data-theme='lg'] .content-conflict-report {
+  --text-secondary: hsl(220, 18%, 84%);
+  --text-tertiary: hsl(220, 16%, 70%);
+  background:
+    linear-gradient(180deg, hsla(352, 76%, 44%, 0.20), hsla(352, 76%, 30%, 0.10)),
+    var(--lg-fill);
+  border-color: hsla(352, 82%, 64%, 0.38);
+  box-shadow:
+    var(--lg-rim-ring),
+    inset 0 0 0 1px hsla(352, 82%, 70%, 0.06),
+    0 10px 24px -18px rgb(4, 6, 12, 0.55);
+  backdrop-filter: blur(14px) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(14px) saturate(var(--lg-sat));
+}
+
+[data-theme='lg'] .content-conflict-report__title {
+  color: hsl(352, 90%, 74%);
+}
+
+[data-theme='lg'] .content-conflict-count {
+  color: hsl(352, 90%, 78%);
+  border-color: hsla(352, 82%, 66%, 0.46);
+  background: hsla(352, 78%, 42%, 0.16);
+}
+
+[data-theme='lg'] .content-conflict-entry {
+  border-top-color: hsla(352, 72%, 64%, 0.22);
+}
+
+[data-theme='lg'] .content-conflict-auto-note {
+  color: hsl(220, 18%, 82%);
 }
 
 /* The installing plaque above the list (it used to be a pure inline style):

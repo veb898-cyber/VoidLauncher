@@ -166,21 +166,15 @@ pub async fn cmd_create_instance(
     loader_version: Option<String>,
 ) -> Result<instances::Instance, String> {
     validate_instance_name(&name)?;
-    let (instances_dir, default_memory_mb, default_gc_preset) = {
+    let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        (
-            config.instances_dir(),
-            config.default_memory_mb,
-            config.default_gc_preset.clone(),
-        )
+        config.instances_dir()
     };
     tauri::async_runtime::spawn_blocking(move || {
         let loader = loader.unwrap_or(instances::LoaderType::Vanilla);
         let instance = instances::Instance::new(
             &name,
             &mc_version,
-            default_memory_mb,
-            &default_gc_preset,
             loader.clone(),
             if loader == instances::LoaderType::Vanilla {
                 None

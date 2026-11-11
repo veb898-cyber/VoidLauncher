@@ -1257,7 +1257,7 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
         instances::get_instance(&instances_dir, &name)
             .map_err(|e| format!("reuse instance: {}", e))?
     } else {
-        let inst = Instance::new(&name, mc, 4096, "g1gc", loader_type(loader), None);
+        let inst = Instance::new(&name, mc, loader_type(loader), None);
         instances::create_instance(&instances_dir, &inst)
             .map_err(|e| format!("create instance: {}", e))?;
         inst

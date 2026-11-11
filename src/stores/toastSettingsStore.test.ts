@@ -13,47 +13,66 @@ beforeEach(() => {
 });
 
 describe('toast settings', () => {
-  it('keeps every category enabled by default', () => {
+  it('shows only error toasts by default', () => {
     expect(loadToastPreferences()).toEqual({
-      success: true,
-      warning: true,
+      success: false,
+      warning: false,
       error: true,
     });
   });
 
-  it('restores a persisted opt-out after a restart', () => {
-    useToastSettingsStore.getState().setCategory('success', false);
+  it('preserves an explicit opt-in after a restart', () => {
+    useToastSettingsStore.getState().setCategory('success', true);
 
     const stored = JSON.parse(localStorage.getItem(TOAST_SETTINGS_STORAGE_KEY) ?? '{}');
-    expect(stored).toEqual({ success: false, warning: true, error: true });
+    expect(stored).toEqual({ success: true, warning: false, error: true });
     expect(loadToastPreferences()).toEqual(stored);
   });
 
-  it('switches categories independently', () => {
-    const store = useToastSettingsStore.getState();
-    store.setCategory('warning', false);
-    expect(useToastSettingsStore.getState().warning).toBe(false);
-    expect(useToastSettingsStore.getState().success).toBe(true);
-    expect(useToastSettingsStore.getState().error).toBe(true);
-
-    store.setCategory('error', false);
-    expect(useToastSettingsStore.getState().error).toBe(false);
-    expect(useToastSettingsStore.getState().success).toBe(true);
-
-    store.setCategory('success', false);
-    expect(useToastSettingsStore.getState()).toMatchObject({
+  it('preserves an explicit opt-out of error toasts', () => {
+    useToastSettingsStore.getState().setCategory('error', false);
+    expect(loadToastPreferences()).toEqual({
       success: false,
       warning: false,
       error: false,
     });
   });
 
-  it('treats missing or malformed stored fields as enabled', () => {
-    localStorage.setItem(TOAST_SETTINGS_STORAGE_KEY, '{"success":false}');
-    expect(loadToastPreferences()).toEqual({
-      success: false,
+  it('switches categories independently', () => {
+    const store = useToastSettingsStore.getState();
+    store.setCategory('warning', true);
+    expect(useToastSettingsStore.getState().warning).toBe(true);
+    expect(useToastSettingsStore.getState().success).toBe(false);
+    expect(useToastSettingsStore.getState().error).toBe(true);
+
+    store.setCategory('success', true);
+    expect(useToastSettingsStore.getState()).toMatchObject({
+      success: true,
       warning: true,
       error: true,
+    });
+
+    store.setCategory('warning', false);
+    expect(useToastSettingsStore.getState()).toMatchObject({
+      success: true,
+      warning: false,
+      error: true,
+    });
+  });
+
+  it('uses the new defaults for missing fields and malformed payloads', () => {
+    localStorage.setItem(TOAST_SETTINGS_STORAGE_KEY, '{"success":true}');
+    expect(loadToastPreferences()).toEqual({
+      success: true,
+      warning: false,
+      error: true,
+    });
+
+    localStorage.setItem(TOAST_SETTINGS_STORAGE_KEY, '{"error":false}');
+    expect(loadToastPreferences()).toEqual({
+      success: false,
+      warning: false,
+      error: false,
     });
 
     localStorage.setItem(TOAST_SETTINGS_STORAGE_KEY, '{not json');

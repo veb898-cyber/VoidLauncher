@@ -10,7 +10,8 @@
 //!
 //! This is deliberately conservative:
 //! - only Java executables are considered;
-//! - at least two Minecraft-specific command-line arguments are required;
+//! - at least two launch flags are required, including one Minecraft-specific
+//!   flag (`--gameDir`, `--assetIndex`, `--accessToken`, ...);
 //! - the candidate directory must normalize to the exact instance directory;
 //! - the process must still have a verifiable identity at the moment of the
 //!   match.
@@ -41,6 +42,30 @@ pub trait ExternalGameProbe {
 
 /// Reads the real process table.
 pub struct SystemExternalGameProbe;
+
+/// True when this instance is in use either by the launcher's own tracked
+/// process or by a game started outside it. Repair calls this again between
+/// phases: the first check alone cannot cover a game that starts while a
+/// large download is already running.
+pub fn instance_is_running(
+    config: &crate::config::AppConfig,
+    instance: &crate::instances::Instance,
+) -> bool {
+    instance_is_running_with(&SystemExternalGameProbe, config, instance)
+}
+
+fn instance_is_running_with(
+    probe: &dyn ExternalGameProbe,
+    config: &crate::config::AppConfig,
+    instance: &crate::instances::Instance,
+) -> bool {
+    crate::running_state::scan_live_games(&config.data_dir)
+        .iter()
+        .any(|game| game.instance == instance.name)
+        || probe
+            .find_for_game_dir(&instance.minecraft_dir(&config.instances_dir()))
+            .is_some()
+}
 
 impl ExternalGameProbe for SystemExternalGameProbe {
     fn find_for_game_dir(&self, game_dir: &Path) -> Option<ExternalGame> {
@@ -126,7 +151,8 @@ fn looks_like_java(exe: Option<&Path>) -> bool {
 
 /// Minecraft's main class and launch arguments. Requiring two flags avoids
 /// treating an unrelated Java application that happens to use one generic
-/// option as the game.
+/// option as the game. At least one flag must be Minecraft-specific:
+/// `--version` and `--uuid` alone are common in unrelated Java tooling.
 const MINECRAFT_FLAGS: &[&str] = &[
     "--gameDir",
     "--assetIndex",
@@ -138,16 +164,31 @@ const MINECRAFT_FLAGS: &[&str] = &[
     "--userType",
 ];
 
+const MINECRAFT_SPECIFIC_FLAGS: &[&str] = &[
+    "--gameDir",
+    "--assetIndex",
+    "--versionType",
+    "--accessToken",
+    "--userProperties",
+    "--userType",
+];
+
 fn arg_is_flag(arg: &OsStr, flag: &str) -> bool {
     let value = arg.to_string_lossy();
     value == flag || value.starts_with(&format!("{flag}="))
 }
 
 fn looks_like_minecraft(args: &[std::ffi::OsString]) -> bool {
-    args.iter()
+    let count = args
+        .iter()
         .filter(|arg| MINECRAFT_FLAGS.iter().any(|flag| arg_is_flag(arg, flag)))
-        .count()
-        >= 2
+        .count();
+    count >= 2
+        && args.iter().any(|arg| {
+            MINECRAFT_SPECIFIC_FLAGS
+                .iter()
+                .any(|flag| arg_is_flag(arg, flag))
+        })
 }
 
 /// `--gameDir <path>` or `--gameDir=<path>`.
@@ -226,8 +267,108 @@ mod tests {
             "--uuid",
             "abc",
         ])));
+        assert!(looks_like_minecraft(&args(&[
+            "--accessToken",
+            "token",
+            "--uuid",
+            "abc",
+        ])));
         assert!(!looks_like_minecraft(&args(&["-jar", "server.jar"])));
         assert!(!looks_like_minecraft(&args(&["--version"])));
+        // Two generic flags are common outside Minecraft; they must not be
+        // enough without a Minecraft-specific argument.
+        assert!(!looks_like_minecraft(&args(&[
+            "--version",
+            "1.0",
+            "--uuid",
+            "abc",
+        ])));
+    }
+
+    #[test]
+    fn an_external_game_appearing_after_the_first_check_is_seen_by_the_second() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ToggleProbe(AtomicBool);
+
+        impl ExternalGameProbe for ToggleProbe {
+            fn find_for_game_dir(&self, game_dir: &Path) -> Option<ExternalGame> {
+                self.0.load(Ordering::SeqCst).then(|| ExternalGame {
+                    game_dir: game_dir.to_path_buf(),
+                    identity: ProcessIdentity {
+                        pid: 4242,
+                        exe: r"c:\java\bin\javaw.exe".to_string(),
+                        created: 1,
+                    },
+                })
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "vl-external-toggle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::config::AppConfig {
+            data_dir: dir.clone(),
+            ..Default::default()
+        };
+        let instance = crate::instances::Instance::new(
+            "Toggle",
+            "1.20.1",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        let probe = ToggleProbe(AtomicBool::new(false));
+        assert!(!instance_is_running_with(&probe, &config, &instance));
+        probe.0.store(true, Ordering::SeqCst);
+        assert!(
+            instance_is_running_with(&probe, &config, &instance),
+            "the second phase check must see a game that appeared after the first"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_instance_is_busy_when_its_pid_file_is_live() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl-external-busy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::config::AppConfig {
+            data_dir: dir.clone(),
+            ..Default::default()
+        };
+        let instance = crate::instances::Instance::new(
+            "Busy",
+            "1.20.1",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        assert!(!instance_is_running(&config, &instance));
+        if let crate::running_state::IdentityProbe::Found(identity) =
+            crate::running_state::read_identity(std::process::id())
+        {
+            crate::running_state::write_pid_file(
+                &config.data_dir,
+                &instance.name,
+                std::process::id(),
+                Some(&identity),
+            )
+            .unwrap();
+            assert!(instance_is_running(&config, &instance));
+            crate::running_state::remove_pid_file(&config.data_dir, &instance.name);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -282,8 +423,8 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
             .current_dir(&dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -295,9 +436,9 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let (exe, cmd, cwd) = snapshot.expect("test process must be enumerable");
-        assert!(exe.to_ascii_lowercase().ends_with("cmd.exe"), "exe: {exe}");
+        assert!(exe.to_ascii_lowercase().ends_with("ping.exe"), "exe: {exe}");
         assert!(
-            cmd.iter().any(|arg| arg.eq_ignore_ascii_case("/C")),
+            cmd.iter().any(|arg| arg.eq_ignore_ascii_case("-n")),
             "cmd: {cmd:?}"
         );
         assert_eq!(

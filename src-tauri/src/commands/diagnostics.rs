@@ -1,8 +1,11 @@
 //! Diagnostics commands: system/instance health report and crash analysis.
 
 use crate::diagnostics::{self, CrashAnalysis, DiagReport};
+use crate::instances;
+use crate::recovery;
 use crate::AppState;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_opener::OpenerExt;
 
 /// Run the full diagnostics (system inventory + automatic problem
 /// detection; instance checks when `instance_name` is given). Read-only.
@@ -69,4 +72,54 @@ pub async fn cmd_analyze_crash(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Apply one safe recovery action from a crash report. The webview sends only
+/// a stable action kind and its argument; both are re-validated here.
+#[tauri::command]
+pub async fn cmd_apply_crash_action(
+    state: State<'_, AppState>,
+    instance_name: String,
+    action: String,
+    arg: String,
+) -> Result<(), String> {
+    super::instances::validate_instance_name(&instance_name)?;
+    let config = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        config.clone()
+    };
+    // A disable is a mod-set edit: hold the same per-instance slot a repair
+    // holds, so a launch cannot start between the running check and rename.
+    // Take it before reading the instance so a concurrent delete cannot make
+    // this command act on a stale directory.
+    let edit_guard = if action == "disable_mod" {
+        Some(
+            state
+                .launches
+                .edit_guard(&instance_name)
+                .map_err(|busy| super::verify::modification_busy(&instance_name, busy))?,
+        )
+    } else {
+        None
+    };
+    let instance = instances::get_instance(&config.instances_dir(), &instance_name)
+        .map_err(|e| e.to_string())?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        recovery::execute(&config, &instance, &action, &arg)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    drop(edit_guard);
+    result
+}
+
+/// Open one of the official driver pages offered by the crash analyzer.
+/// The host/scheme allowlist is re-checked here so a crafted action cannot
+/// turn the opener into an arbitrary-URL primitive.
+#[tauri::command]
+pub fn cmd_open_official_url(app: AppHandle, url: String) -> Result<(), String> {
+    recovery::validate_official_url(&url)?;
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| e.to_string())
 }

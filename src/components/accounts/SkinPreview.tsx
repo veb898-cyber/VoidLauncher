@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { SkinViewer } from 'skinview3d';
-import { IconShine, usePlayerSkin } from '../../lib/remoteImage';
+import { usePlayerSkin } from '../../lib/remoteImage';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { useT } from '../../lib/i18n';
 
 const DEFAULT_WIDTH = 480;
@@ -41,12 +42,14 @@ function loadSkinview3d() {
 export function SkinPreview({
   uuid,
   name,
+  provider,
   cape = null,
   width = DEFAULT_WIDTH,
   height = DEFAULT_HEIGHT,
 }: {
   uuid: string;
   name: string;
+  provider?: string;
   cape?: string | null;
   width?: number;
   height?: number;
@@ -57,7 +60,7 @@ export function SkinPreview({
   // Latest desired cape. The viewer may not exist yet when the cape arrives
   // (it is created on the first ready skin), so creation reads this ref.
   const capeRef = useRef<string | null>(null);
-  const { skin, status: skinStatus } = usePlayerSkin(uuid);
+  const { skin, status: skinStatus, refreshing } = usePlayerSkin(uuid, provider);
   const [viewerReady, setViewerReady] = useState(false);
   const [renderedUuid, setRenderedUuid] = useState<string | null>(null);
   const [viewerError, setViewerError] = useState(false);
@@ -238,17 +241,11 @@ export function SkinPreview({
                 >
                   {t('accounts.skin_viewer_unavailable')}
                 </div>
-              ) : (
-                // No fill: the stage already sits on the card's own plate, and
-                // the dark --bg-tertiary of `.icon-shine` read as a black
-                // rectangle flashing on Liquid Glass. Only the light sweep is
-                // kept, so loading looks the same without the dark slab.
-                <IconShine style={{ position: 'absolute', inset: 0, background: 'transparent' }} />
-              )}
+              ) : null}
             </div>
           )}
         </div>
-        {displayReady && (
+        {displayReady ? (
           <p
             style={{
               margin: 0,
@@ -258,11 +255,35 @@ export function SkinPreview({
               textOverflow: 'ellipsis',
               fontSize: 'var(--font-size-xs)',
               color: 'var(--text-tertiary)',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
             }}
           >
-            {t('accounts.skin_viewer_hint')}
+            {refreshing ? (
+              <>
+                <SnakeSpinner size={12} />
+                {t('accounts.skin_updating')}
+              </>
+            ) : (
+              t('accounts.skin_viewer_hint')
+            )}
           </p>
-        )}
+        ) : skinStatus !== 'failed' && !viewerError ? (
+          <p
+            style={{
+              margin: 0,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 'var(--font-size-xs)',
+              color: 'var(--text-tertiary)',
+            }}
+          >
+            <SnakeSpinner size={12} />
+            {t('accounts.skin_loading')}
+          </p>
+        ) : null}
       </div>
     </div>
   );

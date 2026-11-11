@@ -158,6 +158,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
             <Avatar
               uuid={licensed.uuid ?? ''}
               name={licensed.name}
+              provider={licensed.account_type}
               size={36}
               style={{ width: '100%', height: '100%' }}
             />
@@ -170,6 +171,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
             <Avatar
               uuid={profile.id}
               name={profile.name}
+              provider="Microsoft"
               size={36}
               style={{ width: '100%', height: '100%' }}
             />

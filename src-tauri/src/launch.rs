@@ -20,7 +20,7 @@ pub(crate) const CREATE_NO_WINDOW: u32 = 0x08000000;
 /// Open (create) files to receive a raw byte-for-byte copy of the game
 /// process stdout/stderr (crash forensics).
 ///
-/// Returns `None` for a stream when its file cannot be created — the unified
+/// Returns `None` for a stream when its file cannot be created вЂ” the unified
 /// session log still receives every line via the pipe readers, so a tee
 /// failure must never block the game.
 fn open_game_output_files(
@@ -111,7 +111,7 @@ const CLASSPATH_SEPARATOR: &str = ";";
 /// Semantic description of one launch: what to start and with which arguments.
 ///
 /// `LaunchProfile` is pure data. It contains no Java executable and no flattened
-/// argv — the process layer is [`LaunchCommand`], produced by
+/// argv вЂ” the process layer is [`LaunchCommand`], produced by
 /// [`LaunchProfile::to_command`]. Building a profile never writes files; the
 /// only filesystem input is the injected [`LaunchFs`] probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,7 +382,7 @@ impl PlaceholderContext<'_> {
 /// A literal `${...}` handed to Java is never useful: it either becomes a
 /// bogus property value (KI-5) or silently changes the launch. Real metadata
 /// only uses the tokens handled by [`PlaceholderContext`]. User-provided JVM
-/// arguments are intentionally not passed through this check — they are the
+/// arguments are intentionally not passed through this check вЂ” they are the
 /// user's responsibility and may legitimately contain `${...}`.
 fn expand_checked(arg: &str, placeholders: &PlaceholderContext<'_>, kind: &str) -> Result<String> {
     if let Some(token) = unknown_template_placeholder(arg) {
@@ -429,7 +429,7 @@ pub fn build_launch_profile(
     let version_info = request.version_info;
 
     // The version id is used as a directory name below and ultimately came
-    // from remote metadata — refuse anything that is not a bare name.
+    // from remote metadata вЂ” refuse anything that is not a bare name.
     crate::import::check_safe_file_name(&version_info.id)
         .map_err(|_| LauncherError::Launch(format!("Invalid version id: {}", version_info.id)))?;
 
@@ -487,7 +487,7 @@ pub fn build_launch_profile(
     // class-path contains it" when the loader's -p modules collide with a
     // different-version JAR on the classpath. Skip any vanilla library
     // whose artifact (group:artifact) is provided by a loader library that
-    // actually exists on disk (loader wins — dedup by path couldn't handle
+    // actually exists on disk (loader wins вЂ” dedup by path couldn't handle
     // the same artifact under different versions).
     let mut skip_vanilla_paths: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
@@ -512,7 +512,7 @@ pub fn build_launch_profile(
                 if loader_artifacts.contains(&key) {
                     if let Some(artifact) = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref())
                     {
-                        // Remote metadata path — never let it point outside
+                        // Remote metadata path вЂ” never let it point outside
                         // the libraries directory, even in the dedup set.
                         if crate::import::check_safe_remote_path(&artifact.path).is_err() {
                             continue;
@@ -574,11 +574,8 @@ pub fn build_launch_profile(
     //   - Memory: instance override > launcher default. Xms == Xmx.
     //   - Preset: instance override > default_gc_preset (safe default).
     //   - Any custom instance.jvm_args are appended AFTER the preset.
-    let memory_mb = instance.memory_mb.unwrap_or(request.default_memory_mb);
-    let preset_str = instance
-        .gc_preset
-        .as_deref()
-        .unwrap_or(request.default_gc_preset);
+    let memory_mb = instance.effective_memory_mb(request.default_memory_mb);
+    let preset_str = instance.effective_gc_preset(request.default_gc_preset);
     let requested_preset = GcPreset::from_str(preset_str);
     let (mut jvm_args, effective_preset) =
         build_jvm_args(requested_preset, memory_mb, request.java_major);
@@ -614,7 +611,7 @@ pub fn build_launch_profile(
     // Resolution: when the instance sets it, the manifest's
     // `has_custom_resolution` feature rule emits --width/--height for versions
     // with structured arguments; for legacy versions the manifest has no
-    // resolution placeholders, so they are appended below — but only if the
+    // resolution placeholders, so they are appended below вЂ” but only if the
     // manifest did not already provide them.
     let (res_w, res_h) = match &instance.resolution {
         Some(res) => (res.width.to_string(), res.height.to_string()),
@@ -643,7 +640,7 @@ pub fn build_launch_profile(
     // Add mod loader JVM args (skip the standalone `-cp` / `${classpath}`
     // pair; the final classpath is added by `to_command`). Loader profiles
     // (Forge/NeoForge in particular) sometimes include their own GC selector,
-    // so those are stripped too — the user's chosen preset wins.
+    // so those are stripped too вЂ” the user's chosen preset wins.
     if let Some(profile) = &instance.loader_profile {
         let loader_args = strip_gc_selection_flags(&profile.jvm_args);
         let mut i = 0;
@@ -679,8 +676,8 @@ pub fn build_launch_profile(
     //
     // IMPORTANT: Mojang's 1.20.5+ manifests ship `-XX:+UseG1GC` as the
     // default GC selector. If the user picked a different preset
-    // (ZGC, Standard, …) we MUST drop every GC-selection flag from the
-    // upstream args first — otherwise HotSpot aborts with
+    // (ZGC, Standard, вЂ¦) we MUST drop every GC-selection flag from the
+    // upstream args first вЂ” otherwise HotSpot aborts with
     // "multiple garbage collectors selected" before the game can start.
     // See `jvm::strip_gc_selection_flags` for the full list.
     let version_jvm_args = get_jvm_arguments_for(version_info, request.target_arch);
@@ -727,7 +724,7 @@ pub fn build_launch_profile(
     // Game arguments.
     //
     // For legacy loaders (MC <= 1.12.2 Forge), the loader profile carries the
-    // FULL game argument list in its `minecraftArguments` string — those
+    // FULL game argument list in its `minecraftArguments` string вЂ” those
     // REPLACE the vanilla args.
     let legacy_full_args = instance
         .loader_profile
@@ -767,10 +764,10 @@ pub fn build_launch_profile(
         }
     }
 
-    // Room auto-join, version-aware. Minecraft ≤ 1.19.4 still supports the
+    // Room auto-join, version-aware. Minecraft в‰¤ 1.19.4 still supports the
     // legacy `--server/--port` pair; from 1.20+ (including 26.x and
     // snapshots) the client reads Quick Play arguments instead:
-    // `--quickPlayMultiplayer <host>:<port>` plus `--quickPlayPath` — the
+    // `--quickPlayMultiplayer <host>:<port>` plus `--quickPlayPath` вЂ” the
     // client writes a machine-readable join-log there on a successful
     // connection, which the launcher uses to confirm the auto-join.
     let mut quick_play = false;
@@ -804,7 +801,7 @@ pub fn build_launch_profile(
     //     derivation errors (client.jar has classes in the unnamed package).
     //   - Forge/NeoForge/Fabric: use the loader profile's main class
     //     directly. Its -p (module path) contains the bootstrap JARs and the
-    //     real main class lives there — Class.forName from our entry point
+    //     real main class lives there вЂ” Class.forName from our entry point
     //     would NOT find it because it only searches the classpath.
     let main_class = instance
         .loader_profile
@@ -852,7 +849,7 @@ fn prepare_launch_files(
     target_arch: crate::versions::TargetArch,
 ) -> Result<PreparedLaunch> {
     // The version id becomes a directory name below and ultimately came from
-    // remote metadata — validate it before any write or join.
+    // remote metadata вЂ” validate it before any write or join.
     crate::import::check_safe_file_name(&version_info.id)
         .map_err(|_| LauncherError::Launch(format!("Invalid version id: {}", version_info.id)))?;
 
@@ -1009,7 +1006,7 @@ pub fn spawn_launch(
 
     let child = cmd.spawn().map_err(|e| {
         let msg = if e.raw_os_error() == Some(740) {
-            format!("Java requires administrator privileges. Right-click java.exe → Properties → Compatibility → disable 'Run as admin'. Java path: {}", command.java_path.display())
+            format!("Java requires administrator privileges. Right-click java.exe в†’ Properties в†’ Compatibility в†’ disable 'Run as admin'. Java path: {}", command.java_path.display())
         } else {
             format!("Failed to launch: {}", e)
         };
@@ -1022,7 +1019,7 @@ pub fn spawn_launch(
 }
 
 /// Launch Minecraft for a given instance. `session_log_path` is this run's
-/// game-log file (used for the Quick Play join log) — passed explicitly so
+/// game-log file (used for the Quick Play join log) вЂ” passed explicitly so
 /// concurrent launches cannot mix their logs up via a global pointer.
 ///
 /// `prepared_java` is the installation already chosen (and possibly
@@ -1040,7 +1037,7 @@ pub fn launch_minecraft(
 ) -> Result<std::process::Child> {
     tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
 
-    // 1. Determine the Java executable — and with it the native-selection
+    // 1. Determine the Java executable вЂ” and with it the native-selection
     //    target architecture, taken from the M3.1 probe of that very
     //    executable (never from the launcher binary's build target).
     tracing::info!(target: "launcher", "Detecting Java installation...");
@@ -1060,7 +1057,7 @@ pub fn launch_minecraft(
     tracing::info!(target: "launcher", "Using Java: {:?}", java_path);
 
     // 2. The major version and architecture come from the same probe that
-    //    validated the executable — no second JVM spawn is needed.
+    //    validated the executable вЂ” no second JVM spawn is needed.
     let java_major = java_installation.major_version;
     let target_arch = crate::versions::TargetArch::from_java_arch(java_installation.arch);
     tracing::info!(target: "launcher", "Java major {}: native target {:?}", java_major, target_arch);
@@ -1112,7 +1109,7 @@ pub fn launch_minecraft(
     // Prism-style unified logging: drain BOTH pipes concurrently and append
     // every line to the current session log as it arrives (interleaved with
     // the launcher's own messages). Raw bytes are also teed to forensic
-    // files. Piping is safe here — dedicated reader threads guarantee the
+    // files. Piping is safe here вЂ” dedicated reader threads guarantee the
     // OS pipe buffers never fill up and block the game.
     if let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) {
         // Raw tee files are best-effort: if they fail we still stream to the
@@ -1157,7 +1154,7 @@ pub fn find_all_java_installations(data_dir: &Path) -> Vec<JavaInstallation> {
 /// incompatible Java is reported with the long-standing wording instead of
 /// being silently replaced by another JVM.
 /// Map the unified policy's JavaChoice to the concrete, probed installation.
-/// Rejected or missing Java aborts with an actionable message — the launch
+/// Rejected or missing Java aborts with an actionable message вЂ” the launch
 /// pipeline never downloads on its own (`ensure_java_for_launch` owns the
 /// managed fallback); reaching this arm means no usable 64-bit major exists.
 fn java_installation_from_choice(choice: &JavaChoice) -> Result<JavaInstallation> {
@@ -1179,7 +1176,7 @@ fn java_installation_from_choice(choice: &JavaChoice) -> Result<JavaInstallation
 /// The unified policy (`java::resolve_java`) performs the whole selection:
 /// instance Java, then launcher settings, then detected installations
 /// (system + managed). The returned installation carries the probed major
-/// version AND architecture — both feed the launch composition (GC fallback
+/// version AND architecture вЂ” both feed the launch composition (GC fallback
 /// and native selection) so no second JVM probe is needed.
 pub(crate) fn resolve_launch_java(
     config: &AppConfig,
@@ -1189,7 +1186,7 @@ pub(crate) fn resolve_launch_java(
     // Only the EXACT 64-bit major is acceptable. "Closest newer" is never
     // safe: modern JDKs abort on obfuscated old clients (unnamed-package
     // classes trigger java.lang.module.FindException during boot-layer
-    // scanning) — hence `allow_newer: false` for game launches.
+    // scanning) вЂ” hence `allow_newer: false` for game launches.
     let req = JavaRequirement {
         major: version_info.required_java_major(),
         arch: None,
@@ -1228,7 +1225,7 @@ pub(crate) fn resolve_launch_java(
 /// policy the same way a launch would, but never download and never fail.
 /// An explicit or selected executable contributes its probed architecture;
 /// anything else (auto-detected, managed, missing) yields `Unknown`, which
-/// library checks treat leniently — arch-neutral files are still verified,
+/// library checks treat leniently вЂ” arch-neutral files are still verified,
 /// and no guess is made about the game JVM.
 pub(crate) fn best_effort_target_arch(
     config: &AppConfig,
@@ -1334,7 +1331,7 @@ mod tests {
     #[test]
     fn the_prepared_installation_passes_through_with_its_probed_arch() {
         // launch_minecraft uses a prepared JavaInstallation verbatim; the
-        // native target must then be the install's own architecture — even
+        // native target must then be the install's own architecture вЂ” even
         // when a differently-socialized Java path is configured elsewhere.
         let mut prepared = fake_x64(17);
         prepared.arch = crate::java::JavaArch::Arm64;
@@ -1386,7 +1383,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("requires Java 17"), "got: {msg}");
         assert!(msg.contains("Automatic"), "got: {msg}");
-        // The prepare phase refuses the very same verdict — a managed
+        // The prepare phase refuses the very same verdict вЂ” a managed
         // download must not be scheduled behind an explicit rejection.
         assert!(crate::java::preparation_from_choice(&choice).is_err());
     }
@@ -1450,8 +1447,6 @@ mod tests {
         let instance = crate::instances::Instance::new(
             "Pure",
             "1.20.1",
-            4096,
-            "g1gc",
             crate::instances::LoaderType::Vanilla,
             None,
         );
@@ -1509,8 +1504,6 @@ mod tests {
         let instance = crate::instances::Instance::new(
             "Pure",
             "1.20.1",
-            4096,
-            "g1gc",
             crate::instances::LoaderType::Vanilla,
             None,
         );
@@ -1555,7 +1548,7 @@ mod tests {
     /// An ARM64 game JVM (probed by M3.1) must drive ARM64 native selection
     /// even when the launcher binary itself is built as x64. The profile
     /// request carries the JVM's architecture, so a foreign native bundle
-    /// must never reach the classpath — and the probed major feeds the JVM
+    /// must never reach the classpath вЂ” and the probed major feeds the JVM
     /// args exactly like a real probe would.
     #[test]
     fn native_selection_uses_the_game_jvm_architecture_not_the_launcher_build() {
@@ -1599,8 +1592,6 @@ mod tests {
         let instance = crate::instances::Instance::new(
             "Arch",
             "1.20.4",
-            4096,
-            "g1gc",
             crate::instances::LoaderType::Vanilla,
             None,
         );

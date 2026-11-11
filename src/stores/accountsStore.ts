@@ -203,7 +203,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       const accounts = await invoke<AccountEntry[]>('cmd_add_elyby_account', { username, password });
       const added = accounts.find((a) => a.name.toLowerCase() === username.toLowerCase()) || accounts[accounts.length - 1];
       if (added?.uuid) {
-        void invalidatePlayerHead(added.uuid).catch((e) => {
+        void invalidatePlayerHead(added.uuid, added.account_type).catch((e) => {
           console.warn('Failed to invalidate player head for new account:', e);
         });
       }
@@ -219,7 +219,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       const doomed = get().accounts.find((a) => a.id === id);
       const accounts = await invoke<AccountEntry[]>('cmd_remove_account', { id });
       if (doomed?.uuid) {
-        forgetPlayerHead(doomed.uuid);
+        forgetPlayerHead(doomed.uuid, doomed.account_type);
       }
       // Drop every trace of the removed account so a future account that
       // reuses the id never shows stale capes.
@@ -264,7 +264,7 @@ export const useAccountsStore = create<AccountsState>((set, get) => ({
       let refreshed = true;
       if (account?.uuid) {
         try {
-          refreshed = await invalidatePlayerHead(account.uuid);
+          refreshed = await invalidatePlayerHead(account.uuid, account.account_type);
         } catch (e: any) {
           refreshed = false;
           set({ error: e.toString() });

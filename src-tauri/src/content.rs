@@ -431,9 +431,17 @@ pub struct ConflictReason {
     pub source_provider: String,
     pub source_project_id: String,
     pub source_name: String,
+    /// Version id of the source that declared the requirement (when known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_version_id: Option<String>,
     /// The other version's label for `version_mismatch`; empty for
     /// `incompatible`.
     pub requirement: String,
+    /// Exact version id required by the source, when the provider named one.
+    /// The UI uses this to offer a precise replacement instead of guessing
+    /// from a human-readable label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirement_version_id: Option<String>,
     /// [`CONFLICT_VERSION_MISMATCH`] / [`CONFLICT_INCOMPATIBLE`].
     pub kind: String,
 }
@@ -516,11 +524,16 @@ struct DeferredIncompatible {
     target: ProjectKey,
     source: ProjectKey,
     source_name: String,
+    source_version_id: String,
 }
 
 struct Walk<'a> {
     input: &'a GraphInput,
     installed: HashMap<ProjectKey, &'a InstalledProject>,
+    /// Version explicitly chosen by the user for each root project. A
+    /// dependency edge must never silently re-plan that project at a newer
+    /// version: the root visit supplies the pinned version.
+    root_pins: HashMap<ProjectKey, String>,
     /// Titles for projects that may not have a node (optional/incompatible
     /// targets, unresolved reports), keyed by the full project identity.
     project_names: HashMap<ProjectKey, String>,
@@ -540,12 +553,23 @@ fn key_of_node(node: &VersionNode) -> ProjectKey {
 
 impl<'a> Walk<'a> {
     fn new(input: &'a GraphInput, installed: &'a [InstalledProject]) -> Self {
+        let root_pins = input
+            .roots
+            .iter()
+            .filter_map(|vid| {
+                input
+                    .nodes
+                    .get(vid)
+                    .map(|node| (key_of_node(node), vid.clone()))
+            })
+            .collect();
         Self {
             input,
             installed: installed
                 .iter()
                 .map(|p| (ProjectKey::new(&p.provider, p.project_id.as_str()), p))
                 .collect(),
+            root_pins,
             project_names: input
                 .project_names
                 .iter()
@@ -640,6 +664,7 @@ impl<'a> Walk<'a> {
                     target,
                     source: key_of_node(source),
                     source_name: source.name.clone(),
+                    source_version_id: source.version_id.clone(),
                 });
             }
         }
@@ -666,6 +691,38 @@ impl<'a> Walk<'a> {
                     project_id: key.project_id().to_string(),
                     name: inst.name.clone(),
                 });
+            return;
+        }
+        // The user's explicit root pin is authoritative. A dependency edge
+        // may require this project, but must not choose another version for
+        // it: planning one here would win the first-visit race and silently
+        // replace the version the user picked. A concrete conflicting
+        // requirement is surfaced as a blocking version_mismatch instead.
+        if let Some(root_vid) = self.root_pins.get(&key).cloned() {
+            if let Some(vid) = dep.version_id.as_deref() {
+                if vid != root_vid {
+                    let requirement = self
+                        .input
+                        .nodes
+                        .get(vid)
+                        .map(|n| n.version_label.clone())
+                        .unwrap_or_else(|| vid.to_string());
+                    let name = self.name_for(&key);
+                    self.add_conflict(
+                        &key,
+                        &name,
+                        ConflictReason {
+                            source_provider: normalize_project_provider(&source.provider),
+                            source_project_id: source.project_id.clone(),
+                            source_name: source.name.clone(),
+                            source_version_id: Some(source.version_id.clone()),
+                            requirement,
+                            requirement_version_id: Some(vid.to_string()),
+                            kind: CONFLICT_VERSION_MISMATCH.to_string(),
+                        },
+                    );
+                }
+            }
             return;
         }
         match dep.version_id.as_deref() {
@@ -706,7 +763,9 @@ impl<'a> Walk<'a> {
                         source_provider: normalize_project_provider(&source.provider),
                         source_project_id: source.project_id.clone(),
                         source_name: source.name.clone(),
+                        source_version_id: Some(source.version_id.clone()),
                         requirement,
+                        requirement_version_id: Some(vid.to_string()),
                         kind: CONFLICT_VERSION_MISMATCH.to_string(),
                     },
                 );
@@ -748,7 +807,9 @@ impl<'a> Walk<'a> {
                     source_provider: deferred.source.provider().to_string(),
                     source_project_id: deferred.source.project_id().to_string(),
                     source_name: deferred.source_name,
+                    source_version_id: Some(deferred.source_version_id),
                     requirement: String::new(),
+                    requirement_version_id: None,
                     kind: CONFLICT_INCOMPATIBLE.to_string(),
                 },
             );
@@ -1223,6 +1284,97 @@ mod tests {
     }
 
     #[test]
+    fn dependency_edge_does_not_override_an_explicit_root_pin() {
+        // The user pinned Sodium "vs" and also selected a mod "vm" that
+        // requires Sodium by project only. The mod is listed first: its
+        // dependency resolution used to claim the Sodium project with the
+        // newest node, silently replacing the pinned version.
+        let g = graph(
+            vec![
+                node("vm", "m", "Movie Mod", "1.0.0", vec![req("vm", "s", None)]),
+                node("vs", "s", "Sodium", "0.6.0-pinned", vec![]),
+                node("vs-new", "s", "Sodium", "0.7.0-latest", vec![]),
+            ],
+            &["vm", "vs"],
+        );
+        let res = build_resolution(&g, &[]);
+        let sodium = res
+            .install
+            .iter()
+            .find(|p| p.project_id == "s")
+            .expect("Sodium must be installed");
+        assert_eq!(sodium.version_id, "vs", "the explicit pin must win");
+        assert!(res.conflicts.is_empty());
+    }
+
+    #[test]
+    fn concrete_dependency_version_conflicting_with_a_root_pin_is_reported() {
+        // A dependency that names a concrete Sodium version different from
+        // the user's pin cannot be silently satisfied: report a blocking
+        // version_mismatch and keep the pinned version in the plan.
+        let g = graph(
+            vec![
+                node(
+                    "vm",
+                    "m",
+                    "Movie Mod",
+                    "1.0.0",
+                    vec![req("vm", "s", Some("vs-new"))],
+                ),
+                node("vs", "s", "Sodium", "0.6.0-pinned", vec![]),
+                node("vs-new", "s", "Sodium", "0.7.0-latest", vec![]),
+            ],
+            &["vs", "vm"],
+        );
+        let res = build_resolution(&g, &[]);
+        let sodium = res
+            .install
+            .iter()
+            .find(|p| p.project_id == "s")
+            .expect("Sodium must be installed");
+        assert_eq!(sodium.version_id, "vs");
+        assert_eq!(res.conflicts.len(), 1, "the mismatch must block install");
+        let reason = &res.conflicts[0].reasons[0];
+        assert_eq!(reason.kind, CONFLICT_VERSION_MISMATCH);
+        assert_eq!(reason.requirement, "0.7.0-latest");
+        assert_eq!(reason.requirement_version_id.as_deref(), Some("vs-new"));
+        assert_eq!(reason.source_version_id.as_deref(), Some("vm"));
+        assert_eq!(reason.source_name, "Movie Mod");
+    }
+
+    #[test]
+    fn required_version_selected_as_root_satisfies_dependency_without_conflict() {
+        // Iris (va) requires Sodium c2. With c2 selected as a root, the same
+        // graph that reports a mismatch for c1 must resolve cleanly. This is
+        // the exact "change Sodium to the required version" flow.
+        let g = graph(
+            vec![
+                node(
+                    "va",
+                    "iris",
+                    "Iris Shaders",
+                    "mc26.3-0.9.2-fabric",
+                    vec![req("va", "sodium", Some("c2"))],
+                ),
+                node("c1", "sodium", "Sodium", "mc26.3-0.9.4-fabric", vec![]),
+                node("c2", "sodium", "Sodium", "mc26.3-0.9.2-fabric", vec![]),
+            ],
+            &["va", "c2"],
+        );
+        let res = build_resolution(&g, &[]);
+        assert!(
+            res.conflicts.is_empty(),
+            "the required version must clear the conflict"
+        );
+        let sodium = res
+            .install
+            .iter()
+            .find(|plan| plan.project_id == "sodium")
+            .expect("Sodium must be installed");
+        assert_eq!(sodium.version_id, "c2");
+    }
+
+    #[test]
     fn chain_orders_dependencies_before_parents() {
         // A → B → C: post-order must install C, then B, then A.
         let g = graph(
@@ -1319,6 +1471,8 @@ mod tests {
         assert_eq!(reason.source_project_id, "b");
         assert_eq!(reason.source_name, "Beta");
         assert_eq!(reason.requirement, "2.0");
+        assert_eq!(reason.requirement_version_id.as_deref(), Some("c2"));
+        assert_eq!(reason.source_version_id.as_deref(), Some("vb"));
     }
 
     #[test]
@@ -1364,6 +1518,7 @@ mod tests {
         assert_eq!(reason.kind, CONFLICT_INCOMPATIBLE);
         assert_eq!(reason.source_project_id, "a");
         assert_eq!(reason.source_name, "Alpha");
+        assert_eq!(reason.source_version_id.as_deref(), Some("va"));
     }
 
     #[test]

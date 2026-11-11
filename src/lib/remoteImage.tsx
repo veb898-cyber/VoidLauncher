@@ -15,6 +15,7 @@ export {
   forgetPlayerHead,
   invalidatePlayerHead,
   onPlayerHeadInvalidated,
+  refreshPlayerHead,
 } from './playerHeadStore';
 
 // ---- Remote images via cmd_fetch_icon_url -----------------------------------
@@ -217,7 +218,10 @@ export function RemoteImage({
 // /avatar endpoint is deliberately NOT used: it silently substitutes a
 // default Steve head when its own Mojang lookup fails.
 
-function usePlayerHead(uuid: string | null | undefined): PlayerHeadState {
+function usePlayerHead(
+  uuid: string | null | undefined,
+  provider?: string,
+): PlayerHeadState {
   const key = uuid ? normalizePlayerKey(uuid) : null;
   const [view, setView] = useState<{ key: string; state: PlayerHeadState } | null>(null);
 
@@ -232,17 +236,16 @@ function usePlayerHead(uuid: string | null | undefined): PlayerHeadState {
     // Subscribe even when an entry is already cached: an explicit refresh
     // must update every mounted Avatar, not only the ones that happened to
     // miss the cache when they mounted.
-    const unsub = subscribePlayerHead(key, (head) => {
-      if (!alive) return;
-      push(head ? { src: head, status: 'ready' } : getPlayerHeadState(key));
+    const unsub = subscribePlayerHead(key, () => {
+      if (alive) push(getPlayerHeadState(key));
     });
-    void requestPlayerHead(key);
+    void requestPlayerHead(key, { provider });
 
     return () => {
       alive = false;
       unsub();
     };
-  }, [key]);
+  }, [key, provider]);
 
   if (!key) return { src: null, status: 'failed' };
   if (view?.key === key) return view.state;
@@ -252,6 +255,7 @@ function usePlayerHead(uuid: string | null | undefined): PlayerHeadState {
 /** Raw skin (full PNG) for the 3D preview, sharing the Avatar request/cache. */
 export function usePlayerSkin(
   uuid: string | null | undefined,
+  provider?: string,
 ): PlayerSkinState {
   const key = uuid ? normalizePlayerKey(uuid) : null;
   const [view, setView] = useState<{ key: string; state: PlayerSkinState } | null>(null);
@@ -263,27 +267,27 @@ export function usePlayerSkin(
       if (alive) setView({ key, state });
     };
 
-    push(getPlayerSkinState(key));
-    const unsub = subscribePlayerSkin(key, (skin) => {
-      if (!alive) return;
-      push(skin ? { skin, status: 'ready' } : getPlayerSkinState(key));
-    });
-    void requestPlayerHead(key);
+    push(getPlayerSkinState(key, provider));
+    const unsub = subscribePlayerSkin(key, () => {
+      if (alive) push(getPlayerSkinState(key, provider));
+    }, provider);
+    void requestPlayerHead(key, { provider });
 
     return () => {
       alive = false;
       unsub();
     };
-  }, [key]);
+  }, [key, provider]);
 
   if (!key) return { skin: null, status: 'failed' };
   if (view?.key === key) return view.state;
-  return getPlayerSkinState(key);
+  return getPlayerSkinState(key, provider);
 }
 
 export function Avatar({
   uuid,
   name,
+  provider,
   size = 40,
   style,
   className,
@@ -291,13 +295,14 @@ export function Avatar({
 }: {
   uuid: string;
   name: string;
+  provider?: string;
   size?: number;
   style?: React.CSSProperties;
   className?: string;
   radius?: string;
 }) {
   const letter = (name?.trim().charAt(0) || '?').toUpperCase();
-  const { src, status } = usePlayerHead(uuid);
+  const { src, status, refreshing } = usePlayerHead(uuid, provider);
 
   const containerStyle: React.CSSProperties = {
     width: size,
@@ -319,13 +324,24 @@ export function Avatar({
 
   if (status === 'ready' && src) {
     return (
-      <img
-        src={src}
-        alt={name}
+      <div
         className={className}
-        style={{ ...containerStyle, borderRadius: radius, imageRendering: 'pixelated' }}
-        loading="lazy"
-      />
+        style={{ ...containerStyle, position: 'relative', borderRadius: radius, overflow: 'hidden' }}
+      >
+        <img
+          src={src}
+          alt={name}
+          style={{ width: '100%', height: '100%', borderRadius: radius, imageRendering: 'pixelated' }}
+          loading="lazy"
+        />
+        {refreshing && (
+          <IconShine
+            radius={radius}
+            className="icon-shine--overlay"
+            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
+          />
+        )}
+      </div>
     );
   }
 

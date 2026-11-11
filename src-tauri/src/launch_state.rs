@@ -140,6 +140,17 @@ impl LaunchRegistry {
         self.reserve(instance, LaunchPhase::Editing)
     }
 
+    /// RAII form of [`Self::begin_edit`] for commands that hold the slot
+    /// across an await. The token is released on every return path.
+    pub fn edit_guard(&self, instance: &str) -> Result<EditGuard<'_>, LaunchBusy> {
+        let token = self.begin_edit(instance)?;
+        Ok(EditGuard {
+            registry: self,
+            instance: instance.to_string(),
+            token: Some(token),
+        })
+    }
+
     /// Transition our own reservation `Starting` -> `Running` and record the
     /// identity of the spawned process in the same step.
     ///
@@ -236,6 +247,21 @@ impl LaunchRegistry {
     }
 }
 
+/// Owns an `Editing` reservation and releases exactly its own token on drop.
+pub struct EditGuard<'a> {
+    registry: &'a LaunchRegistry,
+    instance: String,
+    token: Option<LaunchToken>,
+}
+
+impl Drop for EditGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.registry.release(&self.instance, token);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +349,25 @@ mod tests {
         assert!(registry.mark_running("Pack", token, None));
         assert!(registry.clear_running("Pack"));
         assert!(!registry.is_busy("Pack"));
+    }
+
+    #[test]
+    fn edit_guard_releases_the_instance_on_drop() {
+        let registry = LaunchRegistry::new();
+        {
+            let _guard = registry.edit_guard("Pack").expect("reserve for edit");
+            assert_eq!(registry.begin_launch("Pack"), Err(LaunchBusy::Editing));
+        }
+        assert!(registry.begin_launch("Pack").is_ok());
+    }
+
+    #[test]
+    fn independent_instances_can_be_edited_at_the_same_time() {
+        let registry = LaunchRegistry::new();
+        let _a = registry.edit_guard("A").expect("A edit");
+        let _b = registry.edit_guard("B").expect("B edit");
+        assert_eq!(registry.begin_launch("A"), Err(LaunchBusy::Editing));
+        assert_eq!(registry.begin_launch("B"), Err(LaunchBusy::Editing));
     }
 
     #[test]

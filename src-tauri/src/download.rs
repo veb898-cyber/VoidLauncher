@@ -1,6 +1,7 @@
 use crate::error::{LauncherError, Result};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -138,6 +139,73 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
 
 type CachedClient = Mutex<Option<(Option<String>, reqwest::Client)>>;
 static HTTP_CLIENT: OnceLock<CachedClient> = OnceLock::new();
+
+/// Serialize downloads that target the same path. Two instance repairs can
+/// legitimately run at once, but they may share the same library or asset;
+/// letting both write the same `.part` would splice two responses together.
+static DOWNLOAD_PATH_LOCKS: OnceLock<
+    Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = OnceLock::new();
+
+/// Comparison form for a lock key. Two callers that name the same Windows
+/// file must share one mutex even when their `PathBuf`s differ in case,
+/// separators or `.`/`..` components. Canonicalization is deliberately not
+/// used: the destination usually does not exist yet.
+fn download_lock_key(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    // Resolve an existing parent so a junction/symlink alias and its real
+    // directory share one mutex. The destination file itself usually does not
+    // exist yet; when the parent is also missing, the lexical key is used and
+    // all callers still agree on it.
+    if let (Some(parent), Some(name)) = (normalized.parent(), normalized.file_name()) {
+        if let Ok(resolved) = std::fs::canonicalize(parent) {
+            normalized = resolved.join(name);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let text = normalized.to_string_lossy().replace('/', "\\");
+        let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            text
+        }
+        .to_ascii_lowercase();
+        PathBuf::from(text)
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
+fn download_path_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let key = download_lock_key(path);
+    let map = DOWNLOAD_PATH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = guard.get(&key).and_then(std::sync::Weak::upgrade) {
+        return existing;
+    }
+    if guard.len() > 2048 {
+        guard.retain(|_, weak| weak.strong_count() > 0);
+    }
+    let created = Arc::new(tokio::sync::Mutex::new(()));
+    guard.insert(key, Arc::downgrade(&created));
+    created
+}
 
 /// Global HTTP client with connection pooling. On failure (rare: TLS backend
 /// trouble) returns the error instead of panicking; nothing is cached, so the
@@ -847,6 +915,23 @@ fn part_meta_path(path: &Path) -> PathBuf {
     with_suffix(path, ".part.meta")
 }
 
+/// A `.part` or `.part.meta` symlink would make `File::create` truncate or
+/// append to its target instead of the download directory. Resuming through a
+/// link is never legitimate, so refuse it before opening anything.
+fn reject_linked_partial(path: &Path) -> Result<()> {
+    for candidate in [part_path_for(path), part_meta_path(path)] {
+        if let Ok(metadata) = std::fs::symlink_metadata(&candidate) {
+            if metadata.file_type().is_symlink() {
+                return Err(LauncherError::Download(format!(
+                    "Refusing to write through a linked temporary file: {}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Identity of the artifact a `.part` belongs to. Resuming across a restart
 /// is only safe when this matches; otherwise the bytes on disk belong to a
 /// different file and must never be treated as a head start (or, when no
@@ -940,6 +1025,10 @@ pub(crate) async fn download_to_part_observed(
     timeout: Option<Duration>,
     observer: Option<&FileChunkObserver>,
 ) -> Result<()> {
+    // One writer per destination: repairs of different instances may share
+    // the same library/asset path, and a fixed `.part` file cannot serve two
+    // concurrent transfers.
+    let _path_guard = download_path_lock(path).lock_owned().await;
     // Auto-upgrade http:// to https://
     let url = if url.to_ascii_lowercase().starts_with("http://") {
         tracing::debug!(target: "launcher", "Upgrading http:// to https:// for: {}", url);
@@ -976,6 +1065,7 @@ pub(crate) async fn download_to_part_observed(
 
     let part_path = part_path_for(path);
     let meta_path = part_meta_path(path);
+    reject_linked_partial(path)?;
 
     // A leftover .part larger than the expected file is a different artifact
     // (mirror switch, new version) — drop it and restart fresh.
@@ -1933,6 +2023,81 @@ pub async fn download_assets(
     Ok(())
 }
 
+/// Plan assets that are missing, wrong-size, or explicitly forced because a
+/// repair found them corrupt. The force set matters because a corrupt object
+/// may have the expected size: the cheap size-only prefilter would otherwise
+/// skip it. `download_files` re-verifies the SHA-1 and replaces the object
+/// atomically, so the old copy stays readable until a verified one exists.
+fn collect_asset_download_plan_forced(
+    asset_index: &crate::versions::AssetIndexData,
+    assets_dir: &Path,
+    forced: &std::collections::HashSet<PathBuf>,
+) -> Result<Vec<(String, PathBuf, String, u64)>> {
+    Ok(collect_asset_download_plan(asset_index, assets_dir)?
+        .into_iter()
+        .filter(|(url, path, _, size)| {
+            forced.contains(path)
+                || cached_download_size(path, "", *size, DownloadCachePolicy::SizeOnly, url)
+                    .is_none()
+        })
+        .collect())
+}
+
+/// Repair variant of [`download_assets`]: corrupt objects are re-downloaded
+/// with the normal `.part` + SHA-1 + atomic rename path instead of being
+/// deleted first. A failed download therefore leaves the previous object in
+/// place, and an external game never observes a file disappear.
+pub async fn download_assets_repair(
+    asset_index: &crate::versions::AssetIndexData,
+    assets_dir: &Path,
+    forced: &std::collections::HashSet<PathBuf>,
+    on_progress: impl Fn(usize, usize, u64, u64, &str) + Send + Sync,
+) -> Result<()> {
+    tracing::info!(
+        target: "launcher",
+        count = asset_index.objects.len(),
+        forced = forced.len(),
+        "Downloading game assets for repair"
+    );
+
+    let files = collect_asset_download_plan_forced(asset_index, assets_dir, forced)?;
+    if files.is_empty() {
+        tracing::info!(target: "launcher", "Game assets repair complete");
+        return Ok(());
+    }
+
+    download_files(files, on_progress).await?;
+    tracing::info!(target: "launcher", "Game assets repair complete");
+    Ok(())
+}
+
+/// Replace a virtual/legacy asset atomically. Two instances (or two repair
+/// workers in one launcher) may mirror the same global index concurrently;
+/// neither may expose a truncated file to the game. The temporary name is
+/// unique, and the final rename replaces the previous copy in one step.
+fn replace_virtual_asset(src: &Path, dest: &Path) -> Result<()> {
+    let parent = dest.parent().ok_or_else(|| {
+        LauncherError::Download(format!("Virtual asset has no parent: {}", dest.display()))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let name = dest
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("asset");
+    let tmp = parent.join(format!(".{}.{}.tmp", name, uuid::Uuid::new_v4().simple()));
+    if std::fs::hard_link(src, &tmp).is_err() {
+        if let Err(error) = std::fs::copy(src, &tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+    }
+    if let Err(error) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 /// Mirror asset objects into `<assets>/virtual/legacy` for versions that read
 /// flat paths from the assets directory instead of the objects store:
 ///   - "legacy"/"pre-1.6" index (MC 1.6.x and older): the whole index, the
@@ -1991,15 +2156,8 @@ pub fn ensure_virtual_assets(
             if skip {
                 continue;
             }
-            let _ = std::fs::remove_file(&dest);
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Prefer a hard link (instant, deduplicated); fall back to a copy.
-        if std::fs::hard_link(&src, &dest).is_err() {
-            std::fs::copy(&src, &dest)?;
-        }
+        replace_virtual_asset(&src, &dest)?;
         copied += 1;
     }
 
@@ -2127,6 +2285,76 @@ pub(crate) fn http_client_for_hosts(hosts: &[&str]) -> Result<reqwest::Client> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn lock_keys_ignore_dot_segments_and_windows_case() {
+        let dotted = download_lock_key(Path::new("dir/sub/.././file.jar"));
+        let plain = download_lock_key(Path::new("dir/file.jar"));
+        assert_eq!(dotted, plain);
+
+        #[cfg(windows)]
+        {
+            let spaced =
+                download_lock_key(Path::new(r"C:\Games\Pack\libraries\..\libraries\A.jar"));
+            let slashed = download_lock_key(Path::new(r"c:/games/pack/LIBRARIES/a.jar"));
+            assert_eq!(spaced, slashed);
+            assert_eq!(
+                download_lock_key(Path::new(r"\\?\C:\Games\Pack\a.jar")),
+                download_lock_key(Path::new(r"c:\games\pack\A.jar"))
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lock_keys_resolve_directory_aliases() {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_lock_alias_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("link");
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            eprintln!("skipping directory-alias test: privilege unavailable");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(
+            download_lock_key(&real.join("shared.jar")),
+            download_lock_key(&link.join("shared.jar"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_same_destination_is_serialized_but_different_paths_are_not() {
+        let a = temp_file("lock-a.part", b"");
+        let b = temp_file("lock-b.part", b"");
+        let lock_a = download_path_lock(&a);
+        let lock_a_again = download_path_lock(&a);
+        assert!(Arc::ptr_eq(&lock_a, &lock_a_again));
+        assert!(!Arc::ptr_eq(&lock_a, &download_path_lock(&b)));
+
+        let first = lock_a.clone().lock_owned().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), lock_a_again.clone().lock_owned(),)
+                .await
+                .is_err(),
+            "a second writer for the same path must wait"
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), lock_a_again.lock_owned())
+                .await
+                .is_ok(),
+            "the lock must be released after the first writer"
+        );
+    }
 
     fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
         let path =
@@ -2425,6 +2653,37 @@ mod tests {
         assert_eq!(prepare_partial_download(&target, &identity), 0);
         assert!(!part.exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_linked_partial_file_is_refused_before_opening() {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_partial_link_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("artifact.jar");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"keep").unwrap();
+        let link = part_path_for(&target);
+        if std::os::windows::fs::symlink_file(&outside, &link).is_err() {
+            eprintln!("skipping .part symlink test: privilege unavailable");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            reject_linked_partial(&target).is_err(),
+            "a .part symlink must not be followed"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        std::fs::remove_file(&link).unwrap();
+        assert!(reject_linked_partial(&target).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2787,6 +3046,118 @@ mod tests {
             .iter()
             .any(|(_, path, _, _)| path.ends_with(&missing_hash)));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forced_corrupt_asset_is_planned_without_deleting_the_old_copy() {
+        use crate::versions::{AssetIndexData, AssetObject};
+
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_asset_forced_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let hash = "a".repeat(40);
+        let path = dir.join("objects").join(&hash[..2]).join(&hash);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Wrong content with the expected size: the cheap size-only prefilter
+        // alone cannot see the corruption.
+        std::fs::write(&path, b"bad").unwrap();
+
+        let index = AssetIndexData {
+            objects: std::collections::HashMap::from([(
+                "corrupt".to_string(),
+                AssetObject {
+                    hash: hash.clone(),
+                    size: 3,
+                    is_virtual: false,
+                },
+            )]),
+            map_to_resources: false,
+        };
+
+        assert!(
+            collect_asset_download_plan_forced(&index, &dir, &std::collections::HashSet::new())
+                .unwrap()
+                .is_empty(),
+            "size-only planning skips the corrupt object"
+        );
+        let forced = std::collections::HashSet::from([path.clone()]);
+        let plan = collect_asset_download_plan_forced(&index, &dir, &forced).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].1, path);
+        assert!(
+            path.exists(),
+            "planning must not delete the old copy before a verified replacement"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn virtual_asset_replacement_leaves_no_temporary_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_virtual_asset_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = dir.join("objects").join("aa").join("hash");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"abc").unwrap();
+        let dest_dir = dir.join("virtual").join("legacy").join("sounds");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("sound.ogg");
+        std::fs::write(&dest, b"bad").unwrap();
+
+        replace_virtual_asset(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+        let leftovers: Vec<_> = std::fs::read_dir(&dest_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .map(|entry| entry.path())
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_virtual_asset_symlink_is_replaced_not_followed() {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_virtual_link_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("source.bin");
+        std::fs::write(&src, b"new").unwrap();
+        let outside = dir.join("outside.bin");
+        std::fs::write(&outside, b"keep").unwrap();
+        let dest = dir.join("virtual").join("sound.ogg");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        if std::os::windows::fs::symlink_file(&outside, &dest).is_err() {
+            eprintln!("skipping virtual-asset symlink test: privilege unavailable");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        replace_virtual_asset(&src, &dest).unwrap();
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"keep",
+            "the symlink target must stay untouched"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

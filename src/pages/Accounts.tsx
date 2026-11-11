@@ -16,7 +16,8 @@ import { SkinPreview } from '../components/accounts/SkinPreview';
 import { addToast } from '../components/ui/Toast';
 import { Ban, Check, Plus, Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
 import { t } from '../lib/i18n';
-import { Avatar, invalidatePlayerHead } from '../lib/remoteImage';
+import { Avatar, refreshPlayerHead } from '../lib/remoteImage';
+import { canRefreshSkin } from '../lib/skinRefresh';
 
 const ELYBY_SKINS_URL = 'https://ely.by/skins';
 
@@ -289,6 +290,7 @@ export function Accounts() {
                   <SkinPreview
                     uuid={selected.uuid ?? ''}
                     name={selected.name}
+                    provider={selected.account_type}
                     cape={selected.account_type === 'Microsoft' ? activeCapePng : null}
                   />
                 </div>
@@ -338,7 +340,7 @@ export function Accounts() {
                       border: isSelected ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
                     }}
                   >
-                    <Avatar uuid={acc.uuid ?? ''} name={acc.name} size={36} />
+                    <Avatar uuid={acc.uuid ?? ''} name={acc.name} provider={acc.account_type} size={36} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                         {acc.name}
@@ -394,7 +396,7 @@ export function Accounts() {
                           </Button>
                         </Tooltip>
                       )}
-                      {acc.uuid && (
+                      {canRefreshSkin(acc.account_type) && acc.uuid && (
                         <Tooltip content={t('accounts.refresh_skin_btn')}>
                           <Button
                             size="sm"
@@ -405,7 +407,7 @@ export function Accounts() {
                               e.stopPropagation();
                               setRefreshingHead(acc.id);
                               try {
-                                const refreshed = await invalidatePlayerHead(acc.uuid!);
+                                const refreshed = await refreshPlayerHead(acc.uuid!, acc.account_type);
                                 if (refreshed) {
                                   addToast(t('accounts.skin_refreshed'), 'info');
                                 } else {

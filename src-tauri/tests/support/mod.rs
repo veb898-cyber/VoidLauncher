@@ -161,14 +161,7 @@ pub fn test_config(data_dir: &Path) -> AppConfig {
 }
 
 pub fn test_instance(mc_version: &str) -> Instance {
-    Instance::new(
-        "Test",
-        mc_version,
-        TEST_MEMORY_MB,
-        "g1gc",
-        LoaderType::Vanilla,
-        None,
-    )
+    Instance::new("Test", mc_version, LoaderType::Vanilla, None)
 }
 
 pub fn auth() -> LaunchAuth<'static> {

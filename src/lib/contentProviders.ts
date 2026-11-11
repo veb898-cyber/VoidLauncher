@@ -97,6 +97,8 @@ export interface ProviderVersion {
   project_id: string;
   name: string;
   version_number: string;
+  /** Modrinth release channel or CurseForge releaseType mapped to it. */
+  version_type?: string;
   game_versions?: string[];
   loaders?: string[];
   date_published?: string;
@@ -298,6 +300,8 @@ const curseforgeProvider: ContentProvider = {
         project_id: projectId,
         name: file.displayName,
         version_number: file.displayName,
+        version_type:
+          file.releaseType === 3 ? 'alpha' : file.releaseType === 2 ? 'beta' : 'release',
         game_versions: gameVersions.filter((v) => /^\d/.test(v)),
         loaders: gameVersions.filter((v) => CF_LOADERS.includes(v)),
         date_published: file.fileDate,

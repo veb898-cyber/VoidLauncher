@@ -1,5 +1,7 @@
 ﻿import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  PLAYER_HEAD_STORAGE_KEY,
+  PLAYER_SKIN_STORAGE_KEY,
   PLAYER_HEAD_TTL_MS,
   __playerHeadTest,
   getPlayerHeadState,
@@ -7,9 +9,11 @@ import {
   forgetPlayerHead,
   invalidatePlayerHead,
   requestPlayerHead,
+  refreshPlayerHead,
   subscribePlayerHead,
   subscribePlayerSkin,
 } from './playerHeadStore';
+import { useSkinSettingsStore } from '../stores/skinSettingsStore';
 
 const UUID_A = '1a650540-fb59-4d9d-a1d3-f8f7a67379a3';
 const UUID_B = '2b650540-fb59-4d9d-a1d3-f8f7a67379a4';
@@ -56,6 +60,8 @@ function installRuntime(): void {
 
 beforeEach(() => {
   __playerHeadTest.reset();
+  localStorage.clear();
+  useSkinSettingsStore.setState({ refreshMode: 'auto' });
   now = 0;
   calls = [];
   getImpl = async () => 'SKIN';
@@ -295,8 +301,16 @@ describe('player head TTL', () => {
     await tick();
 
     expect(calls.filter((c) => c === 'cmd_get_player_head')).toHaveLength(1);
-    expect(getPlayerHeadState(UUID_A)).toEqual({ src: 'OLD_HEAD', status: 'ready' });
-    expect(getPlayerSkinState(UUID_A)).toEqual({ skin: 'OLD_SKIN', status: 'ready' });
+    expect(getPlayerHeadState(UUID_A)).toEqual({
+      src: 'OLD_HEAD',
+      status: 'ready',
+      refreshing: true,
+    });
+    expect(getPlayerSkinState(UUID_A)).toEqual({
+      skin: 'OLD_SKIN',
+      status: 'ready',
+      refreshing: true,
+    });
 
     fresh.resolve('NEW_SKIN');
     await expect(request).resolves.toBe('NEW_SKIN');
@@ -321,6 +335,20 @@ describe('player head TTL', () => {
     expect(__playerHeadTest.skin(UUID_A)).toBe('OLD_SKIN');
     expect(heads).not.toContain(null);
     expect(getPlayerHeadState(UUID_A)).toEqual({ src: 'OLD_HEAD', status: 'ready' });
+    expect(__playerHeadTest.isRefreshing(UUID_A)).toBe(false);
+  });
+
+  it('cancels the refresh overlay when the revalidation fails', async () => {
+    __playerHeadTest.seedHead(UUID_A, 'OLD_HEAD', 0);
+    now = PLAYER_HEAD_TTL_MS + 1;
+    getImpl = async () => {
+      throw new Error('network down');
+    };
+
+    await requestPlayerHead(UUID_A);
+
+    expect(getPlayerHeadState(UUID_A)).toEqual({ src: 'OLD_HEAD', status: 'ready' });
+    expect(__playerHeadTest.isRefreshing(UUID_A)).toBe(false);
   });
 
   it('explicit invalidation bypasses a fresh renderer cache', async () => {
@@ -386,5 +414,248 @@ describe('player head TTL', () => {
   it('has a TTL no longer than a day', () => {
     expect(PLAYER_HEAD_TTL_MS).toBeGreaterThan(0);
     expect(PLAYER_HEAD_TTL_MS).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
+  });
+});
+
+describe('player head persistence', () => {
+  const HEAD_A = 'data:image/png;base64,AAAA';
+  const HEAD_B = 'data:image/png;base64,BBBB';
+  const keyOf = (uuid: string) => uuid.replace(/-/g, '').toLowerCase();
+
+  it('saves a successful head and restores it without waiting for the network', async () => {
+    getImpl = async () => HEAD_A;
+    await expect(requestPlayerHead(UUID_A)).resolves.toBe(HEAD_A);
+
+    expect(__playerHeadTest.persistedHead(UUID_A)).toBe(HEAD_A);
+
+    calls = [];
+    __playerHeadTest.reloadPersisted();
+    expect(getPlayerHeadState(UUID_A)).toEqual({ src: HEAD_A, status: 'ready' });
+    expect(calls).not.toContain('cmd_get_player_head');
+  });
+
+  it('replaces the persisted head when a newer skin arrives', async () => {
+    __playerHeadTest.seedHead(UUID_A, HEAD_A);
+    getImpl = async () => HEAD_B;
+
+    await expect(requestPlayerHead(UUID_A)).resolves.toBe(HEAD_B);
+
+    expect(__playerHeadTest.head(UUID_A)).toBe(HEAD_B);
+    expect(__playerHeadTest.persistedHead(UUID_A)).toBe(HEAD_B);
+  });
+
+  it('keeps the last good head when the background fetch fails', async () => {
+    __playerHeadTest.seedHead(UUID_A, HEAD_A);
+    getImpl = async () => {
+      throw new Error('network down');
+    };
+
+    await expect(requestPlayerHead(UUID_A)).resolves.toBeNull();
+
+    expect(getPlayerHeadState(UUID_A)).toEqual({ src: HEAD_A, status: 'ready' });
+    expect(__playerHeadTest.isRefreshing(UUID_A)).toBe(false);
+  });
+
+  it('ignores a corrupt persisted entry', () => {
+    localStorage.setItem(
+      PLAYER_HEAD_STORAGE_KEY,
+      JSON.stringify({ [keyOf(UUID_A)]: { value: 'not-an-image', at: 1 } }),
+    );
+    __playerHeadTest.reloadPersisted();
+
+    expect(getPlayerHeadState(UUID_A)).toEqual({ src: null, status: 'loading' });
+  });
+
+  it('keys the persisted heads by uuid, not by player name', async () => {
+    getImpl = async () => HEAD_A;
+    await requestPlayerHead(UUID_A);
+    getImpl = async () => HEAD_B;
+    await requestPlayerHead(UUID_B);
+
+    expect(__playerHeadTest.persistedHead(UUID_A)).toBe(HEAD_A);
+    expect(__playerHeadTest.persistedHead(UUID_B)).toBe(HEAD_B);
+  });
+
+  it('shares one network request between concurrent callers', async () => {
+    const pending = deferred<string | null>();
+    let count = 0;
+    getImpl = () => {
+      count += 1;
+      return pending.promise;
+    };
+
+    const first = requestPlayerHead(UUID_A);
+    const second = requestPlayerHead(UUID_A);
+    await tick();
+    expect(count).toBe(1);
+
+    pending.resolve(HEAD_A);
+    await expect(first).resolves.toBe(HEAD_A);
+    await expect(second).resolves.toBe(HEAD_A);
+  });
+
+  it('keeps the normal placeholder for an account without any cache', () => {
+    expect(getPlayerHeadState(UUID_A)).toEqual({ src: null, status: 'loading' });
+  });
+});
+
+describe('persisted full skin textures', () => {
+  const SKIN_A = 'data:image/png;base64,AAAA';
+  const SKIN_B = 'data:image/png;base64,BBBB';
+
+  it('saves the full texture and restores it without a network request', async () => {
+    getImpl = async () => SKIN_A;
+    await requestPlayerHead(UUID_A, { provider: 'Microsoft' });
+
+    expect(__playerHeadTest.persistedSkin(UUID_A, 'Microsoft')).toBe(SKIN_A);
+
+    calls = [];
+    __playerHeadTest.reloadPersisted();
+    expect(getPlayerSkinState(UUID_A, 'Microsoft')).toEqual({
+      skin: SKIN_A,
+      status: 'ready',
+    });
+
+    await requestPlayerHead(UUID_A, { provider: 'Microsoft' });
+    expect(calls).not.toContain('cmd_get_player_head');
+  });
+
+  it('updates the 3D texture together with the head from one response', async () => {
+    getImpl = async () => SKIN_A;
+    await requestPlayerHead(UUID_A, { provider: 'Microsoft' });
+
+    expect(__playerHeadTest.head(UUID_A)).toBe(SKIN_A);
+    expect(__playerHeadTest.skin(UUID_A, 'Microsoft')).toBe(SKIN_A);
+  });
+
+  it('separates caches for different providers even with the same uuid', async () => {
+    getImpl = async () => SKIN_A;
+    await requestPlayerHead(UUID_A, { provider: 'Microsoft' });
+    getImpl = async () => SKIN_B;
+    await requestPlayerHead(UUID_A, { provider: 'Offline' });
+
+    expect(__playerHeadTest.persistedSkin(UUID_A, 'Microsoft')).toBe(SKIN_A);
+    expect(__playerHeadTest.persistedSkin(UUID_A, 'Offline')).toBe(SKIN_B);
+
+    __playerHeadTest.reloadPersisted();
+    expect(getPlayerSkinState(UUID_A, 'Microsoft').skin).toBe(SKIN_A);
+    expect(getPlayerSkinState(UUID_A, 'Offline').skin).toBe(SKIN_B);
+  });
+
+  it('shows the cached skin and skips automatic refresh in manual mode', async () => {
+    __playerHeadTest.seedHead(UUID_A, SKIN_A);
+    __playerHeadTest.seedSkin(UUID_A, SKIN_A, 0, 'Microsoft');
+    useSkinSettingsStore.setState({ refreshMode: 'manual' });
+    calls = [];
+
+    await requestPlayerHead(UUID_A, { provider: 'Microsoft' });
+
+    expect(calls).not.toContain('cmd_get_player_head');
+    expect(getPlayerSkinState(UUID_A, 'Microsoft')).toEqual({
+      skin: SKIN_A,
+      status: 'ready',
+    });
+  });
+
+  it('auto-refreshes only after the 24 hour cache window', async () => {
+    __playerHeadTest.seedHead(UUID_A, SKIN_A);
+    __playerHeadTest.seedSkin(UUID_A, SKIN_A);
+    now = PLAYER_HEAD_TTL_MS - 1;
+    getImpl = async () => SKIN_B;
+
+    await requestPlayerHead(UUID_A);
+    expect(calls).not.toContain('cmd_get_player_head');
+
+    now = PLAYER_HEAD_TTL_MS + 1;
+    await requestPlayerHead(UUID_A);
+    expect(calls).toContain('cmd_get_player_head');
+    expect(__playerHeadTest.skin(UUID_A)).toBe(SKIN_B);
+  });
+
+  it('keeps the old texture when a background update fails', async () => {
+    __playerHeadTest.seedHead(UUID_A, SKIN_A);
+    __playerHeadTest.seedSkin(UUID_A, SKIN_A);
+    now = PLAYER_HEAD_TTL_MS + 1;
+    getImpl = async () => {
+      throw new Error('network down');
+    };
+
+    await requestPlayerHead(UUID_A);
+
+    expect(getPlayerSkinState(UUID_A)).toEqual({ skin: SKIN_A, status: 'ready' });
+    expect(__playerHeadTest.isRefreshing(UUID_A)).toBe(false);
+  });
+
+  it('ignores a corrupt persisted full texture', () => {
+    const key = UUID_A.replace(/-/g, '').toLowerCase();
+    localStorage.setItem(
+      PLAYER_SKIN_STORAGE_KEY,
+      JSON.stringify({ [`microsoft:${key}`]: { value: 'not-an-image', at: 1 } }),
+    );
+    __playerHeadTest.reloadPersisted();
+
+    expect(getPlayerSkinState(UUID_A, 'Microsoft')).toEqual({
+      skin: null,
+      status: 'loading',
+    });
+  });
+
+  it('refreshes a Microsoft or Ely.by skin only on an explicit request in manual mode', async () => {
+    useSkinSettingsStore.setState({ refreshMode: 'manual' });
+    __playerHeadTest.seedHead(UUID_A, SKIN_A);
+    __playerHeadTest.seedSkin(UUID_A, SKIN_A, 0, 'ElyBy');
+    getImpl = async () => SKIN_B;
+
+    await requestPlayerHead(UUID_A, { provider: 'ElyBy' });
+    expect(__playerHeadTest.skin(UUID_A, 'ElyBy')).toBe(SKIN_A);
+
+    await invalidatePlayerHead(UUID_A, 'ElyBy');
+    expect(__playerHeadTest.skin(UUID_A, 'ElyBy')).toBe(SKIN_B);
+  });
+
+  it('does not start a network request for cached offline skins in manual mode', async () => {
+    useSkinSettingsStore.setState({ refreshMode: 'manual' });
+    __playerHeadTest.seedHead(UUID_B, SKIN_B);
+    __playerHeadTest.seedSkin(UUID_B, SKIN_B, 0, 'Offline');
+    calls = [];
+
+    await requestPlayerHead(UUID_B, { provider: 'Offline' });
+
+    expect(calls).not.toContain('cmd_get_player_head');
+  });
+
+  it('rebuilds a missing head from the cached texture without the network', async () => {
+    useSkinSettingsStore.setState({ refreshMode: 'manual' });
+    __playerHeadTest.seedSkin(UUID_A, SKIN_A, 0, 'Microsoft');
+    calls = [];
+
+    await expect(requestPlayerHead(UUID_A, { provider: 'Microsoft' })).resolves.toBe(SKIN_A);
+
+    expect(calls).not.toContain('cmd_get_player_head');
+    expect(__playerHeadTest.head(UUID_A)).toBe(SKIN_A);
+  });
+
+  it('manual refresh replaces both the head and the 3D texture on success', async () => {
+    __playerHeadTest.seedHead(UUID_A, SKIN_A);
+    __playerHeadTest.seedSkin(UUID_A, SKIN_A, 0, 'Microsoft');
+    getImpl = async () => SKIN_B;
+
+    await expect(refreshPlayerHead(UUID_A, 'Microsoft')).resolves.toBe(true);
+
+    expect(__playerHeadTest.head(UUID_A)).toBe(SKIN_B);
+    expect(__playerHeadTest.skin(UUID_A, 'Microsoft')).toBe(SKIN_B);
+  });
+
+  it('manual refresh keeps the old image and reports failure when the network fails', async () => {
+    __playerHeadTest.seedHead(UUID_A, SKIN_A);
+    __playerHeadTest.seedSkin(UUID_A, SKIN_A, 0, 'Microsoft');
+    getImpl = async () => {
+      throw new Error('network down');
+    };
+
+    await expect(refreshPlayerHead(UUID_A, 'Microsoft')).resolves.toBe(false);
+
+    expect(getPlayerSkinState(UUID_A, 'Microsoft').skin).toBe(SKIN_A);
+    expect(getPlayerHeadState(UUID_A).src).toBe(SKIN_A);
   });
 });

@@ -354,7 +354,11 @@ impl<'a> LaunchReservation<'a> {
                     "Instance '{}' is already starting. Wait for the game to launch.",
                     instance_name
                 ),
-                _ => format!(
+                crate::launch_state::LaunchBusy::Editing => format!(
+                    "Instance '{}' is being modified. Wait for the current operation to finish.",
+                    instance_name
+                ),
+                crate::launch_state::LaunchBusy::Running => format!(
                     "Instance '{}' is already running. Launch it again after it exits.",
                     instance_name
                 ),

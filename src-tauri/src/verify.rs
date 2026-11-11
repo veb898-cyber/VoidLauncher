@@ -49,6 +49,18 @@ pub struct VerifyCategory {
     /// Total number of issues (may exceed `issues.len()` when capped).
     pub issue_count: u32,
     pub issues: Vec<VerifyIssue>,
+    /// Files proven against a trusted checksum in this scan.
+    #[serde(default)]
+    pub verified: u32,
+    /// Files that exist (and may have passed a size check) but have no
+    /// trusted checksum to prove their contents.
+    #[serde(default)]
+    pub unverified: u32,
+    /// `verified` for this category comes from a local sidecar fingerprint,
+    /// not from a checksum supplied by the content source. It detects later
+    /// edits but does not prove provenance.
+    #[serde(default)]
+    pub fingerprint_only: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -59,6 +71,9 @@ pub struct VerifyReport {
     /// User-content issues (reported but never auto-repaired).
     pub content_issues: u32,
     pub healthy: bool,
+    /// "quick" | "deep" — what the scan actually proved.
+    #[serde(default)]
+    pub mode: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -81,6 +96,8 @@ struct CategoryBuilder {
     checked: u32,
     issue_count: u32,
     issues: Vec<VerifyIssue>,
+    verified: u32,
+    unverified: u32,
 }
 
 impl CategoryBuilder {
@@ -90,6 +107,8 @@ impl CategoryBuilder {
             checked: 0,
             issue_count: 0,
             issues: Vec::new(),
+            verified: 0,
+            unverified: 0,
         }
     }
 
@@ -111,6 +130,35 @@ impl CategoryBuilder {
             checked: self.checked,
             issue_count: self.issue_count,
             issues: self.issues,
+            verified: self.verified,
+            unverified: self.unverified,
+            fingerprint_only: false,
+        }
+    }
+}
+
+/// How thoroughly file contents are proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// Existence, expected size (when known) and archive readability.
+    Quick,
+    /// Quick checks plus trusted SHA-1/SHA-256/SHA-512 hashes.
+    Deep,
+}
+
+impl VerifyMode {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "quick" => Self::Quick,
+            "deep" => Self::Deep,
+            other => return Err(format!("Unknown verify mode: {}", other)),
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Deep => "deep",
         }
     }
 }
@@ -135,41 +183,359 @@ pub(crate) fn load_local_version_info(
     serde_json::from_str(&contents).ok()
 }
 
-/// Scan user-managed content directories for files that are not valid
-/// ZIP/JAR archives. Read-only: never modifies. `dirs` selects which of
-/// `mods` / `resourcepacks` / `shaderpacks` to inspect.
-fn scan_content(instances_dir: &Path, instance: &Instance, dirs: &[&str]) -> Vec<VerifyIssue> {
-    let mut issues = Vec::new();
+#[derive(Default)]
+struct ContentScan {
+    issues: Vec<VerifyIssue>,
+    checked: u32,
+    verified: u32,
+    unverified: u32,
+}
+
+/// Match a file against a trusted content hash, choosing the algorithm from
+/// the recorded hash length: SHA-1 (40), SHA-256 (64) or SHA-512 (128).
+fn content_hash_matches(path: &Path, expected: &str) -> Option<bool> {
+    let expected = expected.trim().to_ascii_lowercase();
+    if !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let actual = match expected.len() {
+        40 => download::hash_file_sha1(path).ok()?,
+        64 => download::hash_file_sha256(path).ok()?,
+        128 => {
+            use sha2::{Digest, Sha512};
+            use std::io::Read;
+            let mut file = std::fs::File::open(path).ok()?;
+            let mut hasher = Sha512::new();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buf).ok()?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buf[..read]);
+            }
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+        _ => return None,
+    };
+    Some(actual == expected)
+}
+
+/// A truncated archive usually keeps the ZIP magic even though its central
+/// directory is broken, so opening it is the cheap integrity check that magic
+/// alone cannot provide. An archive the reader refuses to support (encrypted
+/// or unknown compression) is not evidence that the file is damaged.
+fn content_archive_readable(path: &Path) -> ArchiveStreamCheck {
+    if download::verify_zip_magic(path).is_err() {
+        return ArchiveStreamCheck::Corrupt;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return ArchiveStreamCheck::Unverified;
+    };
+    let archive = match zip::ZipArchive::new(std::io::BufReader::new(file)) {
+        Ok(archive) => archive,
+        Err(error) => return zip_error_check(&error),
+    };
+    if archive.is_empty() {
+        ArchiveStreamCheck::Corrupt
+    } else {
+        ArchiveStreamCheck::Valid
+    }
+}
+
+/// Deep-only: decompress every entry into a sink so the ZIP reader validates
+/// offsets and per-entry CRC. Nothing is written to disk and no entry is held
+/// in memory; a broken payload fails the copy.
+///
+/// Deep verification is user-initiated, but a malicious archive must not be
+/// able to keep it busy indefinitely. These caps are far above real mods,
+/// resource packs and shader packs; when they are hit the archive is reported
+/// as unverified (we could not finish checking it), never as corrupt.
+const DEEP_ARCHIVE_MAX_ENTRIES: usize = 65_536;
+const DEEP_ARCHIVE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const DEEP_ARCHIVE_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(60);
+/// A whole Deep scan is user-initiated and the dialog cannot be closed while
+/// it runs. Bound the total time across many archives, not just each archive;
+/// files that were not reached are reported as unverified.
+const DEEP_SCAN_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveStreamCheck {
+    /// Every entry was fully read and its CRC matched.
+    Valid,
+    /// The archive structure or entry data is broken.
+    Corrupt,
+    /// Encryption, an unsupported compression method, a resource cap or a
+    /// transient I/O problem prevents a conclusion.
+    Unverified,
+}
+
+fn zip_error_check(error: &zip::result::ZipError) -> ArchiveStreamCheck {
+    use zip::result::ZipError;
+    match error {
+        ZipError::InvalidArchive(_) | ZipError::FileNotFound => ArchiveStreamCheck::Corrupt,
+        ZipError::UnsupportedArchive(_) | ZipError::InvalidPassword => {
+            ArchiveStreamCheck::Unverified
+        }
+        ZipError::Io(error) => io_error_check(error),
+        // `ZipError` is non-exhaustive; a future variant is not proof that
+        // the user's file is damaged.
+        _ => ArchiveStreamCheck::Unverified,
+    }
+}
+
+fn io_error_check(error: &std::io::Error) -> ArchiveStreamCheck {
+    // A CRC mismatch and a truncated deflate stream surface as invalid data
+    // or EOF. Anything else (sharing violation, permission) is not proof
+    // that the file is damaged.
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+    ) {
+        ArchiveStreamCheck::Corrupt
+    } else {
+        ArchiveStreamCheck::Unverified
+    }
+}
+
+fn content_archive_streams(path: &Path) -> ArchiveStreamCheck {
+    content_archive_streams_with_limits(
+        path,
+        DEEP_ARCHIVE_MAX_ENTRIES,
+        DEEP_ARCHIVE_MAX_BYTES,
+        DEEP_ARCHIVE_MAX_DURATION,
+    )
+}
+
+fn content_archive_streams_with_limits(
+    path: &Path,
+    max_entries: usize,
+    max_bytes: u64,
+    max_duration: std::time::Duration,
+) -> ArchiveStreamCheck {
+    // A file that cannot even be opened (sharing violation, permissions) is
+    // not proven corrupt.
+    let Ok(file) = std::fs::File::open(path) else {
+        return ArchiveStreamCheck::Unverified;
+    };
+    let mut archive = match zip::ZipArchive::new(std::io::BufReader::new(file)) {
+        Ok(archive) => archive,
+        Err(error) => return zip_error_check(&error),
+    };
+    if archive.len() > max_entries {
+        return ArchiveStreamCheck::Unverified;
+    }
+    let started = std::time::Instant::now();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    for index in 0..archive.len() {
+        let mut entry = match archive.by_index(index) {
+            Ok(entry) => entry,
+            Err(error) => return zip_error_check(&error),
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        // Without the password these entries cannot be decompressed; that is
+        // an unsupported archive, not a damaged one. Unsupported compression
+        // methods are reported the same way by `by_index`.
+        if entry.encrypted() {
+            return ArchiveStreamCheck::Unverified;
+        }
+        // The declared size is attacker-controlled, but a mismatch is not
+        // corruption by itself; the real budget below is enforced on bytes
+        // actually produced.
+        if entry.size() > max_bytes.saturating_sub(total) {
+            return ArchiveStreamCheck::Unverified;
+        }
+        loop {
+            if started.elapsed() > max_duration {
+                return ArchiveStreamCheck::Unverified;
+            }
+            match entry.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    total = total.saturating_add(read as u64);
+                    if total > max_bytes {
+                        return ArchiveStreamCheck::Unverified;
+                    }
+                }
+                Err(error) => return io_error_check(&error),
+            }
+        }
+    }
+    ArchiveStreamCheck::Valid
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssetObjectState {
+    Healthy,
+    Missing,
+    Corrupt,
+    Unreadable,
+}
+
+/// A launcher-managed asset is corrupt when its size differs or its content
+/// fails the published SHA-1. Missing files are left to the downloader; an
+/// unreadable file is a failure to report, not a healthy object.
+fn asset_object_state(path: &Path, hash: &str, size: u64) -> AssetObjectState {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return AssetObjectState::Missing;
+        }
+        Err(_) => return AssetObjectState::Unreadable,
+    };
+    if metadata.len() != size {
+        return AssetObjectState::Corrupt;
+    }
+    match download::verify_sha1(path, hash) {
+        Ok(true) => AssetObjectState::Healthy,
+        Ok(false) => AssetObjectState::Corrupt,
+        Err(_) => AssetObjectState::Unreadable,
+    }
+}
+
+fn is_stale_partial(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|age| age > std::time::Duration::from_secs(600))
+        .unwrap_or(false)
+}
+
+/// Scan user-managed content directories. Read-only: never modifies. `dirs`
+/// selects which of `mods` / `resourcepacks` / `shaderpacks` to inspect.
+///
+/// Quick mode proves archives are readable; Deep mode also checks the full
+/// file against the hash recorded in the content sidecar, when one exists.
+/// A file without a trusted hash is counted as `unverified`, never as valid.
+fn scan_content(
+    instances_dir: &Path,
+    instance: &Instance,
+    dirs: &[&str],
+    mode: VerifyMode,
+) -> ContentScan {
+    let mut scan = ContentScan::default();
     let mc_dir = instance.minecraft_dir(instances_dir);
+    let instance_root = std::fs::canonicalize(&mc_dir).ok();
+    let deep_started = std::time::Instant::now();
     for dir_name in dirs {
-        let dir = mc_dir.join(dir_name);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let content_dir = mc_dir.join(dir_name);
+        // A junctioned mods/resourcepacks folder must not make the scanner
+        // read or hash files outside the instance.
+        if let Some(root) = &instance_root {
+            match std::fs::canonicalize(&content_dir) {
+                Ok(canon) if canon.starts_with(root) => {}
+                Ok(_) => {
+                    scan.issues.push(VerifyIssue {
+                        path: format!("{dir_name}/"),
+                        kind: "unsafe".to_string(),
+                        repairable: false,
+                        detail: Some("outside the instance".to_string()),
+                    });
+                    continue;
+                }
+                Err(_) => continue,
+            }
+        }
+        let Ok(entries) = std::fs::read_dir(&content_dir) else {
             continue;
         };
+        let content_type = crate::content::content_type_for_dir(dir_name);
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') || name.ends_with(".disabled") {
+                continue;
+            }
+            if !path.is_file() {
+                // Resource packs and shader packs may legitimately be folders;
+                // there is no single file hash to prove them against.
+                continue;
+            }
+            if name.to_lowercase().ends_with(".part") {
+                if is_stale_partial(&path) {
+                    scan.checked += 1;
+                    scan.issues.push(VerifyIssue {
+                        path: format!("{}/{}", dir_name, name),
+                        kind: "incomplete".to_string(),
+                        repairable: false,
+                        detail: None,
+                    });
+                }
                 continue;
             }
             let lower = name.to_lowercase();
             if !(lower.ends_with(".jar") || lower.ends_with(".zip")) {
                 continue;
             }
-            if download::verify_zip_magic(&path).is_err() {
-                issues.push(VerifyIssue {
+            scan.checked += 1;
+            match content_archive_readable(&path) {
+                ArchiveStreamCheck::Valid => {}
+                ArchiveStreamCheck::Corrupt => {
+                    scan.issues.push(VerifyIssue {
+                        path: format!("{}/{}", dir_name, name),
+                        kind: "corrupt".to_string(),
+                        repairable: false,
+                        detail: None,
+                    });
+                    continue;
+                }
+                ArchiveStreamCheck::Unverified => {
+                    scan.unverified += 1;
+                    continue;
+                }
+            }
+            if mode == VerifyMode::Quick {
+                scan.unverified += 1;
+                continue;
+            }
+            if deep_started.elapsed() >= DEEP_SCAN_MAX_DURATION {
+                scan.unverified += 1;
+                continue;
+            }
+            match content_archive_streams(&path) {
+                ArchiveStreamCheck::Valid => {}
+                ArchiveStreamCheck::Corrupt => {
+                    scan.issues.push(VerifyIssue {
+                        path: format!("{}/{}", dir_name, name),
+                        kind: "corrupt".to_string(),
+                        repairable: false,
+                        detail: Some("archive entry".to_string()),
+                    });
+                    continue;
+                }
+                // Encrypted/unsupported entries and very large archives are
+                // not a reason to call a user's file corrupt.
+                ArchiveStreamCheck::Unverified => {
+                    scan.unverified += 1;
+                    continue;
+                }
+            }
+            let sidecar = crate::content::InstalledContent::read(&content_dir, &name, content_type);
+            match sidecar
+                .hash
+                .as_deref()
+                .and_then(|h| content_hash_matches(&path, h))
+            {
+                Some(true) => scan.verified += 1,
+                Some(false) => scan.issues.push(VerifyIssue {
                     path: format!("{}/{}", dir_name, name),
-                    kind: "corrupt".to_string(),
+                    kind: "hash_mismatch".to_string(),
                     repairable: false,
-                    detail: None,
-                });
+                    detail: Some("content sidecar".to_string()),
+                }),
+                None => scan.unverified += 1,
             }
         }
     }
-    issues
+    scan
 }
 
 /// Read `depends.fabricloader` from a mod jar's `fabric.mod.json`.
@@ -299,12 +665,40 @@ fn scan_fabric_loader_requirements(instances_dir: &Path, instance: &Instance) ->
     issues
 }
 
-fn check_library_file(cat: &mut CategoryBuilder, path: &Path, sha1: &str, display: &str) {
+fn check_library_file(
+    cat: &mut CategoryBuilder,
+    path: &Path,
+    sha1: &str,
+    expected_size: u64,
+    display: &str,
+    mode: VerifyMode,
+) {
     cat.checked += 1;
-    if !path.exists() {
+    let Ok(metadata) = std::fs::metadata(path) else {
         cat.add_issue(display, "missing", true);
-    } else if !sha1.is_empty() && download::verify_sha1(path, sha1).ok() == Some(false) {
+        return;
+    };
+    if metadata.len() == 0 {
         cat.add_issue(display, "corrupt", true);
+        return;
+    }
+    if expected_size > 0 && metadata.len() != expected_size {
+        cat.add_issue(display, "size_mismatch", true);
+        return;
+    }
+    if mode == VerifyMode::Quick {
+        // A size match is useful evidence, but it is not proof of contents.
+        cat.unverified += 1;
+        return;
+    }
+    if sha1.is_empty() {
+        cat.unverified += 1;
+        return;
+    }
+    match download::verify_sha1(path, sha1) {
+        Ok(true) => cat.verified += 1,
+        Ok(false) => cat.add_issue(display, "corrupt", true),
+        Err(_) => cat.unverified += 1,
     }
 }
 
@@ -344,24 +738,34 @@ impl VerifyScope {
 }
 
 /// Report for a content-only scope: no launcher categories, nothing repairable.
-fn content_only_report(config: &AppConfig, instance: &Instance, dirs: &[&str]) -> VerifyReport {
+fn content_only_report(
+    config: &AppConfig,
+    instance: &Instance,
+    dirs: &[&str],
+    mode: VerifyMode,
+) -> VerifyReport {
     let instances_dir = config.instances_dir();
-    let mut content_issues = scan_content(&instances_dir, instance, dirs);
+    let scan = scan_content(&instances_dir, instance, dirs, mode);
+    let mut content_issues = scan.issues;
     if dirs.contains(&"mods") {
         content_issues.extend(scan_fabric_loader_requirements(&instances_dir, instance));
     }
     let content_issues_count = content_issues.len() as u32;
     let categories = vec![VerifyCategory {
         id: "content".to_string(),
-        checked: 0,
+        checked: scan.checked,
         issue_count: content_issues_count,
         issues: content_issues,
+        verified: scan.verified,
+        unverified: scan.unverified,
+        fingerprint_only: true,
     }];
     VerifyReport {
         categories,
         repairable_count: 0,
         content_issues: content_issues_count,
         healthy: content_issues_count == 0,
+        mode: mode.as_str().to_string(),
     }
 }
 
@@ -369,19 +773,30 @@ fn content_only_report(config: &AppConfig, instance: &Instance, dirs: &[&str]) -
 /// version metadata. Never touches the network and never modifies files.
 #[cfg(test)]
 pub fn verify_instance(config: &AppConfig, instance: &Instance) -> VerifyReport {
-    verify_instance_scoped(config, instance, VerifyScope::All)
+    verify_instance_scoped_mode(config, instance, VerifyScope::All, VerifyMode::Deep)
 }
 
 /// Scoped variant of [`verify_instance`]: `Launcher` skips user content,
 /// content-only scopes (mods / resource packs / shader packs) skip every
-/// launcher check and cost only a directory scan.
+/// launcher check and cost only a directory scan. Keeps the historical
+/// deep scan for internal callers.
 pub fn verify_instance_scoped(
     config: &AppConfig,
     instance: &Instance,
     scope: VerifyScope,
 ) -> VerifyReport {
+    verify_instance_scoped_mode(config, instance, scope, VerifyMode::Deep)
+}
+
+/// Scoped + explicitly selected quick/deep scan.
+pub fn verify_instance_scoped_mode(
+    config: &AppConfig,
+    instance: &Instance,
+    scope: VerifyScope,
+    mode: VerifyMode,
+) -> VerifyReport {
     if let Some(dirs) = scope.content_only_dirs() {
-        return content_only_report(config, instance, dirs);
+        return content_only_report(config, instance, dirs, mode);
     }
     let versions_dir = config.versions_dir();
     let libraries_dir = config.libraries_dir();
@@ -402,10 +817,14 @@ pub fn verify_instance_scoped(
                     repairable: false,
                     detail: None,
                 }],
+                verified: 0,
+                unverified: 0,
+                fingerprint_only: false,
             }],
             repairable_count: 0,
             content_issues: 0,
             healthy: false,
+            mode: mode.as_str().to_string(),
         };
     }
 
@@ -449,14 +868,27 @@ pub fn verify_instance_scoped(
     if client_path.exists() {
         if let Some(vi) = &version_info {
             let expected = vi.downloads.client.sha1.as_str();
-            if !expected.is_empty()
-                && download::verify_sha1(&client_path, expected).ok() == Some(false)
-            {
-                minecraft.add_issue(&client_display, "corrupt", true);
+            let expected_size = vi.downloads.client.size;
+            let actual_size = std::fs::metadata(&client_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if expected_size > 0 && actual_size != expected_size {
+                minecraft.add_issue(&client_display, "size_mismatch", true);
+            } else if expected.is_empty() {
+                minecraft.unverified += 1;
+            } else {
+                match download::verify_sha1(&client_path, expected) {
+                    Ok(true) => minecraft.verified += 1,
+                    Ok(false) => minecraft.add_issue(&client_display, "corrupt", true),
+                    Err(_) => minecraft.unverified += 1,
+                }
             }
+        } else {
+            minecraft.unverified += 1;
         }
     } else if legacy_path.exists() {
         // Legacy `{mc}.jar` is migrated to `client.jar` at launch/repair.
+        minecraft.unverified += 1;
     } else {
         minecraft.add_issue(&client_display, "missing", true);
     }
@@ -489,7 +921,9 @@ pub fn verify_instance_scoped(
                             &mut libraries,
                             &p,
                             &artifact.sha1,
+                            artifact.size,
                             &format!("libraries/{}", artifact.path),
+                            mode,
                         );
                     }
                 }
@@ -508,12 +942,15 @@ pub fn verify_instance_scoped(
                                 }
                                 let sha1 =
                                     native.get("sha1").and_then(|v| v.as_str()).unwrap_or("");
+                                let size = native.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let p = libraries_dir.join(path);
                                 check_library_file(
                                     &mut libraries,
                                     &p,
                                     sha1,
+                                    size,
                                     &format!("libraries/{}", path),
+                                    mode,
                                 );
                             }
                         }
@@ -529,6 +966,8 @@ pub fn verify_instance_scoped(
                 let p = libraries_dir.join(&rel);
                 if !p.exists() {
                     libraries.add_issue(format!("libraries/{}", rel), "missing", true);
+                } else {
+                    libraries.unverified += 1;
                 }
             }
         }
@@ -546,15 +985,17 @@ pub fn verify_instance_scoped(
                 &mut libraries,
                 &p,
                 sha1,
+                llib.size.unwrap_or(0),
                 &format!("libraries/{}", llib.path),
+                mode,
             );
         }
     }
     let libraries = libraries.build();
 
-    // ── assets (existence + size only — hashing every object would
-    //    take seconds; size catches truncation which is the common
-    //    failure mode) ───────────────────────────────────────────
+    // ── assets ──────────────────────────────────────────────────
+    // Quick: existence + index-declared size. Deep: the index JSON and every
+    // object are hashed against the SHA-1 Mojang publishes.
     let mut assets = CategoryBuilder::new("assets");
     if let Some(vi) = &version_info {
         // The asset-index id is joined as a file name; never follow a
@@ -574,47 +1015,91 @@ pub fn verify_instance_scoped(
                     true,
                 );
             } else {
-                match versions::load_asset_index(&index_path) {
-                    Ok(index) => {
-                        let objects_dir = assets_dir.join("objects");
-                        for obj in index.objects.values() {
-                            assets.checked += 1;
-                            if !download::is_valid_asset_hash(&obj.hash) {
-                                assets.add_issue(
-                                    format!("assets/objects/{}", obj.hash),
-                                    "unsafe",
-                                    false,
-                                );
-                                continue;
-                            }
-                            let p = objects_dir.join(&obj.hash[..2]).join(&obj.hash);
-                            let display = format!("assets/objects/{}/{}", &obj.hash[..2], obj.hash);
-                            match std::fs::metadata(&p) {
-                                Err(_) => {
-                                    if assets.issue_count < MAX_ISSUES_LISTED as u32 {
-                                        assets.add_issue(&display, "missing", true);
-                                    } else {
-                                        assets.issue_count += 1;
-                                    }
-                                }
-                                Ok(m) if m.len() != obj.size => {
-                                    if assets.issue_count < MAX_ISSUES_LISTED as u32 {
-                                        assets.add_issue(&display, "corrupt", true);
-                                    } else {
-                                        assets.issue_count += 1;
-                                    }
-                                }
-                                _ => {}
-                            }
+                let index_ok = if vi.asset_index.sha1.is_empty() {
+                    assets.unverified += 1;
+                    true
+                } else {
+                    match download::verify_sha1(&index_path, &vi.asset_index.sha1) {
+                        Ok(true) => {
+                            assets.verified += 1;
+                            true
+                        }
+                        Ok(false) => {
+                            assets.checked = 1;
+                            assets.add_issue(
+                                format!("assets/indexes/{}.json", vi.assets),
+                                "corrupt",
+                                true,
+                            );
+                            false
+                        }
+                        Err(_) => {
+                            assets.unverified += 1;
+                            true
                         }
                     }
-                    Err(_) => {
-                        assets.checked = 1;
-                        assets.add_issue(
-                            format!("assets/indexes/{}.json", vi.assets),
-                            "corrupt",
-                            true,
-                        );
+                };
+                if index_ok {
+                    match versions::load_asset_index(&index_path) {
+                        Ok(index) => {
+                            let objects_dir = assets_dir.join("objects");
+                            for obj in index.objects.values() {
+                                assets.checked += 1;
+                                if !download::is_valid_asset_hash(&obj.hash) {
+                                    assets.add_issue(
+                                        format!("assets/objects/{}", obj.hash),
+                                        "unsafe",
+                                        false,
+                                    );
+                                    continue;
+                                }
+                                let p = objects_dir.join(&obj.hash[..2]).join(&obj.hash);
+                                let display =
+                                    format!("assets/objects/{}/{}", &obj.hash[..2], obj.hash);
+                                let metadata = match std::fs::metadata(&p) {
+                                    Ok(m) => m,
+                                    Err(_) => {
+                                        if assets.issue_count < MAX_ISSUES_LISTED as u32 {
+                                            assets.add_issue(&display, "missing", true);
+                                        } else {
+                                            assets.issue_count += 1;
+                                        }
+                                        continue;
+                                    }
+                                };
+                                if metadata.len() != obj.size {
+                                    if assets.issue_count < MAX_ISSUES_LISTED as u32 {
+                                        assets.add_issue(&display, "size_mismatch", true);
+                                    } else {
+                                        assets.issue_count += 1;
+                                    }
+                                    continue;
+                                }
+                                if mode == VerifyMode::Quick {
+                                    assets.unverified += 1;
+                                    continue;
+                                }
+                                match content_hash_matches(&p, &obj.hash) {
+                                    Some(true) => assets.verified += 1,
+                                    Some(false) => {
+                                        if assets.issue_count < MAX_ISSUES_LISTED as u32 {
+                                            assets.add_issue(&display, "corrupt", true);
+                                        } else {
+                                            assets.issue_count += 1;
+                                        }
+                                    }
+                                    None => assets.unverified += 1,
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            assets.checked = 1;
+                            assets.add_issue(
+                                format!("assets/indexes/{}.json", vi.assets),
+                                "corrupt",
+                                true,
+                            );
+                        }
                     }
                 }
             }
@@ -725,18 +1210,23 @@ pub fn verify_instance_scoped(
     let mut categories = vec![metadata, minecraft, libraries, assets, loader, java];
     let mut content_issues_count = 0;
     if scope == VerifyScope::All {
-        let mut content_issues = scan_content(
+        let scan = scan_content(
             &instances_dir,
             instance,
             &["mods", "resourcepacks", "shaderpacks"],
+            mode,
         );
+        let mut content_issues = scan.issues;
         content_issues.extend(scan_fabric_loader_requirements(&instances_dir, instance));
         content_issues_count = content_issues.len() as u32;
         categories.push(VerifyCategory {
             id: "content".to_string(),
-            checked: 0,
+            checked: scan.checked,
             issue_count: content_issues_count,
             issues: content_issues,
+            verified: scan.verified,
+            unverified: scan.unverified,
+            fingerprint_only: true,
         });
     }
     let repairable_count = categories
@@ -751,6 +1241,7 @@ pub fn verify_instance_scoped(
         repairable_count,
         content_issues: content_issues_count,
         healthy,
+        mode: mode.as_str().to_string(),
     }
 }
 
@@ -913,6 +1404,19 @@ fn collect_repair_targets(
     targets
 }
 
+/// Repair performs several long phases (manifest fetch, many downloads,
+/// asset hashing). A game started outside the launcher cannot be reserved
+/// through `LaunchRegistry`, so the process table is consulted again before
+/// each phase that can replace a file the game may read.
+fn ensure_instance_idle(config: &AppConfig, instance: &Instance) -> Result<()> {
+    if crate::external_minecraft::instance_is_running(config, instance) {
+        return Err(LauncherError::Instance(
+            "Instance is running; close the game before repairing its files".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Re-download broken launcher-managed files and restore missing metadata.
 ///
 /// Emits `repair_progress` events: `{ stage, percent, message }`.
@@ -923,6 +1427,10 @@ pub async fn repair_instance(
     instance: &Instance,
 ) -> Result<RepairSummary> {
     let mut summary = RepairSummary::default();
+
+    // Rewriting client/libraries/assets under a live JVM is not safe and the
+    // running process may be reading the very files we would replace.
+    ensure_instance_idle(config, instance)?;
 
     // `mc_version` becomes a directory under `versions/`; a tampered
     // instance.json must not make repair read or write outside it.
@@ -967,10 +1475,11 @@ pub async fn repair_instance(
                 ))
             })?;
         let info = versions::fetch_version_info(&url).await?;
+        ensure_instance_idle(config, instance)?;
         let version_dir = versions_dir.join(&instance.mc_version);
         std::fs::create_dir_all(&version_dir)?;
         let json_path = version_dir.join(format!("{}.json", instance.mc_version));
-        std::fs::write(&json_path, serde_json::to_string_pretty(&info)?)?;
+        instances::write_file_atomic(&json_path, serde_json::to_string_pretty(&info)?.as_bytes())?;
         summary.repaired += 1;
         version_info = Some(info);
     }
@@ -1050,6 +1559,9 @@ pub async fn repair_instance(
 
     let total_files = targets.len();
     for (i, (url, path, sha1, _size)) in targets.into_iter().enumerate() {
+        if i % 32 == 0 {
+            ensure_instance_idle(config, instance)?;
+        }
         let pct = 8.0 + (i as f64 / total_files.max(1) as f64) * 37.0;
         let name = path
             .file_name()
@@ -1060,6 +1572,22 @@ pub async fn repair_instance(
             pct,
             &format!("Downloading {}/{}: {}", i + 1, total_files, name),
         );
+        let base = if path.starts_with(&libraries_dir) {
+            Some(&libraries_dir)
+        } else if path.starts_with(&versions_dir) {
+            Some(&versions_dir)
+        } else {
+            None
+        };
+        if let Some(base) = base {
+            if let Err(e) = crate::import::ensure_no_reparse_points(base, &path) {
+                summary.failed += 1;
+                summary
+                    .errors
+                    .push(format!("{}: refused linked path ({e})", name));
+                continue;
+            }
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -1075,10 +1603,14 @@ pub async fn repair_instance(
 
     // ── 3. assets ───────────────────────────────────────────────
     emit("assets", 48.0, "Checking assets...");
+    ensure_instance_idle(config, instance)?;
     let index_path = assets_dir
         .join("indexes")
         .join(format!("{}.json", vi.assets));
-    let mut asset_index = if index_path.exists() {
+    let index_trusted = index_path.exists()
+        && (vi.asset_index.sha1.is_empty()
+            || download::verify_sha1(&index_path, &vi.asset_index.sha1).ok() == Some(true));
+    let mut asset_index = if index_trusted {
         versions::load_asset_index(&index_path).ok()
     } else {
         None
@@ -1091,27 +1623,61 @@ pub async fn repair_instance(
             ));
         }
         let index = versions::fetch_asset_index(&vi.asset_index.url).await?;
+        ensure_instance_idle(config, instance)?;
         let indexes_dir = assets_dir.join("indexes");
+        if let Err(e) = crate::import::ensure_no_reparse_points(&assets_dir, &indexes_dir) {
+            return Err(LauncherError::Download(format!(
+                "Refusing unsafe asset index path: {e}"
+            )));
+        }
         std::fs::create_dir_all(&indexes_dir)?;
-        std::fs::write(&index_path, serde_json::to_string_pretty(&index)?)?;
+        crate::import::ensure_no_reparse_points(&assets_dir, &index_path).map_err(|e| {
+            LauncherError::Download(format!("Refusing unsafe asset index path: {e}"))
+        })?;
+        instances::write_file_atomic(
+            &index_path,
+            serde_json::to_string_pretty(&index)?.as_bytes(),
+        )?;
         summary.repaired += 1;
         asset_index = Some(index);
     }
     if let Some(index) = &asset_index {
         let objects_dir = assets_dir.join("objects");
-        // Remove size-mismatched objects so download_assets re-fetches them
-        // (it only looks at existence).
+        if let Err(e) = crate::import::ensure_no_reparse_points(&assets_dir, &objects_dir) {
+            return Err(LauncherError::Download(format!(
+                "Refusing unsafe assets directory: {e}"
+            )));
+        }
+        // Objects with a wrong size or hash are not deleted: they are passed
+        // to the repair downloader, which re-verifies them and replaces the
+        // file with an atomically renamed, validated copy. Until that copy
+        // exists the old object stays readable, so an external game can never
+        // observe a missing asset created by this repair.
+        let mut corrupt_assets = std::collections::HashSet::new();
         let mut invalid_asset_hashes = 0usize;
-        for obj in index.objects.values() {
+        let mut checked_prefixes = std::collections::HashSet::new();
+        for (object_index, obj) in index.objects.values().enumerate() {
+            if object_index % 256 == 0 {
+                ensure_instance_idle(config, instance)?;
+            }
             if !download::is_valid_asset_hash(&obj.hash) {
                 invalid_asset_hashes += 1;
                 continue;
             }
-            let p = objects_dir.join(&obj.hash[..2]).join(&obj.hash);
-            if let Ok(m) = std::fs::metadata(&p) {
-                if m.len() != obj.size {
-                    let _ = std::fs::remove_file(&p);
+            let prefix_dir = objects_dir.join(&obj.hash[..2]);
+            if checked_prefixes.insert(obj.hash[..2].to_string()) {
+                if let Err(e) = crate::import::ensure_no_reparse_points(&objects_dir, &prefix_dir) {
+                    return Err(LauncherError::Download(format!(
+                        "Refusing unsafe asset path: {e}"
+                    )));
                 }
+            }
+            let p = prefix_dir.join(&obj.hash);
+            if matches!(
+                asset_object_state(&p, &obj.hash, obj.size),
+                AssetObjectState::Corrupt | AssetObjectState::Unreadable
+            ) {
+                corrupt_assets.insert(p);
             }
         }
         if invalid_asset_hashes > 0 {
@@ -1126,22 +1692,30 @@ pub async fn repair_instance(
             .objects
             .values()
             .filter(|o| {
-                download::is_valid_asset_hash(&o.hash)
-                    && !objects_dir.join(&o.hash[..2]).join(&o.hash).exists()
+                if !download::is_valid_asset_hash(&o.hash) {
+                    return false;
+                }
+                let p = objects_dir.join(&o.hash[..2]).join(&o.hash);
+                corrupt_assets.contains(&p) || !p.exists()
             })
             .count();
-        match download::download_assets(index, &assets_dir, |completed, total, _, _, _| {
-            let frac = if total > 0 {
-                completed as f64 / total as f64
-            } else {
-                0.0
-            };
-            emit(
-                "assets",
-                55.0 + frac * 30.0,
-                &format!("Downloading assets ({}/{})", completed, total),
-            );
-        })
+        match download::download_assets_repair(
+            index,
+            &assets_dir,
+            &corrupt_assets,
+            |completed, total, _, _, _| {
+                let frac = if total > 0 {
+                    completed as f64 / total as f64
+                } else {
+                    0.0
+                };
+                emit(
+                    "assets",
+                    55.0 + frac * 30.0,
+                    &format!("Downloading assets ({}/{})", completed, total),
+                );
+            },
+        )
         .await
         {
             Ok(()) => summary.repaired += missing_before as u32,
@@ -1150,6 +1724,9 @@ pub async fn repair_instance(
                 summary.errors.push(format!("Assets: {}", e));
             }
         }
+        // Virtual/legacy mirrors remove and recreate flat copies; a game that
+        // started during the bulk download must not observe that step.
+        ensure_instance_idle(config, instance)?;
         let _ = download::ensure_virtual_assets(&vi.assets, index, &assets_dir);
     }
 
@@ -1158,6 +1735,7 @@ pub async fn repair_instance(
         && (instance.loader_profile.is_none()
             || neoforge_client_jar_missing(instance, &libraries_dir))
     {
+        ensure_instance_idle(config, instance)?;
         emit("loader", 88.0, "Installing mod loader...");
         match &instance.loader_version {
             Some(lv) => {
@@ -1214,6 +1792,7 @@ pub async fn repair_instance(
         ok
     };
     if !java_ok {
+        ensure_instance_idle(config, instance)?;
         emit("java", 92.0, &format!("Downloading Java {}...", required));
         match crate::java_download::download_java_runtime(required, &config.data_dir, app).await {
             Ok(_) => summary.repaired += 1,
@@ -1230,7 +1809,9 @@ pub async fn repair_instance(
         &instances_dir,
         instance,
         &["mods", "resourcepacks", "shaderpacks"],
+        VerifyMode::Quick,
     )
+    .issues
     .len() as u32;
 
     if summary.failed > 0 {
@@ -1273,7 +1854,7 @@ mod tests {
     }
 
     fn test_instance(mc_version: &str) -> Instance {
-        Instance::new("Test", mc_version, 4096, "g1gc", LoaderType::Vanilla, None)
+        Instance::new("Test", mc_version, LoaderType::Vanilla, None)
     }
 
     /// SHA1 of b"abc".
@@ -1302,7 +1883,7 @@ mod tests {
             },
             "assetIndex": {
                 "id": "5",
-                "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                "sha1": "",
                 "size": 0,
                 "totalSize": 0,
                 "url": "https://piston-meta.mojang.com/fake-index.json"
@@ -1363,7 +1944,9 @@ mod tests {
             "https://example.com/client.jar",
         );
         let client = config.versions_dir().join("1.20.1").join("client.jar");
-        write_file_with_sha1(&client, b"not-abc");
+        // Same size, wrong bytes: this specifically proves size is not the
+        // integrity check for the client JAR.
+        write_file_with_sha1(&client, b"abd");
 
         let report = verify_instance(&config, &instance);
 
@@ -1491,7 +2074,14 @@ mod tests {
         let mods = instance.mods_dir(&config.instances_dir());
         std::fs::create_dir_all(&mods).unwrap();
         write_file_with_sha1(&mods.join("broken.jar"), b"<html>404</html>");
-        write_file_with_sha1(&mods.join("good.jar"), b"PK\x03\x04rest");
+        {
+            let file = std::fs::File::create(mods.join("good.jar")).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(br#"{"id":"good"}"#).unwrap();
+            zip.finish().unwrap();
+        }
         write_file_with_sha1(&mods.join("disabled.jar.disabled"), b"not-a-zip");
 
         let report = verify_instance(&config, &instance);
@@ -1895,7 +2485,7 @@ mod tests {
             },
             "assetIndex": {
                 "id": "5",
-                "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                "sha1": "",
                 "size": 0,
                 "totalSize": 0,
                 "url": "https://piston-meta.mojang.com/fake-index.json"
@@ -2087,6 +2677,449 @@ mod tests {
             )
             .is_some(),
             "repair must reject the same metadata instead of skipping it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_valid_zip(path: &Path, entry: &str, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(entry, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn quick_mode_uses_size_but_never_claims_a_hash_proof() {
+        let dir = temp_dir("quick_library");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
+        let json_path = config.versions_dir().join("1.20.1").join("1.20.1.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        json["libraries"] = serde_json::json!([{
+            "name": "com.example:wrong:1.0",
+            "downloads": {
+                "artifact": {
+                    "path": "com/example/wrong/1.0/wrong-1.0.jar",
+                    "sha1": ABC_SHA1,
+                    "size": 3,
+                    "url": "https://example.com/wrong.jar"
+                }
+            }
+        }]);
+        std::fs::write(&json_path, serde_json::to_string(&json).unwrap()).unwrap();
+        write_file_with_sha1(&config.versions_dir().join("1.20.1/client.jar"), b"abc");
+        write_file_with_sha1(
+            &config
+                .libraries_dir()
+                .join("com/example/wrong/1.0/wrong-1.0.jar"),
+            b"abd",
+        );
+
+        let quick = verify_instance_scoped_mode(
+            &config,
+            &instance,
+            VerifyScope::Launcher,
+            VerifyMode::Quick,
+        );
+        let libs = cat(&quick, "libraries");
+        assert_eq!(libs.issue_count, 0, "a size match is not a hash mismatch");
+        assert!(
+            libs.unverified >= 1,
+            "an unchecked file must stay unverified"
+        );
+
+        let deep = verify_instance_scoped_mode(
+            &config,
+            &instance,
+            VerifyScope::Launcher,
+            VerifyMode::Deep,
+        );
+        let libs = cat(&deep, "libraries");
+        assert!(
+            libs.issues
+                .iter()
+                .any(|i| i.kind == "corrupt" && i.path.contains("wrong-1.0.jar")),
+            "deep mode must catch equal-size, wrong-content libraries: {:?}",
+            libs.issues
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_and_deep_asset_checks_differ_on_contents() {
+        let dir = temp_dir("asset_modes");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
+        write_file_with_sha1(&config.versions_dir().join("1.20.1/client.jar"), b"abc");
+        let indexes = config.assets_dir().join("indexes");
+        std::fs::create_dir_all(&indexes).unwrap();
+        let hash = "aa".repeat(20);
+        let index = serde_json::json!({
+            "objects": { "minecraft/test.bin": { "hash": hash, "size": 3 } }
+        });
+        std::fs::write(
+            indexes.join("5.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+        let object = config
+            .assets_dir()
+            .join("objects")
+            .join(&hash[..2])
+            .join(&hash);
+        write_file_with_sha1(&object, b"abd");
+
+        let quick = verify_instance_scoped_mode(
+            &config,
+            &instance,
+            VerifyScope::Launcher,
+            VerifyMode::Quick,
+        );
+        let assets = cat(&quick, "assets");
+        assert_eq!(assets.issue_count, 0, "size alone is not a hash failure");
+        assert!(assets.unverified >= 1);
+
+        let deep = verify_instance_scoped_mode(
+            &config,
+            &instance,
+            VerifyScope::Launcher,
+            VerifyMode::Deep,
+        );
+        let assets = cat(&deep, "assets");
+        assert!(
+            assets
+                .issues
+                .iter()
+                .any(|i| i.kind == "corrupt" && i.path.contains(&hash)),
+            "deep mode must hash every asset object: {:?}",
+            assets.issues
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_game_started_after_the_first_check_blocks_the_next_repair_phase() {
+        let dir = temp_dir("idle_recheck");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        ensure_instance_idle(&config, &instance).expect("no game yet");
+        if let crate::running_state::IdentityProbe::Found(identity) =
+            crate::running_state::read_identity(std::process::id())
+        {
+            crate::running_state::write_pid_file(
+                &config.data_dir,
+                &instance.name,
+                std::process::id(),
+                Some(&identity),
+            )
+            .unwrap();
+            assert!(
+                ensure_instance_idle(&config, &instance).is_err(),
+                "the phase boundary must notice a game that appeared after the start check"
+            );
+            crate::running_state::remove_pid_file(&config.data_dir, &instance.name);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn asset_object_with_the_right_size_but_wrong_hash_needs_redownload() {
+        let dir = temp_dir("asset_object_corrupt");
+        let path = dir.join("object");
+        write_file_with_sha1(&path, b"abd");
+        assert_eq!(
+            asset_object_state(&path, ABC_SHA1, 3),
+            AssetObjectState::Corrupt,
+            "equal size is not enough for an asset"
+        );
+        write_file_with_sha1(&path, b"abc");
+        assert_eq!(
+            asset_object_state(&path, ABC_SHA1, 3),
+            AssetObjectState::Healthy
+        );
+        assert_eq!(
+            asset_object_state(&path, ABC_SHA1, 4),
+            AssetObjectState::Corrupt,
+            "a size mismatch is corrupt even before hashing"
+        );
+        assert_eq!(
+            asset_object_state(&dir.join("missing"), ABC_SHA1, 3),
+            AssetObjectState::Missing
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn asset_index_hash_mismatch_is_repaired_only_by_redownload() {
+        let dir = temp_dir("asset_index_hash");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
+        let json_path = config.versions_dir().join("1.20.1").join("1.20.1.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        json["assetIndex"]["sha1"] = serde_json::json!(ABC_SHA1);
+        std::fs::write(&json_path, serde_json::to_string(&json).unwrap()).unwrap();
+        write_file_with_sha1(&config.versions_dir().join("1.20.1/client.jar"), b"abc");
+        let indexes = config.assets_dir().join("indexes");
+        std::fs::create_dir_all(&indexes).unwrap();
+        std::fs::write(indexes.join("5.json"), br#"{"objects":{}}"#).unwrap();
+
+        let report = verify_instance_scoped_mode(
+            &config,
+            &instance,
+            VerifyScope::Launcher,
+            VerifyMode::Deep,
+        );
+        let assets = cat(&report, "assets");
+        assert!(
+            assets
+                .issues
+                .iter()
+                .any(|i| i.kind == "corrupt" && i.path.contains("indexes/5.json")),
+            "the asset index itself needs a checksum check: {:?}",
+            assets.issues
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deep_content_hash_mismatch_is_reported_without_repairing_it() {
+        let dir = temp_dir("content_hash");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        let mods = instance.mods_dir(&config.instances_dir());
+        write_valid_zip(
+            &mods.join("sodium.jar"),
+            "fabric.mod.json",
+            br#"{"id":"sodium"}"#,
+        );
+        crate::content::write_sidecar(
+            &mods,
+            "sodium.jar",
+            &crate::content::SidecarWrite {
+                provider: "modrinth",
+                content_type: "mod",
+                project_id: Some("AANobbMI"),
+                project_name: Some("Sodium"),
+                version_id: Some("v1"),
+                version_number: Some("1.0"),
+                file_id: None,
+                hash: Some(ABC_SHA1),
+            },
+        )
+        .unwrap();
+
+        let quick =
+            verify_instance_scoped_mode(&config, &instance, VerifyScope::Mods, VerifyMode::Quick);
+        assert_eq!(
+            quick.content_issues, 0,
+            "quick mode does not hash user content"
+        );
+
+        let deep =
+            verify_instance_scoped_mode(&config, &instance, VerifyScope::Mods, VerifyMode::Deep);
+        let content = cat(&deep, "content");
+        assert!(
+            content.fingerprint_only,
+            "sidecar hashes are local fingerprints, not external provenance"
+        );
+        assert!(
+            content
+                .issues
+                .iter()
+                .any(|i| i.kind == "hash_mismatch" && i.path.contains("sodium.jar")),
+            "deep mode must compare the sidecar hash: {:?}",
+            content.issues
+        );
+        assert!(!content.issues.iter().any(|i| i.repairable));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deep_mode_checks_entry_crc_but_quick_does_not_decompress() {
+        let dir = temp_dir("crc_content");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        let mods = instance.mods_dir(&config.instances_dir());
+        std::fs::create_dir_all(&mods).unwrap();
+        let path = mods.join("bad-crc.jar");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file(
+                "fabric.mod.json",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(br#"{"id":"crc"}"#).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Local file header: 30 bytes + name length + extra length.
+        let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[28], bytes[29]]) as usize;
+        let data_at = 30 + name_len + extra_len;
+        bytes[data_at] ^= 0xFF;
+        std::fs::write(&path, bytes).unwrap();
+
+        let quick =
+            verify_instance_scoped_mode(&config, &instance, VerifyScope::Mods, VerifyMode::Quick);
+        assert_eq!(
+            quick.content_issues, 0,
+            "quick mode must not decompress archives"
+        );
+
+        let deep =
+            verify_instance_scoped_mode(&config, &instance, VerifyScope::Mods, VerifyMode::Deep);
+        let content = cat(&deep, "content");
+        assert!(
+            content
+                .issues
+                .iter()
+                .any(|i| i.kind == "corrupt" && i.path.contains("bad-crc.jar")),
+            "deep mode must validate entry CRC: {:?}",
+            content.issues
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn patch_zip_general_purpose_flag(bytes: &mut [u8], flag: u16) {
+        let local = u16::from_le_bytes([bytes[6], bytes[7]]) | flag;
+        bytes[6..8].copy_from_slice(&local.to_le_bytes());
+        if let Some(pos) = bytes.windows(4).position(|w| w == b"PK\x01\x02") {
+            let central = u16::from_le_bytes([bytes[pos + 8], bytes[pos + 9]]) | flag;
+            bytes[pos + 8..pos + 10].copy_from_slice(&central.to_le_bytes());
+        }
+    }
+
+    fn patch_zip_compression_method(bytes: &mut [u8], method: u16) {
+        bytes[8..10].copy_from_slice(&method.to_le_bytes());
+        if let Some(pos) = bytes.windows(4).position(|w| w == b"PK\x01\x02") {
+            bytes[pos + 10..pos + 12].copy_from_slice(&method.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn deep_encrypted_or_unsupported_archives_are_unverified_not_corrupt() {
+        let dir = temp_dir("unverifiable_archives");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        let mods = instance.mods_dir(&config.instances_dir());
+        std::fs::create_dir_all(&mods).unwrap();
+
+        let encrypted = mods.join("encrypted.jar");
+        write_valid_zip(&encrypted, "fabric.mod.json", br#"{"id":"enc"}"#);
+        let mut bytes = std::fs::read(&encrypted).unwrap();
+        patch_zip_general_purpose_flag(&mut bytes, 1);
+        std::fs::write(&encrypted, bytes).unwrap();
+
+        let unsupported = mods.join("unsupported.jar");
+        write_valid_zip(&unsupported, "fabric.mod.json", br#"{"id":"unsup"}"#);
+        let mut bytes = std::fs::read(&unsupported).unwrap();
+        patch_zip_compression_method(&mut bytes, 1);
+        std::fs::write(&unsupported, bytes).unwrap();
+
+        let valid = mods.join("valid.jar");
+        write_valid_zip(&valid, "fabric.mod.json", br#"{"id":"ok"}"#);
+
+        assert_eq!(content_archive_readable(&valid), ArchiveStreamCheck::Valid);
+
+        let report =
+            verify_instance_scoped_mode(&config, &instance, VerifyScope::Mods, VerifyMode::Deep);
+        let content = cat(&report, "content");
+        assert_eq!(
+            content.unverified, 3,
+            "all three archives lack a sidecar; encrypted/unsupported must be unverified; verified={}, issues={:?}",
+            content.verified, content.issues
+        );
+        assert!(
+            !content
+                .issues
+                .iter()
+                .any(|issue| issue.path.contains("encrypted.jar")
+                    || issue.path.contains("unsupported.jar")),
+            "an unsupported but readable archive is not corrupt: {:?}",
+            content.issues
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deep_archive_caps_stop_work_without_calling_the_file_corrupt() {
+        let dir = temp_dir("archive_caps");
+        let path = dir.join("large.jar");
+        write_valid_zip(&path, "data.bin", &vec![0u8; 1024 * 1024]);
+        let generous = std::time::Duration::from_secs(30);
+
+        assert_eq!(
+            content_archive_streams_with_limits(&path, 0, 1 << 30, generous),
+            ArchiveStreamCheck::Unverified,
+            "entry-count cap"
+        );
+        assert_eq!(
+            content_archive_streams_with_limits(&path, 10, 1024, generous),
+            ArchiveStreamCheck::Unverified,
+            "uncompressed-size cap"
+        );
+        assert_eq!(
+            content_archive_streams_with_limits(&path, 10, 1 << 30, std::time::Duration::ZERO),
+            ArchiveStreamCheck::Unverified,
+            "time cap"
+        );
+        assert_eq!(
+            content_archive_streams_with_limits(&path, 10, 1 << 30, generous),
+            ArchiveStreamCheck::Valid
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_archive_with_zip_magic_is_corrupt() {
+        let dir = temp_dir("truncated_content");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        let mods = instance.mods_dir(&config.instances_dir());
+        let path = mods.join("cut.jar");
+        write_valid_zip(&path, "fabric.mod.json", br#"{"id":"cut"}"#);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+        let report =
+            verify_instance_scoped_mode(&config, &instance, VerifyScope::Mods, VerifyMode::Quick);
+        let content = cat(&report, "content");
+        assert!(
+            content
+                .issues
+                .iter()
+                .any(|i| i.kind == "corrupt" && i.path.contains("cut.jar")),
+            "zip magic must not hide a broken central directory: {:?}",
+            content.issues
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

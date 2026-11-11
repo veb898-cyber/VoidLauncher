@@ -86,7 +86,7 @@ export function DiagnosticsSettings() {
       <p className="settings-section__desc">{t('diag.desc')}</p>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', marginBottom: 'var(--space-md)', flexWrap: 'wrap' }}>
-        <Button onClick={runDiagnostics} disabled={diagRunning}>
+        <Button className="diagnostics-run-btn" onClick={runDiagnostics} disabled={diagRunning}>
           <Search size={16} aria-hidden="true" />
           {diagRunning ? t('diag.running') : t('diag.run')}
         </Button>

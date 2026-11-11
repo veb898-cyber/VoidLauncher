@@ -3,15 +3,19 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { AlertTriangle, HelpCircle, XCircle, FileText, FileSearch, FolderOpen } from 'lucide-react';
+import { AlertTriangle, HelpCircle, XCircle, FileText, FileSearch, FolderOpen, Power, ExternalLink, Wrench } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
 import { addToast } from '../components/ui/Toast';
+import { Button } from '../components/ui/Button';
 import { CopyButton } from '../components/ui/CopyButton';
 import { Tooltip } from '../components/ui/Tooltip';
-import { CRASH_KEYS, VERDICT_KEYS, type CrashAnalysis } from '../lib/diagnostics';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
+import { VerifyRepairModal } from '../components/instances/VerifyRepairModal';
+import { CRASH_KEYS, CRASH_ACTION_KEYS, VERDICT_KEYS, type CrashAnalysis, type CrashAction } from '../lib/diagnostics';
+import { filterLogLines, getLineColor, getLineLevel } from '../lib/gameLogs';
 import {
-  LogToolbar, allLevelsOn, toLevelFilter,
+  LogToolbar, allLevelsOn,
   type LevelFilterState, type LogLevelFilter,
 } from '../components/LogToolbar';
 
@@ -30,29 +34,6 @@ const MAX_SHOWN_RUNS = 7;
 // the backend returns at most this many most-recent lines of the
 // unified session log, older ones are dropped.
 const MAX_DISPLAY_LINES = 100_000;
-
-/** Classify a raw log line into a severity bucket (module scope so the filter
-    memo can depend on it without re-creating it every render). */
-function getLineLevel(line: string): string {
-  const upper = line.toUpperCase();
-  if (/\[ERROR\]|\/ERROR\]/.test(line)) return 'error';
-  if (/\[WARN\]|\/WARN\]/.test(line)) return 'warn';
-  if (/\[DEBUG\]|\/DEBUG\]/.test(line)) return 'debug';
-  if (/\bEXCEPTION\b/.test(upper) || /\bFATAL\b/.test(upper)) return 'error';
-  if (/exit code [1-9]/.test(line) || /exit code \d{2,}/.test(line)) return 'error';
-  if (/FAILED/i.test(line) || /\bERROR\b/i.test(line)) return 'error';
-  if (/WARNING/i.test(line)) return 'warn';
-  return '';
-}
-
-function getLineColor(level: string): string {
-  switch (level) {
-    case 'error': return 'var(--color-danger)';
-    case 'warn': return 'var(--color-warning)';
-    case 'debug': return 'var(--text-tertiary)';
-    default: return 'var(--text-primary)';
-  }
-}
 
 export function GameLogs() {
   const t = useT();
@@ -81,6 +62,10 @@ export function GameLogs() {
   // Crash analysis for the instance of the shown session.
   const [analysis, setAnalysis] = useState<{ instance: string; data: CrashAnalysis } | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [disableAction, setDisableAction] = useState<{ instance: string; action: CrashAction } | null>(null);
+  const [disabledFiles, setDisabledFiles] = useState<Set<string>>(new Set());
+  const [repairOpen, setRepairOpen] = useState(false);
 
   // Chronological console: oldest lines at the TOP, fresh ones appended at
   // the BOTTOM (like Prism's console). The view follows the bottom while
@@ -291,9 +276,49 @@ export function GameLogs() {
       t(entry.message, { culprit: analysis.data.culprit ?? '—' }),
       entry.hint ? t(entry.hint) : '',
       analysis.data.detail,
+      analysis.data.root_cause ?? '',
+      analysis.data.culprit_file ?? '',
+      (analysis.data.culprit_candidates ?? []).join(', '),
       analysis.data.report_path ?? '',
     ].filter(Boolean);
     return lines.join('\n');
+  };
+
+  const runRecoveryAction = (action: CrashAction) => {
+    if (!shownSession) return;
+    if (action.kind === 'disable_mod') {
+      setDisableAction({ instance: shownSession.instance_name, action });
+      return;
+    }
+    if (action.kind === 'open_url') {
+      void invoke('cmd_open_official_url', { url: action.arg }).catch((e) => {
+        addToast(e instanceof Error ? e.message : String(e), 'error');
+      });
+      return;
+    }
+    if (action.kind === 'repair_files') {
+      setRepairOpen(true);
+    }
+  };
+
+  const confirmDisable = async () => {
+    if (!disableAction) return;
+    const file = disableAction.action.arg;
+    setActionBusy(file);
+    try {
+      await invoke('cmd_apply_crash_action', {
+        instanceName: disableAction.instance,
+        action: 'disable_mod',
+        arg: file,
+      });
+      setDisabledFiles((prev) => new Set(prev).add(file));
+      setDisableAction(null);
+      addToast(t('game_logs.action_done', { file }), 'success');
+    } catch (e) {
+      addToast(e instanceof Error ? e.message : String(e), 'error');
+    } finally {
+      setActionBusy(null);
+    }
   };
 
   // Chronological order (oldest → newest): render the file as-is, the view
@@ -314,19 +339,21 @@ export function GameLogs() {
   const needle = debouncedQuery.trim().toLowerCase();
   const filtering = needle !== '' || !levels.error || !levels.warn || !levels.info;
 
-  const visibleLines = useMemo(() => {
-    if (!filtering) return displayLines;
-    return displayLines.filter((line) => {
-      if (!levels[toLevelFilter(getLineLevel(line))]) return false;
-      return needle === '' || line.toLowerCase().includes(needle);
-    });
-  }, [displayLines, filtering, levels, needle]);
+  const visibleLines = useMemo(
+    () => filterLogLines(displayLines, needle, levels),
+    [displayLines, levels, needle],
+  );
 
   const rowVirtualizer = useVirtualizer({
     count: visibleLines.length,
     getScrollElement: () => logContainerRef.current,
     estimateSize: () => 22,
-    overscan: 15,
+    overscan: 20,
+    // Scroll-only movement is written straight to the item transforms and the
+    // sizer height. React re-renders only when the visible range changes,
+    // which removes the one-frame blank band that appeared when a fast wheel
+    // jumped across several estimated rows before React committed.
+    directDomUpdates: true,
   });
 
   const toggleLevel = (level: LogLevelFilter) => {
@@ -469,7 +496,11 @@ export function GameLogs() {
                     {verdictKey ? t(verdictKey) : a.verdict}
                   </span>
                   <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
-                    {a.source === 'crash-report' ? t('diag.source_crash_report') : t('diag.source_log')}
+                    {a.source === 'crash-report'
+                      ? t('diag.source_crash_report')
+                      : a.source === 'hs-error'
+                        ? t('diag.source_hs_error')
+                        : t('diag.source_log')}
                   </span>
                 </div>
 
@@ -479,6 +510,17 @@ export function GameLogs() {
                 {entry.hint && (
                   <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', marginBottom: 'var(--space-sm)' }}>
                     {t(entry.hint)}
+                  </div>
+                )}
+
+                {a.culprit_file && (
+                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-xs)', overflowWrap: 'anywhere' }}>
+                    {t('game_logs.culprit_file', { file: a.culprit_file })}
+                  </div>
+                )}
+                {!a.culprit_file && (a.culprit_candidates?.length ?? 0) > 1 && (
+                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-xs)', overflowWrap: 'anywhere' }}>
+                    {t('game_logs.culprit_candidates', { files: (a.culprit_candidates ?? []).join(', ') })}
                   </div>
                 )}
 
@@ -492,6 +534,43 @@ export function GameLogs() {
                     maxHeight: 160, overflowY: 'auto', userSelect: 'text',
                   }}>
                     {a.detail}
+                  </div>
+                )}
+
+                {a.root_cause && a.root_cause !== a.detail && (
+                  <div style={{
+                    fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)',
+                    marginBottom: 'var(--space-sm)', overflowWrap: 'anywhere',
+                  }}>
+                    <strong>{t('game_logs.root_cause')}:</strong> {a.root_cause}
+                  </div>
+                )}
+
+                {(a.actions ?? []).length > 0 && (
+                  <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap', marginBottom: 'var(--space-sm)' }}>
+                    {(a.actions ?? []).map((action) => {
+                      const meta = CRASH_ACTION_KEYS[action.kind];
+                      const disabled = action.kind === 'disable_mod'
+                        && (disabledFiles.has(action.arg) || actionBusy === action.arg);
+                      const Icon = action.kind === 'disable_mod'
+                        ? Power
+                        : action.kind === 'open_url'
+                          ? ExternalLink
+                          : Wrench;
+                      return (
+                        <Button
+                          key={`${action.kind}:${action.arg}`}
+                          size="sm"
+                          variant={action.tone === 'danger' ? 'danger' : 'secondary'}
+                          onClick={() => runRecoveryAction(action)}
+                          disabled={disabled || actionBusy !== null}
+                          title={meta?.hint ? t(meta.hint) : undefined}
+                        >
+                          <Icon size={14} style={{ marginRight: 6 }} />
+                          {meta ? t(meta.label) : action.kind}
+                        </Button>
+                      );
+                    })}
                   </div>
                 )}
 
@@ -527,6 +606,7 @@ export function GameLogs() {
       <div className="log-container" ref={logContainerRef} style={{
         flex: 1,
         overflowY: 'auto',
+        overflowAnchor: 'none',
         borderRadius: 'var(--radius-lg)',
         padding: 'var(--space-md)',
         fontFamily: 'var(--font-mono)',
@@ -542,7 +622,10 @@ export function GameLogs() {
             {t('terminal.no_matches')}
           </div>
         ) : (
-          <div style={{ height: `${rowVirtualizer.getTotalSize()}px`, width: '100%', position: 'relative' }}>
+          <div
+            ref={rowVirtualizer.containerRef}
+            style={{ position: 'relative' }}
+          >
             {rowVirtualizer.getVirtualItems().map((virtualRow) => {
               const line = visibleLines[virtualRow.index];
               const level = getLineLevel(line);
@@ -557,7 +640,6 @@ export function GameLogs() {
                     top: 0,
                     left: 0,
                     width: '100%',
-                    transform: `translateY(${virtualRow.start}px)`,
                     padding: '1px var(--space-sm)',
                     whiteSpace: 'pre-wrap',
                     wordBreak: 'break-all',
@@ -584,6 +666,24 @@ export function GameLogs() {
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={disableAction !== null}
+        title={t('game_logs.action_disable_confirm_title')}
+        description={t('game_logs.action_disable_confirm_text', {
+          file: disableAction?.action.arg ?? '',
+        })}
+        onConfirm={() => { void confirmDisable(); }}
+        onCancel={() => { if (actionBusy === null) setDisableAction(null); }}
+        confirmLabel={t('game_logs.action_disable_mod')}
+        busy={actionBusy !== null}
+      />
+
+      <VerifyRepairModal
+        open={repairOpen && !!shownSession}
+        onClose={() => setRepairOpen(false)}
+        instanceName={shownSession?.instance_name ?? ''}
+      />
     </div>
   );
 }
