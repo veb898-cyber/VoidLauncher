@@ -323,6 +323,19 @@ describe('CSV generation', () => {
     );
   });
 
+  it('neutralises spreadsheet formulas in remote metadata', () => {
+    const csv = generateModList(
+      [entry({ name: '=SUM(A1:A2)', authors: ['@evil'] })],
+      {
+        format: 'csv',
+        options: { ...ALL_OFF, authors: true },
+        customTemplate: '',
+        customExtension: 'csv',
+      },
+    );
+    expect(csv).toBe("Name,Authors\r\n'=SUM(A1:A2),'@evil");
+  });
+
   it('always includes a header, even when no optional columns are selected', () => {
     const csv = generateModList([entry()], {
       format: 'csv',

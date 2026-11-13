@@ -11,13 +11,22 @@ export function useKeyboardShortcuts() {
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // Enter to play selected instance
-      if (e.key === 'Enter' && selectedInstance && !isLaunching) {
-        // Don't trigger if we're in an input
-        const tag = (e.target as HTMLElement).tagName;
-        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-        launchGame(selectedInstance);
+      // Enter to play selected instance.
+      if (e.key !== 'Enter' || !selectedInstance || isLaunching) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = e.target;
+      if (!(target instanceof Element)) return;
+      // Never hijack Enter from a control, an editable field, or a dialog:
+      // pressing Enter on a focused "Delete" button already activates that
+      // button, and doing both would launch the game as a side effect.
+      if (
+        target.closest(
+          'input, textarea, select, button, a, summary, [role="button"], [role="dialog"], [contenteditable="true"]',
+        )
+      ) {
+        return;
       }
+      launchGame(selectedInstance);
     };
 
     window.addEventListener('keydown', handler);

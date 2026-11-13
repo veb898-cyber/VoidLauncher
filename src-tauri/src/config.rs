@@ -215,6 +215,19 @@ impl AppConfig {
         let mut changed = false;
         let total_ram = detect_total_ram_mb();
 
+        // A hand-edited or corrupted config must never hand absurd heaps to
+        // the JVM (0 MB aborts, multi-TB values make Windows refuse to start).
+        let default_memory = self.default_memory_mb.clamp(2048, 32768);
+        if default_memory != self.default_memory_mb {
+            self.default_memory_mb = default_memory;
+            changed = true;
+        }
+        let max_memory = self.max_memory_mb.clamp(2048, 32768);
+        if max_memory != self.max_memory_mb {
+            self.max_memory_mb = max_memory;
+            changed = true;
+        }
+
         if total_ram >= 24 * 1024 && self.default_memory_mb == 6144 && self.max_memory_mb == 6144 {
             self.default_memory_mb = 8192;
             self.max_memory_mb = 8192;
@@ -295,6 +308,29 @@ impl AppConfig {
     }
 }
 
+/// Keep a copy of a config that failed to parse before the launcher replaces
+/// it with defaults. Without this a single bad byte silently discarded every
+/// user setting (data dir, Java path, proxy, API key) with no way back.
+fn backup_corrupt_config(path: &std::path::Path) {
+    let backup = path.with_file_name(format!(
+        "config.json.bad-{}",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    match std::fs::copy(path, &backup) {
+        Ok(_) => tracing::warn!(
+            target: "config",
+            "Preserved unreadable config as {}",
+            backup.display()
+        ),
+        Err(e) => tracing::warn!(
+            target: "config",
+            "Could not preserve unreadable config at {}: {}",
+            path.display(),
+            e
+        ),
+    }
+}
+
 impl AppConfig {
     /// Load config from disk or create default.
     ///
@@ -340,21 +376,27 @@ impl AppConfig {
                                 }
                                 return config;
                             }
-                            Err(e) => tracing::warn!(
-                                target: "config",
-                                "Failed to parse config at {}: {}; rewriting with defaults",
-                                config_path.display(),
-                                e
-                            ),
+                            Err(e) => {
+                                backup_corrupt_config(&config_path);
+                                tracing::warn!(
+                                    target: "config",
+                                    "Failed to parse config at {}: {}; rewriting with defaults",
+                                    config_path.display(),
+                                    e
+                                );
+                            }
                         }
                     }
                 }
-                Err(e) => tracing::warn!(
-                    target: "config",
-                    "Failed to read config at {}: {}; rewriting with defaults",
-                    config_path.display(),
-                    e
-                ),
+                Err(e) => {
+                    backup_corrupt_config(&config_path);
+                    tracing::warn!(
+                        target: "config",
+                        "Failed to read config at {}: {}; rewriting with defaults",
+                        config_path.display(),
+                        e
+                    );
+                }
             }
         } else {
             tracing::info!(
@@ -383,8 +425,9 @@ impl AppConfig {
         std::fs::create_dir_all(&self.data_dir)?;
         let config_path = self.data_dir.join("config.json");
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(config_path, json)?;
-        Ok(())
+        // Atomic replace: a crash or full disk during Save must leave the
+        // previous working config intact, never a truncated file.
+        crate::instances::write_file_atomic(&config_path, json.as_bytes())
     }
 
     /// Get versions directory
@@ -546,6 +589,83 @@ mod tests {
         assert_eq!(loaded.proxy_port, 3128);
         assert!(loaded.proxy_only);
         assert_eq!(loaded.after_launch_action, "minimize");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absurd_memory_values_are_clamped() {
+        let mut low = base();
+        low.default_memory_mb = 0;
+        low.max_memory_mb = 1;
+        assert!(low.migrate());
+        assert_eq!(low.default_memory_mb, 2048);
+        assert_eq!(low.max_memory_mb, 2048);
+
+        let mut high = base();
+        high.default_memory_mb = 1_000_000;
+        high.max_memory_mb = u32::MAX;
+        assert!(high.migrate());
+        assert_eq!(high.default_memory_mb, 32768);
+        assert_eq!(high.max_memory_mb, 32768);
+    }
+
+    #[test]
+    fn config_save_replaces_atomically_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("vl-config-atomic-{}", uuid::Uuid::new_v4()));
+        let mut config = base();
+        config.data_dir = dir.clone();
+        config.default_memory_mb = 6144;
+        config.save().unwrap();
+
+        let path = dir.join("config.json");
+        let first: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(first["default_memory_mb"], 6144);
+        assert!(
+            !dir.join(".config.json.tmp").exists(),
+            "atomic save must not leave a temp file"
+        );
+
+        config.default_memory_mb = 8192;
+        config.save().unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(second["default_memory_mb"], 8192);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_config_is_preserved_before_defaults_are_written() {
+        let dir = std::env::temp_dir().join(format!("vl-config-corrupt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, b"{ definitely not json").unwrap();
+
+        let loaded = AppConfig::load(&dir);
+        assert_eq!(loaded.data_dir, dir);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"data_dir\""),
+            "a fresh valid config must be written"
+        );
+
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.bad-")
+            })
+            .expect("corrupt config must be backed up");
+        assert_eq!(
+            std::fs::read_to_string(backup.path()).unwrap(),
+            "{ definitely not json"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

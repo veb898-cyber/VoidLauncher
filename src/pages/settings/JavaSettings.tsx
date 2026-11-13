@@ -185,7 +185,12 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               max="32768"
               step="512"
               value={config.default_memory_mb}
-              onChange={(e) => updateConfig('default_memory_mb', Math.max(2048, parseInt(e.target.value) || 2048))}
+              onChange={(e) => {
+                // `max` only constrains the spinner arrows: typed values must
+                // be clamped too, or a typo is persisted and handed to the JVM.
+                const parsed = parseInt(e.target.value, 10) || 2048;
+                updateConfig('default_memory_mb', Math.min(32768, Math.max(2048, parsed)));
+              }}
               style={{ width: 100, textAlign: 'center' }}
               id="min-memory-input"
             />

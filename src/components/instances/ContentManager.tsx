@@ -358,6 +358,8 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   // query doesn't shift the selection onto the wrong items. `Set<string>`
   // is also stable across `items` array reorders from re-loads.
   const [selectedFilenames, setSelectedFilenames] = useState<Set<string>>(new Set());
+  const [removeTargets, setRemoveTargets] = useState<string[] | null>(null);
+  const [removing, setRemoving] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; filename: string } | null>(null);
   const [compatibility, setCompatibility] = useState<Record<string, CompatState>>({});
   const updateCheckKey = `${instanceName}:${SUBFOLDER[contentType]}`;
@@ -998,14 +1000,29 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     setSelectedFilenames(new Set());
   };
 
-  const removeSelected = async () => {
+  const requestRemoveSelected = () => {
     const selected = getSelectedItems();
     if (selected.length === 0) return;
-    for (const item of selected) {
-      await removeSingleItem(item.filename);
+    setRemoveTargets(selected.map((item) => item.filename));
+  };
+
+  const requestRemoveOne = (filename: string) => {
+    setRemoveTargets([filename]);
+  };
+
+  const confirmRemove = async () => {
+    if (!removeTargets || removing) return;
+    setRemoving(true);
+    try {
+      for (const filename of removeTargets) {
+        await removeSingleItem(filename);
+      }
+      setSelectedFilenames(new Set());
+      await loadItems();
+    } finally {
+      setRemoving(false);
+      setRemoveTargets(null);
     }
-    setSelectedFilenames(new Set());
-    loadItems();
   };
 
   const removeSingleItem = async (filename: string) => {
@@ -1451,7 +1468,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
             <Button size="sm" variant="ghost" onClick={toggleSelectedEnabled} style={{ width: '100%', whiteSpace: 'normal' }}>
               {selectedItems.every((m) => m.enabled) ? t('common.disable') : t('common.enable')}{selectedFilenames.size > 1 ? ` (${selectedFilenames.size})` : ''}
             </Button>
-            <Button size="sm" variant="ghost" onClick={removeSelected} style={{ width: '100%', color: 'var(--color-danger)', whiteSpace: 'normal' }}>
+            <Button size="sm" variant="ghost" onClick={requestRemoveSelected} style={{ width: '100%', color: 'var(--color-danger)', whiteSpace: 'normal' }}>
               <Trash2 size={14} style={{ flexShrink: 0 }} /> {t('common.remove')}{selectedFilenames.size > 1 ? ` (${selectedFilenames.size})` : ''}
             </Button>
           </>)}
@@ -1553,7 +1570,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           <button style={{ display: 'block', width: '100%', padding: '6px 12px', border: 'none', background: 'none', color: 'var(--color-danger)', fontSize: 'var(--font-size-sm)', textAlign: 'left', cursor: 'pointer', borderRadius: 'var(--radius-sm)' }}
             onMouseEnter={(e) => e.currentTarget.style.background = 'var(--bg-secondary)'}
             onMouseLeave={(e) => e.currentTarget.style.background = 'none'}
-            onClick={() => { if (ctxItem) removeSingleItem(ctxItem.filename); setContextMenu(null); }}
+            onClick={() => {
+              if (ctxItem) requestRemoveOne(ctxItem.filename);
+              setContextMenu(null);
+            }}
             disabled={!ctxItem}>
             <Trash2 size={12} style={{ marginRight: 6 }} /> {t('common.remove')}
           </button>
@@ -1631,6 +1651,18 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         confirmLabel={t('manager.close_updates_confirm')}
         onConfirm={confirmAbortUpdates}
         onCancel={() => setConfirmCloseUpdates(false)}
+      />
+
+      <ConfirmDialog
+        open={removeTargets !== null}
+        title={t('manager.remove_confirm_title')}
+        description={t('manager.remove_confirm_desc', {
+          count: String(removeTargets?.length ?? 0),
+        })}
+        confirmLabel={t('common.remove')}
+        busy={removing}
+        onConfirm={confirmRemove}
+        onCancel={() => { if (!removing) setRemoveTargets(null); }}
       />
 
       {/* Local import: a name conflict is never resolved silently. */}

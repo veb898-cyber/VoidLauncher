@@ -34,6 +34,8 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const selectInstance = useInstanceStore((s) => s.selectInstance);
   const launchGame = useInstanceStore((s) => s.launchGame);
   const deleteInstance = useInstanceStore((s) => s.deleteInstance);
+  const error = useInstanceStore((s) => s.error);
+  const clearError = useInstanceStore((s) => s.clearError);
   const isLaunching = useInstanceStore((s) => s.isLaunching);
   const installProgress = useEventStore((s) => s.installProgress);
 
@@ -129,6 +131,42 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           <Plus size={14} />
         </Button>
       </div>
+
+      {/* A failed initial load (permissions, locked data dir) must not look
+          like an empty library with no explanation. */}
+      {error && (
+        <div
+          role="alert"
+          style={{
+            margin: 'var(--space-sm)',
+            padding: 'var(--space-sm) var(--space-md)',
+            borderRadius: 'var(--radius-md)',
+            border: '1px solid hsla(352, 82%, 64%, 0.4)',
+            background: 'hsla(352, 76%, 44%, 0.12)',
+            color: 'var(--text-primary)',
+            fontSize: 'var(--font-size-xs)',
+            display: 'flex',
+            gap: 'var(--space-sm)',
+            alignItems: 'flex-start',
+          }}
+        >
+          <span style={{ flex: 1 }}>{error}</span>
+          <button
+            type="button"
+            onClick={clearError}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'var(--text-secondary)',
+              cursor: 'pointer',
+              padding: 0,
+              fontSize: 'var(--font-size-xs)',
+            }}
+          >
+            {t('common.dismiss')}
+          </button>
+        </div>
+      )}
 
       {/* List */}
       <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-sm)' }}>

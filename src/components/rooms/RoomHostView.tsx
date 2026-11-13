@@ -12,6 +12,8 @@ import type { Instance } from '../../stores/instanceStore';
 import { useEventStore } from '../../hooks/useGameEvents';
 import type { RoomStatus } from '../../stores/roomStore';
 import { useT } from '../../lib/i18n';
+import { copyTextToClipboard } from '../../lib/clipboard';
+import { addToast } from '../ui/Toast';
 
 interface RoomHostViewProps {
   status: RoomStatus;
@@ -77,11 +79,14 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
     description: `${i.mc_version} · ${i.loader}`,
   }));
 
-  const copyCode = () => {
+  const copyCode = async () => {
     if (!status.roomId) return;
-    navigator.clipboard.writeText(status.roomId);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    if (await copyTextToClipboard(status.roomId)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } else {
+      addToast(t('common.copy_failed'), 'error');
+    }
   };
 
   const portReady = !!status.minecraftPort && !!status.endpoint;

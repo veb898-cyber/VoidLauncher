@@ -704,6 +704,8 @@ export const ru: Record<string, string> = {
   'manager.move_up':                   'Выше',
   'manager.move_down':                 'Ниже',
   'manager.remove_error':              'Не удалось удалить {name}: {error}',
+  'manager.remove_confirm_title':      'Удалить содержимое?',
+  'manager.remove_confirm_desc':       'Удалить файлы без возможности восстановления: {count}? Их можно снова скачать из каталога.',
   'manager.add_error':                 'Не удалось добавить {name}: {error}',
   'manager.checking_updates':          'Проверка обновлений для {count} элементов...',
   'manager.updated_toast':             'Обновлён {name} до {version}',

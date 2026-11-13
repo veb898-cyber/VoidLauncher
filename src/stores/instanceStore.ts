@@ -167,7 +167,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     set({ isLoading: true });
     try {
       const instances = await invoke<Instance[]>('cmd_list_instances');
-      set({ instances, isLoading: false });
+      set({ instances, isLoading: false, error: null });
     } catch (e: any) {
       const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);

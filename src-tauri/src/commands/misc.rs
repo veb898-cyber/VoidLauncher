@@ -773,8 +773,22 @@ pub fn cmd_save_config(
 ) -> Result<(), String> {
     events::emit_log(&app, "info", "config", "Saving configuration...");
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let previous = config.clone();
+    // The renderer is not a trust boundary for numeric limits: clamp here so
+    // a bad IPC payload can never persist a 0 MB / multi-TB heap.
+    let mut new_config = new_config;
+    new_config.default_memory_mb = new_config.default_memory_mb.clamp(2048, 32768);
+    new_config.max_memory_mb = new_config.max_memory_mb.clamp(2048, 32768);
+    if !crate::config::AFTER_LAUNCH_ACTIONS.contains(&new_config.after_launch_action.as_str()) {
+        new_config.after_launch_action = "do_nothing".to_string();
+    }
     *config = new_config;
-    config.save().map_err(|e| e.to_string())?;
+    if let Err(e) = config.save() {
+        // Keep the running session consistent with the disk: a failed write
+        // must not leave the launcher using values it did not persist.
+        *config = previous;
+        return Err(e.to_string());
+    }
     crate::download::set_global_proxy_policy(
         config.proxy_enabled,
         config.use_system_proxy(),

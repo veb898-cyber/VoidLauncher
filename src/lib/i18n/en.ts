@@ -701,6 +701,8 @@ export const en = {
   'manager.move_up':                   'Move up',
   'manager.move_down':                 'Move down',
   'manager.remove_error':              'Failed to remove {name}: {error}',
+  'manager.remove_confirm_title':      'Remove content?',
+  'manager.remove_confirm_desc':       'Permanently delete {count} file(s) from this instance? They can be downloaded again from the catalog.',
   'manager.add_error':                 'Failed to add {name}: {error}',
   'manager.checking_updates':          'Checking updates for {count} item(s)...',
   'manager.updated_toast':             'Updated {name} to {version}',

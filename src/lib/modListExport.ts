@@ -411,10 +411,15 @@ function jsonEntry(entry: ModListEntry) {
 }
 
 function escapeCsvCell(value: string): string {
-  if (/[",\r\n]/.test(value) || /^\s|\s$/.test(value)) {
-    return `"${value.replace(/"/g, '""')}"`;
+  // Spreadsheet formula injection: mod names/authors are untrusted remote
+  // metadata. A leading =, +, -, @, tab or CR makes Excel/LibreOffice
+  // evaluate the cell even when it was quoted, so prefix it with an
+  // apostrophe (the standard OWASP CSV-injection mitigation).
+  const guarded = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  if (/[",\r\n]/.test(guarded) || /^\s|\s$/.test(guarded)) {
+    return `"${guarded.replace(/"/g, '""')}"`;
   }
-  return value;
+  return guarded;
 }
 
 /** Escape a value for use inside an existing JSON string literal. */

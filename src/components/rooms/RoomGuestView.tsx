@@ -12,6 +12,8 @@ import type { RoomStatus } from '../../stores/roomStore';
 import { useInstanceStore } from '../../stores/instanceStore';
 import type { Instance } from '../../stores/instanceStore';
 import { useT } from '../../lib/i18n';
+import { copyTextToClipboard } from '../../lib/clipboard';
+import { addToast } from '../ui/Toast';
 
 interface RoomGuestViewProps {
   status: RoomStatus;
@@ -72,11 +74,14 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
     description: `${i.mc_version} · ${i.loader}`,
   }));
 
-  const copyEndpoint = () => {
+  const copyEndpoint = async () => {
     if (!status.endpoint) return;
-    navigator.clipboard.writeText(status.endpoint);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    if (await copyTextToClipboard(status.endpoint)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } else {
+      addToast(t('common.copy_failed'), 'error');
+    }
   };
 
   const handleJoin = () => {

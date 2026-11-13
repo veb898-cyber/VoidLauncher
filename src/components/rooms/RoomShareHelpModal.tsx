@@ -4,6 +4,8 @@ import { Modal } from '../ui/Modal';
 import { Button } from '../ui/Button';
 import { useRoomStore } from '../../stores/roomStore';
 import { useT } from '../../lib/i18n';
+import { copyTextToClipboard } from '../../lib/clipboard';
+import { addToast } from '../ui/Toast';
 
 interface RoomShareHelpModalProps {
   open: boolean;
@@ -21,11 +23,14 @@ export function RoomShareHelpModal({ open, onClose, code }: RoomShareHelpModalPr
   const openAdminConsole = useRoomStore((s) => s.openAdminConsole);
   const [copied, setCopied] = useState(false);
 
-  const copyCode = () => {
+  const copyCode = async () => {
     if (!code) return;
-    navigator.clipboard.writeText(code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    if (await copyTextToClipboard(code)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } else {
+      addToast(t('common.copy_failed'), 'error');
+    }
   };
 
   const steps = [
