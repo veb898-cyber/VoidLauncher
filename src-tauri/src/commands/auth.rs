@@ -247,11 +247,15 @@ pub(crate) async fn ensure_ms_session(
     };
 
     // Refresh expired tokens: Microsoft -> Xbox -> XSTS -> Minecraft.
-    if let (Some(mc_token), Some(ms_token)) = (
-        session.minecraft_token.clone(),
-        session.microsoft_token.clone(),
-    ) {
-        if auth::is_token_expired(&mc_token) && !ms_token.refresh_token.is_empty() {
+    // A session that lost its Minecraft token (older builds, interrupted
+    // login) is just as unusable as an expired one and can still be repaired
+    // from the stored refresh token.
+    if let Some(ms_token) = session.microsoft_token.clone() {
+        let needs_refresh = session
+            .minecraft_token
+            .as_ref()
+            .map_or(true, auth::is_token_expired);
+        if needs_refresh && !ms_token.refresh_token.is_empty() {
             tracing::info!(target: "launcher", "Refreshing Microsoft token for account '{}'", account.name);
             match auth::refresh_microsoft_token(&client_id, &ms_token.refresh_token).await {
                 Ok(mut new_ms) => {

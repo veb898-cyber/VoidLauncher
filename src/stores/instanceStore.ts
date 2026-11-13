@@ -5,6 +5,7 @@ import { t } from '../lib/i18n';
 import { friendlyErrorMessage } from '../lib/errors';
 import { createInstallId } from '../lib/installProgress';
 import { useEventStore } from '../hooks/useGameEvents';
+import { addToast } from '../components/ui/Toast';
 
 export type ElybySkinsChoice = 'retry' | 'bypass' | 'cancel';
 
@@ -16,6 +17,8 @@ export interface ElybySkinsPrompt {
 export interface LaunchOptions {
   /** One-shot: the dialog's "launch without Ely.by support" choice. */
   skipElybySkins?: boolean;
+  /** Caller renders its own localized error toast (e.g. ServersManager). */
+  silentError?: boolean;
 }
 
 type ElybySkinsPrepareResult =
@@ -284,6 +287,9 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
       const msg = friendlyErrorMessage(e, t);
       reportInstanceError(msg);
       set({ launchStatus: null, error: msg });
+      if (!options?.silentError) {
+        addToast(t('errors.launch_failed', { error: msg }), 'error');
+      }
       return false;
     } finally {
       launchingInstances.delete(instanceName);

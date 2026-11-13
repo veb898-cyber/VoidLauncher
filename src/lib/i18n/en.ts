@@ -1165,6 +1165,7 @@ export const en = {
   'errors.elyby_skins_bypassed':       'Launching without Ely.by skin support. Some skins may not appear, and servers with Ely.by authentication may reject the session.',
   'errors.elyby_skins_unsupported_mc': 'Ely.by skins in game require Minecraft {version} or newer. The game will launch without them.',
   'errors.network':                    'Network unavailable - check your internet connection or proxy settings',
+  'errors.launch_failed':              'Failed to launch the game: {error}',
   'errors.access':                     'Access denied — a file or folder is locked by another program',
   'errors.disk':                       'Not enough disk space on the drive',
   'errors.main_class':                 'The game did not start: main class not found (broken installation)',

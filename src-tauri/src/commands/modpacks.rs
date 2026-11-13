@@ -234,7 +234,7 @@ pub async fn cmd_install_curseforge_modpack(
         .map_err(|e| e.to_string())?;
 
     // Pack metadata for the update lock — read while the temp zip exists.
-    let (manifest, overrides) = match crate::packlock::pack_zip_info(&temp_path) {
+    let (manifest, overrides, override_hashes) = match crate::packlock::pack_zip_info(&temp_path) {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&temp_path);
@@ -277,6 +277,7 @@ pub async fn cmd_install_curseforge_modpack(
         loader: crate::packlock::loader_slug(&instance.loader).to_string(),
         manifest,
         overrides,
+        override_hashes,
     };
     if let Err(e) = lock.write(&instances_dir.join(&instance_name)) {
         tracing::warn!(
@@ -476,7 +477,8 @@ pub async fn cmd_install_modrinth_modpack(
         .map_err(|e| e.to_string())?;
 
     // Pack metadata for the update lock — read while the temp zip exists.
-    let (manifest, overrides) = match crate::packlock::mrpack_zip_info(&temp_path) {
+    let (manifest, overrides, override_hashes) = match crate::packlock::mrpack_zip_info(&temp_path)
+    {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&temp_path);
@@ -513,6 +515,7 @@ pub async fn cmd_install_modrinth_modpack(
         loader: crate::packlock::loader_slug(&instance.loader).to_string(),
         manifest,
         overrides,
+        override_hashes,
     };
     if let Err(e) = lock.write(&instances_dir.join(&instance_name)) {
         tracing::warn!(

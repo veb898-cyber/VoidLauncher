@@ -26,6 +26,20 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// uses infinite scroll with `PAGE_SIZE` items per request.
 const PAGE_SIZE: usize = 20;
 
+/// Load the version JSON saved by `cmd_install_version`. A missing, corrupt
+/// or mismatched file returns `None` so the caller can fall back to Mojang.
+fn load_local_version_info(versions_dir: &Path, mc_version: &str) -> Option<versions::VersionInfo> {
+    if crate::import::check_safe_file_name(mc_version).is_err() {
+        return None;
+    }
+    let path = versions_dir
+        .join(mc_version)
+        .join(format!("{mc_version}.json"));
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let info: versions::VersionInfo = serde_json::from_str(&contents).ok()?;
+    (info.id == mc_version).then_some(info)
+}
+
 #[tauri::command]
 pub async fn cmd_install_version(
     app: AppHandle,
@@ -766,43 +780,61 @@ pub async fn cmd_launch_game(
         );
     }
 
-    events::emit_log(&app, "info", "launch", "Fetching version manifest...");
-    let manifest = match versions::fetch_version_manifest().await {
-        Ok(m) => m,
-        Err(e) => {
-            let msg = format!("Failed to fetch version manifest: {}", e);
-            events::emit_log(&app, "error", "launch", &msg);
-            return Err(msg.into());
-        }
-    };
+    // A fully installed instance must launch offline. Prefer the version JSON
+    // written by cmd_install_version; only fall back to Mojang when it is
+    // missing or unreadable/corrupt.
+    let version_info = if let Some(local) =
+        load_local_version_info(&config.versions_dir(), &instance.mc_version)
+    {
+        events::emit_log(
+            &app,
+            "info",
+            "launch",
+            &format!(
+                "Using installed version info for {} (offline-capable)",
+                instance.mc_version
+            ),
+        );
+        local
+    } else {
+        events::emit_log(&app, "info", "launch", "Fetching version manifest...");
+        let manifest = match versions::fetch_version_manifest().await {
+            Ok(m) => m,
+            Err(e) => {
+                let msg = format!("Failed to fetch version manifest: {}", e);
+                events::emit_log(&app, "error", "launch", &msg);
+                return Err(msg.into());
+            }
+        };
 
-    let version_url = manifest
-        .versions
-        .iter()
-        .find(|v| v.id == instance.mc_version)
-        .ok_or_else(|| {
-            let msg = format!("Version {} not found in manifest", instance.mc_version);
-            events::emit_log(&app, "error", "launch", &msg);
-            msg
-        })?
-        .url
-        .clone();
+        let version_url = manifest
+            .versions
+            .iter()
+            .find(|v| v.id == instance.mc_version)
+            .ok_or_else(|| {
+                let msg = format!("Version {} not found in manifest", instance.mc_version);
+                events::emit_log(&app, "error", "launch", &msg);
+                msg
+            })?
+            .url
+            .clone();
 
-    events::emit_log(
-        &app,
-        "info",
-        "launch",
-        &format!("Fetching version info for {}...", instance.mc_version),
-    );
-    let version_info = match versions::fetch_version_info(&version_url).await {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = format!(
-                "Failed to fetch version info for {}: {}",
-                instance.mc_version, e
-            );
-            events::emit_log(&app, "error", "launch", &msg);
-            return Err(msg.into());
+        events::emit_log(
+            &app,
+            "info",
+            "launch",
+            &format!("Fetching version info for {}...", instance.mc_version),
+        );
+        match versions::fetch_version_info(&version_url).await {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!(
+                    "Failed to fetch version info for {}: {}",
+                    instance.mc_version, e
+                );
+                events::emit_log(&app, "error", "launch", &msg);
+                return Err(msg.into());
+            }
         }
     };
 
@@ -2572,6 +2604,61 @@ mod tests {
             !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
             "the stopped process must not be reported as running, got: {probe:?}"
         );
+    }
+
+    #[test]
+    fn local_version_json_is_preferred_and_corruption_falls_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl-launch-offline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let versions_dir = dir.join("versions");
+        let version_dir = versions_dir.join("1.20.1");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let json_path = version_dir.join("1.20.1.json");
+
+        let manifest = serde_json::json!({
+            "id": "1.20.1",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "libraries": [],
+            "downloads": {
+                "client": { "sha1": "", "size": 0, "url": "" }
+            },
+            "assetIndex": {
+                "id": "5",
+                "sha1": "",
+                "size": 0,
+                "totalSize": 0,
+                "url": ""
+            },
+            "assets": "5"
+        });
+        std::fs::write(&json_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let loaded = load_local_version_info(&versions_dir, "1.20.1")
+            .expect("installed version JSON must be used without network");
+        assert_eq!(loaded.id, "1.20.1");
+
+        // Corrupt or mismatched metadata must not be trusted: the caller
+        // falls back to the network instead of launching with bad data.
+        std::fs::write(&json_path, b"{not json").unwrap();
+        assert!(load_local_version_info(&versions_dir, "1.20.1").is_none());
+
+        let mut wrong_id = manifest.clone();
+        wrong_id["id"] = serde_json::json!("1.21.1");
+        std::fs::write(&json_path, serde_json::to_string(&wrong_id).unwrap()).unwrap();
+        assert!(load_local_version_info(&versions_dir, "1.20.1").is_none());
+
+        // A tampered instance.json cannot escape versions/.
+        assert!(load_local_version_info(&versions_dir, "../../evil").is_none());
+        assert!(load_local_version_info(&versions_dir, "1.20.1-missing").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

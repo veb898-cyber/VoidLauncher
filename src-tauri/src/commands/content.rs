@@ -532,6 +532,36 @@ impl GraphFetcher {
             }
         }
 
+        // A required edge that named a concrete version but whose version
+        // fetch failed has no project_id yet, so the resolver's dep_key()
+        // cannot report it. Surface it here instead of silently installing
+        // the parent without its dependency.
+        let missing_required: Vec<UnresolvedItem> = self
+            .nodes
+            .values()
+            .flat_map(|node| {
+                node.deps.iter().filter_map(|dep| {
+                    if dep.dep_type != DEP_REQUIRED || dep.project_id.is_some() {
+                        return None;
+                    }
+                    let version_id = dep.version_id.as_deref()?;
+                    if self.nodes.contains_key(version_id) {
+                        return None;
+                    }
+                    Some(UnresolvedItem {
+                        provider: node.provider.clone(),
+                        project_id: version_id.to_string(),
+                        project_name: format!("Unknown dependency ({version_id})"),
+                        source_provider: node.provider.clone(),
+                        source_project_id: node.project_id.clone(),
+                        source_name: node.name.clone(),
+                        reason: "unavailable".to_string(),
+                    })
+                })
+            })
+            .collect();
+        self.unresolved.extend(missing_required);
+
         let project_names = self.graph_project_names();
         Ok(GraphInput {
             nodes: self.nodes,

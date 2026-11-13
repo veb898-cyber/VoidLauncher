@@ -683,16 +683,6 @@ impl<'a> Walk<'a> {
         if key == source_key {
             return;
         }
-        if let Some(inst) = self.installed_for(&key) {
-            self.skipped
-                .entry(key.clone())
-                .or_insert_with(|| SkippedItem {
-                    provider: key.provider().to_string(),
-                    project_id: key.project_id().to_string(),
-                    name: inst.name.clone(),
-                });
-            return;
-        }
         // The user's explicit root pin is authoritative. A dependency edge
         // may require this project, but must not choose another version for
         // it: planning one here would win the first-visit race and silently
@@ -724,6 +714,26 @@ impl<'a> Walk<'a> {
                 }
             }
             return;
+        }
+        if let Some(inst) = self.installed_for(&key) {
+            // An installed project satisfies the dependency only when the
+            // edge does not pin a different concrete version. The old code
+            // skipped every installed project unconditionally, so a mod that
+            // required a newer library silently launched with a broken one.
+            let satisfied = dep.version_id.as_deref().map_or(true, |required| {
+                inst.version_id.as_deref() == Some(required)
+            });
+            if satisfied {
+                self.skipped
+                    .entry(key.clone())
+                    .or_insert_with(|| SkippedItem {
+                        provider: key.provider().to_string(),
+                        project_id: key.project_id().to_string(),
+                        name: inst.name.clone(),
+                    });
+                return;
+            }
+            // Fall through: an explicit different pin is planned below.
         }
         match dep.version_id.as_deref() {
             Some(vid) => self.plan_target(&key, vid, source),
@@ -1279,6 +1289,13 @@ mod tests {
         }
     }
 
+    fn installed_version(pid: &str, name: &str, version: &str) -> InstalledProject {
+        InstalledProject {
+            version_id: Some(version.to_string()),
+            ..installed(pid, name)
+        }
+    }
+
     fn plan_ids(res: &Resolution) -> Vec<&str> {
         res.install.iter().map(|p| p.project_id.as_str()).collect()
     }
@@ -1550,12 +1567,36 @@ mod tests {
             )],
             &["va"],
         );
-        let res = build_resolution(&g, &[installed("b", "Beta")]);
+        let res = build_resolution(&g, &[installed_version("b", "Beta", "vb")]);
         assert_eq!(plan_ids(&res), vec!["a"]);
         assert_eq!(res.skipped.len(), 1);
         assert_eq!(res.skipped[0].project_id, "b");
         assert_eq!(res.skipped[0].name, "Beta");
         assert!(res.unresolved.is_empty());
+    }
+
+    #[test]
+    fn installed_dependency_with_a_different_version_is_replaced() {
+        let g = graph(
+            vec![
+                node("va", "a", "Alpha", "1.0", vec![req("va", "b", Some("vb"))]),
+                node("vb", "b", "Beta", "2.0", vec![]),
+            ],
+            &["va"],
+        );
+        let res = build_resolution(&g, &[installed_version("b", "Beta", "vb-old")]);
+        assert_eq!(
+            plan_ids(&res),
+            vec!["b", "a"],
+            "the version pinned by the dependency must be planned"
+        );
+        let planned = res
+            .install
+            .iter()
+            .find(|item| item.project_id == "b")
+            .expect("required dependency must be planned");
+        assert_eq!(planned.version_id, "vb");
+        assert!(res.skipped.is_empty());
     }
 
     #[test]
@@ -2058,15 +2099,7 @@ mod tests {
             &["va"],
         );
 
-        let res = build_resolution(
-            &g,
-            &[InstalledProject {
-                provider: "modrinth".to_string(),
-                project_id: "mod-b".to_string(),
-                name: "Mod B".to_string(),
-                version_id: None,
-            }],
-        );
+        let res = build_resolution(&g, &[installed_version("mod-b", "Mod B", "vb")]);
 
         // Only mod-a should be planned for install; mod-b is already installed!
         assert_eq!(plan_ids(&res), vec!["mod-a"]);
@@ -2113,12 +2146,7 @@ mod tests {
         );
 
         // 2. When the Modrinth mod 50000 is installed, it correctly satisfies the Modrinth dependency
-        let mr_installed = InstalledProject {
-            provider: "modrinth".to_string(),
-            project_id: "50000".to_string(),
-            name: "MR Mod".to_string(),
-            version_id: None,
-        };
+        let mr_installed = installed_version("50000", "MR Mod", "mr:dep:1");
         let res2 = build_resolution(&g, &[cf_installed, mr_installed]);
         assert_eq!(
             res2.skipped.len(),

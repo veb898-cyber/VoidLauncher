@@ -804,6 +804,34 @@ pub(crate) fn extract_mrpack_override(entry_name: &str) -> Option<&str> {
     None
 }
 
+/// Normalize the `overrides` folder declared by a CurseForge manifest.
+/// Returns the archive prefix (with a trailing slash) whose contents belong
+/// inside `.minecraft`. The folder name comes from the pack, so it is
+/// validated like any other archive path.
+pub(crate) fn curseforge_overrides_prefix(manifest: &serde_json::Value) -> Result<String> {
+    let raw = manifest
+        .get("overrides")
+        .and_then(|value| value.as_str())
+        .unwrap_or("overrides");
+    let normalised = raw.trim().replace('\\', "/");
+    let normalised = normalised.trim_end_matches('/');
+    if normalised.is_empty() {
+        return Ok("overrides/".to_string());
+    }
+    check_safe_relative(normalised).map_err(|_| {
+        LauncherError::Instance(format!("Unsafe CurseForge overrides folder: {raw}"))
+    })?;
+    if normalised
+        .split('/')
+        .any(|component| component.is_empty() || component == ".")
+    {
+        return Err(LauncherError::Instance(format!(
+            "Unsafe CurseForge overrides folder: {raw}"
+        )));
+    }
+    Ok(format!("{}/", normalised))
+}
+
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
 fn read_zip_entry_text(entry: &mut zip::read::ZipFile<'_>, limit: u64) -> Option<String> {
@@ -1709,63 +1737,86 @@ pub(crate) async fn import_mrpack(
     std::fs::create_dir_all(mc_dir.join("shaderpacks"))?;
     std::fs::create_dir_all(mc_dir.join("config"))?;
 
-    // Extract overrides/ + overrides-client/; collect embedded pack files
+    // Extract overrides/ first, then client-overrides/ (and its synonym
+    // overrides-client/) so the documented layered-overrides feature works:
+    // a file present in both layers is replaced by the client variant. Each
+    // layer has its own collision budget, while `override_keys` keeps the
+    // index-vs-override collision check below intact.
     let mut extracted_any = false;
     let mut embedded: HashMap<String, Vec<u8>> = HashMap::new();
     let mut embedded_budget = ExtractBudget::with_limits(MAX_EMBEDDED_BYTES, MAX_EMBEDDED_BYTES);
-    let mut extract_budget = ExtractBudget::new();
+    let mut server_override_budget = ExtractBudget::new();
+    let mut client_override_budget = ExtractBudget::new();
+    let mut override_keys: HashSet<String> = HashSet::new();
     const MAX_EMBEDDED_BYTES: u64 = 1024 * 1024 * 1024;
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| LauncherError::Instance(e.to_string()))?;
-        let entry_name = entry.name().to_string();
 
-        if entry_name == "modrinth.index.json"
-            || entry_name.starts_with("overrides-server/")
-            || entry_name.starts_with("server-overrides/")
-        {
-            continue;
-        }
+    for client_layer in [false, true] {
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| LauncherError::Instance(e.to_string()))?;
+            let entry_name = entry.name().to_string();
 
-        if let Some(relative) = extract_mrpack_override(&entry_name) {
-            if relative.is_empty() {
+            if entry_name == "modrinth.index.json"
+                || entry_name.starts_with("overrides-server/")
+                || entry_name.starts_with("server-overrides/")
+            {
                 continue;
             }
-            check_safe_relative(relative)?;
-            extracted_any = true;
 
-            if entry.is_dir() {
-                std::fs::create_dir_all(mc_dir.join(relative))?;
-            } else {
-                write_extracted_budgeted(&mc_dir, relative, &mut entry, &mut extract_budget)?;
-                write_override_sidecar(&mc_dir, relative, "modrinth");
+            if let Some(relative) = extract_mrpack_override(&entry_name) {
+                let is_client_layer = entry_name.starts_with("client-overrides/")
+                    || entry_name.starts_with("overrides-client/");
+                if is_client_layer != client_layer {
+                    continue;
+                }
+                if relative.is_empty() {
+                    continue;
+                }
+                check_safe_relative(relative)?;
+                extracted_any = true;
+
+                if entry.is_dir() {
+                    std::fs::create_dir_all(mc_dir.join(relative))?;
+                } else {
+                    let budget = if client_layer {
+                        &mut client_override_budget
+                    } else {
+                        &mut server_override_budget
+                    };
+                    write_extracted_budgeted(&mc_dir, relative, &mut entry, budget)?;
+                    write_override_sidecar(&mc_dir, relative, "modrinth");
+                }
+                if let Some(key) = destination_key(relative) {
+                    override_keys.insert(key);
+                }
+                continue;
             }
-            continue;
-        }
 
-        if entry.is_dir() {
-            continue;
-        }
+            // Embedded files are collected once, during the server-layer pass.
+            if client_layer || entry.is_dir() {
+                continue;
+            }
 
-        check_safe_relative(&entry_name)?;
-        // Embedded files stay in memory: the per-file install tasks below run
-        // concurrently against a shared map, and file-backed lookup would
-        // require re-architecting the concurrency model. Bound both a single
-        // entry and the total so a malicious pack cannot exhaust RAM.
-        let size = entry.size();
-        if size > MAX_EMBEDDED_BYTES {
-            return Err(LauncherError::Instance(
-                "The modpack embeds too much data to install safely".to_string(),
-            ));
+            check_safe_relative(&entry_name)?;
+            // Embedded files stay in memory: the per-file install tasks below run
+            // concurrently against a shared map, and file-backed lookup would
+            // require re-architecting the concurrency model. Bound both a single
+            // entry and the total so a malicious pack cannot exhaust RAM.
+            let size = entry.size();
+            if size > MAX_EMBEDDED_BYTES {
+                return Err(LauncherError::Instance(
+                    "The modpack embeds too much data to install safely".to_string(),
+                ));
+            }
+            let mut buf = Vec::new();
+            (&mut entry)
+                .take(MAX_EMBEDDED_BYTES + 1)
+                .read_to_end(&mut buf)?;
+            embedded_budget.reserve_bytes(buf.len() as u64)?;
+            embedded_budget.commit(buf.len() as u64);
+            embedded.insert(normalize_zip_path(&entry_name), buf);
         }
-        let mut buf = Vec::new();
-        (&mut entry)
-            .take(MAX_EMBEDDED_BYTES + 1)
-            .read_to_end(&mut buf)?;
-        embedded_budget.reserve_bytes(buf.len() as u64)?;
-        embedded_budget.commit(buf.len() as u64);
-        embedded.insert(normalize_zip_path(&entry_name), buf);
     }
 
     let embedded = Arc::new(embedded);
@@ -1796,7 +1847,21 @@ pub(crate) async fn import_mrpack(
     // space. Reject a collision before any concurrent install task starts.
     for file_entry in &client_files {
         if let Some(path) = file_entry["path"].as_str().filter(|path| !path.is_empty()) {
-            extract_budget.claim_path(path)?;
+            let key = destination_key(path).ok_or_else(|| {
+                LauncherError::Instance(format!(
+                    "Invalid or empty archive destination path: {path}"
+                ))
+            })?;
+            let conflicts = override_keys.iter().any(|claimed| {
+                key == *claimed
+                    || key.starts_with(&format!("{claimed}/"))
+                    || claimed.starts_with(&format!("{key}/"))
+            });
+            if conflicts {
+                return Err(LauncherError::Instance(format!(
+                    "Duplicate or conflicting archive destination: {path}"
+                )));
+            }
         }
     }
 
@@ -2108,6 +2173,11 @@ pub(crate) async fn import_curseforge_pack(
     std::fs::create_dir_all(&sp_dir)?;
     std::fs::create_dir_all(&config_dir)?;
 
+    // CurseForge packs may store their files in a custom folder declared by
+    // manifest.json (default: "overrides"). Ignoring that field silently
+    // installs a pack without its configs and scripts.
+    let overrides_prefix = curseforge_overrides_prefix(&manifest)?;
+
     // Extract overrides/ with path traversal protection
     let mut extract_budget = ExtractBudget::new();
     for i in 0..archive.len() {
@@ -2120,7 +2190,7 @@ pub(crate) async fn import_curseforge_pack(
             continue;
         }
 
-        if let Some(relative) = entry_name.strip_prefix("overrides/") {
+        if let Some(relative) = entry_name.strip_prefix(&overrides_prefix) {
             if relative.is_empty() {
                 continue;
             }
@@ -2917,6 +2987,29 @@ mod tests {
     }
 
     #[test]
+    fn curseforge_custom_overrides_folder_is_supported_and_contained() {
+        assert_eq!(
+            curseforge_overrides_prefix(&serde_json::json!({})).unwrap(),
+            "overrides/"
+        );
+        assert_eq!(
+            curseforge_overrides_prefix(&serde_json::json!({"overrides": "custom"})).unwrap(),
+            "custom/"
+        );
+        assert_eq!(
+            curseforge_overrides_prefix(&serde_json::json!({"overrides": "pack/core/"})).unwrap(),
+            "pack/core/"
+        );
+        for unsafe_folder in ["../outside", "/rooted", "C:/windows", "a//b", "./a"] {
+            assert!(
+                curseforge_overrides_prefix(&serde_json::json!({ "overrides": unsafe_folder }))
+                    .is_err(),
+                "unsafe overrides folder must be rejected: {unsafe_folder}"
+            );
+        }
+    }
+
+    #[test]
     fn mrpack_install_rejects_unsafe_path() {
         // Regression: a malicious mrpack index entry must fail before any file
         // is written or any download is attempted.
@@ -2934,6 +3027,101 @@ mod tests {
         assert!(result.is_err());
         assert!(!base.parent().unwrap().join("evil.json").exists());
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[tokio::test]
+    async fn mrpack_layered_client_overrides_win_over_base_overrides() {
+        let index = serde_json::json!({
+            "formatVersion": 1,
+            "game": "minecraft",
+            "versionId": "1",
+            "name": "Layered",
+            "files": [],
+            "dependencies": { "minecraft": "1.20.1" }
+        });
+        let zip_path = temp_probe_zip(
+            "layered_overrides.mrpack",
+            &[
+                (
+                    "modrinth.index.json",
+                    serde_json::to_vec(&index).unwrap().as_slice(),
+                ),
+                ("overrides/config/shared.toml", b"base".as_slice()),
+                ("overrides/config/base-only.toml", b"base".as_slice()),
+                ("client-overrides/config/shared.toml", b"client".as_slice()),
+                (
+                    "client-overrides/config/client-only.toml",
+                    b"client".as_slice(),
+                ),
+            ],
+        );
+        let instances_dir =
+            std::env::temp_dir().join(format!("vl_mrpack_layered_{}", std::process::id()));
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let instance = import_mrpack(&instances_dir, zip_path.to_str().unwrap(), "Layered", None)
+            .await
+            .expect("synthetic mrpack must import");
+        assert_eq!(instance.name, "Layered");
+
+        let config = instances_dir.join("Layered/.minecraft/config");
+        assert_eq!(
+            std::fs::read_to_string(config.join("shared.toml")).unwrap(),
+            "client",
+            "client-overrides must replace the base overrides layer"
+        );
+        assert!(config.join("base-only.toml").is_file());
+        assert!(config.join("client-only.toml").is_file());
+
+        let _ = std::fs::remove_dir_all(&instances_dir);
+        let _ = std::fs::remove_file(&zip_path);
+    }
+
+    #[tokio::test]
+    async fn mrpack_index_colliding_with_an_override_is_rejected() {
+        let index = serde_json::json!({
+            "formatVersion": 1,
+            "game": "minecraft",
+            "versionId": "1",
+            "name": "Collision",
+            "files": [{
+                "path": "config/shared.toml",
+                "hashes": { "sha1": "0000000000000000000000000000000000000000" },
+                "downloads": ["https://cdn.modrinth.com/data/x/versions/y/file.jar"],
+                "fileSize": 1
+            }],
+            "dependencies": { "minecraft": "1.20.1" }
+        });
+        let zip_path = temp_probe_zip(
+            "index_override_collision.mrpack",
+            &[
+                (
+                    "modrinth.index.json",
+                    serde_json::to_vec(&index).unwrap().as_slice(),
+                ),
+                ("client-overrides/config/shared.toml", b"client".as_slice()),
+            ],
+        );
+        let instances_dir =
+            std::env::temp_dir().join(format!("vl_mrpack_collision_{}", std::process::id()));
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let error = import_mrpack(
+            &instances_dir,
+            zip_path.to_str().unwrap(),
+            "Collision",
+            None,
+        )
+        .await
+        .expect_err("index and override destinations must not silently overwrite");
+        let message = error.to_string();
+        assert!(
+            message.contains("Duplicate or conflicting"),
+            "got: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&instances_dir);
+        let _ = std::fs::remove_file(&zip_path);
     }
 
     #[test]

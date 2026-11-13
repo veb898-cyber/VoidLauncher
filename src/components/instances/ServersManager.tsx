@@ -385,7 +385,9 @@ export function ServersManager({ instanceName }: Props) {
     }
     setLaunchingAddress(server.ip);
     try {
-      const accepted = await launchGame(instanceName, parsed.host, parsed.port);
+      const accepted = await launchGame(instanceName, parsed.host, parsed.port, {
+        silentError: true,
+      });
       if (accepted) {
         addToast(t('servers.launch_started', { name: server.name }), 'success');
       } else {

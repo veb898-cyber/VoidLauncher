@@ -40,8 +40,14 @@ pub struct PackLock {
     /// Parsed pack manifest (CF `manifest.json` / `modrinth.index.json`).
     pub manifest: serde_json::Value,
     /// All override paths (relative to `.minecraft`) present in the pack
-    /// zip at install time — the basis for identifying removed overrides.
+    /// zip at install time - the basis for identifying removed overrides.
     pub overrides: Vec<String>,
+    /// SHA-1 of every override exactly as shipped by the pack. An update can
+    /// then rewrite only files whose pack content actually changed, leaving
+    /// user-edited configs of unchanged files alone. Empty for locks written
+    /// by older builds (fall back to the legacy rewrite-all behaviour).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub override_hashes: BTreeMap<String, String>,
 }
 
 impl PackLock {
@@ -265,31 +271,24 @@ pub fn content_type_for_rel(rel: &str) -> &'static str {
 /// Read `manifest.json` and the full override path list (relative to
 /// `.minecraft`) from an installed CF pack zip — called while the temp
 /// download still exists, before import removes it.
-pub fn pack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String>), String> {
-    let file =
-        std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
-
+pub fn pack_zip_info(
+    zip_path: &Path,
+) -> Result<(serde_json::Value, Vec<String>, BTreeMap<String, String>), String> {
     let mut manifest_str = String::new();
-    let mut overrides: Vec<String> = Vec::new();
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-        let name = entry.name().to_string();
-        if name == "manifest.json" {
-            entry
-                .read_to_string(&mut manifest_str)
-                .map_err(|e| format!("Cannot read manifest.json: {}", e))?;
-            continue;
-        }
-        if entry.is_dir() {
-            continue;
-        }
-        if let Some(rel) = name.strip_prefix("overrides/") {
-            if !rel.is_empty() {
-                overrides.push(rel.to_string());
+    {
+        let file = std::fs::File::open(zip_path)
+            .map_err(|e| format!("Cannot open pack archive: {}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+            if entry.name() == "manifest.json" {
+                entry
+                    .read_to_string(&mut manifest_str)
+                    .map_err(|e| format!("Cannot read manifest.json: {}", e))?;
+                break;
             }
         }
     }
@@ -298,38 +297,75 @@ pub fn pack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String>)
     }
     let manifest: serde_json::Value =
         serde_json::from_str(&manifest_str).map_err(|e| format!("Invalid manifest.json: {}", e))?;
-    overrides.sort();
-    Ok((manifest, overrides))
-}
+    // The pack may put its files in a custom folder (manifest `overrides`).
+    let prefix =
+        crate::import::curseforge_overrides_prefix(&manifest).map_err(|e| e.to_string())?;
 
-/// Read `modrinth.index.json` and the full override path list (relative to
-/// `.minecraft`, both `overrides/` and `overrides-client/`) from an mrpack
-/// zip — the exact set the importer extracts.
-pub fn mrpack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String>), String> {
     let file =
         std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
-
-    let mut index_str = String::new();
-    let mut overrides: Vec<String> = Vec::new();
+    let mut hashes = BTreeMap::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("Cannot read pack entry: {}", e))?;
         let name = entry.name().to_string();
-        if name == "modrinth.index.json" {
-            entry
-                .read_to_string(&mut index_str)
-                .map_err(|e| format!("Cannot read modrinth.index.json: {}", e))?;
-            continue;
-        }
         if entry.is_dir() {
             continue;
         }
-        if let Some(rel) = crate::import::extract_mrpack_override(&name) {
-            if !rel.is_empty() {
-                overrides.push(rel.to_string());
+        let Some(rel) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rel.is_empty() || crate::import::check_safe_relative(rel).is_err() {
+            continue;
+        }
+        let hash = sha1_of_reader(&mut entry)?;
+        hashes.insert(rel.to_string(), hash);
+    }
+    let overrides = hashes.keys().cloned().collect();
+    Ok((manifest, overrides, hashes))
+}
+
+/// SHA-1 of a streamed zip entry (override files are hashed while reading the
+/// archive, so the pack is never buffered in memory).
+fn sha1_of_reader(reader: &mut dyn std::io::Read) -> Result<String, String> {
+    use sha1::Digest as _;
+    let mut hasher = sha1::Sha1::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Read `modrinth.index.json` and the full override path list (relative to
+/// `.minecraft`, both `overrides/` and `overrides-client/`) from an mrpack
+/// zip — the exact set the importer extracts.
+pub fn mrpack_zip_info(
+    zip_path: &Path,
+) -> Result<(serde_json::Value, Vec<String>, BTreeMap<String, String>), String> {
+    let mut index_str = String::new();
+    {
+        let file = std::fs::File::open(zip_path)
+            .map_err(|e| format!("Cannot open pack archive: {}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+            if entry.name() == "modrinth.index.json" {
+                entry
+                    .read_to_string(&mut index_str)
+                    .map_err(|e| format!("Cannot read modrinth.index.json: {}", e))?;
+                break;
             }
         }
     }
@@ -338,9 +374,40 @@ pub fn mrpack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String
     }
     let index: serde_json::Value = serde_json::from_str(&index_str)
         .map_err(|e| format!("Invalid modrinth.index.json: {}", e))?;
-    overrides.sort();
-    overrides.dedup();
-    Ok((index, overrides))
+
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
+    // Layered overrides: client-overrides/ wins over overrides/.
+    let mut base = BTreeMap::new();
+    let mut client = BTreeMap::new();
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+        let name = entry.name().to_string();
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(rel) = crate::import::extract_mrpack_override(&name) else {
+            continue;
+        };
+        if rel.is_empty() || crate::import::check_safe_relative(rel).is_err() {
+            continue;
+        }
+        let hash = sha1_of_reader(&mut entry)?;
+        let is_client =
+            name.starts_with("client-overrides/") || name.starts_with("overrides-client/");
+        if is_client {
+            client.insert(rel.to_string(), hash);
+        } else {
+            base.insert(rel.to_string(), hash);
+        }
+    }
+    base.extend(client);
+    let overrides = base.keys().cloned().collect();
+    Ok((index, overrides, base))
 }
 
 /// Paths an update/repair must never write or delete: the user's worlds,
@@ -594,9 +661,13 @@ mod tests {
             zw.start_file("overrides/", opts).unwrap();
             zw.finish().unwrap();
         }
-        let (m, overrides) = pack_zip_info(&zip_path).unwrap();
+        let (m, overrides, hashes) = pack_zip_info(&zip_path).unwrap();
         assert_eq!(manifest_files(&m).get("5").map(String::as_str), Some("50"));
         assert_eq!(overrides, vec!["config/mod.toml", "options.txt"]);
+        assert_eq!(
+            hashes.get("config/mod.toml").map(String::as_str),
+            Some(sha1_of_reader(&mut b"cfg".as_slice()).unwrap().as_str())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -617,13 +688,18 @@ mod tests {
             zw.start_file("overrides-client/config/client.toml", opts)
                 .unwrap();
             zw.write_all(b"c").unwrap();
+            zw.start_file("overrides/config/shared.toml", opts).unwrap();
+            zw.write_all(b"base").unwrap();
+            zw.start_file("client-overrides/config/shared.toml", opts)
+                .unwrap();
+            zw.write_all(b"client").unwrap();
             zw.start_file("overrides-server/config/server.toml", opts)
                 .unwrap();
             zw.write_all(b"s").unwrap();
             zw.start_file("overrides/", opts).unwrap();
             zw.finish().unwrap();
         }
-        let (idx, overrides) = mrpack_zip_info(&zip_path).unwrap();
+        let (idx, overrides, hashes) = mrpack_zip_info(&zip_path).unwrap();
         assert_eq!(
             mrpack_manifest_map(&idx).get("p1").map(mrpack_entry_path),
             Some("mods/a.jar".to_string())
@@ -632,8 +708,14 @@ mod tests {
             overrides,
             vec![
                 "config/a.toml".to_string(),
-                "config/client.toml".to_string()
+                "config/client.toml".to_string(),
+                "config/shared.toml".to_string()
             ]
+        );
+        assert_eq!(
+            hashes.get("config/shared.toml").map(String::as_str),
+            Some(sha1_of_reader(&mut b"client".as_slice()).unwrap().as_str()),
+            "the client layer must define the installed content hash"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -654,6 +736,7 @@ mod tests {
             loader: "fabric".into(),
             manifest: manifest(&[]),
             overrides: vec!["config/a.toml".into()],
+            override_hashes: BTreeMap::new(),
         };
         lock.write(&dir).unwrap();
         assert!(PackLock::lock_path(&dir).is_file());
@@ -685,6 +768,7 @@ mod tests {
             loader: String::new(),
             manifest: manifest(&[]),
             overrides: vec![],
+            override_hashes: BTreeMap::new(),
         };
         std::fs::write(
             PackLock::legacy_lock_path(&dir),

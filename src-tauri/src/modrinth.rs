@@ -87,6 +87,10 @@ pub struct ModrinthVersionResponse {
     pub loaders: Vec<String>,
     pub files: Vec<ModrinthFile>,
     pub dependencies: Vec<ModrinthDependency>,
+    /// ISO-8601 publication date. Used to reject older versions when checking
+    /// for modpack updates; `default` keeps older cached payloads parseable.
+    #[serde(default)]
+    pub date_published: String,
 }
 
 async fn api_get<T: serde::de::DeserializeOwned>(url: &str) -> Result<T> {

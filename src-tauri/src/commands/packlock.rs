@@ -23,7 +23,7 @@ use crate::instances;
 use crate::modrinth::{self, ModrinthVersion};
 use crate::packlock::{self, PackDiff, PackFileRef, PackLock};
 use crate::AppState;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -128,6 +128,62 @@ async fn latest_mrpack_version(lock: &PackLock) -> Result<ModrinthVersion, Strin
 fn parse_id(raw: &str, what: &str) -> Result<u64, String> {
     raw.parse::<u64>()
         .map_err(|_| format!("Invalid CurseForge {} id", what))
+}
+
+/// Overrides whose pack-shipped content changed since the lock was written.
+///
+/// Comparing pack hashes (not the files on disk) means a user-edited config
+/// survives updates as long as the pack did not change that file. Locks from
+/// older builds have no hashes, so they fall back to rewriting every override
+/// once; the update then records hashes for subsequent runs.
+fn changed_override_paths(
+    lock: &PackLock,
+    new_overrides: &[String],
+    new_hashes: &BTreeMap<String, String>,
+) -> Vec<String> {
+    if lock.override_hashes.is_empty() {
+        return new_overrides.to_vec();
+    }
+    new_overrides
+        .iter()
+        .filter(|relative| lock.override_hashes.get(*relative) != new_hashes.get(*relative))
+        .cloned()
+        .collect()
+}
+
+/// True only when the candidate's publication date is strictly newer than
+/// the installed file's date. Unknown/unparseable dates do not block updates.
+fn candidate_is_newer(candidate: &str, installed: &str) -> bool {
+    let parse = |value: &str| chrono::DateTime::parse_from_rfc3339(value).ok();
+    match (parse(candidate), parse(installed)) {
+        (Some(candidate), Some(installed)) => candidate > installed,
+        _ => false,
+    }
+}
+
+async fn curseforge_candidate_is_newer(
+    lock: &PackLock,
+    latest: &curseforge::CfFile,
+    api_key: &str,
+) -> bool {
+    let (Ok(project_id), Ok(file_id)) = (
+        lock.pack_project_id.parse::<u64>(),
+        lock.file_id.parse::<u64>(),
+    ) else {
+        return true;
+    };
+    match curseforge::get_mod_file(project_id, file_id, api_key).await {
+        Ok(installed) => candidate_is_newer(&latest.file_date, &installed.file_date),
+        // A deleted/hidden installed file must not permanently block repair.
+        Err(_) => true,
+    }
+}
+
+async fn modrinth_candidate_is_newer(lock: &PackLock, latest: &modrinth::ModrinthVersion) -> bool {
+    match modrinth::get_version_by_id(&lock.file_id).await {
+        Ok(installed) => candidate_is_newer(&latest.date_published, &installed.date_published),
+        Err(_) => true,
+    }
 }
 
 // ==================== Sidecar snapshots (rollback) ====================
@@ -1299,8 +1355,10 @@ pub async fn cmd_check_modpack_update(
     match lock.provider.as_str() {
         "curseforge" => {
             let latest = latest_pack_file(&lock, &ctx.api_key).await?;
+            let newer = latest.id.to_string() != lock.file_id
+                && curseforge_candidate_is_newer(&lock, &latest, &ctx.api_key).await;
             Ok(PackUpdateInfo {
-                up_to_date: latest.id.to_string() == lock.file_id,
+                up_to_date: !newer,
                 current_file_id: lock.file_id.clone(),
                 current_version: lock.file_display_name.clone(),
                 latest_file_id: Some(latest.id.to_string()),
@@ -1310,13 +1368,15 @@ pub async fn cmd_check_modpack_update(
         }
         "modrinth" => {
             let latest = latest_mrpack_version(&lock).await?;
+            let newer =
+                latest.id != lock.file_id && modrinth_candidate_is_newer(&lock, &latest).await;
             let primary = latest
                 .files
                 .iter()
                 .find(|f| f.primary)
                 .or_else(|| latest.files.first());
             Ok(PackUpdateInfo {
-                up_to_date: latest.id == lock.file_id,
+                up_to_date: !newer,
                 current_file_id: lock.file_id.clone(),
                 current_version: lock.file_display_name.clone(),
                 latest_file_id: Some(latest.id.clone()),
@@ -1411,6 +1471,9 @@ async fn update_curseforge(
     if latest.id.to_string() == lock.file_id {
         return Err("The pack is already up to date.".to_string());
     }
+    if !curseforge_candidate_is_newer(&lock, &latest, &ctx.api_key).await {
+        return Err("No newer pack version is available for the installed build.".to_string());
+    }
 
     emit(
         app,
@@ -1442,7 +1505,7 @@ async fn update_curseforge(
     }
 
     let staging = operation_staging_dir(&ctx.instance_dir, "pack-update");
-    let (new_manifest, new_overrides) = match packlock::pack_zip_info(&temp_zip) {
+    let (new_manifest, new_overrides, new_hashes) = match packlock::pack_zip_info(&temp_zip) {
         Ok(v) => v,
         Err(e) => {
             cleanup_files(&staging, &temp_zip);
@@ -1471,7 +1534,8 @@ async fn update_curseforge(
     }
 
     let diff = packlock::diff_manifests(&lock.manifest, &new_manifest);
-    let overrides_changed = new_overrides != lock.overrides;
+    let changed_overrides = changed_override_paths(&lock, &new_overrides, &new_hashes);
+    let overrides_changed = new_overrides != lock.overrides || !changed_overrides.is_empty();
     if diff.is_empty() && !overrides_changed {
         cleanup_files(&staging, &temp_zip);
         return Err("The pack is already up to date.".to_string());
@@ -1527,7 +1591,11 @@ async fn update_curseforge(
         }
     }
 
-    // ---- Phase 2: stage all new overrides (unprotected only) ----
+    // ---- Phase 2: stage overrides whose pack content changed ----
+    // Rewriting every override on every pack release would silently reset
+    // user edits to configs/scripts the pack did not touch.
+    let overrides_prefix =
+        crate::import::curseforge_overrides_prefix(&new_manifest).map_err(|e| e.to_string())?;
     let stage_result: Result<(), String> = (|| {
         let file = std::fs::File::open(&temp_zip)
             .map_err(|e| format!("Cannot reopen pack archive: {}", e))?;
@@ -1539,13 +1607,13 @@ async fn update_curseforge(
                 .by_index(i)
                 .map_err(|e| format!("Cannot read pack entry: {}", e))?;
             let name = entry.name().to_string();
-            let Some(rel) = name.strip_prefix("overrides/") else {
+            let Some(rel) = name.strip_prefix(&overrides_prefix) else {
                 continue;
             };
             if rel.is_empty() || entry.is_dir() {
                 continue;
             }
-            if !new_overrides.iter().any(|o| o == rel) {
+            if !changed_overrides.iter().any(|o| o == rel) {
                 continue;
             }
             if packlock::is_protected_path(rel) {
@@ -1594,6 +1662,7 @@ async fn update_curseforge(
         loader: new_loader.clone(),
         manifest: new_manifest,
         overrides: new_overrides,
+        override_hashes: new_hashes,
     };
     let outcome = apply_and_commit(
         &ctx.mc_dir,
@@ -1894,6 +1963,9 @@ async fn update_modrinth(
     if latest.id == lock.file_id {
         return Err("The pack is already up to date.".to_string());
     }
+    if !modrinth_candidate_is_newer(&lock, &latest).await {
+        return Err("No newer pack version is available for the installed build.".to_string());
+    }
     let file = latest
         .files
         .iter()
@@ -1938,7 +2010,7 @@ async fn update_modrinth(
     }
 
     let staging = operation_staging_dir(&ctx.instance_dir, "pack-update");
-    let (new_manifest, new_overrides) = match packlock::mrpack_zip_info(&temp_zip) {
+    let (new_manifest, new_overrides, new_hashes) = match packlock::mrpack_zip_info(&temp_zip) {
         Ok(v) => v,
         Err(e) => {
             cleanup_files(&staging, &temp_zip);
@@ -1978,7 +2050,8 @@ async fn update_modrinth(
     let old_map = packlock::mrpack_manifest_map(&lock.manifest);
     let new_map = packlock::mrpack_manifest_map(&new_manifest);
     let diff = packlock::diff_mrpack_manifests(&lock.manifest, &new_manifest);
-    let overrides_changed = new_overrides != lock.overrides;
+    let changed_overrides = changed_override_paths(&lock, &new_overrides, &new_hashes);
+    let overrides_changed = new_overrides != lock.overrides || !changed_overrides.is_empty();
     if diff.is_empty() && !overrides_changed {
         cleanup_files(&staging, &temp_zip);
         return Err("The pack is already up to date.".to_string());
@@ -2026,33 +2099,50 @@ async fn update_modrinth(
         }
     }
 
-    // ---- Phase 2: stage all new overrides (unprotected only) ----
+    // ---- Phase 2: stage overrides whose pack content changed ----
+    // Extract the base layer first, then client-overrides/, so the client
+    // variant wins exactly as it does during a fresh import. Staging in raw
+    // zip order could let an earlier client entry be overwritten by a later
+    // base entry for the same path.
     let stage_result: Result<(), String> = (|| {
         let file = std::fs::File::open(&temp_zip)
             .map_err(|e| format!("Cannot reopen pack archive: {}", e))?;
         let mut archive =
             zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
-        let mut extract_budget = crate::import::ExtractBudget::new();
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-            let name = entry.name().to_string();
-            let Some(rel) = crate::import::extract_mrpack_override(&name) else {
-                continue;
+        let mut base_budget = crate::import::ExtractBudget::new();
+        let mut client_budget = crate::import::ExtractBudget::new();
+        for client_layer in [false, true] {
+            let budget = if client_layer {
+                &mut client_budget
+            } else {
+                &mut base_budget
             };
-            if rel.is_empty() || entry.is_dir() {
-                continue;
+            for i in 0..archive.len() {
+                let mut entry = archive
+                    .by_index(i)
+                    .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+                let name = entry.name().to_string();
+                let Some(rel) = crate::import::extract_mrpack_override(&name) else {
+                    continue;
+                };
+                let is_client =
+                    name.starts_with("client-overrides/") || name.starts_with("overrides-client/");
+                if is_client != client_layer {
+                    continue;
+                }
+                if rel.is_empty() || entry.is_dir() {
+                    continue;
+                }
+                if !changed_overrides.iter().any(|o| o == rel) {
+                    continue;
+                }
+                if packlock::is_protected_path(rel) {
+                    continue;
+                }
+                check_safe_relative(rel).map_err(|e| e.to_string())?;
+                write_extracted_budgeted(&stage_ov, rel, &mut entry, budget)
+                    .map_err(|e| e.to_string())?;
             }
-            if !new_overrides.iter().any(|o| o == rel) {
-                continue;
-            }
-            if packlock::is_protected_path(rel) {
-                continue;
-            }
-            check_safe_relative(rel).map_err(|e| e.to_string())?;
-            write_extracted_budgeted(&stage_ov, rel, &mut entry, &mut extract_budget)
-                .map_err(|e| e.to_string())?;
         }
         Ok(())
     })();
@@ -2090,6 +2180,7 @@ async fn update_modrinth(
         loader: new_loader.to_string(),
         manifest: new_manifest,
         overrides: new_overrides,
+        override_hashes: new_hashes,
     };
     let outcome = apply_and_commit(
         &ctx.mc_dir,
@@ -2386,6 +2477,7 @@ mod update_integrity_tests {
             loader: "fabric".to_string(),
             manifest: serde_json::json!({"files": []}),
             overrides: vec![],
+            override_hashes: BTreeMap::new(),
         }
     }
 
@@ -4207,5 +4299,45 @@ mod update_integrity_tests {
             .expect("the reservation is released");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_overrides_with_changed_pack_content_are_rewritten() {
+        let mut lock = sample_lock("1");
+        lock.override_hashes = BTreeMap::from([
+            ("config/a.toml".to_string(), "hash-a".to_string()),
+            ("config/b.toml".to_string(), "hash-b".to_string()),
+        ]);
+        let overrides = vec!["config/a.toml".to_string(), "config/b.toml".to_string()];
+        let new_hashes = BTreeMap::from([
+            ("config/a.toml".to_string(), "hash-a".to_string()),
+            ("config/b.toml".to_string(), "hash-b-changed".to_string()),
+        ]);
+
+        assert_eq!(
+            changed_override_paths(&lock, &overrides, &new_hashes),
+            vec!["config/b.toml".to_string()]
+        );
+
+        // A lock from an older build has no hashes; rewrite once and record
+        // them so the next update can be incremental.
+        lock.override_hashes.clear();
+        assert_eq!(
+            changed_override_paths(&lock, &overrides, &new_hashes),
+            overrides
+        );
+    }
+
+    #[test]
+    fn older_release_is_not_a_newer_pack_candidate() {
+        assert!(candidate_is_newer(
+            "2026-10-10T12:00:00Z",
+            "2026-10-09T12:00:00Z"
+        ));
+        assert!(!candidate_is_newer(
+            "2026-10-08T12:00:00Z",
+            "2026-10-09T12:00:00Z"
+        ));
+        assert!(!candidate_is_newer("not-a-date", "2026-10-09T12:00:00Z"));
     }
 }
