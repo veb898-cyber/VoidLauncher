@@ -151,7 +151,7 @@ function pumpElybyPrompt() {
   });
 }
 
-export const useInstanceStore = create<InstanceState>((set) => ({
+export const useInstanceStore = create<InstanceState>((set, get) => ({
   instances: [],
   selectedInstance: null,
   isLoading: false,
@@ -186,9 +186,15 @@ export const useInstanceStore = create<InstanceState>((set) => ({
 
   deleteInstance: async (name: string) => {
     try {
+      const wasSelected = get().selectedInstance === name;
       await invoke('cmd_delete_instance', { name });
       const instances = await invoke<Instance[]>('cmd_list_instances');
-      set({ instances, selectedInstance: null });
+      set({
+        instances,
+        // Deleting a non-selected instance must not blank the current detail
+        // pane. Only the deleted instance's own selection is cleared.
+        selectedInstance: wasSelected ? null : get().selectedInstance,
+      });
     } catch (e: any) {
       const msg = e.toString();
       reportInstanceError(msg);

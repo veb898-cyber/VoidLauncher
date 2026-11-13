@@ -279,7 +279,7 @@ static EXTRACT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Canonical collision key for a destination path. Removes `.`/empty
 /// components, folds case, and strips trailing dots/spaces that Windows
 /// ignores, so two names that resolve to the same file share one key.
-fn destination_key(relative: &str) -> Option<String> {
+pub(crate) fn destination_key(relative: &str) -> Option<String> {
     let mut parts = Vec::new();
     for part in relative.replace('\\', "/").split('/') {
         if part.is_empty() || part == "." {

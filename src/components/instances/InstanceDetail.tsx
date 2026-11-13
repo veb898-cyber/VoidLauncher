@@ -318,13 +318,21 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
           />
         )}
         {tab === 'worlds' && (
-          <WorldsManager instanceName={instance.name} onOpenFolder={() => handleOpenFolder('saves')} />
+          <WorldsManager
+            key={instance.name}
+            instanceName={instance.name}
+            onOpenFolder={() => handleOpenFolder('saves')}
+          />
         )}
         {tab === 'servers' && (
           <ServersManager key={instance.name} instanceName={instance.name} />
         )}
         {tab === 'screenshots' && (
-          <ScreenshotsGallery instanceName={instance.name} onOpenFolder={() => handleOpenFolder('screenshots')} />
+          <ScreenshotsGallery
+            key={instance.name}
+            instanceName={instance.name}
+            onOpenFolder={() => handleOpenFolder('screenshots')}
+          />
         )}
       </div>
 
@@ -333,8 +341,12 @@ export function InstanceDetail({ onNavigate: _onNavigate }: InstanceDetailProps)
         open={showEditor}
         instance={instance}
         onClose={() => setShowEditor(false)}
-        onSaved={() => {
-          useInstanceStore.getState().loadInstances();
+        onSaved={(newName) => {
+          const store = useInstanceStore.getState();
+          const wasSelected = store.selectedInstance === instance.name;
+          store.loadInstances();
+          // Keep the detail pane attached to the same instance after a rename.
+          if (wasSelected) store.selectInstance(newName);
           setShowEditor(false);
         }}
       />

@@ -795,15 +795,36 @@ fn resolve_open_folder_path(
     base: &std::path::Path,
     target: &std::path::Path,
 ) -> Result<std::path::PathBuf, String> {
-    if !target.exists() {
-        std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
-    }
-    let target_canon = target
-        .canonicalize()
-        .map_err(|_| "Access denied: invalid folder path".to_string())?;
+    // The data directory itself is trusted and may be missing on the very
+    // first settings open. Create it before canonicalizing, but never create
+    // the requested target before the containment check below.
+    std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
     let base_canon = base
         .canonicalize()
         .map_err(|_| "Access denied: data folder unavailable".to_string())?;
+
+    // Never create a directory before proving that its nearest existing
+    // ancestor is inside the data directory. The old code created arbitrary
+    // paths first and only then rejected them.
+    if !target.exists() {
+        let mut ancestor = target;
+        while !ancestor.exists() {
+            ancestor = ancestor
+                .parent()
+                .ok_or_else(|| "Access denied: invalid folder path".to_string())?;
+        }
+        let ancestor_canon = ancestor
+            .canonicalize()
+            .map_err(|_| "Access denied: invalid folder path".to_string())?;
+        if !ancestor_canon.starts_with(&base_canon) {
+            return Err("Access denied: folder is outside the launcher data directory".to_string());
+        }
+        std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    }
+
+    let target_canon = target
+        .canonicalize()
+        .map_err(|_| "Access denied: invalid folder path".to_string())?;
     if !target_canon.starts_with(&base_canon) {
         return Err("Access denied: folder is outside the launcher data directory".to_string());
     }
@@ -890,6 +911,21 @@ mod open_folder_tests {
         let got = resolve_open_folder_path(&base, &missing).unwrap();
         assert!(got.is_dir());
         assert!(got.starts_with(base.canonicalize().unwrap()));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn does_not_create_missing_folder_outside_base() {
+        let tmp =
+            std::env::temp_dir().join(format!("void-open-test-out-create-{}", std::process::id()));
+        let base = tmp.join("data");
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = tmp.join("outside").join("nested");
+        assert!(resolve_open_folder_path(&base, &outside).is_err());
+        assert!(
+            !outside.exists(),
+            "a rejected open_folder call must not create outside directories"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

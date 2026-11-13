@@ -147,6 +147,12 @@ pub fn list_instances(instances_dir: &Path) -> Result<Vec<Instance>> {
         if !dir_path.is_dir() {
             continue;
         }
+        // Restore staging/park directories are dot-prefixed. They may contain
+        // a valid instance.json after an interrupted restore, but they are
+        // never real instances and must not appear in the picker.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let json_path = dir_path.join("instance.json");
         let cfg_path = dir_path.join("instance.cfg");
 
@@ -221,7 +227,39 @@ pub fn save_instance(
         if prev != instance.name {
             let old_dir = instances_dir.join(prev);
             let new_dir = instances_dir.join(&instance.name);
-            if old_dir.exists() && !new_dir.exists() {
+            if !old_dir.exists() {
+                return Err(LauncherError::Instance(format!(
+                    "Instance '{}' no longer exists",
+                    prev
+                )));
+            }
+            if new_dir.exists() {
+                // A case-only rename resolves to the same Windows directory;
+                // anything else would merge two instances. Never overwrite
+                // the other instance's metadata.
+                let same_dir = old_dir
+                    .canonicalize()
+                    .ok()
+                    .zip(new_dir.canonicalize().ok())
+                    .is_some_and(|(old, new)| old == new);
+                if !same_dir {
+                    return Err(LauncherError::Instance(format!(
+                        "An instance named '{}' already exists",
+                        instance.name
+                    )));
+                }
+                // Case-only rename: Windows resolves both names to the same
+                // directory, so metadata is already in place. Try to change
+                // the on-disk casing too; never fall back to copy+delete here
+                // (the source and target are the same directory).
+                if old_dir.file_name() != new_dir.file_name() {
+                    std::fs::rename(&old_dir, &new_dir).map_err(|error| {
+                        LauncherError::Instance(format!(
+                            "Could not rename instance directory: {error}"
+                        ))
+                    })?;
+                }
+            } else {
                 // Try rename first; on Windows this may fail with Access Denied
                 // if any file handle is still open. Fall back to copy + delete.
                 if let Err(rename_err) = std::fs::rename(&old_dir, &new_dir) {
@@ -951,6 +989,21 @@ pub fn is_pack_enabled_in_list(filename: &str, active_packs: &[String]) -> bool 
     })
 }
 
+/// Read options.txt while distinguishing "missing" from a real read error.
+///
+/// A temporary ACL/AV/encoding failure must never be treated as an empty file:
+/// the resource-pack toggles rewrite the whole file and would otherwise erase
+/// every keybind, graphics and audio setting.
+fn read_options_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LauncherError::Instance(format!(
+            "Failed to read options.txt: {error}"
+        ))),
+    }
+}
+
 /// Modify options.txt to enable or disable a resource pack.
 pub fn set_options_resource_pack_enabled(path: &Path, filename: &str, enabled: bool) -> Result<()> {
     let clean_target = filename.strip_suffix(".disabled").unwrap_or(filename);
@@ -959,7 +1012,7 @@ pub fn set_options_resource_pack_enabled(path: &Path, filename: &str, enabled: b
             "Invalid resource pack filename".to_string(),
         ));
     }
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let content = read_options_file(path)?.unwrap_or_default();
     let line_ending = if content.contains("\r\n") {
         "\r\n"
     } else {
@@ -978,8 +1031,13 @@ pub fn set_options_resource_pack_enabled(path: &Path, filename: &str, enabled: b
     for (idx, line) in lines.iter().enumerate() {
         if let Some(val_str) = line.strip_prefix("resourcePacks:") {
             pack_line_idx = Some(idx);
-            if let Ok(packs) = serde_json::from_str::<Vec<String>>(val_str.trim()) {
-                current_packs = packs;
+            match serde_json::from_str::<Vec<String>>(val_str.trim()) {
+                Ok(packs) => current_packs = packs,
+                Err(error) => {
+                    return Err(LauncherError::Instance(format!(
+                        "Cannot parse resourcePacks in options.txt: {error}"
+                    )))
+                }
             }
             break;
         }
@@ -1035,7 +1093,10 @@ pub fn set_options_resource_pack_enabled(path: &Path, filename: &str, enabled: b
 /// currently disabled is ignored instead of being silently enabled. Non-file
 /// system packs (`vanilla`, `mod_resources`, ...) keep their order.
 pub fn set_options_resource_packs_order(path: &Path, filenames: &[String]) -> Result<()> {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let Some(content) = read_options_file(path)? else {
+        // Reordering must not invent options.txt.
+        return Ok(());
+    };
     let line_ending = if content.contains("\r\n") {
         "\r\n"
     } else {
@@ -1054,8 +1115,13 @@ pub fn set_options_resource_packs_order(path: &Path, filenames: &[String]) -> Re
     for (idx, line) in lines.iter().enumerate() {
         if let Some(val_str) = line.strip_prefix("resourcePacks:") {
             pack_line_idx = Some(idx);
-            if let Ok(packs) = serde_json::from_str::<Vec<String>>(val_str.trim()) {
-                current_packs = packs;
+            match serde_json::from_str::<Vec<String>>(val_str.trim()) {
+                Ok(packs) => current_packs = packs,
+                Err(error) => {
+                    return Err(LauncherError::Instance(format!(
+                        "Cannot parse resourcePacks in options.txt: {error}"
+                    )))
+                }
             }
             break;
         }
@@ -6512,6 +6578,37 @@ version = 'hIibTfxn'
     }
 
     #[test]
+    fn options_read_error_is_never_treated_as_an_empty_file() {
+        let dir = temp_dir("options_unreadable");
+        let options_path = dir.join("options.txt");
+        // Invalid UTF-8 is a realistic read error on legacy/localized files.
+        let original = vec![0xFF, 0xFE, 0x00, 0x41];
+        std::fs::write(&options_path, &original).unwrap();
+
+        assert!(set_options_resource_pack_enabled(&options_path, "A.zip", true).is_err());
+        assert_eq!(std::fs::read(&options_path).unwrap(), original);
+        assert!(set_options_resource_packs_order(&options_path, &["A.zip".into()]).is_err());
+        assert_eq!(std::fs::read(&options_path).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_resource_packs_line_is_not_rewritten() {
+        let dir = temp_dir("options_bad_packs");
+        let options_path = dir.join("options.txt");
+        let original = "fov:70.0\nresourcePacks:not-json\ngamma:1.0\n";
+        std::fs::write(&options_path, original).unwrap();
+
+        assert!(set_options_resource_pack_enabled(&options_path, "A.zip", true).is_err());
+        assert_eq!(std::fs::read_to_string(&options_path).unwrap(), original);
+        assert!(set_options_resource_packs_order(&options_path, &["A.zip".into()]).is_err());
+        assert_eq!(std::fs::read_to_string(&options_path).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_set_options_resource_packs_order_preserves_system_packs() {
         let dir = temp_dir("options_order_test");
         let options_path = dir.join("options.txt");
@@ -6979,6 +7076,82 @@ version = 'hIibTfxn'
 
         // 4. Temporary file options.tmp must be cleaned up
         assert!(!tmp.exists(), "Temporary file options.tmp must be removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_instance_never_overwrites_an_existing_instance() {
+        let dir = temp_dir("save_duplicate_name");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let alpha = Instance::new("Alpha", "1.20.1", LoaderType::Vanilla, None);
+        let beta = Instance::new("Beta", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &alpha, None).unwrap();
+        save_instance(&instances_dir, &beta, None).unwrap();
+
+        let beta_config = instances_dir.join("Beta").join("instance.json");
+        let beta_before = std::fs::read_to_string(&beta_config).unwrap();
+
+        let mut renamed = alpha.clone();
+        renamed.name = "Beta".to_string();
+        let error = save_instance(&instances_dir, &renamed, Some("Alpha")).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "got: {error}");
+
+        assert_eq!(
+            std::fs::read_to_string(&beta_config).unwrap(),
+            beta_before,
+            "the existing instance's metadata must stay untouched"
+        );
+        assert!(
+            instances_dir.join("Alpha").join("instance.json").is_file(),
+            "the source instance must not be renamed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn case_only_rename_is_allowed_and_updates_metadata() {
+        let dir = temp_dir("case_only_rename");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let original = Instance::new("Alpha", "1.20.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &original, None).unwrap();
+
+        let mut renamed = original.clone();
+        renamed.name = "alpha".to_string();
+        save_instance(&instances_dir, &renamed, Some("Alpha")).unwrap();
+
+        let listed = list_instances(&instances_dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "alpha");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_instances_ignores_restore_staging_directories() {
+        let dir = temp_dir("list_ignores_staging");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let real = Instance::new("Real", "1.20.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &real, None).unwrap();
+
+        let staging = instances_dir.join(".void-restore-tmp-test");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join("instance.json"),
+            serde_json::to_string(&real).unwrap(),
+        )
+        .unwrap();
+
+        let listed = list_instances(&instances_dir).unwrap();
+        assert_eq!(listed.len(), 1, "staging directory must be hidden");
+        assert_eq!(listed[0].name, "Real");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

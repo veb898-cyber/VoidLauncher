@@ -236,17 +236,46 @@ pub async fn cmd_save_instance(
     old_name: Option<String>,
 ) -> Result<(), String> {
     validate_instance_name(&instance.name)?;
-    // Renaming moves the instance directory; stop the content watcher first
-    // so Windows does not reject the move with "access denied".
-    if let Some(old_name) = old_name.as_deref() {
-        if old_name != instance.name {
-            stop_pack_watcher_for(state.inner(), old_name)?;
-        }
-    }
+
+    // A save can rename the directory, so treat it as a mutation of the
+    // source instance. The guard rejects Starting/Running/Editing, which is
+    // what prevents the copy+delete fallback from touching a live game.
+    let guard_name = old_name.as_deref().unwrap_or(&instance.name);
+    let _guard = InstanceMutationGuard::acquire(state.inner(), guard_name)?;
+
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
     };
+
+    // Renaming moves the instance directory; stop the content watcher first
+    // so Windows does not reject the move with "access denied".
+    if let Some(old_name) = old_name.as_deref() {
+        if old_name != instance.name {
+            let old_dir = instances_dir.join(old_name);
+            let new_dir = instances_dir.join(&instance.name);
+            if !old_dir.exists() {
+                return Err(format!("Instance '{}' no longer exists.", old_name));
+            }
+            // Never overwrite another instance's metadata. A case-only rename
+            // resolves to the same Windows directory and is harmless.
+            if new_dir.exists() {
+                let same_dir = old_dir
+                    .canonicalize()
+                    .ok()
+                    .zip(new_dir.canonicalize().ok())
+                    .is_some_and(|(old, new)| old == new);
+                if !same_dir {
+                    return Err(format!(
+                        "An instance named '{}' already exists.",
+                        instance.name
+                    ));
+                }
+            }
+            stop_pack_watcher_for(state.inner(), old_name)?;
+        }
+    }
+
     tauri::async_runtime::spawn_blocking(move || {
         instances::save_instance(&instances_dir, &instance, old_name.as_deref())
             .map_err(|e| e.to_string())

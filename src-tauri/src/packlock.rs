@@ -347,14 +347,18 @@ pub fn mrpack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String
 /// personal media and core settings. Everything else in the instance is
 /// pack-owned content the pack update may manage.
 pub fn is_protected_path(rel: &str) -> bool {
-    let norm = rel.replace('\\', "/");
-    let lower = norm.trim_start_matches('/').to_ascii_lowercase();
+    // Normalise exactly like archive destinations: collapse `.`/empty
+    // components, strip trailing dots/spaces (Windows does this at open time)
+    // and case-fold. Fail closed on an invalid path.
+    let Some(normalised) = crate::import::destination_key(rel) else {
+        return true;
+    };
     const DIRS: &[&str] = &["saves/", "screenshots/", "logs/", "crash-reports/"];
-    if DIRS.iter().any(|d| lower.starts_with(d)) {
+    if DIRS.iter().any(|dir| normalised.starts_with(dir)) {
         return true;
     }
     matches!(
-        lower.as_str(),
+        normalised.as_str(),
         "options.txt"
             | "optionsof.txt"
             | "servers.dat"
@@ -697,5 +701,18 @@ mod tests {
         assert!(!PackLock::legacy_lock_path(&dir).exists());
         assert_eq!(PackLock::read(&dir).unwrap(), lock);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn protected_paths_use_windows_normalisation() {
+        assert!(is_protected_path("saves/world/level.dat"));
+        assert!(is_protected_path("./saves/world/level.dat"));
+        assert!(is_protected_path("saves./world/level.dat"));
+        assert!(is_protected_path("options.txt"));
+        assert!(is_protected_path("./options.txt"));
+        assert!(is_protected_path("options.txt."));
+        assert!(is_protected_path("screenshots/shot.png"));
+        assert!(!is_protected_path("config/example.toml"));
+        assert!(!is_protected_path("mods/example.jar"));
     }
 }

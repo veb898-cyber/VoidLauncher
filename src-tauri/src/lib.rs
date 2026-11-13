@@ -81,20 +81,19 @@ pub struct PackWatcherHandle {
 /// command that downloads a file from a URL supplied by the frontend
 /// or by an upstream API, to prevent SSRF / file:// / mixed-content
 /// downgrade attacks.
+///
+/// The URL must be parsed with the same WHATWG parser reqwest uses. A manual
+/// split at `:`/`/` is not safe: `https://github.com:443@evil.example/x`
+/// would look like `github.com` to a naive parser while reqwest connects to
+/// `evil.example`. Userinfo is therefore rejected outright.
 pub(crate) fn is_allowed_download_host(url: &str) -> bool {
-    let url = url.trim();
-    if !url.to_ascii_lowercase().starts_with("https://") {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
         return false;
-    }
-    let after_scheme = &url[8..];
-    let host_end = after_scheme
-        .find(['/', ':', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let host = after_scheme[..host_end].to_ascii_lowercase();
-    if host.is_empty() {
-        return false;
-    }
-    download::is_host_allowed(&host)
+    };
+    parsed.scheme() == "https"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.host_str().is_some_and(download::is_host_allowed)
 }
 
 // ==================== App Builder ====================
@@ -488,4 +487,55 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("Error while running VoidLauncher");
+}
+
+#[cfg(test)]
+mod download_host_tests {
+    use super::is_allowed_download_host;
+
+    #[test]
+    fn accepts_allowlisted_https_hosts() {
+        assert!(is_allowed_download_host(
+            "https://cdn.modrinth.com/data/project/version/file.jar"
+        ));
+        assert!(is_allowed_download_host(
+            "https://raw.githubusercontent.com/owner/repo/main/file.jar"
+        ));
+        assert!(is_allowed_download_host(
+            "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+        ));
+    }
+
+    #[test]
+    fn rejects_userinfo_host_confusion() {
+        // `github.com:443` is userinfo; reqwest would connect to evil.example.
+        assert!(!is_allowed_download_host(
+            "https://github.com:443@evil.example/payload"
+        ));
+        assert!(!is_allowed_download_host(
+            "https://cdn.modrinth.com@evil.example/payload"
+        ));
+    }
+
+    #[test]
+    fn rejects_backslash_and_suffix_lookalikes() {
+        assert!(!is_allowed_download_host(
+            "https://evil.example\\.github.com/payload"
+        ));
+        assert!(!is_allowed_download_host(
+            "https://cdn.modrinth.com.evil.example/payload"
+        ));
+        assert!(!is_allowed_download_host(
+            "https://evilcdn.modrinth.com/payload"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_https_and_malformed_urls() {
+        assert!(!is_allowed_download_host(
+            "http://cdn.modrinth.com/file.jar"
+        ));
+        assert!(!is_allowed_download_host("file:///C:/Windows/System32"));
+        assert!(!is_allowed_download_host("not a url"));
+    }
 }

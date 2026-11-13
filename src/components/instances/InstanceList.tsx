@@ -309,7 +309,12 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           open
           instance={editorInstance}
           onClose={() => setEditorName(null)}
-          onSaved={() => useInstanceStore.getState().loadInstances()}
+          onSaved={(newName) => {
+            const store = useInstanceStore.getState();
+            const wasSelected = store.selectedInstance === editorInstance.name;
+            store.loadInstances();
+            if (wasSelected) store.selectInstance(newName);
+          }}
         />
       )}
 

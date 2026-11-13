@@ -40,7 +40,8 @@ interface Props {
   open: boolean;
   instance: InstanceData;
   onClose: () => void;
-  onSaved: () => void;
+  /** Called with the (possibly renamed) instance name after a successful save. */
+  onSaved: (name: string) => void;
 }
 
 type GcPreset = 'standard' | 'g1gc' | 'zgc';
@@ -227,7 +228,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
       };
       await invoke('cmd_save_instance', { instance: updated, oldName: instance.name });
       addToast(t('instance_editor.saved_toast'), 'success');
-      onSaved();
+      onSaved(updated.name);
       onClose();
     } catch (e: any) {
       addToast(t('instance_editor.save_error', { error: e.toString() }), 'error');
@@ -459,7 +460,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
         onClose={() => setLoaderModalOpen(false)}
         onUpdated={() => {
           setLoaderModalOpen(false);
-          onSaved();
+          onSaved(instance.name);
           onClose();
         }}
       />
