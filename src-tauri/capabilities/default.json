@@ -17,6 +17,7 @@
     "shell:default",
     "shell:allow-open",
     "dialog:default",
+    "clipboard-manager:allow-write-text",
     "process:default",
     "fs:default",
     "updater:default",

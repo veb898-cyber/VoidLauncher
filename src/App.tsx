@@ -37,8 +37,8 @@ function App() {
   const t = useT();
   const updater = useUpdater();
   const [activePage, setActivePage] = useState('home');
-  const { checkAuth } = useAuthStore();
-  const { loadConfig } = useSettingsStore();
+  const checkAuth = useAuthStore((s) => s.checkAuth);
+  const loadConfig = useSettingsStore((s) => s.loadConfig);
   const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const isFrozen = useFocusStore((s) => s.isFrozen);
 

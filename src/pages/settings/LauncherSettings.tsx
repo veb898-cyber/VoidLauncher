@@ -8,6 +8,7 @@ import { useT } from '../../lib/i18n';
 import type { AppConfig } from '../../stores/settingsStore';
 import { useToastSettingsStore } from '../../stores/toastSettingsStore';
 import { useSkinSettingsStore } from '../../stores/skinSettingsStore';
+import { usePerformanceStore } from '../../stores/performanceStore';
 import type { UpdateConfig } from './types';
 
 interface LauncherSettingsProps {
@@ -24,6 +25,12 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
   const setToastCategory = useToastSettingsStore((s) => s.setCategory);
   const skinRefreshMode = useSkinSettingsStore((s) => s.refreshMode);
   const setSkinRefreshMode = useSkinSettingsStore((s) => s.setRefreshMode);
+  const reduceInterfaceEffects = usePerformanceStore(
+    (s) => s.reduceInterfaceEffects,
+  );
+  const setReduceInterfaceEffects = usePerformanceStore(
+    (s) => s.setReduceInterfaceEffects,
+  );
 
   const toastRows = [
     {
@@ -195,6 +202,32 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
             >
               {t('settings.clear_cache_btn')}
             </Button>
+          </div>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <h2 className="settings-section__title">
+          {t('settings.optimization_title')}
+        </h2>
+        <p className="settings-section__desc">
+          {t('settings.optimization_desc')}
+        </p>
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">
+              {t('settings.optimization_reduce_title')}
+            </div>
+            <div className="settings-row__desc">
+              {t('settings.optimization_reduce_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control">
+            <Toggle
+              checked={reduceInterfaceEffects}
+              onChange={setReduceInterfaceEffects}
+              ariaLabel={t('settings.optimization_reduce_title')}
+            />
           </div>
         </div>
       </section>

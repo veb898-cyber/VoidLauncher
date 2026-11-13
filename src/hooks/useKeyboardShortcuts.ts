@@ -2,7 +2,12 @@ import { useEffect } from 'react';
 import { useInstanceStore } from '../stores/instanceStore';
 
 export function useKeyboardShortcuts() {
-  const { selectedInstance, launchGame, isLaunching } = useInstanceStore();
+  // Slice subscriptions: the shortcut only depends on the selection and the
+  // launch flag. A whole-store subscription re-rendered App whenever the
+  // instance list or any other instance state changed.
+  const selectedInstance = useInstanceStore((s) => s.selectedInstance);
+  const launchGame = useInstanceStore((s) => s.launchGame);
+  const isLaunching = useInstanceStore((s) => s.isLaunching);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {

@@ -30,9 +30,10 @@ function loadSkinview3d() {
  *
  * The viewer instance is created ONCE and survives account switches —
  * `loadSkin` swaps the texture in place, so switching accounts never
- * flickers, teleports the camera, or restarts the idle animation. The model
- * is NOT auto-rotating: it stays still until the user drags it (or rotates
- * it with the wheel), exactly as asked. `cape` (a cape PNG data URL, or
+ * flickers, teleports the camera, or restarts the model. The model is always
+ * static: no automatic idle animation runs, and the render loop stays paused
+ * until the user drags or zooms it. This keeps the 3D preview at full quality
+ * without a continuous 60 fps WebGL draw. `cape` (a cape PNG data URL, or
  * null for no cape) is applied in place as well and survives skin swaps.
  *
  * `width`/`height` are the IDEAL (maximum) canvas size. The stage is
@@ -104,20 +105,23 @@ export function SkinPreview({
     (async () => {
       try {
         if (!viewerRef.current) {
-          const { SkinViewer, IdleAnimation } = await loadSkinview3d();
+          const { SkinViewer } = await loadSkinview3d();
           if (disposed) return;
           const v = new SkinViewer({
             canvas,
             width: sizeRef.current.w,
             height: sizeRef.current.h,
             model: 'auto-detect',
+            // No continuous RAF: the model is repainted only after a skin or
+            // size change and while the user drags or zooms it.
+            renderPaused: true,
           });
-          // Gentle idle breathing only — no auto-rotation by default.
-          const idle = new IdleAnimation();
-          idle.speed = 0.35;
-          v.animation = idle;
+          v.animation = null;
           v.autoRotate = false;
           v.controls.enablePan = false;
+          v.controls.addEventListener('change', () => {
+            if (!v.disposed) v.render();
+          });
           viewerRef.current = v;
           // The texture is loaded BEFORE the canvas is revealed. The
           // constructor draws its first frames while the skin image is still
@@ -138,6 +142,7 @@ export function SkinPreview({
         } else {
           await viewerRef.current.loadSkin(skin, { model: 'auto-detect' });
           if (disposed) return;
+          viewerRef.current.render();
           setRenderedUuid(uuid);
         }
       } catch (e) {
@@ -152,7 +157,12 @@ export function SkinPreview({
 
   // Resize the existing viewer in place when the stage changes.
   useEffect(() => {
-    viewerRef.current?.setSize(fitW, fitH);
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    viewer.setSize(fitW, fitH);
+    // setSize clears the drawing buffer; a paused viewer has no next frame
+    // to repaint it, so draw the resized frame explicitly.
+    viewer.render();
   }, [fitW, fitH]);
 
   // Apply cape changes in place. Runs before the viewer exists on the very
@@ -163,11 +173,14 @@ export function SkinPreview({
     if (!v) return;
     if (!capeRef.current) {
       v.resetCape();
+      v.render();
       return;
     }
-    v.loadCape(capeRef.current).catch((e) =>
-      console.error('cape load failed:', e)
-    );
+    v.loadCape(capeRef.current)
+      .then(() => {
+        if (!v.disposed) v.render();
+      })
+      .catch((e) => console.error('cape load failed:', e));
   }, [cape]);
 
   // Dispose once, on unmount.

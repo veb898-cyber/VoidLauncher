@@ -31,9 +31,15 @@
             document.documentElement.setAttribute('data-theme', t);
             document.documentElement.style.colorScheme = 'dark';
           }
-          // Liquid motion and the gooey trails are always on (no longer user
-          // settings); prefers-reduced-motion is honoured by the CSS media
-          // blocks and by useGooey in React. Must stay in sync with
+          // Optional interface-effect reduction. Applied before React so the
+          // first frame already uses the saved choice; the performance store
+          // migrates older profile data and re-applies the same value.
+          if (localStorage.getItem('voidlauncher-reduce-interface-effects') === '1') {
+            document.documentElement.setAttribute('data-reduce-effects', 'on');
+          }
+          // Liquid motion is always on; prefers-reduced-motion is honoured by
+          // the CSS media blocks and by useGooey in React. The optimization
+          // switch can also turn the gooey trails off. Must stay in sync with
           // src/stores/themeStore.ts.
           document.documentElement.setAttribute('data-motion', 'liquid');
           var f = localStorage.getItem('voidlauncher-font');

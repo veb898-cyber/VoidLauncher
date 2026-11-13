@@ -1228,6 +1228,20 @@ a {
   border-color: var(--primary) !important;
 }
 
+/* Settings cards: hovering one transitions background, border-color and
+   box-shadow. Without a layer of its own, every frame repainted the whole
+   content layer (measured 1,116 x 925 px). Promoting the normal-theme settings
+   cards keeps that work inside the card: hover CPU fell from ~52% to ~42.5%
+   of one logical core and the WebView2 GPU process CPU from ~27.5% to ~21%.
+   Actual GPU 3D utilization stayed inside run-to-run noise. Rest and hover
+   frames match the original in every normal theme (largest measured channel
+   difference 1/255, no pixel above 2/255). Liquid Glass is excluded: its cards
+   already own a backdrop-filter layer and must keep the current material
+   sampling. */
+html:not([data-theme='lg']) .settings-section .glass-card {
+  will-change: transform;
+}
+
 /* ============================
    Button Component
    ============================ */
@@ -2973,11 +2987,15 @@ html:not([data-theme='lg']) .settings-page--active {
   100% { transform: translateX(100%); }
 }
 
-/* Long content lists (mods/shaders/packs): skip layout/paint for off-screen
-   rows so scrolling hundreds of items stays smooth in the WebView. */
-.content-list-row {
+/* Long content lists (mods/shaders/packs): the manager table is the only list
+   with a fixed row height and hundreds of rows, so it is the only one that can
+   use `content-visibility` safely. The catalog/confirm cards are variable
+   height: skipping them collapsed their flex layout to min-content (18px) and
+   every revealed card jumped to its real ~71px, re-laying out the list and
+   moving the scrollbar. Those views render their (incrementally loaded) rows
+   normally instead. */
+.content-list-row--table {
   content-visibility: auto;
-  contain-intrinsic-size: auto 40px;
 }
 
 /* ============================
@@ -5914,6 +5932,12 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
    values the inline styles used to set. */
 .content-list-row--table {
   background: transparent;
+  /* A manager row is 36px of content box + 1px separator; its 4px vertical
+     padding and border sit outside `contain-intrinsic-size`. The old generic
+     40px estimate made every skipped row 49px tall, so revealing one re-laid
+     out the whole list and the scrollbar jumped while scrolling. 28px is the
+     exact content-box height: skipped and rendered rows both occupy 37px. */
+  contain-intrinsic-size: auto 28px;
 }
 
 .content-list-row--alt {
@@ -6478,4 +6502,442 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
 .loader-version-item__badge--current {
   color: var(--primary);
   font-weight: 600;
+}
+
+/* ============================
+   Mod list export dialog
+   ============================ */
+.mod-export {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mod-export__label {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.mod-export__format-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.mod-export__extension-field {
+  flex: 1;
+  min-width: 220px;
+}
+
+.mod-export__section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mod-export__section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mod-export__section-head .mod-export__label {
+  margin-bottom: 0;
+}
+
+.mod-export__format-field {
+  width: 200px;
+  max-width: 100%;
+}
+
+.mod-export__format {
+  width: 100%;
+}
+
+.mod-export__options-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+.mod-export__column {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.mod-export__checks {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-top: 1px;
+}
+
+.mod-export__check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  user-select: none;
+}
+
+.mod-export__check:hover {
+  color: var(--text-primary);
+}
+
+.mod-export__check input[type='checkbox'] {
+  appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  border: 1.5px solid var(--surface-border);
+  border-radius: 4px;
+  background: var(--surface-glass);
+  cursor: pointer;
+  transition: background-color 150ms ease-out, border-color 150ms ease-out;
+}
+
+.mod-export__check input[type='checkbox']:checked {
+  border-color: var(--primary);
+  background: var(--primary);
+}
+
+.mod-export__check input[type='checkbox']:checked::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid #ffffff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+
+.mod-export__check input[type='checkbox']:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.mod-export__vars {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.mod-export__var {
+  padding: 3px 9px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  background: var(--surface-glass);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: background-color 160ms ease-out, color 160ms ease-out,
+    border-color 160ms ease-out;
+}
+
+.mod-export__var:hover {
+  background: var(--surface-glass-hover);
+  border-color: var(--primary);
+  color: var(--text-primary);
+}
+
+.mod-export__template {
+  width: 100%;
+  height: 100px;
+  min-height: 90px;
+  padding: 8px 10px;
+  resize: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.mod-export__ext-compact {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mod-export__ext {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: 84px;
+}
+
+.mod-export__ext > span {
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
+.mod-export__ext .input {
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+.mod-export__ext-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.mod-export__ext-preset {
+  padding: 3px 8px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background-color 160ms ease-out, color 160ms ease-out,
+    border-color 160ms ease-out;
+}
+
+.mod-export__ext-preset:hover {
+  background: var(--surface-glass-hover);
+  color: var(--text-primary);
+}
+
+.mod-export__ext-preset--active {
+  border-color: var(--primary);
+  background: var(--primary-dim);
+  color: var(--text-primary);
+}
+
+.mod-export__extension-badge {
+  margin-left: 6px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-weight: 400;
+}
+
+.mod-export__preview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mod-export__preview--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.mod-export__pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.mod-export__source {
+  width: 100%;
+  height: min(21vh, 170px);
+  min-height: 145px;
+  padding: 8px 10px;
+  resize: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  tab-size: 2;
+}
+
+/* The source preview and the custom-template editor are the only elements in
+   the launcher that can scroll both ways. The scrollbar corner kept the
+   browser default white square there; fixing it locally avoids changing
+   scrollbars used by every other page. This is the corner of the scrollbar,
+   not a textarea resize grip: resize is already none. */
+.mod-export__source::-webkit-scrollbar-corner,
+.mod-export__template::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.mod-export__frame {
+  width: 100%;
+  height: min(21vh, 170px);
+  min-height: 145px;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+}
+
+.mod-export__hint {
+  color: var(--text-tertiary);
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
+}
+
+.mod-export__hint--error {
+  color: var(--color-danger);
+}
+
+.mod-export__error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-md);
+  background: var(--danger-dim, rgba(244, 67, 54, 0.12));
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
+}
+
+.mod-export__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 18px;
+  border: 1px dashed var(--surface-border);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.mod-export__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  width: 100%;
+}
+
+.mod-export__footer-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-left: auto;
+}
+
+.mod-export__footer .btn {
+  flex-shrink: 0;
+}
+
+@media (max-width: 620px) {
+  .mod-export__format-row {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .mod-export__options-row {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-export__preview {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-export__footer {
+    flex-wrap: wrap;
+  }
+}
+
+/* Compact export sheet: Prism-like footprint without stretching to the whole
+   window. The dialog keeps its content height when shorter and scrolls inside
+   `.modal__scroll` on small windows. */
+.modal:has(.mod-export) {
+  width: min(90vw, 660px);
+  max-height: min(550px, calc(100vh - 48px));
+}
+
+.modal:has(.mod-export) .modal__header {
+  padding: 12px 16px 8px;
+}
+
+.modal:has(.mod-export) .modal__body {
+  padding: 10px 16px;
+}
+
+.modal:has(.mod-export) .modal__footer {
+  padding: 8px 16px;
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: var(--bg-secondary);
+}
+
+.modal:has(.mod-export) .modal__title {
+  font-size: var(--font-size-lg);
+}
+
+[data-theme='lg'] .modal:has(.mod-export) .modal__footer {
+  background: var(--lg-fill);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+}
+
+/* ============================
+   Reduced interface effects
+   ============================ */
+
+/* The switch is intentionally limited to the normal themes' optional chrome:
+   Liquid Glass keeps its own blur, transparency, depth and wallpaper because
+   those are part of the selected appearance, not an optimization toggle. */
+html[data-reduce-effects='on']:not([data-theme='lg']) {
+  --glow-primary: 0 0 0 rgba(0, 0, 0, 0);
+  --glow-primary-intense: 0 0 0 rgba(0, 0, 0, 0);
+  --glow-secondary: 0 0 0 rgba(0, 0, 0, 0);
+  --glow-accent: 0 0 0 rgba(0, 0, 0, 0);
+  --shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-xl: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --slider-shadow: none;
+  --slider-shadow-hover: none;
+}
+
+/* State feedback stays, but it changes instantly. Hover/active/focus visuals
+   are not removed; only the time spent animating them. */
+html[data-reduce-effects='on'] *,
+html[data-reduce-effects='on'] *::before,
+html[data-reduce-effects='on'] *::after {
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+}
+
+/* Decorative, non-functional animation only. Loading spinners, the snake
+   spinner, progress bars and install status indicators stay untouched. */
+html[data-reduce-effects='on'] :is(
+  .animate-slide-up,
+  .animate-pulse,
+  .animate-glow,
+  .animate-content-reveal,
+  .modal-overlay,
+  .settings-page--active,
+  .toast,
+  .skeleton,
+  .ctx-menu,
+  .custom-select__list,
+  .game-logs-picker-panel,
+  .install-overlay,
+  .game-logs-picker-dot--live,
+  .btn--loading > svg:not(.icon-spin)
+) {
+  animation: none !important;
+}
+
+html[data-reduce-effects='on'] .icon-shine::after,
+html[data-reduce-effects='on'] .progress-fill::after {
+  animation: none !important;
+}
+
+html[data-reduce-effects='on'] .ping-bars--checking .ping-bars__bar {
+  animation: none !important;
+  background-color: var(--primary);
+  opacity: 0.6;
 }

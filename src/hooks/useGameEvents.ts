@@ -105,12 +105,16 @@ export const useEventStore = create<EventState>((set) => ({
 }));
 
 export function useGameEvents() {
-  const {
-    applyInstallProgress,
-    clearInstall,
-    setRunningGameId,
-    seedRunningGameIdsIfCurrent,
-  } = useEventStore();
+  // Select the (stable) actions instead of subscribing to the whole store:
+  // install progress and running-state events arrive many times per second
+  // during an install, and a whole-store subscription re-rendered App (and
+  // therefore the page tree) for every one of them.
+  const applyInstallProgress = useEventStore((s) => s.applyInstallProgress);
+  const clearInstall = useEventStore((s) => s.clearInstall);
+  const setRunningGameId = useEventStore((s) => s.setRunningGameId);
+  const seedRunningGameIdsIfCurrent = useEventStore(
+    (s) => s.seedRunningGameIdsIfCurrent,
+  );
   const addLog = useLogStore((s) => s.addLog);
   const setWindowFocused = useFocusStore((s) => s.setWindowFocused);
   const setMinimized = useFocusStore((s) => s.setMinimized);

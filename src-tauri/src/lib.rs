@@ -278,6 +278,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(
@@ -386,6 +387,7 @@ pub fn run() {
             commands::instances::cmd_duplicate_instance,
             commands::instances::cmd_import_prism_instance,
             commands::instances::cmd_export_instance,
+            commands::export::cmd_save_export_file,
             commands::instances::cmd_probe_modpack,
             commands::instances::cmd_import_modpack,
             commands::instances::cmd_set_instance_icon,

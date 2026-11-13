@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { Package, FolderOpen, Download, Search, Check, Trash2, ArrowRight, AlertTriangle, X, ChevronUp, ChevronDown } from 'lucide-react';
+import { Package, FolderOpen, Download, Search, Check, Trash2, ArrowRight, AlertTriangle, X, ChevronUp, ChevronDown, List } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { Modal } from '../ui/Modal';
@@ -11,6 +11,7 @@ import { Tooltip } from '../ui/Tooltip';
 import { addToast } from '../ui/Toast';
 import { logUiMessage } from '../../lib/uiLog';
 import { ContentBrowser, type ContentType } from './ContentBrowser';
+import { ModListExportDialog } from './ModListExportDialog';
 import { useFocusStore } from '../../stores/focusStore';
 import { useEventStore } from '../../hooks/useGameEvents';
 import { isInstanceRunning } from '../../lib/runningGames';
@@ -105,6 +106,12 @@ interface ContentItem {
   slug?: string | null;
   slug_verified?: boolean;
   project_id?: string;
+  /** Jar-declared internal mod id (independent of the provider project id). */
+  mod_id?: string;
+  /** Jar-declared authors, used by the mod list export. */
+  authors?: string[];
+  /** Jar-declared homepage; a fallback when there is no provider project id. */
+  homepage?: string;
 }
 
 /** Match the backend's name ordering for disabled entries. */
@@ -139,7 +146,6 @@ interface ContentRowProps {
   item: ContentItem;
   idx: number;
   isSelected: boolean;
-  iconSrc: string | null;
   iconsResolving: boolean;
   /** Normalized compatibility state; only `incompatible`/`unverified` show a badge. */
   compatState?: CompatState;
@@ -147,6 +153,34 @@ interface ContentRowProps {
   onRowClick: (filename: string, e: React.MouseEvent) => void;
   onContext: (e: React.MouseEvent, filename: string) => void;
   onToggle: (item: ContentItem) => void;
+}
+
+/**
+ * Row-local icon selection from the session cache.
+ *
+ * Each row subscribes to the cache itself and selects only its own key, so an
+ * icon arriving re-renders just that row. Selecting the whole cache in the
+ * manager re-rendered the manager and reconciled every row once per icon
+ * (hundreds of times while a large instance warms up).
+ */
+function useContentItemIcon(item: ContentItem): string | null {
+  return useIconCacheStore((s) => {
+    if (item.icon && item.icon.startsWith('data:')) return item.icon;
+    if (item.project_id) {
+      const hit =
+        s.cache.get(`modrinth:${item.project_id}`) ||
+        s.cache.get(`curseforge:${item.project_id}`);
+      if (hit) return hit;
+    }
+    const hit = s.cache.get(`file:${item.filename}`);
+    if (hit) return hit;
+    // Remote CDN icon: hand the URL to RemoteIcon; useRemoteImage fetches it
+    // through cmd_fetch_icon_url and shows a shine until it settles.
+    if (item.icon && !item.icon.startsWith('data:') && item.icon.includes('/')) {
+      return item.icon;
+    }
+    return null;
+  });
 }
 
 /// Compatibility mark shared by the table row and the card row: only
@@ -182,11 +216,12 @@ function CompatBadge({ state, target }: { state?: CompatState; target: string })
 /// parent state change (selection, search, icon cache updates) caused visible
 /// UI jank; with memo only the actually-changed rows re-render.
 const ContentRow = memo(function ContentRow({
-  item, idx, isSelected, iconSrc, iconsResolving, compatState,
+  item, idx, isSelected, iconsResolving, compatState,
   compatTarget,
   onRowClick, onContext, onToggle,
 }: ContentRowProps) {
   const t = useT();
+  const iconSrc = useContentItemIcon(item);
   const versionLabel = modVersionLabel(item.version, item.version_known, t('manager.version_unknown'));
   const loadersLabel = modLoadersLabel(item.loaders);
   return (
@@ -243,11 +278,12 @@ const ContentRow = memo(function ContentRow({
 /// single tall line (icon height rules the card), and the gaps between cards
 /// stay at 4px so even long lists don't stretch too far.
 const ContentCardRow = memo(function ContentCardRow({
-  item, isSelected, iconSrc, iconsResolving, compatState,
+  item, isSelected, iconsResolving, compatState,
   compatTarget,
   onRowClick, onContext, onToggle,
 }: Omit<ContentRowProps, 'idx'>) {
   const t = useT();
+  const iconSrc = useContentItemIcon(item);
   const versionLabel = modVersionLabel(item.version, item.version_known, t('manager.version_unknown'));
   const loadersLabel = modLoadersLabel(item.loaders);
   return (
@@ -334,6 +370,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const checkingUpdates = updateCheck.running;
   const updates = updateCheck.updates;
   const [showBrowser, setShowBrowser] = useState(false);
+  const [showExport, setShowExport] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [importPrompts, setImportPrompts] = useState<LocalImportPrompt[]>([]);
   const [importBusy, setImportBusy] = useState(false);
@@ -360,9 +397,12 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   // Normal themes keep the table, so the flag alone never switches the view.
   const cardsView = useThemeStore((s) => s.liquidGlass) && useContentViewStore((s) => s.cards);
 
-  // Global icon cache (session memory only, like Prism: survives remounts,
-  // re-extracted from the archives after an app restart)
-  const { cache: iconCache, getIcon, setIcon } = useIconCacheStore();
+  // Session icon cache: read through stable store methods only. Subscribing to
+  // the whole store here re-rendered the manager (and reconciled every row)
+  // once per resolved icon - hundreds of times while a large mod list warms
+  // up. Rows subscribe to their own icon key instead; the parent never does.
+  const setIcon = useIconCacheStore((s) => s.setIcon);
+  const getIcon = useIconCacheStore((s) => s.getIcon);
   const projectNameCache = useRef<Map<string, string>>(new Map());
   const loadGen = useRef(0);
 
@@ -395,7 +435,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     // do a direct lookup. For others, search Modrinth by name to find the project.
     // Local pack.png is a fallback if Modrinth icon is missing.
     const projectType = contentType === 'resourcepack' ? 'resourcepack' : contentType === 'shader' ? 'shader' : 'mod';
-    const cache = iconCache;
+    const cache = useIconCacheStore.getState().cache;
 
     // Build per-pack plans: track which keys are settled and which need a fetch.
     type Plan = { filename: string; name: string; projectId: string | null; modrinthKey: string; localKey: string; hasModrinth: boolean; hasLocal: boolean; resolved: boolean; isCf: boolean };
@@ -511,7 +551,12 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           icon: m.icon,
           slug: m.slug,
           slug_verified: m.slug_verified,
-          project_id: m.slug_verified ? m.slug : undefined,
+          project_id: typeof m.project_id === 'string'
+            ? m.project_id
+            : (m.slug_verified ? m.slug : undefined),
+          mod_id: typeof m.mod_id === 'string' ? m.mod_id : undefined,
+          authors: Array.isArray(m.authors) ? m.authors : [],
+          homepage: typeof m.homepage === 'string' ? m.homepage : undefined,
         }));
         setItems(mapped);
         setHasLoaded(true);
@@ -531,7 +576,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           } catch { }
         })();
 
-        const cache = iconCache;
+        const cache = useIconCacheStore.getState().cache;
         const uncached = raw.filter((m) => {
           if (m.icon && m.icon.startsWith('data:')) return false;
           return !cache.get(`file:${m.filename}`);
@@ -903,6 +948,16 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         }
       } catch { }
       setItems((prev) => prev.map((it) => it.filename === item.filename ? { ...it, filename: newName, enabled: newEnabled } : it));
+      // A mod toggle renames `foo.jar` <-> `foo.jar.disabled`. Keep the
+      // selection attached to the renamed entry so actions (and the export
+      // count) continue to refer to the file the user selected.
+      setSelectedFilenames((prev) => {
+        if (!prev.has(item.filename)) return prev;
+        const next = new Set(prev);
+        next.delete(item.filename);
+        next.add(newName);
+        return next;
+      });
       const oldIconKey = `file:${item.filename}`;
       const cachedIcon = getIcon(oldIconKey);
       if (cachedIcon) {
@@ -1163,29 +1218,14 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     setConfirmCloseUpdates(false);
   };
 
-  const getItemIcon = (item: ContentItem): string | null => {
-    if (item.icon && item.icon.startsWith('data:')) return item.icon;
-    // Look up the persistent icon cache: prefer project_id key, fall back to filename
-    if (item.project_id) {
-      const v = getIcon(`modrinth:${item.project_id}`) || getIcon(`curseforge:${item.project_id}`);
-      if (v) return v;
-    }
-    const fileKey = `file:${item.filename}`;
-    const v2 = getIcon(fileKey);
-    if (v2) return v2;
-    // Remote CDN icon: hand the remote URL to RemoteIcon — useRemoteImage
-    // fetches through cmd_fetch_icon_url, shows a shine while in flight and
-    // a letter only after a failed fetch (session cooldown).
-    if (item.icon && !item.icon.startsWith('data:') && item.icon.includes('/')) {
-      return item.icon;
-    }
-    return null;
-  };
-
-  const filtered = useMemo(
-    () => items.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()) || p.filename.toLowerCase().includes(search.toLowerCase())),
-    [items, search]
-  );
+  const filtered = useMemo(() => {
+    const query = search.toLowerCase();
+    return items.filter(
+      (p) =>
+        p.name.toLowerCase().includes(query) ||
+        p.filename.toLowerCase().includes(query),
+    );
+  }, [items, search]);
 
   const handleRowClick = useCallback((filename: string, e: React.MouseEvent) => {
     if (e.ctrlKey || e.metaKey) {
@@ -1340,7 +1380,6 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
                   key={item.filename}
                   item={item}
                   isSelected={selectedFilenames.has(item.filename)}
-                  iconSrc={getItemIcon(item)}
                   iconsResolving={iconsResolving}
                   compatState={contentType === 'mod' ? compatibility[item.filename] : undefined}
                   compatTarget={compatTarget}
@@ -1357,7 +1396,6 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
                 item={item}
                 idx={idx}
                 isSelected={selectedFilenames.has(item.filename)}
-                iconSrc={getItemIcon(item)}
                 iconsResolving={iconsResolving}
                 compatState={contentType === 'mod' ? compatibility[item.filename] : undefined}
                 compatTarget={compatTarget}
@@ -1468,6 +1506,11 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         )}
         <div style={{ flex: 1 }} />
         <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
+        {contentType === 'mod' && (
+          <Button size="sm" variant="ghost" onClick={() => setShowExport(true)} style={{ width: '100%', whiteSpace: 'normal' }}>
+            <List size={14} style={{ flexShrink: 0 }} /> {t('mod_export.button')}
+          </Button>
+        )}
         <Button size="sm" variant="ghost" onClick={onOpenFolder} style={{ width: '100%' }}>
           <FolderOpen size={14} /> {t('common.open_folder')}
         </Button>
@@ -1517,6 +1560,18 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         </div>
         );
       })()}
+
+      {/* Mod list export — its own dialog, opened from the actions panel.
+          The selection is read at open time and is never persisted. */}
+      {contentType === 'mod' && (
+        <ModListExportDialog
+          open={showExport}
+          onClose={() => setShowExport(false)}
+          instanceName={instanceName}
+          items={items}
+          loading={loading}
+        />
+      )}
 
       {/* Update Dialog — shared modal (lg: scrim + glass sheet). Closing by
           overlay/Escape behaves like the old header ✕; the footer cancel

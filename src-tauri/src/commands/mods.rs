@@ -792,6 +792,19 @@ pub struct ModMetadata {
     pub name: String,
     #[serde(default)]
     pub version: String,
+    /// Internal mod id declared by the JAR descriptor (`fabric.mod.json` id,
+    /// `mods.toml` modId, `mcmod.info` modid). This is NOT the Modrinth /
+    /// CurseForge project id and must not be confused with `project_id`.
+    #[serde(default)]
+    pub mod_id: Option<String>,
+    /// Author names declared by the JAR descriptor. Cached alongside the rest
+    /// of the parsed metadata so the mod list export never rescans archives.
+    #[serde(default)]
+    pub authors: Vec<String>,
+    /// Homepage declared by the JAR descriptor, when it is a plain http(s)
+    /// URL. Used by the export only when no provider project id is available.
+    #[serde(default)]
+    pub homepage: Option<String>,
     #[serde(default)]
     pub provider: String,
     /// Mod loaders advertised by the JAR descriptors (canonical: Fabric,
@@ -2872,6 +2885,9 @@ pub async fn cmd_list_instance_mods(
                     pw.filter(|p| !p.project_id.is_empty())
                         .map(|p| p.project_id.clone())
                 });
+                let mod_id = meta.slug.clone();
+                let authors = meta.authors.clone();
+                let homepage = meta.homepage.clone();
                 let (slug, slug_verified) = project_id
                     .as_ref()
                     .map(|s| (Some(s.clone()), sidecar_project_id.is_some()))
@@ -2903,6 +2919,9 @@ pub async fn cmd_list_instance_mods(
                     filename,
                     name,
                     version,
+                    mod_id,
+                    authors,
+                    homepage,
                     provider,
                     loaders: meta.loaders.clone(),
                     version_known,
@@ -3148,7 +3167,7 @@ static META_CACHE_FILE: OnceLock<PathBuf> = OnceLock::new();
 /// Bump when jar parsing changes in a way that alters stored values:
 /// persisted entries are keyed only by path+mtime+size and would otherwise
 /// survive a parser change with stale results.
-const META_CACHE_VERSION: u32 = 7;
+const META_CACHE_VERSION: u32 = 8;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MetaCacheFile {
@@ -3589,6 +3608,9 @@ fn build_mod_metadata(
     } else {
         String::new()
     };
+    let mod_id = meta.slug.clone();
+    let authors = meta.authors.clone();
+    let homepage = meta.homepage.clone();
     let (slug, slug_verified) = project_id
         .as_ref()
         .map(|s| (Some(s.clone()), sidecar.project_id.is_some()))
@@ -3633,6 +3655,9 @@ fn build_mod_metadata(
         filename: filename.clone(),
         name,
         version,
+        mod_id,
+        authors,
+        homepage,
         provider,
         loaders: meta.loaders.clone(),
         version_known,
@@ -3778,6 +3803,8 @@ pub(crate) struct ModMetaResult {
     pub(crate) version_by_loader: std::collections::HashMap<String, String>,
     pub(crate) icon: Option<String>,
     pub(crate) slug: Option<String>,
+    pub(crate) authors: Vec<String>,
+    pub(crate) homepage: Option<String>,
     /// True when at least one supported mod descriptor was found. A JAR with
     /// no descriptor is a local/unknown drop, not an arbitrary-loader mod.
     pub(crate) has_descriptor: bool,
@@ -3882,6 +3909,8 @@ struct ModDescriptor {
     version: String,
     icon: Option<String>,
     slug: Option<String>,
+    authors: Vec<String>,
+    homepage: Option<String>,
     /// True when `name` came from a human-readable display name rather than a
     /// fallback to the mod id. Used to pick the combined display name.
     name_from_display: bool,
@@ -3913,6 +3942,8 @@ fn fallback_meta_from_filename(path: &std::path::Path) -> ModMetaResult {
         version_by_loader: std::collections::HashMap::new(),
         icon: None,
         slug: None,
+        authors: Vec::new(),
+        homepage: None,
         // A JAR without any mod descriptor is a local/unknown drop. It stays
         // visible under every mod loader (the historical behaviour), but no
         // loader is claimed for it.
@@ -4130,6 +4161,12 @@ fn parse_fabric_descriptor<R: std::io::Read + std::io::Seek>(
             .trim_start_matches("assets/")
             .to_string()
     });
+    let authors = json_author_names(json.get("authors"));
+    let homepage = json
+        .get("contact")
+        .and_then(|contact| contact.get("homepage"))
+        .and_then(|value| value.as_str())
+        .and_then(sanitize_homepage);
 
     Some(ModDescriptor {
         loader: "Fabric",
@@ -4137,6 +4174,8 @@ fn parse_fabric_descriptor<R: std::io::Read + std::io::Seek>(
         version,
         icon,
         slug,
+        authors,
+        homepage,
         name_from_display: display.is_some(),
     })
 }
@@ -4153,6 +4192,8 @@ fn parse_toml_descriptor<R: std::io::Read + std::io::Seek>(
     let mut display = None;
     let mut version = None;
     let mut logo = None;
+    let mut authors: Vec<String> = Vec::new();
+    let mut homepage = None;
 
     if let Ok(toml_val) = contents.parse::<toml::Table>() {
         if let Some(mods_arr) = toml_val.get("mods").and_then(|value| value.as_array()) {
@@ -4193,8 +4234,18 @@ fn parse_toml_descriptor<R: std::io::Read + std::io::Seek>(
                     .get("logoFile")
                     .and_then(|value| value.as_str())
                     .map(str::to_string);
+                authors = toml_author_names(picked.get("authors"));
+                homepage = toml_homepage(picked.get("displayURL"));
                 mod_id = Some(id);
             }
+        }
+        // Forge/NeoForge allow both fields either at the root or inside
+        // `[[mods]]`; the root value is the documented location.
+        if authors.is_empty() {
+            authors = toml_author_names(toml_val.get("authors"));
+        }
+        if homepage.is_none() {
+            homepage = toml_homepage(toml_val.get("displayURL"));
         }
     }
 
@@ -4206,6 +4257,19 @@ fn parse_toml_descriptor<R: std::io::Read + std::io::Seek>(
             .filter(|name| usable_mod_name(name, mod_id.as_deref()).is_some());
         version = extract_toml_field(&contents, "version");
         logo = extract_toml_field(&contents, "logoFile");
+        if authors.is_empty() {
+            authors = extract_toml_field(&contents, "authors")
+                .map(|raw| split_author_list(&raw))
+                .or_else(|| {
+                    extract_toml_root_field(&contents, "authors").map(|raw| split_author_list(&raw))
+                })
+                .unwrap_or_default();
+        }
+        if homepage.is_none() {
+            homepage = extract_toml_field(&contents, "displayURL")
+                .or_else(|| extract_toml_root_field(&contents, "displayURL"))
+                .and_then(|raw| sanitize_homepage(&raw));
+        }
     }
     if mod_id.is_none() && display.is_none() && version.is_none() {
         return None;
@@ -4224,6 +4288,8 @@ fn parse_toml_descriptor<R: std::io::Read + std::io::Seek>(
         version,
         icon: logo,
         slug: Some(mod_id),
+        authors,
+        homepage,
         name_from_display: display.is_some(),
     })
 }
@@ -4272,12 +4338,27 @@ fn parse_legacy_forge_descriptor<R: std::io::Read + std::io::Seek>(
         let name = display.clone().unwrap_or_else(|| mod_id.clone());
         let version = picked["version"].as_str().unwrap_or("").to_string();
         let logo = picked["logoFile"].as_str().map(str::to_string);
+        let mut authors = json_author_names(picked.get("authorList"));
+        if authors.is_empty() {
+            authors = json_author_names(picked.get("authors"));
+        }
+        if authors.is_empty() {
+            if let Some(author) = picked["authors"]
+                .as_str()
+                .or_else(|| picked["author"].as_str())
+            {
+                authors = split_author_list(author);
+            }
+        }
+        let homepage = picked["url"].as_str().and_then(sanitize_homepage);
         return Some(ModDescriptor {
             loader: "Forge",
             name: instances::strip_minecraft_color_codes(&name),
             version,
             icon: logo,
             slug: Some(mod_id),
+            authors,
+            homepage,
             name_from_display: display.is_some(),
         });
     }
@@ -4328,6 +4409,15 @@ fn combine_descriptors(
     let slug = descriptors
         .iter()
         .find_map(|descriptor| descriptor.slug.clone());
+    let homepage = descriptors
+        .iter()
+        .find_map(|descriptor| descriptor.homepage.clone());
+    let mut authors: Vec<String> = Vec::new();
+    for descriptor in &descriptors {
+        for author in &descriptor.authors {
+            push_unique_author(&mut authors, author);
+        }
+    }
 
     let mut loaders: Vec<String> = Vec::new();
     let mut version_by_loader = std::collections::HashMap::new();
@@ -4345,8 +4435,125 @@ fn combine_descriptors(
         version_by_loader,
         icon,
         slug,
+        authors,
+        homepage,
         has_descriptor: true,
     })
+}
+
+fn push_unique_author(authors: &mut Vec<String>, raw: &str) {
+    const MAX_AUTHORS: usize = 50;
+    const MAX_AUTHOR_LEN: usize = 200;
+    if authors.len() >= MAX_AUTHORS {
+        return;
+    }
+    let stripped = instances::strip_minecraft_color_codes(raw.trim());
+    let name = stripped.trim();
+    if name.is_empty() || name.len() > MAX_AUTHOR_LEN {
+        return;
+    }
+    if authors
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(name))
+    {
+        return;
+    }
+    authors.push(name.to_string());
+}
+
+/// `authorList` is an array of plain strings; some legacy descriptors also
+/// use objects with a `name` field. Both are normalized to the same list.
+fn json_author_names(value: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(items) = value.and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    let mut authors = Vec::new();
+    for item in items {
+        let name = item
+            .as_str()
+            .or_else(|| item.get("name").and_then(|name| name.as_str()));
+        if let Some(name) = name {
+            push_unique_author(&mut authors, name);
+        }
+    }
+    authors
+}
+
+/// Forge/NeoForge declare authors as a comma-separated string; Fabric uses an
+/// array. Both end up as separate names for the export.
+fn split_author_list(raw: &str) -> Vec<String> {
+    let mut authors = Vec::new();
+    for part in raw.split(',') {
+        push_unique_author(&mut authors, part);
+    }
+    authors
+}
+
+fn toml_author_names(value: Option<&toml::Value>) -> Vec<String> {
+    let mut authors = Vec::new();
+    match value {
+        Some(toml::Value::String(raw)) => authors = split_author_list(raw),
+        Some(toml::Value::Array(items)) => {
+            for item in items {
+                if let Some(raw) = item.as_str() {
+                    for author in split_author_list(raw) {
+                        push_unique_author(&mut authors, &author);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    authors
+}
+
+fn toml_homepage(value: Option<&toml::Value>) -> Option<String> {
+    value
+        .and_then(|value| value.as_str())
+        .and_then(sanitize_homepage)
+}
+
+/// Only plain http(s) URLs from the JAR metadata are accepted. The export
+/// must never invent a link or pass through a `javascript:`/`file:` URL.
+fn sanitize_homepage(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty()
+        || value.len() > 2048
+        || value.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))?;
+    if rest.trim_start_matches('/').is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// Root-level TOML keys (before the first table). Forge's `authors` and
+/// `displayURL` live there; `extract_toml_field` only scans `[[mods]]`.
+fn extract_toml_root_field(content: &str, field: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        let Some((key, raw)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != field {
+            continue;
+        }
+        let raw = strip_toml_comment(raw);
+        let val = raw.trim().trim_matches('"').trim_matches('\'');
+        if !val.is_empty() {
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 fn strip_toml_comment(val: &str) -> &str {
@@ -4793,6 +5000,9 @@ mod meta_cache_file_tests {
             filename: "sodium.jar".into(),
             name: "Sodium".into(),
             version: "0.6.0".into(),
+            mod_id: Some("sodium".into()),
+            authors: vec!["jellysquid3".into()],
+            homepage: Some("https://modrinth.com/mod/sodium".into()),
             provider: "Modrinth".into(),
             loaders: vec!["Fabric".into()],
             version_known: true,
@@ -4861,6 +5071,132 @@ version="1.10.53"
         let meta = read_mod_meta_from_jar_pub(&jar);
         assert_eq!(meta.name, "spark");
         assert_eq!(meta.slug.as_deref(), Some("spark"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fabric_metadata_exposes_mod_id_authors_and_homepage() {
+        let dir = test_dir("fabric-export-fields");
+        let jar = dir.join("coolmod.jar");
+        write_jar(
+            &jar,
+            &[(
+                "fabric.mod.json",
+                r#"{
+                    "id": "coolmod",
+                    "name": "Cool Mod",
+                    "version": "1.2.3",
+                    "authors": ["Alice", {"name": "Bob"}, "alice"],
+                    "contact": {"homepage": "https://example.com/coolmod"}
+                }"#,
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.slug.as_deref(), Some("coolmod"));
+        assert_eq!(meta.authors, vec!["Alice", "Bob"]);
+        assert_eq!(
+            meta.homepage.as_deref(),
+            Some("https://example.com/coolmod")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forge_metadata_reads_root_authors_and_display_url() {
+        let dir = test_dir("forge-export-fields");
+        let jar = dir.join("forge_mod.jar");
+        write_jar(
+            &jar,
+            &[(
+                "META-INF/mods.toml",
+                r#"
+modLoader="javafml"
+loaderVersion="[47,)"
+authors="Alice, Bob"
+displayURL="https://example.com/forge"
+
+[[mods]]
+modId="forge_mod"
+displayName="Forge Mod"
+version="2.0"
+"#,
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.slug.as_deref(), Some("forge_mod"));
+        assert_eq!(meta.authors, vec!["Alice", "Bob"]);
+        assert_eq!(meta.homepage.as_deref(), Some("https://example.com/forge"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_metadata_reads_author_list_and_url() {
+        let dir = test_dir("legacy-export-fields");
+        let jar = dir.join("legacy.jar");
+        write_jar(
+            &jar,
+            &[(
+                "mcmod.info",
+                r#"[{
+                    "modid": "legacy_mod",
+                    "name": "Legacy Mod",
+                    "version": "1.0",
+                    "authorList": ["Alice", "Bob"],
+                    "url": "https://example.com/legacy"
+                }]"#,
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.slug.as_deref(), Some("legacy_mod"));
+        assert_eq!(meta.authors, vec!["Alice", "Bob"]);
+        assert_eq!(meta.homepage.as_deref(), Some("https://example.com/legacy"));
+        assert!(sanitize_homepage("javascript:alert(1)").is_none());
+        assert!(sanitize_homepage("file:///C:/secret.txt").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn built_mod_metadata_carries_the_export_fields() {
+        let dir = test_dir("built-export-fields");
+        let jar = dir.join("coolmod.jar");
+        write_jar(
+            &jar,
+            &[(
+                "fabric.mod.json",
+                r#"{
+                    "id": "coolmod",
+                    "name": "Cool Mod",
+                    "version": "1.2.3",
+                    "authors": ["Alice", {"name": "Bob"}],
+                    "contact": {"homepage": "https://example.com/coolmod"}
+                }"#,
+            )],
+        );
+        let size = std::fs::metadata(&jar).unwrap().len();
+        let entry = ModFileEntry {
+            path: jar.clone(),
+            filename: "coolmod.jar".into(),
+            enabled: false,
+            mtime: UNIX_EPOCH,
+            size,
+        };
+        let meta = build_mod_metadata(
+            &dir,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            Some("1.21.1"),
+            Some("fabric"),
+            &entry,
+        );
+        assert_eq!(meta.name, "Cool Mod");
+        assert_eq!(meta.mod_id.as_deref(), Some("coolmod"));
+        assert_eq!(meta.authors, vec!["Alice", "Bob"]);
+        assert_eq!(
+            meta.homepage.as_deref(),
+            Some("https://example.com/coolmod")
+        );
+        assert!(!meta.enabled);
+        assert_eq!(meta.provider, "Local");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
