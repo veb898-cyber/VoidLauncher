@@ -31,6 +31,22 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # A tag that disagrees with the project version ships updater metadata
+      # for a version the binary does not report (and the updater then loops).
+      - name: Verify tag matches project version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NPM_VERSION=$(node -p "require('./package.json').version")
+          TAURI_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          CARGO_VERSION=$(awk '/^\[package\]/{f=1} f && /^version *=/{gsub(/[" ]/,"",$3); print $3; exit}' src-tauri/Cargo.toml)
+          echo "tag=$VERSION package.json=$NPM_VERSION tauri.conf.json=$TAURI_VERSION Cargo.toml=$CARGO_VERSION"
+          if [ "$VERSION" != "$NPM_VERSION" ] || [ "$VERSION" != "$TAURI_VERSION" ] || [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::The release tag does not match the project version. Bump all version files first."
+            exit 1
+          fi
+
       # Build the installer. We deliberately do NOT pass
       # `includeUpdaterJson: true` here: when that step's internal signing
       # fails (wrong TAURI_SIGNING_PRIVATE_KEY secret, etc.) tauri-action
@@ -195,26 +211,42 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # The previous step (Sign installer and generate latest.json)
-          # already wrote a freshly built, conflict-free latest.json into
-          # the working tree. We just need to sanity-check, commit, and
-          # push.
+          # `actions/checkout` on a tag push leaves a detached HEAD at the tag
+          # commit. Committing there and pushing `HEAD:main` only works while
+          # main still equals the tag; any commit merged after the tag makes it
+          # a non-fast-forward. Keep the generated manifest, move onto the
+          # CURRENT main, and retry if another commit lands during the push.
+          MANIFEST="$RUNNER_TEMP/voidlauncher-latest.json"
+          cp latest.json "$MANIFEST"
 
-          # actions/checkout on a tag push leaves the runner in a
-          # detached HEAD at the tag commit, with no local `main`
-          # branch. We don't need to be on `main` for this step —
-          # the very last line already pushes HEAD (the new commit
-          # on top of the current tag) to origin:main.
-
-          # Sanity guard: if the file ever does contain a conflict
-          # marker (e.g. someone manually committed a half-resolved
-          # file), fail loudly instead of shipping a broken updater
-          # manifest.
-          if grep -E '^(<{7}|={7}|>{7})' latest.json >/dev/null 2>&1; then
+          # Sanity guard: if the file ever does contain a conflict marker
+          # (e.g. someone manually committed a half-resolved file), fail loudly
+          # instead of shipping a broken updater manifest.
+          if grep -E '^(<{7}|={7}|>{7})' "$MANIFEST" >/dev/null 2>&1; then
             echo "::error::latest.json contains merge conflict markers. Aborting."
             exit 1
           fi
 
-          git add latest.json
-          git commit -m "chore: update latest.json for ${{ github.ref_name }}" || echo "No changes to commit"
-          git push origin HEAD:main
+          attempt=1
+          while [ "$attempt" -le 5 ]; do
+            git fetch origin main
+            # Drop the generated file before switching branches (it would
+            # otherwise block the checkout if main has a different copy).
+            git restore latest.json 2>/dev/null || true
+            git checkout -B latest-json-update FETCH_HEAD
+            cp "$MANIFEST" latest.json
+            git add latest.json
+            if git diff --cached --quiet; then
+              echo "latest.json is already current on main; nothing to commit."
+              exit 0
+            fi
+            git commit -m "chore: update latest.json for ${{ github.ref_name }}"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "::warning::push raced with a newer main commit; retrying (attempt $attempt)"
+            attempt=$((attempt + 1))
+            sleep $((attempt * 3))
+          done
+          echo "::error::Could not update latest.json after 5 attempts."
+          exit 1

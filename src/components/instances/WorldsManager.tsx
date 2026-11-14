@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Globe, FolderOpen, Pencil, Copy, Trash2, Archive, RotateCcw } from 'lucide-react';
 import { Button } from '../ui/Button';
@@ -51,19 +51,35 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
   const [replaceConfirm, setReplaceConfirm] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [deleteBackup, setDeleteBackup] = useState<BackupInfo | null>(null);
+  // Latest-wins guards: a slow list request from the previous instance (or a
+  // previous Refresh) must not overwrite the current view.
+  const loadsSeq = useRef(0);
+  const backupsSeq = useRef(0);
 
   const loadSaves = useCallback(async () => {
+    const seq = ++loadsSeq.current;
     setLoading(true);
     try {
       const s = await invoke<SaveEntry[]>('cmd_list_saves', { instanceName });
+      if (seq !== loadsSeq.current) return;
       setSaves(s);
     } catch (e: any) {
-      addToast(t('worlds.load_error', { error: e.toString() }), 'error');
+      if (seq === loadsSeq.current) {
+        addToast(t('worlds.load_error', { error: e.toString() }), 'error');
+      }
+    } finally {
+      if (seq === loadsSeq.current) setLoading(false);
     }
-    setLoading(false);
   }, [instanceName]);
 
-  useEffect(() => { loadSaves(); }, [loadSaves]);
+  useEffect(() => {
+    loadSaves();
+    return () => {
+      // Invalidate everything still in flight on unmount/instance switch.
+      loadsSeq.current++;
+      backupsSeq.current++;
+    };
+  }, [loadSaves]);
 
   const formatDate = (ts: number | null) => {
     if (!ts) return '';
@@ -132,15 +148,20 @@ export function WorldsManager({ instanceName, onOpenFolder }: Props) {
   };
 
   const loadBackups = useCallback(async (worldName: string) => {
+    const seq = ++backupsSeq.current;
     setBackupsLoading(true);
     try {
       const b = await invoke<BackupInfo[]>('cmd_list_world_backups', { instanceName, worldName });
+      if (seq !== backupsSeq.current) return;
       setBackups(b);
       setSelectedBackup(b[0] ?? null);
     } catch (e: any) {
-      addToast(t('worlds.action_error', { error: e.toString() }), 'error');
+      if (seq === backupsSeq.current) {
+        addToast(t('worlds.action_error', { error: e.toString() }), 'error');
+      }
+    } finally {
+      if (seq === backupsSeq.current) setBackupsLoading(false);
     }
-    setBackupsLoading(false);
   }, [instanceName]);
 
   const openRestore = (save: SaveEntry) => {

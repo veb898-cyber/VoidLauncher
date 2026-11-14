@@ -5361,6 +5361,7 @@ dependencies = [
  "notify",
  "notify-debouncer-mini",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "sha1",

@@ -93,7 +93,9 @@ export function LoaderVersionModal({
   useEffect(() => {
     if (!open) return;
     let unlisten: (() => void) | null = null;
+    let disposed = false;
     listen<{ stage: string; message: string }>('loader-install-progress', (event) => {
+      if (disposed) return;
       const { stage: s, message: msg } = event.payload;
       setMessage(msg);
       if (s === 'done') setStage('done');
@@ -101,8 +103,15 @@ export function LoaderVersionModal({
         setStage('error');
         setError(msg);
       }
-    }).then((unlistenFn) => { unlisten = unlistenFn; });
-    return () => { unlisten?.(); };
+    }).then((unlistenFn) => {
+      if (disposed) unlistenFn();
+      else unlisten = unlistenFn;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+      unlisten = null;
+    };
   }, [open]);
 
   const handleInstall = useCallback(async () => {

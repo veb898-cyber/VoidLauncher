@@ -17,20 +17,32 @@ const MAX_BANNER_DATA_BYTES: usize = 18 * 1024 * 1024;
 /// malicious frontend sends `..` or other escape characters that would
 /// otherwise be joined onto `instances_dir` and traverse the filesystem.
 pub(crate) fn validate_instance_name(name: &str) -> Result<(), String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
+    if name != name.trim() {
+        return Err("Instance name may not start or end with spaces.".to_string());
+    }
+    if name.is_empty() {
         return Err("Instance name is required.".to_string());
     }
-    if trimmed.chars().count() < 3 {
+    if name.chars().count() < 3 {
         return Err("Instance name is too short (min 3 characters).".to_string());
     }
-    if trimmed.chars().count() > 64 {
+    if name.chars().count() > 64 {
         return Err("Instance name is too long (max 64 characters).".to_string());
     }
-    if trimmed.starts_with('.') {
+    if name.starts_with('.') {
         return Err("Instance name may not start with a dot.".to_string());
     }
-    validate_safe_folder_name(trimmed, "Instance name")
+    instances::validate_instance_dir_name(name, "Instance name").map_err(|e| e.to_string())
+}
+
+/// Path-safety for an already existing instance name (`old_name`). Length and
+/// leading-dot rules belong to new names; the point here is to guarantee the
+/// joined path stays inside `instances_dir`.
+pub(crate) fn validate_existing_instance_name(name: &str) -> Result<(), String> {
+    if name != name.trim() {
+        return Err("Instance name may not start or end with spaces.".to_string());
+    }
+    instances::validate_instance_dir_name(name, "Instance name").map_err(|e| e.to_string())
 }
 
 /// Validates a raw folder name for path safety only (no length/leading-dot
@@ -40,43 +52,7 @@ pub(crate) fn validate_instance_name(name: &str) -> Result<(), String> {
 /// containing directory (traversal, separators, NUL) or from breaking on
 /// Windows (control chars, `<>:"|?*`, reserved device names).
 fn validate_safe_folder_name(trimmed: &str, what: &str) -> Result<(), String> {
-    if trimmed.contains("..")
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains('\0')
-    {
-        return Err(format!("{} contains invalid path characters.", what));
-    }
-    if trimmed == "." || trimmed == ".." {
-        return Err(format!("Invalid {}: '{}'.", what, trimmed));
-    }
-    // Reject Windows reserved device names (CON, PRN, AUX, NUL, COM1..9, LPT1..9)
-    let upper = trimmed.to_ascii_uppercase();
-    const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if RESERVED.contains(&upper.as_str()) {
-        return Err(format!("'{}' is a reserved name.", trimmed));
-    }
-    // Allow any printable Unicode character (including Cyrillic, CJK, emoji)
-    // — the folder can be called whatever the user wants. The only thing we
-    // block here are control characters and characters that would break path
-    // joining on any major platform.
-    for ch in trimmed.chars() {
-        if ch.is_control() {
-            return Err(format!(
-                "{} contains a control character (U+{:04X}).",
-                what, ch as u32
-            ));
-        }
-        // Reject the few characters that are special on Windows filenames
-        // even when escaped: < > : " | ? *
-        if matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
-            return Err(format!("{} contains an invalid character: {:?}", what, ch));
-        }
-    }
-    Ok(())
+    instances::validate_path_component(trimmed, what).map_err(|e| e.to_string())
 }
 
 /// Path-safety validation for free-form world/save folder names.
@@ -104,6 +80,10 @@ fn ensure_instance_not_running(state: &AppState, instance_name: &str) -> Result<
             ),
             crate::launch_state::LaunchPhase::Running => format!(
                 "Instance '{}' is currently running. Close the game first, then try again.",
+                instance_name
+            ),
+            crate::launch_state::LaunchPhase::Preparing => format!(
+                "Instance '{}' is still being installed or prepared. Wait for setup to finish, then try again.",
                 instance_name
             ),
         };
@@ -138,17 +118,18 @@ fn ensure_instance_not_running(state: &AppState, instance_name: &str) -> Result<
 #[tauri::command]
 pub async fn cmd_list_instances(
     state: State<'_, AppState>,
-) -> Result<Vec<instances::Instance>, String> {
+) -> Result<Vec<instances::InstanceSummary>, String> {
     let (instances_dir, data_dir) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         (config.instances_dir(), config.data_dir.clone())
     };
     tauri::async_runtime::spawn_blocking(move || {
-        let mut insts = instances::list_instances(&instances_dir).map_err(|e| e.to_string())?;
+        let mut insts =
+            instances::list_instance_summaries(&instances_dir).map_err(|e| e.to_string())?;
         let playtime_map = playtime::load_playtime(&data_dir);
         for inst in &mut insts {
-            if let Some(entry) = playtime_map.get(&inst.name) {
-                inst.play_time_seconds = entry.minutes * 60;
+            if let Some(entry) = playtime_map.get(&inst.instance.name) {
+                inst.instance.play_time_seconds = entry.minutes * 60;
             }
         }
         Ok(insts)
@@ -170,29 +151,33 @@ pub async fn cmd_create_instance(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        let loader = loader.unwrap_or(instances::LoaderType::Vanilla);
-        let instance = instances::Instance::new(
-            &name,
-            &mc_version,
-            loader.clone(),
-            if loader == instances::LoaderType::Vanilla {
-                None
-            } else {
-                loader_version
-            },
-        );
-        instances::create_instance(&instances_dir, &instance).map_err(|e| e.to_string())?;
-        Ok(instance)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let loader = loader.unwrap_or(instances::LoaderType::Vanilla);
+    let instance = instances::Instance::new(
+        &name,
+        &mc_version,
+        loader.clone(),
+        if loader == instances::LoaderType::Vanilla {
+            None
+        } else {
+            loader_version
+        },
+    );
+    // Creating an instance writes a handful of small files. Doing it in place
+    // lets the reservation hold the launch slot for the whole operation.
+    instances::create_instance(&instances_dir, &instance, &state.launches)
+        .map_err(|e| e.to_string())?;
+    Ok(instance)
 }
 
 #[tauri::command]
 pub async fn cmd_delete_instance(state: State<'_, AppState>, name: String) -> Result<(), String> {
     validate_instance_name(&name)?;
     ensure_instance_not_running(state.inner(), &name)?;
+    // The check above produces a clear message; this guard is the atomic
+    // reservation. A launch (or another mutation) that wins the race after the
+    // check makes `begin_edit` fail, so the directory is never removed from
+    // under a starting/running game.
+    let _guard = InstanceMutationGuard::acquire(state.inner(), &name)?;
     // A live content watcher holds handles inside the instance directory and
     // prevents Windows from removing it.
     stop_pack_watcher_for(state.inner(), &name)?;
@@ -236,6 +221,9 @@ pub async fn cmd_save_instance(
     old_name: Option<String>,
 ) -> Result<(), String> {
     validate_instance_name(&instance.name)?;
+    if let Some(old_name) = old_name.as_deref() {
+        validate_existing_instance_name(old_name)?;
+    }
 
     // A save can rename the directory, so treat it as a mutation of the
     // source instance. The guard rejects Starting/Running/Editing, which is
@@ -243,10 +231,14 @@ pub async fn cmd_save_instance(
     let guard_name = old_name.as_deref().unwrap_or(&instance.name);
     let _guard = InstanceMutationGuard::acquire(state.inner(), guard_name)?;
 
-    let instances_dir = {
+    let (instances_dir, max_memory_mb) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        config.instances_dir()
+        (config.instances_dir(), config.max_memory_mb)
     };
+    // Backend is the source of truth: never persist an impossible heap just
+    // because a hand-edited/corrupted JSON or a non-UI caller supplied one.
+    let mut instance = instance;
+    instance.memory_mb = instance.normalized_memory_mb(max_memory_mb);
 
     // Renaming moves the instance directory; stop the content watcher first
     // so Windows does not reject the move with "access denied".
@@ -277,7 +269,7 @@ pub async fn cmd_save_instance(
     }
 
     tauri::async_runtime::spawn_blocking(move || {
-        instances::save_instance(&instances_dir, &instance, old_name.as_deref())
+        instances::save_instance_existing(&instances_dir, &instance, old_name.as_deref())
             .map_err(|e| e.to_string())
     })
     .await
@@ -306,16 +298,13 @@ pub async fn cmd_duplicate_instance(
         screenshots: exclude_screenshots.unwrap_or(false),
         logs: exclude_logs.unwrap_or(false),
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        instances::duplicate_instance(&instances_dir, &name, &new_name, exclude)
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    instances::duplicate_instance(&instances_dir, &name, &new_name, exclude, &state.launches)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn cmd_import_prism_instance(
+    app: AppHandle,
     state: State<'_, AppState>,
     zip_path: String,
 ) -> Result<instances::Instance, String> {
@@ -326,15 +315,36 @@ pub async fn cmd_import_prism_instance(
     if zip.extension().is_none_or(|e| e != "zip") {
         return Err("File must be a .zip archive".to_string());
     }
-    let instances_dir = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        config.instances_dir()
+    let config = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.clone()
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        instances::import_prism_pack(&instances_dir, &zip_path).map_err(|e| e.to_string())
-    })
+    // Legacy IPC used to import the archive and immediately publish it as
+    // ready. Reuse the exact UI orchestration instead: import, prepare the
+    // loader/game/assets, verify, and only then retire the readiness marker.
+    let instance_name = instances::prism_pack_default_name(&zip_path).map_err(|e| e.to_string())?;
+    validate_instance_name(&instance_name)?;
+    let (outcome, mut reservation) = crate::import::import_modpack_reserved(
+        &config.instances_dir(),
+        &zip_path,
+        &instance_name,
+        &config.curseforge_api_key,
+        &config.libraries_dir(),
+        Some(&app),
+        &state.launches,
+    )
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    let outcome = crate::import::finish_import_for_launch(
+        Some(&app),
+        &config,
+        &instance_name,
+        outcome,
+        &mut reservation,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(outcome.instance)
 }
 
 #[tauri::command]
@@ -344,6 +354,10 @@ pub async fn cmd_export_instance(
     output_path: String,
 ) -> Result<(), String> {
     validate_instance_name(&name)?;
+    ensure_instance_not_running(state.inner(), &name)?;
+    // Export reads the whole tree; a concurrent rename/delete would produce a
+    // truncated or mixed archive.
+    let _guard = InstanceMutationGuard::acquire(state.inner(), &name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -382,30 +396,87 @@ pub async fn cmd_import_modpack(
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.clone()
     };
-    let outcome = crate::import::import_modpack(
+    let (outcome, mut reservation) = crate::import::import_modpack_reserved(
         &config.instances_dir(),
         &path,
         &instance_name,
         &config.curseforge_api_key,
         &config.libraries_dir(),
         Some(&app),
+        &state.launches,
     )
     .await
     .map_err(|e| e.to_string())?;
 
     // Download the loader profile, game files and assets right away, so the
-    // first launch does not have to fetch them while the player waits.
-    let mut outcome = outcome;
-    let prepare =
-        crate::import::prepare_instance_files(Some(&app), &config, &outcome.instance).await;
-    outcome.report.warnings.extend(prepare.warnings);
+    // first launch does not have to fetch them while the player waits. The
+    // import reservation is still held: a rename/delete/parallel import of the
+    // same name cannot touch the directory until preparation is finished, and
+    // the persistent marker keeps the instance unlaunchable after a crash.
+    let outcome = crate::import::finish_import_for_launch(
+        Some(&app),
+        &config,
+        &instance_name,
+        outcome,
+        &mut reservation,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let done = if outcome.report.warnings.is_empty() {
         "Import complete!"
     } else {
-        "Import complete — missing files will be downloaded on first launch."
+        "Import finished, but setup is incomplete. Open the instance to finish setup before launching."
     };
     crate::import::emit_progress(Some(&app), "done", 1, 1, done);
     Ok(outcome)
+}
+
+#[tauri::command]
+pub async fn cmd_finish_instance_setup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<(), String> {
+    validate_instance_name(&name)?;
+    let config = {
+        let c = state.config.lock().map_err(|e| e.to_string())?;
+        c.clone()
+    };
+    let instances_dir = config.instances_dir();
+    // Resuming is only valid for an operation that crashed *after* metadata
+    // was written. An interrupted import is rejected by `resume` and must be
+    // imported again.
+    let mut reservation = crate::import::InstanceReservation::resume(
+        &instances_dir,
+        &name,
+        &state.launches,
+        "repair",
+    )
+    .map_err(|e| e.to_string())?;
+    let instance = instances::get_instance(&instances_dir, &name).map_err(|e| e.to_string())?;
+    let prepare = crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
+    for warning in &prepare.warnings {
+        events::emit_log(&app, "warn", "launch", warning);
+    }
+    if !prepare.warnings.is_empty() {
+        // Keep the persistent pending marker: the instance is preserved, but
+        // it must not become launchable until the remaining files are ready.
+        return Err(format!(
+            "Setup for '{}' is still incomplete ({} issue(s)); retry when the network or disk \
+             problem is resolved.",
+            name,
+            prepare.warnings.len()
+        ));
+    }
+    crate::import::verify_instance_ready(&instances_dir, &name).map_err(|e| e.to_string())?;
+    reservation.commit().map_err(|e| e.to_string())?;
+    events::emit_log(
+        &app,
+        "info",
+        "launch",
+        &format!("Instance '{}' finished its interrupted setup.", name),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -481,7 +552,7 @@ pub async fn cmd_rename_world(
     validate_instance_name(&instance_name)?;
     validate_world_name(&old_name)?;
     validate_world_name(&new_name)?;
-    ensure_instance_not_running(state.inner(), &instance_name)?;
+    let _guard = acquire_world_mutation_guard(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -504,7 +575,7 @@ pub async fn cmd_copy_world(
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
     validate_world_name(&new_name)?;
-    ensure_instance_not_running(state.inner(), &instance_name)?;
+    let _guard = acquire_world_mutation_guard(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -525,7 +596,7 @@ pub async fn cmd_delete_world(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
-    ensure_instance_not_running(state.inner(), &instance_name)?;
+    let _guard = acquire_world_mutation_guard(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -546,7 +617,7 @@ pub async fn cmd_backup_world(
 ) -> Result<instances::BackupInfo, String> {
     validate_instance_name(&instance_name)?;
     validate_world_name(&world_name)?;
-    ensure_instance_not_running(state.inner(), &instance_name)?;
+    let _guard = acquire_world_mutation_guard(state.inner(), &instance_name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -643,6 +714,9 @@ pub async fn cmd_backup_instance(
 ) -> Result<instances::BackupInfo, String> {
     validate_instance_name(&name)?;
     ensure_instance_not_running(state.inner(), &name)?;
+    // A backup must read one coherent directory: the guard blocks a rename or
+    // delete (and a launch) for the whole archive creation.
+    let _guard = InstanceMutationGuard::acquire(state.inner(), &name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.instances_dir()
@@ -681,6 +755,11 @@ pub async fn cmd_restore_instance(
     new_name: Option<String>,
 ) -> Result<(), String> {
     validate_instance_name(&name)?;
+    if mode == "as_new" {
+        if let Some(new_name) = new_name.as_deref() {
+            validate_instance_name(new_name)?;
+        }
+    }
     let _guard = InstanceMutationGuard::acquire(state.inner(), &name)?;
     let instances_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -882,6 +961,7 @@ impl<'a> InstanceMutationGuard<'a> {
                     LaunchBusy::Running => "Minecraft is currently running",
                     LaunchBusy::Starting => "Minecraft is still starting",
                     LaunchBusy::Editing => "another operation is already modifying it",
+                    LaunchBusy::Preparing => "it is still being installed or prepared",
                 };
                 format!(
                     "Cannot modify instance '{}': {}. Close the game or wait for the other operation to finish.",
@@ -900,6 +980,21 @@ impl Drop for InstanceMutationGuard<'_> {
     fn drop(&mut self) {
         self.state.launches.release(&self.instance_name, self.token);
     }
+}
+
+/// Reserve an instance for a world-file mutation.
+///
+/// `ensure_instance_not_running` produces the friendlier "close the game"
+/// message for an already-running instance, but the following registry guard
+/// is the atomic part: a launch that starts after the check makes `begin_edit`
+/// fail, and a launch cannot start once `begin_edit` has succeeded. The guard
+/// is held across the `spawn_blocking` filesystem operation by every caller.
+fn acquire_world_mutation_guard<'a>(
+    state: &'a AppState,
+    instance_name: &str,
+) -> Result<InstanceMutationGuard<'a>, String> {
+    ensure_instance_not_running(state, instance_name)?;
+    InstanceMutationGuard::acquire(state, instance_name)
 }
 
 /// RAII guard that reserves an instance for a config/options modification so
@@ -1261,6 +1356,21 @@ mod instance_name_tests {
         dir
     }
 
+    fn test_app_state(temp: &std::path::Path) -> crate::AppState {
+        crate::AppState {
+            config: std::sync::Mutex::new(crate::AppConfig {
+                data_dir: temp.to_path_buf(),
+                ..crate::AppConfig::default()
+            }),
+            auth_state: std::sync::Mutex::new(crate::auth::AuthState::default()),
+            launches: crate::launch_state::LaunchRegistry::new(),
+            pack_watcher: std::sync::Mutex::new(None),
+            active_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            room_state: std::sync::Arc::new(crate::rooms::room_state::RoomStateManager::new(temp)),
+            tailscale: crate::rooms::tailscale::TailscaleManager::new(temp.to_path_buf()),
+        }
+    }
+
     /// Build a real content watcher on `path`, mirroring what
     /// `arm_pack_watcher` stores in `AppState::pack_watcher`.
     fn test_watcher(path: &std::path::Path, instance_name: &str) -> crate::PackWatcherHandle {
@@ -1277,6 +1387,45 @@ mod instance_name_tests {
             instance_name: instance_name.to_string(),
             _debouncer: debouncer,
         }
+    }
+
+    #[test]
+    fn an_import_in_progress_blocks_launch_delete_and_edit() {
+        let temp = temp_dir("prepare_guard_test");
+        let config = crate::AppConfig {
+            data_dir: temp.clone(),
+            ..crate::AppConfig::default()
+        };
+        let state = crate::AppState {
+            config: std::sync::Mutex::new(config),
+            auth_state: std::sync::Mutex::new(crate::auth::AuthState::default()),
+            launches: crate::launch_state::LaunchRegistry::new(),
+            pack_watcher: std::sync::Mutex::new(None),
+            active_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            room_state: std::sync::Arc::new(crate::rooms::room_state::RoomStateManager::new(&temp)),
+            tailscale: crate::rooms::tailscale::TailscaleManager::new(temp.clone()),
+        };
+
+        let import = state
+            .launches
+            .prepare_guard("Pack")
+            .expect("an import owns the slot");
+
+        // The UI Play path (cmd_launch_game) uses begin_launch through
+        // LaunchReservation; the backend mutation path uses begin_edit.
+        assert!(state.launches.begin_launch("pack").is_err());
+        let err = match super::InstanceMutationGuard::acquire(&state, "Pack") {
+            Ok(_) => panic!("delete/rename must be refused during import"),
+            Err(e) => e,
+        };
+        assert!(err.contains("installed or prepared"), "got: {err}");
+        let err = super::ensure_instance_not_running(&state, "Pack")
+            .expect_err("the user-facing delete check must explain the setup state");
+        assert!(err.contains("installed or prepared"), "got: {err}");
+
+        drop(import);
+        assert!(super::InstanceMutationGuard::acquire(&state, "Pack").is_ok());
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -1320,6 +1469,65 @@ mod instance_name_tests {
         let re_guard = super::InstanceConfigGuard::acquire(&state, &temp, instance);
         assert!(re_guard.is_ok());
 
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn world_mutation_guard_is_mutually_exclusive_with_a_launch() {
+        let temp = temp_dir("world_guard_test");
+        let state = test_app_state(&temp);
+
+        let guard = super::acquire_world_mutation_guard(&state, "Worlds")
+            .expect("a free instance must allow the world mutation");
+        assert!(
+            state.launches.begin_launch("Worlds").is_err(),
+            "a launch must not start while a world operation owns the instance"
+        );
+        drop(guard);
+
+        let token = state
+            .launches
+            .begin_launch("Worlds")
+            .expect("the world guard released its slot");
+        let err = match super::acquire_world_mutation_guard(&state, "Worlds") {
+            Ok(_) => panic!("a starting launch must block the world operation"),
+            Err(e) => e,
+        };
+        assert!(err.contains("still starting"), "got: {err}");
+        state.launches.release("Worlds", token);
+
+        assert!(
+            super::acquire_world_mutation_guard(&state, "Worlds").is_ok(),
+            "the world operation must be possible after the launch slot is released"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn concurrent_world_mutation_and_launch_cannot_both_reserve_the_instance() {
+        let temp = temp_dir("world_guard_race");
+        let state = test_app_state(&temp);
+        let barrier = std::sync::Barrier::new(2);
+
+        let (launch_won, world_won) = std::thread::scope(|scope| {
+            let launch = scope.spawn(|| {
+                barrier.wait();
+                state.launches.begin_launch("Worlds").is_ok()
+            });
+            let world = scope.spawn(|| {
+                barrier.wait();
+                super::acquire_world_mutation_guard(&state, "Worlds").is_ok()
+            });
+            (
+                launch.join().expect("launch thread"),
+                world.join().expect("world thread"),
+            )
+        });
+
+        assert_ne!(
+            launch_won, world_won,
+            "exactly one of the launch and the world operation must reserve the instance"
+        );
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -1468,7 +1676,7 @@ mod instance_name_tests {
 /// treated like a running one by destructive operations.
 #[cfg(test)]
 mod instance_use_tests {
-    use super::ensure_instance_not_running;
+    use super::{ensure_instance_not_running, InstanceMutationGuard};
 
     fn temp_dir(prefix: &str) -> std::path::PathBuf {
         let unique = format!(
@@ -1509,6 +1717,10 @@ mod instance_use_tests {
         let message = ensure_instance_not_running(&state, instance)
             .expect_err("a preparing instance is still in use");
         assert!(message.contains("still starting"), "got: {message}");
+        assert!(
+            InstanceMutationGuard::acquire(&state, instance).is_err(),
+            "the atomic delete/edit guard must also refuse a preparing launch"
+        );
 
         // Once the launch finishes (or fails), the instance is editable again.
         assert!(state.launches.release(instance, reservation));

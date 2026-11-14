@@ -65,6 +65,12 @@ export interface LoaderProfile {
   game_args: string[];
 }
 
+export interface InstanceSetupState {
+  operation: string;
+  stage: 'importing' | 'preparing' | string;
+  started_at: string;
+}
+
 export interface Instance {
   name: string;
   mc_version: string;
@@ -83,6 +89,12 @@ export interface Instance {
   last_played: string | null;
   play_time_seconds: number;
   notes: string;
+  /**
+   * Present while the backend still considers the instance incomplete
+   * (import/install/preparation in flight or interrupted). Play must stay
+   * disabled; the backend refuses the launch independently.
+   */
+  setup_state?: InstanceSetupState | null;
 }
 
 interface InstanceState {
@@ -154,7 +166,7 @@ function pumpElybyPrompt() {
   });
 }
 
-export const useInstanceStore = create<InstanceState>((set, get) => ({
+export const useInstanceStore = create<InstanceState>((set) => ({
   instances: [],
   selectedInstance: null,
   isLoading: false,
@@ -189,15 +201,15 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
 
   deleteInstance: async (name: string) => {
     try {
-      const wasSelected = get().selectedInstance === name;
       await invoke('cmd_delete_instance', { name });
       const instances = await invoke<Instance[]>('cmd_list_instances');
-      set({
+      set((state) => ({
         instances,
-        // Deleting a non-selected instance must not blank the current detail
-        // pane. Only the deleted instance's own selection is cleared.
-        selectedInstance: wasSelected ? null : get().selectedInstance,
-      });
+        // Decide at COMPLETION time, not at call time: the user may have
+        // selected another instance while the deletion was running. Only the
+        // deleted instance's own selection is cleared.
+        selectedInstance: state.selectedInstance === name ? null : state.selectedInstance,
+      }));
     } catch (e: any) {
       const msg = e.toString();
       reportInstanceError(msg);

@@ -40,6 +40,51 @@ describe('instance list loading lifecycle', () => {
   });
 });
 
+describe('instance deletion selection', () => {
+  beforeEach(() => {
+    resetStore();
+    invokeMock.mockReset();
+  });
+
+  it('keeps a different selection made while the deletion is in flight', async () => {
+    let releaseDelete!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'cmd_delete_instance') {
+        await gate;
+        return null;
+      }
+      if (command === 'cmd_list_instances') {
+        return [{ name: 'B' }, { name: 'A' }] as any;
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    useInstanceStore.setState({ selectedInstance: 'A' });
+    const deleting = useInstanceStore.getState().deleteInstance('A');
+    // The user selects B while A is still being deleted.
+    useInstanceStore.getState().selectInstance('B');
+    releaseDelete();
+    await deleting;
+
+    expect(useInstanceStore.getState().selectedInstance).toBe('B');
+    expect(useInstanceStore.getState().instances.map((i) => i.name)).toEqual(['B', 'A']);
+  });
+
+  it('clears the selection only when the selected instance itself is deleted', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'cmd_delete_instance') return null;
+      if (command === 'cmd_list_instances') return [] as any;
+      throw new Error(`unexpected command: ${command}`);
+    });
+    useInstanceStore.setState({ selectedInstance: 'A' });
+    await useInstanceStore.getState().deleteInstance('A');
+    expect(useInstanceStore.getState().selectedInstance).toBeNull();
+  });
+});
+
 describe('Ely.by skin preparation fallback', () => {
   beforeEach(() => {
     resetStore();

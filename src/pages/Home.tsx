@@ -24,6 +24,7 @@ export function Home({ onNavigate }: HomeProps) {
   const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const instances = useInstanceStore((s) => s.instances);
   const instancesLoading = useInstanceStore((s) => s.isLoading);
+  const instancesError = useInstanceStore((s) => s.error);
   const isLaunching = useInstanceStore((s) => s.isLaunching);
   const launchGame = useInstanceStore((s) => s.launchGame);
   const loadInstances = useInstanceStore((s) => s.loadInstances);
@@ -171,7 +172,8 @@ export function Home({ onNavigate }: HomeProps) {
           <button
             className="btn btn--play"
             onClick={handleQuickPlay}
-            disabled={isLaunching}
+            disabled={isLaunching || !!lastInstance?.setup_state}
+            title={lastInstance?.setup_state ? t('instances.setup_incomplete') : undefined}
             id="quick-play-btn"
             style={{ padding: 'var(--space-md) var(--space-xl)' }}
           >
@@ -187,6 +189,27 @@ export function Home({ onNavigate }: HomeProps) {
           </button>
         </div>
       </div>
+
+      {instancesError && (
+        <div
+          role="alert"
+          className="glass-card"
+          style={{
+            padding: 'var(--space-sm) var(--space-lg)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--space-sm)',
+            border: '1px solid var(--warning)',
+            color: 'var(--text-secondary)',
+            fontSize: 'var(--font-size-sm)',
+          }}
+        >
+          <span style={{ flex: 1 }}>{t('home.instances_load_error', { error: instancesError })}</span>
+          <button className="btn btn--ghost btn--sm" onClick={() => loadInstances()}>
+            {t('common.retry')}
+          </button>
+        </div>
+      )}
 
       {/* Instance grid */}
       <div style={{ flex: 1 }}>

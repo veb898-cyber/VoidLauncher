@@ -28,6 +28,8 @@ interface PackUpdateInfo {
   latest_file_id: string | null;
   latest_version: string | null;
   latest_file_name: string | null;
+  channel_unknown: boolean;
+  version_order_unknown: boolean;
 }
 
 interface PackUpdateReport {
@@ -35,6 +37,7 @@ interface PackUpdateReport {
   mods_removed: number;
   overrides_written: number;
   overrides_removed: number;
+  overrides_skipped: number;
   new_version: string;
 }
 
@@ -154,6 +157,9 @@ export function PackModal({ open, instanceName, onClose }: Props) {
       }),
       'success',
     );
+    if (rep.overrides_skipped > 0) {
+      addToast(t('pack.update_overrides_kept', { n: rep.overrides_skipped }), 'info');
+    }
   });
 
   const handleRepair = () => runBusy(async () => {
@@ -247,8 +253,18 @@ export function PackModal({ open, instanceName, onClose }: Props) {
 
           {/* Status */}
           {!checking && !checkError && update && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', fontSize: 'var(--font-size-sm)' }}>
-              {update.up_to_date ? (
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--space-sm)', fontSize: 'var(--font-size-sm)' }}>
+              {update.channel_unknown ? (
+                <>
+                  <AlertTriangle size={14} style={{ color: 'var(--warning)', flexShrink: 0, marginTop: 1 }} />
+                  <span style={{ color: 'var(--warning)' }}>{t('pack.channel_unknown')}</span>
+                </>
+              ) : update.version_order_unknown ? (
+                <>
+                  <AlertTriangle size={14} style={{ color: 'var(--warning)', flexShrink: 0, marginTop: 1 }} />
+                  <span style={{ color: 'var(--warning)' }}>{t('pack.version_order_unknown')}</span>
+                </>
+              ) : update.up_to_date ? (
                 <>
                   <CheckCircle2 size={15} style={{ color: 'var(--success)' }} />
                   <span style={{ color: 'var(--success)' }}>{t('pack.up_to_date')}</span>

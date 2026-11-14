@@ -6,6 +6,7 @@ use crate::instances::{self, Instance, LoaderType};
 use crate::modloaders;
 use crate::modrinth;
 use crate::modrinth::ModrinthFile;
+use crate::verify;
 use crate::versions;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -56,7 +57,7 @@ pub struct FailedImportFile {
     pub file_id: Option<u64>,
     /// Human-readable reason (provider error, unsafe file name, bad manifest).
     pub reason: String,
-    /// False for manifest entries that carry no ids — nothing to retry.
+    /// False for manifest entries that carry no ids вЂ” nothing to retry.
     pub retryable: bool,
 }
 
@@ -195,7 +196,15 @@ pub(crate) fn check_safe_relative(relative: &str) -> Result<()> {
         )));
     }
     for component in normalised.split('/') {
-        if component == ".." {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        // Win32 ignores trailing dots and spaces in a component, so `.. `
+        // opens the parent directory just like `..`, and `...`/`. ` collapse
+        // to nothing. Compare the form Windows will actually use, not the raw
+        // string.
+        let trimmed = component.trim_end_matches(['.', ' ']);
+        if trimmed.is_empty() || trimmed == ".." {
             return Err(LauncherError::Instance(format!(
                 "Path traversal detected in zip entry: {}",
                 relative
@@ -206,7 +215,7 @@ pub(crate) fn check_safe_relative(relative: &str) -> Result<()> {
 }
 
 /// Reject a remote-supplied file name that could escape the directory it is
-/// joined into: must be a bare file name — no separators, drive prefixes,
+/// joined into: must be a bare file name вЂ” no separators, drive prefixes,
 /// "." / ".." or null bytes.
 pub(crate) fn check_safe_file_name(name: &str) -> Result<()> {
     if name.is_empty() || name.contains('\0') || name == "." || name == ".." {
@@ -251,8 +260,8 @@ pub(crate) fn validate_import_versions(
 }
 
 /// Reject an unsafe relative path from remote metadata (Mojang version JSON
-/// libraries, NeoForge data map). Same rules as zip entries — no "..",
-/// absolute/rooted paths, drive prefixes or null bytes — but with a message
+/// libraries, NeoForge data map). Same rules as zip entries вЂ” no "..",
+/// absolute/rooted paths, drive prefixes or null bytes вЂ” but with a message
 /// naming the actual source.
 pub(crate) fn check_safe_remote_path(relative: &str) -> Result<()> {
     if relative.trim().is_empty() {
@@ -273,8 +282,31 @@ pub(crate) fn check_safe_remote_path(relative: &str) -> Result<()> {
 /// deliberately enforced on *actual* bytes read, not on metadata sizes.
 pub(crate) const MAX_EXTRACT_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const MAX_EXTRACT_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Files (not directory entries) one import/update operation may materialise.
+/// Collapses the "millions of empty entries" archive into a hard failure.
+pub(crate) const MAX_EXTRACT_FILES: usize = 100_000;
+/// Total destination-path metadata a single operation may retain. Combined
+/// with the per-path limit this bounds memory for attacker-controlled names.
+pub(crate) const MAX_EXTRACT_PATH_BYTES: u64 = 16 * 1024 * 1024;
+/// Longest single relative destination path accepted from an archive.
+pub(crate) const MAX_EXTRACT_PATH_LEN: usize = 4096;
+/// Maximum raw ZIP entries inspected in one archive.
+pub(crate) const MAX_ARCHIVE_ENTRIES: usize = 100_000;
+/// Embedded (in-memory) pack payload allowed for one import.
+pub(crate) const MAX_EMBEDDED_BYTES: u64 = 1024 * 1024 * 1024;
 
 static EXTRACT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Reject archives with an unreasonable number of entries before allocating
+/// per-entry metadata or iterating them.
+pub(crate) fn check_archive_entry_count(count: usize) -> Result<()> {
+    if count > MAX_ARCHIVE_ENTRIES {
+        return Err(LauncherError::Instance(format!(
+            "Archive contains too many entries ({count}, limit {MAX_ARCHIVE_ENTRIES})"
+        )));
+    }
+    Ok(())
+}
 
 /// Canonical collision key for a destination path. Removes `.`/empty
 /// components, folds case, and strips trailing dots/spaces that Windows
@@ -285,23 +317,71 @@ pub(crate) fn destination_key(relative: &str) -> Option<String> {
         if part.is_empty() || part == "." {
             continue;
         }
-        if part == ".." {
+        // Normalise before the `..` check: Windows strips trailing dots and
+        // spaces, so `.. ` must be treated as a traversal, and `...`/`. `
+        // collapse to an empty component rather than aliasing a real file.
+        let part = part.trim_end_matches(['.', ' ']);
+        if part.is_empty() || part == ".." {
             return None;
         }
-        let part = part.trim_end_matches(['.', ' ']).to_lowercase();
-        if part.is_empty() {
-            return None;
-        }
-        parts.push(part);
+        parts.push(part.to_lowercase());
     }
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// Shared extraction budget for one logical import/update operation.
+/// Resource counters shared by every extraction layer of one logical
+/// import/update operation. Unlike path claims these counters are global: two
+/// layers may legitimately contain the same path, but their bytes, files and
+/// path metadata all consume the same budget.
 #[derive(Debug)]
-pub(crate) struct ExtractBudget {
+struct ExtractResources {
     total: u64,
     total_limit: u64,
+    files: usize,
+    files_limit: usize,
+    path_bytes: u64,
+    path_bytes_limit: u64,
+}
+
+impl ExtractResources {
+    fn reserve_bytes(&self, entry_bytes: u64, entry_limit: u64) -> Result<()> {
+        if entry_bytes > entry_limit {
+            return Err(LauncherError::Instance(format!(
+                "Archive entry exceeds the safe extraction limit ({} bytes)",
+                entry_limit
+            )));
+        }
+        if self.total.saturating_add(entry_bytes) > self.total_limit {
+            return Err(LauncherError::Instance(
+                "Archive extraction exceeds the safe total limit".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reserve_file(&self) -> Result<()> {
+        if self.files >= self.files_limit {
+            return Err(LauncherError::Instance(format!(
+                "Archive extraction exceeds the safe file count limit ({})",
+                self.files_limit
+            )));
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, bytes: u64) {
+        self.total = self.total.saturating_add(bytes);
+        self.files = self.files.saturating_add(1);
+    }
+}
+
+/// One extraction layer's path-claim registry plus a handle to the operation's
+/// shared resource counters. Layered overrides create a fresh layer (empty
+/// `paths`) with `layer()`, so a base/client overlap is allowed while the
+/// global byte/file/path limits still apply to the sum of both layers.
+#[derive(Debug)]
+pub(crate) struct ExtractBudget {
+    resources: Arc<Mutex<ExtractResources>>,
     entry_limit: u64,
     paths: HashSet<String>,
 }
@@ -312,14 +392,82 @@ impl ExtractBudget {
     }
 
     pub(crate) fn with_limits(total_limit: u64, entry_limit: u64) -> Self {
-        Self {
-            total: 0,
+        Self::with_all_limits(
             total_limit,
+            entry_limit,
+            MAX_EXTRACT_FILES,
+            MAX_EXTRACT_PATH_BYTES,
+        )
+    }
+
+    /// Fully explicit constructor used by regression tests with tiny limits.
+    pub(crate) fn with_all_limits(
+        total_limit: u64,
+        entry_limit: u64,
+        files_limit: usize,
+        path_bytes_limit: u64,
+    ) -> Self {
+        Self {
+            resources: Arc::new(Mutex::new(ExtractResources {
+                total: 0,
+                total_limit,
+                files: 0,
+                files_limit,
+                path_bytes: 0,
+                path_bytes_limit,
+            })),
             entry_limit,
             paths: HashSet::new(),
         }
     }
+
+    /// A new path-claim layer that shares this operation's resource counters.
+    pub(crate) fn layer(&self) -> Self {
+        Self {
+            resources: Arc::clone(&self.resources),
+            entry_limit: self.entry_limit,
+            paths: HashSet::new(),
+        }
+    }
+
+    /// A layer with a stricter per-entry limit (embedded payload keeps its
+    /// historical 1 GiB cap) but the same operation-wide counters.
+    pub(crate) fn layer_with_entry_limit(&self, entry_limit: u64) -> Self {
+        Self {
+            resources: Arc::clone(&self.resources),
+            entry_limit,
+            paths: HashSet::new(),
+        }
+    }
+
+    /// A fresh path-claim layer that still sees the parent's existing claims.
+    ///
+    /// Two sibling override layers (base and client) must both be checked
+    /// against non-override destinations already claimed by the operation,
+    /// such as files listed in an mrpack index, while remaining independent of
+    /// each other so a client override may legitimately replace a base file.
+    pub(crate) fn layer_with_existing_claims(&self) -> Self {
+        Self {
+            resources: Arc::clone(&self.resources),
+            entry_limit: self.entry_limit,
+            paths: self.paths.clone(),
+        }
+    }
+
+    fn resources(&self) -> Result<std::sync::MutexGuard<'_, ExtractResources>> {
+        self.resources.lock().map_err(|_| {
+            LauncherError::Instance("Archive extraction budget lock failed".to_string())
+        })
+    }
+
     pub(crate) fn claim_path(&mut self, relative: &str) -> Result<()> {
+        if relative.len() > MAX_EXTRACT_PATH_LEN {
+            return Err(LauncherError::Instance(format!(
+                "Archive destination path is too long ({} bytes, limit {})",
+                relative.len(),
+                MAX_EXTRACT_PATH_LEN
+            )));
+        }
         let key = destination_key(relative).ok_or_else(|| {
             LauncherError::Instance(format!(
                 "Invalid or empty archive destination path: {relative}"
@@ -339,32 +487,53 @@ impl ExtractBudget {
                 "Duplicate or conflicting archive destination: {relative}"
             )));
         }
+        let mut resources = self.resources()?;
+        let next_path_bytes = resources
+            .path_bytes
+            .saturating_add(key.len() as u64)
+            .saturating_add(1);
+        if next_path_bytes > resources.path_bytes_limit {
+            return Err(LauncherError::Instance(
+                "Archive extraction exceeds the safe path metadata limit".to_string(),
+            ));
+        }
+        resources.path_bytes = next_path_bytes;
+        drop(resources);
         self.paths.insert(key);
         Ok(())
     }
 
+    fn reserve_file(&self) -> Result<()> {
+        self.resources()?.reserve_file()
+    }
+
     fn reserve_bytes(&self, entry_bytes: u64) -> Result<()> {
-        if entry_bytes > self.entry_limit {
-            return Err(LauncherError::Instance(format!(
-                "Archive entry exceeds the safe extraction limit ({} bytes)",
-                self.entry_limit
-            )));
-        }
-        if self.total.saturating_add(entry_bytes) > self.total_limit {
-            return Err(LauncherError::Instance(
-                "Archive extraction exceeds the safe total limit".to_string(),
-            ));
-        }
-        Ok(())
+        self.resources()?
+            .reserve_bytes(entry_bytes, self.entry_limit)
     }
 
     fn commit(&mut self, bytes: u64) {
-        self.total = self.total.saturating_add(bytes);
+        if let Ok(mut resources) = self.resources.lock() {
+            resources.commit(bytes);
+        }
+    }
+
+    /// Account for a non-streamed payload (embedded pack content) as one file.
+    pub(crate) fn consume_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.reserve_file()?;
+        self.reserve_bytes(bytes)?;
+        self.commit(bytes);
+        Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn total(&self) -> u64 {
-        self.total
+        self.resources.lock().map(|r| r.total).unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn files(&self) -> usize {
+        self.resources.lock().map(|r| r.files).unwrap_or(0)
     }
 }
 
@@ -403,6 +572,7 @@ pub(crate) fn write_extracted_budgeted(
         )));
     }
     budget.claim_path(entry_name)?;
+    budget.reserve_file()?;
     ensure_no_reparse_points(base, &target)?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
@@ -449,7 +619,7 @@ pub(crate) fn normalize_zip_path(path: &str) -> String {
 }
 
 #[cfg(windows)]
-fn is_unsafe_reparse_point(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_unsafe_reparse_point(meta: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     // FILE_ATTRIBUTE_REPARSE_POINT. Directory reparse points (junctions,
     // mount points, directory symlinks) can redirect a whole subtree.
@@ -463,7 +633,7 @@ fn is_unsafe_reparse_point(meta: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_unsafe_reparse_point(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_unsafe_reparse_point(meta: &std::fs::Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
@@ -556,9 +726,19 @@ pub(crate) fn write_override_sidecar(mc_dir: &Path, relative: &str, provider: &s
 
 /// Extract every entry of a zip archive into `dest`, rejecting zip-slip paths.
 pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
+    let mut budget = ExtractBudget::new();
+    extract_zip_to_dir_budgeted(zip_path, dest, &mut budget)
+}
+
+/// Extract every entry into `dest` using the caller's shared budget/layer.
+pub(crate) fn extract_zip_to_dir_budgeted(
+    zip_path: &Path,
+    dest: &Path,
+    budget: &mut ExtractBudget,
+) -> Result<()> {
     let file = std::fs::File::open(zip_path)?;
     let mut archive = zip::ZipArchive::new(file)?;
-    let mut budget = ExtractBudget::new();
+    check_archive_entry_count(archive.len())?;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -567,7 +747,7 @@ pub(crate) fn extract_zip_to_dir(zip_path: &Path, dest: &Path) -> Result<()> {
         if entry.is_dir() {
             continue;
         }
-        write_extracted_budgeted(dest, &entry_name, &mut entry, &mut budget)?;
+        write_extracted_budgeted(dest, &entry_name, &mut entry, budget)?;
     }
     Ok(())
 }
@@ -611,12 +791,25 @@ fn pick_modrinth_file<'a>(
 }
 
 async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> Vec<String> {
+    // External metadata is untrusted: only URLs that pass the shared
+    // downloader policy may reach a request. The downloader validates again
+    // immediately before the request, but filtering here avoids forwarding
+    // credentials or spoofed hosts at all.
     let mut urls: Vec<String> = file_entry["downloads"]
         .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str())
-                .filter(|s| s.starts_with("https://"))
+                .filter(|s| {
+                    let allowed = crate::download::validate_download_url(s).is_ok();
+                    if !allowed {
+                        tracing::warn!(
+                            target: "launcher",
+                            "Ignoring an unsafe download URL in mrpack metadata"
+                        );
+                    }
+                    allowed
+                })
                 .map(|s| s.to_string())
                 .collect()
         })
@@ -636,8 +829,10 @@ async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> 
     }) {
         if let Ok(version) = modrinth::get_version_by_id(vid).await {
             if let Some(file) = pick_modrinth_file(&version.files, filename, hashes) {
-                urls.push(file.url.clone());
-                return urls;
+                if crate::download::validate_download_url(&file.url).is_ok() {
+                    urls.push(file.url.clone());
+                    return urls;
+                }
             }
         }
     }
@@ -651,8 +846,10 @@ async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> 
     {
         if let Ok(version) = modrinth::get_version_by_hash(hash, algo).await {
             if let Some(file) = pick_modrinth_file(&version.files, filename, hashes) {
-                urls.push(file.url.clone());
-                return urls;
+                if crate::download::validate_download_url(&file.url).is_ok() {
+                    urls.push(file.url.clone());
+                    return urls;
+                }
             }
         }
     }
@@ -661,8 +858,10 @@ async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> 
         if let Ok(versions) = modrinth::get_project_versions(pid).await {
             for version in &versions {
                 if let Some(file) = pick_modrinth_file(&version.files, filename, hashes) {
-                    urls.push(file.url.clone());
-                    return urls;
+                    if crate::download::validate_download_url(&file.url).is_ok() {
+                        urls.push(file.url.clone());
+                        return urls;
+                    }
                 }
             }
         }
@@ -699,7 +898,7 @@ fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) -> std
 }
 
 /// Validate an mrpack index path and resolve its destination under `mc_dir`,
-/// rejecting path traversal, absolute/rooted paths and drive prefixes — the
+/// rejecting path traversal, absolute/rooted paths and drive prefixes вЂ” the
 /// path comes straight from the pack's `modrinth.index.json` and must not
 /// escape the instance directory.
 fn mrpack_dest(mc_dir: &Path, path_str: &str) -> Result<PathBuf> {
@@ -857,6 +1056,7 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         .map_err(|e| LauncherError::Instance(format!("Cannot read file: {}", e)))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| LauncherError::Instance(format!("Invalid archive: {}", e)))?;
+    check_archive_entry_count(archive.len())?;
 
     let names: Vec<String> = (0..archive.len())
         .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
@@ -1043,7 +1243,7 @@ fn atl_loader_from_instance_json(
     }
 
     // Components array (export v2). `type` may be "minecraft"/"game" for the
-    // game itself — the keyword match naturally skips those.
+    // game itself вЂ” the keyword match naturally skips those.
     for key in ["components", "component"] {
         if let Some(arr) = inst[key].as_array() {
             for x in arr {
@@ -1070,6 +1270,7 @@ fn loader_slug(lt: &LoaderType) -> Option<String> {
 }
 
 /// Import a modpack into the instances directory
+#[allow(dead_code)] // command layer uses `import_modpack_reserved`; kept for tests/embedders
 pub async fn import_modpack(
     instances_dir: &Path,
     path: &str,
@@ -1077,10 +1278,38 @@ pub async fn import_modpack(
     curseforge_api_key: &str,
     libraries_dir: &Path,
     app: Option<&AppHandle>,
+    launches: &crate::launch_state::LaunchRegistry,
 ) -> Result<ImportOutcome> {
+    let (outcome, mut reservation) = import_modpack_reserved(
+        instances_dir,
+        path,
+        instance_name,
+        curseforge_api_key,
+        libraries_dir,
+        app,
+        launches,
+    )
+    .await?;
+    reservation.commit()?;
+    Ok(outcome)
+}
+
+/// Import a pack and keep the name/directory reservation alive. Command
+/// callers use this variant so post-import preparation (loader, assets, pack
+/// lock) cannot race a rename/delete and a failure still removes only the
+/// directory this operation created.
+pub(crate) async fn import_modpack_reserved<'a>(
+    instances_dir: &Path,
+    path: &str,
+    instance_name: &str,
+    curseforge_api_key: &str,
+    libraries_dir: &Path,
+    app: Option<&AppHandle>,
+    launches: &'a crate::launch_state::LaunchRegistry,
+) -> Result<(ImportOutcome, InstanceReservation<'a>)> {
     emit_progress(app, "reading", 0, 1, "Reading archive...");
 
-    // Never merge into an existing instance — a same-named import would
+    // Never merge into an existing instance вЂ” a same-named import would
     // silently overwrite its mods/configs.
     ensure_instance_target_free(instances_dir, instance_name)?;
 
@@ -1107,51 +1336,80 @@ pub async fn import_modpack(
         }
     };
 
-    let outcome = match format {
+    let (outcome, reservation) = match format {
         ModpackFormat::Prism => {
-            let instance = import_with_cleanup(instances_dir, instance_name, || async {
-                instances::import_prism_pack_reserved(instances_dir, path, instance_name)
-            })
+            let (instance, reservation) = import_with_cleanup_keep(
+                instances_dir,
+                instance_name,
+                launches,
+                "import",
+                || async {
+                    instances::import_prism_pack_reserved(instances_dir, path, instance_name)
+                },
+            )
             .await?;
-            ImportOutcome {
-                report: ImportReport::complete(0, 0),
-                instance,
-            }
+            (
+                ImportOutcome {
+                    report: ImportReport::complete(0, 0),
+                    instance,
+                },
+                reservation,
+            )
         }
         ModpackFormat::Modrinth => {
-            let instance = import_with_cleanup(instances_dir, instance_name, || async {
-                import_mrpack(instances_dir, path, instance_name, app).await
-            })
+            let (instance, reservation) = import_with_cleanup_keep(
+                instances_dir,
+                instance_name,
+                launches,
+                "import",
+                || async { import_mrpack(instances_dir, path, instance_name, app).await },
+            )
             .await?;
-            ImportOutcome {
-                report: ImportReport::complete(0, 0),
-                instance,
-            }
+            (
+                ImportOutcome {
+                    report: ImportReport::complete(0, 0),
+                    instance,
+                },
+                reservation,
+            )
         }
         ModpackFormat::CurseForge => {
-            let (instance, report) = import_with_cleanup(instances_dir, instance_name, || async {
-                import_curseforge_pack(
-                    instances_dir,
-                    path,
-                    instance_name,
-                    curseforge_api_key,
-                    libraries_dir,
-                    app,
-                )
-                .await
-            })
+            let ((instance, report), reservation) = import_with_cleanup_keep(
+                instances_dir,
+                instance_name,
+                launches,
+                "import",
+                || async {
+                    import_curseforge_pack(
+                        instances_dir,
+                        path,
+                        instance_name,
+                        curseforge_api_key,
+                        libraries_dir,
+                        app,
+                    )
+                    .await
+                },
+            )
             .await?;
-            ImportOutcome { instance, report }
+            (ImportOutcome { instance, report }, reservation)
         }
         ModpackFormat::ATLauncher => {
-            let instance = import_with_cleanup(instances_dir, instance_name, || async {
-                import_atlauncher_pack(instances_dir, path, instance_name)
-            })
+            let (instance, reservation) = import_with_cleanup_keep(
+                instances_dir,
+                instance_name,
+                launches,
+                "import",
+                || async { import_atlauncher_pack(instances_dir, path, instance_name) },
+            )
             .await?;
-            ImportOutcome {
-                report: ImportReport::complete(0, 0),
-                instance,
-            }
+            (
+                ImportOutcome {
+                    report: ImportReport::complete(0, 0),
+                    instance,
+                },
+                reservation,
+            )
         }
     };
 
@@ -1159,7 +1417,7 @@ pub async fn import_modpack(
     // `prepare_instance_files` (loader profile + game files + assets) first
     // and only then emits "done", so the progress UI stays live until the
     // instance is actually ready for its first launch.
-    Ok(outcome)
+    Ok((outcome, reservation))
 }
 
 /// Download everything an instance needs for its first launch: the mod-loader
@@ -1181,8 +1439,65 @@ pub async fn prepare_instance_files(
     report
 }
 
+/// Shared final step for every import path (UI modpack import, store installs,
+/// legacy Prism IPC): prepare loader/game/assets, verify the instance is still
+/// the one on disk, and only then retire the readiness marker.
+///
+/// When preparation is incomplete the directory and every imported file are
+/// preserved, but the persistent pending marker stays in place so no launch can
+/// start against a half-prepared instance. `finish_instance_setup` retries the
+/// same preparation later.
+pub(crate) async fn finish_import_for_launch(
+    app: Option<&AppHandle>,
+    config: &AppConfig,
+    instance_name: &str,
+    mut outcome: ImportOutcome,
+    reservation: &mut InstanceReservation<'_>,
+) -> Result<ImportOutcome> {
+    reservation.set_stage(crate::instance_readiness::SetupStage::Preparing)?;
+    let prepare = prepare_instance_files(app, config, &outcome.instance).await;
+    outcome.report.warnings.extend(prepare.warnings);
+    verify_instance_ready(&config.instances_dir(), instance_name)?;
+    if outcome.report.warnings.is_empty() {
+        reservation.commit()?;
+    } else {
+        outcome.report.warnings.push(
+            "Instance setup is not complete yet. The launch stays blocked and the remaining files \
+             will be downloaded when you finish setup."
+                .to_string(),
+        );
+        reservation.preserve_for_retry();
+    }
+    Ok(outcome)
+}
+
+/// Final publication check: the instance directory must still exist and its
+/// metadata must parse and describe the expected name. Only after this does
+/// the caller retire the readiness marker.
+pub(crate) fn verify_instance_ready(instances_dir: &Path, instance_name: &str) -> Result<()> {
+    if !instances_dir.join(instance_name).is_dir() {
+        return Err(LauncherError::Instance(format!(
+            "Instance '{}' disappeared during import preparation.",
+            instance_name
+        )));
+    }
+    let instance = instances::get_instance(instances_dir, instance_name).map_err(|e| {
+        LauncherError::Instance(format!(
+            "Instance '{}' has unreadable metadata after preparation: {}",
+            instance_name, e
+        ))
+    })?;
+    if instance.name != instance_name {
+        return Err(LauncherError::Instance(format!(
+            "Instance metadata describes '{}', but the directory is '{}'.",
+            instance.name, instance_name
+        )));
+    }
+    Ok(())
+}
+
 /// Install the mod loader when the instance declares one but has no profile
-/// saved yet (every importer stores `loader_profile: None` — the profile is
+/// saved yet (every importer stores `loader_profile: None` вЂ” the profile is
 /// built from the loader's metadata service, not from the pack archive).
 async fn prepare_loader(
     app: Option<&AppHandle>,
@@ -1231,7 +1546,9 @@ async fn prepare_loader(
         Ok(profile) => {
             let mut updated = instance.clone();
             updated.loader_profile = Some(profile);
-            if let Err(e) = instances::save_instance(&config.instances_dir(), &updated, None) {
+            if let Err(e) =
+                instances::save_instance_existing_reserved(&config.instances_dir(), &updated, None)
+            {
                 tracing::warn!(
                     target: "launcher",
                     "Failed to save {} profile for '{}': {}",
@@ -1349,7 +1666,7 @@ async fn prepare_version_and_assets(
         return;
     }
 
-    // Version files: client JAR, libraries, natives — only the missing ones.
+    // Version files: client JAR, libraries, natives вЂ” only the missing ones.
     let all_files = match versions::collect_downloads(
         &version_info,
         &config.libraries_dir(),
@@ -1408,7 +1725,7 @@ async fn prepare_version_and_assets(
         }
     }
 
-    // Version JSON — the launch path reads this file to build the command.
+    // Version JSON вЂ” the launch path reads this file to build the command.
     let version_dir = config.versions_dir().join(&version_info.id);
     if let Err(e) = std::fs::create_dir_all(&version_dir) {
         tracing::warn!(target: "launcher", "Failed to create version dir for '{}': {}", instance.name, e);
@@ -1440,93 +1757,169 @@ async fn prepare_version_and_assets(
         }
     }
 
-    // Asset index + assets (skipped wholesale when the index is on disk —
+    // Asset index + assets (skipped wholesale when the index is on disk вЂ”
     // same coarse check the launch self-heal uses).
+    // Asset index + assets. A present index is validated, not trusted: a
+    // truncated JSON or an index whose objects are missing must be restored
+    // before the instance is published as ready.
     let index_path = config
         .assets_dir()
         .join("indexes")
         .join(format!("{}.json", version_info.assets));
-    if index_path.exists() {
-        return;
-    }
-    emit_progress(app, "assets", 0, 1, "Downloading asset index...");
-    if !crate::is_allowed_download_host(&version_info.asset_index.url) {
-        tracing::warn!(
-            target: "launcher",
-            "Asset index URL for {} is not in the download allowlist; skipping",
-            instance.mc_version
-        );
-        report.warn(format!(
-            "The asset download source for Minecraft {} is not allowed.",
-            instance.mc_version
-        ));
-        return;
-    }
-    let asset_index = match versions::fetch_asset_index(&version_info.asset_index.url).await {
-        Ok(a) => a,
-        Err(e) => {
+    let mut asset_index = if index_path.exists() {
+        match versions::load_asset_index(&index_path)
+            .and_then(|index| verify::validate_asset_index(&index).map(|_| index))
+        {
+            Ok(index) => Some(index),
+            Err(e) => {
+                tracing::warn!(
+                    target: "launcher",
+                    "Local asset index for '{}' is unusable: {}",
+                    instance.name, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if asset_index.is_none() {
+        emit_progress(app, "assets", 0, 1, "Downloading asset index...");
+        if !crate::is_allowed_download_host(&version_info.asset_index.url) {
             tracing::warn!(
                 target: "launcher",
-                "Failed to fetch asset index for {}: {} (the launch will retry)",
-                instance.mc_version, e
+                "Asset index URL for {} is not in the download allowlist; skipping",
+                instance.mc_version
             );
             report.warn(format!(
-                "The asset index for Minecraft {} could not be downloaded: {}",
+                "The asset download source for Minecraft {} is not allowed.",
+                instance.mc_version
+            ));
+            return;
+        }
+        let fetched = match versions::fetch_asset_index(&version_info.asset_index.url).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    target: "launcher",
+                    "Failed to fetch asset index for {}: {} (the launch will retry)",
+                    instance.mc_version, e
+                );
+                report.warn(format!(
+                    "The asset index for Minecraft {} could not be downloaded: {}",
+                    instance.mc_version, e
+                ));
+                return;
+            }
+        };
+        if let Err(e) = verify::validate_asset_index(&fetched) {
+            tracing::warn!(
+                target: "launcher",
+                "Downloaded asset index for '{}' is invalid: {}",
+                instance.name, e
+            );
+            report.warn(format!(
+                "The asset index for Minecraft {} is invalid: {}",
                 instance.mc_version, e
             ));
             return;
         }
-    };
-    if let Some(parent) = index_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::warn!(target: "launcher", "Failed to create asset index dir for '{}': {}", instance.name, e);
-            report.warn(format!(
-                "The asset index directory could not be created: {}",
-                e
-            ));
-            return;
-        }
-    }
-    match serde_json::to_string_pretty(&asset_index) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&index_path, json) {
-                tracing::warn!(target: "launcher", "Failed to write asset index for '{}': {}", instance.name, e);
-                report.warn(format!("The asset index could not be saved: {}", e));
+        if let Some(parent) = index_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(target: "launcher", "Failed to create asset index dir for '{}': {}", instance.name, e);
+                report.warn(format!(
+                    "The asset index directory could not be created: {}",
+                    e
+                ));
                 return;
             }
         }
+        match serde_json::to_string_pretty(&fetched) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&index_path, json) {
+                    tracing::warn!(target: "launcher", "Failed to write asset index for '{}': {}", instance.name, e);
+                    report.warn(format!("The asset index could not be saved: {}", e));
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "launcher", "Failed to serialize asset index for '{}': {}", instance.name, e);
+                report.warn(format!("The asset index could not be serialized: {}", e));
+                return;
+            }
+        }
+        asset_index = Some(fetched);
+    }
+    let asset_index = asset_index.expect("asset index was loaded or downloaded");
+
+    // Validate every object; download only what is missing/damaged. Import
+    // preparation should leave the instance genuinely launchable, not merely
+    // create an index file.
+    let check = match verify::check_asset_objects_for_launch(&config.assets_dir(), &asset_index) {
+        Ok(check) => check,
         Err(e) => {
-            tracing::warn!(target: "launcher", "Failed to serialize asset index for '{}': {}", instance.name, e);
-            report.warn(format!("The asset index could not be serialized: {}", e));
+            tracing::warn!(target: "launcher", "Asset validation for '{}' failed: {}", instance.name, e);
+            report.warn(format!("Minecraft assets could not be validated: {}", e));
             return;
         }
-    }
-    if let Err(e) = download::download_assets(
-        &asset_index,
-        &config.assets_dir(),
-        |completed, total, bytes_done, bytes_total, _msg| {
-            emit_progress_bytes(
-                app,
-                "assets",
-                completed,
-                total,
-                bytes_done,
-                bytes_total,
-                &format!("Downloading assets ({}/{})", completed, total),
-            );
-        },
-    )
-    .await
-    {
-        tracing::warn!(
-            target: "launcher",
-            "Asset download for '{}' failed: {} (the launch will retry)",
-            instance.name, e
+    };
+    if !check.is_healthy() {
+        emit_progress(
+            app,
+            "assets",
+            0,
+            check.issue_count(),
+            &format!("Downloading {} asset file(s)...", check.issue_count()),
         );
-        report.warn(format!("Game assets could not be downloaded: {}", e));
-        return;
+        let forced: std::collections::HashSet<PathBuf> = check.paths.iter().cloned().collect();
+        if let Err(e) = download::download_assets_repair(
+            &asset_index,
+            &config.assets_dir(),
+            &forced,
+            |completed, total, bytes_done, bytes_total, _msg| {
+                emit_progress_bytes(
+                    app,
+                    "assets",
+                    completed,
+                    total,
+                    bytes_done,
+                    bytes_total,
+                    &format!("Downloading assets ({}/{})", completed, total),
+                );
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "launcher",
+                "Asset download for '{}' failed: {} (the launch will retry)",
+                instance.name, e
+            );
+            report.warn(format!("Game assets could not be downloaded: {}", e));
+            return;
+        }
+        match verify::check_asset_objects_for_launch(&config.assets_dir(), &asset_index) {
+            Ok(recheck) if recheck.is_healthy() => {}
+            Ok(recheck) => {
+                tracing::warn!(
+                    target: "launcher",
+                    "Assets for '{}' are still incomplete after download: {} problem(s)",
+                    instance.name,
+                    recheck.issue_count()
+                );
+                report.warn(format!(
+                    "{} Minecraft asset object(s) are still missing or damaged after the download.",
+                    recheck.issue_count()
+                ));
+                return;
+            }
+            Err(e) => {
+                report.warn(format!("Minecraft assets could not be validated: {}", e));
+                return;
+            }
+        }
     }
-    // Virtual/legacy mirror for old versions (1.8 and older) — same step the
+    // Virtual/legacy mirror for old versions (1.8 and older) вЂ” same step the
     // version installer performs.
     if let Err(e) =
         download::ensure_virtual_assets(&version_info.assets, &asset_index, &config.assets_dir())
@@ -1543,9 +1936,13 @@ async fn prepare_version_and_assets(
 /// wiping the whole directory when a loader install failed). Update flows
 /// for managed packs go through the pack-lock updater, never a re-import, so
 /// a name collision here is always a user mistake worth stopping.
+///
+/// A directory left behind by an operation that crashed *before* writing
+/// metadata is not a usable instance: [`InstanceReservation::reserve`] parks
+/// it under a hidden recovery name, so a retry is not blocked by it.
 pub(crate) fn ensure_instance_target_free(instances_dir: &Path, instance_name: &str) -> Result<()> {
     let target = instances_dir.join(instance_name);
-    if target.exists() {
+    if target.exists() && !crate::instance_readiness::is_incomplete_target(&target) {
         return Err(LauncherError::Instance(format!(
             "An instance named '{}' already exists. Choose a different name for the imported pack.",
             instance_name
@@ -1558,7 +1955,7 @@ pub(crate) fn ensure_instance_target_free(instances_dir: &Path, instance_name: &
 /// The random token inside proves which operation created the directory; a
 /// failing operation may only delete a directory whose marker still carries
 /// its own token.
-const IMPORT_OWNER_MARKER: &str = ".void-import-owner";
+pub(crate) const IMPORT_OWNER_MARKER: &str = ".void-import-owner";
 
 /// Ownership handle for one instance directory created by an import/install.
 ///
@@ -1568,93 +1965,403 @@ const IMPORT_OWNER_MARKER: &str = ".void-import-owner";
 /// winner's files (TOCTOU). Here the loser fails before touching anything,
 /// and `Drop` removes the directory only while the owner marker proves it is
 /// still the directory this operation created.
-#[derive(Debug)]
-pub(crate) struct InstanceReservation {
+///
+/// The same handle also owns the *readiness* lifecycle:
+///
+/// - it holds a [`LaunchRegistry`] `Preparing` slot for its whole lifetime, so
+///   a launch cannot start between the readiness check and the last file
+///   write (and a launch that already won makes the import abort up front);
+/// - it writes a persistent pending marker before any content, so an
+///   interrupted operation is still not launchable after an app restart;
+/// - only [`Self::commit`] retires that marker, after the importer, pack lock
+///   and file preparation are all done.
+///
+/// [`LaunchRegistry`]: crate::launch_state::LaunchRegistry
+pub(crate) struct InstanceReservation<'a> {
     target: PathBuf,
     marker: PathBuf,
     token: String,
+    operation: &'static str,
+    /// `false` for a resume of an already imported instance: a failed retry
+    /// must never delete the user's pack files.
+    owns_directory: bool,
     committed: bool,
+    /// Name reservation. Declared before the launch slot so it is released
+    /// first: a waiter can never see a free name while the import slot is
+    /// still held (the reverse order would let a launch start and then fail
+    /// when it tries to save the instance metadata).
+    _name_guard: Option<crate::instances::InstanceNameReservation>,
+    /// Launch slot, held while the directory is being written and retired by
+    /// `commit` only after the readiness marker is gone.
+    prepare: Option<crate::launch_state::PrepareGuard<'a>>,
 }
 
-impl InstanceReservation {
-    pub(crate) fn reserve(instances_dir: &Path, instance_name: &str) -> Result<Self> {
+fn launch_busy_error(instance_name: &str, busy: crate::launch_state::LaunchBusy) -> LauncherError {
+    use crate::launch_state::LaunchBusy;
+    let reason = match busy {
+        LaunchBusy::Starting => "it is already starting",
+        LaunchBusy::Running => "Minecraft is currently running",
+        LaunchBusy::Editing => "another operation is already modifying it",
+        LaunchBusy::Preparing => "another installation/preparation is already running for it",
+    };
+    LauncherError::Instance(format!(
+        "Cannot set up instance '{}': {}. Wait for the current operation to finish and try again.",
+        instance_name, reason
+    ))
+}
+
+/// Move an operation-interrupted directory (pending marker, no metadata) out
+/// of the way so the user can retry the same import name.
+///
+/// The files are preserved under a hidden `.void-recovery-*` name instead of
+/// being deleted: the archive is the source of truth, but silently discarding
+/// whatever the failed attempt produced is still worse than keeping it.
+fn park_incomplete_target(instances_dir: &Path, target: &Path, name: &str) -> Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let parked = instances_dir.join(format!(".void-recovery-{}-{}", safe.trim(), stamp));
+    std::fs::rename(target, &parked).map_err(|e| {
+        LauncherError::Instance(format!(
+            "An interrupted operation left a directory for '{}', and it could not be moved aside ({}). Remove {} manually, then retry.",
+            name,
+            e,
+            target.display()
+        ))
+    })?;
+    tracing::warn!(
+        target: "launcher",
+        "Interrupted setup for '{}' was moved to {}; the operation can be retried",
+        name,
+        parked.display()
+    );
+    Ok(())
+}
+
+impl std::fmt::Debug for InstanceReservation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceReservation")
+            .field("target", &self.target)
+            .field("operation", &self.operation)
+            .field("owns_directory", &self.owns_directory)
+            .field("committed", &self.committed)
+            .finish()
+    }
+}
+
+impl<'a> InstanceReservation<'a> {
+    /// Atomically claim a fresh instance directory and its launch slot.
+    ///
+    /// `operation` is shown in the UI/recovery message ("import", "install",
+    /// "create").
+    pub(crate) fn reserve(
+        instances_dir: &Path,
+        instance_name: &str,
+        launches: &'a crate::launch_state::LaunchRegistry,
+        operation: &'static str,
+    ) -> Result<Self> {
         let name = instance_name.trim();
-        if name.is_empty() || name.starts_with('.') {
+        if name != instance_name {
             return Err(LauncherError::Instance(format!(
                 "Invalid instance name: '{}'",
                 instance_name
             )));
         }
-        check_safe_file_name(name)?;
+        crate::instances::validate_instance_dir_name(name, "Instance name")?;
         std::fs::create_dir_all(instances_dir)?;
-
         let target = instances_dir.join(name);
-        match std::fs::create_dir(&target) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+
+        // Reserve the name before inspecting the directory: another operation
+        // in this process either holds the name (we fail here) or is finished,
+        // so an incomplete directory below is genuinely abandoned.
+        let name_guard =
+            crate::instances::InstanceNameReservation::acquire(instances_dir, &[name])?;
+
+        // Atomic exclusion against launch/edit. Acquired before touching any
+        // existing directory, so an incomplete directory is never moved while
+        // a launch (or another mutation) still owns that name.
+        let prepare = launches
+            .prepare_guard(name)
+            .map_err(|busy| launch_busy_error(name, busy))?;
+
+        if target.exists() {
+            if crate::instance_readiness::is_incomplete_target(&target) {
+                park_incomplete_target(instances_dir, &target, name)?;
+            } else {
                 return Err(LauncherError::Instance(format!(
                     "An instance named '{}' already exists. Choose a different name for the imported pack.",
                     name
-                )))
+                )));
             }
-            Err(e) => return Err(e.into()),
         }
 
+        // Build the directory with its ownership/readiness markers in a
+        // hidden sibling, then rename it into place. A crash at any point
+        // leaves either the old state or a hidden `.void-setup-*.tmp`; it can
+        // never leave an unmarked directory that looks like a real instance.
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let marker = target.join(IMPORT_OWNER_MARKER);
-        if let Err(e) = std::fs::write(&marker, &token) {
-            let _ = std::fs::remove_dir_all(&target);
+        let staging =
+            instances_dir.join(format!(".void-setup-{}.tmp", uuid::Uuid::new_v4().simple()));
+        if let Err(e) = std::fs::create_dir(&staging) {
             return Err(e.into());
         }
+        if let Err(e) = std::fs::write(staging.join(IMPORT_OWNER_MARKER), &token) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e.into());
+        }
+        let pending = crate::instance_readiness::PendingSetup {
+            stage: crate::instance_readiness::SetupStage::Importing,
+            operation: operation.to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            token: token.clone(),
+        };
+        if let Err(e) = crate::instance_readiness::write_pending(&staging, &pending) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&staging, &target) {
+            let _ = std::fs::remove_dir_all(&staging);
+            if target.exists() {
+                return Err(LauncherError::Instance(format!(
+                    "An instance named '{}' already exists. Choose a different name for the imported pack.",
+                    name
+                )));
+            }
+            return Err(e.into());
+        }
+        let marker = target.join(IMPORT_OWNER_MARKER);
+
         Ok(Self {
             target,
             marker,
             token,
+            operation,
+            owns_directory: true,
             committed: false,
+            _name_guard: Some(name_guard),
+            prepare: Some(prepare),
         })
     }
 
-    /// Keep the directory: the import completed and the marker is retired.
-    pub(crate) fn commit(&mut self) {
-        let _ = std::fs::remove_file(&self.marker);
+    /// Re-open an interrupted *preparation* (metadata already exists) so the
+    /// user can finish setup instead of losing a fully imported pack.
+    ///
+    /// An interrupted *import* cannot be resumed: extraction may be half done,
+    /// so the honest recovery is delete + re-import (the UI offers that path).
+    pub(crate) fn resume(
+        instances_dir: &Path,
+        instance_name: &str,
+        launches: &'a crate::launch_state::LaunchRegistry,
+        operation: &'static str,
+    ) -> Result<Self> {
+        let name = instance_name.trim();
+        if name != instance_name {
+            return Err(LauncherError::Instance(format!(
+                "Invalid instance name: '{}'",
+                instance_name
+            )));
+        }
+        crate::instances::validate_instance_dir_name(name, "Instance name")?;
+        let target = instances_dir.join(name);
+        let name_guard =
+            crate::instances::InstanceNameReservation::acquire(instances_dir, &[name])?;
+
+        let Some(mut pending) = crate::instance_readiness::read_pending(&target) else {
+            return Err(LauncherError::Instance(format!(
+                "Instance '{}' is not waiting for setup.",
+                name
+            )));
+        };
+        if pending.stage != crate::instance_readiness::SetupStage::Preparing {
+            return Err(LauncherError::Instance(format!(
+                "The import of '{}' did not finish. Delete the incomplete instance and import the pack again.",
+                name
+            )));
+        }
+        if !target.join("instance.json").is_file() && !target.join("instance.cfg").is_file() {
+            return Err(LauncherError::Instance(format!(
+                "Instance '{}' has no usable metadata; delete it and import the pack again.",
+                name
+            )));
+        }
+
+        let prepare = launches
+            .prepare_guard(name)
+            .map_err(|busy| launch_busy_error(name, busy))?;
+
+        // Refresh the operation label, but keep the original start time so the
+        // UI can still explain when the interrupted operation began.
+        pending.operation = operation.to_string();
+        crate::instance_readiness::write_pending(&target, &pending)?;
+
+        Ok(Self {
+            marker: target.join(IMPORT_OWNER_MARKER),
+            target,
+            token: pending.token,
+            operation,
+            owns_directory: false,
+            committed: false,
+            _name_guard: Some(name_guard),
+            prepare: Some(prepare),
+        })
+    }
+
+    fn marker_matches(&self) -> bool {
+        matches!(
+            std::fs::read_to_string(&self.marker),
+            Ok(token) if token.trim() == self.token
+        )
+    }
+
+    /// Advance the persisted stage. Called once the importer has written
+    /// metadata, so a crash from this point can be resumed.
+    pub(crate) fn set_stage(&self, stage: crate::instance_readiness::SetupStage) -> Result<()> {
+        let Some(mut pending) = crate::instance_readiness::read_pending(&self.target) else {
+            return Err(LauncherError::Instance(format!(
+                "The readiness marker for '{}' disappeared during setup.",
+                self.target.display()
+            )));
+        };
+        if pending.token != self.token {
+            return Err(LauncherError::Instance(format!(
+                "The readiness marker for '{}' belongs to another operation.",
+                self.target.display()
+            )));
+        }
+        pending.stage = stage;
+        crate::instance_readiness::write_pending(&self.target, &pending)
+    }
+
+    /// Keep the directory and make the instance launchable: the import,
+    /// pack-lock write, preparation and final check all succeeded.
+    ///
+    /// If retiring the marker fails, the directory is still kept (it contains
+    /// user data) but the instance stays blocked: the caller receives an
+    /// error instead of a half-published "ready" instance.
+    pub(crate) fn commit(&mut self) -> Result<()> {
+        if self.committed {
+            return Ok(());
+        }
+        // Never delete the directory after this point, even if the marker
+        // cannot be removed.
         self.committed = true;
+        let result = crate::instance_readiness::clear_pending(&self.target, &self.token);
+        // The owner marker has served its purpose once the instance is
+        // published. Failure to remove it is not a readiness problem, but it
+        // should not be left behind silently.
+        if let Err(e) = std::fs::remove_file(&self.marker) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    target: "launcher",
+                    "Could not remove the import owner marker {}: {}",
+                    self.marker.display(),
+                    e
+                );
+            }
+        }
+        // Readiness is decided by the marker; once it is retired the name and
+        // slot must be released now, not whenever the caller drops this
+        // handle. Name first, launch slot last: a launch can only start once
+        // every part of the import lifecycle is finished.
+        self._name_guard.take();
+        self.prepare.take();
+        result.map_err(|e| {
+            LauncherError::Instance(format!(
+                "Instance '{}' was created, but its setup marker could not be cleared ({}). Close any program using the folder and restart the launcher.",
+                self.target.display(),
+                e
+            ))
+        })
+    }
+
+    /// Keep an imported instance on disk but leave its readiness marker in
+    /// place when preparation could not finish (offline first run, loader
+    /// download failure). Launch stays blocked; `cmd_finish_instance_setup`
+    /// can retry without deleting the pack.
+    pub(crate) fn preserve_for_retry(&mut self) {
+        self.committed = true;
+        self.owns_directory = false;
+        self._name_guard.take();
+        self.prepare.take();
+    }
+
+    /// Keep the failure from being masked: best-effort rewrite of the pending
+    /// marker after a failed cleanup, so the leftover directory is still
+    /// refused by the launch gate and visible as "setup incomplete".
+    fn keep_gated(&self) {
+        let pending = crate::instance_readiness::PendingSetup {
+            stage: crate::instance_readiness::SetupStage::Importing,
+            operation: self.operation.to_string(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            token: self.token.clone(),
+        };
+        if crate::instance_readiness::read_pending(&self.target).is_none() {
+            if let Err(e) = crate::instance_readiness::write_pending(&self.target, &pending) {
+                tracing::warn!(
+                    target: "launcher",
+                    "Could not keep {} marked as incomplete: {}",
+                    self.target.display(),
+                    e
+                );
+            }
+        }
     }
 }
 
-impl Drop for InstanceReservation {
+impl Drop for InstanceReservation<'_> {
     fn drop(&mut self) {
         if self.committed {
             return;
         }
-        match std::fs::read_to_string(&self.marker) {
-            Ok(token) if token.trim() == self.token => {
-                tracing::warn!(
-                    target: "launcher",
-                    "Import failed, removing partially-created instance {}",
-                    self.target.display()
-                );
-                if let Err(e) = std::fs::remove_dir_all(&self.target) {
-                    tracing::warn!(
-                        target: "launcher",
-                        "Cleanup of {} failed: {}",
-                        self.target.display(), e
-                    );
-                }
-            }
-            Ok(_) => tracing::warn!(
+        if !self.owns_directory {
+            // A resumed preparation failed: preserve every file and keep the
+            // persistent gate in place. The user can retry or delete.
+            self.keep_gated();
+            tracing::warn!(
+                target: "launcher",
+                "Preparation of {} failed; keeping the instance and its setup marker",
+                self.target.display()
+            );
+            return;
+        }
+        if !self.marker_matches() {
+            // The directory (or its owner marker) is no longer ours. Never
+            // delete it and never write a marker into what another operation
+            // may now own: leave the directory exactly as we found it.
+            tracing::warn!(
                 target: "launcher",
                 "Not removing {}: the import owner marker changed",
                 self.target.display()
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // The import itself (or the user) removed/moved the directory;
-                // there is nothing left this operation owns.
-            }
-            Err(e) => tracing::warn!(
+            );
+            return;
+        }
+        tracing::warn!(
+            target: "launcher",
+            "Import failed, removing partially-created instance {}",
+            self.target.display()
+        );
+        if let Err(e) = std::fs::remove_dir_all(&self.target) {
+            // `remove_dir_all` can delete the marker and then fail on a locked
+            // file, which would expose a partial directory to the launch gate.
+            // Rewrite the marker so the leftover stays refused.
+            self.keep_gated();
+            tracing::warn!(
                 target: "launcher",
-                "Not removing {}: owner marker is unreadable ({})",
-                self.target.display(), e
-            ),
+                "Cleanup of {} failed: {}; the directory stays marked as incomplete",
+                self.target.display(),
+                e
+            );
         }
     }
 }
@@ -1665,24 +2372,138 @@ impl Drop for InstanceReservation {
 ///
 /// The reservation is atomic: an already existing directory (including one
 /// created by a concurrent import) is never touched by this operation.
+#[allow(dead_code)] // test-only convenience; commands use import_with_cleanup_keep
 pub(crate) async fn import_with_cleanup<T, F, Fut>(
     instances_dir: &Path,
     instance_name: &str,
+    launches: &crate::launch_state::LaunchRegistry,
+    operation: &'static str,
     importer: F,
 ) -> Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let mut reservation = InstanceReservation::reserve(instances_dir, instance_name)?;
-    let result = importer().await;
-    if result.is_ok() {
-        reservation.commit();
-    }
-    result
+    let (value, mut reservation) =
+        import_with_cleanup_keep(instances_dir, instance_name, launches, operation, importer)
+            .await?;
+    reservation.commit()?;
+    Ok(value)
 }
 
+/// Same as [`import_with_cleanup`], but returns the live reservation so the
+/// command can keep the directory protected through loader preparation, pack
+/// lock writing and the final instance check. The caller must call
+/// [`InstanceReservation::commit`] on success; dropping it cleans up.
+pub(crate) async fn import_with_cleanup_keep<'a, T, F, Fut>(
+    instances_dir: &Path,
+    instance_name: &str,
+    launches: &'a crate::launch_state::LaunchRegistry,
+    operation: &'static str,
+    importer: F,
+) -> Result<(T, InstanceReservation<'a>)>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let reservation =
+        InstanceReservation::reserve(instances_dir, instance_name, launches, operation)?;
+    let value = importer().await?;
+    Ok((value, reservation))
+}
+
+/// Whether any override was extracted, the embedded index payload, and the
+/// normalized destination keys claimed by the override layers.
+type MrpackLayers = (bool, HashMap<String, Vec<u8>>, HashSet<String>);
+
 /// Import a Modrinth .mrpack
+/// Extract the Modrinth `overrides/` and `client-overrides/` layers under one
+/// shared resource budget. Each layer gets a fresh path-claim registry so a
+/// client file may legally replace the base file, while bytes/files/metadata
+/// are counted for the operation as a whole. Also collects root-level embedded
+/// files (index payload) into memory under the same budget.
+fn extract_mrpack_layers(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    mc_dir: &Path,
+    operation_budget: &ExtractBudget,
+) -> Result<MrpackLayers> {
+    let mut extracted_any = false;
+    let mut embedded: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut embedded_budget = operation_budget.layer_with_entry_limit(MAX_EMBEDDED_BYTES);
+    let mut server_override_budget = operation_budget.layer();
+    let mut client_override_budget = operation_budget.layer();
+    let mut override_keys: HashSet<String> = HashSet::new();
+    check_archive_entry_count(archive.len())?;
+
+    for client_layer in [false, true] {
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| LauncherError::Instance(e.to_string()))?;
+            let entry_name = entry.name().to_string();
+
+            if entry_name == "modrinth.index.json"
+                || entry_name.starts_with("overrides-server/")
+                || entry_name.starts_with("server-overrides/")
+            {
+                continue;
+            }
+
+            if let Some(relative) = extract_mrpack_override(&entry_name) {
+                let is_client_layer = entry_name.starts_with("client-overrides/")
+                    || entry_name.starts_with("overrides-client/");
+                if is_client_layer != client_layer {
+                    continue;
+                }
+                if relative.is_empty() {
+                    continue;
+                }
+                check_safe_relative(relative)?;
+                extracted_any = true;
+
+                if entry.is_dir() {
+                    std::fs::create_dir_all(mc_dir.join(relative))?;
+                } else {
+                    let budget = if client_layer {
+                        &mut client_override_budget
+                    } else {
+                        &mut server_override_budget
+                    };
+                    write_extracted_budgeted(mc_dir, relative, &mut entry, budget)?;
+                    write_override_sidecar(mc_dir, relative, "modrinth");
+                }
+                if let Some(key) = destination_key(relative) {
+                    override_keys.insert(key);
+                }
+                continue;
+            }
+
+            // Embedded files are collected once, during the server-layer pass.
+            if client_layer || entry.is_dir() {
+                continue;
+            }
+
+            check_safe_relative(&entry_name)?;
+            // Embedded files stay in memory: the per-file install tasks below
+            // run concurrently against a shared map, and file-backed lookup
+            // would require re-architecting the concurrency model. Bound the
+            // entries under the same operation-wide budget.
+            if entry.size() > MAX_EMBEDDED_BYTES {
+                return Err(LauncherError::Instance(
+                    "The modpack embeds too much data to install safely".to_string(),
+                ));
+            }
+            let mut buf = Vec::new();
+            (&mut entry)
+                .take(MAX_EMBEDDED_BYTES + 1)
+                .read_to_end(&mut buf)?;
+            embedded_budget.consume_bytes(buf.len() as u64)?;
+            embedded.insert(normalize_zip_path(&entry_name), buf);
+        }
+    }
+    Ok((extracted_any, embedded, override_keys))
+}
+
 pub(crate) async fn import_mrpack(
     instances_dir: &Path,
     path: &str,
@@ -1693,6 +2514,7 @@ pub(crate) async fn import_mrpack(
 
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    check_archive_entry_count(archive.len())?;
 
     // Read index
     let mut index_str = String::new();
@@ -1739,86 +2561,12 @@ pub(crate) async fn import_mrpack(
 
     // Extract overrides/ first, then client-overrides/ (and its synonym
     // overrides-client/) so the documented layered-overrides feature works:
-    // a file present in both layers is replaced by the client variant. Each
-    // layer has its own collision budget, while `override_keys` keeps the
-    // index-vs-override collision check below intact.
-    let mut extracted_any = false;
-    let mut embedded: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut embedded_budget = ExtractBudget::with_limits(MAX_EMBEDDED_BYTES, MAX_EMBEDDED_BYTES);
-    let mut server_override_budget = ExtractBudget::new();
-    let mut client_override_budget = ExtractBudget::new();
-    let mut override_keys: HashSet<String> = HashSet::new();
-    const MAX_EMBEDDED_BYTES: u64 = 1024 * 1024 * 1024;
-
-    for client_layer in [false, true] {
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| LauncherError::Instance(e.to_string()))?;
-            let entry_name = entry.name().to_string();
-
-            if entry_name == "modrinth.index.json"
-                || entry_name.starts_with("overrides-server/")
-                || entry_name.starts_with("server-overrides/")
-            {
-                continue;
-            }
-
-            if let Some(relative) = extract_mrpack_override(&entry_name) {
-                let is_client_layer = entry_name.starts_with("client-overrides/")
-                    || entry_name.starts_with("overrides-client/");
-                if is_client_layer != client_layer {
-                    continue;
-                }
-                if relative.is_empty() {
-                    continue;
-                }
-                check_safe_relative(relative)?;
-                extracted_any = true;
-
-                if entry.is_dir() {
-                    std::fs::create_dir_all(mc_dir.join(relative))?;
-                } else {
-                    let budget = if client_layer {
-                        &mut client_override_budget
-                    } else {
-                        &mut server_override_budget
-                    };
-                    write_extracted_budgeted(&mc_dir, relative, &mut entry, budget)?;
-                    write_override_sidecar(&mc_dir, relative, "modrinth");
-                }
-                if let Some(key) = destination_key(relative) {
-                    override_keys.insert(key);
-                }
-                continue;
-            }
-
-            // Embedded files are collected once, during the server-layer pass.
-            if client_layer || entry.is_dir() {
-                continue;
-            }
-
-            check_safe_relative(&entry_name)?;
-            // Embedded files stay in memory: the per-file install tasks below run
-            // concurrently against a shared map, and file-backed lookup would
-            // require re-architecting the concurrency model. Bound both a single
-            // entry and the total so a malicious pack cannot exhaust RAM.
-            let size = entry.size();
-            if size > MAX_EMBEDDED_BYTES {
-                return Err(LauncherError::Instance(
-                    "The modpack embeds too much data to install safely".to_string(),
-                ));
-            }
-            let mut buf = Vec::new();
-            (&mut entry)
-                .take(MAX_EMBEDDED_BYTES + 1)
-                .read_to_end(&mut buf)?;
-            embedded_budget.reserve_bytes(buf.len() as u64)?;
-            embedded_budget.commit(buf.len() as u64);
-            embedded.insert(normalize_zip_path(&entry_name), buf);
-        }
-    }
-
+    // a file present in both layers is replaced by the client variant. The
+    // helper shares one operation-wide resource budget across both layers and
+    // the embedded payload while keeping path claims per layer.
+    let operation_budget = ExtractBudget::new();
+    let (extracted_any, embedded, override_keys) =
+        extract_mrpack_layers(&mut archive, &mc_dir, &operation_budget)?;
     let embedded = Arc::new(embedded);
 
     if !extracted_any {
@@ -1984,21 +2732,73 @@ pub(crate) async fn import_mrpack(
         notes: String::new(),
     };
 
-    instances::save_instance(instances_dir, &instance, None)?;
+    instances::save_instance_reserved(instances_dir, &instance, None)?;
     tracing::info!(target: "launcher", "Imported Modrinth pack as '{}' ({} client files, {} mods)", instance_name, total, mod_count);
     Ok(instance)
 }
 
-/// Download one CurseForge mod file into an instance's `mods` directory and
-/// write its sidecar. The error carries the file name and a human-readable
-/// reason so the import report (and the retry UI) can name the failed file.
+/// One manifest file resolved to a real content class. The CurseForge file
+/// API does not expose the project class, so it must come from project
+/// metadata; an unresolved project is reported, never installed into `mods/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CfImportTarget {
+    pub project_id: u64,
+    pub file_id: u64,
+    pub class: crate::curseforge::CfContentClass,
+}
+
+pub(crate) fn plan_curseforge_manifest_files(
+    files: &[serde_json::Value],
+    projects: &[crate::curseforge::CfBulkMod],
+) -> (Vec<CfImportTarget>, Vec<FailedImportFile>) {
+    let mut targets = Vec::new();
+    let mut failed = Vec::new();
+    for entry in files {
+        let (Some(project_id), Some(file_id)) =
+            (entry["projectID"].as_u64(), entry["fileID"].as_u64())
+        else {
+            // The caller counts these as skipped; there is nothing to retry.
+            continue;
+        };
+        match crate::curseforge::content_class_from_bulk(projects, project_id) {
+            Some(class) => targets.push(CfImportTarget {
+                project_id,
+                file_id,
+                class,
+            }),
+            None => failed.push(FailedImportFile {
+                file_name: format!("{project_id}:{file_id}"),
+                project_id: Some(project_id),
+                file_id: Some(file_id),
+                reason: "CurseForge project metadata did not identify a supported content class \
+                         (mod, resource pack or shader pack); the file was not installed."
+                    .to_string(),
+                retryable: true,
+            }),
+        }
+    }
+    (targets, failed)
+}
+
+/// Download one CurseForge mod file into the correct content folder of an
+/// instance and write its sidecar. The error carries the file name and a
+/// human-readable reason so the import report (and the retry UI) can name the
+/// failed file.
 pub(crate) async fn install_curseforge_file(
-    mods_dir: &Path,
+    mc_dir: &Path,
+    class: crate::curseforge::CfContentClass,
     pid: u64,
     fid: u64,
     api_key: &str,
     claims: Option<&Mutex<ExtractBudget>>,
 ) -> std::result::Result<String, (String, String)> {
+    let content_dir = mc_dir.join(class.folder());
+    if let Err(e) = std::fs::create_dir_all(&content_dir) {
+        return Err((
+            format!("{}:{}", pid, fid),
+            format!("Cannot create {} folder: {}", class.folder(), e),
+        ));
+    }
     let fallback = format!("{}:{}", pid, fid);
     let cf_file = crate::curseforge::get_mod_file(pid, fid, api_key)
         .await
@@ -2009,8 +2809,8 @@ pub(crate) async fn install_curseforge_file(
         cf_file.display_name.clone()
     };
 
-    // The file name comes from remote metadata and is joined into mods/ —
-    // reject any path component.
+    // The file name comes from remote metadata and is joined into a content
+    // folder вЂ” reject any path component.
     if let Err(e) = check_safe_file_name(&cf_file.file_name) {
         return Err((display, format!("Unsafe file name: {}", e)));
     }
@@ -2018,7 +2818,7 @@ pub(crate) async fn install_curseforge_file(
     // here: a mod that lands on the same destination as an extracted override
     // (or another manifest entry) must be reported, not silently overwrite it.
     if let Some(claims) = claims {
-        let rel = format!("mods/{}", cf_file.file_name);
+        let rel = format!("{}/{}", class.folder(), cf_file.file_name);
         let mut guard = claims.lock().map_err(|_| {
             (
                 display.clone(),
@@ -2029,9 +2829,8 @@ pub(crate) async fn install_curseforge_file(
             return Err((display, e.to_string()));
         }
     }
-    let dest_path = mods_dir.join(&cf_file.file_name);
-    let base = mods_dir.parent().unwrap_or(mods_dir);
-    ensure_no_reparse_points(base, &dest_path)
+    let dest_path = content_dir.join(&cf_file.file_name);
+    ensure_no_reparse_points(mc_dir, &dest_path)
         .map_err(|e| (display.clone(), format!("Unsafe destination: {}", e)))?;
     if let Err(e) =
         crate::curseforge::download_mod_file(pid, fid, &cf_file, api_key, &dest_path).await
@@ -2045,11 +2844,11 @@ pub(crate) async fn install_curseforge_file(
     let fid_str = fid.to_string();
     let hash = cf_file.sha1_hash().map(|s| s.to_string());
     let _ = content::write_sidecar(
-        mods_dir,
+        &content_dir,
         &cf_file.file_name,
         &content::SidecarWrite {
             provider: "curseforge",
-            content_type: "mod",
+            content_type: class.content_type(),
             project_id: Some(&pid_str),
             project_name: Some(&display),
             version_id: None,
@@ -2075,22 +2874,66 @@ pub(crate) async fn retry_curseforge_import_files(
     files: &[(u64, u64)],
     api_key: &str,
 ) -> Result<ImportReport> {
-    let mods_dir = instances_dir
-        .join(instance_name)
-        .join(".minecraft")
-        .join("mods");
-    if !instances_dir.join(instance_name).exists() {
+    let instance_dir = instances_dir.join(instance_name);
+    let mc_dir = instance_dir.join(".minecraft");
+    if !instance_dir.exists() {
         return Err(LauncherError::Instance(format!(
             "Instance '{}' does not exist",
             instance_name
         )));
     }
-    std::fs::create_dir_all(&mods_dir)?;
+    for dir in ["mods", "resourcepacks", "shaderpacks"] {
+        std::fs::create_dir_all(mc_dir.join(dir))?;
+    }
+
+    // Resolve the project class once for the whole retry. A failed metadata
+    // request is a per-file failure with a retryable reason, not a silent
+    // fallback to `mods/`.
+    let mut project_ids: Vec<u64> = files.iter().map(|(pid, _)| *pid).collect();
+    project_ids.sort_unstable();
+    project_ids.dedup();
+    let projects = match crate::curseforge::get_mods_by_ids_chunked(&project_ids, api_key).await {
+        Ok(projects) => projects,
+        Err(e) => {
+            let total = files.len();
+            return Ok(ImportReport {
+                total_files: total,
+                installed: 0,
+                failed: files
+                    .iter()
+                    .map(|(pid, fid)| FailedImportFile {
+                        file_name: format!("{pid}:{fid}"),
+                        project_id: Some(*pid),
+                        file_id: Some(*fid),
+                        reason: format!(
+                            "CurseForge project metadata is unavailable, so the content class \
+                             could not be verified: {e}"
+                        ),
+                        retryable: true,
+                    })
+                    .collect(),
+                skipped: 0,
+                warnings: Vec::new(),
+            });
+        }
+    };
 
     let total = files.len();
     let mut report = ImportReport::complete(total, 0);
     for (pid, fid) in files {
-        match install_curseforge_file(&mods_dir, *pid, *fid, api_key, None).await {
+        let Some(class) = crate::curseforge::content_class_from_bulk(&projects, *pid) else {
+            report.failed.push(FailedImportFile {
+                file_name: format!("{pid}:{fid}"),
+                project_id: Some(*pid),
+                file_id: Some(*fid),
+                reason: "CurseForge project metadata did not identify a supported content class \
+                         (mod, resource pack or shader pack); the file was not installed."
+                    .to_string(),
+                retryable: true,
+            });
+            continue;
+        };
+        match install_curseforge_file(&mc_dir, class, *pid, *fid, api_key, None).await {
             Ok(_) => report.installed += 1,
             Err((name, reason)) => report.failed.push(FailedImportFile {
                 file_name: name,
@@ -2118,6 +2961,7 @@ pub(crate) async fn import_curseforge_pack(
 
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    check_archive_entry_count(archive.len())?;
 
     // Read manifest
     let mut manifest_str = String::new();
@@ -2216,13 +3060,45 @@ pub(crate) async fn import_curseforge_pack(
     let total = files.len();
     let mut report = ImportReport::complete(total, total);
     if total > 0 {
+        // The file endpoint does not expose the project class. Resolve it once
+        // for all projects so resource packs and shaders never land in mods/.
+        let mut project_ids: Vec<u64> = files
+            .iter()
+            .filter_map(|entry| entry["projectID"].as_u64())
+            .collect();
+        project_ids.sort_unstable();
+        project_ids.dedup();
+        let projects = match crate::curseforge::get_mods_by_ids_chunked(
+            &project_ids,
+            curseforge_api_key,
+        )
+        .await
+        {
+            Ok(projects) => projects,
+            Err(e) => {
+                tracing::warn!(
+                    target: "launcher",
+                    "CurseForge project metadata request failed; content will not be guessed: {}",
+                    e
+                );
+                Vec::new()
+            }
+        };
+        let (targets, classification_failed) = plan_curseforge_manifest_files(&files, &projects);
+        let skipped = files
+            .iter()
+            .filter(|entry| {
+                entry["projectID"].as_u64().is_none() || entry["fileID"].as_u64().is_none()
+            })
+            .count();
+        let total_tasks = targets.len();
+
         let semaphore = Arc::new(Semaphore::new(4));
-        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(classification_failed.len()));
         let in_progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let succeeded = Arc::new(AtomicUsize::new(0));
-        let failed_ids = Arc::new(Mutex::new(Vec::<FailedImportFile>::new()));
-        let mut tasks = Vec::with_capacity(total);
-        let mut skipped = 0usize;
+        let failed_ids = Arc::new(Mutex::new(classification_failed));
+        let mut tasks = Vec::with_capacity(total_tasks);
 
         // Initial progress
         emit_progress(
@@ -2230,94 +3106,95 @@ pub(crate) async fn import_curseforge_pack(
             "downloading-mods",
             0,
             total,
-            &format!("Preparing {} mods...", total),
+            &format!("Preparing {} files...", total),
         );
 
-        for (entry_idx, file_entry) in files.into_iter().enumerate() {
-            let project_id = file_entry["projectID"].as_u64();
-            let file_id = file_entry["fileID"].as_u64();
+        for target in targets {
+            let sem = semaphore.clone();
+            let mc_dir = mc_dir.clone();
+            let api_key = curseforge_api_key.to_string();
+            let app_owned = app.cloned();
+            let completed = completed.clone();
+            let in_progress = in_progress.clone();
+            let succeeded = succeeded.clone();
+            let failed_ids = failed_ids.clone();
+            let claims = claims.clone();
+            let pid = target.project_id;
+            let fid = target.file_id;
+            let class = target.class;
 
-            if let (Some(pid), Some(fid)) = (project_id, file_id) {
-                let sem = semaphore.clone();
-                let mods_dir = mods_dir.clone();
-                let api_key = curseforge_api_key.to_string();
-                let app_owned = app.cloned();
-                let completed = completed.clone();
-                let in_progress = in_progress.clone();
-                let succeeded = succeeded.clone();
-                let failed_ids = failed_ids.clone();
-                let claims = claims.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.map_err(|e| format!("Semaphore error: {}", e))?;
+                in_progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                tasks.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await.map_err(|e| format!("Semaphore error: {}", e))?;
-                    in_progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Emit in-progress batch update
+                if let Some(ref a) = app_owned {
+                    let done = completed.load(std::sync::atomic::Ordering::Relaxed);
+                    let inflight = in_progress.load(std::sync::atomic::Ordering::Relaxed);
+                    let _ = a.emit("import-progress", ImportProgressPayload {
+                        stage: "downloading-mods".into(),
+                        current: done,
+                        total,
+                        message: format!("Downloading {} files ({} active)...", total, inflight),
+                        bytes_done: 0,
+                        bytes_total: 0,
+                    });
+                }
 
-                    // Emit in-progress batch update
-                    if let Some(ref a) = app_owned {
-                        let done = completed.load(std::sync::atomic::Ordering::Relaxed);
-                        let inflight = in_progress.load(std::sync::atomic::Ordering::Relaxed);
-                        let _ = a.emit("import-progress", ImportProgressPayload {
-                            stage: "downloading-mods".into(),
-                            current: done,
-                            total,
-                            message: format!("Downloading {} mods ({} active)...", total, inflight),
-                            bytes_done: 0,
-                            bytes_total: 0,
-                        });
+                let result = install_curseforge_file(
+                    &mc_dir,
+                    class,
+                    pid,
+                    fid,
+                    &api_key,
+                    Some(claims.as_ref()),
+                )
+                .await;
+
+                in_progress.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+                let (last_name, file_ok) = match &result {
+                    Ok(name) => {
+                        succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        (name.clone(), true)
                     }
-
-                    let result =
-                        install_curseforge_file(&mods_dir, pid, fid, &api_key, Some(claims.as_ref()))
-                            .await;
-
-                    in_progress.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-
-                    let (last_name, file_ok) = match &result {
-                        Ok(name) => {
-                            succeeded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            (name.clone(), true)
+                    Err((name, reason)) => {
+                        tracing::warn!(target: "launcher", "CurseForge {} install failed ({}:{}): {}", class.label(), pid, fid, reason);
+                        if let Ok(mut failed) = failed_ids.lock() {
+                            failed.push(FailedImportFile {
+                                file_name: name.clone(),
+                                project_id: Some(pid),
+                                file_id: Some(fid),
+                                reason: reason.clone(),
+                                retryable: true,
+                            });
                         }
-                        Err((name, reason)) => {
-                            tracing::warn!(target: "launcher", "CurseForge mod download failed ({}:{}): {}", pid, fid, reason);
-                            if let Ok(mut failed) = failed_ids.lock() {
-                                failed.push(FailedImportFile {
-                                    file_name: name.clone(),
-                                    project_id: Some(pid),
-                                    file_id: Some(fid),
-                                    reason: reason.clone(),
-                                    retryable: true,
-                                });
-                            }
-                            (name.clone(), false)
-                        }
+                        (name.clone(), false)
+                    }
+                };
+
+                // Emit completion progress
+                if let Some(ref a) = app_owned {
+                    let inflight = in_progress.load(std::sync::atomic::Ordering::Relaxed);
+                    let ok = succeeded.load(std::sync::atomic::Ordering::Relaxed);
+                    let msg = if file_ok {
+                        format!("Downloaded: {} ({}/{} installed, {} active)", last_name, ok, total, inflight)
+                    } else {
+                        format!("Failed: {} ({}/{} installed, {} active)", last_name, ok, total, inflight)
                     };
+                    let _ = a.emit("import-progress", ImportProgressPayload {
+                        stage: "downloading-mods".into(),
+                        current: done,
+                        total,
+                        message: msg,
+                        bytes_done: 0,
+                        bytes_total: 0,
+                    });
+                }
 
-                    // Emit completion progress
-                    if let Some(ref a) = app_owned {
-                        let inflight = in_progress.load(std::sync::atomic::Ordering::Relaxed);
-                        let ok = succeeded.load(std::sync::atomic::Ordering::Relaxed);
-                        let msg = if file_ok {
-                            format!("Downloaded: {} ({}/{} installed, {} active)", last_name, ok, total, inflight)
-                        } else {
-                            format!("Failed: {} ({}/{} installed, {} active)", last_name, ok, total, inflight)
-                        };
-                        let _ = a.emit("import-progress", ImportProgressPayload {
-                            stage: "downloading-mods".into(),
-                            current: done,
-                            total,
-                            message: msg,
-                            bytes_done: 0,
-                            bytes_total: 0,
-                        });
-                    }
-
-                    Ok::<_, String>(())
-                }));
-            } else {
-                skipped += 1;
-                tracing::warn!(target: "launcher", "Skipping CurseForge file entry #{}: missing projectID or fileID", entry_idx + 1);
-            }
+                Ok::<_, String>(())
+            }));
         }
 
         // Wait for all downloads to complete
@@ -2326,7 +3203,7 @@ pub(crate) async fn import_curseforge_pack(
         let ok = succeeded.load(std::sync::atomic::Ordering::Relaxed);
         tracing::info!(
             target: "launcher",
-            "CurseForge mod download: {} succeeded, {} failed, {} skipped (no IDs)",
+            "CurseForge content install: {} succeeded, {} failed, {} skipped (no IDs)",
             ok,
             failed_list.len(),
             skipped
@@ -2334,7 +3211,7 @@ pub(crate) async fn import_curseforge_pack(
 
         // A pack with at least one installed file is usable: keep it and let
         // the caller show the failed list with a retry. Only a pack where
-        // nothing at all landed is unrecoverable — return an error so the
+        // nothing at all landed is unrecoverable вЂ” return an error so the
         // caller's cleanup removes the empty shell.
         if import_completion(total, ok) == ImportCompletion::Failed {
             let preview: Vec<String> = failed_list
@@ -2353,7 +3230,7 @@ pub(crate) async fn import_curseforge_pack(
                 String::new()
             };
             return Err(LauncherError::Instance(format!(
-                "CurseForge import failed: none of the {} mod files could be installed.{}{}",
+                "CurseForge import failed: none of the {} pack files could be installed.{}{}",
                 total, details, skipped_note
             )));
         }
@@ -2394,10 +3271,317 @@ pub(crate) async fn import_curseforge_pack(
         notes: String::new(),
     };
 
-    instances::save_instance(instances_dir, &instance, None)?;
+    instances::save_instance_reserved(instances_dir, &instance, None)?;
 
     tracing::info!(target: "launcher", "Imported CurseForge pack as '{}' ({} of {} mods) - loader install pending", instance_name, report.installed, total);
     Ok((instance, report))
+}
+
+/// ATLauncher mod type that changes how the downloaded archive is placed.
+/// Upstream `ModType` also has `texturepackextract` and
+/// `resourcepackextract`; all other types copy the archive verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtlModKind {
+    Normal,
+    Extract,
+    TexturePackExtract,
+    ResourcePackExtract,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AtlModSpec {
+    /// Candidate archive file names from the manifest (`file`, then `name`).
+    pub(crate) names: Vec<String>,
+    pub(crate) kind: AtlModKind,
+    pub(crate) extract_to: Option<String>,
+    pub(crate) extract_folder: Option<String>,
+}
+
+/// Build the extraction description for one ATLauncher mod record. Returns
+/// `None` for ordinary archive types. Shared by local `.zip` import and the
+/// ATLauncher catalog installer so both use identical upstream semantics.
+pub(crate) fn atl_extract_spec(
+    kind: &str,
+    extract_to: Option<&str>,
+    extract_folder: Option<&str>,
+) -> Option<AtlModSpec> {
+    let kind = match kind.trim().to_ascii_lowercase().as_str() {
+        "extract" => AtlModKind::Extract,
+        "texturepackextract" => AtlModKind::TexturePackExtract,
+        "resourcepackextract" => AtlModKind::ResourcePackExtract,
+        _ => return None,
+    };
+    Some(AtlModSpec {
+        names: Vec::new(),
+        kind,
+        extract_to: extract_to.map(str::to_string),
+        extract_folder: extract_folder.map(str::to_string),
+    })
+}
+
+fn atl_mod_specs(instance: &serde_json::Value) -> Vec<AtlModSpec> {
+    let Some(mods) = instance["mods"].as_array() else {
+        return Vec::new();
+    };
+    mods.iter()
+        .filter_map(|entry| {
+            let type_name = entry["type"].as_str().unwrap_or("").to_ascii_lowercase();
+            let kind = match type_name.as_str() {
+                "extract" => AtlModKind::Extract,
+                "texturepackextract" => AtlModKind::TexturePackExtract,
+                "resourcepackextract" => AtlModKind::ResourcePackExtract,
+                _ => AtlModKind::Normal,
+            };
+            let mut names = Vec::new();
+            for key in ["file", "name"] {
+                if let Some(name) = entry[key]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    if !names.iter().any(|existing| existing == name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+            if names.is_empty() {
+                return None;
+            }
+            Some(AtlModSpec {
+                names,
+                kind,
+                extract_to: entry["extractTo"].as_str().map(str::to_string),
+                extract_folder: entry["extractFolder"].as_str().map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+/// Basename an ATLauncher export may use for a mod archive. Only root-level
+/// files and direct `mods/` children are considered, so a same-named config
+/// deep in the tree is never mistaken for the declared mod archive.
+fn atl_source_basename(entry_name: &str) -> Option<&str> {
+    let relative = entry_name.strip_prefix("mods/").unwrap_or(entry_name);
+    (!relative.is_empty() && !relative.contains('/')).then_some(relative)
+}
+
+fn atl_archive_spec<'a>(specs: &'a [AtlModSpec], entry_name: &str) -> Option<&'a AtlModSpec> {
+    let basename = atl_source_basename(entry_name)?;
+    specs.iter().find(|spec| {
+        spec.kind != AtlModKind::Normal
+            && spec
+                .names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(basename))
+    })
+}
+
+fn atl_extract_folder_components(raw: Option<&str>) -> Result<Vec<String>> {
+    let raw = raw.unwrap_or("").trim();
+    if raw.is_empty() {
+        return Err(LauncherError::Instance(
+            "ATLauncher extract mod has no extractFolder".to_string(),
+        ));
+    }
+    let normalised = normalize_zip_path(raw);
+    let normalised = normalised.trim_matches('/');
+    if normalised.is_empty() || normalised == "." {
+        return Ok(Vec::new());
+    }
+    check_safe_relative(normalised)?;
+    let components: Vec<String> = normalised
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(|part| part.to_string())
+        .collect();
+    if components.is_empty() {
+        return Err(LauncherError::Instance(format!(
+            "ATLauncher extractFolder is empty: {raw}"
+        )));
+    }
+    Ok(components)
+}
+
+fn atl_strip_folder(entry_name: &str, folder: &[String]) -> Option<String> {
+    let normalised = normalize_zip_path(entry_name);
+    let parts: Vec<&str> = normalised
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts.len() <= folder.len() {
+        return None;
+    }
+    for (part, expected) in parts.iter().zip(folder.iter()) {
+        if !part.eq_ignore_ascii_case(expected) {
+            return None;
+        }
+    }
+    Some(parts[folder.len()..].join("/"))
+}
+
+fn atl_copy_entry_to_file(
+    entry: &mut zip::read::ZipFile<'_>,
+    dest: &Path,
+    max_bytes: u64,
+) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(dest)?;
+    let mut out = std::io::BufWriter::new(file);
+    let mut written = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = entry.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        written = written.saturating_add(read as u64);
+        if written > max_bytes {
+            return Err(LauncherError::Instance(
+                "ATLauncher mod archive exceeds the safe extraction limit".to_string(),
+            ));
+        }
+        out.write_all(&buffer[..read])?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// Remove an unpublished ATL staging tree on every return path.
+struct AtlStageGuard(PathBuf);
+
+impl Drop for AtlStageGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Publish every file from `stage` under `mc_dir`, preserving the relative
+/// path. Paths were already claimed in the shared budget while they were
+/// extracted; this step only performs the atomic same-volume move.
+fn atl_publish_staged(stage: &Path, mc_dir: &Path) -> Result<()> {
+    fn walk(root: &Path, dir: &Path, mc_dir: &Path) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if is_unsafe_reparse_point(&meta) {
+                return Err(LauncherError::Instance(format!(
+                    "ATLauncher extraction produced an unsafe link: {}",
+                    path.display()
+                )));
+            }
+            if meta.is_dir() {
+                walk(root, &path, mc_dir)?;
+                continue;
+            }
+            let relative = path.strip_prefix(root).map_err(|_| {
+                LauncherError::Instance("ATLauncher staging path escaped its root".to_string())
+            })?;
+            let relative_text = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            check_safe_relative(&relative_text)?;
+            let dest = mc_dir.join(relative);
+            ensure_no_reparse_points(mc_dir, &dest)?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            ensure_no_reparse_points(mc_dir, &dest)?;
+            std::fs::rename(&path, &dest)?;
+            write_override_sidecar(mc_dir, &relative_text, "atlauncher");
+        }
+        Ok(())
+    }
+    walk(stage, stage, mc_dir)
+}
+
+/// Expand one ATLauncher `extract`/`texturepackextract`/`resourcepackextract`
+/// archive into the instance. `source` is a file inside the ATL staging tree.
+pub(crate) fn atl_extract_mod_archive(
+    source: &Path,
+    spec: &AtlModSpec,
+    staging: &Path,
+    mc_dir: &Path,
+    final_budget: &mut ExtractBudget,
+) -> Result<()> {
+    let mut nested = zip::ZipArchive::new(std::fs::File::open(source)?)?;
+    check_archive_entry_count(nested.len())?;
+    let (destination_prefix, folder): (&str, Vec<String>) = match spec.kind {
+        AtlModKind::Extract => {
+            let to = spec
+                .extract_to
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    LauncherError::Instance(
+                        "ATLauncher extract mod has no extractTo destination".to_string(),
+                    )
+                })?;
+            let prefix = match to.as_str() {
+                "root" => "",
+                "mods" => "mods",
+                "coremods" => "coremods",
+                other => {
+                    return Err(LauncherError::Instance(format!(
+                        "Unsupported ATLauncher extractTo destination: {other}"
+                    )))
+                }
+            };
+            let folder = atl_extract_folder_components(spec.extract_folder.as_deref())?;
+            (prefix, folder)
+        }
+        AtlModKind::TexturePackExtract => ("texturepacks/extracted", Vec::new()),
+        AtlModKind::ResourcePackExtract => ("resourcepacks/extracted", Vec::new()),
+        AtlModKind::Normal => return Ok(()),
+    };
+
+    let nested_stage = staging.join(format!("nested-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&nested_stage)?;
+    let mut matched_any = false;
+    for i in 0..nested.len() {
+        let mut entry = nested
+            .by_index(i)
+            .map_err(|e| LauncherError::Instance(e.to_string()))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let entry_name = entry.name().to_string();
+        check_safe_relative(&entry_name)?;
+        // For `extract`, upstream copies only the extractFolder subtree; the
+        // folder is a path inside the archive, not a destination folder.
+        let relative = if folder.is_empty() {
+            Some(normalize_zip_path(&entry_name))
+        } else {
+            atl_strip_folder(&entry_name, &folder)
+        };
+        let Some(relative) = relative else {
+            continue;
+        };
+        if relative.is_empty() {
+            continue;
+        }
+        matched_any = true;
+        let final_relative = if destination_prefix.is_empty() {
+            relative
+        } else {
+            format!("{destination_prefix}/{relative}")
+        };
+        write_extracted_budgeted(&nested_stage, &final_relative, &mut entry, final_budget)?;
+    }
+    if !matched_any {
+        return Err(LauncherError::Instance(format!(
+            "ATLauncher extract mod does not contain its extractFolder '{}'",
+            spec.extract_folder.as_deref().unwrap_or("")
+        )));
+    }
+    atl_publish_staged(&nested_stage, mc_dir)?;
+    let _ = std::fs::remove_dir_all(&nested_stage);
+    Ok(())
 }
 
 /// Import an ATLauncher instance
@@ -2408,6 +3592,7 @@ fn import_atlauncher_pack(
 ) -> Result<Instance> {
     // File-backed archive: the pack is not buffered in memory.
     let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    check_archive_entry_count(archive.len())?;
 
     // Read instance.json for metadata
     let mut inst_str = String::new();
@@ -2421,8 +3606,10 @@ fn import_atlauncher_pack(
         }
     }
 
+    let mut mod_specs = Vec::new();
     let (mc_version, loader, loader_version);
     if let Ok(inst) = serde_json::from_str::<serde_json::Value>(&inst_str) {
+        mod_specs = atl_mod_specs(&inst);
         mc_version = inst["minecraftVersion"]
             .as_str()
             .or_else(|| {
@@ -2448,8 +3635,21 @@ fn import_atlauncher_pack(
     let mc_dir = target_dir.join(".minecraft");
     std::fs::create_dir_all(&mc_dir)?;
 
-    // Extract all files with path traversal protection
-    let mut extract_budget = ExtractBudget::new();
+    // All ATL work happens inside the instance so every rename stays on the
+    // same volume; the guard removes unpublished staging on every error path.
+    let staging = mc_dir.join(format!(
+        ".voidlauncher-atl-stage-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&staging)?;
+    let _stage_guard = AtlStageGuard(staging.clone());
+
+    // One shared resource budget for normal files and every nested archive.
+    // Each nested archive has its own path-claim registry only where needed;
+    // final destination paths all live in `final_budget` so conflicts between
+    // archives and outer files are still rejected.
+    let mut final_budget = ExtractBudget::new();
+
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -2460,7 +3660,20 @@ fn import_atlauncher_pack(
         }
         check_safe_relative(&entry_name)?;
 
-        write_extracted_budgeted(&mc_dir, &entry_name, &mut entry, &mut extract_budget)?;
+        if let Some(spec) = atl_archive_spec(&mod_specs, &entry_name) {
+            if spec.kind != AtlModKind::Normal {
+                // The archive is an ATL installation input, not content: it is
+                // expanded according to extractTo/extractFolder and the source
+                // file itself is consumed.
+                let source = staging.join(format!("source-{i}.zip"));
+                atl_copy_entry_to_file(&mut entry, &source, MAX_EXTRACT_ENTRY_BYTES)?;
+                atl_extract_mod_archive(&source, spec, &staging, &mc_dir, &mut final_budget)?;
+                let _ = std::fs::remove_file(&source);
+                continue;
+            }
+        }
+
+        write_extracted_budgeted(&mc_dir, &entry_name, &mut entry, &mut final_budget)?;
         write_override_sidecar(&mc_dir, &entry_name, "atlauncher");
     }
 
@@ -2484,13 +3697,13 @@ fn import_atlauncher_pack(
         notes: String::new(),
     };
 
-    instances::save_instance(instances_dir, &instance, None)?;
+    instances::save_instance_reserved(instances_dir, &instance, None)?;
     tracing::info!(target: "launcher", "Imported ATLauncher pack as '{}'", instance_name);
     Ok(instance)
 }
 
 /// Map a detected mrpack loader key to our LoaderType. Quilt is rejected
-/// with a clear error — Quilt mods are not always Fabric-compatible, so a
+/// with a clear error вЂ” Quilt mods are not always Fabric-compatible, so a
 /// silent conversion would produce a broken instance.
 pub(crate) fn mrpack_loader_type(loader: Option<&str>) -> Result<LoaderType> {
     Ok(match loader {
@@ -2508,7 +3721,7 @@ pub(crate) fn mrpack_loader_type(loader: Option<&str>) -> Result<LoaderType> {
 
 /// Deterministic loader detection from an mrpack manifest's dependencies
 /// object. Keys can be "fabric-loader", "forge", "neoforge", "quilt-loader"
-/// — and JSON key order is not guaranteed, so we probe known keys in
+/// вЂ” and JSON key order is not guaranteed, so we probe known keys in
 /// priority order instead of taking the first non-minecraft key.
 pub(crate) fn detect_mrpack_loader(
     deps: &serde_json::Map<String, serde_json::Value>,
@@ -2547,6 +3760,45 @@ mod tests {
         assert!(check_safe_relative("../evil.jar").is_err());
         assert!(check_safe_relative("mods/../../evil.jar").is_err());
         assert!(check_safe_relative("mods/..\\..\\evil.jar").is_err());
+    }
+
+    #[test]
+    fn safe_relative_normalizes_windows_trailing_dots_and_spaces() {
+        // Win32 strips trailing dots/spaces before resolving a component, so
+        // every one of these names the parent directory on disk.
+        for bad in [
+            ".. ",
+            "..\\ ",
+            "mods/.. ",
+            "mods\\.. ",
+            "mods/...",
+            "mods/.. .",
+            "mods/. ",
+            ". /evil.jar",
+            "mods/../evil.jar ",
+            "mods\\.. \\evil.jar",
+        ] {
+            assert!(
+                check_safe_relative(bad).is_err(),
+                "Windows-normalised traversal must be rejected: {bad:?}"
+            );
+            assert!(
+                destination_key(bad).is_none(),
+                "the collision key must also reject {bad:?}"
+            );
+        }
+        // Legitimate file names that merely end in a dot/space still map to
+        // their Windows form instead of being treated as traversal.
+        assert!(check_safe_relative("mods/example.").is_ok());
+        assert!(check_safe_relative("mods/example ").is_ok());
+        assert_eq!(
+            destination_key("mods/example."),
+            Some("mods/example".to_string())
+        );
+        assert_eq!(
+            destination_key("Saves.\\World \\level.dat"),
+            Some("saves/world/level.dat".to_string())
+        );
     }
 
     #[test]
@@ -2844,6 +4096,146 @@ mod tests {
         assert!(ExtractBudget::with_limits(100, 5).reserve_bytes(6).is_err());
     }
 
+    fn open_probe_zip(entries: &[(&str, &[u8])], name: &str) -> (PathBuf, std::fs::File) {
+        let path = temp_probe_zip(name, entries);
+        let file = std::fs::File::open(&path).unwrap();
+        (path, file)
+    }
+
+    fn layered_test_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("vl_{}_{}", tag, uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn layered_override_layers_share_the_total_byte_budget() {
+        let (zip, file) = open_probe_zip(
+            &[
+                ("overrides/config/base.toml", b"123456"),
+                ("client-overrides/config/client.toml", b"654321"),
+            ],
+            "layered_total.mrpack",
+        );
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let dir = layered_test_dir("layered_total");
+        let budget = ExtractBudget::with_limits(10, 10);
+        let err = extract_mrpack_layers(&mut archive, &dir, &budget).unwrap_err();
+        assert!(
+            err.to_string().contains("total limit"),
+            "each layer fits its own 10-byte limit, their sum must fail: {err}"
+        );
+        assert_eq!(budget.total(), 6, "only the first layer was committed");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn a_layer_that_exhausts_the_budget_blocks_the_next_layer() {
+        let (zip, file) = open_probe_zip(
+            &[
+                ("overrides/config/base.toml", b"123456789"),
+                ("client-overrides/config/client.toml", b"12"),
+            ],
+            "layered_remaining.mrpack",
+        );
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let dir = layered_test_dir("layered_remaining");
+        let err = extract_mrpack_layers(&mut archive, &dir, &ExtractBudget::with_limits(10, 10))
+            .unwrap_err();
+        assert!(err.to_string().contains("total limit"), "got: {err}");
+        assert!(!dir.join("config/client.toml").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn embedded_payload_consumes_the_same_operation_budget_as_overrides() {
+        let (zip, file) = open_probe_zip(
+            &[
+                ("overrides/config/base.toml", b"123456"),
+                ("embedded.bin", b"abcdef"),
+            ],
+            "layered_embedded.mrpack",
+        );
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let dir = layered_test_dir("layered_embedded");
+        let err = extract_mrpack_layers(&mut archive, &dir, &ExtractBudget::with_limits(10, 10))
+            .unwrap_err();
+        assert!(err.to_string().contains("total limit"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn legal_layer_overlap_keeps_client_priority_with_a_shared_budget() {
+        let (zip, file) = open_probe_zip(
+            &[
+                ("overrides/config/shared.toml", b"base"),
+                ("client-overrides/config/shared.toml", b"client"),
+            ],
+            "layered_overlap.mrpack",
+        );
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let dir = layered_test_dir("layered_overlap");
+        extract_mrpack_layers(&mut archive, &dir, &ExtractBudget::with_limits(100, 100)).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("config/shared.toml")).unwrap(),
+            b"client"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn duplicate_path_inside_one_layer_is_still_rejected() {
+        let (zip, file) = open_probe_zip(
+            &[
+                ("overrides/config/a.toml", b"one"),
+                ("overrides/config/A.TOML", b"two"),
+            ],
+            "layered_duplicate.mrpack",
+        );
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let dir = layered_test_dir("layered_duplicate");
+        let err = extract_mrpack_layers(&mut archive, &dir, &ExtractBudget::with_limits(100, 100))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Duplicate or conflicting"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn file_count_limit_stops_a_flood_of_empty_entries() {
+        let (zip, file) = open_probe_zip(
+            &[
+                ("overrides/a", b""),
+                ("overrides/b", b""),
+                ("client-overrides/c", b""),
+            ],
+            "layered_empty_files.mrpack",
+        );
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let dir = layered_test_dir("layered_empty_files");
+        let budget = ExtractBudget::with_all_limits(1000, 1000, 2, 1000);
+        let err = extract_mrpack_layers(&mut archive, &dir, &budget).unwrap_err();
+        assert!(err.to_string().contains("file count limit"), "got: {err}");
+        assert_eq!(budget.files(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn path_metadata_limit_bounds_attacker_controlled_names() {
+        let mut budget = ExtractBudget::with_all_limits(1000, 1000, 1000, 8);
+        let err = budget.claim_path("config/long-name.toml").unwrap_err();
+        assert!(err.to_string().contains("path metadata"), "got: {err}");
+    }
+
     #[test]
     fn mrpack_detect_fabric_loader_key() {
         let deps: serde_json::Map<String, serde_json::Value> =
@@ -2987,6 +4379,66 @@ mod tests {
     }
 
     #[test]
+    fn curseforge_manifest_files_route_by_project_class() {
+        let files = serde_json::json!([
+            {"projectID": 1, "fileID": 10},
+            {"projectID": 2, "fileID": 20},
+            {"projectID": 3, "fileID": 30},
+            {"projectID": 4, "fileID": 40},
+            {"projectID": 5, "fileID": 50}
+        ]);
+        let projects = vec![
+            crate::curseforge::CfBulkMod {
+                id: 1,
+                name: "Mod".into(),
+                class_id: Some(6),
+                latest_files: Vec::new(),
+                latest_files_indexes: Vec::new(),
+            },
+            crate::curseforge::CfBulkMod {
+                id: 2,
+                name: "Pack".into(),
+                class_id: Some(12),
+                latest_files: Vec::new(),
+                latest_files_indexes: Vec::new(),
+            },
+            crate::curseforge::CfBulkMod {
+                id: 3,
+                name: "Shader".into(),
+                class_id: Some(6552),
+                latest_files: Vec::new(),
+                latest_files_indexes: Vec::new(),
+            },
+            crate::curseforge::CfBulkMod {
+                id: 4,
+                name: "Unknown".into(),
+                class_id: Some(999),
+                latest_files: Vec::new(),
+                latest_files_indexes: Vec::new(),
+            },
+        ];
+        let (targets, failed) =
+            plan_curseforge_manifest_files(files.as_array().unwrap(), &projects);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].class, crate::curseforge::CfContentClass::Mod);
+        assert_eq!(
+            targets[1].class,
+            crate::curseforge::CfContentClass::ResourcePack
+        );
+        assert_eq!(
+            targets[2].class,
+            crate::curseforge::CfContentClass::ShaderPack
+        );
+        assert_eq!(failed.len(), 2, "unknown and missing classes are reported");
+        assert!(failed.iter().all(|f| f.retryable));
+        assert!(failed.iter().all(|f| f.reason.contains("content class")));
+        // A missing class must never be turned into `mods/`.
+        assert!(targets
+            .iter()
+            .all(|t| t.project_id != 4 && t.project_id != 5));
+    }
+
+    #[test]
     fn curseforge_custom_overrides_folder_is_supported_and_contained() {
         assert_eq!(
             curseforge_overrides_prefix(&serde_json::json!({})).unwrap(),
@@ -3026,6 +4478,60 @@ mod tests {
         ));
         assert!(result.is_err());
         assert!(!base.parent().unwrap().join("evil.json").exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[tokio::test]
+    async fn mrpack_download_metadata_rejects_spoofed_urls() {
+        let entry = serde_json::json!({
+            "downloads": [
+                "https://cdn.modrinth.com:443@evil.example/payload",
+                "https://cdn.modrinth.com@evil.example/payload",
+                "https://cdn.modrinth.com:8443/data/file.jar",
+                "https://cdn.modrinth.com/data/ok.jar"
+            ]
+        });
+        assert_eq!(
+            resolve_mrpack_urls(&entry, "mods/ok.jar").await,
+            vec!["https://cdn.modrinth.com/data/ok.jar".to_string()]
+        );
+
+        let only_bad = serde_json::json!({
+            "downloads": ["https://cdn.modrinth.com:443@evil.example/payload"]
+        });
+        assert!(
+            resolve_mrpack_urls(&only_bad, "mods/bad.jar")
+                .await
+                .is_empty(),
+            "an unsafe URL must never be handed to the downloader"
+        );
+    }
+
+    #[tokio::test]
+    async fn mrpack_install_rejects_a_spoofed_download_before_any_request() {
+        let base = std::env::temp_dir().join(format!(
+            "vl_mrpack_spoof_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let entry = serde_json::json!({
+            "path": "mods/bad.jar",
+            "hashes": {},
+            "downloads": ["https://cdn.modrinth.com:443@evil.example/payload"]
+        });
+        let embedded = Arc::new(HashMap::new());
+        let err = install_mrpack_file("mods/bad.jar", &entry, &base, &embedded, false)
+            .await
+            .expect_err("the spoofed URL must be rejected");
+        assert!(
+            err.to_string().contains("No download URL"),
+            "unexpected error: {err}"
+        );
+        assert!(!base.join("mods/bad.jar").exists());
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -3136,7 +4642,7 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
-    // ── Import format matrix: probe_modpack across pack formats ──
+    // в”Ђв”Ђ Import format matrix: probe_modpack across pack formats в”Ђв”Ђ
 
     fn temp_probe_zip(name: &str, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
         use std::io::Write;
@@ -3211,7 +4717,7 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    // ── CurseForge partial-success policy ──
+    // в”Ђв”Ђ CurseForge partial-success policy в”Ђв”Ђ
 
     #[test]
     fn validate_import_versions_rejects_path_components() {
@@ -3255,6 +4761,7 @@ mod tests {
             std::env::temp_dir().join(format!("vl_cf_critical_{}", std::process::id()));
         std::fs::create_dir_all(&instances_dir).unwrap();
 
+        let launches = crate::launch_state::LaunchRegistry::new();
         let err = import_modpack(
             &instances_dir,
             zip_path.to_str().unwrap(),
@@ -3262,11 +4769,12 @@ mod tests {
             "",
             &instances_dir,
             None,
+            &launches,
         )
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains("none of the 1 mod files"),
+            err.to_string().contains("none of the 1 pack files"),
             "unexpected error: {}",
             err
         );
@@ -3356,10 +4864,13 @@ mod tests {
             ],
         );
 
-        let mut reservation = InstanceReservation::reserve(&instances_dir, "AT Pack").unwrap();
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let mut reservation =
+            InstanceReservation::reserve(&instances_dir, "AT Pack", &launches, "test").unwrap();
         let instance =
             import_atlauncher_pack(&instances_dir, p.to_str().unwrap(), "AT Pack").unwrap();
-        reservation.commit();
+        reservation.commit().unwrap();
+        drop(reservation);
         assert_eq!(instance.loader, LoaderType::Forge);
         assert_eq!(instance.loader_version.as_deref(), Some("43.3.5"));
         assert!(instances_dir
@@ -3370,11 +4881,218 @@ mod tests {
             .exists());
 
         // A second import into the same name must be refused, not merged.
-        let err = InstanceReservation::reserve(&instances_dir, "AT Pack").unwrap_err();
+        let err =
+            InstanceReservation::reserve(&instances_dir, "AT Pack", &launches, "test").unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {}", err);
 
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn nested_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, data) in entries {
+                writer.start_file(*name, opts).unwrap();
+                writer.write_all(data).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        bytes
+    }
+
+    fn atl_import_fixture(
+        name: &str,
+        mods_json: &str,
+        nested: &[(&str, &[u8])],
+        extra: &[(&str, &[u8])],
+    ) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_atl_fixture_{}_{}",
+            name,
+            uuid::Uuid::new_v4().simple()
+        ));
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let instance_json =
+            format!(r#"{{"name":"{name}","minecraftVersion":"1.20.1","mods":{mods_json}}}"#);
+        let nested_bytes = nested_zip_bytes(nested);
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            ("instance.json", instance_json.as_bytes()),
+            ("mods/extract.zip", nested_bytes.as_slice()),
+        ];
+        entries.extend(extra.iter().copied());
+        let zip = temp_probe_zip(
+            &format!("atl_{}_{}.zip", name, uuid::Uuid::new_v4().simple()),
+            &entries,
+        );
+        (dir, zip)
+    }
+
+    #[test]
+    fn atl_extract_to_mods_coremods_and_root_respects_extract_folder() {
+        for (to, nested_name, expected) in [
+            ("mods", "payload/foo.jar", "mods/foo.jar"),
+            ("coremods", "payload/core.jar", "coremods/core.jar"),
+            ("root", "payload/config/root.toml", "config/root.toml"),
+        ] {
+            let mods_json = format!(
+                r#"[{{"name":"Old","file":"extract.zip","type":"extract","extractTo":"{to}","extractFolder":"payload"}}]"#
+            );
+            let (dir, zip) = atl_import_fixture(
+                &format!("atl_{to}"),
+                &mods_json,
+                &[(nested_name, b"content")],
+                &[],
+            );
+            let instances_dir = dir.join("instances");
+            let instance =
+                import_atlauncher_pack(&instances_dir, zip.to_str().unwrap(), &format!("ATL {to}"))
+                    .unwrap();
+            let mc = instances_dir.join(&instance.name).join(".minecraft");
+            assert!(
+                mc.join(expected).is_file(),
+                "extractTo={to} must publish {expected}"
+            );
+            assert!(
+                !mc.join("mods/extract.zip").exists(),
+                "the extract source archive must be consumed"
+            );
+            assert!(
+                !mc.join("payload").exists(),
+                "extractFolder is an archive-internal path, not a destination"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_file(&zip);
+        }
+    }
+
+    #[test]
+    fn atl_texture_and_resource_pack_extract_use_the_upstream_extracted_folders() {
+        for (kind, target) in [
+            ("texturepackextract", "texturepacks/extracted"),
+            ("resourcepackextract", "resourcepacks/extracted"),
+        ] {
+            let mods_json = format!(r#"[{{"name":"Pack","file":"extract.zip","type":"{kind}"}}]"#);
+            let (dir, zip) = atl_import_fixture(
+                &format!("atl_{kind}"),
+                &mods_json,
+                &[("pack.mcmeta", b"{}"), ("assets/icon.png", b"png")],
+                &[],
+            );
+            let instances_dir = dir.join("instances");
+            let instance =
+                import_atlauncher_pack(&instances_dir, zip.to_str().unwrap(), "ATL Pack").unwrap();
+            let mc = instances_dir.join(&instance.name).join(".minecraft");
+            assert!(mc.join(target).join("pack.mcmeta").is_file());
+            assert!(mc.join(target).join("assets/icon.png").is_file());
+            assert!(!mc.join("mods/extract.zip").exists());
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_file(&zip);
+        }
+    }
+
+    #[test]
+    fn atl_extract_without_extract_folder_is_a_clear_failure() {
+        let mods_json =
+            r#"[{"name":"Old","file":"extract.zip","type":"extract","extractTo":"mods"}]"#;
+        let (dir, zip) =
+            atl_import_fixture("atl_missing_folder", mods_json, &[("foo.jar", b"jar")], &[]);
+        let instances_dir = dir.join("instances");
+        let err =
+            import_atlauncher_pack(&instances_dir, zip.to_str().unwrap(), "ATL Bad").unwrap_err();
+        assert!(
+            err.to_string().contains("extractFolder"),
+            "expected an actionable error, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn atl_extract_rejects_nested_traversal_and_invalid_archives() {
+        let mods_json = r#"[{"name":"Old","file":"extract.zip","type":"extract","extractTo":"mods","extractFolder":"payload"}]"#;
+        let (dir, zip) = atl_import_fixture(
+            "atl_traversal",
+            mods_json,
+            &[("payload/../evil.jar", b"evil")],
+            &[],
+        );
+        let instances_dir = dir.join("instances");
+        let err =
+            import_atlauncher_pack(&instances_dir, zip.to_str().unwrap(), "ATL Evil").unwrap_err();
+        assert!(err.to_string().contains("Path traversal"), "got: {err}");
+        assert!(!instances_dir.join("ATL Evil/evil.jar").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+
+        let dir =
+            std::env::temp_dir().join(format!("vl_atl_invalid_{}", uuid::Uuid::new_v4().simple()));
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let instance_json =
+            format!(r#"{{"name":"ATL Invalid","minecraftVersion":"1.20.1","mods":{mods_json}}}"#);
+        let zip = temp_probe_zip(
+            &format!("atl_invalid_{}.zip", uuid::Uuid::new_v4().simple()),
+            &[
+                ("instance.json", instance_json.as_bytes()),
+                ("mods/extract.zip", b"not-a-zip"),
+            ],
+        );
+        let err = import_atlauncher_pack(&instances_dir, zip.to_str().unwrap(), "ATL Invalid")
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("invalid zip"),
+            "got: {err}"
+        );
+        assert!(!instances_dir.join("ATL Invalid/mods/extract.zip").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn atl_partial_extract_failure_removes_the_instance() {
+        let mods_json = r#"[{"name":"Good","file":"first.zip","type":"extract","extractTo":"mods","extractFolder":"payload"},{"name":"Bad","file":"second.zip","type":"extract","extractTo":"mods","extractFolder":"payload"}]"#;
+        let good = nested_zip_bytes(&[("payload/good.jar", b"good")]);
+        let dir =
+            std::env::temp_dir().join(format!("vl_atl_partial_{}", uuid::Uuid::new_v4().simple()));
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let instance_json =
+            format!(r#"{{"name":"ATL Partial","minecraftVersion":"1.20.1","mods":{mods_json}}}"#);
+        let zip = temp_probe_zip(
+            &format!("atl_partial_{}.zip", uuid::Uuid::new_v4().simple()),
+            &[
+                ("instance.json", instance_json.as_bytes()),
+                ("mods/first.zip", good.as_slice()),
+                ("mods/second.zip", b"not-a-zip"),
+            ],
+        );
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let err = futures::executor::block_on(import_modpack(
+            &instances_dir,
+            zip.to_str().unwrap(),
+            "ATL Partial",
+            "",
+            &dir.join("libraries"),
+            None,
+            &launches,
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("invalid zip"),
+            "got: {err}"
+        );
+        assert!(
+            !instances_dir.join("ATL Partial").exists(),
+            "a failed import must not leave a partially extracted instance"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
     }
 
     fn prism_zip(path: &Path, cfg_name: &str, entries: &[(&str, &[u8])]) {
@@ -3399,6 +5117,40 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    #[test]
+    fn preserving_a_failed_preparation_keeps_the_files_and_the_launch_gate() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_preserve_gated_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let mut reservation =
+            InstanceReservation::reserve(&instances_dir, "Gated", &launches, "import").unwrap();
+        std::fs::write(instances_dir.join("Gated/instance.json"), b"{}").unwrap();
+        reservation
+            .set_stage(crate::instance_readiness::SetupStage::Preparing)
+            .unwrap();
+        reservation.preserve_for_retry();
+        drop(reservation);
+
+        assert!(
+            instances_dir.join("Gated/instance.json").is_file(),
+            "the imported pack must be preserved for a retry"
+        );
+        assert!(
+            crate::instance_readiness::read_pending(&instances_dir.join("Gated")).is_some(),
+            "readiness must stay pending after an incomplete preparation"
+        );
+        assert!(
+            crate::instance_readiness::ensure_launch_ready(&instances_dir.join("Gated"), "Gated")
+                .is_err(),
+            "a pending instance must not be launchable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn prism_import_uses_the_chosen_name_and_cleans_failed_imports() {
         let dir = std::env::temp_dir().join(format!(
@@ -3417,6 +5169,7 @@ mod tests {
         );
 
         // The archive says "Pack Name", but the user typed "Chosen Name".
+        let launches = crate::launch_state::LaunchRegistry::new();
         let outcome = import_modpack(
             &instances_dir,
             good.to_str().unwrap(),
@@ -3424,6 +5177,7 @@ mod tests {
             "",
             &instances_dir,
             None,
+            &launches,
         )
         .await
         .expect("Prism import with a different user-chosen name must succeed");
@@ -3457,6 +5211,7 @@ mod tests {
             "",
             &instances_dir,
             None,
+            &launches,
         )
         .await
         .unwrap_err();
@@ -3474,6 +5229,7 @@ mod tests {
             "",
             &instances_dir,
             None,
+            &launches,
         )
         .await
         .expect("repeat import after cleanup must succeed");
@@ -3492,8 +5248,9 @@ mod tests {
         std::fs::create_dir_all(&instances_dir).unwrap();
         let target = instances_dir.join("Same Name");
 
+        let launches = crate::launch_state::LaunchRegistry::new();
         let (first, second) = tokio::join!(
-            import_with_cleanup(&instances_dir, "Same Name", || async {
+            import_with_cleanup(&instances_dir, "Same Name", &launches, "test", || async {
                 // Hold the reservation long enough for the second future to
                 // attempt (and lose) the same target.
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3501,19 +5258,81 @@ mod tests {
                 std::fs::write(target.join(".minecraft/winner.txt"), b"winner").unwrap();
                 Ok::<_, LauncherError>("first")
             }),
-            import_with_cleanup(&instances_dir, "Same Name", || async {
+            import_with_cleanup(&instances_dir, "Same Name", &launches, "test", || async {
                 Ok::<_, LauncherError>("second")
             }),
         );
 
         assert_eq!(first.expect("first import must win"), "first");
         let err = second.expect_err("second import must be refused");
-        assert!(err.to_string().contains("already exists"), "got: {}", err);
+        assert!(err.to_string().contains("already"), "got: {}", err);
         assert_eq!(
             std::fs::read_to_string(instances_dir.join("Same Name/.minecraft/winner.txt")).unwrap(),
             "winner"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn kept_import_reservation_protects_the_directory_until_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_import_keep_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let target = instances_dir.join("Kept");
+
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let ((), reservation) =
+            import_with_cleanup_keep(&instances_dir, "Kept", &launches, "test", || async {
+                std::fs::create_dir_all(target.join(".minecraft")).unwrap();
+                std::fs::write(target.join(".minecraft/data.txt"), b"data").unwrap();
+                Ok::<_, LauncherError>(())
+            })
+            .await
+            .expect("reserve import");
+        assert!(target.is_dir());
+
+        // While the reservation is alive, a concurrent delete/rename of the
+        // same name must be refused, even after the importer returned.
+        let err = crate::instances::delete_instance(&instances_dir, "Kept")
+            .expect_err("delete must not race post-import preparation")
+            .to_string();
+        assert!(err.contains("operation is already"), "got: {err}");
+        let renamed = crate::instances::Instance::new(
+            "Renamed",
+            "1.20.1",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        let err = crate::instances::save_instance(&instances_dir, &renamed, Some("Kept"))
+            .expect_err("rename must not race post-import preparation")
+            .to_string();
+        assert!(err.contains("operation is already"), "got: {err}");
+        assert_eq!(
+            std::fs::read(target.join(".minecraft/data.txt")).unwrap(),
+            b"data"
+        );
+
+        // Dropping without commit is a failed command: only this operation's
+        // directory is removed.
+        drop(reservation);
+        assert!(!target.exists(), "an uncommitted import is cleaned up");
+
+        // A committed reservation keeps the prepared instance.
+        let ((), mut reservation) =
+            import_with_cleanup_keep(&instances_dir, "Kept", &launches, "test", || async {
+                std::fs::create_dir_all(target.join(".minecraft")).unwrap();
+                Ok::<_, LauncherError>(())
+            })
+            .await
+            .expect("reserve import again");
+        reservation.commit().unwrap();
+        drop(reservation);
+        assert!(target.is_dir(), "a committed import must survive");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3528,7 +5347,8 @@ mod tests {
         std::fs::create_dir_all(&instances_dir).unwrap();
 
         // 1) Partial directory created by this operation is removed.
-        let err = import_with_cleanup(&instances_dir, "Broken", || async {
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let err = import_with_cleanup(&instances_dir, "Broken", &launches, "test", || async {
             let target = instances_dir.join("Broken");
             std::fs::create_dir_all(target.join(".minecraft")).unwrap();
             std::fs::write(target.join(".minecraft/partial.jar"), b"partial").unwrap();
@@ -3546,7 +5366,7 @@ mod tests {
         let existing = instances_dir.join("Existing");
         std::fs::create_dir_all(&existing).unwrap();
         std::fs::write(existing.join("user-data.txt"), b"keep me").unwrap();
-        let err = import_with_cleanup(&instances_dir, "Existing", || async {
+        let err = import_with_cleanup(&instances_dir, "Existing", &launches, "test", || async {
             Ok::<_, LauncherError>(())
         })
         .await
@@ -3557,6 +5377,294 @@ mod tests {
             "keep me"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn readiness_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_readiness_import_{}_{}",
+            tag,
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_pending_marker(
+        instances_dir: &Path,
+        name: &str,
+        stage: crate::instance_readiness::SetupStage,
+        token: &str,
+    ) {
+        let dir = instances_dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::instance_readiness::write_pending(
+            &dir,
+            &crate::instance_readiness::PendingSetup {
+                stage,
+                operation: "import".to_string(),
+                started_at: "2026-11-14T00:00:00Z".to_string(),
+                token: token.to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_is_refused_while_an_import_reservation_is_held() {
+        let dir = readiness_dir("held");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let mut reservation =
+            InstanceReservation::reserve(&instances_dir, "Pack", &launches, "import").unwrap();
+
+        // The importer has already written metadata — the exact state the
+        // previous audit proved launchable.
+        let instance = crate::instances::Instance::new(
+            "Pack",
+            "1.20.1",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        crate::instances::save_instance_reserved(&instances_dir, &instance, None).unwrap();
+        assert!(instances_dir.join("Pack/instance.json").is_file());
+
+        assert_eq!(
+            launches.begin_launch("Pack"),
+            Err(crate::launch_state::LaunchBusy::Preparing),
+            "launch must be refused while post-import preparation is running"
+        );
+        // Case-insensitive: the same Windows directory under another spelling.
+        assert_eq!(
+            launches.begin_launch("pack"),
+            Err(crate::launch_state::LaunchBusy::Preparing)
+        );
+        // A delete/rename is refused too, so cleanup cannot run under a launch.
+        assert_eq!(
+            launches.begin_edit("PACK"),
+            Err(crate::launch_state::LaunchBusy::Preparing)
+        );
+
+        reservation.commit().unwrap();
+        drop(reservation);
+        assert!(
+            launches.begin_launch("Pack").is_ok(),
+            "after commit the instance is launchable again"
+        );
+        assert!(crate::instance_readiness::read_pending(&instances_dir.join("Pack")).is_none());
+        assert!(
+            !instances_dir.join("Pack/.void-import-owner").exists(),
+            "the ownership marker must be retired with the pending marker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_won_prevents_an_import_from_creating_anything() {
+        let dir = readiness_dir("launch-wins");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let token = launches.begin_launch("Pack").expect("launch wins");
+
+        let err = InstanceReservation::reserve(&instances_dir, "Pack", &launches, "import")
+            .expect_err("an import must not start while the launch is preparing");
+        assert!(err.to_string().contains("already starting"), "got: {err}");
+        assert!(
+            !instances_dir.join("Pack").exists(),
+            "the losing import must leave no directory behind"
+        );
+
+        // The same holds for an abandoned incomplete directory: a launch that
+        // owns the name must not have its directory moved aside.
+        write_pending_marker(
+            &instances_dir,
+            "Pack",
+            crate::instance_readiness::SetupStage::Importing,
+            "interrupted",
+        );
+        let err = InstanceReservation::reserve(&instances_dir, "Pack", &launches, "import")
+            .expect_err("the launch still owns the name");
+        assert!(err.to_string().contains("already starting"), "got: {err}");
+        assert!(instances_dir.join("Pack/.void-instance-pending").is_file());
+        let parked = std::fs::read_dir(&instances_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".void-recovery-")
+            })
+            .count();
+        assert_eq!(
+            parked, 0,
+            "nothing may be parked while a launch owns the name"
+        );
+
+        launches.release("Pack", token);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_crashed_import_is_not_launchable_even_with_metadata() {
+        let dir = readiness_dir("crash");
+        let instances_dir = dir.join("instances");
+        let instance = crate::instances::Instance::new(
+            "Pack",
+            "1.20.1",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        crate::instances::create_instance(
+            &instances_dir,
+            &instance,
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .unwrap();
+        // Simulate a crash after metadata but before preparation finished.
+        write_pending_marker(
+            &instances_dir,
+            "Pack",
+            crate::instance_readiness::SetupStage::Preparing,
+            "crashed-owner",
+        );
+
+        // A fresh process has no in-memory Preparing entry, so the registry
+        // alone would grant the launch. The persistent marker must refuse it.
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let token = launches.begin_launch("Pack").expect("registry grants");
+        let err =
+            crate::instance_readiness::ensure_launch_ready(&instances_dir.join("Pack"), "Pack")
+                .expect_err("the persistent readiness gate must refuse an interrupted setup");
+        assert!(err.to_string().contains("not ready"), "got: {err}");
+        launches.release("Pack", token);
+
+        // The user can finish the interrupted preparation.
+        let mut reservation =
+            InstanceReservation::resume(&instances_dir, "Pack", &launches, "repair").unwrap();
+        assert_eq!(
+            launches.begin_launch("Pack"),
+            Err(crate::launch_state::LaunchBusy::Preparing)
+        );
+        reservation.commit().unwrap();
+        drop(reservation);
+        assert!(crate::instance_readiness::ensure_launch_ready(
+            &instances_dir.join("Pack"),
+            "Pack"
+        )
+        .is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_import_cannot_be_resumed_and_a_retry_parks_it() {
+        let dir = readiness_dir("park");
+        let instances_dir = dir.join("instances");
+        let launches = crate::launch_state::LaunchRegistry::new();
+        write_pending_marker(
+            &instances_dir,
+            "Pack",
+            crate::instance_readiness::SetupStage::Importing,
+            "interrupted",
+        );
+        std::fs::write(instances_dir.join("Pack/partial.jar"), b"partial").unwrap();
+
+        let err = InstanceReservation::resume(&instances_dir, "Pack", &launches, "repair")
+            .expect_err("an interrupted import must not be resumed");
+        assert!(err.to_string().contains("did not finish"), "got: {err}");
+
+        // Re-importing the same name parks the incomplete directory instead of
+        // failing or deleting it, then creates a fresh one.
+        let mut reservation =
+            InstanceReservation::reserve(&instances_dir, "Pack", &launches, "import").unwrap();
+        assert!(instances_dir.join("Pack").is_dir());
+        assert!(!instances_dir.join("Pack/partial.jar").exists());
+        let parked: Vec<_> = std::fs::read_dir(&instances_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".void-recovery-")
+            })
+            .collect();
+        assert_eq!(
+            parked.len(),
+            1,
+            "the old files must be preserved, not deleted"
+        );
+        assert!(parked[0].path().join("partial.jar").is_file());
+
+        reservation.commit().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn two_independent_instances_can_be_prepared_at_the_same_time() {
+        let dir = readiness_dir("independent");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let mut a =
+            InstanceReservation::reserve(&instances_dir, "Alpha", &launches, "import").unwrap();
+        let mut b =
+            InstanceReservation::reserve(&instances_dir, "Beta", &launches, "import").unwrap();
+        assert_eq!(
+            launches.begin_launch("Alpha"),
+            Err(crate::launch_state::LaunchBusy::Preparing)
+        );
+        assert_eq!(
+            launches.begin_launch("Beta"),
+            Err(crate::launch_state::LaunchBusy::Preparing)
+        );
+        a.commit().unwrap();
+        assert!(launches.begin_launch("Alpha").is_ok());
+        assert_eq!(
+            launches.begin_launch("Beta"),
+            Err(crate::launch_state::LaunchBusy::Preparing),
+            "committing one import must not release the other"
+        );
+        b.commit().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failed_resume_never_deletes_the_imported_instance() {
+        let dir = readiness_dir("resume-fail");
+        let instances_dir = dir.join("instances");
+        let launches = crate::launch_state::LaunchRegistry::new();
+        write_pending_marker(
+            &instances_dir,
+            "Pack",
+            crate::instance_readiness::SetupStage::Preparing,
+            "resume-owner",
+        );
+        let instance = crate::instances::Instance::new(
+            "Pack",
+            "1.20.1",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        crate::instances::save_instance_reserved(&instances_dir, &instance, None).unwrap();
+        std::fs::write(instances_dir.join("Pack/mods.jar"), b"user data").unwrap();
+
+        {
+            let _reservation =
+                InstanceReservation::resume(&instances_dir, "Pack", &launches, "repair").unwrap();
+            // Dropped without commit == the repair failed.
+        }
+        assert!(instances_dir.join("Pack/mods.jar").is_file());
+        assert!(
+            crate::instance_readiness::read_pending(&instances_dir.join("Pack")).is_some(),
+            "a failed repair must leave the instance blocked, not publish it"
+        );
+        assert!(
+            launches.begin_launch("Pack").is_ok(),
+            "the slot is released"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

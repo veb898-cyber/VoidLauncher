@@ -6267,6 +6267,7 @@ displayName="Autochef's Delight"
         let project = curseforge::CfBulkMod {
             id: 1,
             name: "Test Mod".into(),
+            class_id: None,
             latest_files: Vec::new(),
             latest_files_indexes: vec![
                 {
@@ -6294,6 +6295,7 @@ displayName="Autochef's Delight"
         let project = curseforge::CfBulkMod {
             id: 1,
             name: "Beta Only".into(),
+            class_id: None,
             latest_files: Vec::new(),
             latest_files_indexes: vec![newer, older],
         };
@@ -6308,6 +6310,7 @@ displayName="Autochef's Delight"
         let project = curseforge::CfBulkMod {
             id: 1,
             name: "Test Mod".into(),
+            class_id: None,
             latest_files: Vec::new(),
             latest_files_indexes: vec![
                 cf_index(30, "1.20.1", Some(1)),

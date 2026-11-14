@@ -10,6 +10,15 @@
 //! manager, crash) closes the handle automatically. There is no stale lock
 //! file to clean up. Multiple Tauri windows inside the first process are not
 //! affected: the guard is per process, not per window.
+//!
+//! Residual risk (deliberately not "fixed" with `Global\`): the name lives in
+//! the per-session `Local\` namespace. Two interactive Windows users can each
+//! run one launcher, and a manually redirected/shared data directory would
+//! then be mutated by both processes. Global objects require ACL work and
+//! would still not stop a process started with a different integrity level,
+//! so the in-process registries remain a same-process guarantee only. The
+//! safest deployment is still one data directory per Windows user (the
+//! default `%APPDATA%\VoidLauncher` location).
 
 use std::fmt;
 

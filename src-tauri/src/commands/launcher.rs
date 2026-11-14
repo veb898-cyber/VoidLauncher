@@ -13,10 +13,11 @@ use crate::java_download;
 use crate::launch;
 use crate::modloaders;
 use crate::playtime;
+use crate::verify;
 use crate::versions;
 use crate::AppState;
 use crate::{accounts, i18n};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -236,6 +237,163 @@ pub async fn cmd_install_version(
 /// very same JVM and the native selection follows its probed architecture.
 /// An explicitly configured but broken/incompatible Java is reported instead
 /// of being replaced by another installation or a download.
+/// Load the local asset index, or restore it from Mojang when it is missing or
+/// structurally invalid. Launch must never treat "the file exists" as proof
+/// that its contents are usable.
+async fn ensure_asset_index_for_launch(
+    app: &AppHandle,
+    config: &crate::config::AppConfig,
+    version_info: &versions::VersionInfo,
+) -> Result<versions::AssetIndexData, String> {
+    if crate::import::check_safe_file_name(&version_info.assets).is_err() {
+        return Err(format!(
+            "The Minecraft version metadata names an unsafe asset index: {:?}",
+            version_info.assets
+        ));
+    }
+    let index_path = config
+        .assets_dir()
+        .join("indexes")
+        .join(format!("{}.json", version_info.assets));
+    let mut local_problem = None;
+    if index_path.exists() {
+        match versions::load_asset_index(&index_path)
+            .and_then(|index| verify::validate_asset_index(&index).map(|_| index))
+        {
+            Ok(index) => return Ok(index),
+            Err(e) => {
+                local_problem = Some(e.to_string());
+                events::emit_log(
+                    app,
+                    "warn",
+                    "launch",
+                    &format!(
+                        "Local asset index {} is unusable ({}); restoring it from Mojang.",
+                        version_info.assets, e
+                    ),
+                );
+            }
+        }
+    }
+    if !crate::is_allowed_download_host(&version_info.asset_index.url) {
+        return Err(format!(
+            "Minecraft assets are incomplete: the asset index host is not allowed ({}).",
+            version_info.asset_index.url
+        ));
+    }
+    let index = versions::fetch_asset_index(&version_info.asset_index.url)
+        .await
+        .map_err(|e| {
+            let reason = local_problem
+                .as_deref()
+                .map(|problem| format!(" the local index is invalid ({problem});"))
+                .unwrap_or_default();
+            format!(
+                "Minecraft assets are incomplete:{reason} the asset index could not be \
+                 downloaded. Connect to the internet or run Repair. ({e})"
+            )
+        })?;
+    verify::validate_asset_index(&index).map_err(|e| {
+        format!(
+            "The downloaded asset index for Minecraft {} is invalid: {e}",
+            version_info.assets
+        )
+    })?;
+    if let Some(parent) = index_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&index).map_err(|e| e.to_string())?;
+    let temp = index_path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        version_info.assets,
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&temp, json).map_err(|e| e.to_string())?;
+    if let Err(e) = std::fs::rename(&temp, &index_path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("The restored asset index could not be saved: {e}"));
+    }
+    events::emit_log(
+        app,
+        "info",
+        "launch",
+        &format!("Restored asset index {} from Mojang.", version_info.assets),
+    );
+    Ok(index)
+}
+
+/// Verify every asset object before launch, then download only the objects
+/// that are missing, truncated or fail their hash. Offline this returns a
+/// clear error instead of letting the game start with an incomplete asset set.
+async fn ensure_assets_for_launch(
+    app: &AppHandle,
+    config: &crate::config::AppConfig,
+    version_info: &versions::VersionInfo,
+    index: &versions::AssetIndexData,
+) -> Result<(), String> {
+    let check = verify::check_asset_objects_for_launch(&config.assets_dir(), index)
+        .map_err(|e| format!("Minecraft assets could not be validated: {e}"))?;
+    if check.is_healthy() {
+        tracing::info!(
+            target: "launcher",
+            "Assets verified: {} hashed, {} cached, 0 problems",
+            check.hashed,
+            check.cached
+        );
+    } else {
+        events::emit_log(
+            app,
+            "info",
+            "launch",
+            &format!(
+                "Repairing {} missing or damaged Minecraft asset object(s)...",
+                check.issue_count()
+            ),
+        );
+        let forced: std::collections::HashSet<PathBuf> = check.paths.iter().cloned().collect();
+        download::download_assets_repair(index, &config.assets_dir(), &forced, |completed, total, bytes_done, bytes_total, _msg| {
+            tracing::info!(target: "launcher", "Asset repair {}/{} ({} / {} bytes)", completed, total, bytes_done, bytes_total);
+        })
+        .await
+        .map_err(|e| {
+            format!(
+                "Minecraft assets are incomplete: {} object(s) are missing or damaged and could \
+                 not be downloaded. Connect to the internet or run Repair. ({e})",
+                check.issue_count()
+            )
+        })?;
+        let recheck = verify::check_asset_objects_for_launch(&config.assets_dir(), index)
+            .map_err(|e| format!("Minecraft assets could not be validated: {e}"))?;
+        if !recheck.is_healthy() {
+            let names: Vec<String> = recheck
+                .paths
+                .iter()
+                .take(5)
+                .filter_map(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string)
+                })
+                .collect();
+            return Err(format!(
+                "Minecraft assets are still incomplete after the download ({} object(s) missing \
+                 or damaged{}). Connect to the internet or run Repair.",
+                recheck.issue_count(),
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", names.join(", "))
+                }
+            ));
+        }
+    }
+    // Virtual/legacy mirror for old versions (1.8 and older).
+    download::ensure_virtual_assets(&version_info.assets, index, &config.assets_dir())
+        .map_err(|e| format!("Legacy Minecraft assets could not be prepared: {e}"))?;
+    Ok(())
+}
+
 async fn ensure_java_for_launch(
     app: &AppHandle,
     data_dir: &Path,
@@ -376,6 +534,10 @@ impl<'a> LaunchReservation<'a> {
                     "Instance '{}' is already running. Launch it again after it exits.",
                     instance_name
                 ),
+                crate::launch_state::LaunchBusy::Preparing => format!(
+                    "Instance '{}' is still being set up. Wait for the installation to finish.",
+                    instance_name
+                ),
             })?;
         Ok(Self {
             state,
@@ -414,6 +576,29 @@ impl Drop for LaunchReservation<'_> {
         }
         self.state.launches.release(&self.instance_name, self.token);
     }
+}
+
+/// Backend launch gate: reserve the single-flight slot, then verify the
+/// persistent readiness marker. Keeping both steps together is what makes the
+/// check race-free — an import either holds the slot (this fails) or the slot
+/// is ours until the marker is read, so it cannot publish/remove the directory
+/// in between. Used by `cmd_launch_game`; tested directly without an AppHandle.
+fn acquire_launch_gate<'a>(
+    state: &'a AppState,
+    instance_name: &str,
+) -> Result<LaunchReservation<'a>, String> {
+    let reservation = LaunchReservation::acquire(state, instance_name)?;
+    let instances_dir = state
+        .config
+        .lock()
+        .map_err(|e| e.to_string())?
+        .instances_dir();
+    crate::instance_readiness::ensure_launch_ready(
+        &instances_dir.join(instance_name),
+        instance_name,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(reservation)
 }
 
 /// The account the launcher would use for a normal launch: the explicit
@@ -579,8 +764,10 @@ pub async fn cmd_launch_game(
     // The instance enters `Starting` NOW (before the long download/prepare
     // phase) and is released automatically if this launch fails before the
     // game starts; on success it becomes `Running` until the process exits
-    // (see the exit handler).
-    let mut reservation = match LaunchReservation::acquire(state.inner(), &instance_name) {
+    // (see the exit handler). The same gate also refuses an instance whose
+    // persistent readiness marker is still present (interrupted import or an
+    // import that is preparing in this process).
+    let mut reservation = match acquire_launch_gate(state.inner(), &instance_name) {
         Ok(r) => r,
         Err(msg) => {
             events::emit_log(&app, "warn", "launch", &msg);
@@ -987,55 +1174,13 @@ pub async fn cmd_launch_game(
         })?;
     }
 
-    // Self-heal: ensure the asset index and assets exist (e.g. when the
-    // instance creation was interrupted before the asset step).
-    let index_path = config
-        .assets_dir()
-        .join("indexes")
-        .join(format!("{}.json", version_info.assets));
-    if !index_path.exists() {
-        events::emit_log(
-            &app,
-            "info",
-            "launch",
-            &format!("Downloading asset index {}...", version_info.assets),
-        );
-        if !crate::is_allowed_download_host(&version_info.asset_index.url) {
-            let msg = format!(
-                "Access denied: asset index host not allowed ({})",
-                version_info.asset_index.url
-            );
-            events::emit_log(&app, "error", "launch", &msg);
-            return Err(msg.into());
-        }
-        let asset_index = versions::fetch_asset_index(&version_info.asset_index.url)
-            .await
-            .map_err(|e| {
-                let msg = format!("Failed to fetch asset index: {}", e);
-                events::emit_log(&app, "error", "launch", &msg);
-                msg
-            })?;
-        if let Some(parent) = index_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let index_json = serde_json::to_string_pretty(&asset_index).map_err(|e| e.to_string())?;
-        std::fs::write(&index_path, index_json).map_err(|e| e.to_string())?;
-        events::emit_log(
-            &app,
-            "info",
-            "launch",
-            &format!("Downloading assets for {}...", version_info.assets),
-        );
-        download::download_assets(&asset_index, &config.assets_dir(), |completed, total, bytes_done, bytes_total, _msg| {
-            tracing::info!(target: "launcher", "Asset download {}/{} ({} / {} bytes)", completed, total, bytes_done, bytes_total);
-        })
-        .await
-        .map_err(|e| {
-            let msg = format!("Failed to download assets: {}", e);
-            events::emit_log(&app, "error", "launch", &msg);
-            msg
-        })?;
-    }
+    // Verify the asset index and every object it references before building
+    // the command. "index.json exists" is not proof that the assets exist:
+    // a corrupt index is restored online, and a missing/damaged object is
+    // re-downloaded. Offline, this stops with an actionable error instead of
+    // launching a game that will fail later.
+    let asset_index = ensure_asset_index_for_launch(&app, &config, &version_info).await?;
+    ensure_assets_for_launch(&app, &config, &version_info, &asset_index).await?;
 
     // Ensure loader processor-generated JARs exist (client-*-srg.jar,
     // forge-*-client.jar, NeoForge's patched client, etc.). Do NOT refresh
@@ -1122,24 +1267,6 @@ pub async fn cmd_launch_game(
         return Err(msg.into());
     }
 
-    // Ensure virtual/legacy assets exist for old versions (1.6.x and
-    // older need them as --assetsDir; 1.7.x/1.8.x use them as fallback).
-    let index_path = config
-        .assets_dir()
-        .join("indexes")
-        .join(format!("{}.json", version_info.assets));
-    if index_path.exists() {
-        if let Ok(asset_index) = versions::load_asset_index(&index_path) {
-            if let Err(e) = download::ensure_virtual_assets(
-                &version_info.assets,
-                &asset_index,
-                &config.assets_dir(),
-            ) {
-                tracing::warn!(target: "launcher", "Virtual assets check failed (continuing anyway): {}", e);
-            }
-        }
-    }
-
     events::emit_log(
         &app,
         "info",
@@ -1219,8 +1346,8 @@ pub async fn cmd_launch_game(
         Arc::new(std::sync::Mutex::new(Some(child)));
 
     // Start the playtime session BEFORE releasing the reservation and before
-    // the "close on launch" window close: the CloseRequested handler flushes
-    // active sessions, and the exit watcher finalizes this one by pid. If the
+    // the "close on launch" window close: the app-exit handler flushes active
+    // sessions, and the exit watcher finalizes this one by pid. If the
     // sessions lock is poisoned we stop the freshly started game instead of
     // leaving it marked "running" without tracking — which would block every
     // future relaunch until an app restart.
@@ -1504,6 +1631,56 @@ fn ensure_loader_mc_match(
     Ok(())
 }
 
+/// State shared by every loader-install command. The launch-registry guard and
+/// the instance-name reservation are held for the whole command, so a rename,
+/// delete or launch cannot invalidate the instance between reading its config
+/// and saving the installed profile.
+struct LoaderInstallContext<'a> {
+    _mutation: crate::commands::instances::InstanceMutationGuard<'a>,
+    _name: instances::InstanceNameReservation,
+    instances_dir: std::path::PathBuf,
+    libraries_dir: std::path::PathBuf,
+    versions_dir: std::path::PathBuf,
+    instance: instances::Instance,
+}
+
+impl<'a> LoaderInstallContext<'a> {
+    fn acquire(state: &'a AppState, instance_name: &str) -> Result<Self, String> {
+        // No config lock may be held here: the mutation guard reads data_dir
+        // through the same mutex.
+        let mutation =
+            crate::commands::instances::InstanceMutationGuard::acquire(state, instance_name)?;
+        let (instances_dir, libraries_dir, versions_dir) = {
+            let config = state.config.lock().map_err(|e| e.to_string())?;
+            (
+                config.instances_dir(),
+                config.libraries_dir(),
+                config.versions_dir(),
+            )
+        };
+        let name = instances::InstanceNameReservation::acquire(&instances_dir, &[instance_name])
+            .map_err(|e| e.to_string())?;
+        let instance =
+            instances::get_instance(&instances_dir, instance_name).map_err(|e| e.to_string())?;
+        Ok(Self {
+            _mutation: mutation,
+            _name: name,
+            instances_dir,
+            libraries_dir,
+            versions_dir,
+            instance,
+        })
+    }
+
+    /// Save metadata of the instance this operation started with. The
+    /// reservation is already held, so the non-reserving variant must be used:
+    /// acquiring it again would deadlock the name registry.
+    fn save(&self, instance: &instances::Instance) -> Result<(), String> {
+        instances::save_instance_existing_reserved(&self.instances_dir, instance, None)
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_install_fabric(
     state: State<'_, AppState>,
@@ -1514,14 +1691,9 @@ pub async fn cmd_install_fabric(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
     let lang = lang.as_deref().unwrap_or("en");
-    let libraries_dir = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
-        ensure_loader_mc_match(lang, "Fabric", &instance, &mc_version)?;
-        config.libraries_dir()
-    };
-    let profile = modloaders::fabric::install(&mc_version, &loader_version, &libraries_dir)
+    let ctx = LoaderInstallContext::acquire(state.inner(), &instance_name)?;
+    ensure_loader_mc_match(lang, "Fabric", &ctx.instance, &mc_version)?;
+    let profile = modloaders::fabric::install(&mc_version, &loader_version, &ctx.libraries_dir)
         .await
         .map_err(|e| {
             i18n::tr(
@@ -1531,15 +1703,11 @@ pub async fn cmd_install_fabric(
             )
         })?;
 
-    // Save loader profile to instance
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
+    let mut instance = ctx.instance.clone();
     instance.loader = instances::LoaderType::Fabric;
     instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None)
-        .map_err(|e| e.to_string())?;
+    ctx.save(&instance)?;
     Ok(())
 }
 
@@ -1553,33 +1721,28 @@ pub async fn cmd_install_forge(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
     let lang = lang.as_deref().unwrap_or("en");
-    let (libraries_dir, versions_dir) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
-        ensure_loader_mc_match(lang, "Forge", &instance, &mc_version)?;
-        (config.libraries_dir(), config.versions_dir())
-    };
-    let profile =
-        modloaders::forge::install(&mc_version, &loader_version, &libraries_dir, &versions_dir)
-            .await
-            .map_err(|e| {
-                i18n::tr(
-                    lang,
-                    "loader_install_failed",
-                    &[("loader", "Forge"), ("error", &e.to_string())],
-                )
-            })?;
+    let ctx = LoaderInstallContext::acquire(state.inner(), &instance_name)?;
+    ensure_loader_mc_match(lang, "Forge", &ctx.instance, &mc_version)?;
+    let profile = modloaders::forge::install(
+        &mc_version,
+        &loader_version,
+        &ctx.libraries_dir,
+        &ctx.versions_dir,
+    )
+    .await
+    .map_err(|e| {
+        i18n::tr(
+            lang,
+            "loader_install_failed",
+            &[("loader", "Forge"), ("error", &e.to_string())],
+        )
+    })?;
 
-    // Save loader profile to instance
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
+    let mut instance = ctx.instance.clone();
     instance.loader = instances::LoaderType::Forge;
     instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None)
-        .map_err(|e| e.to_string())?;
+    ctx.save(&instance)?;
     Ok(())
 }
 
@@ -1593,18 +1756,13 @@ pub async fn cmd_install_neoforge(
 ) -> Result<(), String> {
     validate_instance_name(&instance_name)?;
     let lang = lang.as_deref().unwrap_or("en");
-    let (libraries_dir, versions_dir) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
-        ensure_loader_mc_match(lang, "NeoForge", &instance, &mc_version)?;
-        (config.libraries_dir(), config.versions_dir())
-    };
+    let ctx = LoaderInstallContext::acquire(state.inner(), &instance_name)?;
+    ensure_loader_mc_match(lang, "NeoForge", &ctx.instance, &mc_version)?;
     let profile = modloaders::neoforge::install(
         &mc_version,
         &loader_version,
-        &libraries_dir,
-        &versions_dir,
+        &ctx.libraries_dir,
+        &ctx.versions_dir,
         None,
     )
     .await
@@ -1616,15 +1774,11 @@ pub async fn cmd_install_neoforge(
         )
     })?;
 
-    // Save loader profile to instance
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
+    let mut instance = ctx.instance.clone();
     instance.loader = instances::LoaderType::NeoForge;
     instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None)
-        .map_err(|e| e.to_string())?;
+    ctx.save(&instance)?;
     Ok(())
 }
 
@@ -1639,37 +1793,27 @@ pub async fn cmd_install_instance_loader(
     validate_instance_name(&instance_name)?;
     let lang = lang.as_deref().unwrap_or("en");
 
-    let (libraries_dir, versions_dir, loader_type, loader_version, mc_version) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
-
-        let loader_type = match instance.loader {
-            instances::LoaderType::Fabric => "Fabric",
-            instances::LoaderType::Forge => "Forge",
-            instances::LoaderType::NeoForge => "NeoForge",
-            instances::LoaderType::Vanilla => {
-                return Err(i18n::tr(lang, "instance_no_loader", &[]));
-            }
-        };
-        let loader_version = instance
-            .loader_version
-            .clone()
-            .ok_or_else(|| i18n::tr(lang, "instance_no_loader_version", &[]))?;
-        (
-            config.libraries_dir(),
-            config.versions_dir(),
-            loader_type.to_string(),
-            loader_version,
-            instance.mc_version.clone(),
-        )
+    let ctx = LoaderInstallContext::acquire(state.inner(), &instance_name)?;
+    let loader_type = match ctx.instance.loader {
+        instances::LoaderType::Fabric => "Fabric",
+        instances::LoaderType::Forge => "Forge",
+        instances::LoaderType::NeoForge => "NeoForge",
+        instances::LoaderType::Vanilla => {
+            return Err(i18n::tr(lang, "instance_no_loader", &[]));
+        }
     };
+    let loader_version = ctx
+        .instance
+        .loader_version
+        .clone()
+        .ok_or_else(|| i18n::tr(lang, "instance_no_loader_version", &[]))?;
+    let mc_version = ctx.instance.mc_version.clone();
 
     let installing_msg = i18n::tr(
         lang,
         "installing_loader",
         &[
-            ("loader", &loader_type),
+            ("loader", loader_type),
             ("version", &loader_version),
             ("mc", &mc_version),
         ],
@@ -1678,18 +1822,18 @@ pub async fn cmd_install_instance_loader(
         "loader-install-progress",
         serde_json::json!({ "stage": "start", "message": installing_msg }),
     );
-    let downloading_msg = i18n::tr(lang, "downloading_loader_libs", &[("loader", &loader_type)]);
+    let downloading_msg = i18n::tr(lang, "downloading_loader_libs", &[("loader", loader_type)]);
     let _ = app.emit(
         "loader-install-progress",
         serde_json::json!({ "stage": "download", "message": downloading_msg }),
     );
 
     let profile = modloaders::install_loader(
-        &loader_type,
+        loader_type,
         &mc_version,
         &loader_version,
-        &libraries_dir,
-        &versions_dir,
+        &ctx.libraries_dir,
+        &ctx.versions_dir,
         Some(&app),
     )
     .await
@@ -1697,7 +1841,7 @@ pub async fn cmd_install_instance_loader(
         let msg = i18n::tr(
             lang,
             "loader_install_failed",
-            &[("loader", &loader_type), ("error", &e.to_string())],
+            &[("loader", loader_type), ("error", &e.to_string())],
         );
         let _ = app.emit(
             "loader-install-progress",
@@ -1709,15 +1853,13 @@ pub async fn cmd_install_instance_loader(
         msg
     })?;
 
-    // Save profile to instance
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
+    // Save profile to the instance this operation started with. The name
+    // reservation and launch guard held by `ctx` make the path stable.
+    let mut instance = ctx.instance.clone();
     instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None)
-        .map_err(|e| e.to_string())?;
+    ctx.save(&instance)?;
 
-    let msg_done = i18n::tr(lang, "loader_install_success", &[("loader", &loader_type)]);
+    let msg_done = i18n::tr(lang, "loader_install_success", &[("loader", loader_type)]);
     let _ = app.emit(
         "loader-install-progress",
         serde_json::json!({
@@ -1755,33 +1897,23 @@ pub async fn cmd_update_instance_loader(
         return Err(i18n::tr(lang, "instance_no_loader_version", &[]));
     }
 
-    let (libraries_dir, versions_dir, loader_type, mc_version, old_version) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
-
-        let loader_type = match instance.loader {
-            instances::LoaderType::Fabric => "Fabric",
-            instances::LoaderType::Forge => "Forge",
-            instances::LoaderType::NeoForge => "NeoForge",
-            instances::LoaderType::Vanilla => {
-                return Err(i18n::tr(lang, "instance_no_loader", &[]));
-            }
-        };
-        (
-            config.libraries_dir(),
-            config.versions_dir(),
-            loader_type.to_string(),
-            instance.mc_version.clone(),
-            instance.loader_version.clone().unwrap_or_default(),
-        )
+    let ctx = LoaderInstallContext::acquire(state.inner(), &instance_name)?;
+    let loader_type = match ctx.instance.loader {
+        instances::LoaderType::Fabric => "Fabric",
+        instances::LoaderType::Forge => "Forge",
+        instances::LoaderType::NeoForge => "NeoForge",
+        instances::LoaderType::Vanilla => {
+            return Err(i18n::tr(lang, "instance_no_loader", &[]));
+        }
     };
+    let mc_version = ctx.instance.mc_version.clone();
+    let old_version = ctx.instance.loader_version.clone().unwrap_or_default();
 
     let installing_msg = i18n::tr(
         lang,
         "installing_loader",
         &[
-            ("loader", &loader_type),
+            ("loader", loader_type),
             ("version", &loader_version),
             ("mc", &mc_version),
         ],
@@ -1790,18 +1922,18 @@ pub async fn cmd_update_instance_loader(
         "loader-install-progress",
         serde_json::json!({ "stage": "start", "message": installing_msg }),
     );
-    let downloading_msg = i18n::tr(lang, "downloading_loader_libs", &[("loader", &loader_type)]);
+    let downloading_msg = i18n::tr(lang, "downloading_loader_libs", &[("loader", loader_type)]);
     let _ = app.emit(
         "loader-install-progress",
         serde_json::json!({ "stage": "download", "message": downloading_msg }),
     );
 
     let profile = modloaders::install_loader(
-        &loader_type,
+        loader_type,
         &mc_version,
         &loader_version,
-        &libraries_dir,
-        &versions_dir,
+        &ctx.libraries_dir,
+        &ctx.versions_dir,
         Some(&app),
     )
     .await
@@ -1809,7 +1941,7 @@ pub async fn cmd_update_instance_loader(
         let msg = i18n::tr(
             lang,
             "loader_install_failed",
-            &[("loader", &loader_type), ("error", &e.to_string())],
+            &[("loader", loader_type), ("error", &e.to_string())],
         );
         let _ = app.emit(
             "loader-install-progress",
@@ -1821,16 +1953,14 @@ pub async fn cmd_update_instance_loader(
         msg
     })?;
 
-    // Install succeeded: record the new version and profile together.
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut instance = instances::get_instance(&config.instances_dir(), &instance_name)
-        .map_err(|e| e.to_string())?;
+    // Install succeeded: record the new version and profile together on the
+    // instance that was reserved for this operation.
+    let mut instance = ctx.instance.clone();
     instance.loader_version = Some(loader_version.clone());
     instance.loader_profile = Some(profile);
-    instances::save_instance(&config.instances_dir(), &instance, None)
-        .map_err(|e| e.to_string())?;
+    ctx.save(&instance)?;
 
-    let msg_done = i18n::tr(lang, "loader_install_success", &[("loader", &loader_type)]);
+    let msg_done = i18n::tr(lang, "loader_install_success", &[("loader", loader_type)]);
     let _ = app.emit(
         "loader-install-progress",
         serde_json::json!({
@@ -2672,5 +2802,225 @@ mod tests {
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .expect("spawn a disposable test process")
+    }
+
+    // ---- loader installation lifecycle -----------------------------------
+
+    fn state_in(dir: &Path) -> AppState {
+        let config = crate::AppConfig {
+            data_dir: dir.to_path_buf(),
+            ..crate::AppConfig::default()
+        };
+        AppState {
+            config: std::sync::Mutex::new(config),
+            auth_state: std::sync::Mutex::new(crate::auth::AuthState::default()),
+            launches: LaunchRegistry::new(),
+            pack_watcher: std::sync::Mutex::new(None),
+            active_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            room_state: std::sync::Arc::new(crate::rooms::room_state::RoomStateManager::new(dir)),
+            tailscale: crate::rooms::tailscale::TailscaleManager::new(dir.to_path_buf()),
+        }
+    }
+
+    fn loader_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vl-loader-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn launch_gate_refuses_a_pending_instance_and_releases_the_slot() {
+        let dir = loader_test_dir("launch-gate");
+        let state = state_in(&dir);
+        let instances_dir = state.config.lock().unwrap().instances_dir();
+        crate::instances::create_instance(
+            &instances_dir,
+            &crate::instances::Instance::new(
+                "Pack",
+                "1.20.1",
+                crate::instances::LoaderType::Vanilla,
+                None,
+            ),
+            &state.launches,
+        )
+        .unwrap();
+
+        crate::instance_readiness::write_pending(
+            &instances_dir.join("Pack"),
+            &crate::instance_readiness::PendingSetup {
+                stage: crate::instance_readiness::SetupStage::Preparing,
+                operation: "import".to_string(),
+                started_at: "2026-11-14T00:00:00Z".to_string(),
+                token: "gate-owner".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(
+            crate::instance_readiness::read_pending(&instances_dir.join("Pack")).is_some(),
+            "test marker must be readable"
+        );
+        assert_eq!(
+            state.config.lock().unwrap().instances_dir(),
+            instances_dir,
+            "the test and the gate must look at the same directory"
+        );
+        assert!(
+            crate::instance_readiness::ensure_launch_ready(&instances_dir.join("Pack"), "Pack")
+                .is_err(),
+            "the readiness helper itself must refuse"
+        );
+
+        // This is the backend entry point used by cmd_launch_game: it must
+        // refuse even when the UI is bypassed.
+        let err = match acquire_launch_gate(&state, "Pack") {
+            Ok(_) => panic!("a pending instance must not be launchable"),
+            Err(e) => e,
+        };
+        assert!(err.contains("not ready"), "got: {err}");
+        assert_eq!(
+            state.launches.phase("Pack"),
+            None,
+            "a refused launch must not leave the instance reserved"
+        );
+
+        crate::instance_readiness::clear_pending(&instances_dir.join("Pack"), "gate-owner")
+            .unwrap();
+        let reservation = acquire_launch_gate(&state, "Pack").expect("ready instance launches");
+        assert_eq!(
+            state.launches.phase("Pack"),
+            Some(crate::launch_state::LaunchPhase::Starting)
+        );
+        drop(reservation);
+        assert_eq!(state.launches.phase("Pack"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_install_holds_the_instance_against_rename_and_delete() {
+        let dir = loader_test_dir("hold");
+        let state = state_in(&dir);
+        let instances_dir = state.config.lock().unwrap().instances_dir();
+        instances::create_instance(
+            &instances_dir,
+            &instances::Instance::new("Pack", "1.20.1", instances::LoaderType::Vanilla, None),
+            &state.launches,
+        )
+        .unwrap();
+
+        let ctx = LoaderInstallContext::acquire(&state, "Pack").expect("reserve loader install");
+
+        let err = instances::delete_instance(&instances_dir, "Pack")
+            .expect_err("delete must not race a loader install")
+            .to_string();
+        assert!(err.contains("operation is already"), "got: {err}");
+        assert!(
+            instances_dir.join("Pack").is_dir(),
+            "the failed delete must leave the instance intact"
+        );
+
+        let renamed =
+            instances::Instance::new("Renamed", "1.20.1", instances::LoaderType::Vanilla, None);
+        let err = instances::save_instance(&instances_dir, &renamed, Some("Pack"))
+            .expect_err("rename must not race a loader install")
+            .to_string();
+        assert!(err.contains("operation is already"), "got: {err}");
+        assert!(instances_dir.join("Pack").is_dir());
+        assert!(!instances_dir.join("Renamed").exists());
+
+        // Releasing the guard (a failed install) makes the instance editable.
+        drop(ctx);
+        assert!(
+            crate::commands::instances::InstanceMutationGuard::acquire(&state, "Pack").is_ok(),
+            "a failed install must not leave the mutation guard held"
+        );
+        instances::delete_instance(&instances_dir, "Pack").expect("delete after release");
+        assert!(!instances_dir.join("Pack").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_reservation_and_world_mutation_guard_are_mutually_exclusive() {
+        let dir = loader_test_dir("world-launch-guard");
+        let state = state_in(&dir);
+
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("launch reservation");
+        let err = match crate::commands::instances::InstanceMutationGuard::acquire(&state, "Pack") {
+            Ok(_) => panic!("a world mutation must be refused while a launch is starting"),
+            Err(e) => e,
+        };
+        assert!(err.contains("still starting"), "got: {err}");
+        drop(reservation);
+
+        let guard = crate::commands::instances::InstanceMutationGuard::acquire(&state, "Pack")
+            .expect("a world mutation must be allowed after the launch slot is released");
+        assert!(
+            LaunchReservation::acquire(&state, "Pack").is_err(),
+            "a launch must be refused while a world mutation owns the instance"
+        );
+        drop(guard);
+
+        assert!(
+            LaunchReservation::acquire(&state, "Pack").is_ok(),
+            "the launch slot must be available again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_save_never_recreates_a_removed_instance() {
+        let dir = loader_test_dir("no-recreate");
+        let state = state_in(&dir);
+        let instances_dir = state.config.lock().unwrap().instances_dir();
+        instances::create_instance(
+            &instances_dir,
+            &instances::Instance::new("Pack", "1.20.1", instances::LoaderType::Vanilla, None),
+            &state.launches,
+        )
+        .unwrap();
+
+        let ctx = LoaderInstallContext::acquire(&state, "Pack").expect("reserve loader install");
+        // Simulate a delete that happened outside this process (the in-process
+        // name registry cannot see another launcher/process).
+        std::fs::remove_dir_all(instances_dir.join("Pack")).unwrap();
+
+        let err = ctx
+            .save(&ctx.instance)
+            .expect_err("saving must not resurrect a deleted instance");
+        assert!(err.contains("no longer exists"), "got: {err}");
+        assert!(
+            !instances_dir.join("Pack").exists(),
+            "a failed save must not recreate the directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_guard_and_launch_are_mutually_exclusive() {
+        let dir = loader_test_dir("launch");
+        let state = state_in(&dir);
+
+        let guard = crate::commands::instances::InstanceMutationGuard::acquire(&state, "Pack")
+            .expect("edit guard");
+        assert_eq!(
+            state.launches.begin_launch("Pack"),
+            Err(crate::launch_state::LaunchBusy::Editing),
+            "a launch must not start while a loader install holds the instance"
+        );
+        drop(guard);
+
+        let launch = state.launches.begin_launch("Pack").expect("launch reserve");
+        assert!(
+            crate::commands::instances::InstanceMutationGuard::acquire(&state, "Pack").is_err(),
+            "a loader install must not start while the game is Starting/Running"
+        );
+        state.launches.release("Pack", launch);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

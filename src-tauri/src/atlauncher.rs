@@ -105,10 +105,13 @@ pub struct AtMod {
     pub hidden: bool,
     #[serde(default)]
     pub library: bool,
-    /// Folder (relative to the instance's `.minecraft`) that an `extract`
-    /// mod is unpacked into. ATLauncher has used both spellings over time.
+    /// ATLauncher `extractTo`: destination class (`root`, `mods`,
+    /// `coremods`) for an `extract` mod. It is NOT a folder inside the
+    /// archive; `extractFolder` is.
     #[serde(default, alias = "extractTo")]
     pub extract_to: Option<String>,
+    /// ATLauncher `extractFolder`: path inside the downloaded archive whose
+    /// contents are copied to `extract_to`.
     #[serde(default, alias = "extractFolder")]
     pub extract_folder: Option<String>,
 }
@@ -380,30 +383,15 @@ fn safe_filename(name: &str) -> String {
 
 fn mod_dest_dir(type_: &str) -> Option<&'static str> {
     match type_.to_lowercase().as_str() {
-        "mods" | "dependency" | "ic2lib" | "denlib" | "coremods" | "jar" => Some("mods"),
-        "resourcepack" | "texturepack" => Some("resourcepacks"),
+        "mods" | "dependency" | "ic2lib" | "denlib" | "jar" => Some("mods"),
+        "coremods" => Some("coremods"),
+        "resourcepack" => Some("resourcepacks"),
+        "texturepack" => Some("texturepacks"),
         "shaderpack" => Some("shaderpacks"),
+        "datapack" => Some("datapacks"),
+        "plugins" => Some("plugins"),
         _ => None,
     }
-}
-
-/// Directory inside `.minecraft` that an `extract` mod unpacks into.
-/// `extractTo`/`extractFolder` are pack-author supplied, so they must stay a
-/// safe relative path: a malicious Configs.json must not extract into the
-/// instance root or outside the game directory.
-fn atl_extract_dest(mc_dir: &Path, m: &AtMod) -> std::result::Result<PathBuf, String> {
-    let relative = m
-        .extract_to
-        .as_deref()
-        .or(m.extract_folder.as_deref())
-        .unwrap_or("")
-        .replace('\\', "/");
-    if relative.is_empty() {
-        return Ok(mc_dir.to_path_buf());
-    }
-    crate::import::check_safe_relative(&relative)
-        .map_err(|e| format!("Unsafe ATLauncher extraction folder '{}': {}", relative, e))?;
-    Ok(mc_dir.join(relative))
 }
 
 fn write_atl_sidecar(dest: &Path, name: &str, version: Option<&str>) {
@@ -697,8 +685,13 @@ pub async fn install_atlauncher_pack(
                         .unwrap_or_else(|| safe_filename(&m.name))
                 });
             let file_name = safe_filename(&file_name);
-            let is_extract = m.type_.eq_ignore_ascii_case("extract");
-            // An `extract` archive is not content: unpack it from a temporary
+            let extract_spec = crate::import::atl_extract_spec(
+                &m.type_,
+                m.extract_to.as_deref(),
+                m.extract_folder.as_deref(),
+            );
+            let is_extract = extract_spec.is_some();
+            // Extraction inputs are not content: unpack them from a temporary
             // directory so a failed extraction never leaves a stray .zip in
             // mods/ (where some loaders would try to read it).
             let dest_dir = if is_extract {
@@ -708,7 +701,15 @@ pub async fn install_atlauncher_pack(
                     .map(|d| mc_dir.join(d))
                     .unwrap_or_else(|| mc_dir.join("mods"))
             };
-            let dest = dest_dir.join(&file_name);
+            let dest = if is_extract {
+                dest_dir.join(format!(
+                    "{}-{}",
+                    uuid::Uuid::new_v4().simple(),
+                    file_name
+                ))
+            } else {
+                dest_dir.join(&file_name)
+            };
             if !is_extract && dest.exists() && !m.optional {
                 let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if let Some(ref a) = app_owned {
@@ -729,15 +730,28 @@ let client = crate::download::global_http_client()
             let result = download_atl_mod(&m, &dest, &client).await;
             match result {
                 Ok(()) => {
-                    if is_extract {
-                        let extract_root = atl_extract_dest(&mc_dir, &m)?;
-                        if let Err(e) =
-                            crate::import::extract_zip_to_dir(&dest, &extract_root)
-                        {
-                            tracing::warn!(target: "launcher", "Failed to extract ATL mod {}: {}", m.name, e);
-                        }
+                    if let Some(spec) = extract_spec {
+                        let staging = mc_dir.join(format!(
+                            ".atl-tmp/staging-{}",
+                            uuid::Uuid::new_v4().simple()
+                        ));
+                        let stage_result = (|| -> std::result::Result<(), String> {
+                            std::fs::create_dir_all(&staging)
+                                .map_err(|e| format!("Cannot create extraction staging: {e}"))?;
+                            let mut budget = crate::import::ExtractBudget::new();
+                            crate::import::atl_extract_mod_archive(
+                                &dest, &spec, &staging, &mc_dir, &mut budget,
+                            )
+                            .map_err(|e| e.to_string())
+                        })();
                         let _ = std::fs::remove_file(&dest);
-                        let _ = std::fs::remove_dir(mc_dir.join(".atl-tmp"));
+                        let _ = std::fs::remove_dir_all(&staging);
+                        if let Err(e) = stage_result {
+                            return Err(format!(
+                                "Failed to extract ATLauncher mod {}: {}",
+                                m.name, e
+                            ));
+                        }
                     } else {
                         write_atl_sidecar(&dest, &m.name, m.version.as_deref());
                     }
@@ -795,8 +809,9 @@ let client = crate::download::global_http_client()
             failed.join("; ")
         )));
     }
+    let _ = std::fs::remove_dir_all(mc_dir.join(".atl-tmp"));
 
-    instances::save_instance(instances_dir, &instance, None)?;
+    instances::save_instance_reserved(instances_dir, &instance, None)?;
     // The terminal "done" event is emitted by the command layer after
     // `prepare_instance_files` — the progress UI stays live until game files
     // and assets are downloaded too.
@@ -835,46 +850,37 @@ mod tests {
         assert_eq!(mod_dest_dir("dependency"), Some("mods"));
         assert_eq!(mod_dest_dir("ic2lib"), Some("mods"));
         assert_eq!(mod_dest_dir("denlib"), Some("mods"));
-        assert_eq!(mod_dest_dir("coremods"), Some("mods"));
+        assert_eq!(mod_dest_dir("coremods"), Some("coremods"));
         assert_eq!(mod_dest_dir("jar"), Some("mods"));
         assert_eq!(mod_dest_dir("resourcepack"), Some("resourcepacks"));
-        assert_eq!(mod_dest_dir("texturepack"), Some("resourcepacks"));
+        assert_eq!(mod_dest_dir("texturepack"), Some("texturepacks"));
         assert_eq!(mod_dest_dir("shaderpack"), Some("shaderpacks"));
+        assert_eq!(mod_dest_dir("datapack"), Some("datapacks"));
         assert_eq!(mod_dest_dir("forge"), None);
         assert_eq!(mod_dest_dir("extract"), None);
     }
 
     #[test]
-    fn atl_extract_to_is_honoured_and_contained() {
-        let mc_dir = std::env::temp_dir().join("vl_atl_extract_dest");
-        let m: AtMod = serde_json::from_value(serde_json::json!({
-            "name": "Configs",
-            "type": "extract",
-            "extractTo": "config/custom"
-        }))
-        .unwrap();
+    fn atl_extract_spec_uses_upstream_field_semantics() {
+        let extract =
+            crate::import::atl_extract_spec("extract", Some("mods"), Some("payload/inside"))
+                .expect("extract type");
+        assert_eq!(extract.kind, crate::import::AtlModKind::Extract);
+        assert_eq!(extract.extract_to.as_deref(), Some("mods"));
+        assert_eq!(extract.extract_folder.as_deref(), Some("payload/inside"));
         assert_eq!(
-            atl_extract_dest(&mc_dir, &m).unwrap(),
-            mc_dir.join("config/custom")
+            crate::import::atl_extract_spec("texturepackextract", None, None)
+                .expect("texture pack")
+                .kind,
+            crate::import::AtlModKind::TexturePackExtract
         );
-
-        let escaped: AtMod = serde_json::from_value(serde_json::json!({
-            "name": "Evil",
-            "type": "extract",
-            "extractTo": "../outside"
-        }))
-        .unwrap();
-        assert!(
-            atl_extract_dest(&mc_dir, &escaped).is_err(),
-            "extractTo must never escape the game directory"
+        assert_eq!(
+            crate::import::atl_extract_spec("resourcepackextract", None, None)
+                .expect("resource pack")
+                .kind,
+            crate::import::AtlModKind::ResourcePackExtract
         );
-
-        let root: AtMod = serde_json::from_value(serde_json::json!({
-            "name": "Root",
-            "type": "extract"
-        }))
-        .unwrap();
-        assert_eq!(atl_extract_dest(&mc_dir, &root).unwrap(), mc_dir);
+        assert!(crate::import::atl_extract_spec("mods", Some("mods"), None).is_none());
     }
 
     #[test]

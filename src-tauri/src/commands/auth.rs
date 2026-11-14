@@ -7,7 +7,27 @@ use crate::config::AppConfig;
 use crate::error::LauncherError;
 use crate::events;
 use crate::AppState;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, State};
+
+/// One async lock per Microsoft account. Refresh tokens rotate; two launches
+/// refreshing the same token concurrently can invalidate each other and the
+/// loser could overwrite the winner's freshly stored session. The second
+/// caller waits, then re-reads the now-valid stored session.
+static MS_SESSION_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+fn ms_session_lock(account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let locks = MS_SESSION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 /// Build the public (token-free) account list for the frontend. Mirrors the
 /// legacy fallback of `ensure_ms_session`: a Microsoft account whose session
@@ -226,6 +246,10 @@ pub(crate) async fn ensure_ms_session(
         config.data_dir.clone()
     };
 
+    // Serialize the whole read/refresh/write sequence for this account.
+    let session_lock = ms_session_lock(&account.id);
+    let _session_guard = session_lock.lock().await;
+
     let mut session = accounts::load_ms_session(&account.id);
     if session.is_none() {
         // Legacy fallback: the single cached session, if it belongs to this account.
@@ -250,71 +274,79 @@ pub(crate) async fn ensure_ms_session(
     // A session that lost its Minecraft token (older builds, interrupted
     // login) is just as unusable as an expired one and can still be repaired
     // from the stored refresh token.
-    if let Some(ms_token) = session.microsoft_token.clone() {
-        let needs_refresh = session
-            .minecraft_token
-            .as_ref()
-            .map_or(true, auth::is_token_expired);
-        if needs_refresh && !ms_token.refresh_token.is_empty() {
-            tracing::info!(target: "launcher", "Refreshing Microsoft token for account '{}'", account.name);
-            match auth::refresh_microsoft_token(&client_id, &ms_token.refresh_token).await {
-                Ok(mut new_ms) => {
-                    // If Microsoft did not return a rotated refresh_token, keep
-                    // the stored one so a future refresh is still possible.
-                    // (Only happens for offline_access scopes; guard the clobber.)
-                    if new_ms.refresh_token.is_empty() {
-                        new_ms.refresh_token = ms_token.refresh_token.clone();
-                    }
-                    match auth::full_auth_flow(&new_ms).await {
-                        Ok((new_mc, new_profile)) => {
-                            tracing::info!(target: "launcher", "Token refreshed for user: {}", new_profile.name);
-                            *session = auth::AuthState {
-                                microsoft_token: Some(new_ms),
-                                minecraft_token: Some(new_mc),
-                                profile: Some(new_profile),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                                offline_mode: false,
-                            };
-                            // Never drop freshly refreshed tokens silently: the
-                            // vault write is retried once inside accounts and a
-                            // persistent failure is logged for diagnosis.
-                            if let Err(e) = accounts::store_ms_session(&account.id, session) {
-                                tracing::error!(
-                                    target: "launcher",
-                                    "Failed to persist refreshed Microsoft session for '{}': {}",
-                                    account.name, e
-                                );
-                            }
-                            let is_active = accounts::list_accounts(&data_dir)
-                                .iter()
-                                .any(|a| a.default && a.id == account.id);
-                            if is_active {
-                                let config = state.config.lock().map_err(|e| e.to_string())?;
-                                if let Err(e) = auth::save_auth_state(&config.auth_file(), session)
-                                {
-                                    tracing::error!(
-                                        target: "launcher",
-                                        "Failed to persist global auth state for '{}': {}",
-                                        account.name, e
-                                    );
-                                }
-                                let mut auth_state =
-                                    state.auth_state.lock().map_err(|e| e.to_string())?;
-                                *auth_state = session.clone();
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(target: "launcher", "Full re-auth failed for '{}': {}", account.name, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(target: "launcher", "Microsoft token refresh failed for '{}': {}", account.name, e);
-                }
+    let needs_refresh = session
+        .minecraft_token
+        .as_ref()
+        .is_none_or(auth::is_token_expired);
+    if needs_refresh {
+        let Some(ms_token) = session.microsoft_token.clone() else {
+            return Err(format!(
+                "Microsoft session for '{}' has expired and cannot be renewed. Sign in again.",
+                account.name
+            ));
+        };
+        if ms_token.refresh_token.is_empty() {
+            return Err(format!(
+                "Microsoft session for '{}' has expired and has no refresh token. Sign in again.",
+                account.name
+            ));
+        }
+
+        tracing::info!(target: "launcher", "Refreshing Microsoft token for account '{}'", account.name);
+        let mut new_ms = auth::refresh_microsoft_token(&client_id, &ms_token.refresh_token)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Microsoft session for '{}' expired and could not be refreshed ({}). Check your connection and try again.",
+                    account.name, e
+                )
+            })?;
+        // If Microsoft did not return a rotated refresh_token, keep the
+        // stored one so a future refresh is still possible.
+        if new_ms.refresh_token.is_empty() {
+            new_ms.refresh_token = ms_token.refresh_token.clone();
+        }
+        let (new_mc, new_profile) = auth::full_auth_flow(&new_ms).await.map_err(|e| {
+            format!(
+                "Microsoft sign-in for '{}' could not obtain a Minecraft token ({}). Sign in again.",
+                account.name, e
+            )
+        })?;
+        tracing::info!(target: "launcher", "Token refreshed for user: {}", new_profile.name);
+        *session = auth::AuthState {
+            microsoft_token: Some(new_ms),
+            minecraft_token: Some(new_mc),
+            profile: Some(new_profile),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            offline_mode: false,
+        };
+        // Never drop freshly refreshed tokens silently: the vault write is
+        // retried once inside accounts and a persistent failure is logged for
+        // diagnosis.
+        if let Err(e) = accounts::store_ms_session(&account.id, session) {
+            tracing::error!(
+                target: "launcher",
+                "Failed to persist refreshed Microsoft session for '{}': {}",
+                account.name, e
+            );
+        }
+        let is_active = accounts::list_accounts(&data_dir)
+            .iter()
+            .any(|a| a.default && a.id == account.id);
+        if is_active {
+            let config = state.config.lock().map_err(|e| e.to_string())?;
+            if let Err(e) = auth::save_auth_state(&config.auth_file(), session) {
+                tracing::error!(
+                    target: "launcher",
+                    "Failed to persist global auth state for '{}': {}",
+                    account.name, e
+                );
             }
+            let mut auth_state = state.auth_state.lock().map_err(|e| e.to_string())?;
+            *auth_state = session.clone();
         }
     }
 
@@ -601,5 +633,46 @@ mod offline_username_tests {
     fn rejects_empty() {
         assert!(validate_offline_username("").is_err());
         assert!(validate_offline_username("   ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_lock_tests {
+    use super::ms_session_lock;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn refreshes_are_serialized_per_account_and_not_across_accounts() {
+        let lock_a = ms_session_lock("account-a");
+        let guard_a = lock_a.lock().await;
+
+        let same_account = tokio::spawn(async move {
+            let lock = ms_session_lock("account-a");
+            let _guard = lock.lock().await;
+            "a"
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !same_account.is_finished(),
+            "two refreshes of one account must not rotate the same token concurrently"
+        );
+
+        let other_account = tokio::time::timeout(Duration::from_secs(1), async {
+            let lock = ms_session_lock("account-b");
+            let _guard = lock.lock().await;
+            "b"
+        })
+        .await
+        .expect("a different account must not wait behind an unrelated refresh");
+        assert_eq!(other_account, "b");
+
+        drop(guard_a);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), same_account)
+                .await
+                .expect("the per-account waiter must resume after release")
+                .unwrap(),
+            "a"
+        );
     }
 }

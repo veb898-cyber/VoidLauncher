@@ -777,11 +777,23 @@ pub fn cmd_save_config(
     // The renderer is not a trust boundary for numeric limits: clamp here so
     // a bad IPC payload can never persist a 0 MB / multi-TB heap.
     let mut new_config = new_config;
-    new_config.default_memory_mb = new_config.default_memory_mb.clamp(2048, 32768);
-    new_config.max_memory_mb = new_config.max_memory_mb.clamp(2048, 32768);
+    new_config.default_memory_mb = new_config
+        .default_memory_mb
+        .clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+    new_config.max_memory_mb = new_config
+        .max_memory_mb
+        .clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+    let gc = new_config.default_gc_preset.trim().to_lowercase();
+    new_config.default_gc_preset = match gc.as_str() {
+        "standard" | "g1gc" | "zgc" => gc,
+        _ => "g1gc".to_string(),
+    };
     if !crate::config::AFTER_LAUNCH_ACTIONS.contains(&new_config.after_launch_action.as_str()) {
         new_config.after_launch_action = "do_nothing".to_string();
     }
+    // The renderer does not know about the migration marker; saving settings
+    // must not downgrade a current config back to the legacy schema.
+    new_config.config_version = crate::config::CONFIG_VERSION;
     *config = new_config;
     if let Err(e) = config.save() {
         // Keep the running session consistent with the disk: a failed write

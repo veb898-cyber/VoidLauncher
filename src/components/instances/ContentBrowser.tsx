@@ -977,7 +977,11 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
         await applyResolution(next);
       }
     } catch (e: any) { addToast(t('content.add_error', { error: e.toString() }), 'error'); }
-    setAddingId(null);
+    finally {
+      // Every path (including the "already added while fetching" return)
+      // must clear the spinner; leaving it set froze the Add button.
+      setAddingId((current) => (current === hit.project_id ? null : current));
+    }
   };
 
   const removeItem = (idx: number) => {

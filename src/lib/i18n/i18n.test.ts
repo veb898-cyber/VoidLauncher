@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { formatPlayTime, formatRelativeTime, t } from './index';
+import { en } from './en';
+import { ru } from './ru';
 import { useLanguageStore } from '../../stores/languageStore';
 
 const setLanguage = (language: 'en' | 'ru') =>
@@ -7,8 +9,14 @@ const setLanguage = (language: 'en' | 'ru') =>
 
 afterEach(() => setLanguage('en'));
 
-describe('translation interpolation', () => {
-  it('treats replacement-pattern characters in values literally', () => {
+describe('translation completeness', () => {
+  it('provides a Russian string for every English key', () => {
+    const missing = Object.keys(en).filter((key) => !(key in ru));
+    expect(missing).toEqual([]);
+  });
+});
+
+describe('translation interpolation', () => {  it('treats replacement-pattern characters in values literally', () => {
     setLanguage('en');
     const value = t('install.progress', { prepared: '$&', total: "$' and $1" });
     expect(value).toContain('$&');

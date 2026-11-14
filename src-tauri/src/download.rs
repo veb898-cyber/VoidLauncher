@@ -12,11 +12,45 @@ const MAX_RETRIES: u32 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 const CONCURRENT_LIMIT: usize = 32;
 
+/// Absolute cap for one artifact written to disk.
+///
+/// Modpacks, game libraries, assets and JVM runtimes are all far below this;
+/// the cap exists so a malicious or misbehaving server cannot fill the disk by
+/// streaming an unbounded body (with no `Content-Length`, the downloader used
+/// to write until the connection closed or the disk was full). It is checked
+/// both against the advertised length and after every received chunk.
+const MAX_SINGLE_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Global pause flag for modpack installs: when set, the currently active
 /// download stops at the next chunk (keeping the .part file) and install
 /// commands fail with `LauncherError::Paused`. Resuming re-runs the install
 /// and `download_to_part` continues from the saved offset via Range.
 static PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+// Test-only fault injection for the file-operation paths that cannot be
+// triggered portably otherwise (a real disk-full error, a failing flush).
+// Compiled out of every non-test build.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_CLIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_write() {
+    FAIL_NEXT_WRITE.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn fail_next_flush() {
+    FAIL_NEXT_FLUSH.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn fail_next_client() {
+    FAIL_NEXT_CLIENT.with(|flag| flag.set(true));
+}
 
 /// Number of pausable operations (modpack installs/updates/repairs) that are
 /// currently running. A pause request is only honoured while at least one is
@@ -114,22 +148,147 @@ pub const ALLOWED_DOWNLOAD_HOSTS: &[&str] = &[
     "pkgs.tailscale.com",
 ];
 
+/// Only the default HTTPS port may be used. A non-default port would let an
+/// allowlisted name point at an unrelated service on the same host.
+const HTTPS_PORT: u16 = 443;
+
+/// Maximum redirects followed by the shared clients. reqwest does not apply
+/// its default limit to a custom policy, so the policy enforces it itself.
+const MAX_REDIRECTS: usize = 10;
+
 /// Check whether `host` is in the allowlist (exact or subdomain match).
+/// Comparison is case-insensitive; the suffix must start at a DNS label
+/// boundary, so `notgithub.com` never matches `github.com`.
 pub fn is_host_allowed(host: &str) -> bool {
-    ALLOWED_DOWNLOAD_HOSTS
-        .iter()
-        .any(|h| host == *h || host.ends_with(&format!(".{}", h)))
+    let host = host.to_ascii_lowercase();
+    ALLOWED_DOWNLOAD_HOSTS.iter().any(|allowed| {
+        host == *allowed
+            || host
+                .strip_suffix(allowed)
+                .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
+    })
 }
 
-/// Redirect policy: follow a redirect only if the destination is HTTPS and
-/// its host is allowlisted, otherwise stop. reqwest follows up to 10
-/// redirects by default without re-validating the target, which would let
-/// a 302 from a trusted host escape to an arbitrary host.
+/// Validate the parts shared by every downloader URL. The host allowlist is
+/// deliberately left to the caller: the global downloader uses the launcher
+/// allowlist, while pinned module clients use their own host set.
+///
+/// This is the single source of truth for URL safety. It parses the real
+/// `reqwest::Url` instead of splitting the string by hand, so userinfo
+/// (`https://cdn.modrinth.com:443@evil.example/`) cannot spoof the host,
+/// backslashes cannot change the parser's host decision, and IP literals,
+/// non-HTTPS schemes and non-default ports are rejected.
+fn parse_https_download_url(raw: &str) -> Result<reqwest::Url> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(LauncherError::Download("Download URL is empty".to_string()));
+    }
+    // The URL parser normalises backslashes in special schemes; reject them
+    // before parsing so a Windows-style path can never be reinterpreted.
+    if raw.chars().any(|c| c.is_control() || c == '\\') {
+        return Err(LauncherError::Download(
+            "Download URL contains invalid characters".to_string(),
+        ));
+    }
+    let url = reqwest::Url::parse(raw)
+        .map_err(|_| LauncherError::Download("Invalid download URL".to_string()))?;
+    if url.scheme() != "https" {
+        return Err(LauncherError::Download(
+            "Download URL must use HTTPS".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(LauncherError::Download(
+            "Download URL must not contain a username or password".to_string(),
+        ));
+    }
+    let host = url.host_str().unwrap_or("");
+    if host.is_empty() {
+        return Err(LauncherError::Download(
+            "Download URL has no host".to_string(),
+        ));
+    }
+    let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
+    if ip_candidate.parse::<std::net::IpAddr>().is_ok() {
+        return Err(LauncherError::Download(
+            "Download URL must not use an IP address".to_string(),
+        ));
+    }
+    if url.port().is_some_and(|port| port != HTTPS_PORT) {
+        return Err(LauncherError::Download(
+            "Download URL uses a non-standard port".to_string(),
+        ));
+    }
+    Ok(url)
+}
+
+/// Validate a download URL against the launcher-wide allowlist.
+pub(crate) fn validate_download_url(raw: &str) -> Result<reqwest::Url> {
+    let url = parse_https_download_url(raw)?;
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    if !is_host_allowed(&host) {
+        return Err(LauncherError::Download(format!(
+            "Download host '{}' is not in the allowlist",
+            host
+        )));
+    }
+    Ok(url)
+}
+
+/// Validate a download URL against a module-owned host set.
+pub(crate) fn validate_download_url_for_hosts(raw: &str, hosts: &[String]) -> Result<reqwest::Url> {
+    let url = parse_https_download_url(raw)?;
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let allowed = hosts.iter().any(|allowed| {
+        host == *allowed
+            || host
+                .strip_suffix(allowed.as_str())
+                .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
+    });
+    if !allowed {
+        return Err(LauncherError::Download(format!(
+            "Download host '{}' is not in this module's allowlist",
+            host
+        )));
+    }
+    Ok(url)
+}
+
+fn redirect_target_allowed(url: &reqwest::Url, previous: usize) -> bool {
+    previous < MAX_REDIRECTS && validate_download_url(url.as_str()).is_ok()
+}
+
+/// Authenticated API requests carry secrets (`x-api-key`) that reqwest does
+/// not strip on a redirect. They may only follow a redirect to the exact same
+/// HTTPS host; even another allowlisted download host is a different trust
+/// boundary.
+pub(crate) fn same_host_redirect_allowed(url: &reqwest::Url, host: &str, previous: usize) -> bool {
+    previous < MAX_REDIRECTS
+        && url.scheme() == "https"
+        && url.host_str().is_some_and(|target| {
+            target.eq_ignore_ascii_case(host) && url.port_or_known_default() == Some(443)
+        })
+}
+
+pub(crate) fn same_host_redirect_policy(host: &str) -> reqwest::redirect::Policy {
+    let host = host.to_ascii_lowercase();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if same_host_redirect_allowed(attempt.url(), &host, attempt.previous().len()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// Redirect policy: follow a redirect only if the destination is HTTPS, on
+/// an allowlisted host, and the chain is still below the redirect limit.
+/// reqwest follows up to 10 redirects by default without re-validating the
+/// target, which would let a 302 from a trusted host escape to an arbitrary
+/// host.
 pub fn redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        let url = attempt.url();
-        let host = url.host_str().unwrap_or("");
-        if url.scheme() == "https" && is_host_allowed(host) {
+        if redirect_target_allowed(attempt.url(), attempt.previous().len()) {
             attempt.follow()
         } else {
             attempt.stop()
@@ -211,6 +370,12 @@ fn download_path_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 /// trouble) returns the error instead of panicking; nothing is cached, so the
 /// next call retries the build.
 fn http_client() -> Result<reqwest::Client> {
+    #[cfg(test)]
+    if FAIL_NEXT_CLIENT.with(|flag| flag.replace(false)) {
+        return Err(LauncherError::Download(
+            "injected HTTP client build failure (test)".to_string(),
+        ));
+    }
     let proxy = proxy_client_url()?;
     let mut slot = HTTP_CLIENT
         .get_or_init(|| Mutex::new(None))
@@ -566,6 +731,31 @@ pub fn resolved_proxy_url(raw: Option<String>) -> Option<String> {
     Some(format!("http://{}", raw))
 }
 
+/// Build the short-lived client used to test a proxy. Redirects are disabled:
+/// a probe only needs to prove that the proxy accepts and answers a request,
+/// and following a redirect could turn the probe into a request to a host the
+/// user never configured.
+fn build_proxy_probe_client(proxy_url: &str) -> Option<reqwest::Client> {
+    let proxy = reqwest::Proxy::all(proxy_url.to_string()).ok()?;
+    reqwest::Client::builder()
+        .proxy(proxy)
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()
+}
+
+async fn probe_proxy(proxy_url: &str, target: &str) -> bool {
+    let Some(client) = build_proxy_probe_client(proxy_url) else {
+        return false;
+    };
+    tokio::time::timeout(Duration::from_secs(4), client.get(target).send())
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
 /// Test the configured proxy once (HTTP first, then SOCKS5) and cache the
 /// scheme that actually connects. Called before the first network request.
 /// `127.0.0.1:10808` style SOCKS ports (VPN apps) are detected this way.
@@ -585,25 +775,7 @@ pub async fn ensure_proxy_resolved() {
     let candidates = [format!("http://{}", raw), format!("socks5://{}", raw)];
     let mut chosen: Option<String> = None;
     for url in &candidates {
-        let Ok(proxy) = reqwest::Proxy::all(url.clone()) else {
-            continue;
-        };
-        let Ok(client) = reqwest::Client::builder()
-            .proxy(proxy)
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(4))
-            .build()
-        else {
-            continue;
-        };
-        let ok = tokio::time::timeout(
-            Duration::from_secs(4),
-            client.get("https://api.modrinth.com/").send(),
-        )
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false);
-        if ok {
+        if probe_proxy(url, "https://api.modrinth.com/").await {
             chosen = Some(url.clone());
             break;
         }
@@ -640,6 +812,22 @@ pub async fn ensure_proxy_resolved() {
 pub async fn send_with_fallback(
     req: reqwest::RequestBuilder,
 ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    send_with_fallback_inner(req, None).await
+}
+
+/// Same as [`send_with_fallback`], but the direct retry keeps the exact-host
+/// redirect policy so an API credential cannot leave its origin.
+pub(crate) async fn send_with_fallback_same_host(
+    req: reqwest::RequestBuilder,
+    host: &str,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    send_with_fallback_inner(req, Some(host.to_string())).await
+}
+
+async fn send_with_fallback_inner(
+    req: reqwest::RequestBuilder,
+    exact_host: Option<String>,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
     // Proxy-only mode: the request is already bound to a proxy client; never
     // clone/rebuild it against a direct client after a failure.
     if proxy_only_enabled() {
@@ -656,7 +844,16 @@ pub async fn send_with_fallback(
                 // for most hosts can still refuse specific ones (Mojang CDN).
                 if let Some(builder) = req.try_clone() {
                     if let Ok(request) = builder.build() {
-                        let direct = match build_client(None) {
+                        let direct = match exact_host.as_deref() {
+                            Some(host) => base_client_builder(None).and_then(|builder| {
+                                builder
+                                    .redirect(same_host_redirect_policy(host))
+                                    .build()
+                                    .map_err(Into::into)
+                            }),
+                            None => build_client(None),
+                        };
+                        let direct = match direct {
                             Ok(client) => client,
                             Err(_) => return Err(e),
                         };
@@ -691,13 +888,39 @@ pub async fn get_with_retry(
     attempts: usize,
     backoff_ms: &[u64],
 ) -> Result<reqwest::Response> {
+    get_with_retry_inner(req, provider, attempts, backoff_ms, None).await
+}
+
+/// [`get_with_retry`] for authenticated API requests: both the proxied request
+/// and the direct proxy-fallback retry only follow same-host redirects.
+pub(crate) async fn get_with_retry_same_host(
+    req: reqwest::RequestBuilder,
+    provider: &str,
+    attempts: usize,
+    backoff_ms: &[u64],
+    host: &str,
+) -> Result<reqwest::Response> {
+    get_with_retry_inner(req, provider, attempts, backoff_ms, Some(host)).await
+}
+
+async fn get_with_retry_inner(
+    req: reqwest::RequestBuilder,
+    provider: &str,
+    attempts: usize,
+    backoff_ms: &[u64],
+    exact_host: Option<&str>,
+) -> Result<reqwest::Response> {
     let mut last_err: Option<LauncherError> = None;
     for attempt in 0..attempts {
         let attempt_req = match req.try_clone() {
             Some(r) => r,
             None => return req.send().await.map_err(LauncherError::Network),
         };
-        let response = match send_with_fallback(attempt_req).await {
+        let response = match exact_host {
+            Some(host) => send_with_fallback_same_host(attempt_req, host).await,
+            None => send_with_fallback(attempt_req).await,
+        };
+        let response = match response {
             Ok(r) => r,
             Err(e) => {
                 last_err = Some(LauncherError::Network(e));
@@ -915,6 +1138,49 @@ fn part_meta_path(path: &Path) -> PathBuf {
     with_suffix(path, ".part.meta")
 }
 
+/// Remove the temporary files that belong to a failed download. The final
+/// destination is never touched. Returns a description of cleanup failures so
+/// the caller can report them next to (never instead of) the original error.
+fn discard_partial_files(part_path: &Path, meta_path: &Path) -> Option<String> {
+    let mut failures = Vec::new();
+    for (path, label) in [(part_path, ".part"), (meta_path, ".part identity")] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failures.push(format!("{}: {}", label, e)),
+        }
+    }
+    if failures.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "failed to remove temporary download files ({})",
+            failures.join("; ")
+        ))
+    }
+}
+
+/// Build a terminal download error. Temporary-file cleanup is performed once,
+/// by [`download_to_part_observed`], for every error return that is not a
+/// pause: a single owner avoids cleanup gaps on newly added return paths.
+fn terminal_download_error(message: String) -> LauncherError {
+    LauncherError::Download(message)
+}
+
+/// Remove the partial data and its identity after a failed attempt, appending
+/// a warning to (never replacing) the original error when cleanup itself
+/// fails. The final destination is never touched.
+fn finish_failed_download(
+    error: LauncherError,
+    part_path: &Path,
+    meta_path: &Path,
+) -> LauncherError {
+    match discard_partial_files(part_path, meta_path) {
+        Some(warning) => LauncherError::Download(format!("{}; {}", error, warning)),
+        None => error,
+    }
+}
+
 /// A `.part` or `.part.meta` symlink would make `File::create` truncate or
 /// append to its target instead of the download directory. Resuming through a
 /// link is never legitimate, so refuse it before opening anything.
@@ -1029,35 +1295,31 @@ pub(crate) async fn download_to_part_observed(
     // the same library/asset path, and a fixed `.part` file cannot serve two
     // concurrent transfers.
     let _path_guard = download_path_lock(path).lock_owned().await;
-    // Auto-upgrade http:// to https://
-    let url = if url.to_ascii_lowercase().starts_with("http://") {
-        tracing::debug!(target: "launcher", "Upgrading http:// to https:// for: {}", url);
-        url.replacen("http://", "https://", 1)
+    // Auto-upgrade http:// to https://, then run the same URL policy for
+    // every caller. This happens before any filesystem or network side
+    // effect, so a spoofed URL can never initiate a request.
+    let raw = url.trim();
+    let upgraded = if raw
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        tracing::debug!(target: "launcher", "Upgrading http:// to https:// for: {}", raw);
+        format!("https://{}", &raw[7..])
     } else {
-        url.to_string()
+        raw.to_string()
     };
-    if !url.starts_with("https://") {
-        return Err(LauncherError::Download(format!(
-            "Download URL must use HTTPS: {}",
-            url
-        )));
-    }
-    let after_scheme = &url[8..];
-    let host_end = after_scheme
-        .find(['/', ':', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let host = after_scheme[..host_end].to_ascii_lowercase();
+    let url = if cfg!(test) && raw.starts_with("http://127.0.0.1:") {
+        // Test-only: a controlled loopback HTTP origin for fault injection.
+        // Release builds always validate against the HTTPS allowlist below.
+        raw.to_string()
+    } else {
+        validate_download_url(&upgraded)?.to_string()
+    };
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("")
         .to_string();
-    if !is_host_allowed(&host) {
-        return Err(LauncherError::Download(format!(
-            "Download host '{}' is not in the allowlist",
-            host
-        )));
-    }
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1078,18 +1340,27 @@ pub(crate) async fn download_to_part_observed(
         }
     }
 
+    // ---- Single owner of the temporary files -------------------------------
+    // Every non-pause error return below goes through the match at the end of
+    // this block, which removes `.part` + identity exactly once. Retries keep
+    // the files; a pause or an aborted task (future dropped) keeps them too.
+    let result: Result<()> = async {
+    // Do not create an identity (or any other temp file) for a call that is
+    // already paused: nothing can be resumed yet.
+    if pause_requested() {
+        return Err(LauncherError::Paused);
+    }
     // A .part without a matching identity sidecar cannot be trusted: the
     // target path may be reused for another artifact/version, and resuming
     // would splice two files together.
     let identity = download_identity(&url, expected_sha1, expected_size);
     let mut offset = prepare_partial_download(path, &identity);
     if let Err(e) = std::fs::write(&meta_path, &identity) {
-        tracing::warn!(
-            target: "launcher",
-            "Could not write .part identity for {}: {}",
+        return Err(terminal_download_error(format!(
+            "Failed to write .part identity for {}: {}",
             path.display(),
             e
-        );
+        )));
     }
 
     // Probe the proxy scheme before the client is built so the first attempt
@@ -1201,10 +1472,15 @@ pub(crate) async fn download_to_part_observed(
             break;
         }
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(LauncherError::Download(format!(
-                "HTTP {} for {}",
-                status, url
-            )));
+            let detail = if status.is_redirection() {
+                format!(
+                    "HTTP {} for {} (redirect target is not allowed; response refused)",
+                    status, url
+                )
+            } else {
+                format!("HTTP {} for {}", status, url)
+            };
+            return Err(terminal_download_error(detail));
         }
 
         // Reject non-binary responses (only when no SHA1 to validate)
@@ -1212,7 +1488,7 @@ pub(crate) async fn download_to_part_observed(
             if let Some(ct) = response.headers().get("content-type") {
                 let ct_str = ct.to_str().unwrap_or("");
                 if is_rejected_content_type(ct_str) {
-                    return Err(LauncherError::Download(format!(
+                    return Err(terminal_download_error(format!(
                         "Server returned unexpected content-type '{}' for {}",
                         ct_str, url
                     )));
@@ -1226,11 +1502,48 @@ pub(crate) async fn download_to_part_observed(
             .and_then(|v| v.to_str().ok())
             .and_then(content_range_total);
         let content_length = response.content_length();
+        // The artifact's total size, when any trustworthy source knows it:
+        // manifest size, or the total in this response's Content-Range.
+        let size_ceiling = expected_size.or(range_total);
+        // Reject an over-limit artifact before a single body byte is written.
+        // A 206 length covers only the remainder, so add the resume offset; a
+        // 200 length is the whole body and the file will be truncated first.
+        let advertised_total = match content_length {
+            Some(len) if status == reqwest::StatusCode::PARTIAL_CONTENT && offset > 0 => {
+                match offset.checked_add(len) {
+                    Some(total) => Some(total),
+                    None => {
+                        return Err(terminal_download_error(format!(
+                            "Download size overflow for {}",
+                            url
+                        )))
+                    }
+                }
+            }
+            Some(len) => Some(len),
+            None => None,
+        };
+        if let Some(total) = advertised_total {
+            if total > MAX_SINGLE_DOWNLOAD_BYTES {
+                return Err(terminal_download_error(format!(
+                    "Refusing to download {}: server advertises {} bytes, above the {} byte limit",
+                    url, total, MAX_SINGLE_DOWNLOAD_BYTES
+                )));
+            }
+            if let Some(ceiling) = size_ceiling {
+                if total > ceiling {
+                    return Err(terminal_download_error(format!(
+                        "Server advertises {} bytes for {}, but the expected artifact size is {} bytes",
+                        total, url, ceiling
+                    )));
+                }
+            }
+        }
         // The final size check keeps using only manifest/Content-Range data.
         // A 200 response's Content-Length is still the best progress hint (and
         // its truncation detector below), but a 206's Content-Length describes
         // only the remaining range and must never become the total.
-        known_total = expected_size.or(range_total);
+        known_total = size_ceiling;
         let progress_total =
             download_progress_total(status, expected_size, range_total, content_length);
 
@@ -1304,6 +1617,43 @@ pub(crate) async fn download_to_part_observed(
                         }
                         match chunk {
                             Ok(c) => {
+                                // Streaming cap: Content-Length can be absent or
+                                // lie, so the bytes actually written are checked
+                                // before every write. Returns terminate the
+                                // attempt; the central cleanup removes the
+                                // partial file after the handle is dropped.
+                                let projected = match offset
+                                    .checked_add(received)
+                                    .and_then(|total| total.checked_add(c.len() as u64))
+                                {
+                                    Some(total) => total,
+                                    None => {
+                                        return Err(terminal_download_error(format!(
+                                            "Download size overflow for {}",
+                                            url
+                                        )))
+                                    }
+                                };
+                                if projected > MAX_SINGLE_DOWNLOAD_BYTES {
+                                    return Err(terminal_download_error(format!(
+                                        "Refusing to download {}: received more than the {} byte limit",
+                                        url, MAX_SINGLE_DOWNLOAD_BYTES
+                                    )));
+                                }
+                                if let Some(ceiling) = known_total {
+                                    if projected > ceiling {
+                                        return Err(terminal_download_error(format!(
+                                            "Server sent more than the expected {} bytes for {}",
+                                            ceiling, url
+                                        )));
+                                    }
+                                }
+                                #[cfg(test)]
+                                if FAIL_NEXT_WRITE.with(|flag| flag.replace(false)) {
+                                    return Err(terminal_download_error(
+                                        "injected .part write failure (test)".to_string(),
+                                    ));
+                                }
                                 file.write_all(&c).await.map_err(|e| {
                                     LauncherError::Download(format!("Failed to write .part: {}", e))
                                 })?;
@@ -1356,6 +1706,12 @@ pub(crate) async fn download_to_part_observed(
                     }
                 }
             }
+            #[cfg(test)]
+            if FAIL_NEXT_FLUSH.with(|flag| flag.replace(false)) {
+                return Err(terminal_download_error(
+                    "injected .part flush failure (test)".to_string(),
+                ));
+            }
             file.flush()
                 .await
                 .map_err(|e| LauncherError::Download(format!("Failed to flush .part: {}", e)))?;
@@ -1393,9 +1749,7 @@ pub(crate) async fn download_to_part_observed(
         if pause_requested() {
             return Err(LauncherError::Paused);
         }
-        let _ = std::fs::remove_file(&part_path);
-        let _ = std::fs::remove_file(&meta_path);
-        return Err(LauncherError::Download(format!(
+        return Err(terminal_download_error(format!(
             "Failed to download {}: {}",
             url,
             last_err.unwrap_or_else(|| "connection interrupted".to_string())
@@ -1408,9 +1762,7 @@ pub(crate) async fn download_to_part_observed(
     if let Some(expected) = known_total {
         let actual = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
         if actual != expected {
-            let _ = std::fs::remove_file(&part_path);
-            let _ = std::fs::remove_file(&meta_path);
-            return Err(LauncherError::Download(format!(
+            return Err(terminal_download_error(format!(
                 "Size mismatch for {}: expected {} bytes, got {}",
                 path.display(),
                 expected,
@@ -1421,16 +1773,41 @@ pub(crate) async fn download_to_part_observed(
 
     // Validate the .part file content
     if let Err(e) = validate_download(&part_path, expected_sha1) {
-        let _ = std::fs::remove_file(&part_path);
-        let _ = std::fs::remove_file(&meta_path);
-        return Err(e);
+        return Err(terminal_download_error(e.to_string()));
     }
 
-    // Atomically replace the destination: rename .part → final path
+    // Atomically replace the destination: rename .part → final path. The
+    // destination is not touched before every size/checksum check passed.
     std::fs::rename(&part_path, path)?;
-    let _ = std::fs::remove_file(&meta_path);
+
+    // The destination is already published; a leftover sidecar cannot corrupt
+    // it (the next download overwrites the identity), but surface the failed
+    // cleanup in the log instead of swallowing it.
+    if let Err(e) = std::fs::remove_file(&meta_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                target: "launcher",
+                "Downloaded {}, but could not remove its identity sidecar {}: {}",
+                path.display(),
+                meta_path.display(),
+                e
+            );
+        }
+    }
 
     Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => Ok(()),
+        // A pause is an intentional interruption: keep `.part` + identity so
+        // resuming continues from the saved offset.
+        Err(LauncherError::Paused) => Err(LauncherError::Paused),
+        // Every other error is terminal for this attempt/URL. Cleanup happens
+        // here, after all file handles inside the block were dropped.
+        Err(error) => Err(finish_failed_download(error, &part_path, &meta_path)),
+    }
 }
 
 /// Some Mojang artifacts (e.g. `launchwrapper`) are referenced by old
@@ -1999,6 +2376,7 @@ pub fn collect_asset_download_plan(
 }
 
 /// Download assets from Mojang
+#[allow(dead_code)] // used by smoke tests; launch/import paths use the repair variant
 pub async fn download_assets(
     asset_index: &crate::versions::AssetIndexData,
     assets_dir: &Path,
@@ -2266,20 +2644,42 @@ pub(crate) fn http_client_for_hosts(hosts: &[&str]) -> Result<reqwest::Client> {
     let proxy = proxy_client_url()?;
     let allowed: Vec<String> = hosts.iter().map(|h| h.to_ascii_lowercase()).collect();
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        let url = attempt.url();
-        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
-        let host_ok = allowed
-            .iter()
-            .any(|h| host == *h || host.ends_with(&format!(".{}", h)));
-        if url.scheme() == "https" && host_ok {
-            attempt.follow()
-        } else {
+        if attempt.previous().len() >= MAX_REDIRECTS
+            || validate_download_url_for_hosts(attempt.url().as_str(), &allowed).is_err()
+        {
             attempt.stop()
+        } else {
+            attempt.follow()
         }
     });
     Ok(base_client_builder(proxy.as_deref())?
         .redirect(policy)
         .build()?)
+}
+
+type ExactHostClient = Mutex<Option<(String, Option<String>, reqwest::Client)>>;
+static EXACT_HOST_CLIENT: OnceLock<ExactHostClient> = OnceLock::new();
+
+/// Client for authenticated API calls whose credentials must never cross a
+/// host boundary. Redirects are limited to the exact HTTPS host; proxy
+/// settings are shared with the global client and rebuilt on change.
+pub(crate) fn http_client_for_exact_host(host: &str) -> Result<reqwest::Client> {
+    let host = host.to_ascii_lowercase();
+    let proxy = proxy_client_url()?;
+    let mut slot = EXACT_HOST_CLIENT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached_host, cached_proxy, client)) = slot.as_ref() {
+        if cached_host == &host && cached_proxy == &proxy {
+            return Ok(client.clone());
+        }
+    }
+    let client = base_client_builder(proxy.as_deref())?
+        .redirect(same_host_redirect_policy(&host))
+        .build()?;
+    *slot = Some((host, proxy, client.clone()));
+    Ok(client)
 }
 #[cfg(test)]
 mod tests {
@@ -2420,6 +2820,205 @@ mod tests {
         assert!(!is_host_allowed("github.com.attacker.example"));
         assert!(!is_host_allowed("notgithub.com"));
         assert!(!is_host_allowed(""));
+    }
+
+    #[test]
+    fn download_url_policy_accepts_allowlisted_https_urls() {
+        assert!(
+            validate_download_url("https://cdn.modrinth.com/data/abc/versions/1/file.jar").is_ok()
+        );
+        assert!(validate_download_url("https://media.forgecdn.net/files/1/2/mod.jar").is_ok());
+        assert!(
+            validate_download_url("https://github.com/owner/repo/releases/download/v1/a.zip")
+                .is_ok()
+        );
+        assert!(
+            validate_download_url("https://cdn.modrinth.com:443/data/abc/versions/1/file.jar")
+                .is_ok(),
+            "the explicit default HTTPS port is equivalent to omitting it"
+        );
+    }
+
+    #[test]
+    fn download_url_policy_rejects_scheme_credentials_and_host_spoofing() {
+        let rejected = [
+            "http://cdn.modrinth.com/data/file.jar",
+            "ftp://cdn.modrinth.com/data/file.jar",
+            "https://user:pass@cdn.modrinth.com/data/file.jar",
+            "https://user@cdn.modrinth.com/data/file.jar",
+            // The real host is evil.example; the allowlisted name is userinfo.
+            "https://cdn.modrinth.com:443@evil.example/payload",
+            "https://cdn.modrinth.com@evil.example/payload",
+            "https://evil.example/payload?next=https://cdn.modrinth.com/",
+            "https://evil.example/cdn.modrinth.com/payload",
+            "https://cdn.modrinth.com.evil.example/payload",
+            "https://notgithub.com/owner/repo",
+            "https://github.com.attacker.example/owner/repo",
+            "https://cdn.modrinth.com./data/file.jar",
+            "https://cdn.modrinth.com:8443/data/file.jar",
+            "https://127.0.0.1/data/file.jar",
+            "https://[::1]/data/file.jar",
+            "https://cdn.modrinth.com\\@evil.example/payload",
+            "https://cdn.modrinth.com/data/file.jar\nHost: evil.example",
+            "",
+            "not a url",
+            "https://",
+        ];
+        for url in rejected {
+            assert!(
+                validate_download_url(url).is_err(),
+                "URL must be rejected before any request: {url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_targets_are_revalidated_with_the_same_policy() {
+        let allowed = reqwest::Url::parse("https://github.com/owner/repo/releases/download/v1/a")
+            .expect("valid test URL");
+        let another_allowed =
+            reqwest::Url::parse("https://cdn.modrinth.com/data/a/versions/1/file.jar")
+                .expect("valid test URL");
+        let denied = reqwest::Url::parse("https://evil.example/payload").expect("valid test URL");
+        let spoofed = reqwest::Url::parse("https://cdn.modrinth.com:443@evil.example/payload")
+            .expect("the URL parser accepts userinfo");
+
+        assert!(redirect_target_allowed(&allowed, 0));
+        assert!(
+            redirect_target_allowed(&another_allowed, 0),
+            "a redirect to another allowlisted HTTPS host is allowed"
+        );
+        assert!(
+            !redirect_target_allowed(&denied, 0),
+            "a redirect from an allowlisted host to an arbitrary host must stop"
+        );
+        assert!(
+            !redirect_target_allowed(&spoofed, 0),
+            "redirect targets use the parsed host, not a string prefix"
+        );
+        assert!(
+            !redirect_target_allowed(&allowed, MAX_REDIRECTS),
+            "redirect loops/chains must stop at the cap"
+        );
+    }
+
+    #[test]
+    fn authenticated_redirects_stay_on_the_exact_https_host() {
+        let url = |raw: &str| reqwest::Url::parse(raw).expect("valid test URL");
+        let api = url("https://api.curseforge.com/v1/mods/1");
+        assert!(same_host_redirect_allowed(&api, "api.curseforge.com", 0));
+        assert!(same_host_redirect_allowed(
+            &url("https://api.curseforge.com:443/v1/mods/1"),
+            "api.curseforge.com",
+            0
+        ));
+        assert!(
+            same_host_redirect_allowed(
+                &url("https://API.CurseForge.com/v1/mods/2"),
+                "api.curseforge.com",
+                0
+            ),
+            "host comparison is case-insensitive"
+        );
+        assert!(
+            !same_host_redirect_allowed(
+                &url("https://cdn.curseforge.com/files/pack.zip"),
+                "api.curseforge.com",
+                0
+            ),
+            "even another allowlisted download host is a different trust boundary"
+        );
+        assert!(!same_host_redirect_allowed(
+            &url("https://evil.example/payload"),
+            "api.curseforge.com",
+            0
+        ));
+        assert!(
+            !same_host_redirect_allowed(
+                &url("http://api.curseforge.com/v1/mods/1"),
+                "api.curseforge.com",
+                0
+            ),
+            "a scheme downgrade must stop"
+        );
+        assert!(
+            !same_host_redirect_allowed(
+                &url("https://api.curseforge.com:8443/v1/mods/1"),
+                "api.curseforge.com",
+                0
+            ),
+            "a non-default port is not the API origin"
+        );
+        assert!(
+            !same_host_redirect_allowed(
+                &url("https://api.curseforge.com@evil.example/payload"),
+                "api.curseforge.com",
+                0
+            ),
+            "the parsed host is compared, not userinfo"
+        );
+        assert!(!same_host_redirect_allowed(
+            &api,
+            "api.curseforge.com",
+            MAX_REDIRECTS
+        ));
+    }
+
+    #[test]
+    fn module_redirect_policy_keeps_the_host_boundary() {
+        let hosts = vec!["maven.neoforged.net".to_string()];
+        assert!(validate_download_url_for_hosts(
+            "https://maven.neoforged.net/releases/a.jar",
+            &hosts
+        )
+        .is_ok());
+        assert!(validate_download_url_for_hosts(
+            "https://maven.neoforged.net:443/releases/a.jar",
+            &hosts
+        )
+        .is_ok());
+        for url in [
+            "https://github.com/owner/repo/a.jar",
+            "https://maven.neoforged.net.attacker.example/a.jar",
+            "https://notmaven.neoforged.net/a.jar",
+            "https://maven.neoforged.net:8443/a.jar",
+            "https://maven.neoforged.net:443@evil.example/a.jar",
+        ] {
+            assert!(
+                validate_download_url_for_hosts(url, &hosts).is_err(),
+                "module host policy must reject {url:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spoofed_url_is_rejected_before_touching_disk_or_network() {
+        let path = std::env::temp_dir().join(format!(
+            "voidlauncher_bad_url_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let err = download_to_part_observed(
+            "https://cdn.modrinth.com:443@evil.example/payload",
+            &path,
+            "",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the spoofed URL must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("not in the allowlist") || text.contains("username or password"),
+            "unexpected error: {err}"
+        );
+        assert!(!path.exists(), "no destination may be created");
+        assert!(!part_path_for(&path).exists(), "no .part may be created");
     }
 
     #[cfg(windows)]
@@ -2710,6 +3309,55 @@ mod tests {
         assert!(!is_transient_download_status(
             reqwest::StatusCode::BAD_REQUEST
         ));
+    }
+
+    #[test]
+    fn terminal_failure_cleanup_removes_partial_and_keeps_destination() {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_terminal_cleanup_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("artifact.jar");
+        let part = part_path_for(&target);
+        let meta = part_meta_path(&target);
+        std::fs::write(&target, b"previous-good-file").unwrap();
+        std::fs::write(&part, b"partial").unwrap();
+        std::fs::write(&meta, b"identity").unwrap();
+
+        let err = finish_failed_download(
+            terminal_download_error(
+                "HTTP 302 for https://example.com/a.jar (redirect target is not allowed; response refused)"
+                    .to_string(),
+            ),
+            &part,
+            &meta,
+        );
+
+        let message = err.to_string();
+        assert!(
+            message.contains("HTTP 302"),
+            "original error is preserved: {message}"
+        );
+        assert!(message.contains("redirect target is not allowed"));
+        assert!(
+            !part.exists(),
+            "a refused redirect must not keep resumable bytes"
+        );
+        assert!(
+            !meta.exists(),
+            "the identity sidecar must be removed with it"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"previous-good-file",
+            "the destination must never be touched by a failed download"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3331,6 +3979,36 @@ mod tests {
         }
     }
 
+    /// A proxy that answers every request with a redirect to `location`.
+    async fn spawn_redirect_proxy(location: String) -> TestProxy {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let task_hits = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let hits = task_hits.clone();
+                let location = location.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0u8; 1024];
+                    let _ = client.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        location
+                    );
+                    let _ = client.write_all(head.as_bytes()).await;
+                    let _ = client.shutdown().await;
+                });
+            }
+        });
+        TestProxy {
+            addr: format!("127.0.0.1:{}", port),
+            hits,
+        }
+    }
+
     async fn send_test_request(url: &str) -> std::result::Result<String, String> {
         let client = global_http_client().map_err(|e| e.to_string())?;
         let response = send_with_fallback(client.get(url))
@@ -3345,6 +4023,41 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), send_test_request(url))
             .await
             .expect("proxy test request timed out")
+    }
+
+    #[tokio::test]
+    async fn proxy_probe_does_not_follow_redirects() {
+        let origin = spawn_origin().await;
+        let proxy = spawn_redirect_proxy(origin.url.clone()).await;
+        let reachable = probe_proxy(&format!("http://{}", proxy.addr), &origin.url).await;
+        assert!(
+            reachable,
+            "a redirect response still proves that the proxy is reachable"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            proxy.hits.load(Ordering::SeqCst),
+            1,
+            "the probe must not follow the redirect back through the proxy"
+        );
+        assert_eq!(
+            origin.hits.load(Ordering::SeqCst),
+            0,
+            "the probe target must never be contacted directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_probe_reports_a_dead_proxy() {
+        let proxy = spawn_proxy(false).await;
+        assert!(
+            !probe_proxy(
+                &format!("http://{}", proxy.addr),
+                "https://api.modrinth.com/"
+            )
+            .await,
+            "a proxy that closes the connection must probe as unreachable"
+        );
     }
 
     #[tokio::test]
@@ -3661,6 +4374,886 @@ mod tests {
         assert!(result.contains("proxy-ok"), "unexpected response: {result}");
         assert_eq!(origin.hits.load(Ordering::SeqCst), 0);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ==================== Download lifecycle fault injection ====================
+    //
+    // A controlled loopback HTTP origin exercises the real
+    // `download_to_part_observed` code path (URL policy is bypassed only under
+    // `cfg(test)` for `http://127.0.0.1`; release builds still validate the
+    // HTTPS allowlist). Every test seeds a destination and checks that a
+    // failed download never touches it.
+
+    #[derive(Clone)]
+    struct MockSpec {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        declared_len: Option<usize>,
+        chunked: bool,
+        slow: bool,
+    }
+
+    impl MockSpec {
+        fn ok(body: &[u8]) -> Self {
+            Self {
+                status: 200,
+                headers: vec![("Content-Type".into(), "application/octet-stream".into())],
+                body: body.to_vec(),
+                declared_len: None,
+                chunked: false,
+                slow: false,
+            }
+        }
+
+        fn status(status: u16) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: b"error".to_vec(),
+                declared_len: None,
+                chunked: false,
+                slow: false,
+            }
+        }
+
+        fn partial(body: &[u8], total: usize, start: usize) -> Self {
+            Self {
+                status: 206,
+                headers: vec![
+                    ("Content-Type".into(), "application/octet-stream".into()),
+                    (
+                        "Content-Range".into(),
+                        format!(
+                            "bytes {}-{}/{}",
+                            start,
+                            start + body.len().saturating_sub(1),
+                            total
+                        ),
+                    ),
+                ],
+                body: body.to_vec(),
+                declared_len: Some(body.len()),
+                chunked: false,
+                slow: false,
+            }
+        }
+
+        fn truncated(body: &[u8], declared: usize) -> Self {
+            Self {
+                status: 200,
+                headers: vec![("Content-Type".into(), "application/octet-stream".into())],
+                body: body.to_vec(),
+                declared_len: Some(declared),
+                chunked: false,
+                slow: false,
+            }
+        }
+
+        fn chunked(body: &[u8]) -> Self {
+            Self {
+                status: 200,
+                headers: vec![("Content-Type".into(), "application/octet-stream".into())],
+                body: body.to_vec(),
+                declared_len: None,
+                chunked: true,
+                slow: false,
+            }
+        }
+
+        fn html(body: &[u8]) -> Self {
+            Self {
+                status: 200,
+                headers: vec![("Content-Type".into(), "text/html".into())],
+                body: body.to_vec(),
+                declared_len: None,
+                chunked: false,
+                slow: false,
+            }
+        }
+
+        fn redirect(location: &str) -> Self {
+            Self {
+                status: 302,
+                headers: vec![("Location".into(), location.into())],
+                body: Vec::new(),
+                declared_len: Some(0),
+                chunked: false,
+                slow: false,
+            }
+        }
+
+        fn slow(body: &[u8]) -> Self {
+            Self {
+                status: 200,
+                headers: vec![("Content-Type".into(), "application/octet-stream".into())],
+                body: body.to_vec(),
+                declared_len: Some(body.len()),
+                chunked: false,
+                slow: true,
+            }
+        }
+    }
+
+    struct MockServer {
+        url: String,
+        hits: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    async fn spawn_mock(specs: Vec<MockSpec>) -> MockServer {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_hits = hits.clone();
+        let task_started = started.clone();
+        tokio::spawn(async move {
+            let mut specs = std::collections::VecDeque::from(specs);
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let hits = task_hits.clone();
+                let started = task_started.clone();
+                let spec = specs.pop_front().unwrap_or_else(|| MockSpec::status(500));
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                request.extend_from_slice(&chunk[..n]);
+                                if request.windows(4).any(|w| w == b"\r\n\r\n")
+                                    || request.len() > 65536
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let reason = match spec.status {
+                        200 => "OK",
+                        206 => "Partial Content",
+                        302 => "Found",
+                        400 => "Bad Request",
+                        403 => "Forbidden",
+                        404 => "Not Found",
+                        500 => "Internal Server Error",
+                        503 => "Service Unavailable",
+                        _ => "Status",
+                    };
+                    let mut head = format!(
+                        "HTTP/1.1 {} {}\r\nConnection: close\r\n",
+                        spec.status, reason
+                    );
+                    if spec.chunked {
+                        head.push_str("Transfer-Encoding: chunked\r\n");
+                    } else {
+                        let len = spec.declared_len.unwrap_or(spec.body.len());
+                        head.push_str(&format!("Content-Length: {}\r\n", len));
+                    }
+                    for (name, value) in &spec.headers {
+                        head.push_str(&format!("{}: {}\r\n", name, value));
+                    }
+                    head.push_str("\r\n");
+                    let _ = socket.write_all(head.as_bytes()).await;
+
+                    if spec.chunked {
+                        let _ = socket
+                            .write_all(format!("{:x}\r\n", spec.body.len()).as_bytes())
+                            .await;
+                        let _ = socket.write_all(&spec.body).await;
+                        let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+                    } else if spec.slow && !spec.body.is_empty() {
+                        let split = spec.body.len() / 2;
+                        let _ = socket.write_all(&spec.body[..split]).await;
+                        started.notify_one();
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        return;
+                    } else {
+                        let _ = socket.write_all(&spec.body).await;
+                    }
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        MockServer {
+            url: format!("http://{}/artifact.bin", addr),
+            hits,
+            started,
+        }
+    }
+
+    fn mock_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_download_lifecycle_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sha1_hex(bytes: &[u8]) -> String {
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+
+    async fn direct_proxy_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = PROXY_TEST_LOCK.lock().await;
+        apply_test_proxy(false, false, None, true);
+        guard
+    }
+
+    fn assert_clean(part: &Path, meta: &Path) {
+        assert!(
+            !part.exists(),
+            ".part must be removed after a terminal error"
+        );
+        assert!(
+            !meta.exists(),
+            "the identity sidecar must be removed after a terminal error"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_success_publishes_destination_and_cleans_temp() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("success");
+        let dest = dir.join("artifact.jar");
+
+        download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"hello"),
+            Some(5),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect("successful download");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_terminal_statuses_clean_temp_and_keep_destination() {
+        let _proxy = direct_proxy_lock().await;
+        for status in [400u16, 403, 404] {
+            let server = spawn_mock(vec![MockSpec::status(status)]).await;
+            let dir = mock_dir(&format!("status{status}"));
+            let dest = dir.join("artifact.jar");
+            std::fs::write(&dest, b"previous-good").unwrap();
+
+            let err = download_to_part_observed(
+                &server.url,
+                &dest,
+                "",
+                None,
+                Some(Duration::from_secs(10)),
+                None,
+            )
+            .await
+            .expect_err("terminal status must fail");
+            assert!(err.to_string().contains(&status.to_string()), "got: {err}");
+            assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+            assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transient_503_retries_then_succeeds() {
+        let _proxy = direct_proxy_lock().await;
+        let mut retry = MockSpec::status(503);
+        retry.headers.push(("Retry-After".into(), "1".into()));
+        let server = spawn_mock(vec![retry, MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("retry503");
+        let dest = dir.join("artifact.jar");
+
+        download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"hello"),
+            Some(5),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect("503 must be retried");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_redirect_stop_cleans_without_contacting_target() {
+        let _proxy = direct_proxy_lock().await;
+        let target = spawn_mock(vec![MockSpec::ok(b"must-not-be-written")]).await;
+        let redirect = spawn_mock(vec![MockSpec::redirect(&target.url)]).await;
+        let dir = mock_dir("redirect");
+        let dest = dir.join("artifact.jar");
+        std::fs::write(&dest, b"previous-good").unwrap();
+
+        let err = download_to_part_observed(
+            &redirect.url,
+            &dest,
+            "",
+            None,
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("redirect must stop");
+        assert!(err.to_string().contains("redirect"), "got: {err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        assert_eq!(
+            target.hits.load(Ordering::SeqCst),
+            0,
+            "the refused redirect target must never be contacted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_wrong_content_type_cleans_temp() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::html(b"<html>nope</html>")]).await;
+        let dir = mock_dir("contenttype");
+        let dest = dir.join("artifact.jar");
+
+        let err = download_to_part_observed(
+            &server.url,
+            &dest,
+            "",
+            None,
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("HTML must be rejected");
+        assert!(err.to_string().contains("content-type"), "got: {err}");
+        assert!(!dest.exists());
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_declared_size_over_expected_fails_before_writing() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("declared-size");
+        let dest = dir.join("artifact.jar");
+        std::fs::write(&dest, b"previous-good").unwrap();
+
+        let err = download_to_part_observed(
+            &server.url,
+            &dest,
+            "",
+            Some(3),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("a declared body larger than the artifact must fail");
+        assert!(err.to_string().contains("advertises"), "got: {err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_chunked_body_over_expected_is_stopped_while_streaming() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::chunked(b"hello")]).await;
+        let dir = mock_dir("chunked-size");
+        let dest = dir.join("artifact.jar");
+        std::fs::write(&dest, b"previous-good").unwrap();
+
+        let err = download_to_part_observed(
+            &server.url,
+            &dest,
+            "",
+            Some(3),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("a chunked body larger than the artifact must stop mid-stream");
+        assert!(
+            err.to_string().contains("more than the expected"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_checksum_mismatch_cleans_temp() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("checksum");
+        let dest = dir.join("artifact.jar");
+        std::fs::write(&dest, b"previous-good").unwrap();
+
+        let err = download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"not-hello"),
+            Some(5),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("checksum mismatch must fail");
+        assert!(err.to_string().to_lowercase().contains("sha"), "got: {err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_truncated_body_resumes_with_range() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![
+            MockSpec::truncated(b"hello", 10),
+            MockSpec::partial(b"world", 10, 5),
+        ])
+        .await;
+        let dir = mock_dir("resume");
+        let dest = dir.join("artifact.jar");
+
+        download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"helloworld"),
+            Some(10),
+            Some(Duration::from_secs(20)),
+            None,
+        )
+        .await
+        .expect("truncated body must resume");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"helloworld");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_existing_matching_part_resumes_across_calls() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::partial(b"world", 10, 5)]).await;
+        let dir = mock_dir("resume-existing");
+        let dest = dir.join("artifact.jar");
+        let identity = download_identity(&server.url, &sha1_hex(b"helloworld"), Some(10));
+        std::fs::write(part_path_for(&dest), b"hello").unwrap();
+        std::fs::write(part_meta_path(&dest), identity).unwrap();
+
+        download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"helloworld"),
+            Some(10),
+            Some(Duration::from_secs(20)),
+            None,
+        )
+        .await
+        .expect("matching .part must resume");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"helloworld");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_part_open_failure_removes_sidecar() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("open-fail");
+        let dest = dir.join("artifact.jar");
+        // A directory at the `.part` path makes File::create fail after the
+        // identity sidecar was already written.
+        std::fs::create_dir_all(part_path_for(&dest)).unwrap();
+
+        let err = download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"hello"),
+            Some(5),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("opening a directory as .part must fail");
+
+        assert!(
+            err.to_string().contains("Failed to create .part"),
+            "got: {err}"
+        );
+        assert!(!dest.exists());
+        assert!(
+            !part_meta_path(&dest).exists(),
+            "the sidecar must not survive an open failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_write_failure_cleans_temp() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("write-fail");
+        let dest = dir.join("artifact.jar");
+        std::fs::write(&dest, b"previous-good").unwrap();
+        fail_next_write();
+
+        let err = download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"hello"),
+            Some(5),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("injected write failure must fail");
+        assert!(
+            err.to_string().contains("injected .part write"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_flush_failure_cleans_temp() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("flush-fail");
+        let dest = dir.join("artifact.jar");
+        std::fs::write(&dest, b"previous-good").unwrap();
+        fail_next_flush();
+
+        let err = download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"hello"),
+            Some(5),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("injected flush failure must fail");
+        assert!(
+            err.to_string().contains("injected .part flush"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_rename_failure_cleans_temp_and_keeps_destination() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("rename-fail");
+        let dest = dir.join("artifact.jar");
+        // A directory at the destination makes the final rename fail.
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let _err = download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"hello"),
+            Some(5),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("rename onto a directory must fail");
+
+        assert!(dest.is_dir(), "the existing destination must be preserved");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_sidecar_creation_failure_cleans_part() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("sidecar-fail");
+        let dest = dir.join("artifact.jar");
+        // A directory at the sidecar path makes the identity write fail.
+        std::fs::create_dir_all(part_meta_path(&dest)).unwrap();
+
+        let err = download_to_part_observed(
+            &server.url,
+            &dest,
+            &sha1_hex(b"hello"),
+            Some(5),
+            Some(Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect_err("an unwritable identity sidecar must fail the download");
+        assert!(err.to_string().contains("identity"), "got: {err}");
+        assert!(!dest.exists());
+        assert!(
+            !part_path_for(&dest).exists(),
+            "no .part may survive a failed identity write"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_http_client_failure_cleans_temp() {
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("client-fail");
+        let dest = dir.join("artifact.jar");
+        std::fs::write(&dest, b"previous-good").unwrap();
+        fail_next_client();
+
+        let err = download_to_part_observed(
+            "http://127.0.0.1:9/artifact.bin",
+            &dest,
+            "",
+            Some(5),
+            Some(Duration::from_secs(5)),
+            None,
+        )
+        .await
+        .expect_err("injected client failure must fail");
+        assert!(err.to_string().contains("client build"), "got: {err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "production retry backoff takes about two minutes"]
+    async fn lifecycle_exhausted_500_retries_then_cleans_temp() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::status(500); 12]).await;
+        let dir = mock_dir("exhaust500");
+        let dest = dir.join("artifact.jar");
+        std::fs::write(&dest, b"previous-good").unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(180),
+            download_to_part_observed(
+                &server.url,
+                &dest,
+                "",
+                None,
+                Some(Duration::from_secs(10)),
+                None,
+            ),
+        )
+        .await
+        .expect("exhausted retries must finish")
+        .expect_err("500 must eventually fail");
+
+        println!(
+            "exhausted 500: hits={} error={err}",
+            server.hits.load(Ordering::SeqCst)
+        );
+        assert!(err.to_string().contains("500"), "got: {err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_parallel_downloads_keep_their_own_temp_files() {
+        let _proxy = direct_proxy_lock().await;
+        let a = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let b = spawn_mock(vec![MockSpec::ok(b"world")]).await;
+        let dir = mock_dir("parallel");
+        let dest_a = dir.join("a.jar");
+        let dest_b = dir.join("b.jar");
+        let sha_a = sha1_hex(b"hello");
+        let sha_b = sha1_hex(b"world");
+
+        let (ra, rb) = tokio::join!(
+            download_to_part_observed(
+                &a.url,
+                &dest_a,
+                &sha_a,
+                Some(5),
+                Some(Duration::from_secs(10)),
+                None
+            ),
+            download_to_part_observed(
+                &b.url,
+                &dest_b,
+                &sha_b,
+                Some(5),
+                Some(Duration::from_secs(10)),
+                None
+            )
+        );
+        ra.expect("first parallel download");
+        rb.expect("second parallel download");
+        assert_eq!(std::fs::read(&dest_a).unwrap(), b"hello");
+        assert_eq!(std::fs::read(&dest_b).unwrap(), b"world");
+        assert_clean(&part_path_for(&dest_a), &part_meta_path(&dest_a));
+        assert_clean(&part_path_for(&dest_b), &part_meta_path(&dest_b));
+
+        // Two downloads of the same destination are serialized by the path
+        // lock; both finish and leave no temporary files behind.
+        let shared = spawn_mock(vec![
+            MockSpec::ok(b"same-bytes"),
+            MockSpec::ok(b"same-bytes"),
+        ])
+        .await;
+        let dest = dir.join("shared.jar");
+        let shared_sha = sha1_hex(b"same-bytes");
+        let (r1, r2) = tokio::join!(
+            download_to_part_observed(
+                &shared.url,
+                &dest,
+                &shared_sha,
+                Some(10),
+                Some(Duration::from_secs(10)),
+                None
+            ),
+            download_to_part_observed(
+                &shared.url,
+                &dest,
+                &shared_sha,
+                Some(10),
+                Some(Duration::from_secs(10)),
+                None
+            )
+        );
+        r1.expect("first shared download");
+        r2.expect("second shared download");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"same-bytes");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_pause_before_start_writes_no_temp_files() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+        let dir = mock_dir("pause");
+        let dest = dir.join("artifact.jar");
+        std::fs::write(&dest, b"previous-good").unwrap();
+
+        let scope = PausableInstallScope::begin();
+        request_pause();
+        let err = download_to_part_observed(
+            &server.url,
+            &dest,
+            "",
+            Some(5),
+            Some(Duration::from_secs(5)),
+            None,
+        )
+        .await
+        .expect_err("a paused operation must stop");
+        assert!(matches!(err, LauncherError::Paused));
+        clear_pause();
+        drop(scope);
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous-good");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_aborted_download_keeps_part_for_resume() {
+        let _proxy = direct_proxy_lock().await;
+        let slow = spawn_mock(vec![MockSpec::slow(b"helloworld")]).await;
+        let dir = mock_dir("abort");
+        let dest = dir.join("artifact.jar");
+        let url = slow.url.clone();
+        let path = dest.clone();
+        let sha = sha1_hex(b"helloworld");
+
+        let task = tokio::spawn(async move {
+            download_to_part_observed(
+                &url,
+                &path,
+                &sha,
+                Some(10),
+                Some(Duration::from_secs(60)),
+                None,
+            )
+            .await
+        });
+
+        // Wait until the server has sent half the body *and* the downloader
+        // has persisted it, then abort the task.
+        slow.started.notified().await;
+        let part_path = part_path_for(&dest);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while std::fs::metadata(&part_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+            < 5
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the downloader did not persist the first chunk in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            !dest.exists(),
+            "an aborted download must not publish a file"
+        );
+        assert_eq!(
+            std::fs::read(&part_path).unwrap(),
+            b"hello",
+            "aborting must keep the partial bytes for a later resume"
+        );
+        assert!(part_meta_path(&dest).exists());
+
+        // The saved `.part` is valid: a later run resumes and completes.
+        let resume = spawn_mock(vec![MockSpec::partial(b"world", 10, 5)]).await;
+        let identity = download_identity(&resume.url, &sha1_hex(b"helloworld"), Some(10));
+        std::fs::write(part_meta_path(&dest), identity).unwrap();
+        download_to_part_observed(
+            &resume.url,
+            &dest,
+            &sha1_hex(b"helloworld"),
+            Some(10),
+            Some(Duration::from_secs(20)),
+            None,
+        )
+        .await
+        .expect("the retained .part must be resumable");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"helloworld");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

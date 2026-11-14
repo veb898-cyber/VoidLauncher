@@ -48,7 +48,12 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const [packModalName, setPackModalName] = useState<string | null>(null);
   const [hasPack, setHasPack] = useState(false);
   const [backupBusy, setBackupBusy] = useState<string | null>(null);
+  const [setupBusy, setSetupBusy] = useState<string | null>(null);
   const editorInstance = editorName ? instances.find((i) => i.name === editorName) ?? null : null;
+  const contextInstance = contextMenu
+    ? instances.find((i) => i.name === contextMenu.name) ?? null
+    : null;
+  const contextSetup = contextInstance?.setup_state ?? null;
 
   const installingName = installProgress && !isTerminalInstallStage(installProgress.stage)
     ? installProgress.instance_id
@@ -101,6 +106,21 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
       addToast(t('instances.backup_error', { error: e.toString() }), 'error');
     }
     setBackupBusy(null);
+  };
+
+  // Rerun the idempotent preparation of an instance whose setup was
+  // interrupted after its files were imported. An interrupted *import* is
+  // rejected by the backend and must be re-imported instead.
+  const handleFinishSetup = async (name: string) => {
+    setSetupBusy(name);
+    try {
+      await invoke('cmd_finish_instance_setup', { name });
+      addToast(t('instances.setup_finished', { name }), 'success');
+      await useInstanceStore.getState().loadInstances();
+    } catch (e: any) {
+      addToast(t('instances.setup_finish_error', { error: e.toString() }), 'error');
+    }
+    setSetupBusy(null);
   };
 
   return (
@@ -176,6 +196,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           instances.map((instance) => {
             const isInstalling = installingName === instance.name;
             const isSelected = selectedInstance === instance.name;
+            const isPreparing = !!instance.setup_state;
 
             return (
               <div
@@ -255,6 +276,23 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
                       />
                     </div>
                   )}
+                  {!isInstalling && isPreparing && (
+                    <div
+                      style={{
+                        marginTop: 4,
+                        fontSize: 'var(--font-size-xs)',
+                        color: 'var(--warning)',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {instance.setup_state?.stage === 'importing' &&
+                      instance.setup_state?.operation === 'import'
+                        ? t('instances.setup_interrupted')
+                        : t('instances.setup_incomplete')}
+                    </div>
+                  )}
                 </div>
               </div>
             );
@@ -274,12 +312,18 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
             className="ctx-menu"
             style={{
               left: Math.min(contextMenu.x, window.innerWidth - 200),
-              top: Math.min(contextMenu.y, window.innerHeight - 340),
+              top: Math.min(contextMenu.y, window.innerHeight - 380),
             }}
             onMouseDown={(e) => e.stopPropagation()}
           >
-            <ContextMenuItem icon={<Play size={14} fill="currentColor" />} label={t('instances.play')} disabled={isLaunching}
+            <ContextMenuItem icon={<Play size={14} fill="currentColor" />} label={t('instances.play')}
+              disabled={isLaunching || installingName === contextMenu.name || !!contextSetup}
               onClick={() => { launchGame(contextMenu.name); setContextMenu(null); }} />
+            {contextSetup?.stage === 'preparing' && (
+              <ContextMenuItem icon={<RefreshCw size={14} />} label={t('instances.setup_finish')}
+                disabled={setupBusy === contextMenu.name}
+                onClick={() => { handleFinishSetup(contextMenu.name); setContextMenu(null); }} />
+            )}
             <ContextMenuItem icon={<Settings size={14} />} label={t('instances.ctx_settings')}
               onClick={() => { setEditorName(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<Copy size={14} />} label={t('instances.ctx_duplicate')} disabled={isLaunching}

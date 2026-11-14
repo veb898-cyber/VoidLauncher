@@ -1,6 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Hard bounds for any heap value the launcher will hand to the JVM.
+/// The UI and the global config use the same bounds; the per-instance value
+/// is additionally capped by the user's global `max_memory_mb`.
+pub const MIN_MEMORY_MB: u32 = 2048;
+pub const MAX_MEMORY_MB: u32 = 32768;
+
+/// Current config schema/migration marker. Bump only together with a
+/// deterministic, non-ambiguous migration.
+pub const CONFIG_VERSION: u32 = 1;
+
 /// Tiered memory recommendation based on total system RAM (in MB).
 ///
 ///   total ≤ 8192   → 4096 (4 GB)
@@ -46,6 +56,12 @@ pub struct AppConfig {
     pub default_gc_preset: String,
     /// Default JVM arguments
     pub default_jvm_args: Vec<String>,
+    /// Monotonic config migration marker. `0` (or a missing field) is an
+    /// untouched legacy config; new configs start at the current version.
+    /// Ambiguous preference changes (for example, whether `g1gc` was the old
+    /// default or an explicit user choice) are never guessed from this marker.
+    #[serde(default)]
+    pub config_version: u32,
     /// Custom Java path (None = auto-detect)
     pub java_path: Option<PathBuf>,
     /// What to do with the launcher window after the game process has
@@ -150,10 +166,11 @@ impl Default for AppConfig {
             // the preset). Only flags that are meaningful for EVERY preset
             // belong below.
             default_jvm_args: vec![
-                // Mods occasionally call System.gc() (often in loops) —
+                // Mods occasionally call System.gc() (often in loops) -
                 // disabling explicit GC prevents surprise Full GC pauses.
                 "-XX:+DisableExplicitGC".into(),
             ],
+            config_version: CONFIG_VERSION,
             java_path: None,
             after_launch_action: default_after_launch_action(),
             close_on_launch: false,
@@ -202,39 +219,43 @@ impl AppConfig {
         args.len() == legacy.len() && legacy.iter().zip(args).all(|(l, a)| *l == a)
     }
 
-    /// Migrate pre-0.1.7 defaults in a freshly loaded config so the new
-    /// Prism-style GC behaviour applies without the user touching settings:
-    ///   * 6 GB default on big-RAM machines → 8 GB (matches the tiered
-    ///     recommendation now that ≥ 24 GB RAM maps to 8 GB);
-    ///   * ZGC preset with less than 8 GB of heap → G1GC (ZGC requires
-    ///     8+ GB; on 6 GB it stalled the client during pack/server loads);
+    /// Migrate a freshly loaded config without guessing ambiguous user
+    /// preferences:
+    ///   * clamp impossible heap values;
+    ///   * record the config schema version once (legacy configs have no
+    ///     marker, so an explicit `g1gc`/6 GB choice is preserved rather than
+    ///     reinterpreted as an old default);
+    ///   * ZGC with less than 8 GB of heap → G1GC (ZGC cannot work there, and
+    ///     the launch path would fall back anyway);
     ///   * legacy server-style `default_jvm_args` → slim preset-neutral set.
     ///
     /// Returns true when something changed (caller should persist).
     fn migrate(&mut self) -> bool {
         let mut changed = false;
-        let total_ram = detect_total_ram_mb();
 
         // A hand-edited or corrupted config must never hand absurd heaps to
         // the JVM (0 MB aborts, multi-TB values make Windows refuse to start).
-        let default_memory = self.default_memory_mb.clamp(2048, 32768);
+        let default_memory = self.default_memory_mb.clamp(MIN_MEMORY_MB, MAX_MEMORY_MB);
         if default_memory != self.default_memory_mb {
             self.default_memory_mb = default_memory;
             changed = true;
         }
-        let max_memory = self.max_memory_mb.clamp(2048, 32768);
+        let max_memory = self.max_memory_mb.clamp(MIN_MEMORY_MB, MAX_MEMORY_MB);
         if max_memory != self.max_memory_mb {
             self.max_memory_mb = max_memory;
             changed = true;
         }
 
-        if total_ram >= 24 * 1024 && self.default_memory_mb == 6144 && self.max_memory_mb == 6144 {
-            self.default_memory_mb = 8192;
-            self.max_memory_mb = 8192;
+        if self.config_version < CONFIG_VERSION {
+            // Version 0 has no reliable record of whether a value was the old
+            // default or an explicit user choice. Never rewrite an ambiguous
+            // preference here: keep G1GC/6 GB exactly as stored. Only record
+            // that the schema has been seen.
+            self.config_version = CONFIG_VERSION;
             tracing::info!(
                 target: "config",
-                "Migrated default memory 6144 -> 8192 MB (system has {} MB RAM)",
-                total_ram
+                "Migrated config schema to version {} (user choices preserved)",
+                CONFIG_VERSION
             );
             changed = true;
         }
@@ -245,24 +266,6 @@ impl AppConfig {
                 target: "config",
                 "Migrated default GC preset zgc -> g1gc (ZGC needs >= 8 GB heap, current: {} MB)",
                 self.default_memory_mb
-            );
-            changed = true;
-        }
-
-        // ZGC became the default for machines with >= 24 GB RAM (heaps >= 8 GB).
-        // Only flip untouched-looking configs: heap still at the recommended
-        // 8 GB and the old hard-coded "g1gc" default. A manual choice (any
-        // other memory value or preset) is left alone.
-        if total_ram >= 24 * 1024
-            && self.default_memory_mb >= 8192
-            && self.max_memory_mb >= 8192
-            && self.default_gc_preset.eq_ignore_ascii_case("g1gc")
-        {
-            self.default_gc_preset = "zgc".into();
-            tracing::info!(
-                target: "config",
-                "Migrated default GC preset g1gc -> zgc (system has {} MB RAM, heap {} MB)",
-                total_ram, self.default_memory_mb
             );
             changed = true;
         }
@@ -522,6 +525,10 @@ mod tests {
         let config: AppConfig = serde_json::from_value(legacy).expect("legacy config parses");
         assert!(config.elyby_skins_in_game);
         assert!(config.proxy_only);
+        assert_eq!(
+            config.config_version, 0,
+            "a config without the marker is a legacy config"
+        );
     }
 
     #[test]
@@ -591,6 +598,54 @@ mod tests {
         assert_eq!(loaded.after_launch_action, "minimize");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_migration_never_reinterprets_an_explicit_gc_choice() {
+        // A legacy config has no marker. Its stored g1gc may be the old
+        // default or an explicit choice; migration must preserve it.
+        let mut legacy = base();
+        legacy.config_version = 0;
+        legacy.default_gc_preset = "g1gc".into();
+        legacy.default_memory_mb = 8192;
+        legacy.max_memory_mb = 8192;
+        assert!(legacy.migrate(), "schema marker is recorded once");
+        assert_eq!(legacy.default_gc_preset, "g1gc");
+        assert_eq!(legacy.config_version, CONFIG_VERSION);
+        assert!(
+            !legacy.migrate(),
+            "a second run must not change anything (idempotent migration)"
+        );
+        assert_eq!(legacy.default_gc_preset, "g1gc");
+
+        // Explicit ZGC survives as long as the heap is large enough.
+        let mut zgc = base();
+        zgc.config_version = 0;
+        zgc.default_gc_preset = "zgc".into();
+        zgc.default_memory_mb = 8192;
+        zgc.max_memory_mb = 8192;
+        assert!(zgc.migrate());
+        assert_eq!(zgc.default_gc_preset, "zgc");
+
+        // The old 6 GB value is preserved too: it may be a deliberate choice.
+        let mut six_gb = base();
+        six_gb.config_version = 0;
+        six_gb.default_gc_preset = "g1gc".into();
+        six_gb.default_memory_mb = 6144;
+        six_gb.max_memory_mb = 6144;
+        assert!(six_gb.migrate());
+        assert_eq!(six_gb.default_memory_mb, 6144);
+        assert_eq!(six_gb.max_memory_mb, 6144);
+
+        // ZGC below the 8 GB floor is a safety correction: the JVM launch
+        // path would fall back to G1GC anyway.
+        let mut low = base();
+        low.config_version = 0;
+        low.default_gc_preset = "zgc".into();
+        low.default_memory_mb = 4096;
+        low.max_memory_mb = 4096;
+        assert!(low.migrate());
+        assert_eq!(low.default_gc_preset, "g1gc");
     }
 
     #[test]

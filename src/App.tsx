@@ -21,6 +21,7 @@ import { useFocusStore } from './stores/focusStore';
 import { useUpdater } from './hooks/useUpdater';
 import { useBrowserGuardStore } from './stores/browserGuardStore';
 import { useJavaDownloadStore } from './stores/javaDownloadStore';
+import { useLanguageStore } from './stores/languageStore';
 import { useT } from './lib/i18n';
 
 const Home = lazy(() => import('./pages/Home').then(m => ({ default: m.Home })));
@@ -35,6 +36,7 @@ function App() {
   useGameEvents();
   useKeyboardShortcuts();
   const t = useT();
+  const language = useLanguageStore((s) => s.language);
   const updater = useUpdater();
   const [activePage, setActivePage] = useState('home');
   const checkAuth = useAuthStore((s) => s.checkAuth);
@@ -53,6 +55,36 @@ function App() {
     useBrowserGuardStore.getState().askLeave(() => setActivePage(page));
   }, []);
 
+  // Window close is guarded too: unsaved Settings/InstanceEditor changes must
+  // not disappear without a question. `onCloseRequested` fires for the titlebar
+  // button and the OS close button alike.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    (async () => {
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const appWindow = getCurrentWindow();
+        const fn = await appWindow.onCloseRequested((event) => {
+          const guard = useBrowserGuardStore.getState();
+          if (!guard.unsaved) return;
+          event.preventDefault();
+          guard.askUnsaved(() => {
+            appWindow.destroy().catch(() => {});
+          });
+        });
+        if (disposed) fn();
+        else unlisten = fn;
+      } catch {
+        /* the guard is best-effort; a close must never be blocked by it */
+      }
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   // Listen for java_download_progress during launch to show the setup modal
   useEffect(() => {
     const isLaunchingRef = { current: false };
@@ -67,17 +99,28 @@ function App() {
       'java_download_progress',
       (event) => {
         const p = event.payload;
-        if (p.stage === 'done' || p.stage === 'error') {
-          // Both are terminal: stop showing progress (the launch modal shows
-          // the error text itself when it catches the event).
-          useJavaDownloadStore.getState().clear();
-          if (p.stage === 'done' && isLaunchingRef.current) {
+        if (p.stage === 'error') {
+          // Keep the error entry visible in the modal/store; the launch flow
+          // also reports it. Other majors keep their own entries.
+          useJavaDownloadStore
+            .getState()
+            .reportProgress(p.major_version, p.percent, p.message, p.stage);
+        } else if (p.stage === 'done') {
+          useJavaDownloadStore
+            .getState()
+            .reportProgress(p.major_version, p.percent, p.message, p.stage);
+          setTimeout(() => {
+            useJavaDownloadStore.getState().clear(p.major_version);
+          }, 800);
+          if (isLaunchingRef.current) {
             setTimeout(() => setJavaSetupVisible(false), 500);
           }
         } else {
-          // Keep the global store fresh even while Settings is not mounted,
-          // so re-entering it mid-download still shows progress.
-          useJavaDownloadStore.getState().reportProgress(p.major_version, p.percent, p.message);
+          // Keep every major separate so concurrent Java 17/21 downloads
+          // cannot overwrite each other's progress.
+          useJavaDownloadStore
+            .getState()
+            .reportProgress(p.major_version, p.percent, p.message, p.stage);
           if (isLaunchingRef.current) {
             setJavaSetupVisible(true);
           }
@@ -87,6 +130,13 @@ function App() {
 
     return () => { unsub(); unlisten.then((fn) => fn()).catch(() => {}); };
   }, []);
+
+  // Keep the document language in sync: screen readers and spellcheck use it,
+  // and it must follow the Settings language switch.
+  useEffect(() => {
+    document.documentElement.lang = language === 'ru' ? 'ru' : 'en';
+    document.documentElement.dataset.lang = language;
+  }, [language]);
 
   useEffect(() => {
     checkAuth();
@@ -149,12 +199,18 @@ function App() {
           glass surfaces actually refract, plus the chosen animated backdrop
           painted into it. Out of flow (position: fixed) and invisible unless
           Liquid Glass is applied, so the normal themes are untouched. */}
-      <LiquidGlassWallpaper />
-      <Titlebar />
+      <ErrorBoundary fallback={null}>
+        <LiquidGlassWallpaper />
+      </ErrorBoundary>
+      <ErrorBoundary fallback={null}>
+        <Titlebar />
+      </ErrorBoundary>
       <div className="app-layout">
-        <Sidebar activePage={activePage} onNavigate={navigate} />
+        <ErrorBoundary fallback={null}>
+          <Sidebar activePage={activePage} onNavigate={navigate} />
+        </ErrorBoundary>
         <main className="main-content">
-          <ErrorBoundary>
+          <ErrorBoundary resetKey={activePage}>
             <Suspense
               fallback={
                 <div className="page-loading">
@@ -167,20 +223,24 @@ function App() {
           </ErrorBoundary>
         </main>
       </div>
-      <InstallOverlay />
-      <UpdaterModal
-        updateAvailable={updater.updateAvailable}
-        updateInfo={updater.updateInfo}
-        downloading={updater.downloading}
-        downloadProgress={updater.downloadProgress}
-        installing={updater.installing}
-        error={updater.error}
-        checkError={updater.checkError}
-        onUpdate={updater.downloadAndInstall}
-        onDismiss={updater.dismissUpdate}
-        onRetryCheck={updater.retryCheck}
-        onDismissCheckError={updater.dismissCheckError}
-      />
+      <ErrorBoundary fallback={null}>
+        <InstallOverlay />
+      </ErrorBoundary>
+      <ErrorBoundary fallback={null}>
+        <UpdaterModal
+          updateAvailable={updater.updateAvailable}
+          updateInfo={updater.updateInfo}
+          downloading={updater.downloading}
+          downloadProgress={updater.downloadProgress}
+          installing={updater.installing}
+          error={updater.error}
+          checkError={updater.checkError}
+          onUpdate={updater.downloadAndInstall}
+          onDismiss={updater.dismissUpdate}
+          onRetryCheck={updater.retryCheck}
+          onDismissCheckError={updater.dismissCheckError}
+        />
+      </ErrorBoundary>
       <ToastContainer />
       <JavaSetupModal
         open={javaSetupVisible}

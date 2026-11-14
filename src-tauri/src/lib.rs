@@ -19,6 +19,7 @@ mod game_logs;
 mod i18n;
 mod import;
 mod install_progress;
+mod instance_readiness;
 pub mod instances;
 mod java;
 mod java_download;
@@ -49,7 +50,7 @@ use config::AppConfig;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tauri::{Manager, WindowEvent};
+use tauri::Manager;
 
 /// Global app state shared across all Tauri commands
 pub struct AppState {
@@ -87,13 +88,7 @@ pub struct PackWatcherHandle {
 /// would look like `github.com` to a naive parser while reqwest connects to
 /// `evil.example`. Userinfo is therefore rejected outright.
 pub(crate) fn is_allowed_download_host(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
-        return false;
-    };
-    parsed.scheme() == "https"
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
-        && parsed.host_str().is_some_and(download::is_host_allowed)
+    download::validate_download_url(url).is_ok()
 }
 
 // ==================== App Builder ====================
@@ -144,6 +139,26 @@ pub fn run() {
     // ~140 MB and froze the UI on first open; icons now live only in
     // renderer memory for the session (same as Prism Launcher).
     let _ = std::fs::remove_file(data_dir.join("icon_cache.json"));
+
+    // Crash recovery: hidden `.void-setup-*.tmp` folders are never valid
+    // instances and are safe to remove. `.void-recovery-*` folders preserve
+    // an interrupted import and are reported instead of deleted.
+    let instances_dir = config.instances_dir();
+    let removed = instance_readiness::cleanup_abandoned_setup_dirs(&instances_dir);
+    if removed > 0 {
+        tracing::warn!(
+            target: "launcher",
+            "Removed {} abandoned setup folder(s) from a previous crash",
+            removed
+        );
+    }
+    for dir in instance_readiness::recovery_dirs(&instances_dir) {
+        tracing::warn!(
+            target: "launcher",
+            "Preserved data from an interrupted import: {} (kept until you remove it)",
+            dir.display()
+        );
+    }
 
     download::set_global_proxy_policy(
         config.proxy_enabled,
@@ -269,7 +284,7 @@ pub fn run() {
         }
     }
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             events::set_app_handle(app.handle());
             Ok(())
@@ -389,6 +404,7 @@ pub fn run() {
             commands::export::cmd_save_export_file,
             commands::instances::cmd_probe_modpack,
             commands::instances::cmd_import_modpack,
+            commands::instances::cmd_finish_instance_setup,
             commands::instances::cmd_set_instance_icon,
             commands::instances::cmd_set_instance_banner,
             commands::instances::cmd_log_toast,
@@ -463,30 +479,55 @@ pub fn run() {
             commands::servers::cmd_ping_server,
             commands::launcher::cmd_stop_game,
         ])
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { .. } = event {
-                // Flush any active playtime session before the app exits.
-                // We do NOT call api.prevent_close() — we let the window close,
-                // but first we write the unpaid minutes to disk synchronously.
-                let state: tauri::State<'_, AppState> = window.state();
-                let now = Instant::now();
-                let flushed = playtime::flush_all_sessions(
-                    &state.active_sessions,
-                    &{
-                        match state.config.lock() {
-                            Ok(cfg) => cfg.data_dir.clone(),
-                            Err(_) => std::path::PathBuf::new(),
-                        }
-                    },
-                    now,
-                );
-                if flushed > 0 {
-                    tracing::info!(target: "launcher", "Flushed {} playtime session(s) on close", flushed);
-                }
-            }
-        })
-        .run(tauri::generate_context!())
-        .expect("Error while running VoidLauncher");
+        .build(tauri::generate_context!())
+        .expect("Error while building VoidLauncher");
+
+    // Playtime must be finalized only when the application really exits.
+    // `CloseRequested` is not final: the JS close guard may prevent the close
+    // (unsaved changes) or the user may cancel the confirmation. Flushing
+    // there would drain the live sessions and stop counting the running game.
+    app.run(|app_handle, event| {
+        if should_flush_playtime_on_run_event(&event) {
+            flush_playtime_on_exit(app_handle);
+        }
+    });
+}
+
+/// The final application-exit event is the only point where active playtime
+/// sessions may be drained.
+fn should_flush_playtime_on_run_event(event: &tauri::RunEvent) -> bool {
+    matches!(event, tauri::RunEvent::Exit)
+}
+
+/// Commit every still-active playtime session exactly once at app exit.
+fn flush_playtime_on_exit(app_handle: &tauri::AppHandle) {
+    let state: tauri::State<'_, AppState> = app_handle.state();
+    let data_dir = match state.config.lock() {
+        Ok(config) => config.data_dir.clone(),
+        Err(_) => return,
+    };
+    let flushed = playtime::flush_all_sessions(&state.active_sessions, &data_dir, Instant::now());
+    if flushed > 0 {
+        tracing::info!(
+            target: "launcher",
+            "Flushed {} playtime session(s) on exit",
+            flushed
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_lifecycle_tests {
+    use super::should_flush_playtime_on_run_event;
+
+    #[test]
+    fn playtime_is_flushed_only_on_application_exit() {
+        assert!(should_flush_playtime_on_run_event(&tauri::RunEvent::Exit));
+        assert!(!should_flush_playtime_on_run_event(&tauri::RunEvent::Ready));
+        assert!(!should_flush_playtime_on_run_event(
+            &tauri::RunEvent::MainEventsCleared
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -34,6 +34,17 @@ pub const VOID_LINK_PORT: u16 = 48888;
 static VOID_LINK_STATE: std::sync::OnceLock<std::sync::Mutex<Option<BridgeTask>>> =
     std::sync::OnceLock::new();
 
+/// Serializes start/stop transitions. The bridge state itself only needs a
+/// short std-mutex critical section, but `ensure` has to release it while
+/// `TcpListener::bind().await` runs; without this operation lock two starts
+/// could each bind and one task would be orphaned, and a stop racing a start
+/// could miss the task that is installed after the stop.
+static VOID_LINK_OP_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn void_link_op_lock() -> &'static tokio::sync::Mutex<()> {
+    VOID_LINK_OP_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// A running control-bridge task bound to a single tailnet IP.
 struct BridgeTask {
     /// Tailnet IP this bridge is bound to (e.g. `100.101.102.103`).
@@ -161,19 +172,59 @@ async fn write_response(
     socket.flush().await
 }
 
-/// Guest-side client: query the host bridge, ignoring proxy settings (this
-/// is a direct tailnet peer). Returns the parsed control status.
-pub async fn query_host_status(
+/// VoidLink is a direct tailnet control channel. Only Tailscale's IPv4 CGNAT
+/// range and its IPv6 ULA prefix are accepted; arbitrary IP literals are not
+/// trusted merely because a caller supplied them.
+fn is_allowed_void_link_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            octets[0] == 100 && (64..=127).contains(&octets[1])
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
+        }
+    }
+}
+
+async fn query_host_status_with(
     host_ip: &str,
     port: u16,
     room_code: &str,
+    allow_loopback_for_test: bool,
 ) -> crate::error::Result<VoidLinkStatus> {
+    let ip: std::net::IpAddr = host_ip.parse().map_err(|_| {
+        crate::error::LauncherError::Download(format!(
+            "VoidLink: invalid host address '{}'",
+            host_ip
+        ))
+    })?;
+    let allowed = is_allowed_void_link_ip(ip)
+        || (allow_loopback_for_test && ip.is_loopback() && ip.is_ipv4());
+    if !allowed {
+        return Err(crate::error::LauncherError::Download(
+            "VoidLink: host address is not a Tailscale address".to_string(),
+        ));
+    }
+    let host = match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{}]", v6),
+    };
+    // No redirects: a room peer must not be able to turn the control query
+    // into an SSRF probe against an arbitrary internal endpoint.
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(crate::error::LauncherError::Network)?;
-    let url = format!("http://{host_ip}:{port}/room/status?code={room_code}");
+    let url = format!(
+        "http://{}:{}/room/status?code={}",
+        host,
+        port,
+        urlencoding::encode(room_code)
+    );
     let resp = client
         .get(&url)
         .send()
@@ -190,6 +241,25 @@ pub async fn query_host_status(
         .map_err(crate::error::LauncherError::Network)
 }
 
+/// Guest-side client: query the host bridge, ignoring proxy settings (this
+/// is a direct tailnet peer). Returns the parsed control status.
+pub async fn query_host_status(
+    host_ip: &str,
+    port: u16,
+    room_code: &str,
+) -> crate::error::Result<VoidLinkStatus> {
+    query_host_status_with(host_ip, port, room_code, false).await
+}
+
+#[cfg(test)]
+pub(crate) async fn query_host_status_for_test(
+    host_ip: &str,
+    port: u16,
+    room_code: &str,
+) -> crate::error::Result<VoidLinkStatus> {
+    query_host_status_with(host_ip, port, room_code, true).await
+}
+
 /// Resolve the address the host's bridge should bind to: `self_ip:VOID_LINK_PORT`.
 pub fn bind_addr(self_ip: &str, port: u16) -> Option<SocketAddr> {
     let ip: std::net::IpAddr = self_ip.parse().ok()?;
@@ -204,25 +274,9 @@ pub async fn ensure_void_link_server(
     self_ip: String,
     room_state: Arc<RoomStateManager>,
 ) -> crate::error::Result<()> {
-    // Reconcile the current bridge OUTSIDE the await: no lock may be held
-    // across `bind().await` (the Tauri command future must stay `Send`).
-    {
-        let mut state = void_link_state().lock().unwrap_or_else(|e| e.into_inner());
-        match state.as_mut() {
-            Some(b) if b.ip == self_ip && !b.task.is_finished() => {
-                return Ok(());
-            }
-            Some(b) if !b.task.is_finished() => {
-                // Stale bridge: bound to a previous IP, or the accept loop
-                // exited. Abort it so the old listener stops serving, then
-                // re-bind below.
-                b.task.abort();
-            }
-            _ => {}
-        }
-        *state = None;
-    } // guard dropped here, before the await
-
+    // Validate the requested address BEFORE touching a live bridge: an
+    // invalid/missing Tailscale address must not stop a bridge that is still
+    // serving the room.
     let port = room_state.void_link_port();
     let addr = bind_addr(&self_ip, port).ok_or_else(|| {
         crate::error::LauncherError::Launch(format!(
@@ -230,6 +284,39 @@ pub async fn ensure_void_link_server(
             self_ip
         ))
     })?;
+
+    // Serialize start/stop transitions. The bridge-state mutex itself must not
+    // be held across `bind().await` (the Tauri command future must stay
+    // `Send`), but the operation lock may be: tokio's mutex guard is Send.
+    let _op = void_link_op_lock().lock().await;
+
+    // A status poll can race a leave. Never recreate a bridge after this
+    // launcher stopped being the host.
+    if room_state.role() != RoomRole::Host {
+        return Ok(());
+    }
+
+    let old_bridge = {
+        let mut state = void_link_state().lock().unwrap_or_else(|e| e.into_inner());
+        match state.as_ref() {
+            Some(b) if b.ip == self_ip && !b.task.is_finished() => {
+                return Ok(());
+            }
+            Some(_) => state.take(),
+            None => None,
+        }
+    }; // bridge-state guard dropped here, before the await
+
+    if let Some(old) = old_bridge {
+        // Abort AND await the old task: abort() only schedules cancellation,
+        // and the old listener must be dropped before a rebind on the same
+        // port can succeed.
+        if !old.task.is_finished() {
+            old.task.abort();
+        }
+        let _ = old.task.await;
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         crate::error::LauncherError::Launch(format!("VoidLink bind {}: {}", addr, e))
     })?;
@@ -249,12 +336,24 @@ pub async fn ensure_void_link_server(
 /// Abort the host-side bridge (the room ended). The bridge never outlives a
 /// room session; the next `ensure_void_link_server` binds a fresh listener on
 /// the current tailnet IP.
-pub fn stop_void_link_server() {
-    let mut state = void_link_state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(b) = state.take() {
-        if !b.task.is_finished() {
-            b.task.abort();
+///
+/// Async because it must wait for an in-flight start to finish before taking
+/// the bridge; otherwise a stop that runs while `ensure` is inside
+/// `bind().await` would see `None` and the new listener would be installed
+/// after the stop.
+pub async fn stop_void_link_server() {
+    let _op = void_link_op_lock().lock().await;
+    let old = {
+        let mut state = void_link_state().lock().unwrap_or_else(|e| e.into_inner());
+        state.take()
+    };
+    if let Some(old) = old {
+        // Wait for cancellation so the listener is actually closed before the
+        // caller reports the room as stopped (and before a later rebind).
+        if !old.task.is_finished() {
+            old.task.abort();
         }
+        let _ = old.task.await;
     }
 }
 
@@ -310,6 +409,63 @@ mod tests {
         );
         assert_eq!(query_param("x=1", "code"), None);
         assert_eq!(query_param("", "code"), None);
+    }
+
+    #[test]
+    fn void_link_only_accepts_tailscale_addresses() {
+        for allowed in [
+            "100.64.0.1",
+            "100.100.100.100",
+            "100.127.255.254",
+            "fd7a:115c:a1e0::1",
+            "fd7a:115c:a1e0:1234::abcd",
+        ] {
+            let ip: std::net::IpAddr = allowed.parse().unwrap();
+            assert!(
+                is_allowed_void_link_ip(ip),
+                "{allowed} is a Tailscale address"
+            );
+        }
+        for denied in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.63.255.255",
+            "100.128.0.1",
+            "8.8.8.8",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "fd7a:115c:a1e1::1",
+        ] {
+            let ip: std::net::IpAddr = denied.parse().unwrap();
+            assert!(
+                !is_allowed_void_link_ip(ip),
+                "{denied} must not be treated as a tailnet host"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn query_host_status_rejects_non_tailnet_targets_before_connecting() {
+        // Loopback/private/link-local targets are refused before a client is
+        // built, so this never reaches the network.
+        for host in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "::1",
+            "fe80::1",
+            "not-an-ip",
+            "100.100.100.100.evil.example",
+        ] {
+            assert!(
+                query_host_status(host, 1, "ABCD-1234").await.is_err(),
+                "non-tailnet endpoint must be rejected: {host}"
+            );
+        }
     }
 
     #[test]

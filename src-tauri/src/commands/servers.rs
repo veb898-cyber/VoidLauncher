@@ -162,6 +162,14 @@ fn begin_server_edit_with<'a>(
         Err(LaunchBusy::Running) => return Err(ServerCommandError::InstanceRunning),
         Err(LaunchBusy::Starting) => return Err(ServerCommandError::InstanceStarting),
         Err(LaunchBusy::Editing) => return Err(ServerCommandError::AnotherEdit),
+        Err(LaunchBusy::Preparing) => {
+            return Err(ServerCommandError::Message {
+                message: format!(
+                    "Instance '{}' is still being installed or prepared. Wait for setup to finish before changing its server list.",
+                    instance_name
+                ),
+            })
+        }
     };
     let guard = ServerEditGuard {
         state,

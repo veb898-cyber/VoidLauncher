@@ -187,10 +187,20 @@ export function Modpacks() {
   // state itself lives in the store so it survives page switches.
   useEffect(() => {
     const unsubs: (() => void)[] = [];
-    listen<any>('modpack_fetch_retry', (event) => store.onFetchRetry(event.payload)).then((fn) => unsubs.push(fn)).catch(() => {});
-    listen<any>('modpack_file_progress', (event) => store.onFileProgress(event.payload)).then((fn) => unsubs.push(fn)).catch(() => {});
-    listen<any>('import-progress', (event) => store.onImportProgress(event.payload)).then((fn) => unsubs.push(fn)).catch(() => {});
-    return () => { unsubs.forEach((fn) => fn()); };
+    let dead = false;
+    const register = (p: Promise<() => void>) => {
+      p.then((fn) => {
+        if (dead) fn();
+        else unsubs.push(fn);
+      }).catch(() => {});
+    };
+    register(listen<any>('modpack_fetch_retry', (event) => store.onFetchRetry(event.payload)));
+    register(listen<any>('modpack_file_progress', (event) => store.onFileProgress(event.payload)));
+    register(listen<any>('import-progress', (event) => store.onImportProgress(event.payload)));
+    return () => {
+      dead = true;
+      unsubs.forEach((fn) => fn());
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

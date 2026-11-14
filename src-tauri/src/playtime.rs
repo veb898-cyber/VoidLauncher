@@ -3,8 +3,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Child;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// Serializes every read-modify-write of `playtime.json`. Two sessions or the
+/// periodic timer and the exit watcher can commit at the same time; without
+/// this lock one update can overwrite the other's minutes.
+static PLAYTIME_UPDATE_LOCK: Mutex<()> = Mutex::new(());
+/// Unique temp-file suffix. Even with the lock, unique names prevent a crash
+/// leftover from colliding with the next update.
+static PLAYTIME_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-instance playtime record (in minutes)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -17,24 +26,79 @@ pub struct PlaytimeEntry {
 /// JSON-backed map of instance name -> playtime entry
 pub type PlaytimeMap = HashMap<String, PlaytimeEntry>;
 
-/// Load the playtime map from `data_dir/playtime.json`. Returns empty map on any error.
-pub fn load_playtime(data_dir: &Path) -> PlaytimeMap {
-    let path = data_dir.join("playtime.json");
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str(&contents).unwrap_or_default()
+fn playtime_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("playtime.json")
 }
 
-/// Persist the playtime map atomically (write to temp then rename). Best-effort; ignores errors.
-pub fn save_playtime(data_dir: &Path, map: &PlaytimeMap) {
-    let _ = fs::create_dir_all(data_dir);
-    let final_path = data_dir.join("playtime.json");
-    let tmp_path = data_dir.join("playtime.json.tmp");
-    if let Ok(json) = serde_json::to_string_pretty(map) {
-        if fs::write(&tmp_path, json).is_ok() {
-            let _ = fs::rename(&tmp_path, &final_path);
+/// Read and parse the map, distinguishing "missing" (normal first run) from a
+/// corrupt/unreadable file (must not be silently replaced with an empty map).
+fn load_playtime_checked(data_dir: &Path) -> (PlaytimeMap, Option<String>) {
+    let path = playtime_path(data_dir);
+    match fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(map) => (map, None),
+            Err(e) => (
+                HashMap::new(),
+                Some(format!("playtime.json is corrupt: {e}")),
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), None),
+        Err(e) => (
+            HashMap::new(),
+            Some(format!("playtime.json is unreadable: {e}")),
+        ),
+    }
+}
+
+/// Load the playtime map from `data_dir/playtime.json`. A corrupt file is
+/// logged and treated as empty for display; `add_minutes_and_save` backs it up
+/// before starting a new file so the old data is recoverable.
+pub fn load_playtime(data_dir: &Path) -> PlaytimeMap {
+    let (map, problem) = load_playtime_checked(data_dir);
+    if let Some(problem) = problem {
+        tracing::warn!(target: "launcher", "{}", problem);
+    }
+    map
+}
+
+/// Write the map atomically. Caller must hold [`PLAYTIME_UPDATE_LOCK`].
+fn save_playtime_locked(data_dir: &Path, map: &PlaytimeMap) -> std::io::Result<()> {
+    fs::create_dir_all(data_dir)?;
+    let final_path = playtime_path(data_dir);
+    let serial = PLAYTIME_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = data_dir.join(format!(".playtime.{}.{}.tmp", std::process::id(), serial));
+    let json = serde_json::to_string_pretty(map)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let result = (|| -> std::io::Result<()> {
+        fs::write(&tmp_path, json)?;
+        // Flush before the rename so a crash cannot publish a truncated file
+        // on a delayed-write filesystem.
+        if let Ok(file) = fs::OpenOptions::new().write(true).open(&tmp_path) {
+            let _ = file.sync_all();
         }
+        fs::rename(&tmp_path, &final_path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+/// Persist the playtime map atomically under the update lock.
+#[allow(dead_code)] // public helper kept for future callers; add_minutes uses the locked path
+pub fn save_playtime(data_dir: &Path, map: &PlaytimeMap) {
+    let _guard = PLAYTIME_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Err(e) = save_playtime_locked(data_dir, map) {
+        tracing::warn!(
+            target: "launcher",
+            "Failed to save playtime to {}: {}",
+            data_dir.display(),
+            e
+        );
     }
 }
 
@@ -182,10 +246,49 @@ pub fn add_minutes_and_save(data_dir: &Path, instance_name: &str, delta_minutes:
     if delta_minutes == 0 {
         return;
     }
-    let mut map = load_playtime(data_dir);
+    let _guard = PLAYTIME_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let (mut map, problem) = load_playtime_checked(data_dir);
+    if let Some(problem) = problem {
+        // Never silently destroy an existing playtime file. Keep a copy the
+        // user can recover, then start a fresh map with the new minutes.
+        let source = playtime_path(data_dir);
+        let backup = data_dir.join(format!(
+            "playtime.json.corrupt-{}",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        ));
+        match fs::rename(&source, &backup) {
+            Ok(()) => tracing::warn!(
+                target: "launcher",
+                "{}; previous file preserved at {}",
+                problem,
+                backup.display()
+            ),
+            Err(e) => tracing::warn!(
+                target: "launcher",
+                "{}; could not preserve the old file: {}",
+                problem,
+                e
+            ),
+        }
+    }
+
     let entry = map.entry(instance_name.to_string()).or_default();
     entry.minutes = entry.minutes.saturating_add(delta_minutes);
-    save_playtime(data_dir, &map);
+    if let Err(e) = save_playtime_locked(data_dir, &map) {
+        // The delta is lost for this flush, but the next timer tick will add
+        // the following whole minutes. Surface the failure instead of
+        // pretending the write succeeded.
+        tracing::warn!(
+            target: "launcher",
+            "Failed to save playtime for '{}' (+{} min): {}",
+            instance_name,
+            delta_minutes,
+            e
+        );
+    }
 }
 
 /// Get total playtime in minutes for a single instance.
@@ -231,7 +334,7 @@ pub fn take_keyed_session_for_pid(
     Some((instance_name.to_string(), delta))
 }
 
-/// Take and commit all active sessions (used on window close). Returns the
+/// Take and commit all active sessions (used on application exit). Returns the
 /// total number of flushed sessions for logging.
 pub fn flush_all_sessions(
     sessions: &Mutex<HashMap<String, ActiveSession>>,
@@ -459,6 +562,96 @@ mod tests {
         assert_eq!(flushed, 2);
         assert_eq!(get_playtime(&dir, "X"), 1);
         assert_eq!(get_playtime(&dir, "Y"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canceled_close_keeps_sessions_and_final_flush_credits_once() {
+        let start = Instant::now();
+        let mut map = HashMap::new();
+        map.insert(
+            "A".to_string(),
+            fake_session("A", start - std::time::Duration::from_secs(120)),
+        );
+        let sessions = Mutex::new(map);
+        let dir = unique_playtime_dir("canceled_close");
+
+        // A prevented CloseRequested must not drain the live session: this is
+        // exactly what the old window-close handler did.
+        assert_eq!(
+            sessions.lock().unwrap().len(),
+            1,
+            "a canceled close must keep the active session"
+        );
+
+        let now = Instant::now();
+        assert_eq!(flush_all_sessions(&sessions, &dir, now), 1);
+        assert_eq!(get_playtime(&dir, "A"), 2);
+        assert!(sessions.lock().unwrap().is_empty());
+
+        // The final exit event may be delivered again during shutdown; the
+        // drained map makes the second flush a no-op, never a double credit.
+        assert_eq!(flush_all_sessions(&sessions, &dir, now), 0);
+        assert_eq!(get_playtime(&dir, "A"), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unique_playtime_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "void_playtime_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn concurrent_playtime_updates_do_not_lose_minutes() {
+        let dir = unique_playtime_dir("concurrent");
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| add_minutes_and_save(&dir, "Shared", 1));
+            }
+        });
+        assert_eq!(
+            get_playtime(&dir, "Shared"),
+            16,
+            "every concurrent read-modify-write must be serialized"
+        );
+        assert!(
+            !std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().contains(".tmp")),
+            "atomic save must not leave temp files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_playtime_is_backed_up_before_a_new_file_is_written() {
+        let dir = unique_playtime_dir("corrupt");
+        std::fs::write(dir.join("playtime.json"), b"{not-json").unwrap();
+        add_minutes_and_save(&dir, "Recovered", 7);
+
+        assert_eq!(get_playtime(&dir, "Recovered"), 7);
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("playtime.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "corrupt data must remain recoverable");
+        assert_eq!(std::fs::read(backups[0].path()).unwrap(), b"{not-json");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

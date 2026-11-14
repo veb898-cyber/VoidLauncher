@@ -16,6 +16,7 @@
  * directly from the store and is safe for use in event handlers,
  * callbacks, and non-React code.
  */
+import { useCallback } from 'react';
 import { en, type MessageKey } from './en';
 import { ru } from './ru';
 import { useLanguageStore } from '../../stores/languageStore';
@@ -133,14 +134,20 @@ function pluralRu(n: number, one: string, few: string, many: string): string {
  */
 export function useT(): (key: MessageKey, vars?: Record<string, string | number>) => string {
   const lang = useLanguageStore((s) => s.language);
-  return (key, vars) => {
-    const dict = dictionaries[lang] ?? en;
-    let str = dict[key] ?? en[key] ?? key;
-    if (vars) {
-      for (const [name, val] of Object.entries(vars)) {
-        str = str.replace(new RegExp(`\\{${name}\\}`, 'g'), () => String(val));
+  // A referentially stable callback per language: components use `t` in
+  // effect dependency arrays, and a fresh arrow on every render made those
+  // effects re-run (and in some cases loop).
+  return useCallback(
+    (key: MessageKey, vars?: Record<string, string | number>) => {
+      const dict = dictionaries[lang] ?? en;
+      let str = dict[key] ?? en[key] ?? key;
+      if (vars) {
+        for (const [name, val] of Object.entries(vars)) {
+          str = str.replace(new RegExp(`\\{${name}\\}`, 'g'), () => String(val));
+        }
       }
-    }
-    return str;
-  };
+      return str;
+    },
+    [lang],
+  );
 }

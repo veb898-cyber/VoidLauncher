@@ -96,17 +96,27 @@ export function SkinPreview({
   // Create the viewer on the first ready skin; later skins load in place.
   // The shared player-head store already re-fetches after an invalidation, so
   // this component never issues a second independent backend request.
+  //
+  // Skins load through a serialized chain with latest-wins invalidation:
+  // skinview3d has no cancellation, so overlapping `loadSkin` calls could let
+  // a slow previous account finish last and overwrite the new account. The
+  // chain guarantees the newest request is applied after any older one.
+  const skinSeq = useRef(0);
+  const skinChain = useRef<Promise<void>>(Promise.resolve());
   useEffect(() => {
     if (skinStatus !== 'ready' || !skin) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    let disposed = false;
-    setViewerError(false);
-    (async () => {
+    const seq = ++skinSeq.current;
+    const skinToLoad = skin;
+    const uuidToRender = uuid;
+    const run = async () => {
+      if (seq !== skinSeq.current) return;
+      setViewerError(false);
       try {
         if (!viewerRef.current) {
           const { SkinViewer } = await loadSkinview3d();
-          if (disposed) return;
+          if (seq !== skinSeq.current) return;
           const v = new SkinViewer({
             canvas,
             width: sizeRef.current.w,
@@ -123,35 +133,46 @@ export function SkinPreview({
             if (!v.disposed) v.render();
           });
           viewerRef.current = v;
-          // The texture is loaded BEFORE the canvas is revealed. The
-          // constructor draws its first frames while the skin image is still
-          // decoding, so revealing right away showed an empty plate — which
-          // read as a black rectangle flash on Liquid Glass. `render()` then
-          // guarantees a painted frame sits in the buffer before opacity
-          // flips to 1, so the fade-in never starts from a blank canvas.
-          await v.loadSkin(skin, { model: 'auto-detect' });
-          if (disposed) return;
-          if (capeRef.current) {
-            v.loadCape(capeRef.current).catch((e) =>
-              console.error('cape load failed:', e)
-            );
-          }
-          v.render();
-          setViewerReady(true);
-          setRenderedUuid(uuid);
-        } else {
-          await viewerRef.current.loadSkin(skin, { model: 'auto-detect' });
-          if (disposed) return;
-          viewerRef.current.render();
-          setRenderedUuid(uuid);
         }
+        const viewer = viewerRef.current;
+        if (!viewer || viewer.disposed) return;
+        // The texture is loaded BEFORE the canvas is revealed. The
+        // constructor draws its first frames while the skin image is still
+        // decoding, so revealing right away showed an empty plate.
+        await viewer.loadSkin(skinToLoad, { model: 'auto-detect' });
+        if (seq !== skinSeq.current) {
+          // A newer account/skin is queued behind this run; it will load and
+          // reveal itself. Do not publish this stale texture as ready.
+          return;
+        }
+        // Apply the cape that belongs to THIS account. The first creation
+        // used to start `loadCape` without awaiting it, so the revealed frame
+        // had no cape. The awaited load also prevents a previous account's
+        // cape from lingering.
+        const capeNow = capeRef.current;
+        if (capeNow) {
+          try {
+            await viewer.loadCape(capeNow);
+          } catch (e) {
+            console.error('cape load failed:', e);
+          }
+        } else {
+          viewer.resetCape();
+        }
+        if (seq !== skinSeq.current || viewer.disposed) return;
+        viewer.render();
+        setViewerReady(true);
+        setRenderedUuid(uuidToRender);
       } catch (e) {
         console.error('skin preview failed:', e);
-        if (!disposed) setViewerError(true);
+        if (seq === skinSeq.current) setViewerError(true);
       }
-    })();
+    };
+    skinChain.current = skinChain.current.then(run, run);
     return () => {
-      disposed = true;
+      // Invalidate this request if it is still the newest one; queued newer
+      // requests keep their own sequence.
+      if (seq === skinSeq.current) skinSeq.current++;
     };
   }, [skin, skinStatus, uuid]);
 
@@ -166,18 +187,30 @@ export function SkinPreview({
   }, [fitW, fitH]);
 
   // Apply cape changes in place. Runs before the viewer exists on the very
-  // first paint — capeRef covers that case at creation time.
+  // first paint — capeRef covers that case at creation time. A late cape load
+  // re-applies the latest value instead of leaving the old account's cape.
+  const capeSeq = useRef(0);
   useEffect(() => {
     capeRef.current = cape ?? null;
     const v = viewerRef.current;
     if (!v) return;
+    const seq = ++capeSeq.current;
     if (!capeRef.current) {
       v.resetCape();
       v.render();
       return;
     }
     v.loadCape(capeRef.current)
-      .then(() => {
+      .then(async () => {
+        if (v.disposed) return;
+        if (seq !== capeSeq.current) {
+          const latest = capeRef.current;
+          if (latest) {
+            await v.loadCape(latest).catch((e) => console.error('cape load failed:', e));
+          } else {
+            v.resetCape();
+          }
+        }
         if (!v.disposed) v.render();
       })
       .catch((e) => console.error('cape load failed:', e));

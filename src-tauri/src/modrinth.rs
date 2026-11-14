@@ -91,6 +91,10 @@ pub struct ModrinthVersionResponse {
     /// for modpack updates; `default` keeps older cached payloads parseable.
     #[serde(default)]
     pub date_published: String,
+    /// `"release"` / `"beta"` / `"alpha"`. `default` keeps older cached
+    /// payloads parseable; an empty value is treated as an unknown channel.
+    #[serde(default)]
+    pub version_type: String,
 }
 
 async fn api_get<T: serde::de::DeserializeOwned>(url: &str) -> Result<T> {

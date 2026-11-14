@@ -157,7 +157,7 @@ export function ToastContainer() {
   // restarting on unrelated re-renders of the app — otherwise a busy
   // re-rendering parent would keep toasts alive forever.
   return (
-    <div className="toast-container">
+    <div className="toast-container" aria-live="polite" aria-atomic="false">
       {items.map((t) => (
         <ToastItem key={t.id} toast={t} onDismiss={dismissToast} />
       ))}

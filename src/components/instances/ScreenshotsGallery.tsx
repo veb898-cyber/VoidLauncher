@@ -29,18 +29,26 @@ function ScreenshotTile({ instanceName, filename }: { instanceName: string; file
   useEffect(() => {
     const node = containerRef.current;
     if (!node) return;
+    let cancelled = false;
     const observer = new IntersectionObserver((entries) => {
       for (const entry of entries) {
         if (entry.isIntersecting) {
           observer.disconnect();
           invoke<string>('cmd_read_screenshot', { instanceName, filename })
-            .then((dataUrl) => setSrc(dataUrl))
-            .catch(() => setFailed(true));
+            .then((dataUrl) => {
+              if (!cancelled) setSrc(dataUrl);
+            })
+            .catch(() => {
+              if (!cancelled) setFailed(true);
+            });
         }
       }
     }, { rootMargin: '200px' });
     observer.observe(node);
-    return () => observer.disconnect();
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
   }, [instanceName, filename]);
 
   return (
@@ -70,20 +78,36 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
   const liquidGlass = useThemeStore((s) => s.liquidGlass);
   const [screenshots, setScreenshots] = useState<ScreenshotEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [viewer, setViewer] = useState<string | null>(null);
   const [viewerSrc, setViewerSrc] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  // Latest-wins guards for list + preview requests.
+  const listSeq = useRef(0);
+  const viewerSeq = useRef(0);
 
   const loadScreenshots = useCallback(async () => {
+    const seq = ++listSeq.current;
     setLoading(true);
     try {
       const s = await invoke<ScreenshotEntry[]>('cmd_list_screenshots', { instanceName });
+      if (seq !== listSeq.current) return;
       setScreenshots(s);
-    } catch { /* ignore */ }
-    setLoading(false);
+      setLoadError(null);
+    } catch (e: any) {
+      if (seq === listSeq.current) setLoadError(e?.toString?.() ?? String(e));
+    } finally {
+      if (seq === listSeq.current) setLoading(false);
+    }
   }, [instanceName]);
 
-  useEffect(() => { loadScreenshots(); }, [loadScreenshots]);
+  useEffect(() => {
+    loadScreenshots();
+    return () => {
+      listSeq.current++;
+      viewerSeq.current++;
+    };
+  }, [loadScreenshots]);
 
   const handleDelete = async () => {
     if (!deleteTarget) return;
@@ -91,7 +115,10 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
       await invoke('cmd_delete_screenshot', { instanceName, filename: deleteTarget });
       addToast(t('screenshots.deleted'), 'success');
       setDeleteTarget(null);
-      if (viewer === deleteTarget) setViewer(null);
+      if (viewer === deleteTarget) {
+        viewerSeq.current++;
+        setViewer(null);
+      }
       loadScreenshots();
     } catch (e: any) {
       addToast(e.toString(), 'error');
@@ -99,12 +126,15 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
   };
 
   const openViewer = async (filename: string) => {
+    const seq = ++viewerSeq.current;
     setViewer(filename);
     setViewerSrc(null);
     try {
       const dataUrl = await invoke<string>('cmd_read_screenshot', { instanceName, filename });
-      setViewerSrc(dataUrl);
-    } catch { /* keep placeholder */ }
+      if (seq === viewerSeq.current) setViewerSrc(dataUrl);
+    } catch {
+      /* keep placeholder */
+    }
   };
 
   return (
@@ -129,6 +159,16 @@ export function ScreenshotsGallery({ instanceName, onOpenFolder }: Props) {
       <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-lg) var(--space-2xl)' }}>
         {loading ? (
           <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>
+        ) : loadError ? (
+          <div role="alert" style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>
+            <Camera size={32} style={{ opacity: 0.5, marginBottom: 'var(--space-sm)' }} />
+            <div>{t('screenshots.load_error', { error: loadError })}</div>
+            <div style={{ marginTop: 'var(--space-md)' }}>
+              <Button size="sm" variant="secondary" onClick={loadScreenshots}>
+                {t('common.retry')}
+              </Button>
+            </div>
+          </div>
         ) : screenshots.length === 0 ? (
           <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-secondary)' }}>
             <Camera size={32} style={{ opacity: 0.5, marginBottom: 'var(--space-sm)' }} />

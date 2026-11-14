@@ -60,7 +60,8 @@ export function GameLogs() {
   const runsBtnRef = useRef<HTMLButtonElement>(null);
 
   // Crash analysis for the instance of the shown session.
-  const [analysis, setAnalysis] = useState<{ instance: string; data: CrashAnalysis } | null>(null);
+  const [analysis, setAnalysis] = useState<{ path: string; instance: string; data: CrashAnalysis } | null>(null);
+  const analysisSeq = useRef(0);
   const [analyzing, setAnalyzing] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [disableAction, setDisableAction] = useState<{ instance: string; action: CrashAction } | null>(null);
@@ -137,7 +138,9 @@ export function GameLogs() {
         });
       }
     } catch {
-      if (token === loadTokenRef.current) setLinesBuffer([]);
+      // A transient read error (AV lock, file being rotated) must not wipe
+      // the console: the offset is unchanged, so the next poll retries and
+      // the already-shown lines stay readable in the meantime.
     } finally {
       if (showLoading && token === loadTokenRef.current) setLoadingContent(false);
     }
@@ -237,6 +240,8 @@ export function GameLogs() {
   const analyzeCrash = useCallback(async () => {
     if (!shownSession) return;
     const instance = shownSession.instance_name;
+    const sessionPath = shownSession.path;
+    const seq = ++analysisSeq.current;
     setAnalyzing(true);
     try {
       // Pass the session path so the backend analyzes THIS run (crash
@@ -244,8 +249,9 @@ export function GameLogs() {
       // ever", which could be from an older launch.
       const data = await invoke<CrashAnalysis>('cmd_analyze_crash', {
         instanceName: instance,
-        sessionPath: shownSession.path,
+        sessionPath,
       });
+      if (seq !== analysisSeq.current) return;
       if (data.source === 'clean') {
         setAnalysis(null);
         addToast(t('game_logs.clean_run'), 'info');
@@ -256,16 +262,20 @@ export function GameLogs() {
         addToast(t('game_logs.no_crash'), 'info');
         return;
       }
-      setAnalysis({ instance, data });
+      setAnalysis({ path: sessionPath, instance, data });
     } catch (e) {
-      addToast(e instanceof Error ? e.message : String(e), 'error');
+      if (seq === analysisSeq.current) {
+        addToast(e instanceof Error ? e.message : String(e), 'error');
+      }
     } finally {
-      setAnalyzing(false);
+      if (seq === analysisSeq.current) setAnalyzing(false);
     }
   }, [shownSession, t]);
 
+  // The result belongs to ONE run: switching to another run (even of the
+  // same instance) must never show the previous run's crash analysis.
   const analysisVisible =
-    analysis !== null && shownSession !== null && analysis.instance === shownSession.instance_name;
+    analysis !== null && shownSession !== null && analysis.path === shownSession.path;
 
   const copyAnalysis = () => {
     if (!analysis) return '';

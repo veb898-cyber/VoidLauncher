@@ -998,6 +998,11 @@ a {
   color: var(--text-primary);
 }
 
+.titlebar__btn:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -3px;
+}
+
 .titlebar__btn--close:hover {
   background: var(--error);
   color: white;

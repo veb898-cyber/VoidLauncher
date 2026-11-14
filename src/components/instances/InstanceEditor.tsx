@@ -18,6 +18,7 @@ import {
   resolveInitialMemoryMb,
 } from '../../lib/memory';
 import { useSettingsStore } from '../../stores/settingsStore';
+import { useBrowserGuardStore } from '../../stores/browserGuardStore';
 import { gcOverrideValue, memoryOverrideValue, type GcChoice } from '../../lib/instanceDefaults';
 import { LoaderVersionModal } from './LoaderVersionModal';
 import { useT, getLanguage } from '../../lib/i18n';
@@ -158,6 +159,19 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     baseline !== '' &&
     JSON.stringify({ name, notes, memoryMb, useDefaultMemory, jvmArgs, gcPreset, javaPath, resWidth, resHeight }) !== baseline;
 
+  // Tell the global window-close guard about unsaved edits. The editor closes
+  // itself on save, so leaving the page or the whole app must ask first.
+  useEffect(() => {
+    if (!open) return;
+    useBrowserGuardStore.getState().setUnsaved(dirty);
+    return () => {
+      useBrowserGuardStore.getState().setUnsaved(false);
+    };
+  }, [open, dirty]);
+
+  // Editing another instance in the same mounted modal must also be guarded
+  // by the NEW form's dirty state, not the previous instance's.
+
   /** Close via overlay click / Escape / Cancel — but ask first when dirty.
    *  While the loader version dialog is open, Escape belongs to it: both
    *  modals listen on the window, and without this guard one Escape would
@@ -182,11 +196,16 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     return () => { cancelled = true; };
   }, [open]);
 
-  // Dynamic max memory: min(total - 2 GB, 80% of total), floored to step, with a hard minimum of MIN_MEMORY_MB
-  const maxMemoryMb = useMemo(
-    () => getMaxMemoryMb(systemRamMb),
-    [systemRamMb]
-  );
+  // Dynamic max memory: min(total - 2 GB, 80% of total), floored to step,
+  // also capped by the global Settings limit so the slider never promises a
+  // value the backend will silently clamp on save.
+  const configMaxMemoryMb = globalConfig?.max_memory_mb ?? null;
+  const maxMemoryMb = useMemo(() => {
+    const ramMax = getMaxMemoryMb(systemRamMb);
+    return configMaxMemoryMb
+      ? Math.max(MIN_MEMORY_MB, Math.min(ramMax, configMaxMemoryMb))
+      : ramMax;
+  }, [systemRamMb, configMaxMemoryMb]);
 
   // Clamp the memory value when bounds change (e.g., system RAM detected after open)
   useEffect(() => {
@@ -425,7 +444,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
       {/* Floating save button (bottom-right), only while there are unsaved
           changes — same pattern as the global Settings page. Portaled above
           the modal overlay (z 1000). */}
-      {dirty && createPortal(
+      {open && dirty && createPortal(
         <div className="settings-save-fab" style={{ zIndex: 1100 }}>
           <button className="btn btn--primary" onClick={handleSave}>{t('common.save')}</button>
         </div>,

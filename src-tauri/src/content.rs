@@ -676,6 +676,21 @@ impl<'a> Walk<'a> {
 
     fn process_required(&mut self, dep: &DepEdge, source: &VersionNode) {
         let Some(key) = self.dep_key(dep, source) else {
+            // The edge names a concrete version that was never fetched and
+            // carries no project id, so no ProjectKey can be formed. Silently
+            // returning here would claim a successful install with a missing
+            // REQUIRED dependency; report it instead.
+            if let Some(vid) = dep.version_id.as_deref() {
+                self.unresolved.push(UnresolvedItem {
+                    provider: normalize_project_provider(&source.provider).to_string(),
+                    project_id: vid.to_string(),
+                    project_name: format!("version {}", vid),
+                    source_provider: normalize_project_provider(&source.provider).to_string(),
+                    source_project_id: source.project_id.clone(),
+                    source_name: source.name.clone(),
+                    reason: "unavailable".to_string(),
+                });
+            }
             return;
         };
         let source_key = key_of_node(source);
@@ -720,9 +735,10 @@ impl<'a> Walk<'a> {
             // edge does not pin a different concrete version. The old code
             // skipped every installed project unconditionally, so a mod that
             // required a newer library silently launched with a broken one.
-            let satisfied = dep.version_id.as_deref().map_or(true, |required| {
-                inst.version_id.as_deref() == Some(required)
-            });
+            let satisfied = dep
+                .version_id
+                .as_deref()
+                .is_none_or(|required| inst.version_id.as_deref() == Some(required));
             if satisfied {
                 self.skipped
                     .entry(key.clone())
@@ -1665,6 +1681,35 @@ mod tests {
         let res = build_resolution(&g, &[]);
         assert_eq!(res.unresolved.len(), 1);
         assert_eq!(res.unresolved[0].project_id, "y");
+    }
+
+    #[test]
+    fn required_edge_with_only_a_missing_version_id_is_reported_unresolved() {
+        // The fetch of `ghost` failed and the API gave no project_id. The
+        // resolver cannot even form a ProjectKey; it must still surface the
+        // required dependency instead of reporting a complete installation.
+        let g = graph(
+            vec![provider_node(
+                "va",
+                "a",
+                "modrinth",
+                "Alpha",
+                "1.0",
+                vec![DepEdge {
+                    source_version_id: "va".to_string(),
+                    dep_type: DEP_REQUIRED.to_string(),
+                    project_id: None,
+                    version_id: Some("ghost".to_string()),
+                }],
+            )],
+            &["va"],
+        );
+        let res = build_resolution(&g, &[]);
+        assert_eq!(plan_ids(&res), vec!["a"]);
+        assert_eq!(res.unresolved.len(), 1);
+        assert_eq!(res.unresolved[0].project_id, "ghost");
+        assert_eq!(res.unresolved[0].source_name, "Alpha");
+        assert_eq!(res.unresolved[0].reason, "unavailable");
     }
 
     #[test]

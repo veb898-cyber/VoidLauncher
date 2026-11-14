@@ -65,6 +65,7 @@ export function Accounts() {
   const capesByAccount = useAccountsStore((s) => s.capesByAccount);
   const capesLoadingByAccount = useAccountsStore((s) => s.capesLoadingByAccount);
   const capesErrorByAccount = useAccountsStore((s) => s.capesErrorByAccount);
+  const accountsError = useAccountsStore((s) => s.error);
 
   const [showAddOffline, setShowOffline] = useState(false);
   const [offlineName, setOfflineName] = useState('');
@@ -273,6 +274,27 @@ export function Accounts() {
           </Button>
         </div>
       </div>
+
+      {accountsError && (
+        <div
+          role="alert"
+          className="glass-card"
+          style={{
+            padding: 'var(--space-sm) var(--space-lg)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--space-sm)',
+            border: '1px solid var(--warning)',
+            color: 'var(--text-secondary)',
+            fontSize: 'var(--font-size-sm)',
+          }}
+        >
+          <span style={{ flex: 1 }}>{t('accounts.load_error', { error: accountsError })}</span>
+          <Button size="sm" variant="secondary" onClick={() => loadAccounts(true)}>
+            {t('common.retry')}
+          </Button>
+        </div>
+      )}
 
       {accounts.length === 0 ? (
         <div className="glass-card" style={{ padding: 'var(--space-lg)' }}>

@@ -17,6 +17,46 @@ pub struct GameLogSession {
 /// Tracks the current game session log path
 static CURRENT_LOG_PATH: Mutex<Option<String>> = Mutex::new(None);
 
+/// Hard cap for ONE incremental update sent to the renderer. A crash-looping
+/// game can append hundreds of megabytes between two polls; without a cap the
+/// read allocates that whole delta (and serializes it over IPC). When the
+/// delta exceeds the cap only the newest complete lines are returned and the
+/// offset still advances, so later polls remain correct.
+pub const MAX_INCREMENTAL_LOG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Hard cap for the initial tail snapshot / "show last N lines" read. 100k
+/// lines of a pathological log can otherwise be arbitrarily large.
+const MAX_TAIL_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Cache of the `Instance:` header per session path. Session filenames are
+/// unique and the header never changes, so listing hundreds of sessions every
+/// second must not re-open and re-read every file.
+static LOG_HEADER_CACHE: Mutex<Option<HashMap<std::path::PathBuf, String>>> = Mutex::new(None);
+
+fn cached_instance_header(path: &std::path::Path) -> Option<String> {
+    {
+        let guard = LOG_HEADER_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cache) = guard.as_ref() {
+            if let Some(name) = cache.get(path) {
+                return Some(name.clone());
+            }
+        }
+    }
+    let name = read_instance_header(path)?;
+    let mut guard = LOG_HEADER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    // Keep the cache bounded when users accumulate years of sessions.
+    if cache.len() > 2000 {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), name.clone());
+    Some(name)
+}
+
 /// Sanitize an instance name for use inside a session filename.
 /// Shared by `create_game_log_file` and by `cmd_list_game_logs` so the
 /// frontend can filter sessions by instance without guessing the scheme.
@@ -407,7 +447,7 @@ pub fn list_game_log_sessions(data_dir: &Path) -> Vec<GameLogSession> {
         return Vec::new();
     }
 
-    let mut sessions: Vec<GameLogSession> = Vec::new();
+    let mut sessions: Vec<(Option<std::time::SystemTime>, GameLogSession)> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(&game_logs_dir) {
         for entry in entries.flatten() {
@@ -442,36 +482,35 @@ pub fn list_game_log_sessions(data_dir: &Path) -> Vec<GameLogSession> {
                         .last()
                         .unwrap_or(&file_name)
                         .to_string();
-                    let instance_name = read_instance_header(&path).unwrap_or(fallback_name);
+                    let instance_name = cached_instance_header(&path).unwrap_or(fallback_name);
 
-                    let started_at = if let Ok(modified) = meta.modified() {
+                    let modified = meta.modified().ok();
+                    let started_at = if let Some(modified) = modified {
                         let dt: chrono::DateTime<chrono::Local> = modified.into();
                         dt.format("%d/%m/%Y %H:%M:%S").to_string()
                     } else {
                         String::new()
                     };
 
-                    sessions.push(GameLogSession {
-                        path: path.to_string_lossy().to_string(),
-                        instance_name,
-                        started_at,
-                        size_bytes: meta.len(),
-                    });
+                    sessions.push((
+                        modified,
+                        GameLogSession {
+                            path: path.to_string_lossy().to_string(),
+                            instance_name,
+                            started_at,
+                            size_bytes: meta.len(),
+                        },
+                    ));
                 }
             }
         }
     }
 
-    // Sort by modification time, most recent first
-    sessions.sort_by(|a, b| {
-        let a_path = PathBuf::from(&a.path);
-        let b_path = PathBuf::from(&b.path);
-        let a_modified = a_path.metadata().ok().and_then(|m| m.modified().ok());
-        let b_modified = b_path.metadata().ok().and_then(|m| m.modified().ok());
-        b_modified.cmp(&a_modified)
-    });
-
-    sessions
+    // Sort by modification time, most recent first. The timestamp was already
+    // read from metadata above: hundreds of sessions must not be re-stat'ed on
+    // every poll.
+    sessions.sort_by_key(|b| std::cmp::Reverse(b.0));
+    sessions.into_iter().map(|(_, session)| session).collect()
 }
 
 /// Read a game log file and return its content (with line limit)
@@ -533,7 +572,13 @@ fn read_tail_bytes_from(file: &std::fs::File, max: usize) -> (Vec<u8>, bool, u64
     let mut boundaries: Vec<u64> = Vec::with_capacity(max + 1);
     let mut block_end: u64 = file_len;
     let mut buf = vec![0u8; CHUNK as usize];
-    while block_end > 0 && boundaries.len() < max + 1 {
+    // Stop the backwards scan at the same byte budget used for the read:
+    // a multi-gigabyte file with very long lines must not be walked end to
+    // end just to discover it has fewer than `max` newlines.
+    while block_end > 0
+        && boundaries.len() < max + 1
+        && file_len.saturating_sub(block_end) < MAX_TAIL_LOG_BYTES
+    {
         let read_start = block_end.saturating_sub(CHUNK);
         let len = (block_end - read_start) as usize;
         if reader.seek(SeekFrom::Start(read_start)).is_err() {
@@ -569,7 +614,18 @@ fn read_tail_bytes_from(file: &std::fs::File, max: usize) -> (Vec<u8>, bool, u64
         // Fewer newlines than asked for — include the whole file.
         0
     };
-    let truncated = tail_start > 0;
+    let mut truncated = tail_start > 0;
+    let mut tail_start = tail_start;
+    // Cap the byte window as well as the line count. A file with very long
+    // lines can otherwise force a huge allocation from a "last 100k lines"
+    // request. Skip the leading partial line so the caller never receives a
+    // spliced line.
+    let mut drop_leading_partial = false;
+    if file_len.saturating_sub(tail_start) > MAX_TAIL_LOG_BYTES {
+        tail_start = file_len - MAX_TAIL_LOG_BYTES;
+        truncated = true;
+        drop_leading_partial = true;
+    }
 
     let mut tail = Vec::new();
     if reader.seek(SeekFrom::Start(tail_start)).is_err() {
@@ -581,6 +637,18 @@ fn read_tail_bytes_from(file: &std::fs::File, max: usize) -> (Vec<u8>, bool, u64
     let mut limited = reader.take(remaining);
     if limited.read_to_end(&mut tail).is_err() {
         return (Vec::new(), truncated, tail_start, file_len);
+    }
+    if drop_leading_partial {
+        match tail.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                tail.drain(..=pos);
+                tail_start += pos as u64 + 1;
+            }
+            None => {
+                // One giant unterminated line fills the whole window.
+                return (Vec::new(), true, file_len, file_len);
+            }
+        }
     }
     (tail, truncated, tail_start, file_len)
 }
@@ -834,12 +902,50 @@ pub fn read_game_log_incremental(
     }
 
     let mut reader = file;
+    let delta = file_len - byte_offset;
+    // A huge unread delta is delivered as its newest complete lines only.
+    // The middle is dropped deliberately (the log file itself is untouched)
+    // and the offset advances past it, so the next poll stays cheap and
+    // correct instead of replaying hundreds of megabytes over IPC.
+    let read_start = if delta > MAX_INCREMENTAL_LOG_BYTES {
+        file_len - MAX_INCREMENTAL_LOG_BYTES
+    } else {
+        byte_offset
+    };
+    let capped = read_start > byte_offset;
     reader
-        .seek(SeekFrom::Start(byte_offset))
+        .seek(SeekFrom::Start(read_start))
         .map_err(|e| e.to_string())?;
-    let bytes_to_read = (file_len - byte_offset) as usize;
+    let bytes_to_read = (file_len - read_start) as usize;
     let mut buffer = vec![0u8; bytes_to_read];
     reader.read_exact(&mut buffer).map_err(|e| e.to_string())?;
+
+    // The cap starts mid-line: drop that partial first line.
+    let mut first_returned_byte = read_start;
+    if capped {
+        match buffer.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                buffer.drain(..=pos);
+                first_returned_byte += pos as u64 + 1;
+            }
+            None => {
+                // The whole capped window is one unterminated line.
+                let token = compute_file_token(&reader, file_len);
+                return Ok(IncrementalLogChunk {
+                    lines: Vec::new(),
+                    new_byte_offset: file_len,
+                    reset: false,
+                    file_token: token,
+                });
+            }
+        }
+        tracing::warn!(
+            target: "launcher",
+            "Game log grew by {} bytes between polls; delivered only the newest {} bytes",
+            delta,
+            MAX_INCREMENTAL_LOG_BYTES
+        );
+    }
 
     // Find the last newline in buffer.
     // If a line is partially written (no newline yet) or a multi-byte UTF-8 character
@@ -848,7 +954,7 @@ pub fn read_game_log_incremental(
         let valid_bytes = &buffer[..=last_nl];
         let text = String::from_utf8_lossy(valid_bytes);
         let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-        let new_byte_offset = byte_offset + (last_nl as u64) + 1;
+        let new_byte_offset = first_returned_byte + (last_nl as u64) + 1;
         let token_for_new_offset = compute_file_token(&reader, new_byte_offset);
 
         Ok(IncrementalLogChunk {
@@ -1618,6 +1724,83 @@ mod tests {
             ]
         );
         assert!(chunk2.new_byte_offset > target_offset);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_huge_incremental_delta_is_capped_and_later_reads_stay_correct() {
+        let dir = std::env::temp_dir().join(format!("vl_log_cap_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("cap.log");
+        std::fs::write(&log_path, "start\n").unwrap();
+
+        let first = read_game_log_incremental(log_path.to_str().unwrap(), 0, None, None).unwrap();
+        assert!(first.reset);
+
+        // Append well over the per-poll cap in one burst, ending with
+        // recognizable lines.
+        let filler = b"[INFO] filler log line 0123456789abcdef\n";
+        let mut burst = Vec::new();
+        while burst.len() as u64 <= MAX_INCREMENTAL_LOG_BYTES + 512 * 1024 {
+            burst.extend_from_slice(filler);
+        }
+        burst.extend_from_slice(b"[INFO] LAST-A\n[INFO] LAST-B\n");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(&burst).unwrap();
+            f.flush().unwrap();
+        }
+        let file_len = std::fs::metadata(&log_path).unwrap().len();
+
+        let second = read_game_log_incremental(
+            log_path.to_str().unwrap(),
+            first.new_byte_offset,
+            None,
+            Some(&first.file_token),
+        )
+        .unwrap();
+        assert!(!second.reset, "a large append is not a rotation");
+        assert!(
+            second.new_byte_offset > first.new_byte_offset,
+            "the offset must advance past the dropped middle"
+        );
+        assert!(second.new_byte_offset <= file_len);
+        assert!(
+            second
+                .lines
+                .last()
+                .is_some_and(|line| line.contains("LAST-B")),
+            "the newest lines must survive the cap: {:?}",
+            second.lines.last()
+        );
+        assert!(
+            second.lines.len() < (MAX_INCREMENTAL_LOG_BYTES / 8) as usize,
+            "the returned chunk must respect the byte cap"
+        );
+
+        // Reading continues correctly after the capped chunk.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(b"[INFO] AFTER-CAP\n").unwrap();
+            f.flush().unwrap();
+        }
+        let third = read_game_log_incremental(
+            log_path.to_str().unwrap(),
+            second.new_byte_offset,
+            None,
+            Some(&second.file_token),
+        )
+        .unwrap();
+        assert_eq!(third.lines, vec!["[INFO] AFTER-CAP"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

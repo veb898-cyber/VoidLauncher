@@ -69,10 +69,22 @@ fn valid_id(id: &str) -> bool {
 /// keyed by [`ProjectKey`], so the same numeric id can exist in both catalogs.
 /// CurseForge dependency edges are always provider-pure, so a CF node's
 /// dependencies resolve against CF and vice versa.
+/// A concrete (pinned) required dependency only satisfies the edge when the
+/// exact version is installed. Any other installed version must be fetched so
+/// the resolver can replace it (or report a conflict).
+fn pinned_dependency_needs_fetch(installed_version: Option<&str>, required: &str) -> bool {
+    installed_version != Some(required)
+}
+
 struct GraphFetcher {
     mc_version: Option<String>,
     loader: Option<String>,
     installed_pids: HashSet<ProjectKey>,
+    /// Installed version per project, when the sidecar exposes one. A pinned
+    /// required dependency is only skipped when this exact version is present;
+    /// otherwise the pinned node must be fetched so the resolver can replace
+    /// the installed one (or surface a conflict).
+    installed_versions: HashMap<ProjectKey, String>,
     roots: HashSet<String>,
     nodes: HashMap<String, VersionNode>,
     /// Full project identity → (title, icon) for every project the graph
@@ -98,12 +110,14 @@ impl GraphFetcher {
         mc_version: Option<String>,
         loader: Option<String>,
         installed_pids: HashSet<ProjectKey>,
+        installed_versions: HashMap<ProjectKey, String>,
         cf_key: String,
     ) -> Self {
         Self {
             mc_version,
             loader,
             installed_pids,
+            installed_versions,
             roots: root_version_ids.iter().cloned().collect(),
             nodes: HashMap::new(),
             projects: HashMap::new(),
@@ -333,10 +347,14 @@ impl GraphFetcher {
                                     version_id: Some(dep_vid.clone()),
                                 });
                                 if let Some(p) = &known_pid {
-                                    if self
-                                        .installed_pids
-                                        .contains(&ProjectKey::new("modrinth", p.as_str()))
-                                    {
+                                    let dep_key = ProjectKey::new("modrinth", p.as_str());
+                                    // Skip only when the exact pinned version
+                                    // is installed. An older/other installed
+                                    // version must be fetched and planned.
+                                    if !pinned_dependency_needs_fetch(
+                                        self.installed_versions.get(&dep_key).map(String::as_str),
+                                        dep_vid,
+                                    ) {
                                         continue;
                                     }
                                 }
@@ -668,6 +686,17 @@ pub async fn cmd_resolve_dependencies(
         .iter()
         .map(|p| ProjectKey::new(&p.provider, p.project_id.as_str()))
         .collect();
+    let installed_versions = installed_projects
+        .iter()
+        .filter_map(|p| {
+            p.version_id.as_ref().map(|version| {
+                (
+                    ProjectKey::new(&p.provider, p.project_id.as_str()),
+                    version.clone(),
+                )
+            })
+        })
+        .collect();
     let cf_key = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.curseforge_api_key.clone()
@@ -678,6 +707,7 @@ pub async fn cmd_resolve_dependencies(
         mc_version,
         loader,
         installed_pids,
+        installed_versions,
         cf_key,
     );
     let graph = fetcher.run(&root_version_ids).await?;
@@ -814,7 +844,14 @@ mod tests {
 
     #[test]
     fn graph_fetcher_projects_separate_same_id_by_provider() {
-        let mut fetcher = GraphFetcher::new(&[], None, None, HashSet::new(), String::new());
+        let mut fetcher = GraphFetcher::new(
+            &[],
+            None,
+            None,
+            HashSet::new(),
+            HashMap::new(),
+            String::new(),
+        );
         fetcher.projects.insert(
             ProjectKey::new("curseforge", "12345"),
             ("CF Project".to_string(), Some("cf-icon".to_string())),
@@ -846,5 +883,21 @@ mod tests {
                 && entry.project_id == "12345"
                 && entry.name == "MR Project"
         }));
+    }
+
+    #[test]
+    fn pinned_dependency_requires_the_exact_installed_version() {
+        assert!(
+            !pinned_dependency_needs_fetch(Some("v-required"), "v-required"),
+            "the exact installed version satisfies the pin"
+        );
+        assert!(
+            pinned_dependency_needs_fetch(Some("v-other"), "v-required"),
+            "a different installed version must be replaced/fetched"
+        );
+        assert!(
+            pinned_dependency_needs_fetch(None, "v-required"),
+            "an unversioned installed file cannot satisfy a concrete pin"
+        );
     }
 }

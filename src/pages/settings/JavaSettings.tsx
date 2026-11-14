@@ -37,7 +37,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
   const javaInstallations = useSettingsStore((s) => s.javaInstallations);
   const detectJava = useSettingsStore((s) => s.detectJava);
   const detectSystemRam = useSettingsStore((s) => s.detectSystemRam);
-  const javaDownload = useJavaDownloadStore((s) => s.active);
+  const javaDownloads = useJavaDownloadStore((s) => s.active);
 
   const [availableJava, setAvailableJava] = useState<AvailableJavaVersion[]>([]);
   const [managedJava, setManagedJava] = useState<ManagedJavaRuntime[]>([]);
@@ -88,6 +88,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               type="text"
               value={config.java_path || ''}
               placeholder={t('settings.java_path_placeholder')}
+              aria-label={t('settings.java_path_title')}
               onChange={(e) => updateConfig('java_path', e.target.value || null)}
               style={{ width: 330, fontSize: 'var(--font-size-xs)' }}
             />
@@ -257,7 +258,8 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)', marginBottom: 'var(--space-lg)' }}>
             {availableJava.map((jv) => {
-              const isDownloading = javaDownload?.majorVersion === jv.major_version;
+              const javaDownload = javaDownloads[jv.major_version] ?? null;
+              const isDownloading = javaDownload !== null;
               const isInstalled = managedJava.some((m) => m.major_version === jv.major_version);
               return (
                 <div key={jv.major_version} className="glass-card" style={{
@@ -290,7 +292,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
                       } catch (e) {
                         addToast(t('settings.java_install_error', { error: String(e) }), 'error');
                       } finally {
-                        useJavaDownloadStore.getState().clear();
+                        useJavaDownloadStore.getState().clear(jv.major_version);
                       }
                     }}
                   >

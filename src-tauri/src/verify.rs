@@ -400,6 +400,197 @@ fn asset_object_state(path: &Path, hash: &str, size: u64) -> AssetObjectState {
     }
 }
 
+/// Structural validation shared by launch and import preparation. A file that
+/// merely parses as JSON is not necessarily a usable asset index.
+pub(crate) fn validate_asset_index(index: &versions::AssetIndexData) -> Result<()> {
+    if index.objects.is_empty() {
+        return Err(LauncherError::Version(
+            "Asset index contains no objects".to_string(),
+        ));
+    }
+    for (name, object) in &index.objects {
+        if name.is_empty() || name.contains('\0') {
+            return Err(LauncherError::Version(
+                "Asset index contains an invalid asset name".to_string(),
+            ));
+        }
+        if !download::is_valid_asset_hash(&object.hash) {
+            return Err(LauncherError::Version(format!(
+                "Asset index contains an invalid hash for '{name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Result of the cheap launch-time check. `paths` holds every object that must
+/// be (re)downloaded; `hashed`/`cached` expose how much work the check did so
+/// tests can prove the cache avoids re-hashing on the next launch.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LaunchAssetCheck {
+    pub missing: usize,
+    pub corrupt: usize,
+    pub unreadable: usize,
+    pub paths: Vec<PathBuf>,
+    pub hashed: usize,
+    pub cached: usize,
+}
+
+impl LaunchAssetCheck {
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.missing == 0 && self.corrupt == 0 && self.unreadable == 0
+    }
+
+    pub(crate) fn issue_count(&self) -> usize {
+        self.missing + self.corrupt + self.unreadable
+    }
+}
+
+const ASSET_VERIFY_CACHE_FILE: &str = ".voidlauncher-asset-verify.json";
+const ASSET_VERIFY_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const ASSET_VERIFY_CACHE_MAX_ENTRIES: usize = 100_000;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AssetVerifyCache {
+    entries: std::collections::HashMap<String, AssetVerifyCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AssetVerifyCacheEntry {
+    size: u64,
+    modified_nanos: u128,
+    hash: String,
+}
+
+fn asset_cache_key(assets_dir: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(assets_dir).ok()?;
+    Some(
+        relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+fn file_modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+fn read_asset_verify_cache(assets_dir: &Path) -> AssetVerifyCache {
+    let path = assets_dir.join(ASSET_VERIFY_CACHE_FILE);
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return AssetVerifyCache::default();
+    };
+    if metadata.len() > ASSET_VERIFY_CACHE_MAX_BYTES {
+        return AssetVerifyCache::default();
+    }
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_asset_verify_cache(assets_dir: &Path, cache: &AssetVerifyCache) {
+    let Ok(json) = serde_json::to_vec(cache) else {
+        return;
+    };
+    let path = assets_dir.join(ASSET_VERIFY_CACHE_FILE);
+    let temp = assets_dir.join(format!(
+        ".voidlauncher-asset-verify-{}.tmp",
+        std::process::id()
+    ));
+    if std::fs::write(&temp, json).is_ok() {
+        let _ = std::fs::rename(&temp, &path);
+    }
+    let _ = std::fs::remove_file(&temp);
+}
+
+/// Check every object referenced by `index` before launch. Existence and size
+/// are always checked; content hashes are checked on the first sight of a file
+/// and cached by (size, mtime, hash), so subsequent launches do not re-hash
+/// gigabytes of assets. A changed file automatically misses the cache.
+pub(crate) fn check_asset_objects_for_launch(
+    assets_dir: &Path,
+    index: &versions::AssetIndexData,
+) -> Result<LaunchAssetCheck> {
+    validate_asset_index(index)?;
+    let objects_dir = assets_dir.join("objects");
+    let cache = read_asset_verify_cache(assets_dir);
+    let mut next_cache = AssetVerifyCache::default();
+    let mut check = LaunchAssetCheck::default();
+
+    for object in index.objects.values() {
+        let hash_prefix = &object.hash[..2];
+        let path = objects_dir.join(hash_prefix).join(&object.hash);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                check.missing += 1;
+                check.paths.push(path);
+                continue;
+            }
+            Err(_) => {
+                check.unreadable += 1;
+                check.paths.push(path);
+                continue;
+            }
+        };
+        if metadata.len() != object.size {
+            check.corrupt += 1;
+            check.paths.push(path);
+            continue;
+        }
+        let key = asset_cache_key(assets_dir, &path).unwrap_or_else(|| object.hash.clone());
+        let modified_nanos = file_modified_nanos(&metadata);
+        if let (Some(modified), Some(entry)) = (modified_nanos, cache.entries.get(&key)) {
+            if entry.size == metadata.len()
+                && entry.modified_nanos == modified
+                && entry.hash == object.hash
+            {
+                check.cached += 1;
+                next_cache.entries.insert(key, entry.clone());
+                continue;
+            }
+        }
+        check.hashed += 1;
+        match download::verify_sha1(&path, &object.hash) {
+            Ok(true) => {
+                if let Some(modified) = modified_nanos {
+                    next_cache.entries.insert(
+                        key,
+                        AssetVerifyCacheEntry {
+                            size: metadata.len(),
+                            modified_nanos: modified,
+                            hash: object.hash.clone(),
+                        },
+                    );
+                }
+            }
+            Ok(false) => {
+                check.corrupt += 1;
+                check.paths.push(path);
+            }
+            Err(_) => {
+                check.unreadable += 1;
+                check.paths.push(path);
+            }
+        }
+    }
+
+    // Bound the cache and drop entries for objects no longer in this index.
+    if next_cache.entries.len() > ASSET_VERIFY_CACHE_MAX_ENTRIES {
+        next_cache.entries.clear();
+    }
+    write_asset_verify_cache(assets_dir, &next_cache);
+    Ok(check)
+}
+
 fn is_stale_partial(path: &Path) -> bool {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
@@ -692,7 +883,14 @@ fn check_library_file(
         return;
     }
     if sha1.is_empty() {
-        cat.unverified += 1;
+        // No provider checksum: `exists()` is not proof of a usable JAR.
+        // At least reject a truncated/non-archive file so Repair can act;
+        // otherwise report it honestly as unverified (not verified).
+        match content_archive_readable(path) {
+            ArchiveStreamCheck::Valid => cat.unverified += 1,
+            ArchiveStreamCheck::Corrupt => cat.add_issue(display, "corrupt", true),
+            ArchiveStreamCheck::Unverified => cat.unverified += 1,
+        }
         return;
     }
     match download::verify_sha1(path, sha1) {
@@ -1537,8 +1735,15 @@ pub async fn repair_instance(
             }
             let p = libraries_dir.join(&llib.path);
             let sha1 = llib.sha1.clone().unwrap_or_default();
-            let ok = p.exists()
-                && (sha1.is_empty() || download::verify_sha1(&p, &sha1).ok() == Some(true));
+            let ok = if !p.exists() {
+                false
+            } else if sha1.is_empty() {
+                // No checksum: a readable JAR is the best proof available.
+                // A truncated/non-ZIP file must be re-downloaded.
+                matches!(content_archive_readable(&p), ArchiveStreamCheck::Valid)
+            } else {
+                download::verify_sha1(&p, &sha1).ok() == Some(true)
+            };
             if !ok {
                 if llib.url.is_empty() {
                     summary.failed += 1;
@@ -2692,6 +2897,53 @@ mod tests {
     }
 
     #[test]
+    fn checksum_less_loader_library_is_structural_verified_not_trusted() {
+        let dir = temp_dir("loader_no_hash");
+        let mut cat = CategoryBuilder::new("libraries");
+
+        let good = dir.join("good.jar");
+        write_valid_zip(&good, "META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\n");
+        check_library_file(
+            &mut cat,
+            &good,
+            "",
+            0,
+            "libraries/good.jar",
+            VerifyMode::Deep,
+        );
+        let report = cat.build();
+        assert_eq!(report.verified, 0, "no provider hash means not verified");
+        assert_eq!(
+            report.unverified, 1,
+            "a readable JAR is unverified, not trusted"
+        );
+        assert!(report.issues.is_empty());
+
+        let bad = dir.join("bad.jar");
+        std::fs::write(&bad, b"this is not a zip archive").unwrap();
+        let mut cat = CategoryBuilder::new("libraries");
+        check_library_file(&mut cat, &bad, "", 0, "libraries/bad.jar", VerifyMode::Deep);
+        let report = cat.build();
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].kind, "corrupt");
+        assert!(report.issues[0].repairable);
+
+        let mut cat = CategoryBuilder::new("libraries");
+        check_library_file(
+            &mut cat,
+            &dir.join("missing.jar"),
+            "",
+            0,
+            "libraries/missing.jar",
+            VerifyMode::Deep,
+        );
+        let report = cat.build();
+        assert_eq!(report.issues[0].kind, "missing");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn quick_mode_uses_size_but_never_claims_a_hash_proof() {
         let dir = temp_dir("quick_library");
         let config = test_config(&dir);
@@ -2865,6 +3117,105 @@ mod tests {
             AssetObjectState::Missing
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_asset_check_detects_missing_size_and_hash_problems_and_caches_hashes() {
+        use crate::versions::{AssetIndexData, AssetObject};
+        use sha1::Digest as _;
+
+        fn sha1_hex(bytes: &[u8]) -> String {
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(bytes);
+            format!("{:x}", hasher.finalize())
+        }
+
+        let dir = temp_dir("launch_asset_check");
+        let assets = dir.join("assets");
+        let healthy_hash = sha1_hex(b"abc");
+        let missing_hash = sha1_hex(b"miss");
+        let wrong_size_hash = sha1_hex(b"wxyz");
+        let bad_hash = sha1_hex(b"good");
+        let object = |hash: &str, size: u64| AssetObject {
+            hash: hash.to_string(),
+            size,
+            is_virtual: false,
+        };
+        let index = AssetIndexData {
+            objects: std::collections::HashMap::from([
+                ("healthy".to_string(), object(&healthy_hash, 3)),
+                ("missing".to_string(), object(&missing_hash, 4)),
+                ("wrong_size".to_string(), object(&wrong_size_hash, 4)),
+                ("bad_hash".to_string(), object(&bad_hash, 4)),
+            ]),
+            map_to_resources: true,
+        };
+        let write_object = |hash: &str, bytes: &[u8]| {
+            let path = assets.join("objects").join(&hash[..2]).join(hash);
+            write_file_with_sha1(&path, bytes);
+            path
+        };
+        write_object(&healthy_hash, b"abc");
+        let wrong_size_path = write_object(&wrong_size_hash, b"abc");
+        let bad_hash_path = write_object(&bad_hash, b"bad!");
+
+        let first = check_asset_objects_for_launch(&assets, &index).unwrap();
+        assert!(!first.is_healthy());
+        assert_eq!(first.missing, 1);
+        assert_eq!(first.corrupt, 2);
+        assert_eq!(first.paths.len(), 3);
+        assert!(first.hashed >= 2, "the first check must hash candidates");
+
+        // A same-size corrupt object must keep being rejected until fixed.
+        std::fs::write(&bad_hash_path, b"good").unwrap();
+        std::fs::write(&wrong_size_path, b"wxyz").unwrap();
+        write_object(&missing_hash, b"miss");
+        let second = check_asset_objects_for_launch(&assets, &index).unwrap();
+        assert!(second.is_healthy(), "{second:?}");
+        assert!(
+            second.cached >= 1,
+            "the healthy object must come from the cache"
+        );
+
+        let third = check_asset_objects_for_launch(&assets, &index).unwrap();
+        assert!(third.is_healthy());
+        assert_eq!(third.hashed, 0, "a warm cache must not re-hash assets");
+        assert_eq!(third.cached, 4);
+
+        std::fs::remove_file(
+            assets
+                .join("objects")
+                .join(&healthy_hash[..2])
+                .join(&healthy_hash),
+        )
+        .unwrap();
+        let fourth = check_asset_objects_for_launch(&assets, &index).unwrap();
+        assert_eq!(fourth.missing, 1, "a removed object is detected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn asset_index_structure_is_validated_before_use() {
+        use crate::versions::{AssetIndexData, AssetObject};
+
+        let empty = AssetIndexData {
+            objects: std::collections::HashMap::new(),
+            map_to_resources: false,
+        };
+        assert!(validate_asset_index(&empty).is_err());
+
+        let bad_hash = AssetIndexData {
+            objects: std::collections::HashMap::from([(
+                "bad".to_string(),
+                AssetObject {
+                    hash: "not-a-hash".to_string(),
+                    size: 1,
+                    is_virtual: false,
+                },
+            )]),
+            map_to_resources: false,
+        };
+        assert!(validate_asset_index(&bad_hash).is_err());
     }
 
     #[test]

@@ -76,17 +76,30 @@ function diagnosticsText(report: DiagReport, t: ReturnType<typeof useT>): string
 
 async function copyText(text: string) {
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Permission/OS clipboard failure: use the textarea fallback below.
+    }
   }
+  const previousFocus = document.activeElement as HTMLElement | null;
   const area = document.createElement('textarea');
   area.value = text;
+  area.setAttribute('readonly', '');
   area.style.position = 'fixed';
   area.style.opacity = '0';
   document.body.appendChild(area);
   area.select();
-  document.execCommand('copy');
-  area.remove();
+  area.setSelectionRange(0, area.value.length);
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } finally {
+    area.remove();
+    previousFocus?.focus?.();
+  }
+  if (!ok) throw new Error('clipboard is unavailable');
 }
 
 /**

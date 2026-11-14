@@ -21,6 +21,10 @@ pub(crate) fn modification_busy(instance: &str, busy: LaunchBusy) -> String {
             "Instance '{}' is already being modified. Wait for the current operation to finish.",
             instance
         ),
+        LaunchBusy::Preparing => format!(
+            "Instance '{}' is still being installed or prepared. Wait for setup to finish before repairing its files.",
+            instance
+        ),
     }
 }
 

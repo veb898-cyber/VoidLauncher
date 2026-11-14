@@ -809,29 +809,50 @@ fn probe_java_with_runner(
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    if let Ok(output) = run(&mut cmd, timeout) {
-        let probe_text = probe_output_text(&output);
-        if output.status.success() {
-            if let Some(data) = parse_probe_output(&probe_text) {
-                tracing::debug!(
-                    target: "launcher",
-                    "Java probe at {:?}: version={}, vendor='{}', vm='{}', os.arch='{}', bits={:?}",
-                    path,
-                    data.version,
-                    data.vendor,
-                    data.vm_name,
-                    data.os_arch,
-                    data.data_model
-                );
-                return Some(installation_from_probe(path, &data, &probe_text));
+    let probe = run(&mut cmd, timeout);
+    match probe {
+        Ok(output) => {
+            let probe_text = probe_output_text(&output);
+            if output.status.success() {
+                if let Some(data) = parse_probe_output(&probe_text) {
+                    tracing::debug!(
+                        target: "launcher",
+                        "Java probe at {:?}: version={}, vendor='{}', vm='{}', os.arch='{}', bits={:?}",
+                        path,
+                        data.version,
+                        data.vendor,
+                        data.vm_name,
+                        data.os_arch,
+                        data.data_model
+                    );
+                    return Some(installation_from_probe(path, &data, &probe_text));
+                }
             }
+            tracing::debug!(
+                target: "launcher",
+                "Structured Java probe unusable at {:?} (status={}): fallback to text parser",
+                path,
+                output.status
+            );
         }
-        tracing::debug!(
-            target: "launcher",
-            "Structured Java probe unusable at {:?} (status={}): fallback to text parser",
-            path,
-            output.status
-        );
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            // Do not run the same (already slow) check a second time: a
+            // 20-second timeout must stay a 20-second maximum, not 40.
+            tracing::warn!(
+                target: "launcher",
+                "Java probe at {:?} timed out; not retrying the text fallback",
+                path
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "launcher",
+                "Structured Java probe failed at {:?} ({}): fallback to text parser",
+                path,
+                e
+            );
+        }
     }
 
     // Step 2: fallback to the legacy `java -version` text parser.
@@ -1458,6 +1479,26 @@ openjdk version \"11.0.20\" 2023-07-18
         ));
         std::fs::write(&path, vec![0u8; 12_000]).expect("write fake executable file");
         path
+    }
+
+    #[test]
+    fn a_timed_out_probe_is_not_retried_with_the_text_fallback() {
+        let exe = fake_java_file("timeout-once");
+        let calls = std::cell::Cell::new(0u32);
+        let result = probe_java_with_runner(&exe, Duration::from_millis(10), |_cmd, _timeout| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out",
+            ))
+        });
+        assert!(result.is_none());
+        assert_eq!(
+            calls.get(),
+            1,
+            "a timed-out JVM must not spend a second full timeout on the fallback"
+        );
+        let _ = std::fs::remove_file(&exe);
     }
 
     #[test]
