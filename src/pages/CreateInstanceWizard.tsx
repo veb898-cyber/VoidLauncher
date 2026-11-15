@@ -824,7 +824,6 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                               type="button"
                               className={`version-item${selectedLoaderVersion === lv.version ? ' version-item--selected' : ''}`}
                               aria-pressed={selectedLoaderVersion === lv.version}
-                              title={lv.version}
                               onClick={() => setSelectedLoaderVersion(lv.version)}
                             >
                               <span className="version-item__name">{lv.version}</span>
