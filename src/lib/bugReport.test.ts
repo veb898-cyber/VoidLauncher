@@ -425,6 +425,22 @@ describe('GitHub issue prefill', () => {
     expect(visible).toContain('[REDACTED]');
   });
 
+  it('redacts session and escaped quoted values before URL encoding', () => {
+    const { url } = buildBugReportIssueUrl({
+      ...prefill,
+      extra: 'session=legacy-session-url-secret',
+      environment: String.raw`{"password":"escaped\"url-secret-tail"}`,
+    });
+    const parsed = new URL(url);
+    const visible = [
+      parsed.searchParams.get('extra'),
+      parsed.searchParams.get('environment'),
+    ].join('\n');
+    expect(visible).not.toContain('legacy-session-url-secret');
+    expect(visible).not.toContain('url-secret-tail');
+    expect(visible).toContain('[REDACTED]');
+  });
+
   it('keeps required fields and stays under GitHub URL limit with huge logs', () => {
     const huge = (label: string) => `${label}\n${'x'.repeat(5000)}`;
     const { url, shortened } = buildBugReportIssueUrl({

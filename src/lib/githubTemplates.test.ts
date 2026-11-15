@@ -3,6 +3,7 @@ import bugForm from '../../.github/ISSUE_TEMPLATE/bug_report.yml?raw';
 import featureForm from '../../.github/ISSUE_TEMPLATE/feature_request.yml?raw';
 import questionForm from '../../.github/ISSUE_TEMPLATE/question.yml?raw';
 import issueConfig from '../../.github/ISSUE_TEMPLATE/config.yml?raw';
+import ciWorkflow from '../../.github/workflows/ci.yml?raw';
 import pullRequestTemplate from '../../.github/pull_request_template.md?raw';
 import contributing from '../../CONTRIBUTING.md?raw';
 import security from '../../SECURITY.md?raw';
@@ -89,6 +90,14 @@ describe('contributor documentation', () => {
     expect(security).toContain('Report a vulnerability');
     expect(security).toContain('Supported versions');
     expect(security).toContain('Do not open a public issue');
+    expect(security).toContain('private reporting has');
+    expect(security).toContain('Private vulnerability reporting');
+  });
+
+  it('keeps the branch-protection check name aligned with the workflow', () => {
+    expect(ciWorkflow).toContain('jobs:');
+    expect(ciWorkflow).toContain('  check:');
+    expect(ciWorkflow).toContain('    name: Windows checks');
   });
 
   it('links users to bugs, features, contributing and security', () => {
