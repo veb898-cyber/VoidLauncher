@@ -4,12 +4,16 @@ import { useLanguageStore } from '../stores/languageStore';
 import { useToastSettingsStore } from '../stores/toastSettingsStore';
 import {
   buildBugReport,
+  buildBugReportIssueUrl,
   BUG_REPORT_ISSUE_URL,
   bugReportFieldErrors,
+  GITHUB_ISSUE_URL_LIMIT,
   isBugReportComplete,
+  parseBugReportPreview,
   redactReportText,
   resolveReportForCopy,
   type BugReportFields,
+  type BugReportIssuePrefill,
   type BugReportLabels,
   type BugReportSection,
 } from './bugReport';
@@ -131,6 +135,42 @@ describe('bug report redaction', () => {
     expect(output).not.toContain('theme=dark');
   });
 
+  it('redacts bare session values and escaped quoted secrets', () => {
+    const input = [
+      'session=legacy-session-value',
+      String.raw`{"session":"json-session-value"}`,
+      String.raw`{"password":"escaped\"secret-tail"}`,
+      String.raw`--accessToken "quoted\"token-secret"`,
+      String.raw`-Dsome.password='single\'quoted-secret'`,
+    ].join('\n');
+    const output = redactReportText(input);
+    for (const secret of [
+      'legacy-session-value',
+      'json-session-value',
+      'secret-tail',
+      'token-secret',
+      'quoted-secret',
+    ]) {
+      expect(output).not.toContain(secret);
+    }
+    expect(output).toContain('[REDACTED]');
+  });
+
+  it('redacts unquoted secret values that contain spaces', () => {
+    const output = redactReportText(
+      [
+        'password: correct horse battery staple',
+        'api_key=query-secret&page=1',
+        'version: 1.2.3',
+      ].join('\n'),
+    );
+    for (const secret of ['correct', 'horse', 'battery', 'staple', 'query-secret']) {
+      expect(output).not.toContain(secret);
+    }
+    expect(output).toContain('page=1');
+    expect(output).toContain('version: 1.2.3');
+  });
+
   it('masks home paths and removes private-key material', () => {
     const output = redactReportText(
       'C:\\Users\\alice\\AppData\\Roaming\\VoidLauncher\n-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----',
@@ -245,6 +285,42 @@ describe('bug report composition', () => {
     expect(report).toContain('[REDACTED]');
   });
 
+  it('parses an edited preview back into fields and sections', () => {
+    const sections: BugReportSection[] = [
+      { id: 'environment', title: 'Environment', content: 'OS: Windows', enabled: true },
+      { id: 'game', title: 'Game log', content: 'line one', enabled: true },
+    ];
+    const report = buildBugReport(fields, sections, labels).replace(
+      'The game starts',
+      'The edited expectation',
+    );
+    const parsed = parseBugReportPreview(report, labels, {
+      environment: 'Environment',
+      game: 'Game log',
+    });
+    expect(parsed).not.toBeNull();
+    expect(parsed?.fields.summary).toBe(fields.summary);
+    expect(parsed?.fields.expected).toBe('The edited expectation');
+    expect(parsed?.sections.environment).toBe('OS: Windows');
+    expect(parsed?.sections.game).toBe('line one');
+  });
+
+  it('refuses to parse a preview without the required headings', () => {
+    expect(parseBugReportPreview('just some edited text', labels, {})).toBeNull();
+    const report = buildBugReport(fields, [], labels).replace('## Steps\n', '');
+    expect(parseBugReportPreview(report, labels, {})).toBeNull();
+  });
+
+  it('does not treat unknown markdown headings inside a section as separators', () => {
+    const sections: BugReportSection[] = [
+      { id: 'game', title: 'Game log', content: 'before\n## not a real heading\nafter', enabled: true },
+    ];
+    const report = buildBugReport(fields, sections, labels);
+    const parsed = parseBugReportPreview(report, labels, { game: 'Game log' });
+    expect(parsed?.sections.game).toContain('## not a real heading');
+    expect(parsed?.sections.game).toContain('after');
+  });
+
   it('opens the bug-report issue template without sending anything', () => {
     expect(BUG_REPORT_ISSUE_URL).toContain('/issues/new');
     expect(BUG_REPORT_ISSUE_URL).toContain('template=bug_report.yml');
@@ -275,6 +351,115 @@ describe('bug report validation', () => {
     ).toBe('required');
     useToastSettingsStore.setState({ success: true, warning: true, error: true });
   });
+});
+
+describe('GitHub issue prefill', () => {
+  const prefill: BugReportIssuePrefill = {
+    summary: 'Launcher & game crash',
+    steps: '1. Open the launcher\n2. Click Play\n3. Wait',
+    expected: 'The game starts',
+    actual: 'Nothing happens',
+    extra: 'Instance: Test Pack',
+    launcherVersion: '1.5.0',
+    windowsVersion: 'Windows 11 23H2, x64',
+    minecraftVersion: '1.21.1',
+    loader: 'Fabric',
+    environment: 'VoidLauncher: 1.5.0\nOS: Windows 11',
+    instance: 'Instance: Test Pack\nMinecraft: 1.21.1\nLoader: Fabric',
+    diagnostics: 'Network: 4/4',
+    launcherLog: 'INFO launcher started',
+    gameLog: 'INFO game started',
+    crash: 'Verdict: likely',
+  };
+
+  it('uses the bug-report form ids and URL-encodes every value', () => {
+    const { url, shortened } = buildBugReportIssueUrl(prefill);
+    expect(shortened).toBe(false);
+    const parsed = new URL(url);
+    expect(parsed.origin).toBe('https://github.com');
+    expect(parsed.pathname).toBe('/veb898-cyber/VoidLauncher/issues/new');
+    expect(parsed.searchParams.get('template')).toBe('bug_report.yml');
+    expect(parsed.searchParams.get('title')).toBe('[Bug]: Launcher & game crash');
+    for (const [field, value] of Object.entries({
+      summary: prefill.summary,
+      steps: prefill.steps,
+      expected: prefill.expected,
+      actual: prefill.actual,
+      extra: prefill.extra,
+      launcher_version: prefill.launcherVersion,
+      windows_version: prefill.windowsVersion,
+      minecraft_version: prefill.minecraftVersion,
+      loader: prefill.loader,
+      environment: prefill.environment,
+      instance: prefill.instance,
+      diagnostics: prefill.diagnostics,
+      launcher_log: prefill.launcherLog,
+      game_log: prefill.gameLog,
+      crash: prefill.crash,
+    })) {
+      expect(parsed.searchParams.get(field), field).toBe(value);
+    }
+  });
+
+  it('redacts secrets before they reach the URL', () => {
+    const { url } = buildBugReportIssueUrl({
+      ...prefill,
+      summary: '--accessToken synthetic-access-secret',
+      extra: 'password: synthetic-password',
+      environment: 'Authorization: Bearer synthetic-bearer-secret',
+    });
+    const parsed = new URL(url);
+    const visible = [
+      parsed.searchParams.get('title'),
+      parsed.searchParams.get('summary'),
+      parsed.searchParams.get('extra'),
+      parsed.searchParams.get('environment'),
+    ].join('\n');
+    for (const secret of [
+      'synthetic-access-secret',
+      'synthetic-password',
+      'synthetic-bearer-secret',
+    ]) {
+      expect(visible).not.toContain(secret);
+    }
+    expect(visible).toContain('[REDACTED]');
+  });
+
+  it('keeps required fields and stays under GitHub URL limit with huge logs', () => {
+    const huge = (label: string) => `${label}\n${'x'.repeat(5000)}`;
+    const { url, shortened } = buildBugReportIssueUrl({
+      ...prefill,
+      environment: huge('environment'),
+      instance: huge('instance'),
+      diagnostics: huge('diagnostics'),
+      launcherLog: huge('launcher'),
+      gameLog: huge('game'),
+      crash: huge('crash'),
+    });
+    expect(shortened).toBe(true);
+    expect(url.length).toBeLessThanOrEqual(GITHUB_ISSUE_URL_LIMIT);
+    const parsed = new URL(url);
+    expect(parsed.searchParams.get('summary')).toBe(prefill.summary);
+    expect(parsed.searchParams.get('steps')).toBe(prefill.steps);
+    expect(parsed.searchParams.get('expected')).toBe(prefill.expected);
+    expect(parsed.searchParams.get('actual')).toBe(prefill.actual);
+    expect(parsed.searchParams.get('crash')).toBeNull();
+  });
+
+  it('does not add empty optional fields', () => {
+    const { url } = buildBugReportIssueUrl({
+      summary: 'Only the required fields',
+      steps: '1. Step',
+      expected: 'It works',
+      actual: 'It fails',
+      crash: '   ',
+    });
+    const parsed = new URL(url);
+    expect(parsed.searchParams.has('crash')).toBe(false);
+    expect(parsed.searchParams.has('extra')).toBe(false);
+    expect(parsed.searchParams.get('title')).toBe('[Bug]: Only the required fields');
+  });
+
 });
 
 describe('bug report localization', () => {

@@ -17,13 +17,15 @@ import { CHECK_LABELS, ISSUE_KEYS, type DiagReport } from '../../lib/diagnostics
 import { friendlyErrorMessage } from '../../lib/errors';
 import {
   buildBugReport,
-  BUG_REPORT_ISSUE_URL,
+  buildBugReportIssueUrl,
   bugReportFieldErrors,
   isBugReportComplete,
+  parseBugReportPreview,
   REQUIRED_BUG_REPORT_FIELDS,
   resolveReportForCopy,
   type BugReportField,
   type BugReportFields,
+  type BugReportIssuePrefill,
   type BugReportSection,
 } from '../../lib/bugReport';
 
@@ -38,7 +40,21 @@ interface Props {
 interface PreparedSection {
   id: string;
   content: string;
-  enabled: boolean;
+}
+
+interface PreparedInstance {
+  name: string;
+  mc_version: string;
+  loader: string;
+  loader_version: string | null;
+  mod_count: number;
+}
+
+interface PreparedReport {
+  launcher_version: string;
+  windows_version: string | null;
+  instance: PreparedInstance | null;
+  sections: PreparedSection[];
 }
 
 interface LogState {
@@ -56,6 +72,13 @@ const EMPTY_FIELDS: BugReportFields = {
 };
 
 const EMPTY_LOG_STATE: LogState = {};
+
+const EMPTY_ISSUE_PREFILL: BugReportIssuePrefill = {
+  summary: '',
+  steps: '',
+  expected: '',
+  actual: '',
+};
 
 function diagnosticsText(report: DiagReport, t: ReturnType<typeof useT>): string {
   const lines: string[] = [];
@@ -164,6 +187,7 @@ export function BugReportModal({
 }: Props) {
   const t = useT();
   const [fields, setFields] = useState<BugReportFields>(EMPTY_FIELDS);
+  const [prepared, setPrepared] = useState<PreparedReport | null>(null);
   const [baseSections, setBaseSections] = useState<PreparedSection[]>([]);
   const [sectionEnabled, setSectionEnabled] = useState<Record<string, boolean>>({});
   const [diagnostics, setDiagnostics] = useState<DiagReport | null>(diagReport);
@@ -200,6 +224,7 @@ export function BugReportModal({
     setFields(EMPTY_FIELDS);
     setReportText('');
     previewEditedRef.current = false;
+    setPrepared(null);
     setBaseSections([]);
     setSectionEnabled({});
     setLogs({});
@@ -210,11 +235,12 @@ export function BugReportModal({
     setPreparing(true);
     (async () => {
       try {
-        const data = await invoke<{ sections: PreparedSection[] }>(
+        const data = await invoke<PreparedReport>(
           'cmd_prepare_bug_report',
           { instanceName },
         );
         if (cancelled || sessionRef.current !== session) return;
+        setPrepared(data);
         setBaseSections(data.sections);
         setSectionEnabled((previous) => {
           const next = { ...previous };
@@ -344,7 +370,7 @@ export function BugReportModal({
       id: section.id,
       title: sectionTitle(section.id),
       content: section.content,
-      enabled: sectionEnabled[section.id] ?? section.enabled,
+      enabled: sectionEnabled[section.id] ?? true,
     }));
     if (diagnostics) {
       result.push({
@@ -388,11 +414,11 @@ export function BugReportModal({
   };
 
   /**
-   * The one place that actually copies/builds the report. Both the Copy button
-   * and the “Open GitHub issue” flow go through it, so an incomplete form can
+   * The one place that actually builds the report. Both the Copy button and
+   * the “Open GitHub issue” flow go through it, so an incomplete form can
    * never reach the clipboard or the external issue page.
    */
-  const performCopy = async (): Promise<boolean> => {
+  const prepareReport = (): string | null => {
     const report = resolveReportForCopy(
       reportText,
       fields,
@@ -402,9 +428,15 @@ export function BugReportModal({
     );
     if (!report) {
       markAllRequiredTouched();
-      return false;
+      return null;
     }
     if (!previewEditedRef.current) setReportText(report);
+    return report;
+  };
+
+  const performCopy = async (): Promise<boolean> => {
+    const report = prepareReport();
+    if (!report) return false;
     try {
       await copyText(report);
       addToast(t('bug.copied'), 'success');
@@ -425,13 +457,90 @@ export function BugReportModal({
     }
   };
 
+  /**
+   * Build the GitHub form prefill from the same values as the copied report.
+   * GitHub issue forms accept field-id query parameters; large sections are
+   * shortened by `buildBugReportIssueUrl` before the URL is opened. The full
+   * report always stays on the clipboard.
+   *
+   * If the preview was edited, parse the edited text instead of the form state:
+   * otherwise details the user deliberately removed would reappear in the URL.
+   * A preview that cannot be parsed returns null and the form opens empty.
+   */
+  const buildIssuePrefill = (): BugReportIssuePrefill | null => {
+    if (previewEditedRef.current && reportText.trim()) {
+      const parsed = parseBugReportPreview(reportText, reportLabels(), {
+        environment: sectionTitle('environment'),
+        instance: sectionTitle('instance'),
+        diagnostics: sectionTitle('diagnostics'),
+        launcher: sectionTitle('launcher'),
+        game: sectionTitle('game'),
+        crash: sectionTitle('crash'),
+      });
+      if (!parsed) return null;
+      return {
+        summary: parsed.fields.summary,
+        steps: parsed.fields.steps,
+        expected: parsed.fields.expected,
+        actual: parsed.fields.actual,
+        extra: parsed.fields.extra,
+        launcherVersion: prepared?.launcher_version,
+        windowsVersion: prepared?.windows_version,
+        minecraftVersion: prepared?.instance?.mc_version,
+        loader: prepared?.instance?.loader,
+        environment: parsed.sections.environment,
+        instance: parsed.sections.instance,
+        diagnostics: parsed.sections.diagnostics,
+        launcherLog: parsed.sections.launcher,
+        gameLog: parsed.sections.game,
+        crash: parsed.sections.crash,
+      };
+    }
+    const sections = allSections();
+    const enabledContent = (id: string) =>
+      sections.find((section) => section.id === id && section.enabled)?.content ?? '';
+    return {
+      summary: fields.summary,
+      steps: fields.steps,
+      expected: fields.expected,
+      actual: fields.actual,
+      extra: fields.extra,
+      launcherVersion: prepared?.launcher_version,
+      windowsVersion: prepared?.windows_version,
+      minecraftVersion: prepared?.instance?.mc_version,
+      loader: prepared?.instance?.loader,
+      environment: enabledContent('environment'),
+      instance: enabledContent('instance'),
+      diagnostics: enabledContent('diagnostics'),
+      launcherLog: enabledContent('launcher'),
+      gameLog: enabledContent('game'),
+      crash: enabledContent('crash'),
+    };
+  };
+
   const openIssue = async () => {
     if (busyAction) return;
     setBusyAction(true);
     try {
-      const copied = await performCopy();
-      if (!copied) return;
-      await openUrl(BUG_REPORT_ISSUE_URL);
+      const report = prepareReport();
+      if (!report) return;
+      try {
+        await copyText(report);
+      } catch (error) {
+        addToast(t('bug.copy_error', { error: String(error) }), 'error');
+        return;
+      }
+      const prefill = buildIssuePrefill();
+      const { url, shortened } = buildBugReportIssueUrl(prefill ?? EMPTY_ISSUE_PREFILL);
+      await openUrl(url);
+      if (!prefill) {
+        addToast(t('bug.issue_opened_manual'), 'warning');
+      } else {
+        addToast(
+          t(shortened ? 'bug.issue_opened_shortened' : 'bug.issue_opened'),
+          shortened ? 'warning' : 'success',
+        );
+      }
     } catch (error) {
       addToast(t('bug.open_error', { error: String(error) }), 'error');
     } finally {
@@ -588,7 +697,7 @@ export function BugReportModal({
               {baseSections.map((section) => (
                 <label key={section.id} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                   <input type="checkbox"
-                    checked={sectionEnabled[section.id] ?? section.enabled}
+                    checked={sectionEnabled[section.id] ?? true}
                     onChange={(e) => toggleSection(section.id, e.target.checked)} />
                   {sectionTitle(section.id)}
                 </label>

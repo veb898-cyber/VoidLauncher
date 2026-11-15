@@ -27,8 +27,24 @@ pub struct BugReportSection {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct BugReportInstance {
+    pub name: String,
+    pub mc_version: String,
+    pub loader: String,
+    pub loader_version: Option<String>,
+    pub mod_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct BugReportData {
     pub launcher_version: String,
+    /// Best-effort OS string from the same checks included in the environment
+    /// section. It lets the GitHub issue form prefill a short Windows field
+    /// without asking the user to copy it out of the report.
+    pub windows_version: Option<String>,
+    /// Structured instance metadata for the GitHub issue form. The readable
+    /// `instance` section remains the source of truth for the copied report.
+    pub instance: Option<BugReportInstance>,
     pub sections: Vec<BugReportSection>,
 }
 
@@ -158,6 +174,10 @@ fn is_value_end(byte: u8) -> bool {
 }
 
 fn is_json_value_end(byte: u8) -> bool {
+    // An unquoted secret can contain spaces (`password: correct horse`).
+    // Stop only at a structural delimiter: stopping at the first space would
+    // leave the rest of the passphrase in the report. Newlines are still
+    // delimiters, and URL query strings stop at `&`/`;`.
     matches!(byte, b',' | b'}' | b']' | b'&' | b';' | b'\r' | b'\n')
 }
 
@@ -731,10 +751,15 @@ fn loader_name(loader: &LoaderType) -> &'static str {
 /// it does not run the instance file verification or network probes.
 pub fn prepare_report(config: &AppConfig, instance_name: Option<&str>) -> BugReportData {
     let checks = diagnostics::system_checks(config);
+    let windows_version = checks
+        .iter()
+        .find(|check| check.id == "os")
+        .map(|check| check.value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let mut environment = String::new();
     environment.push_str(&format!("VoidLauncher: {}\n", env!("CARGO_PKG_VERSION")));
     environment.push_str(&format!("OS architecture: {}\n", std::env::consts::ARCH));
-    for check in checks {
+    for check in &checks {
         if check.value.trim().is_empty() {
             continue;
         }
@@ -747,6 +772,7 @@ pub fn prepare_report(config: &AppConfig, instance_name: Option<&str>) -> BugRep
         content: environment,
     }];
 
+    let mut report_instance = None;
     if let Some(name) = instance_name {
         if let Ok(instance) = instances::get_instance(&config.instances_dir(), name) {
             let mods_dir = instance.minecraft_dir(&config.instances_dir()).join("mods");
@@ -761,10 +787,11 @@ pub fn prepare_report(config: &AppConfig, instance_name: Option<&str>) -> BugRep
                         .count()
                 })
                 .unwrap_or(0);
+            let loader = loader_name(&instance.loader).to_string();
             let mut content = String::new();
             content.push_str(&format!("Instance: {}\n", instance.name));
             content.push_str(&format!("Minecraft: {}\n", instance.mc_version));
-            content.push_str(&format!("Loader: {}\n", loader_name(&instance.loader)));
+            content.push_str(&format!("Loader: {}\n", loader));
             if let Some(version) = &instance.loader_version {
                 content.push_str(&format!("Loader version: {}\n", version));
             }
@@ -773,11 +800,20 @@ pub fn prepare_report(config: &AppConfig, instance_name: Option<&str>) -> BugRep
                 id: "instance".to_string(),
                 content: redact_or_omit(&content, config),
             });
+            report_instance = Some(BugReportInstance {
+                name: instance.name,
+                mc_version: instance.mc_version,
+                loader,
+                loader_version: instance.loader_version,
+                mod_count,
+            });
         }
     }
 
     BugReportData {
         launcher_version: env!("CARGO_PKG_VERSION").to_string(),
+        windows_version,
+        instance: report_instance,
         sections,
     }
 }
