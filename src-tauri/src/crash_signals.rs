@@ -251,15 +251,14 @@ fn duplicate_mod(line: &str) -> Option<CrashSignal> {
     let (id, list) = if let Some(at) = line.find(" from mod files: ") {
         let id = line[..at].rsplit('\'').next().unwrap_or("").to_lowercase();
         (id, &line[at + 17..])
-    } else if let Some(at) = line.find(" is present in multiple files: ") {
+    } else {
+        let at = line.find(" is present in multiple files: ")?;
         let id = line[..at]
             .split_whitespace()
             .last()
             .unwrap_or("")
             .to_lowercase();
         (id, &line[at + 31..])
-    } else {
-        return None;
     };
     let files: Vec<String> = list
         .split(',')
@@ -321,7 +320,8 @@ fn suspected_mod(line: &str) -> Option<CrashSignal> {
     let low = trimmed.to_lowercase();
     let entry = if let Some(rest) = trimmed.strip_prefix("Suspected Mods:") {
         rest.split(',').next().unwrap_or("").trim()
-    } else if let Some(rest) = low.strip_prefix("-- mod loading issue for:") {
+    } else {
+        let rest = low.strip_prefix("-- mod loading issue for:")?;
         return Some(CrashSignal {
             kind: "mod_crash",
             verdict: "likely",
@@ -334,8 +334,6 @@ fn suspected_mod(line: &str) -> Option<CrashSignal> {
             ),
             file: None,
         });
-    } else {
-        return None;
     };
     let open = entry.find(" (")?;
     let close = open + 2 + entry[open + 2..].find(')')?;
