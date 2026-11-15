@@ -1,0 +1,98 @@
+name: Feature request
+description: Suggest a new feature or an improvement for VoidLauncher.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping shape VoidLauncher.
+
+        Please describe the **problem** first, then the feature you have in mind. A
+        clear use case is more useful than a list of implementation details. If you
+        are planning a large change, open this request before writing code so the
+        approach can be discussed.
+
+        Do not include account tokens, passwords or other personal data in examples.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched existing issues and discussions for this request.
+          required: true
+        - label: I read the README and CONTRIBUTING.md.
+          required: true
+        - label: I agree to follow this project's Code of Conduct.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the situation where the current launcher is inconvenient, confusing or missing something.
+      placeholder: When I manage several instances, I cannot...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed feature
+      description: What should VoidLauncher do? Describe the user-visible behavior, not only the implementation.
+      placeholder: Add a...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, other launchers or simpler options you have tried.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the launcher does this affect? Select all that apply.
+      multiple: true
+      options:
+        - Launcher UI and accessibility
+        - Instances and modpacks
+        - Mods, resource packs and shaders
+        - Accounts and authentication
+        - Rooms and multiplayer
+        - Performance and reliability
+        - Documentation and translations
+        - Other
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: How you can help
+      description: Optional. Volunteers make the project possible.
+      options:
+        - label: I can help with implementation.
+        - label: I can help with testing on Windows.
+        - label: I can help with English or Russian translations.
+        - label: I can help with documentation.
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Mockups, links, examples from other tools, or anything else that clarifies the request.
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or mockups
+      description: Drag and drop images here after opening the issue, or paste links.
+    validations:
+      required: false

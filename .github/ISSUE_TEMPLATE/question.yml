@@ -1,0 +1,53 @@
+name: Question
+description: Ask for help with installing, configuring or using VoidLauncher.
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before asking, please check the
+        [README](https://github.com/veb898-cyber/VoidLauncher#readme), the
+        [documentation](https://github.com/veb898-cyber/VoidLauncher/tree/main/docs)
+        and existing issues. For a reproducible defect, use the **Bug report**
+        template instead.
+
+        **Privacy:** never post access tokens, refresh tokens, session IDs,
+        passwords, private keys or account files.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before you submit
+      options:
+        - label: I checked the README, documentation and existing issues.
+          required: true
+        - label: I removed tokens, passwords, session IDs and other account secrets from this question.
+          required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What are you trying to do, and where are you stuck?
+      placeholder: How do I...
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Steps, settings, error messages and workarounds you already attempted.
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: VoidLauncher version, Windows version, Minecraft version and loader, if relevant.
+      render: text
+    validations:
+      required: false
