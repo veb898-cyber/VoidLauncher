@@ -1,6 +1,22 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { headFromSkin } from './skinHead';
+import {
+  getPlayerHeadState,
+  getPlayerSkinState,
+  normalizePlayerKey,
+  requestPlayerHead,
+  subscribePlayerHead,
+  subscribePlayerSkin,
+  type PlayerHeadState,
+  type PlayerSkinState,
+} from './playerHeadStore';
+
+export {
+  forgetPlayerHead,
+  invalidatePlayerHead,
+  onPlayerHeadInvalidated,
+  refreshPlayerHead,
+} from './playerHeadStore';
 
 // ---- Remote images via cmd_fetch_icon_url -----------------------------------
 // CDN images (mod icon, thumbnails) are never handed to
@@ -202,100 +218,76 @@ export function RemoteImage({
 // /avatar endpoint is deliberately NOT used: it silently substitutes a
 // default Steve head when its own Mojang lookup fails.
 
-const playerHeadCache = new Map<string, string>();
-const playerHeadFailedAt = new Map<string, number>();
-const playerHeadInflight = new Set<string>();
-const playerHeadSubs = new Map<string, ((v: string | null) => void)[]>();
-const PLAYER_HEAD_RETRY_MS = 60_000;
-
-function requestPlayerHead(uuid: string) {
-  if (playerHeadInflight.has(uuid)) return;
-  const failedAt = playerHeadFailedAt.get(uuid);
-  if (failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS) {
-    setTimeout(() => {
-      (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(null));
-      playerHeadSubs.delete(uuid);
-    }, 0);
-    return;
-  }
-  playerHeadInflight.add(uuid);
-  invoke<string | null>('cmd_get_player_head', { uuid })
-    .then(async (skin) => {
-      const head = skin ? await headFromSkin(uuid, skin) : null;
-      if (head) {
-        playerHeadCache.set(uuid, head);
-        playerHeadFailedAt.delete(uuid);
-      } else {
-        playerHeadFailedAt.set(uuid, Date.now());
-      }
-      (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(head));
-    })
-    .catch(() => {
-      playerHeadFailedAt.set(uuid, Date.now());
-      (playerHeadSubs.get(uuid) ?? []).forEach((fn) => fn(null));
-    })
-    .finally(() => {
-      playerHeadInflight.delete(uuid);
-      playerHeadSubs.delete(uuid);
-    });
-}
-
-function usePlayerHead(uuid: string | null | undefined): {
-  src: string | null;
-  status: 'ready' | 'loading' | 'failed';
-} {
-  const key = uuid ? uuid.replace(/-/g, '').toLowerCase() : null;
-  const [value, setValue] = useState<{ key: string; src: string | null } | null>(null);
+function usePlayerHead(
+  uuid: string | null | undefined,
+  provider?: string,
+): PlayerHeadState {
+  const key = uuid ? normalizePlayerKey(uuid) : null;
+  const [view, setView] = useState<{ key: string; state: PlayerHeadState } | null>(null);
 
   useEffect(() => {
     if (!key) return;
-
-    const cached = playerHeadCache.get(key);
-    if (cached) {
-      setValue({ key, src: cached });
-      return;
-    }
-
-    const failedAt = playerHeadFailedAt.get(key);
-    if (failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS) {
-      setValue({ key, src: null });
-      return;
-    }
-
     let alive = true;
-    const subs = playerHeadSubs.get(key) ?? [];
-    subs.push((v) => {
-      if (alive) setValue({ key, src: v });
+    const push = (state: PlayerHeadState) => {
+      if (alive) setView({ key, state });
+    };
+
+    push(getPlayerHeadState(key));
+    // Subscribe even when an entry is already cached: an explicit refresh
+    // must update every mounted Avatar, not only the ones that happened to
+    // miss the cache when they mounted.
+    const unsub = subscribePlayerHead(key, () => {
+      if (alive) push(getPlayerHeadState(key));
     });
-    playerHeadSubs.set(key, subs);
-    requestPlayerHead(key);
+    void requestPlayerHead(key, { provider });
+
     return () => {
       alive = false;
+      unsub();
     };
-  }, [key]);
+  }, [key, provider]);
 
-  if (!key) {
-    return { src: null, status: 'failed' };
-  }
-  const f = value && value.key === key ? value : null;
-  if (f) {
-    return f.src
-      ? { src: f.src, status: 'ready' }
-      : { src: null, status: 'failed' };
-  }
-  const cached = playerHeadCache.get(key);
-  if (cached) return { src: cached, status: 'ready' };
-  const failedAt = playerHeadFailedAt.get(key);
-  return {
-    src: null,
-    status:
-      failedAt && Date.now() - failedAt < PLAYER_HEAD_RETRY_MS ? 'failed' : 'loading',
-  };
+  if (!key) return { src: null, status: 'failed' };
+  if (view?.key === key) return view.state;
+  return getPlayerHeadState(key);
+}
+
+/** Raw skin (full PNG) for the 3D preview, sharing the Avatar request/cache. */
+export function usePlayerSkin(
+  uuid: string | null | undefined,
+  provider?: string,
+): PlayerSkinState {
+  const key = uuid ? normalizePlayerKey(uuid) : null;
+  const [view, setView] = useState<{ key: string; state: PlayerSkinState } | null>(null);
+
+  useEffect(() => {
+    if (!key) return;
+    let alive = true;
+    const push = (state: PlayerSkinState) => {
+      if (alive) setView({ key, state });
+    };
+
+    push(getPlayerSkinState(key, provider));
+    const unsub = subscribePlayerSkin(key, () => {
+      if (alive) push(getPlayerSkinState(key, provider));
+    }, provider);
+    void requestPlayerHead(key, { provider });
+
+    return () => {
+      alive = false;
+      unsub();
+    };
+  }, [key, provider]);
+
+  if (!key) return { skin: null, status: 'failed' };
+  if (view?.key === key) return view.state;
+  return getPlayerSkinState(key, provider);
 }
 
 export function Avatar({
   uuid,
   name,
+  provider,
   size = 40,
   style,
   className,
@@ -303,13 +295,14 @@ export function Avatar({
 }: {
   uuid: string;
   name: string;
+  provider?: string;
   size?: number;
   style?: React.CSSProperties;
   className?: string;
   radius?: string;
 }) {
   const letter = (name?.trim().charAt(0) || '?').toUpperCase();
-  const { src, status } = usePlayerHead(uuid);
+  const { src, status, refreshing } = usePlayerHead(uuid, provider);
 
   const containerStyle: React.CSSProperties = {
     width: size,
@@ -331,13 +324,24 @@ export function Avatar({
 
   if (status === 'ready' && src) {
     return (
-      <img
-        src={src}
-        alt={name}
+      <div
         className={className}
-        style={{ ...containerStyle, borderRadius: radius, imageRendering: 'pixelated' }}
-        loading="lazy"
-      />
+        style={{ ...containerStyle, position: 'relative', borderRadius: radius, overflow: 'hidden' }}
+      >
+        <img
+          src={src}
+          alt={name}
+          style={{ width: '100%', height: '100%', borderRadius: radius, imageRendering: 'pixelated' }}
+          loading="lazy"
+        />
+        {refreshing && (
+          <IconShine
+            radius={radius}
+            className="icon-shine--overlay"
+            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
+          />
+        )}
+      </div>
     );
   }
 

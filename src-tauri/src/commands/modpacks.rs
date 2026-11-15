@@ -114,33 +114,49 @@ pub async fn cmd_install_atlauncher_modpack(
     // install may create files before the loader/config download fails; only
     // the directory created by this operation may be removed.
     let instances_dir = config.instances_dir();
-    let instance = crate::import::import_with_cleanup(&instances_dir, &instance_name, || async {
-        atlauncher::install_atlauncher_pack(
-            &instances_dir,
-            &config.libraries_dir(),
-            &config.versions_dir(),
-            pack_id,
-            &version,
-            &instance_name,
-            Some(&app),
-        )
-        .await
-    })
+    let (instance, mut reservation) = crate::import::import_with_cleanup_keep(
+        &instances_dir,
+        &instance_name,
+        &state.launches,
+        "install",
+        || async {
+            atlauncher::install_atlauncher_pack(
+                &instances_dir,
+                &config.libraries_dir(),
+                &config.versions_dir(),
+                pack_id,
+                &version,
+                &instance_name,
+                Some(&app),
+            )
+            .await
+        },
+    )
     .await
     .map_err(|e| e.to_string())?;
 
     // Download the loader profile, game files and assets right away, so the
-    // first launch does not have to fetch them while the player waits.
-    let prepare = crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
-    let mut report = crate::import::ImportReport::complete(0, 0);
-    report.warnings.extend(prepare.warnings);
-    let done = if report.warnings.is_empty() {
+    // first launch does not have to fetch them while the player waits. The
+    // reservation stays live until this whole command is done.
+    let outcome = crate::import::finish_import_for_launch(
+        Some(&app),
+        &config,
+        &instance_name,
+        crate::import::ImportOutcome {
+            instance,
+            report: crate::import::ImportReport::complete(0, 0),
+        },
+        &mut reservation,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let done = if outcome.report.warnings.is_empty() {
         "Install complete!"
     } else {
-        "Install complete — missing files will be downloaded on first launch."
+        "Install finished, but setup is incomplete. Open the instance to finish setup before launching."
     };
     crate::import::emit_progress(Some(&app), "done", 1, 1, done);
-    Ok(crate::import::ImportOutcome { instance, report })
+    Ok(outcome)
 }
 
 // ==================== CurseForge ====================
@@ -234,7 +250,7 @@ pub async fn cmd_install_curseforge_modpack(
         .map_err(|e| e.to_string())?;
 
     // Pack metadata for the update lock — read while the temp zip exists.
-    let (manifest, overrides) = match crate::packlock::pack_zip_info(&temp_path) {
+    let (manifest, overrides, override_hashes) = match crate::packlock::pack_zip_info(&temp_path) {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&temp_path);
@@ -243,20 +259,30 @@ pub async fn cmd_install_curseforge_modpack(
     };
 
     let temp_path_str = temp_path.to_string_lossy().to_string();
-    let imported = crate::import::import_with_cleanup(&instances_dir, &instance_name, || async {
-        crate::import::import_curseforge_pack(
-            &instances_dir,
-            &temp_path_str,
-            &instance_name,
-            &api_key,
-            &libraries_dir,
-            Some(&app),
-        )
-        .await
-    })
+    let imported = crate::import::import_with_cleanup_keep(
+        &instances_dir,
+        &instance_name,
+        &state.launches,
+        "install",
+        || async {
+            crate::import::import_curseforge_pack(
+                &instances_dir,
+                &temp_path_str,
+                &instance_name,
+                &api_key,
+                &libraries_dir,
+                Some(&app),
+            )
+            .await
+        },
+    )
     .await;
     let _ = std::fs::remove_file(&temp_path);
-    let (instance, mut report) = imported.map_err(|e| e.to_string())?;
+    let ((instance, mut report), mut reservation) = imported.map_err(|e| e.to_string())?;
+
+    reservation
+        .set_stage(crate::instance_readiness::SetupStage::Preparing)
+        .map_err(|e| e.to_string())?;
 
     // Track the pack so update/repair can find it later. A failed lock write
     // leaves an untracked but fully usable instance, so warn instead of
@@ -265,6 +291,8 @@ pub async fn cmd_install_curseforge_modpack(
         Ok(p) => p.name,
         Err(_) => file.file_name.clone(),
     };
+    let overrides_prefix = crate::import::curseforge_overrides_prefix(&manifest)
+        .unwrap_or_else(|_| "overrides/".to_string());
     let lock = crate::packlock::PackLock {
         provider: "curseforge".to_string(),
         pack_project_id: mod_id.to_string(),
@@ -272,11 +300,16 @@ pub async fn cmd_install_curseforge_modpack(
         file_id: file_id.to_string(),
         file_name: file.file_name.clone(),
         file_display_name: file.display_name.clone(),
+        channel: crate::packlock::PackChannel::from_curseforge(file.release_type)
+            .map(|channel| channel.as_str().to_string())
+            .unwrap_or_default(),
         installed_at: chrono::Utc::now().to_rfc3339(),
         mc_version: instance.mc_version.clone(),
         loader: crate::packlock::loader_slug(&instance.loader).to_string(),
         manifest,
         overrides,
+        overrides_prefix,
+        override_hashes,
     };
     if let Err(e) = lock.write(&instances_dir.join(&instance_name)) {
         tracing::warn!(
@@ -296,15 +329,22 @@ pub async fn cmd_install_curseforge_modpack(
         let c = state.config.lock().map_err(|e| e.to_string())?;
         c.clone()
     };
-    let prepare = crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
-    report.warnings.extend(prepare.warnings);
-    let done = if report.warnings.is_empty() {
+    let outcome = crate::import::finish_import_for_launch(
+        Some(&app),
+        &config,
+        &instance_name,
+        crate::import::ImportOutcome { instance, report },
+        &mut reservation,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let done = if outcome.report.warnings.is_empty() {
         "Install complete!"
     } else {
-        "Install complete — missing files will be downloaded on first launch."
+        "Install finished, but setup is incomplete. Open the instance to finish setup before launching."
     };
     crate::import::emit_progress(Some(&app), "done", 1, 1, done);
-    Ok(crate::import::ImportOutcome { instance, report })
+    Ok(outcome)
 }
 
 /// Request payload for retrying the files a CurseForge import failed to get.
@@ -476,7 +516,8 @@ pub async fn cmd_install_modrinth_modpack(
         .map_err(|e| e.to_string())?;
 
     // Pack metadata for the update lock — read while the temp zip exists.
-    let (manifest, overrides) = match crate::packlock::mrpack_zip_info(&temp_path) {
+    let (manifest, overrides, override_hashes) = match crate::packlock::mrpack_zip_info(&temp_path)
+    {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&temp_path);
@@ -485,14 +526,21 @@ pub async fn cmd_install_modrinth_modpack(
     };
 
     let temp_path_str = temp_path.to_string_lossy().to_string();
-    let imported = crate::import::import_with_cleanup(&instances_dir, &instance_name, || {
-        crate::import::import_mrpack(&instances_dir, &temp_path_str, &instance_name, Some(&app))
-    })
+    let imported = crate::import::import_with_cleanup_keep(
+        &instances_dir,
+        &instance_name,
+        &state.launches,
+        "install",
+        || crate::import::import_mrpack(&instances_dir, &temp_path_str, &instance_name, Some(&app)),
+    )
     .await;
     let _ = std::fs::remove_file(&temp_path);
-    let instance = imported.map_err(|e| e.to_string())?;
+    let (instance, mut reservation) = imported.map_err(|e| e.to_string())?;
 
     let mut report = crate::import::ImportReport::complete(0, 0);
+    reservation
+        .set_stage(crate::instance_readiness::SetupStage::Preparing)
+        .map_err(|e| e.to_string())?;
 
     // Track the pack so update/repair can find it later. A failed lock write
     // leaves an untracked but fully usable instance, so warn instead of
@@ -508,11 +556,16 @@ pub async fn cmd_install_modrinth_modpack(
         file_id: version.id.clone(),
         file_name: file.filename.clone(),
         file_display_name: version.version_number.clone(),
+        channel: crate::packlock::PackChannel::from_modrinth(&version.version_type)
+            .map(|channel| channel.as_str().to_string())
+            .unwrap_or_default(),
         installed_at: chrono::Utc::now().to_rfc3339(),
         mc_version: instance.mc_version.clone(),
         loader: crate::packlock::loader_slug(&instance.loader).to_string(),
         manifest,
         overrides,
+        overrides_prefix: String::new(),
+        override_hashes,
     };
     if let Err(e) = lock.write(&instances_dir.join(&instance_name)) {
         tracing::warn!(
@@ -528,13 +581,20 @@ pub async fn cmd_install_modrinth_modpack(
 
     // Download the loader profile, game files and assets right away, so the
     // first launch does not have to fetch them while the player waits.
-    let prepare = crate::import::prepare_instance_files(Some(&app), &config, &instance).await;
-    report.warnings.extend(prepare.warnings);
-    let done = if report.warnings.is_empty() {
+    let outcome = crate::import::finish_import_for_launch(
+        Some(&app),
+        &config,
+        &instance_name,
+        crate::import::ImportOutcome { instance, report },
+        &mut reservation,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let done = if outcome.report.warnings.is_empty() {
         "Install complete!"
     } else {
-        "Install complete — missing files will be downloaded on first launch."
+        "Install finished, but setup is incomplete. Open the instance to finish setup before launching."
     };
     crate::import::emit_progress(Some(&app), "done", 1, 1, done);
-    Ok(crate::import::ImportOutcome { instance, report })
+    Ok(outcome)
 }

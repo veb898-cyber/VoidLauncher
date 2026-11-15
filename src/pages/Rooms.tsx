@@ -12,6 +12,7 @@ import { Input } from '../components/ui/Input';
 import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { addToast } from '../components/ui/Toast';
 import { useT } from '../lib/i18n';
+import { copyTextToClipboard } from '../lib/clipboard';
 
 // "Комнаты": host a world or join a friend's room over Tailscale Machine
 // Sharing. The page orchestrates the room snapshot and delegates each state to
@@ -200,11 +201,10 @@ function RoomLobbyReady({ status }: { status: RoomStatus | null }) {
 
   const copyAddress = async () => {
     if (!ts.self_ip) return;
-    try {
-      await navigator.clipboard.writeText(ts.self_ip);
+    if (await copyTextToClipboard(ts.self_ip)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch {
+    } else {
       addToast(t('common.copy_failed'), 'error');
     }
   };

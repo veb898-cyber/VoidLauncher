@@ -1,18 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import type { SkinViewer } from 'skinview3d';
-import { invoke } from '@tauri-apps/api/core';
-import { IconShine } from '../../lib/remoteImage';
+import { usePlayerSkin } from '../../lib/remoteImage';
+import { SnakeSpinner } from '../ui/SnakeSpinner';
 import { useT } from '../../lib/i18n';
 
 const DEFAULT_WIDTH = 480;
 const DEFAULT_HEIGHT = 640;
 /** Room for the one-line hint under the canvas (font-xs + gap). */
 const HINT_RESERVE = 26;
-
-type SkinState =
-  | { status: 'loading' }
-  | { status: 'ready'; skin: string }
-  | { status: 'error' };
 
 /**
  * One shared dynamic import for the whole module. The Accounts page is
@@ -35,9 +30,10 @@ function loadSkinview3d() {
  *
  * The viewer instance is created ONCE and survives account switches —
  * `loadSkin` swaps the texture in place, so switching accounts never
- * flickers, teleports the camera, or restarts the idle animation. The model
- * is NOT auto-rotating: it stays still until the user drags it (or rotates
- * it with the wheel), exactly as asked. `cape` (a cape PNG data URL, or
+ * flickers, teleports the camera, or restarts the model. The model is always
+ * static: no automatic idle animation runs, and the render loop stays paused
+ * until the user drags or zooms it. This keeps the 3D preview at full quality
+ * without a continuous 60 fps WebGL draw. `cape` (a cape PNG data URL, or
  * null for no cape) is applied in place as well and survives skin swaps.
  *
  * `width`/`height` are the IDEAL (maximum) canvas size. The stage is
@@ -47,12 +43,14 @@ function loadSkinview3d() {
 export function SkinPreview({
   uuid,
   name,
+  provider,
   cape = null,
   width = DEFAULT_WIDTH,
   height = DEFAULT_HEIGHT,
 }: {
   uuid: string;
   name: string;
+  provider?: string;
   cape?: string | null;
   width?: number;
   height?: number;
@@ -63,9 +61,12 @@ export function SkinPreview({
   // Latest desired cape. The viewer may not exist yet when the cape arrives
   // (it is created on the first ready skin), so creation reads this ref.
   const capeRef = useRef<string | null>(null);
-  const [skinState, setSkinState] = useState<SkinState>({ status: 'loading' });
+  const { skin, status: skinStatus, refreshing } = usePlayerSkin(uuid, provider);
   const [viewerReady, setViewerReady] = useState(false);
+  const [renderedUuid, setRenderedUuid] = useState<string | null>(null);
+  const [viewerError, setViewerError] = useState(false);
   const [box, setBox] = useState<{ w: number; h: number } | null>(null);
+  const displayReady = Boolean(viewerReady && renderedUuid === uuid);
 
   // Measure the stage: the canvas is sized to whatever room the card gives,
   // preserving the 3:4 ratio (height first, then width).
@@ -92,98 +93,127 @@ export function SkinPreview({
   const sizeRef = useRef({ w: fitW, h: fitH });
   sizeRef.current = { w: fitW, h: fitH };
 
-  // Fetch the raw skin whenever the selected account changes.
-  useEffect(() => {
-    if (!uuid) {
-      setSkinState({ status: 'error' });
-      return;
-    }
-    let alive = true;
-    setSkinState({ status: 'loading' });
-    invoke<string | null>('cmd_get_player_head', {
-      uuid: uuid.replace(/-/g, '').toLowerCase(),
-    })
-      .then((skin) => {
-        if (!alive) return;
-        setSkinState(skin ? { status: 'ready', skin } : { status: 'error' });
-      })
-      .catch(() => {
-        if (alive) setSkinState({ status: 'error' });
-      });
-    return () => {
-      alive = false;
-    };
-  }, [uuid]);
-
   // Create the viewer on the first ready skin; later skins load in place.
+  // The shared player-head store already re-fetches after an invalidation, so
+  // this component never issues a second independent backend request.
+  //
+  // Skins load through a serialized chain with latest-wins invalidation:
+  // skinview3d has no cancellation, so overlapping `loadSkin` calls could let
+  // a slow previous account finish last and overwrite the new account. The
+  // chain guarantees the newest request is applied after any older one.
+  const skinSeq = useRef(0);
+  const skinChain = useRef<Promise<void>>(Promise.resolve());
   useEffect(() => {
-    if (skinState.status !== 'ready') return;
+    if (skinStatus !== 'ready' || !skin) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    let disposed = false;
-    (async () => {
+    const seq = ++skinSeq.current;
+    const skinToLoad = skin;
+    const uuidToRender = uuid;
+    const run = async () => {
+      if (seq !== skinSeq.current) return;
+      setViewerError(false);
       try {
         if (!viewerRef.current) {
-          const { SkinViewer, IdleAnimation } = await loadSkinview3d();
-          if (disposed) return;
+          const { SkinViewer } = await loadSkinview3d();
+          if (seq !== skinSeq.current) return;
           const v = new SkinViewer({
             canvas,
             width: sizeRef.current.w,
             height: sizeRef.current.h,
             model: 'auto-detect',
+            // No continuous RAF: the model is repainted only after a skin or
+            // size change and while the user drags or zooms it.
+            renderPaused: true,
           });
-          // Gentle idle breathing only — no auto-rotation by default.
-          const idle = new IdleAnimation();
-          idle.speed = 0.35;
-          v.animation = idle;
+          v.animation = null;
           v.autoRotate = false;
           v.controls.enablePan = false;
+          v.controls.addEventListener('change', () => {
+            if (!v.disposed) v.render();
+          });
           viewerRef.current = v;
-          // The texture is loaded BEFORE the canvas is revealed. The
-          // constructor draws its first frames while the skin image is still
-          // decoding, so revealing right away showed an empty plate — which
-          // read as a black rectangle flash on Liquid Glass. `render()` then
-          // guarantees a painted frame sits in the buffer before opacity
-          // flips to 1, so the fade-in never starts from a blank canvas.
-          await v.loadSkin(skinState.skin, { model: 'auto-detect' });
-          if (disposed) return;
-          if (capeRef.current) {
-            v.loadCape(capeRef.current).catch((e) =>
-              console.error('cape load failed:', e)
-            );
-          }
-          v.render();
-          setViewerReady(true);
-        } else {
-          await viewerRef.current.loadSkin(skinState.skin, { model: 'auto-detect' });
         }
+        const viewer = viewerRef.current;
+        if (!viewer || viewer.disposed) return;
+        // The texture is loaded BEFORE the canvas is revealed. The
+        // constructor draws its first frames while the skin image is still
+        // decoding, so revealing right away showed an empty plate.
+        await viewer.loadSkin(skinToLoad, { model: 'auto-detect' });
+        if (seq !== skinSeq.current) {
+          // A newer account/skin is queued behind this run; it will load and
+          // reveal itself. Do not publish this stale texture as ready.
+          return;
+        }
+        // Apply the cape that belongs to THIS account. The first creation
+        // used to start `loadCape` without awaiting it, so the revealed frame
+        // had no cape. The awaited load also prevents a previous account's
+        // cape from lingering.
+        const capeNow = capeRef.current;
+        if (capeNow) {
+          try {
+            await viewer.loadCape(capeNow);
+          } catch (e) {
+            console.error('cape load failed:', e);
+          }
+        } else {
+          viewer.resetCape();
+        }
+        if (seq !== skinSeq.current || viewer.disposed) return;
+        viewer.render();
+        setViewerReady(true);
+        setRenderedUuid(uuidToRender);
       } catch (e) {
         console.error('skin preview failed:', e);
+        if (seq === skinSeq.current) setViewerError(true);
       }
-    })();
-    return () => {
-      disposed = true;
     };
-  }, [skinState]);
+    skinChain.current = skinChain.current.then(run, run);
+    return () => {
+      // Invalidate this request if it is still the newest one; queued newer
+      // requests keep their own sequence.
+      if (seq === skinSeq.current) skinSeq.current++;
+    };
+  }, [skin, skinStatus, uuid]);
 
   // Resize the existing viewer in place when the stage changes.
   useEffect(() => {
-    viewerRef.current?.setSize(fitW, fitH);
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    viewer.setSize(fitW, fitH);
+    // setSize clears the drawing buffer; a paused viewer has no next frame
+    // to repaint it, so draw the resized frame explicitly.
+    viewer.render();
   }, [fitW, fitH]);
 
   // Apply cape changes in place. Runs before the viewer exists on the very
-  // first paint — capeRef covers that case at creation time.
+  // first paint — capeRef covers that case at creation time. A late cape load
+  // re-applies the latest value instead of leaving the old account's cape.
+  const capeSeq = useRef(0);
   useEffect(() => {
     capeRef.current = cape ?? null;
     const v = viewerRef.current;
     if (!v) return;
+    const seq = ++capeSeq.current;
     if (!capeRef.current) {
       v.resetCape();
+      v.render();
       return;
     }
-    v.loadCape(capeRef.current).catch((e) =>
-      console.error('cape load failed:', e)
-    );
+    v.loadCape(capeRef.current)
+      .then(async () => {
+        if (v.disposed) return;
+        if (seq !== capeSeq.current) {
+          const latest = capeRef.current;
+          if (latest) {
+            await v.loadCape(latest).catch((e) => console.error('cape load failed:', e));
+          } else {
+            v.resetCape();
+          }
+        }
+        if (!v.disposed) v.render();
+      })
+      .catch((e) => console.error('cape load failed:', e));
   }, [cape]);
 
   // Dispose once, on unmount.
@@ -235,13 +265,13 @@ export function SkinPreview({
               display: 'block',
               width: fitW,
               height: fitH,
-              opacity: viewerReady ? 1 : 0,
+              opacity: displayReady ? 1 : 0,
               transition: 'opacity 0.25s ease-out',
             }}
           />
-          {!viewerReady && (
+          {!displayReady && (
             <div style={{ position: 'absolute', inset: 0 }}>
-              {skinState.status === 'error' ? (
+              {skinStatus === 'failed' || viewerError ? (
                 <div
                   style={{
                     position: 'absolute',
@@ -257,17 +287,11 @@ export function SkinPreview({
                 >
                   {t('accounts.skin_viewer_unavailable')}
                 </div>
-              ) : (
-                // No fill: the stage already sits on the card's own plate, and
-                // the dark --bg-tertiary of `.icon-shine` read as a black
-                // rectangle flashing on Liquid Glass. Only the light sweep is
-                // kept, so loading looks the same without the dark slab.
-                <IconShine style={{ position: 'absolute', inset: 0, background: 'transparent' }} />
-              )}
+              ) : null}
             </div>
           )}
         </div>
-        {viewerReady && (
+        {displayReady ? (
           <p
             style={{
               margin: 0,
@@ -277,11 +301,35 @@ export function SkinPreview({
               textOverflow: 'ellipsis',
               fontSize: 'var(--font-size-xs)',
               color: 'var(--text-tertiary)',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
             }}
           >
-            {t('accounts.skin_viewer_hint')}
+            {refreshing ? (
+              <>
+                <SnakeSpinner size={12} />
+                {t('accounts.skin_updating')}
+              </>
+            ) : (
+              t('accounts.skin_viewer_hint')
+            )}
           </p>
-        )}
+        ) : skinStatus !== 'failed' && !viewerError ? (
+          <p
+            style={{
+              margin: 0,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 'var(--font-size-xs)',
+              color: 'var(--text-tertiary)',
+            }}
+          >
+            <SnakeSpinner size={12} />
+            {t('accounts.skin_loading')}
+          </p>
+        ) : null}
       </div>
     </div>
   );

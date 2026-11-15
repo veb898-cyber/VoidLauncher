@@ -24,6 +24,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "=2.3.3"
 tauri-plugin-process = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-updater = "2"
@@ -40,6 +41,7 @@ dirs = "6"
 flate2 = "1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
+semver = "1"
 futures = "0.3"
 hex = "0.4"
 sysinfo = "0.33"
@@ -59,6 +61,7 @@ winreg = "0.55"
 # reuse protection needs.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Threading",
     # Used only by the smoke harness' OpenGL capability probe (M7.4.1):
     # a hidden window + a 3.2 core context, so CI reports what the runner's
@@ -66,6 +69,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_OpenGL",
     "Win32_System_LibraryLoader",
+    "Win32_Storage_FileSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

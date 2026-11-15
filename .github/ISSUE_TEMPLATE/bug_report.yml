@@ -1,0 +1,173 @@
+name: Bug report
+description: Report a problem with VoidLauncher. Never include tokens, passwords or account data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve VoidLauncher.
+
+        **Fastest path:** open **Settings → About → Report a bug** inside the launcher.
+        It collects redacted diagnostics, copies the full report to your clipboard and
+        opens this form with the fields below prefilled. Review everything before
+        submitting.
+
+        **Privacy:** never paste access tokens, refresh tokens, session IDs, passwords,
+        private keys or account files. The launcher redacts known secret fields, but you
+        are responsible for the final text.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am using the latest VoidLauncher release, or I explain below why not.
+          required: true
+        - label: I removed tokens, passwords, session IDs and other account secrets from this report.
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Short summary
+      description: One or two sentences describing the problem.
+      placeholder: The launcher crashes when I open...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What did you do before the problem appeared? Be specific.
+      placeholder: |
+        1. Open...
+        2. Click...
+        3. See...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the exact error message if there is one.
+      placeholder: What actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional information
+      description: "Optional context: instance name, mods, server, recent changes, workarounds tried."
+      placeholder: Do not paste account secrets.
+    validations:
+      required: false
+
+  - type: input
+    id: launcher_version
+    attributes:
+      label: VoidLauncher version
+      description: Shown in Settings → About. Leave empty if the launcher cannot start.
+      placeholder: 1.5.0
+
+  - type: input
+    id: windows_version
+    attributes:
+      label: Windows version
+      description: For example Windows 11 23H2, x64.
+      placeholder: Windows 11 23H2, x64
+
+  - type: input
+    id: minecraft_version
+    attributes:
+      label: Minecraft version
+      description: Leave empty if the problem happens before a game launch.
+      placeholder: 1.21.1
+
+  - type: dropdown
+    id: loader
+    attributes:
+      label: Mod loader
+      description: Leave empty for vanilla or if the problem is not instance-specific.
+      options:
+        - Vanilla
+        - Fabric
+        - Forge
+        - NeoForge
+        - Other / not sure
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: System and launcher details
+      description: Prefilled by the in-app reporter. Paste it manually if you did not use the in-app form.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: instance
+    attributes:
+      label: Instance summary
+      description: Minecraft version, loader, loader version and installed mod count.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics report
+      description: From Settings → About → Report a bug (run diagnostics there if needed). Remove anything you do not want to publish.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: launcher_log
+    attributes:
+      label: Launcher log
+      description: The in-app reporter can attach the redacted tail. Remove anything you do not want to publish.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: game_log
+    attributes:
+      label: Latest game log
+      description: The in-app reporter can attach the redacted tail. Remove anything you do not want to publish.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: crash
+    attributes:
+      label: Crash analysis
+      description: Automatic verdict from the in-app reporter, if a crash was detected.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or recordings
+      description: Drag and drop images here after opening the issue, or paste links.
+    validations:
+      required: false

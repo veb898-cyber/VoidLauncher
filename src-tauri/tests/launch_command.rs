@@ -18,8 +18,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use support::*;
+use voidlauncher_lib::authlib_injector::AuthlibInjector;
 use voidlauncher_lib::instances::LoaderType;
-use voidlauncher_lib::launch::{build_launch_command, LaunchCommand};
+use voidlauncher_lib::launch::{build_launch_command, LaunchAuth, LaunchCommand};
 use voidlauncher_lib::modloaders::LoaderProfile;
 
 /// G1GC preset flags emitted by `jvm::build_jvm_args` for every supported JDK.
@@ -144,6 +145,221 @@ fn vanilla_1_20_1_composes_expected_argv() {
         "1.20.1 argv changed; see tests/fixtures/SOURCES.md for the metadata"
     );
     assert_no_placeholders(&command.args);
+}
+
+fn test_agent() -> AuthlibInjector {
+    AuthlibInjector {
+        jar: PathBuf::from(
+            r"C:\Program Files\Void Launcher\runtime\authlib-injector\1.2.8\authlib-injector.jar",
+        ),
+        api_root: "https://authserver.ely.by/api/authlib-injector".to_string(),
+        prefetched_metadata: "eyJza2luRG9tYWlucyI6WyJlbHkuYnkiXX0=".to_string(),
+    }
+}
+
+fn elyby_auth_with_agent<'a>(agent: &'a AuthlibInjector) -> LaunchAuth<'a> {
+    LaunchAuth {
+        access_token: "elyby-token",
+        uuid: "00000000-0000-0000-0000-000000000002",
+        username: "ElyPlayer",
+        user_type: "mojang",
+        authlib_injector: Some(agent),
+    }
+}
+
+#[test]
+fn elyby_authlib_agent_args_are_single_argv_elements_before_main_class() {
+    let fixture = Fixture::new("authlib-agent-vanilla", "1.20.1");
+    let agent = test_agent();
+    let auth = elyby_auth_with_agent(&agent);
+    let command = fixture.build_with_auth(&auth);
+
+    let javaagent = format!("-javaagent:{}={}", agent.jar.display(), agent.api_root);
+    let prefetched = format!(
+        "-Dauthlibinjector.yggdrasil.prefetched={}",
+        agent.prefetched_metadata
+    );
+
+    assert_eq!(count_args(&command.args, &javaagent), 1);
+    assert_eq!(count_args(&command.args, &prefetched), 1);
+    assert_eq!(
+        count_args(&command.args, "-javaagent:"),
+        0,
+        "prefix must not be a separate arg"
+    );
+
+    let agent_index = command
+        .args
+        .iter()
+        .position(|a| a == &javaagent)
+        .expect("javaagent arg");
+    let prefetched_index = command
+        .args
+        .iter()
+        .position(|a| a == &prefetched)
+        .expect("prefetched arg");
+    let cp_index = command
+        .args
+        .iter()
+        .position(|a| a == "-cp")
+        .expect("-cp arg");
+    let main_index = command
+        .args
+        .iter()
+        .position(|a| a == "voidlauncher.entry.VoidLauncherEntry")
+        .expect("main class");
+
+    assert!(agent_index < cp_index, "agent must be a JVM arg before -cp");
+    assert!(
+        prefetched_index < cp_index,
+        "prefetch must be a JVM arg before -cp"
+    );
+    assert!(agent_index < main_index);
+    assert!(prefetched_index < main_index);
+    assert_eq!(value_after(&command.args, "--userType"), "mojang");
+
+    let classpath = &command.args[cp_index + 1];
+    assert!(
+        !classpath.contains("authlib-injector"),
+        "the agent must not be on the classpath"
+    );
+}
+
+#[test]
+fn elyby_one_shot_bypass_keeps_mojang_session_without_agent() {
+    let fixture = Fixture::new("elyby-bypass", "1.20.1");
+    let auth = LaunchAuth {
+        access_token: "elyby-token",
+        uuid: "00000000-0000-0000-0000-000000000002",
+        username: "ElyPlayer",
+        user_type: "mojang",
+        authlib_injector: None,
+    };
+    let command = fixture.build_with_auth(&auth);
+
+    assert!(
+        !command.args.iter().any(|a| a.starts_with("-javaagent:")),
+        "bypass must not load authlib-injector"
+    );
+    assert!(
+        !command
+            .args
+            .iter()
+            .any(|a| a.starts_with("-Dauthlibinjector.yggdrasil.prefetched=")),
+        "bypass must not add prefetched metadata"
+    );
+    assert_eq!(value_after(&command.args, "--userType"), "mojang");
+    assert_eq!(value_after(&command.args, "--accessToken"), "elyby-token");
+}
+
+#[test]
+fn microsoft_and_offline_launches_do_not_get_the_elyby_agent() {
+    for (label, user_type) in [("msa-no-agent", "msa"), ("legacy-no-agent", "legacy")] {
+        let fixture = Fixture::new(label, "1.20.1");
+        let auth = LaunchAuth {
+            access_token: TEST_TOKEN,
+            uuid: TEST_UUID,
+            username: TEST_USERNAME,
+            user_type,
+            authlib_injector: None,
+        };
+        let command = fixture.build_with_auth(&auth);
+        assert!(
+            !command.args.iter().any(|a| a.starts_with("-javaagent:")),
+            "{label} must not load authlib-injector"
+        );
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|a| a.starts_with("-Dauthlibinjector.yggdrasil.prefetched=")),
+            "{label} must not receive Ely.by metadata"
+        );
+    }
+}
+
+#[test]
+fn elyby_agent_composes_with_every_supported_loader() {
+    let agent = test_agent();
+    let auth = elyby_auth_with_agent(&agent);
+
+    let vanilla = Fixture::new("authlib-vanilla", "1.20.1");
+    let fabric = Fixture::new("authlib-fabric", "1.20.1").with_loader(
+        LoaderType::Fabric,
+        load_loader_profile("fabric-0.16.9-1.20.1"),
+    );
+    let forge = Fixture::new("authlib-forge", "1.12.2").with_loader(
+        LoaderType::Forge,
+        load_loader_profile("forge-14.23.5.2860-1.12.2"),
+    );
+    let neoforge = Fixture::new("authlib-neoforge", "1.21.4").with_loader(
+        LoaderType::NeoForge,
+        load_loader_profile("neoforge-21.1.172-1.21.4"),
+    );
+
+    for (label, command) in [
+        ("vanilla", vanilla.build_with_auth(&auth)),
+        ("fabric", fabric.build_with_auth(&auth)),
+        ("forge", forge.build_with_auth(&auth)),
+        ("neoforge", neoforge.build_with_auth(&auth)),
+    ] {
+        assert_eq!(
+            command
+                .args
+                .iter()
+                .filter(|a| a.starts_with("-javaagent:"))
+                .count(),
+            1,
+            "{label}: exactly one javaagent"
+        );
+        assert!(
+            command.args.iter().any(|a| a
+                == "-Dauthlibinjector.yggdrasil.prefetched=eyJza2luRG9tYWlucyI6WyJlbHkuYnkiXX0="),
+            "{label}: prefetched metadata"
+        );
+        let agent_index = command
+            .args
+            .iter()
+            .position(|a| a.starts_with("-javaagent:"))
+            .expect("agent arg");
+        let cp_index = command
+            .args
+            .iter()
+            .position(|a| a == "-cp")
+            .expect("-cp arg");
+        assert!(agent_index < cp_index, "{label}: agent before -cp");
+        assert!(
+            !command.args[cp_index + 1].contains("authlib-injector"),
+            "{label}: agent must not be on the classpath"
+        );
+        assert_eq!(value_after(&command.args, "--userType"), "mojang");
+    }
+}
+
+#[test]
+fn duplicate_elyby_agent_arg_is_not_added_twice() {
+    let mut fixture = Fixture::new("authlib-duplicate", "1.20.1");
+    let agent = test_agent();
+    let duplicate = format!("-javaagent:{}={}", agent.jar.display(), agent.api_root);
+    fixture.instance.jvm_args = Some(vec![duplicate.clone()]);
+    let auth = elyby_auth_with_agent(&agent);
+    let command = fixture.build_with_auth(&auth);
+    assert_eq!(count_args(&command.args, &duplicate), 1);
+}
+
+#[test]
+fn elyby_auth_uses_mojang_user_type() {
+    let fixture = Fixture::new("elyby-user-type", "1.20.1");
+    let auth = LaunchAuth {
+        access_token: "elyby-token",
+        uuid: "00000000-0000-0000-0000-000000000002",
+        username: "ElyPlayer",
+        user_type: "mojang",
+        authlib_injector: None,
+    };
+    let command = fixture.build_with_auth(&auth);
+    assert_eq!(value_after(&command.args, "--userType"), "mojang");
+    assert_eq!(value_after(&command.args, "--accessToken"), "elyby-token");
 }
 
 #[test]

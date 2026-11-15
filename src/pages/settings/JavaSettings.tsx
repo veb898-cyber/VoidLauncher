@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
-import { Check, Download, RefreshCw } from 'lucide-react';
+import { Check, Download } from 'lucide-react';
 import { useSettingsStore, type AppConfig } from '../../stores/settingsStore';
 import { useJavaDownloadStore } from '../../stores/javaDownloadStore';
 import { Button } from '../../components/ui/Button';
+import { RefreshIcon } from '../../components/ui/RefreshIcon';
 import { CustomSelect } from '../../components/ui/CustomSelect';
 import { SnakeSpinner } from '../../components/ui/SnakeSpinner';
 import { Tooltip } from '../../components/ui/Tooltip';
@@ -36,7 +37,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
   const javaInstallations = useSettingsStore((s) => s.javaInstallations);
   const detectJava = useSettingsStore((s) => s.detectJava);
   const detectSystemRam = useSettingsStore((s) => s.detectSystemRam);
-  const javaDownload = useJavaDownloadStore((s) => s.active);
+  const javaDownloads = useJavaDownloadStore((s) => s.active);
 
   const [availableJava, setAvailableJava] = useState<AvailableJavaVersion[]>([]);
   const [managedJava, setManagedJava] = useState<ManagedJavaRuntime[]>([]);
@@ -87,6 +88,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               type="text"
               value={config.java_path || ''}
               placeholder={t('settings.java_path_placeholder')}
+              aria-label={t('settings.java_path_title')}
               onChange={(e) => updateConfig('java_path', e.target.value || null)}
               style={{ width: 330, fontSize: 'var(--font-size-xs)' }}
             />
@@ -117,7 +119,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               }}
               disabled={javaRefreshing}
             >
-              <RefreshCw size={14} className={javaRefreshing ? 'icon-spin' : undefined} />
+              <RefreshIcon spinning={javaRefreshing} />
               {t('settings.java_refresh')}
             </Button>
           </div>
@@ -184,7 +186,12 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               max="32768"
               step="512"
               value={config.default_memory_mb}
-              onChange={(e) => updateConfig('default_memory_mb', Math.max(2048, parseInt(e.target.value) || 2048))}
+              onChange={(e) => {
+                // `max` only constrains the spinner arrows: typed values must
+                // be clamped too, or a typo is persisted and handed to the JVM.
+                const parsed = parseInt(e.target.value, 10) || 2048;
+                updateConfig('default_memory_mb', Math.min(32768, Math.max(2048, parsed)));
+              }}
               style={{ width: 100, textAlign: 'center' }}
               id="min-memory-input"
             />
@@ -251,7 +258,8 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)', marginBottom: 'var(--space-lg)' }}>
             {availableJava.map((jv) => {
-              const isDownloading = javaDownload?.majorVersion === jv.major_version;
+              const javaDownload = javaDownloads[jv.major_version] ?? null;
+              const isDownloading = javaDownload !== null;
               const isInstalled = managedJava.some((m) => m.major_version === jv.major_version);
               return (
                 <div key={jv.major_version} className="glass-card" style={{
@@ -284,7 +292,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
                       } catch (e) {
                         addToast(t('settings.java_install_error', { error: String(e) }), 'error');
                       } finally {
-                        useJavaDownloadStore.getState().clear();
+                        useJavaDownloadStore.getState().clear(jv.major_version);
                       }
                     }}
                   >

@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+/// Manifest, override paths and per-override SHA-1 hashes read from a pack zip.
+type PackArchiveInfo = (serde_json::Value, Vec<String>, BTreeMap<String, String>);
+
 /// Lock file name inside the instance directory (above `.minecraft` — the
 /// instance root is the launcher's own territory).
 pub const LOCK_FILE: &str = "pack-lock.json";
@@ -33,6 +36,12 @@ pub struct PackLock {
     pub file_name: String,
     /// Display name of that version (what the UI shows as a version).
     pub file_display_name: String,
+    /// Normalized release channel of the installed file: `"release"`,
+    /// `"beta"` or `"alpha"`. Empty for locks written before this field
+    /// existed; the update check then asks the provider and refuses an
+    /// automatic update when the channel cannot be established.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel: String,
     pub installed_at: String,
     pub mc_version: String,
     /// Lowercase loader slug (`fabric`/`forge`/`neoforge`), `""` = vanilla.
@@ -40,8 +49,66 @@ pub struct PackLock {
     /// Parsed pack manifest (CF `manifest.json` / `modrinth.index.json`).
     pub manifest: serde_json::Value,
     /// All override paths (relative to `.minecraft`) present in the pack
-    /// zip at install time — the basis for identifying removed overrides.
+    /// zip at install time - the basis for identifying removed overrides.
     pub overrides: Vec<String>,
+    /// CurseForge `manifest.json` overrides folder prefix (EG `overrides/` or
+    /// `custom/path/`). Empty for locks written before this field; repair then
+    /// derives it from the stored manifest or falls back to `overrides/`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub overrides_prefix: String,
+    /// SHA-1 of every override exactly as shipped by the pack. An update can
+    /// then rewrite only files whose pack content actually changed, leaving
+    /// user-edited configs of unchanged files alone. Empty for locks written
+    /// by older builds (fall back to the legacy rewrite-all behaviour).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub override_hashes: BTreeMap<String, String>,
+}
+
+/// Provider release channels in descending stability order. Automatic pack
+/// updates stay within the installed channel: a release is never silently
+/// replaced by a beta (or vice versa), and unknown provider values are not
+/// guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackChannel {
+    Release,
+    Beta,
+    Alpha,
+}
+
+impl PackChannel {
+    /// Modrinth `version_type` (`release` / `beta` / `alpha`).
+    pub fn from_modrinth(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "release" => Some(Self::Release),
+            "beta" => Some(Self::Beta),
+            "alpha" => Some(Self::Alpha),
+            _ => None,
+        }
+    }
+
+    /// CurseForge `releaseType` (`1` release, `2` beta, `3` alpha).
+    pub fn from_curseforge(release_type: u32) -> Option<Self> {
+        match release_type {
+            1 => Some(Self::Release),
+            2 => Some(Self::Beta),
+            3 => Some(Self::Alpha),
+            _ => None,
+        }
+    }
+
+    /// Parse the normalized value stored in a pack lock. Older locks have no
+    /// value, which is `None` (callers must consult the provider).
+    pub fn from_lock(value: &str) -> Option<Self> {
+        Self::from_modrinth(value)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Beta => "beta",
+            Self::Alpha => "alpha",
+        }
+    }
 }
 
 impl PackLock {
@@ -88,6 +155,23 @@ impl PackLock {
         } else {
             Some(&self.loader)
         }
+    }
+
+    /// Override source prefix used by the pack that created this lock. New
+    /// locks store it explicitly; old locks fall back to the manifest, then to
+    /// the historical `overrides/` default. A corrupt stored prefix never wins
+    /// over the manifest.
+    pub fn effective_curseforge_overrides_prefix(&self) -> String {
+        let stored = self.overrides_prefix.trim();
+        if !stored.is_empty() {
+            if let Ok(prefix) = crate::import::curseforge_overrides_prefix(
+                &serde_json::json!({ "overrides": stored }),
+            ) {
+                return prefix;
+            }
+        }
+        crate::import::curseforge_overrides_prefix(&self.manifest)
+            .unwrap_or_else(|_| "overrides/".to_string())
     }
 }
 
@@ -265,31 +349,23 @@ pub fn content_type_for_rel(rel: &str) -> &'static str {
 /// Read `manifest.json` and the full override path list (relative to
 /// `.minecraft`) from an installed CF pack zip — called while the temp
 /// download still exists, before import removes it.
-pub fn pack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String>), String> {
-    let file =
-        std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
-
+pub fn pack_zip_info(zip_path: &Path) -> Result<PackArchiveInfo, String> {
     let mut manifest_str = String::new();
-    let mut overrides: Vec<String> = Vec::new();
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-        let name = entry.name().to_string();
-        if name == "manifest.json" {
-            entry
-                .read_to_string(&mut manifest_str)
-                .map_err(|e| format!("Cannot read manifest.json: {}", e))?;
-            continue;
-        }
-        if entry.is_dir() {
-            continue;
-        }
-        if let Some(rel) = name.strip_prefix("overrides/") {
-            if !rel.is_empty() {
-                overrides.push(rel.to_string());
+    {
+        let file = std::fs::File::open(zip_path)
+            .map_err(|e| format!("Cannot open pack archive: {}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
+        crate::import::check_archive_entry_count(archive.len()).map_err(|e| e.to_string())?;
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+            if entry.name() == "manifest.json" {
+                entry
+                    .read_to_string(&mut manifest_str)
+                    .map_err(|e| format!("Cannot read manifest.json: {}", e))?;
+                break;
             }
         }
     }
@@ -298,38 +374,75 @@ pub fn pack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String>)
     }
     let manifest: serde_json::Value =
         serde_json::from_str(&manifest_str).map_err(|e| format!("Invalid manifest.json: {}", e))?;
-    overrides.sort();
-    Ok((manifest, overrides))
-}
+    // The pack may put its files in a custom folder (manifest `overrides`).
+    let prefix =
+        crate::import::curseforge_overrides_prefix(&manifest).map_err(|e| e.to_string())?;
 
-/// Read `modrinth.index.json` and the full override path list (relative to
-/// `.minecraft`, both `overrides/` and `overrides-client/`) from an mrpack
-/// zip — the exact set the importer extracts.
-pub fn mrpack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String>), String> {
     let file =
         std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
-
-    let mut index_str = String::new();
-    let mut overrides: Vec<String> = Vec::new();
+    crate::import::check_archive_entry_count(archive.len()).map_err(|e| e.to_string())?;
+    let mut hashes = BTreeMap::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("Cannot read pack entry: {}", e))?;
         let name = entry.name().to_string();
-        if name == "modrinth.index.json" {
-            entry
-                .read_to_string(&mut index_str)
-                .map_err(|e| format!("Cannot read modrinth.index.json: {}", e))?;
-            continue;
-        }
         if entry.is_dir() {
             continue;
         }
-        if let Some(rel) = crate::import::extract_mrpack_override(&name) {
-            if !rel.is_empty() {
-                overrides.push(rel.to_string());
+        let Some(rel) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rel.is_empty() || crate::import::check_safe_relative(rel).is_err() {
+            continue;
+        }
+        let hash = sha1_of_reader(&mut entry)?;
+        hashes.insert(rel.to_string(), hash);
+    }
+    let overrides = hashes.keys().cloned().collect();
+    Ok((manifest, overrides, hashes))
+}
+
+/// SHA-1 of a streamed zip entry (override files are hashed while reading the
+/// archive, so the pack is never buffered in memory).
+fn sha1_of_reader(reader: &mut dyn std::io::Read) -> Result<String, String> {
+    use sha1::Digest as _;
+    let mut hasher = sha1::Sha1::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Read `modrinth.index.json` and the full override path list (relative to
+/// `.minecraft`, both `overrides/` and `overrides-client/`) from an mrpack
+/// zip — the exact set the importer extracts.
+pub fn mrpack_zip_info(zip_path: &Path) -> Result<PackArchiveInfo, String> {
+    let mut index_str = String::new();
+    {
+        let file = std::fs::File::open(zip_path)
+            .map_err(|e| format!("Cannot open pack archive: {}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
+        crate::import::check_archive_entry_count(archive.len()).map_err(|e| e.to_string())?;
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+            if entry.name() == "modrinth.index.json" {
+                entry
+                    .read_to_string(&mut index_str)
+                    .map_err(|e| format!("Cannot read modrinth.index.json: {}", e))?;
+                break;
             }
         }
     }
@@ -338,23 +451,64 @@ pub fn mrpack_zip_info(zip_path: &Path) -> Result<(serde_json::Value, Vec<String
     }
     let index: serde_json::Value = serde_json::from_str(&index_str)
         .map_err(|e| format!("Invalid modrinth.index.json: {}", e))?;
-    overrides.sort();
-    overrides.dedup();
-    Ok((index, overrides))
+
+    let file =
+        std::fs::File::open(zip_path).map_err(|e| format!("Cannot open pack archive: {}", e))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Cannot read pack archive: {}", e))?;
+    crate::import::check_archive_entry_count(archive.len()).map_err(|e| e.to_string())?;
+    // Layered overrides: client-overrides/ wins over overrides/.
+    let mut base = BTreeMap::new();
+    let mut client = BTreeMap::new();
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Cannot read pack entry: {}", e))?;
+        let name = entry.name().to_string();
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(rel) = crate::import::extract_mrpack_override(&name) else {
+            continue;
+        };
+        if rel.is_empty() || crate::import::check_safe_relative(rel).is_err() {
+            continue;
+        }
+        let hash = sha1_of_reader(&mut entry)?;
+        let is_client =
+            name.starts_with("client-overrides/") || name.starts_with("overrides-client/");
+        if is_client {
+            client.insert(rel.to_string(), hash);
+        } else {
+            base.insert(rel.to_string(), hash);
+        }
+    }
+    base.extend(client);
+    let overrides = base.keys().cloned().collect();
+    Ok((index, overrides, base))
 }
 
 /// Paths an update/repair must never write or delete: the user's worlds,
 /// personal media and core settings. Everything else in the instance is
 /// pack-owned content the pack update may manage.
 pub fn is_protected_path(rel: &str) -> bool {
-    let norm = rel.replace('\\', "/");
-    let lower = norm.trim_start_matches('/').to_ascii_lowercase();
-    const DIRS: &[&str] = &["saves/", "screenshots/", "logs/", "crash-reports/"];
-    if DIRS.iter().any(|d| lower.starts_with(d)) {
+    // Normalise exactly like archive destinations: collapse `.`/empty
+    // components, strip trailing dots/spaces (Windows does this at open time)
+    // and case-fold. Fail closed on an invalid path.
+    let Some(normalised) = crate::import::destination_key(rel) else {
+        return true;
+    };
+    const DIRS: &[&str] = &["saves", "screenshots", "logs", "crash-reports"];
+    if DIRS.iter().any(|dir| {
+        normalised == *dir
+            || normalised
+                .strip_prefix(dir)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }) {
         return true;
     }
     matches!(
-        lower.as_str(),
+        normalised.as_str(),
         "options.txt"
             | "optionsof.txt"
             | "servers.dat"
@@ -590,9 +744,13 @@ mod tests {
             zw.start_file("overrides/", opts).unwrap();
             zw.finish().unwrap();
         }
-        let (m, overrides) = pack_zip_info(&zip_path).unwrap();
+        let (m, overrides, hashes) = pack_zip_info(&zip_path).unwrap();
         assert_eq!(manifest_files(&m).get("5").map(String::as_str), Some("50"));
         assert_eq!(overrides, vec!["config/mod.toml", "options.txt"]);
+        assert_eq!(
+            hashes.get("config/mod.toml").map(String::as_str),
+            Some(sha1_of_reader(&mut b"cfg".as_slice()).unwrap().as_str())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -613,13 +771,18 @@ mod tests {
             zw.start_file("overrides-client/config/client.toml", opts)
                 .unwrap();
             zw.write_all(b"c").unwrap();
+            zw.start_file("overrides/config/shared.toml", opts).unwrap();
+            zw.write_all(b"base").unwrap();
+            zw.start_file("client-overrides/config/shared.toml", opts)
+                .unwrap();
+            zw.write_all(b"client").unwrap();
             zw.start_file("overrides-server/config/server.toml", opts)
                 .unwrap();
             zw.write_all(b"s").unwrap();
             zw.start_file("overrides/", opts).unwrap();
             zw.finish().unwrap();
         }
-        let (idx, overrides) = mrpack_zip_info(&zip_path).unwrap();
+        let (idx, overrides, hashes) = mrpack_zip_info(&zip_path).unwrap();
         assert_eq!(
             mrpack_manifest_map(&idx).get("p1").map(mrpack_entry_path),
             Some("mods/a.jar".to_string())
@@ -628,8 +791,14 @@ mod tests {
             overrides,
             vec![
                 "config/a.toml".to_string(),
-                "config/client.toml".to_string()
+                "config/client.toml".to_string(),
+                "config/shared.toml".to_string()
             ]
+        );
+        assert_eq!(
+            hashes.get("config/shared.toml").map(String::as_str),
+            Some(sha1_of_reader(&mut b"client".as_slice()).unwrap().as_str()),
+            "the client layer must define the installed content hash"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -645,11 +814,14 @@ mod tests {
             file_id: "456".into(),
             file_name: "TestPack-1.0.zip".into(),
             file_display_name: "TestPack 1.0".into(),
+            channel: "release".into(),
             installed_at: "2026-10-10T00:00:00Z".into(),
             mc_version: "1.20.1".into(),
             loader: "fabric".into(),
             manifest: manifest(&[]),
             overrides: vec!["config/a.toml".into()],
+            overrides_prefix: "overrides/".into(),
+            override_hashes: BTreeMap::new(),
         };
         lock.write(&dir).unwrap();
         assert!(PackLock::lock_path(&dir).is_file());
@@ -676,11 +848,14 @@ mod tests {
             file_id: "2".into(),
             file_name: "l.zip".into(),
             file_display_name: "L".into(),
+            channel: "release".into(),
             installed_at: "2026-10-10T00:00:00Z".into(),
             mc_version: "1.20.1".into(),
             loader: String::new(),
             manifest: manifest(&[]),
             overrides: vec![],
+            overrides_prefix: String::new(),
+            override_hashes: BTreeMap::new(),
         };
         std::fs::write(
             PackLock::legacy_lock_path(&dir),
@@ -697,5 +872,49 @@ mod tests {
         assert!(!PackLock::legacy_lock_path(&dir).exists());
         assert_eq!(PackLock::read(&dir).unwrap(), lock);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn protected_paths_use_windows_normalisation() {
+        assert!(is_protected_path("saves/world/level.dat"));
+        assert!(is_protected_path("./saves/world/level.dat"));
+        assert!(is_protected_path("saves./world/level.dat"));
+        assert!(is_protected_path("saves"));
+        assert!(is_protected_path("saves."));
+        assert!(is_protected_path("saves\\world\\level.dat"));
+        assert!(is_protected_path("options.txt"));
+        assert!(is_protected_path("./options.txt"));
+        assert!(is_protected_path("options.txt."));
+        assert!(is_protected_path("options.txt "));
+        assert!(is_protected_path("OPTIONS.TXT"));
+        assert!(is_protected_path("servers.dat"));
+        assert!(is_protected_path("screenshots/shot.png"));
+        assert!(!is_protected_path("config/example.toml"));
+        assert!(!is_protected_path("mods/example.jar"));
+        assert!(!is_protected_path("saves_backup/world/level.dat"));
+    }
+
+    #[test]
+    fn protected_paths_fail_closed_on_windows_trailing_forms() {
+        // `.. `, `...` and `. ` resolve differently once Win32 strips trailing
+        // dots/spaces, so a protected-file lookup must fail closed rather than
+        // return an alias that looks unrelated to the raw string.
+        for path in [
+            ".. ",
+            "saves/../options.txt",
+            "saves\\.. \\options.txt",
+            "options.txt... ",
+            "servers.dat.",
+            "screenshots.../shot.png",
+            "logs/.. /latest.log",
+        ] {
+            assert!(
+                is_protected_path(path),
+                "ambiguous Windows path must be treated as protected: {path:?}"
+            );
+        }
+        assert!(is_protected_path("saves/.. /world/level.dat"));
+        assert!(is_protected_path("saves."));
+        assert!(is_protected_path("screenshots "));
     }
 }

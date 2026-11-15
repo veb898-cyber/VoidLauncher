@@ -3,12 +3,12 @@ import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
 import "./index.css";
-// Side-effect import: creating the store is what applies the persisted
-// appearance (normal theme or the Liquid Glass sentinel) to <html>. Without
-// it the store would only be evaluated once Settings is opened, and the
-// boot-time value written by the inline script in index.html would be the
-// only thing in effect.
+// Side-effect imports: the stores apply the persisted appearance and the
+// optional interface-effect reduction to <html> before the first React render.
+// themeStore applies the saved theme or Liquid Glass; performanceStore migrates
+// the old profile keys and applies the reduced-effects attribute.
 import "./stores/themeStore";
+import "./stores/performanceStore";
 import { useLanguageStore } from "./stores/languageStore";
 
 // The installer asks for a language before its first page, and that choice

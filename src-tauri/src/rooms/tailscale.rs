@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::error::{LauncherError, Result};
 use crate::rooms::peer_discovery::{HostInfo, PeerInfo};
@@ -17,10 +19,20 @@ use crate::rooms::peer_discovery::{HostInfo, PeerInfo};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
+/// Tailscale/msiexec are synchronous system processes. Serialize the CLI so a
+/// high-frequency status poll cannot spawn an unbounded number of identical
+/// `tailscale status` processes at once.
+static TAILSCALE_CLI_LOCK: Mutex<()> = Mutex::new(());
+static MSI_INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// A hung `tailscaled`/CLI must never block IPC or a Minecraft launch forever.
+const CLI_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Default location of the Tailscale Windows client.
 #[cfg(target_os = "windows")]
 const TAILSCALE_EXE: &str = "tailscale.exe";
 
+#[derive(Clone)]
 pub struct TailscaleManager {
     data_dir: PathBuf,
 }
@@ -230,15 +242,19 @@ impl TailscaleManager {
         progress(0.75, "Verifying installer checksum");
         verify_sha256(&msi_path, &sha256_hex)?;
 
-        // 5. Silent install.
+        // 5. Silent install. msiexec is synchronous and can take minutes;
+        //    never block the async runtime with it.
         progress(0.8, "Installing Tailscale");
-        install_msi_silent(&msi_path)?;
+        let msi_for_install = msi_path.clone();
+        tokio::task::spawn_blocking(move || install_msi_silent(&msi_for_install))
+            .await
+            .map_err(|e| LauncherError::Launch(format!("Installer task failed: {}", e)))??;
 
         // 6. Give the service a moment to come up.
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         if !self.is_installed() && tailscale_exe_path().is_none() {
             // The service may still be registering; one quick retry window.
-            std::thread::sleep(std::time::Duration::from_millis(3000));
+            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
         }
         progress(1.0, "Tailscale installed");
         tracing::info!(target: "rooms", "Tailscale installed from {}", msi_path.display());
@@ -283,26 +299,86 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Run the CLAN CLI and capture stdout; stderr is merged for diagnostics.
+/// Run the Tailscale CLI and capture stdout; stderr is merged for diagnostics.
+///
+/// The CLI is synchronous and can hang when `tailscaled` is starting or wedged.
+/// A bounded timeout plus a process-wide CLI lock keeps a status poll from
+/// blocking the async runtime or accumulating child processes.
 pub fn run_cli_output(exe: &Path, args: &[&str]) -> std::result::Result<String, String> {
+    let _guard = TAILSCALE_CLI_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    use std::io::Read;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(args);
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     #[cfg(target_os = "windows")]
     cmd.creation_flags(crate::launch::CREATE_NO_WINDOW);
-    let out = cmd
-        .output()
+
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Failed to run {:?}: {}", exe, e))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+
+    // Drain both pipes concurrently; a status document can exceed the OS pipe
+    // buffer and would otherwise deadlock the child before it exits.
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + CLI_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "{} timed out after {}s",
+                    exe.display(),
+                    CLI_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("Failed to wait for {:?}: {}", exe, e));
+            }
+        }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     } else {
-        let stderr = String::from_utf8_lossy(&out.stderr);
         Err(format!(
             "{} exited {:?}: {}",
             exe.display(),
-            out.status.code(),
-            stderr.trim()
-        )
-        .to_string())
+            status.code(),
+            String::from_utf8_lossy(&stderr).trim()
+        ))
     }
 }
 
@@ -481,14 +557,44 @@ fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
 /// Run msiexec for a silent install; 0 and 3010 (reboot required) are OK.
 #[cfg(target_os = "windows")]
 fn install_msi_silent(msi_path: &Path) -> Result<()> {
-    let status = std::process::Command::new("msiexec")
+    let _guard = MSI_INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut child = std::process::Command::new("msiexec")
         .arg("/i")
         .arg(msi_path)
         .arg("/qn")
         .arg("/norestart")
         .arg("TS_SERVICE_UI_PREFERENCES={\"NoUI\"}")
-        .status()
+        .spawn()
         .map_err(|e| LauncherError::Launch(format!("Failed to start msiexec: {}", e)))?;
+    // Windows Installer can legitimately take several minutes on a slow disk,
+    // but a wedged installer must not block the launcher forever.
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(LauncherError::Launch(
+                    "msiexec did not finish within 10 minutes; the Tailscale installation may be incomplete."
+                        .to_string(),
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(LauncherError::Launch(format!(
+                    "Failed to wait for msiexec: {}",
+                    e
+                )));
+            }
+        }
+    };
     let code = status.code().unwrap_or(-1);
     if code == 0 || code == 3010 {
         Ok(())

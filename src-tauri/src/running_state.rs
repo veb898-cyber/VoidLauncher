@@ -171,10 +171,12 @@ fn running_dir(data_dir: &Path) -> PathBuf {
 }
 
 fn pid_file(data_dir: &Path, instance: &str) -> PathBuf {
-    running_dir(data_dir).join(format!(
-        "{}.json",
-        crate::game_logs::sanitize_instance_name(instance)
-    ))
+    // `sanitize_instance_name` maps spaces and other characters to `_`, so
+    // "My Pack" and "My_Pack" would otherwise share one record. Hash the raw
+    // name instead: the filename is an injective, case-sensitive identity.
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(instance.to_ascii_lowercase().as_bytes()));
+    running_dir(data_dir).join(format!("{digest}.json"))
 }
 
 /// Record that `instance` is running as `pid`, together with the identity of
@@ -253,6 +255,40 @@ fn unique_suffix() -> u128 {
 /// Best-effort: drop the pid file for `instance` (called on game exit / stop).
 pub fn remove_pid_file(data_dir: &Path, instance: &str) {
     let _ = std::fs::remove_file(pid_file(data_dir, instance));
+    // Also remove legacy/sanitized-name records written by older versions.
+    // Compare the parsed `instance` field, never the filename, so a different
+    // instance whose sanitized name would collide is never touched.
+    let Ok(entries) = std::fs::read_dir(running_dir(data_dir)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let matches = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<RunningGame>(&raw).ok())
+            .is_some_and(|record| record.instance == instance);
+        if matches {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// True when the process recorded in `identity` is provably gone or its PID now
+/// belongs to a different process. `Unavailable` is deliberately false: an
+/// unreadable process must not be treated as dead.
+pub fn identity_is_dead(identity: &ProcessIdentity) -> bool {
+    identity_is_dead_with(identity, &SystemProbe)
+}
+
+fn identity_is_dead_with(identity: &ProcessIdentity, probe: &dyn ProcessProbe) -> bool {
+    match probe.probe(identity.pid) {
+        IdentityProbe::Gone => true,
+        IdentityProbe::Found(actual) => actual != *identity,
+        IdentityProbe::Unavailable => false,
+    }
 }
 
 /// Records found on disk, split by whether their process identity could be
@@ -752,6 +788,42 @@ mod tests {
     }
 
     #[test]
+    fn pid_file_names_are_unique_even_when_sanitized_names_collide() {
+        let dir = temp_dir("pid_name_collision");
+        let first = identity(111, r"C:\Java\bin\java.exe", 1_000);
+        let second = identity(222, r"C:\Java\bin\java.exe", 2_000);
+
+        write_pid_file(&dir, "My Pack", 111, Some(&first)).expect("first record");
+        write_pid_file(&dir, "My_Pack", 222, Some(&second)).expect("second record");
+
+        let first_path = pid_file(&dir, "My Pack");
+        let second_path = pid_file(&dir, "My_Pack");
+        assert_ne!(first_path, second_path);
+        assert!(first_path.is_file());
+        assert!(second_path.is_file());
+
+        remove_pid_file(&dir, "My Pack");
+        assert!(!first_path.exists(), "only the removed instance is deleted");
+        assert!(second_path.exists(), "the other instance record survives");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_is_dead_detects_reused_or_gone_but_not_unreadable() {
+        let recorded = identity(111, r"C:\Java\bin\java.exe", 1_000);
+        let reused = identity(111, r"C:\Java\bin\java.exe", 2_000);
+        let probe = FakeProbe::new(&[(111, IdentityProbe::Found(reused))]);
+        assert!(identity_is_dead_with(&recorded, &probe));
+
+        let gone = FakeProbe::new(&[(111, IdentityProbe::Gone)]);
+        assert!(identity_is_dead_with(&recorded, &gone));
+
+        let unavailable = FakeProbe::new(&[(111, IdentityProbe::Unavailable)]);
+        assert!(!identity_is_dead_with(&recorded, &unavailable));
+    }
+
+    #[test]
     fn write_pid_file_replaces_the_record_atomically() {
         let dir = temp_dir("atomic_write");
         let first = identity(111, r"C:\Java\bin\java.exe", 1_000);
@@ -838,7 +910,7 @@ mod tests {
     #[test]
     fn a_failed_move_cleans_up_the_temporary_file() {
         let dir = temp_dir("atomic_rename_fail");
-        std::fs::create_dir_all(running_dir(&dir).join("Pack.json")).expect("blocking directory");
+        std::fs::create_dir_all(pid_file(&dir, "Pack")).expect("blocking directory");
 
         let err = write_pid_file(&dir, "Pack", 111, None)
             .expect_err("a directory cannot be replaced by a file");

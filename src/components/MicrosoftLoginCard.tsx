@@ -7,6 +7,8 @@ import { useLogPlaque } from '../lib/uiLog';
 import { SnakeSpinner } from './ui/SnakeSpinner';
 import { Button } from './ui/Button';
 import { Tooltip } from './ui/Tooltip';
+import { addToast } from './ui/Toast';
+import { copyTextToClipboard } from '../lib/clipboard';
 
 interface MicrosoftLoginCardProps {
   /**
@@ -84,11 +86,13 @@ export function MicrosoftLoginCard({ onSuccess, embedded = false }: MicrosoftLog
     };
   }, [userCode, pollLogin]);
 
-  const handleCopyCode = () => {
-    if (userCode) {
-      navigator.clipboard.writeText(userCode);
+  const handleCopyCode = async () => {
+    if (!userCode) return;
+    if (await copyTextToClipboard(userCode)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
+    } else {
+      addToast(t('common.copy_failed'), 'error');
     }
   };
 

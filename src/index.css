@@ -14,6 +14,40 @@
   font-display: swap;
 }
 
+/* Inter — bundled locally so the strict CSP (`font-src 'self'`) never blocks
+   the UI font and the launcher works offline.
+   SIL Open Font License 1.1, (c) The Inter Project Authors
+   https://github.com/rsms/inter (see Inter-OFL.txt).
+   Subsets: latin, latin-ext, cyrillic; weight axis 300–900. */
+@font-face {
+  font-family: 'Inter';
+  src: url('./assets/fonts/Inter-latin.woff2') format('woff2');
+  font-weight: 300 900;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191,
+    U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('./assets/fonts/Inter-latin-ext.woff2') format('woff2');
+  font-weight: 300 900;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7,
+    U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF,
+    U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('./assets/fonts/Inter-cyrillic.woff2') format('woff2');
+  font-weight: 300 900;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+
 :root {
   /* Background Colors */
   --bg-primary: hsl(230, 25%, 7%);
@@ -92,6 +126,14 @@
   --space-xl: 24px;
   --space-2xl: 32px;
   --space-3xl: 48px;
+
+  /* Shared list geometry. Normal tables and Liquid Glass card lists use the
+     same row padding, thumbnail and action-box sizes; the theme changes the
+     material around that geometry, not the geometry itself. */
+  --row-padding-y: var(--space-sm);
+  --row-icon-size: 32px;
+  --row-action-size: 22px;
+  --row-card-gap: var(--space-xs);
 
   /* Border Radius */
   --radius-sm: 6px;
@@ -956,6 +998,11 @@ a {
   color: var(--text-primary);
 }
 
+.titlebar__btn:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -3px;
+}
+
 .titlebar__btn--close:hover {
   background: var(--error);
   color: white;
@@ -1133,6 +1180,19 @@ a {
   position: relative;
 }
 
+/* Lazy-page Suspense fallback: fill the content viewport (not the whole
+   window, not the sidebar) and center the spinner in both axes. The parent
+   flex item has a definite height, so min-height:100% resolves against it. */
+.page-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 100%;
+  padding: var(--space-3xl);
+  box-sizing: border-box;
+}
+
 /* Ambient background glow */
 .main-content::before {
   content: '';
@@ -1205,6 +1265,20 @@ a {
 
 .glass-card--selected:hover {
   border-color: var(--primary) !important;
+}
+
+/* Settings cards: hovering one transitions background, border-color and
+   box-shadow. Without a layer of its own, every frame repainted the whole
+   content layer (measured 1,116 x 925 px). Promoting the normal-theme settings
+   cards keeps that work inside the card: hover CPU fell from ~52% to ~42.5%
+   of one logical core and the WebView2 GPU process CPU from ~27.5% to ~21%.
+   Actual GPU 3D utilization stayed inside run-to-run noise. Rest and hover
+   frames match the original in every normal theme (largest measured channel
+   difference 1/255, no pixel above 2/255). Liquid Glass is excluded: its cards
+   already own a backdrop-filter layer and must keep the current material
+   sampling. */
+html:not([data-theme='lg']) .settings-section .glass-card {
+  will-change: transform;
 }
 
 /* ============================
@@ -1285,6 +1359,30 @@ a {
 .btn--sm {
   padding: var(--space-sm) var(--space-lg);
   font-size: var(--font-size-sm);
+}
+
+/* Diagnostics: keep the magnifier at the same distance from the left edge as
+   from the label, but size this one button to its content. The default 24px
+   horizontal padding plus the wider icon gap left too much empty space on the
+   right of the label. */
+.diagnostics-run-btn {
+  flex: 0 0 auto;
+  width: fit-content;
+  max-width: 100%;
+  gap: var(--space-lg);
+  padding-inline: var(--space-lg);
+}
+
+/* Icon-only action inside a material card. The flat list draws the same
+   action as a 14px glyph with 4px padding; the card must not inflate it into
+   a 34px chip just because it uses the button component. */
+.btn--icon-only {
+  width: var(--row-action-size);
+  height: var(--row-action-size);
+  min-width: var(--row-action-size);
+  padding: 0;
+  gap: 0;
+  flex-shrink: 0;
 }
 
 .btn--icon {
@@ -1941,6 +2039,17 @@ select option {
   box-shadow: var(--glow-primary);
 }
 
+.progress--indeterminate .progress__bar {
+  width: 34%;
+  min-width: 48px;
+  animation: progress-indeterminate 1.15s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(320%); }
+}
+
 /* Subtle moving highlight over the filled part of any progress bar.
    Position/height/logic stay untouched: the sheen is a clipped overlay. */
 .progress-fill {
@@ -2122,7 +2231,8 @@ select option {
 }
 
 .modpacks-overlay__body > .page {
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   /* The page itself never scrolls: the results list and the detail panel
@@ -2483,6 +2593,14 @@ html:not([data-theme='lg']) .settings-page--active {
   margin-top: var(--space-lg);
 }
 
+/* Secondary settings separated from the primary block by a hairline: the
+   proxy-only rule applies to both proxy sources and should not read as
+   another primary connection parameter. */
+.settings-subsection--divided {
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--surface-border);
+}
+
 .settings-subsection__head {
   display: flex;
   align-items: center;
@@ -2525,6 +2643,12 @@ html:not([data-theme='lg']) .settings-page--active {
   flex-shrink: 0;
 }
 
+/* Child settings that only apply while their parent switch is on. The indent
+   shows the hierarchy; the row keeps the same layout when active. */
+.settings-row--dependent {
+  padding-left: var(--space-lg);
+}
+
 /* Rows whose control is a small form (e.g. proxy host/port) read better with
    the fields stacked under the label than pinned to the far edge, where
    justify-content: space-between opens a huge dead gap. */
@@ -2562,6 +2686,20 @@ html:not([data-theme='lg']) .settings-page--active {
 .field-group__hint {
   font-size: var(--font-size-xs);
   color: var(--text-tertiary);
+}
+
+/* The proxy port is typed, not stepped. WebView2 draws native number
+   spinners; hide them only on this field instead of changing every numeric
+   input in the app. */
+.proxy-port-input::-webkit-outer-spin-button,
+.proxy-port-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.proxy-port-input {
+  -moz-appearance: textfield;
+  appearance: textfield;
 }
 
 /* ============================
@@ -2877,16 +3015,358 @@ html:not([data-theme='lg']) .settings-page--active {
   animation: icon-shine 1.6s ease-in-out infinite;
 }
 
+/* Revalidation overlay: the last good head stays visible underneath, the
+   sweep only signals that a fresh skin is being checked. */
+.icon-shine--overlay {
+  background: transparent;
+}
+
 @keyframes icon-shine {
   0% { transform: translateX(-100%); }
   100% { transform: translateX(100%); }
 }
 
-/* Long content lists (mods/shaders/packs): skip layout/paint for off-screen
-   rows so scrolling hundreds of items stays smooth in the WebView. */
-.content-list-row {
+/* Long content lists (mods/shaders/packs): the manager table is the only list
+   with a fixed row height and hundreds of rows, so it is the only one that can
+   use `content-visibility` safely. The catalog/confirm cards are variable
+   height: skipping them collapsed their flex layout to min-content (18px) and
+   every revealed card jumped to its real ~71px, re-laying out the list and
+   moving the scrollbar. Those views render their (incrementally loaded) rows
+   normally instead. */
+.content-list-row--table {
   content-visibility: auto;
-  contain-intrinsic-size: auto 40px;
+}
+
+/* ============================
+   Content install: conflict cards and resolver UI
+   ============================ */
+
+.content-download-card {
+  border: 1px solid transparent;
+  transition: background 160ms ease-out, border-color 160ms ease-out, box-shadow 160ms ease-out;
+}
+
+.content-download-card.content-list-row--dep:not(.content-download-card--conflict) {
+  border-color: hsla(35, 90%, 55%, 0.2);
+  background: hsla(35, 90%, 55%, 0.04);
+}
+
+.content-download-card--conflict {
+  --content-conflict-accent: var(--warning);
+  border-color: transparent;
+  background: transparent;
+  box-shadow: inset 2px 0 0 var(--content-conflict-accent);
+}
+
+.content-download-card--conflict-source {
+  --content-conflict-accent: var(--color-danger);
+}
+
+.content-download-card__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.content-conflict-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 15px;
+  white-space: nowrap;
+}
+
+.content-conflict-badge--target {
+  color: var(--warning);
+  background: hsla(35, 90%, 55%, 0.08);
+}
+
+.content-conflict-badge--source {
+  color: var(--color-danger);
+  background: var(--danger-bg);
+}
+
+.content-version-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 1px;
+}
+
+.content-version-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--primary);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.content-version-link:hover:not(:disabled) {
+  color: var(--primary-light);
+  text-decoration-thickness: 2px;
+}
+
+.content-version-link:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.content-conflict-report {
+  margin-bottom: var(--space-md);
+  padding: 10px 12px;
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-md);
+  background: var(--danger-bg);
+}
+
+.content-conflict-report__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.content-conflict-report__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.content-conflict-count {
+  padding: 0 7px;
+  border: 1px solid var(--danger-border);
+  border-radius: 999px;
+  color: var(--color-danger);
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.content-conflict-report__actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.content-conflict-auto-note {
+  margin: 4px 0 8px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.content-conflict-entry {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--danger-border);
+}
+
+.content-conflict-entry__title {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.content-conflict-entry__reason {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.content-autofix-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.content-autofix-row {
+  padding: 10px 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-active);
+}
+
+.content-autofix-row__name {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.content-autofix-row__line {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.content-autofix-row__line--next {
+  color: var(--success);
+  font-weight: 500;
+}
+
+.content-autofix-row__reason {
+  margin-top: 4px;
+  color: var(--warning);
+  font-size: 11px;
+}
+
+.content-autofix-unresolved {
+  margin-top: var(--space-md);
+  padding: var(--space-md);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-md);
+  background: hsla(35, 90%, 55%, 0.08);
+}
+
+.content-autofix-unresolved__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  color: var(--warning);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.content-autofix-unresolved__row {
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.content-version-group {
+  margin-top: var(--space-md);
+}
+
+.content-version-group__title {
+  margin-bottom: 4px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.content-version-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-md);
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-bottom-color: var(--surface-border);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 150ms ease-out, border-color 150ms ease-out;
+}
+
+.content-version-row:hover {
+  background: var(--surface-active);
+}
+
+.content-version-row--current {
+  border-color: var(--primary);
+  background: var(--primary-dim);
+}
+
+.content-version-row__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.content-version-row__name {
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+}
+
+.content-version-row__meta,
+.content-version-row__id {
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.content-version-row__id {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.content-version-row__badges {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.content-version-channel,
+.content-version-required,
+.content-version-conflict,
+.content-version-current {
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 17px;
+  white-space: nowrap;
+}
+
+.content-version-channel {
+  border: 1px solid var(--surface-border);
+  color: var(--text-secondary);
+}
+
+.content-version-channel--beta,
+.content-version-channel--alpha {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.content-version-required {
+  border: 1px solid var(--warning);
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.content-version-conflict {
+  border: 1px solid var(--danger-border);
+  color: var(--color-danger);
+  font-weight: 600;
+}
+
+.content-version-row__note {
+  margin-top: 2px;
+  color: var(--warning);
+  font-size: 11px;
+}
+
+.content-version-current {
+  border: 1px solid var(--primary);
+  color: var(--primary);
+}
+
+.content-version-error {
+  padding: var(--space-md);
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
 }
 
 /* ============================
@@ -3869,6 +4349,31 @@ input[type="range"]:active::-moz-range-thumb {
   top: 0;
   align-self: flex-start;
   max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Narrow catalog: the fixed 340px detail column would collide with the
+   results list. Stack it under the list and let the overlay page scroll. */
+@media (max-width: 900px) {
+  .modpacks-overlay__body > .page {
+    height: auto;
+    min-height: 100%;
+    overflow: visible;
+  }
+  .modpacks-overlay__body .modpacks-main {
+    flex-direction: column;
+    height: auto !important;
+    min-height: 0;
+  }
+  .modpacks-results {
+    max-height: 60vh;
+  }
+  .modpack-detail-panel {
+    position: static;
+    width: 100% !important;
+    max-height: none;
+  }
 }
 
 /* Bottom card with the mod selection count (add-mods browser): quiet elevated panel. */
@@ -3897,6 +4402,70 @@ input[type="range"]:active::-moz-range-thumb {
 .account-card:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
+}
+
+/* Per-account actions: compact hit targets with a soft glow on hover. The
+   wider default .btn--sm padding made a row of icon buttons look like
+   scattered pills and left the card's hover tint as the only feedback. */
+.account-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.account-card__actions .btn {
+  min-width: 28px;
+  height: 28px;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+}
+.account-card__actions .btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  /* Soft light filling the whole button instead of a hard inset outline. */
+  box-shadow:
+    inset 0 0 10px rgba(255, 255, 255, 0.18),
+    0 0 6px rgba(255, 255, 255, 0.10);
+}
+.account-card__actions .btn--danger {
+  color: var(--color-danger);
+}
+.account-card__actions .btn--danger:hover:not(:disabled) {
+  /* Keep destructive actions red-tinted; the icon colour still carries the
+     warning. No border — only a soft glow in the same shape. */
+  background: var(--danger-bg);
+  box-shadow:
+    inset 0 0 10px var(--danger-bg),
+    0 0 7px var(--danger-bg);
+}
+
+/* Small icon-only row actions (worlds/servers tables). The destructive one
+   uses the shared danger colour and a matching hover tint. */
+.icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.icon-action:hover:not(:disabled) {
+  background: var(--surface-glass-hover);
+  color: var(--text-primary);
+}
+.icon-action--danger {
+  color: var(--color-danger);
+}
+.icon-action--danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  color: var(--error);
+}
+.icon-action:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* Account rows are outline-only: the dark plate backing plus the hover
@@ -3975,7 +4544,10 @@ input[type="range"]:active::-moz-range-thumb {
   display: flex;
   flex-direction: column;
   gap: var(--space-md);
-  padding-right: 2px;
+  /* Room for the first/last card's -1px hover lift and 2px focus outline;
+     the list itself is the scroll container, so without this padding the
+     top edge clips the hovered card. */
+  padding: 6px 4px 8px;
 }
 
 /* Accounts page: cape picker tiles. The thumbnail shows the FRONT face of
@@ -4457,7 +5029,10 @@ input[type="range"]:active::-moz-range-thumb {
 
   --text-primary: hsl(220, 25%, 96%);
   --text-secondary: hsl(220, 14%, 68%);
-  --text-tertiary: hsl(220, 12%, 48%);
+  /* 48% measured 3.66:1 on the LG substrate — below WCAG AA for the small
+     captions this token is used for. 58% keeps the visual hierarchy while
+     clearing 4.5:1 on both the base and elevated surfaces. */
+  --text-tertiary: hsl(220, 12%, 58%);
   --text-disabled: hsl(220, 10%, 32%);
 
   /* Legacy surface tokens kept working as aliases onto the material
@@ -4632,7 +5207,7 @@ input[type="range"]:active::-moz-range-thumb {
       .selection-bar, .game-logs-picker-panel, .floating-menu, .floating-menu .btn--ghost,
       .game-logs-picker-trigger,
       .glass-card, .empty-state, .instance-list, .tabs__indicator,
-      .install-overlay__sheet, .content-detail-panel,
+      .install-overlay__sheet, .content-detail-panel, .content-conflict-report,
       .settings-section, .log-container,
       .content-manager__pane, .content-manager__pane .btn--ghost, .content-actions .btn--ghost,
       .btn--secondary, .btn--danger, .segmented, .input, .search-bar,
@@ -4671,7 +5246,7 @@ input[type="range"]:active::-moz-range-thumb {
       .selection-bar, .game-logs-picker-panel, .floating-menu, .floating-menu .btn--ghost,
       .game-logs-picker-trigger,
       .glass-card, .empty-state, .instance-list, .tabs__indicator,
-      .install-overlay__sheet, .content-detail-panel,
+      .install-overlay__sheet, .content-detail-panel, .content-conflict-report,
       .settings-section, .log-container,
       .content-manager__pane, .content-manager__pane .btn--ghost, .content-actions .btn--ghost,
       .btn--secondary, .btn--danger, .segmented, .input, .search-bar,
@@ -4868,6 +5443,24 @@ input[type="range"]:active::-moz-range-thumb {
     /* Tint, not --bg-tertiary: an opaque hover drops the card out of the
        material for exactly as long as the pointer is over it. */
     background: var(--surface-glass-hover);
+  }
+
+  /* The shared Liquid Glass material rule above paints every modpack card
+     with the neutral fill and divider edge, which used to swallow the
+     primary border and tint of the selected card. Restore the same selection
+     reading the normal themes have, but keep the glass fill underneath: a
+     primary-tinted sheet plus the same 3px ring used by selected glass cards. */
+  [data-theme='lg'] .modpack-card--selected,
+  [data-theme='lg'] .modpack-card--selected:hover {
+    background:
+      linear-gradient(var(--primary-dim), var(--primary-dim)),
+      var(--lg-fill);
+    border-color: var(--primary);
+    box-shadow:
+      var(--lg-rim-ring),
+      var(--lg-inner-depth),
+      var(--lg-depth-shadow),
+      0 0 0 3px var(--primary-dim);
   }
 
   [data-theme='lg'] .experimental-block {
@@ -5381,6 +5974,12 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
    values the inline styles used to set. */
 .content-list-row--table {
   background: transparent;
+  /* A manager row is 36px of content box + 1px separator; its 4px vertical
+     padding and border sit outside `contain-intrinsic-size`. The old generic
+     40px estimate made every skipped row 49px tall, so revealing one re-laid
+     out the whole list and the scrollbar jumped while scrolling. 28px is the
+     exact content-box height: skipped and rendered rows both occupy 37px. */
+  contain-intrinsic-size: auto 28px;
 }
 
 .content-list-row--alt {
@@ -5699,6 +6298,44 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
   box-shadow: var(--lg-rim-ring), inset 0 0 0 1px hsla(35, 90%, 55%, 0.24);
 }
 
+/* Blocking conflict report: the flat danger film in normal themes becomes a
+   red-tinted glass sheet under Liquid Glass. The tint stays translucent so
+   the wallpaper is still part of the material; the red border, title and
+   counter keep the conflict semantics, and the local text tokens stay light
+   enough to read over bright parts of the animated backdrop. */
+[data-theme='lg'] .content-conflict-report {
+  --text-secondary: hsl(220, 18%, 84%);
+  --text-tertiary: hsl(220, 16%, 70%);
+  background:
+    linear-gradient(180deg, hsla(352, 76%, 44%, 0.20), hsla(352, 76%, 30%, 0.10)),
+    var(--lg-fill);
+  border-color: hsla(352, 82%, 64%, 0.38);
+  box-shadow:
+    var(--lg-rim-ring),
+    inset 0 0 0 1px hsla(352, 82%, 70%, 0.06),
+    0 10px 24px -18px rgb(4, 6, 12, 0.55);
+  backdrop-filter: blur(14px) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(14px) saturate(var(--lg-sat));
+}
+
+[data-theme='lg'] .content-conflict-report__title {
+  color: hsl(352, 90%, 74%);
+}
+
+[data-theme='lg'] .content-conflict-count {
+  color: hsl(352, 90%, 78%);
+  border-color: hsla(352, 82%, 66%, 0.46);
+  background: hsla(352, 78%, 42%, 0.16);
+}
+
+[data-theme='lg'] .content-conflict-entry {
+  border-top-color: hsla(352, 72%, 64%, 0.22);
+}
+
+[data-theme='lg'] .content-conflict-auto-note {
+  color: hsl(220, 18%, 82%);
+}
+
 /* The installing plaque above the list (it used to be a pure inline style):
    normal themes keep the exact flat film it always had; on Liquid Glass it
    gets the same material as the rows it reports on (owner wave 26: «плашка
@@ -5907,4 +6544,442 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
 .loader-version-item__badge--current {
   color: var(--primary);
   font-weight: 600;
+}
+
+/* ============================
+   Mod list export dialog
+   ============================ */
+.mod-export {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mod-export__label {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+.mod-export__format-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.mod-export__extension-field {
+  flex: 1;
+  min-width: 220px;
+}
+
+.mod-export__section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mod-export__section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mod-export__section-head .mod-export__label {
+  margin-bottom: 0;
+}
+
+.mod-export__format-field {
+  width: 200px;
+  max-width: 100%;
+}
+
+.mod-export__format {
+  width: 100%;
+}
+
+.mod-export__options-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+.mod-export__column {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.mod-export__checks {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-top: 1px;
+}
+
+.mod-export__check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  user-select: none;
+}
+
+.mod-export__check:hover {
+  color: var(--text-primary);
+}
+
+.mod-export__check input[type='checkbox'] {
+  appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  border: 1.5px solid var(--surface-border);
+  border-radius: 4px;
+  background: var(--surface-glass);
+  cursor: pointer;
+  transition: background-color 150ms ease-out, border-color 150ms ease-out;
+}
+
+.mod-export__check input[type='checkbox']:checked {
+  border-color: var(--primary);
+  background: var(--primary);
+}
+
+.mod-export__check input[type='checkbox']:checked::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid #ffffff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+
+.mod-export__check input[type='checkbox']:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.mod-export__vars {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.mod-export__var {
+  padding: 3px 9px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  background: var(--surface-glass);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: background-color 160ms ease-out, color 160ms ease-out,
+    border-color 160ms ease-out;
+}
+
+.mod-export__var:hover {
+  background: var(--surface-glass-hover);
+  border-color: var(--primary);
+  color: var(--text-primary);
+}
+
+.mod-export__template {
+  width: 100%;
+  height: 100px;
+  min-height: 90px;
+  padding: 8px 10px;
+  resize: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.mod-export__ext-compact {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mod-export__ext {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: 84px;
+}
+
+.mod-export__ext > span {
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
+.mod-export__ext .input {
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+.mod-export__ext-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.mod-export__ext-preset {
+  padding: 3px 8px;
+  border: 1px solid var(--surface-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background-color 160ms ease-out, color 160ms ease-out,
+    border-color 160ms ease-out;
+}
+
+.mod-export__ext-preset:hover {
+  background: var(--surface-glass-hover);
+  color: var(--text-primary);
+}
+
+.mod-export__ext-preset--active {
+  border-color: var(--primary);
+  background: var(--primary-dim);
+  color: var(--text-primary);
+}
+
+.mod-export__extension-badge {
+  margin-left: 6px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  font-weight: 400;
+}
+
+.mod-export__preview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.mod-export__preview--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.mod-export__pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.mod-export__source {
+  width: 100%;
+  height: min(21vh, 170px);
+  min-height: 145px;
+  padding: 8px 10px;
+  resize: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  tab-size: 2;
+}
+
+/* The source preview and the custom-template editor are the only elements in
+   the launcher that can scroll both ways. The scrollbar corner kept the
+   browser default white square there; fixing it locally avoids changing
+   scrollbars used by every other page. This is the corner of the scrollbar,
+   not a textarea resize grip: resize is already none. */
+.mod-export__source::-webkit-scrollbar-corner,
+.mod-export__template::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.mod-export__frame {
+  width: 100%;
+  height: min(21vh, 170px);
+  min-height: 145px;
+  border: 1px solid var(--surface-border);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+}
+
+.mod-export__hint {
+  color: var(--text-tertiary);
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
+}
+
+.mod-export__hint--error {
+  color: var(--color-danger);
+}
+
+.mod-export__error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-danger);
+  border-radius: var(--radius-md);
+  background: var(--danger-dim, rgba(244, 67, 54, 0.12));
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
+}
+
+.mod-export__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 18px;
+  border: 1px dashed var(--surface-border);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.mod-export__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  width: 100%;
+}
+
+.mod-export__footer-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-left: auto;
+}
+
+.mod-export__footer .btn {
+  flex-shrink: 0;
+}
+
+@media (max-width: 620px) {
+  .mod-export__format-row {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .mod-export__options-row {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-export__preview {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-export__footer {
+    flex-wrap: wrap;
+  }
+}
+
+/* Compact export sheet: Prism-like footprint without stretching to the whole
+   window. The dialog keeps its content height when shorter and scrolls inside
+   `.modal__scroll` on small windows. */
+.modal:has(.mod-export) {
+  width: min(90vw, 660px);
+  max-height: min(550px, calc(100vh - 48px));
+}
+
+.modal:has(.mod-export) .modal__header {
+  padding: 12px 16px 8px;
+}
+
+.modal:has(.mod-export) .modal__body {
+  padding: 10px 16px;
+}
+
+.modal:has(.mod-export) .modal__footer {
+  padding: 8px 16px;
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  background: var(--bg-secondary);
+}
+
+.modal:has(.mod-export) .modal__title {
+  font-size: var(--font-size-lg);
+}
+
+[data-theme='lg'] .modal:has(.mod-export) .modal__footer {
+  background: var(--lg-fill);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-sat));
+}
+
+/* ============================
+   Reduced interface effects
+   ============================ */
+
+/* The switch is intentionally limited to the normal themes' optional chrome:
+   Liquid Glass keeps its own blur, transparency, depth and wallpaper because
+   those are part of the selected appearance, not an optimization toggle. */
+html[data-reduce-effects='on']:not([data-theme='lg']) {
+  --glow-primary: 0 0 0 rgba(0, 0, 0, 0);
+  --glow-primary-intense: 0 0 0 rgba(0, 0, 0, 0);
+  --glow-secondary: 0 0 0 rgba(0, 0, 0, 0);
+  --glow-accent: 0 0 0 rgba(0, 0, 0, 0);
+  --shadow-lg: 0 2px 6px rgba(0, 0, 0, 0.35);
+  --shadow-xl: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --slider-shadow: none;
+  --slider-shadow-hover: none;
+}
+
+/* State feedback stays, but it changes instantly. Hover/active/focus visuals
+   are not removed; only the time spent animating them. */
+html[data-reduce-effects='on'] *,
+html[data-reduce-effects='on'] *::before,
+html[data-reduce-effects='on'] *::after {
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+}
+
+/* Decorative, non-functional animation only. Loading spinners, the snake
+   spinner, progress bars and install status indicators stay untouched. */
+html[data-reduce-effects='on'] :is(
+  .animate-slide-up,
+  .animate-pulse,
+  .animate-glow,
+  .animate-content-reveal,
+  .modal-overlay,
+  .settings-page--active,
+  .toast,
+  .skeleton,
+  .ctx-menu,
+  .custom-select__list,
+  .game-logs-picker-panel,
+  .install-overlay,
+  .game-logs-picker-dot--live,
+  .btn--loading > svg:not(.icon-spin)
+) {
+  animation: none !important;
+}
+
+html[data-reduce-effects='on'] .icon-shine::after,
+html[data-reduce-effects='on'] .progress-fill::after {
+  animation: none !important;
+}
+
+html[data-reduce-effects='on'] .ping-bars--checking .ping-bars__bar {
+  animation: none !important;
+  background-color: var(--primary);
+  opacity: 0.6;
 }

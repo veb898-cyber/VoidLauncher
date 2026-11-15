@@ -33,6 +33,12 @@ export interface VerifyCategory {
   checked: number;
   issue_count: number;
   issues: VerifyIssue[];
+  /** Files proven against a trusted checksum in this scan. */
+  verified: number;
+  /** Files that exist but have no trusted checksum to prove them. */
+  unverified: number;
+  /** `verified` is a local sidecar fingerprint, not external provenance. */
+  fingerprint_only?: boolean;
 }
 
 export interface VerifyReport {
@@ -40,6 +46,7 @@ export interface VerifyReport {
   repairable_count: number;
   content_issues: number;
   healthy: boolean;
+  mode: 'quick' | 'deep';
 }
 
 export interface DiagReport {
@@ -50,16 +57,27 @@ export interface DiagReport {
   verify: VerifyReport | null;
 }
 
+export interface CrashAction {
+  kind: 'disable_mod' | 'open_url' | 'repair_files' | string;
+  arg: string;
+  tone: 'danger' | 'secondary' | string;
+}
+
 export interface CrashAnalysis {
   verdict: 'likely' | 'possible' | 'unknown';
   kind: string;
   culprit: string | null;
+  culprit_file?: string | null;
+  culprit_candidates?: string[];
   detail: string;
+  root_cause?: string | null;
+  exit_code?: number | null;
+  actions?: CrashAction[];
   /**
    * Where the verdict came from. `'clean'` = the analyzed run exited with
    * code 0 and left no crash artifacts — NOT a crash at all.
    */
-  source: 'crash-report' | 'session-log' | 'latest-log' | 'clean' | 'none';
+  source: 'crash-report' | 'session-log' | 'latest-log' | 'hs-error' | 'clean' | 'none';
   report_path: string | null;
 }
 
@@ -114,7 +132,21 @@ export const CRASH_KEYS: Record<string, { message: MessageKey; hint?: MessageKey
   missing_class: { message: 'diag.crash_missing_class', hint: 'diag.crash_hint_mod' },
   mod_conflict: { message: 'diag.crash_mod_conflict', hint: 'diag.crash_hint_conflict' },
   graphics: { message: 'diag.crash_graphics', hint: 'diag.crash_hint_graphics' },
+  system_memory: { message: 'diag.crash_system_memory', hint: 'diag.crash_hint_system_memory' },
+  native_crash: { message: 'diag.crash_native', hint: 'diag.crash_hint_native' },
+  graphics_driver: { message: 'diag.crash_graphics_driver', hint: 'diag.crash_hint_graphics_driver' },
+  wrong_loader: { message: 'diag.crash_wrong_loader', hint: 'diag.crash_hint_wrong_loader' },
+  wrong_game: { message: 'diag.crash_wrong_game', hint: 'diag.crash_hint_wrong_game' },
+  duplicate_mod: { message: 'diag.crash_duplicate_mod', hint: 'diag.crash_hint_duplicate_mod' },
+  mod_version_mismatch: { message: 'diag.crash_mod_version', hint: 'diag.crash_hint_mod_version' },
   unknown: { message: 'diag.crash_unknown', hint: 'diag.crash_hint_unknown' },
+};
+
+/** Crash action → button label and optional hint. */
+export const CRASH_ACTION_KEYS: Record<string, { label: MessageKey; hint?: MessageKey }> = {
+  disable_mod: { label: 'game_logs.action_disable_mod', hint: 'game_logs.action_disable_mod_hint' },
+  open_url: { label: 'game_logs.action_driver', hint: 'game_logs.action_driver_hint' },
+  repair_files: { label: 'game_logs.action_repair', hint: 'game_logs.action_repair_hint' },
 };
 
 /** Verdict → label. */

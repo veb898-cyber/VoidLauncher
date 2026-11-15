@@ -40,7 +40,7 @@ pub struct RoomStatusPublic {
 
 /// The host the room UI should display. Guests use the peer discovered over
 /// the tailnet; the HOST machine has no peer to discover, so it presents its
-/// own node — this is what lets the host UI show port-found/endpoint state
+/// own node вЂ” this is what lets the host UI show port-found/endpoint state
 /// without ever having resolved a guest-side peer.
 fn display_host_for(room: &RoomStateRow, status: Option<&TailscaleStatus>) -> Option<HostInfo> {
     room.host.clone().or_else(|| {
@@ -52,13 +52,16 @@ fn display_host_for(room: &RoomStateRow, status: Option<&TailscaleStatus>) -> Op
     })
 }
 
-/// Pure status snapshot. Callers are responsible for keeping the bridge
-/// alive (`cmd_room_status`, `cmd_room_create_host`).
-pub fn build_status(state: &State<'_, AppState>) -> RoomStatusPublic {
+/// Snapshot from an already-fetched Tailscale status. Async commands fetch the
+/// status in `spawn_blocking` and call this, so no blocking process runs on the
+/// async runtime.
+fn build_status_with(
+    state: &State<'_, AppState>,
+    installed: bool,
+    status: Option<&TailscaleStatus>,
+) -> RoomStatusPublic {
     let room = state.room_state.snapshot();
-    let ts = tailscale_manager_for(state);
-    let status = ts.status().ok();
-    let tailscale = if !ts.is_installed() {
+    let tailscale = if !installed {
         TailscaleStatusPublic {
             installed: false,
             service_ok: false,
@@ -70,9 +73,9 @@ pub fn build_status(state: &State<'_, AppState>) -> RoomStatusPublic {
             auth_url: None,
         }
     } else {
-        crate::rooms::tailscale::public_status(true, status.as_ref())
+        crate::rooms::tailscale::public_status(true, status)
     };
-    let host = display_host_for(&room, status.as_ref());
+    let host = display_host_for(&room, status);
     let host_online = host.as_ref().map(|h| h.online).unwrap_or(false);
     let endpoint = match (&host, room.minecraft_port) {
         (Some(h), Some(port)) => {
@@ -106,6 +109,17 @@ pub fn build_status(state: &State<'_, AppState>) -> RoomStatusPublic {
     }
 }
 
+/// Fetch Tailscale status off the async runtime, then build the snapshot.
+async fn build_status_async(state: &State<'_, AppState>) -> RoomStatusPublic {
+    let ts = tailscale_manager_for(state);
+    let installed = ts.is_installed();
+    let status = tauri::async_runtime::spawn_blocking(move || ts.status().ok())
+        .await
+        .ok()
+        .flatten();
+    build_status_with(state, installed, status.as_ref())
+}
+
 fn tailscale_manager_for(state: &State<'_, AppState>) -> TailscaleManager {
     TailscaleManager::new(data_dir_of(state))
 }
@@ -117,13 +131,17 @@ pub async fn cmd_room_status(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RoomStatusPublic, String> {
-    let bridge_ip = if state.room_state.role() == RoomRole::Host && state.tailscale.is_installed() {
-        state
-            .tailscale
-            .status()
-            .ok()
-            .filter(TailscaleManager::is_logged_in)
-            .and_then(|status| TailscaleManager::self_ip(&status))
+    let ts = tailscale_manager_for(&state);
+    let installed = ts.is_installed();
+    let status = tauri::async_runtime::spawn_blocking(move || ts.status().ok())
+        .await
+        .ok()
+        .flatten();
+    let bridge_ip = if state.room_state.role() == RoomRole::Host && installed {
+        status
+            .as_ref()
+            .filter(|s| TailscaleManager::is_logged_in(s))
+            .and_then(TailscaleManager::self_ip)
     } else {
         None
     };
@@ -135,13 +153,13 @@ pub async fn cmd_room_status(
     // the setup screen is open, so diagnostics here flooded the log with the
     // same warning. The explicit "check connection" action below logs once.
     let _ = app;
-    Ok(build_status(&state))
+    Ok(build_status_with(&state, installed, status.as_ref()))
 }
 
 /// Best-effort diagnostics dumped to the launcher log / Terminal page while
-/// the Tailscale setup is not ready. Never logs keys or tokens — only the
+/// the Tailscale setup is not ready. Never logs keys or tokens вЂ” only the
 /// CLI path and parsed status fields, which are safe.
-fn log_tailscale_diagnostics(app: &AppHandle, state: &State<'_, AppState>) {
+fn log_tailscale_diagnostics(app: &AppHandle) {
     match crate::rooms::tailscale::tailscale_exe_path() {
         Some(path) => events::emit_log(
             app,
@@ -156,8 +174,16 @@ fn log_tailscale_diagnostics(app: &AppHandle, state: &State<'_, AppState>) {
             "Tailscale CLI not found under Program Files",
         ),
     }
-    match state.tailscale.status() {
-        Ok(status) => events::emit_log(
+}
+
+async fn log_tailscale_status_diagnostics(app: &AppHandle, state: &State<'_, AppState>) {
+    let ts = state.tailscale.clone();
+    let status = tauri::async_runtime::spawn_blocking(move || ts.status())
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+    match status {
+        Some(status) => events::emit_log(
             app,
             "info",
             "rooms",
@@ -173,20 +199,20 @@ fn log_tailscale_diagnostics(app: &AppHandle, state: &State<'_, AppState>) {
                     .and_then(|u| u.login_name.clone()),
             ),
         ),
-        Err(e) => events::emit_log(
+        None => events::emit_log(
             app,
             "warn",
             "rooms",
-            &format!("tailscale status --json failed: {}", e),
+            "tailscale status --json failed or timed out",
         ),
     }
 }
 
 /// Make sure Tailscale is installed and the node is logged in.
 ///
-/// * Not installed → spawns the download+install task (this call returns
+/// * Not installed в†’ spawns the download+install task (this call returns
 ///   immediately; progress arrives via `room_progress` events).
-/// * Installed but not logged in → runs `tailscale up`; `auth_url` in the
+/// * Installed but not logged in в†’ runs `tailscale up`; `auth_url` in the
 ///   status is the link the UI opens for browser approval.
 #[tauri::command]
 pub async fn cmd_room_check_link(
@@ -194,12 +220,19 @@ pub async fn cmd_room_check_link(
     state: State<'_, AppState>,
 ) -> Result<RoomStatusPublic, String> {
     // Diagnostics belong to the explicit user action, not to the status poll.
-    log_tailscale_diagnostics(&app, &state);
+    // The status call is bounded but still a blocking process: keep it off
+    // the async runtime.
+    log_tailscale_diagnostics(&app);
+    log_tailscale_status_diagnostics(&app, &state).await;
     if !state.tailscale.is_installed() {
         let ts = tailscale_manager_for(&state);
         let room = state.room_state.clone();
         tokio::spawn(async move {
-            events::emit_room_progress("install", 0.02, "Tailscale is not installed. Installing…");
+            events::emit_room_progress(
+                "install",
+                0.02,
+                "Tailscale is not installed. InstallingвЂ¦",
+            );
             let result = ts
                 .install_msi(|frac, label| {
                     events::emit_room_progress("install", frac, label);
@@ -214,16 +247,23 @@ pub async fn cmd_room_check_link(
                 Err(e) => {
                     let msg = format!("Install failed: {}", e);
                     // Launcher log file + Terminal page, and a global toast
-                    // in the UI (see useRoomEvents → `room_error`).
+                    // in the UI (see useRoomEvents в†’ `room_error`).
                     events::emit_log(&app, "error", "rooms", &msg);
                     events::emit_room_error(&msg);
                 }
             }
         });
-        return Ok(build_status(&state));
+        return Ok(build_status_async(&state).await);
     }
 
-    if let Ok(status) = state.tailscale.status() {
+    let status = {
+        let ts = state.tailscale.clone();
+        tauri::async_runtime::spawn_blocking(move || ts.status())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    };
+    if let Some(status) = status {
         if !TailscaleManager::is_logged_in(&status) {
             events::emit_room_progress("login", 0.0, "Please approve this device in the browser.");
             state
@@ -234,7 +274,7 @@ pub async fn cmd_room_check_link(
             events::emit_room_progress("login", 1.0, "Logged in");
         }
     }
-    Ok(build_status(&state))
+    Ok(build_status_async(&state).await)
 }
 
 /// Create a room as host: stamp the room id, advertise the hostname hint,
@@ -247,15 +287,16 @@ pub async fn cmd_room_create_host(
     if !state.tailscale.is_installed() {
         return Err("Tailscale is not installed. Click 'Check connection' first.".into());
     }
-    let status = state
-        .tailscale
-        .status()
+    let ts = tailscale_manager_for(&state);
+    let status = tauri::async_runtime::spawn_blocking(move || ts.status())
+        .await
+        .map_err(|e| e.to_string())?
         .map_err(|e| format!("Failed to read Tailscale status: {}", e))?;
     if !TailscaleManager::is_logged_in(&status) {
         return Err("You must log in to Tailscale before creating a room.".into());
     }
     let self_ip = TailscaleManager::self_ip(&status)
-        .ok_or_else(|| "No tailnet IP — is the Tailscale connection healthy?".to_string())?;
+        .ok_or_else(|| "No tailnet IP вЂ” is the Tailscale connection healthy?".to_string())?;
 
     // Capture the machine's real name BEFORE the room hint renames it, so a
     // later `leave` can put it back (temporary discovery rename side effect).
@@ -281,16 +322,16 @@ pub async fn cmd_room_create_host(
         // The bridge failed to bind (e.g. port 48888 already in use): roll
         // the half-created room back so the launcher is not left in a Host
         // state that has no working bridge. The error is reported to the UI.
-        let _ = leave_room_and_restore(&state);
+        let _ = leave_room_and_restore(&state).await;
         return Err(e.to_string());
     }
 
     events::emit_room_progress(
         "ready",
         1.0,
-        "Room is ready — share the code with the guest.",
+        "Room is ready вЂ” share the code with the guest.",
     );
-    Ok(build_status(&state))
+    Ok(build_status_async(&state).await)
 }
 
 /// Join a room as guest: record the code and start the discovery loop that
@@ -324,8 +365,8 @@ pub async fn cmd_room_join_guest(
     let data_dir = data_dir_of(&state);
     spawn_discovery_loop(app, room, data_dir);
 
-    events::emit_room_progress("discovering", 0.0, "Looking for the host on the tailnet…");
-    Ok(build_status(&state))
+    events::emit_room_progress("discovering", 0.0, "Looking for the host on the tailnetвЂ¦");
+    Ok(build_status_async(&state).await)
 }
 
 /// Leave the current room. The Tailscale Machine Sharing grant itself stays
@@ -333,25 +374,29 @@ pub async fn cmd_room_join_guest(
 /// hint is restored and the VoidLink bridge is torn down.
 #[tauri::command]
 pub async fn cmd_room_leave(state: State<'_, AppState>) -> Result<RoomStatusPublic, String> {
-    leave_room_and_restore(&state)?;
-    Ok(build_status(&state))
+    leave_room_and_restore(&state).await?;
+    Ok(build_status_async(&state).await)
 }
 
 /// Tear the room down: restore the machine's original hostname (if a room
 /// hint renamed it), stop the host-side VoidLink bridge, then clear the room
 /// state. Shared by `cmd_room_leave` and the create-host rollback.
-fn leave_room_and_restore(state: &State<'_, AppState>) -> Result<(), String> {
+async fn leave_room_and_restore(state: &State<'_, AppState>) -> Result<(), String> {
     if let Some(name) = state.room_state.previous_hostname() {
         if let Err(e) = state.tailscale.set_hostname(&name) {
             tracing::warn!(target: "rooms", "Hostname restore failed: {}", e);
         }
     }
-    crate::rooms::void_link::stop_void_link_server();
-    state
+    // Clear the room role before stopping the bridge. A status poll that was
+    // already in flight must see role=None when it reaches `ensure` and must
+    // not recreate the bridge after the leave.
+    let leave = state
         .room_state
         .leave()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+    crate::rooms::void_link::stop_void_link_server().await;
+    leave
 }
 
 /// Single discovery pass (guest): resolve the host, then read its advertised
@@ -359,10 +404,10 @@ fn leave_room_and_restore(state: &State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn cmd_room_refresh(state: State<'_, AppState>) -> Result<RoomStatusPublic, String> {
     if state.room_state.role() != RoomRole::Guest {
-        return Ok(build_status(&state));
+        return Ok(build_status_async(&state).await);
     }
     run_discovery_pass(&state.room_state, &data_dir_of(&state)).await;
-    Ok(build_status(&state))
+    Ok(build_status_async(&state).await)
 }
 
 /// Host side: advertise the current Minecraft LAN port (or clear it with
@@ -396,7 +441,7 @@ pub async fn cmd_room_detect_minecraft_port(
 }
 
 /// Build extra arguments to auto-join a host (`None` when the MC version
-/// cannot be auto-jointed — use Direct Connect instead).
+/// cannot be auto-jointed вЂ” use Direct Connect instead).
 #[tauri::command]
 pub fn cmd_room_join_args(
     mc_version: String,
@@ -415,7 +460,7 @@ pub fn cmd_room_join_args(
 /// the client writes a JSON log at the `--quickPlayPath` the launcher passed
 /// it; this reads the current session's copy and reports the joined world.
 /// `None` means no confirmation yet (game still loading, or the version has
-/// no Quick Play join log — e.g. legacy `--server/--port` up to 1.19.4).
+/// no Quick Play join log вЂ” e.g. legacy `--server/--port` up to 1.19.4).
 #[tauri::command]
 pub async fn cmd_room_quick_play_join_status(
 ) -> Result<Option<crate::rooms::minecraft_connector::QuickJoinInfo>, String> {
@@ -467,7 +512,7 @@ fn spawn_discovery_loop(app: AppHandle, room: Arc<RoomStateManager>, data_dir: s
 /// One discovery pass (guest): resolve the host from the current tailnet
 /// peers, read its advertised Minecraft port over VoidLink, persist both, and
 /// return the resulting key tuple for emit-on-change deduplication. A flaky
-/// tailnet or a briefly-unreachable host just yields an absent snapshot —
+/// tailnet or a briefly-unreachable host just yields an absent snapshot вЂ”
 /// never an error the caller must handle.
 async fn run_discovery_pass(
     room: &Arc<RoomStateManager>,
@@ -476,8 +521,9 @@ async fn run_discovery_pass(
     let snapshot = room.snapshot();
     let code = snapshot.room_id.clone().unwrap_or_default();
     let ts = TailscaleManager::new(data_dir.to_path_buf());
-    let Ok(status) = ts.status() else {
-        return (None, false, None);
+    let status = match tokio::task::spawn_blocking(move || ts.status()).await {
+        Ok(Ok(status)) => status,
+        _ => return (None, false, None),
     };
     let peers = crate::rooms::peer_discovery::peers_from_status(&status);
     let Some(host) = resolve_host_for_room(&peers, snapshot.room_id.as_deref()) else {
@@ -518,7 +564,14 @@ async fn auto_login_and_open(app: &AppHandle, ts: &TailscaleManager) {
             login_kicks += 1;
             let _ = ts.login();
         }
-        if let Ok(status) = ts.status() {
+        let status = {
+            let ts = ts.clone();
+            match tokio::task::spawn_blocking(move || ts.status()).await {
+                Ok(Ok(status)) => Some(status),
+                _ => None,
+            }
+        };
+        if let Some(status) = status {
             if TailscaleManager::is_logged_in(&status) {
                 events::emit_room_progress("login", 1.0, "Logged in");
                 return;
@@ -532,7 +585,7 @@ async fn auto_login_and_open(app: &AppHandle, ts: &TailscaleManager) {
                             app,
                             "warn",
                             "rooms",
-                            "Could not open the Tailscale login URL automatically — use the Open login button.",
+                            "Could not open the Tailscale login URL automatically вЂ” use the Open login button.",
                         );
                     }
                     return;
@@ -545,7 +598,7 @@ async fn auto_login_and_open(app: &AppHandle, ts: &TailscaleManager) {
                 app,
                 "warn",
                 "rooms",
-                "Tailscale login URL has not appeared yet — click 'Check connection' again.",
+                "Tailscale login URL has not appeared yet вЂ” click 'Check connection' again.",
             );
             return;
         }

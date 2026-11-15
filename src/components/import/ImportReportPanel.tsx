@@ -1,5 +1,6 @@
-import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { AlertTriangle } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { RefreshIcon } from '../ui/RefreshIcon';
 import { useT } from '../../lib/i18n';
 import type { ImportReport } from '../../lib/importReport';
 
@@ -86,7 +87,7 @@ export function ImportReportPanel({ report, instanceName, retrying = false, onRe
               loading={retrying}
               disabled={retrying}
             >
-              <RefreshCw size={14} className={retrying ? 'icon-spin' : undefined} style={{ marginRight: 6 }} />
+              <RefreshIcon spinning={retrying} />
               {t('import_report.retry', { n: String(retryable.length) })}
             </Button>
           )}

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Coffee, Globe, Info, Palette, RefreshCw, ScanSearch, SlidersHorizontal } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { Coffee, Globe, Info, Palette, ScanSearch, SlidersHorizontal } from 'lucide-react';
 import { useSettingsStore, type AppConfig } from '../stores/settingsStore';
 import { useBrowserGuardStore } from '../stores/browserGuardStore';
 import { useLanguageStore } from '../stores/languageStore';
 import { useFontStore } from '../stores/fontStore';
 import { Button } from '../components/ui/Button';
+import { RefreshIcon } from '../components/ui/RefreshIcon';
 import { SlidingTabs, type SlidingTabDef } from '../components/ui/SlidingTabs';
 import { addToast } from '../components/ui/Toast';
 import { useT } from '../lib/i18n';
@@ -40,10 +42,30 @@ export function Settings() {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [category, setCategory] = useState<SettingsCategory>('java');
   const pageRef = useRef<HTMLDivElement>(null);
+  // Network toggles apply immediately (so downloads react before Save), which
+  // means leaving the page with unsaved edits must restore the persisted
+  // policy; otherwise the runtime keeps a proxy the user just discarded.
+  const persistedConfigRef = useRef(config);
+  persistedConfigRef.current = config;
 
   useEffect(() => {
     loadConfig();
   }, [loadConfig]);
+
+  useEffect(() => () => {
+    const persisted = persistedConfigRef.current;
+    if (!persisted) return;
+    void invoke('cmd_apply_proxy_policy', {
+      proxyEnabled: persisted.proxy_enabled,
+      useSystemProxy: persisted.use_system_proxy,
+      proxyAddr: persisted.proxy_addr,
+      proxyPort: persisted.proxy_port,
+      proxyOnly: persisted.proxy_only,
+    }).catch(() => {
+      // Closing Settings must never surface an IPC error; the next launch
+      // re-applies the persisted policy anyway.
+    });
+  }, []);
 
   useEffect(() => {
     setLocalConfig(config);
@@ -98,7 +120,7 @@ export function Settings() {
               {t('settings.load_error_desc', { error: loadError })}
             </div>
             <Button variant="secondary" onClick={() => loadConfig()}>
-              <RefreshCw size={14} style={{ marginRight: 6 }} />
+              <RefreshIcon spinning={configLoading} />
               {t('common.retry')}
             </Button>
           </div>

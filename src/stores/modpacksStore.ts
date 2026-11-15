@@ -5,6 +5,7 @@ import { useInstanceStore } from './instanceStore';
 import { useSettingsStore } from './settingsStore';
 import { t } from '../lib/i18n';
 import { reportHasGaps, type ImportOutcome, type ImportReport } from '../lib/importReport';
+import type { FileProgressPayload } from '../lib/downloadProgress';
 
 export type ModpacksTab = 'modrinth' | 'curseforge' | 'atlauncher';
 
@@ -59,6 +60,10 @@ export interface ProgressPayload {
   current: number;
   total: number;
   message: string;
+  /** Bytes completed when the backend knows real file sizes (0 = unknown). */
+  bytes_done?: number;
+  /** Byte total when every file size is known (0 = indeterminate). */
+  bytes_total?: number;
 }
 
 export interface FetchRetryPayload {
@@ -81,12 +86,6 @@ const catalogGeneration: Record<ModpacksTab, number> = {
 
 /** Generation of the selected-pack detail request (Mr/Cf/Atl). */
 let detailGeneration = 0;
-
-export interface FileProgressPayload {
-  url: string;
-  downloaded: number;
-  total: number;
-}
 
 const PAGE_SIZE = 50;
 

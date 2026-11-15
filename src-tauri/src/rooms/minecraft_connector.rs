@@ -46,10 +46,21 @@ const LAN_PHRASES: &[&str] = &[
     "started lan server",
 ];
 
+/// Lines that mean the previously advertised LAN server is gone. They are
+/// checked in reverse chronological order so a closed world does not keep
+/// returning its old port.
+const LAN_STOP_PHRASES: &[&str] = &["stopping server", "stopping lan server"];
+
 impl MinecraftDiscovery for LanLogDiscovery {
     fn detect_mc_port(&self, log_text: &str) -> Option<u16> {
-        for line in log_text.lines() {
+        // The newest LAN event wins. The log may contain several
+        // open/close/reopen cycles (and ports), especially after the player
+        // leaves and re-opens the world in one session.
+        for line in log_text.lines().rev() {
             let lower = line.to_ascii_lowercase();
+            if LAN_STOP_PHRASES.iter().any(|p| lower.contains(p)) {
+                return None;
+            }
             if LAN_PHRASES.iter().any(|p| lower.contains(p)) {
                 if let Some(port) = extract_port_after(&lower, "port") {
                     return Some(port);
@@ -201,9 +212,28 @@ mod tests {
     }
 
     #[test]
-    fn multi_line_log_picks_first_lan_port() {
-        let log = "[..] started\n[..] Started LAN server, port 12345\n[..] more\n";
-        assert_eq!(LanLogDiscovery.detect_mc_port(log), Some(12345));
+    fn multi_line_log_picks_the_newest_lan_port() {
+        let log = "[..] Started LAN server, port 12345\n[..] more\n[..] Local game hosted on port 23456\n";
+        assert_eq!(LanLogDiscovery.detect_mc_port(log), Some(23456));
+    }
+
+    #[test]
+    fn reopening_lan_after_close_uses_the_new_port() {
+        let log = concat!(
+            "[..] Local game hosted on port 11111\n",
+            "[..] [Server thread/INFO]: Stopping server\n",
+            "[..] Local game hosted on port 22222\n",
+        );
+        assert_eq!(LanLogDiscovery.detect_mc_port(log), Some(22222));
+    }
+
+    #[test]
+    fn a_newer_stop_event_clears_the_old_port() {
+        let log = concat!(
+            "[..] Local game hosted on port 11111\n",
+            "[..] [Server thread/INFO]: Stopping server\n",
+        );
+        assert_eq!(LanLogDiscovery.detect_mc_port(log), None);
     }
 
     #[test]

@@ -161,14 +161,7 @@ pub fn test_config(data_dir: &Path) -> AppConfig {
 }
 
 pub fn test_instance(mc_version: &str) -> Instance {
-    Instance::new(
-        "Test",
-        mc_version,
-        TEST_MEMORY_MB,
-        "g1gc",
-        LoaderType::Vanilla,
-        None,
-    )
+    Instance::new("Test", mc_version, LoaderType::Vanilla, None)
 }
 
 pub fn auth() -> LaunchAuth<'static> {
@@ -176,6 +169,8 @@ pub fn auth() -> LaunchAuth<'static> {
         access_token: TEST_TOKEN,
         uuid: TEST_UUID,
         username: TEST_USERNAME,
+        user_type: "msa",
+        authlib_injector: None,
     }
 }
 
@@ -224,6 +219,21 @@ impl Fixture {
 
     pub fn build(&self) -> LaunchCommand {
         self.build_with_target(None, None, test_target_arch())
+    }
+
+    pub fn build_with_auth(&self, auth: &LaunchAuth) -> LaunchCommand {
+        build_launch_command(
+            &self.config,
+            &self.instance,
+            &self.version,
+            auth,
+            None,
+            None,
+            self.java_path(),
+            self.java_major(),
+            test_target_arch(),
+        )
+        .unwrap_or_else(|e| panic!("build launch command: {}", e))
     }
 
     pub fn build_with(
@@ -421,13 +431,19 @@ pub fn assert_golden(name: &str, fixture: &Fixture, args: &[String]) {
         return;
     }
 
-    let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "read golden {}: {}\nrun with UPDATE_GOLDEN=1 to generate it",
-            path.display(),
-            e
-        )
-    });
+    let expected = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| {
+            panic!(
+                "read golden {}: {}\nrun with UPDATE_GOLDEN=1 to generate it",
+                path.display(),
+                e
+            )
+        })
+        // Git can check out text fixtures with CRLF when `core.autocrlf` is
+        // enabled on Windows. The golden content itself is always generated
+        // with LF, so normalize the checkout before comparing. `.gitattributes`
+        // keeps new checkouts LF; this keeps existing clones stable too.
+        .replace("\r\n", "\n");
     assert_eq!(
         text,
         expected,

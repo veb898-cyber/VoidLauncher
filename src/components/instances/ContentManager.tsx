@@ -2,21 +2,55 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { Package, FolderOpen, Download, Search, Check, Trash2, RefreshCw, ArrowRight, AlertTriangle, X } from 'lucide-react';
+import { Package, FolderOpen, Download, Search, Check, Trash2, ArrowRight, AlertTriangle, X, ChevronUp, ChevronDown, List } from 'lucide-react';
 import { Button } from '../ui/Button';
+import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { Modal } from '../ui/Modal';
+import { RefreshIcon } from '../ui/RefreshIcon';
 import { Tooltip } from '../ui/Tooltip';
 import { addToast } from '../ui/Toast';
 import { logUiMessage } from '../../lib/uiLog';
 import { ContentBrowser, type ContentType } from './ContentBrowser';
+import { ModListExportDialog } from './ModListExportDialog';
 import { useFocusStore } from '../../stores/focusStore';
+import { useEventStore } from '../../hooks/useGameEvents';
+import { isInstanceRunning } from '../../lib/runningGames';
 import { useT } from '../../lib/i18n';
 import { useIconCacheStore } from '../../stores/iconCacheStore';
 import { useThemeStore } from '../../stores/themeStore';
 import { useContentViewStore } from '../../stores/contentViewStore';
-import { EMPTY_UPDATE_CHECK, useUpdateCheckStore, type UpdateInfo } from '../../stores/updateCheckStore';
+import {
+  EMPTY_UPDATE_CHECK,
+  updateCheckFiles,
+  useUpdateCheckStore,
+  type UpdateInfo,
+} from '../../stores/updateCheckStore';
 import { RemoteIcon } from '../../lib/remoteImage';
 import type { CompatState } from '../../lib/contentProviders';
+import { moveActiveContent, resourcePacksOptionsOrder } from '../../lib/contentOrder';
+import {
+  modLoadersLabel,
+  modVersionLabel,
+  normalizeModLoaders,
+} from '../../lib/modDisplay';
+import {
+  importPromptForResult,
+  importStatusMessage,
+  isLocalImportFailure,
+  localImportErrorKey,
+  localImportReloadHintKey,
+  type LocalImportPrompt,
+  type LocalImportResult,
+} from '../../lib/localImport';
+
+/**
+ * Builds tab feedback is intentionally snappier than the shared 600 ms: list
+ * refreshes and update checks in this tab are often near-instant, so the
+ * spinner should not linger after the result is already on screen. Long
+ * operations still spin until they actually finish (the hook only keeps the
+ * icon class on; it never delays the operation).
+ */
+const BUILDS_REFRESH_MIN_SPIN_MS = 300;
 
 /// Strip a trailing version like "_v1.2.3", "-1.0", " v3.2" from a name
 function strip_version_suffix(name: string): string {
@@ -61,14 +95,28 @@ async function runPool<T>(items: T[], limit: number, fn: (item: T) => Promise<vo
 interface ContentItem {
   filename: string;
   name: string;
+  description?: string;
   version: string;
+  version_known?: boolean;
   provider: string;
+  loaders?: string[];
   enabled: boolean;
   icon: string | null;
   size?: number;
   slug?: string | null;
   slug_verified?: boolean;
   project_id?: string;
+  /** Jar-declared internal mod id (independent of the provider project id). */
+  mod_id?: string;
+  /** Jar-declared authors, used by the mod list export. */
+  authors?: string[];
+  /** Jar-declared homepage; a fallback when there is no provider project id. */
+  homepage?: string;
+}
+
+/** Match the backend's name ordering for disabled entries. */
+function compareContentNames(a: ContentItem, b: ContentItem): number {
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 }
 
 /**
@@ -98,7 +146,6 @@ interface ContentRowProps {
   item: ContentItem;
   idx: number;
   isSelected: boolean;
-  iconSrc: string | null;
   iconsResolving: boolean;
   /** Normalized compatibility state; only `incompatible`/`unverified` show a badge. */
   compatState?: CompatState;
@@ -106,6 +153,34 @@ interface ContentRowProps {
   onRowClick: (filename: string, e: React.MouseEvent) => void;
   onContext: (e: React.MouseEvent, filename: string) => void;
   onToggle: (item: ContentItem) => void;
+}
+
+/**
+ * Row-local icon selection from the session cache.
+ *
+ * Each row subscribes to the cache itself and selects only its own key, so an
+ * icon arriving re-renders just that row. Selecting the whole cache in the
+ * manager re-rendered the manager and reconciled every row once per icon
+ * (hundreds of times while a large instance warms up).
+ */
+function useContentItemIcon(item: ContentItem): string | null {
+  return useIconCacheStore((s) => {
+    if (item.icon && item.icon.startsWith('data:')) return item.icon;
+    if (item.project_id) {
+      const hit =
+        s.cache.get(`modrinth:${item.project_id}`) ||
+        s.cache.get(`curseforge:${item.project_id}`);
+      if (hit) return hit;
+    }
+    const hit = s.cache.get(`file:${item.filename}`);
+    if (hit) return hit;
+    // Remote CDN icon: hand the URL to RemoteIcon; useRemoteImage fetches it
+    // through cmd_fetch_icon_url and shows a shine until it settles.
+    if (item.icon && !item.icon.startsWith('data:') && item.icon.includes('/')) {
+      return item.icon;
+    }
+    return null;
+  });
 }
 
 /// Compatibility mark shared by the table row and the card row: only
@@ -141,10 +216,14 @@ function CompatBadge({ state, target }: { state?: CompatState; target: string })
 /// parent state change (selection, search, icon cache updates) caused visible
 /// UI jank; with memo only the actually-changed rows re-render.
 const ContentRow = memo(function ContentRow({
-  item, idx, isSelected, iconSrc, iconsResolving, compatState,
+  item, idx, isSelected, iconsResolving, compatState,
   compatTarget,
   onRowClick, onContext, onToggle,
 }: ContentRowProps) {
+  const t = useT();
+  const iconSrc = useContentItemIcon(item);
+  const versionLabel = modVersionLabel(item.version, item.version_known, t('manager.version_unknown'));
+  const loadersLabel = modLoadersLabel(item.loaders);
   return (
     <div
       className={`content-list-row content-list-row--table${idx % 2 === 1 ? ' content-list-row--alt' : ''}${isSelected ? ' content-list-row--selected' : ''}`}
@@ -179,7 +258,8 @@ const ContentRow = memo(function ContentRow({
         {item.name}
       </div>
       <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {item.version}
+        {versionLabel}
+        {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
       </div>
       <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
         {item.provider || ''}
@@ -198,10 +278,14 @@ const ContentRow = memo(function ContentRow({
 /// single tall line (icon height rules the card), and the gaps between cards
 /// stay at 4px so even long lists don't stretch too far.
 const ContentCardRow = memo(function ContentCardRow({
-  item, isSelected, iconSrc, iconsResolving, compatState,
+  item, isSelected, iconsResolving, compatState,
   compatTarget,
   onRowClick, onContext, onToggle,
 }: Omit<ContentRowProps, 'idx'>) {
+  const t = useT();
+  const iconSrc = useContentItemIcon(item);
+  const versionLabel = modVersionLabel(item.version, item.version_known, t('manager.version_unknown'));
+  const loadersLabel = modLoadersLabel(item.loaders);
   return (
     <div
       className={`glass-card${isSelected ? ' glass-card--selected' : ''}`}
@@ -229,11 +313,19 @@ const ContentCardRow = memo(function ContentCardRow({
         />
       </div>
       <div style={{ flex: 1, minWidth: 0, display: 'grid', gridTemplateColumns: '1fr 1fr 80px', gap: 'var(--space-sm)', alignItems: 'center' }}>
-        <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {item.name}
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {item.name}
+          </div>
+          {item.description ? (
+            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {item.description}
+            </div>
+          ) : null}
         </div>
         <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {item.version}
+          {versionLabel}
+          {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
         </div>
         <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {item.provider || ''}
@@ -259,11 +351,15 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const [hasLoaded, setHasLoaded] = useState(() => cachedList !== undefined);
   const [skeletonVisible, setSkeletonVisible] = useState(false);
   const [iconsResolving, setIconsResolving] = useState(false);
+  const [reordering, setReordering] = useState(false);
+  const reorderingRef = useRef(false);
   const [search, setSearch] = useState('');
   // Selected by filename (NOT by filtered index) so changing the search
   // query doesn't shift the selection onto the wrong items. `Set<string>`
   // is also stable across `items` array reorders from re-loads.
   const [selectedFilenames, setSelectedFilenames] = useState<Set<string>>(new Set());
+  const [removeTargets, setRemoveTargets] = useState<string[] | null>(null);
+  const [removing, setRemoving] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; filename: string } | null>(null);
   const [compatibility, setCompatibility] = useState<Record<string, CompatState>>({});
   const updateCheckKey = `${instanceName}:${SUBFOLDER[contentType]}`;
@@ -276,21 +372,39 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const checkingUpdates = updateCheck.running;
   const updates = updateCheck.updates;
   const [showBrowser, setShowBrowser] = useState(false);
+  const [showExport, setShowExport] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [importPrompts, setImportPrompts] = useState<LocalImportPrompt[]>([]);
+  const [importBusy, setImportBusy] = useState(false);
+  const currentImportPrompt = importPrompts[0] ?? null;
+  const conflictPrompt = currentImportPrompt?.kind === 'conflict' ? currentImportPrompt : null;
+  const duplicatePrompt = currentImportPrompt?.kind === 'duplicate' ? currentImportPrompt : null;
+  const activationPrompt = currentImportPrompt?.kind === 'activation' ? currentImportPrompt : null;
   const [downloadingMods, setDownloadingMods] = useState<Set<string>>(new Set());
   const [updateProgress, setUpdateProgress] = useState<{ current: number; total: number } | null>(null);
+  const [confirmCloseUpdates, setConfirmCloseUpdates] = useState(false);
+  const [stoppingUpdates, setStoppingUpdates] = useState(false);
+  const abortUpdatesRef = useRef(false);
   // Heavy effects (file watcher, compatibility checks) are skipped while the window
   // is unfocused AND a game is running — this is the "frozen" state. State and UI
   // remain mounted; only the network/CPU work is suspended.
   const isFrozen = useFocusStore((s) => s.isFrozen);
+  // Per-instance, not a global "some game is running" flag: a warning for a
+  // resource pack imported into instance B must not appear because instance A
+  // happens to be running.
+  const runningGameIds = useEventStore((s) => s.runningGameIds);
+  const isGameRunning = isInstanceRunning(runningGameIds, instanceName);
 
   // Card list mode: Liquid Glass material + the settings toggle (default on).
   // Normal themes keep the table, so the flag alone never switches the view.
   const cardsView = useThemeStore((s) => s.liquidGlass) && useContentViewStore((s) => s.cards);
 
-  // Global icon cache (session memory only, like Prism: survives remounts,
-  // re-extracted from the archives after an app restart)
-  const { cache: iconCache, getIcon, setIcon } = useIconCacheStore();
+  // Session icon cache: read through stable store methods only. Subscribing to
+  // the whole store here re-rendered the manager (and reconciled every row)
+  // once per resolved icon - hundreds of times while a large mod list warms
+  // up. Rows subscribe to their own icon key instead; the parent never does.
+  const setIcon = useIconCacheStore((s) => s.setIcon);
+  const getIcon = useIconCacheStore((s) => s.getIcon);
   const projectNameCache = useRef<Map<string, string>>(new Map());
   const loadGen = useRef(0);
 
@@ -323,7 +437,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     // do a direct lookup. For others, search Modrinth by name to find the project.
     // Local pack.png is a fallback if Modrinth icon is missing.
     const projectType = contentType === 'resourcepack' ? 'resourcepack' : contentType === 'shader' ? 'shader' : 'mod';
-    const cache = iconCache;
+    const cache = useIconCacheStore.getState().cache;
 
     // Build per-pack plans: track which keys are settled and which need a fetch.
     type Plan = { filename: string; name: string; projectId: string | null; modrinthKey: string; localKey: string; hasModrinth: boolean; hasLocal: boolean; resolved: boolean; isCf: boolean };
@@ -432,12 +546,19 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           filename: m.filename,
           name: m.name,
           version: m.version || '',
+          version_known: typeof m.version_known === 'boolean' ? m.version_known : Boolean(m.version),
           provider: !m.provider || m.provider === 'Local' ? t('manager.provider_local') : m.provider,
+          loaders: Array.isArray(m.loaders) ? m.loaders : [],
           enabled: m.enabled,
           icon: m.icon,
           slug: m.slug,
           slug_verified: m.slug_verified,
-          project_id: m.slug_verified ? m.slug : undefined,
+          project_id: typeof m.project_id === 'string'
+            ? m.project_id
+            : (m.slug_verified ? m.slug : undefined),
+          mod_id: typeof m.mod_id === 'string' ? m.mod_id : undefined,
+          authors: Array.isArray(m.authors) ? m.authors : [],
+          homepage: typeof m.homepage === 'string' ? m.homepage : undefined,
         }));
         setItems(mapped);
         setHasLoaded(true);
@@ -457,7 +578,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           } catch { }
         })();
 
-        const cache = iconCache;
+        const cache = useIconCacheStore.getState().cache;
         const uncached = raw.filter((m) => {
           if (m.icon && m.icon.startsWith('data:')) return false;
           return !cache.get(`file:${m.filename}`);
@@ -489,10 +610,12 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           filename: p.filename,
           name: p.name,
           version: p.version || '',
+          version_known: Boolean(p.version),
           provider: !p.provider || p.provider === 'Local' ? t('manager.provider_local') : p.provider,
           project_id: p.project_id || '',
           slug: p.project_id || undefined,
-          enabled: !p.filename.endsWith('.disabled'),
+          enabled: typeof p.enabled === 'boolean' ? p.enabled : !p.filename.endsWith('.disabled'),
+          description: p.description || '',
           icon: null,
           size: p.file_size,
         })));
@@ -655,38 +778,118 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     }
   }, [isFrozen, loadItems]);
 
-  // Drag-and-drop .jar/.zip files onto the mods/packs list
+  const handleImportResult = useCallback((result: LocalImportResult, sourcePath: string) => {
+    const prompt = importPromptForResult(result, sourcePath);
+    if (prompt) setImportPrompts((prev) => [...prev, prompt]);
+
+    if (result.status === 'installed' || result.status === 'alreadyInstalled') {
+      const message = importStatusMessage(result);
+      addToast(t(message.key as Parameters<typeof t>[0], { name: result.filename, folder: label }), message.type);
+      loadItems();
+      const hintKey = localImportReloadHintKey(result.contentType);
+      if (hintKey && !result.requiresActivation && (result.contentType !== 'resourcepack' || isGameRunning)) {
+        addToast(t(hintKey as Parameters<typeof t>[0]), 'info');
+      }
+    }
+  }, [isGameRunning, label, loadItems, t]);
+
+  const runLocalImport = useCallback(async (
+    sourcePath: string,
+    options?: { conflict?: 'replace' | 'keepBoth'; expectedExistingSha256?: string },
+  ) => {
+    const name = sourcePath.split(/[/\\]/).pop() || sourcePath;
+    try {
+      const result = await invoke<LocalImportResult>('cmd_install_local_content', {
+        instanceName,
+        sourcePath,
+        subfolder,
+        conflict: options?.conflict ?? null,
+        expectedExistingSha256: options?.expectedExistingSha256 ?? null,
+      });
+      handleImportResult(result, sourcePath);
+    } catch (error: any) {
+      const failure = isLocalImportFailure(error) ? error : { message: String(error) };
+      addToast(t(localImportErrorKey(failure.code) as Parameters<typeof t>[0], {
+        name,
+        error: failure.message ?? failure.code ?? String(error),
+      }), 'error');
+    }
+  }, [handleImportResult, instanceName, subfolder, t]);
+
+  const dismissImportPrompt = useCallback(() => {
+    setImportPrompts((prev) => prev.slice(1));
+  }, []);
+
+  const resolveImportPrompt = useCallback(async (mode: 'replace' | 'keepBoth' | 'enable') => {
+    const prompt = currentImportPrompt;
+    if (!prompt || importBusy) return;
+    setImportBusy(true);
+    try {
+      if (prompt.kind === 'activation') {
+        await invoke('cmd_set_resource_pack_enabled', {
+          instanceName,
+          filename: prompt.filename,
+          enabled: true,
+        });
+        addToast(t('manager.local_activation_enabled', { name: prompt.name }), 'success');
+        loadItems();
+        if (isGameRunning) addToast(t('manager.local_reload_hint'), 'info');
+      } else if (prompt.kind === 'conflict') {
+        await runLocalImport(prompt.sourcePath, {
+          conflict: mode === 'replace' ? 'replace' : 'keepBoth',
+          expectedExistingSha256: prompt.result.existingSha256,
+        });
+      } else {
+        await runLocalImport(prompt.sourcePath, {
+          conflict: 'keepBoth',
+          expectedExistingSha256: prompt.result.existingSha256,
+        });
+      }
+      setImportPrompts((prev) => prev.slice(1));
+    } catch (error: any) {
+      addToast(t('manager.toggle_error', { error: String(error) }), 'error');
+    } finally {
+      setImportBusy(false);
+    }
+  }, [currentImportPrompt, importBusy, instanceName, isGameRunning, loadItems, runLocalImport, t]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let cancelled = false;
     (async () => {
       try {
         const w = getCurrentWindow();
-        unlisten = await w.onDragDropEvent((event) => {
+        const fn = await w.onDragDropEvent((event) => {
           const e = event.payload;
           if (e.type === 'drop') {
             setDragOver(false);
             if (!e.paths || e.paths.length === 0) return;
-            const validExt = contentType === 'mod' ? '.jar' : '.zip';
-            for (const filePath of e.paths) {
-              const filename = filePath.split(/[/\\]/).pop() || '';
-              if (!filename.toLowerCase().endsWith(validExt)) continue;
-              (async () => {
-                try {
-                  await invoke('cmd_install_mod', { instanceName, downloadUrl: `file://${filePath}`, fileName: filename, provider: 'local', subfolder });
-                  loadItems();
-                } catch (e: any) { addToast(t('manager.dragdrop_error', { name: filename, error: e.toString() }), 'error'); }
-              })();
-            }
+            (async () => {
+              // The backend validates the extension/type and rejects folders
+              // for mods. Sending every dropped path keeps directory drops
+              // working for resource packs and shaders.
+              for (const filePath of e.paths) {
+                await runLocalImport(filePath);
+              }
+            })();
           } else if (e.type === 'over') {
             setDragOver(true);
           } else if (e.type === 'leave') {
             setDragOver(false);
           }
         });
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
       } catch { }
     })();
-    return () => { if (unlisten) unlisten(); };
-  }, [instanceName, contentType, loadItems]);
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [runLocalImport]);
 
   useEffect(() => {
     const handler = () => setContextMenu(null);
@@ -704,6 +907,33 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
   const toggleEnabled = useCallback(async (item: ContentItem) => {
     try {
+      if (subfolder === 'resourcepacks') {
+        const newEnabled = !item.enabled;
+        await invoke('cmd_set_resource_pack_enabled', {
+          instanceName,
+          filename: item.filename,
+          enabled: newEnabled,
+        });
+        setItems((prev) => {
+          const next = prev.map((it) =>
+            it.filename === item.filename ? { ...it, enabled: newEnabled } : it
+          );
+          const changed = next.find((it) => it.filename === item.filename);
+          if (!changed) return next;
+          const rest = next.filter((it) => it.filename !== item.filename);
+          const active = newEnabled
+            ? [changed, ...rest.filter((it) => it.enabled)]
+            : rest.filter((it) => it.enabled);
+          const disabled = [
+            ...rest.filter((it) => !it.enabled),
+            ...(newEnabled ? [] : [changed]),
+          ].sort(compareContentNames);
+          return [...active, ...disabled];
+        });
+        if (newEnabled && isGameRunning) addToast(t('manager.local_reload_hint'), 'info');
+        return;
+      }
+
       const dir = await invoke<string>('cmd_get_instance_dir', { instanceName });
       const itemDir = `${dir}/${subfolder}`;
       const newEnabled = !item.enabled;
@@ -720,13 +950,46 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         }
       } catch { }
       setItems((prev) => prev.map((it) => it.filename === item.filename ? { ...it, filename: newName, enabled: newEnabled } : it));
+      // A mod toggle renames `foo.jar` <-> `foo.jar.disabled`. Keep the
+      // selection attached to the renamed entry so actions (and the export
+      // count) continue to refer to the file the user selected.
+      setSelectedFilenames((prev) => {
+        if (!prev.has(item.filename)) return prev;
+        const next = new Set(prev);
+        next.delete(item.filename);
+        next.add(newName);
+        return next;
+      });
       const oldIconKey = `file:${item.filename}`;
       const cachedIcon = getIcon(oldIconKey);
       if (cachedIcon) {
         setIcon(`file:${newName}`, cachedIcon);
       }
     } catch (e: any) { addToast(t('manager.toggle_error', { error: e.toString() }), 'error'); }
-  }, [instanceName, subfolder, getIcon, setIcon, t]);
+  }, [instanceName, subfolder, getIcon, setIcon, isGameRunning, t]);
+
+  const moveResourcePack = useCallback(async (item: ContentItem, direction: 'up' | 'down') => {
+    if (reorderingRef.current) return;
+    const reordered = moveActiveContent(items, item.filename, direction);
+    if (!reordered) return;
+    reorderingRef.current = true;
+    setReordering(true);
+    const previous = items;
+    setItems(reordered);
+    try {
+      // options.txt stores low -> high priority; the UI shows high -> low.
+      await invoke('cmd_set_resource_packs_order', {
+        instanceName,
+        filenames: resourcePacksOptionsOrder(reordered),
+      });
+    } catch (e: any) {
+      setItems(previous);
+      addToast(t('manager.reorder_error', { error: e.toString() }), 'error');
+    } finally {
+      reorderingRef.current = false;
+      setReordering(false);
+    }
+  }, [items, instanceName, t]);
 
   const toggleSelectedEnabled = async () => {
     const selected = getSelectedItems();
@@ -737,14 +1000,29 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     setSelectedFilenames(new Set());
   };
 
-  const removeSelected = async () => {
+  const requestRemoveSelected = () => {
     const selected = getSelectedItems();
     if (selected.length === 0) return;
-    for (const item of selected) {
-      await removeSingleItem(item.filename);
+    setRemoveTargets(selected.map((item) => item.filename));
+  };
+
+  const requestRemoveOne = (filename: string) => {
+    setRemoveTargets([filename]);
+  };
+
+  const confirmRemove = async () => {
+    if (!removeTargets || removing) return;
+    setRemoving(true);
+    try {
+      for (const filename of removeTargets) {
+        await removeSingleItem(filename);
+      }
+      setSelectedFilenames(new Set());
+      await loadItems();
+    } finally {
+      setRemoving(false);
+      setRemoveTargets(null);
     }
-    setSelectedFilenames(new Set());
-    loadItems();
   };
 
   const removeSingleItem = async (filename: string) => {
@@ -771,24 +1049,38 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     if (!selected || selected.length === 0) return;
     const files = Array.isArray(selected) ? selected : [selected];
     for (const filePath of files) {
-      const filename = filePath.split(/[/\\]/).pop() || '';
-      try {
-        await invoke('cmd_install_mod', { instanceName, downloadUrl: `file://${filePath}`, fileName: filename, provider: 'local', subfolder });
-      } catch (e: any) { addToast(t('manager.add_error', { name: filename, error: e.toString() }), 'error'); }
+      await runLocalImport(filePath);
     }
-    loadItems();
+  };
+
+  const handleAddLocalFolder = async () => {
+    const selected = await openFileDialog({
+      title: t('manager.add_folder_dialog', { label }),
+      directory: true,
+      multiple: false,
+    });
+    if (!selected || Array.isArray(selected)) return;
+    const folderPath = selected.replace(/[\\/]+$/, '');
+    await runLocalImport(folderPath);
   };
 
   const handleCheckUpdates = async () => {
     if (checkingUpdates) return;
+    const files = updateCheckFiles(selectedFilenames);
     startUpdateCheck(updateCheckKey);
-    addToast(t('manager.checking_updates', { count: items.length.toString() }), 'info');
+    addToast(
+      t('manager.checking_updates', {
+        count: (files?.length ?? items.length).toString(),
+      }),
+      'info',
+    );
     try {
       const results = await invoke<any[]>('cmd_check_mod_updates', {
         instanceName,
         mcVersion: mcVersion ?? null,
         loader: contentType === 'mod' ? (loader ?? null) : null,
         packType: subfolder,
+        files,
       });
       const found: UpdateInfo[] = (results || []).map((r: any) => ({
         name: r.name,
@@ -865,11 +1157,14 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
   const handleApplyAllUpdates = async () => {
     if (!updates) return;
+    abortUpdatesRef.current = false;
+    setStoppingUpdates(false);
     const total = updates.length;
     setUpdateProgress({ current: 0, total });
     const successes: string[] = [];
     const errors: { name: string; error: string }[] = [];
     for (const u of updates) {
+      if (abortUpdatesRef.current) break;
       try {
         await invoke('cmd_download_to_folder', {
           instanceName,
@@ -889,9 +1184,16 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       } catch (e: any) { errors.push({ name: u.name, error: e.toString() }); }
       setUpdateProgress((prev) => prev ? { ...prev, current: prev.current + 1 } : null);
     }
+    const aborted = abortUpdatesRef.current;
+    abortUpdatesRef.current = false;
+    setStoppingUpdates(false);
     setUpdateProgress(null);
     dismissUpdateCheck(updateCheckKey);
     loadItems();
+    if (aborted) {
+      addToast(t('manager.updates_cancelled'), 'info');
+      return;
+    }
     if (errors.length === 0) {
       addToast(t('manager.updated_all_success', { count: successes.length.toString() }), 'success');
     } else {
@@ -906,29 +1208,41 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     }
   };
 
-  const getItemIcon = (item: ContentItem): string | null => {
-    if (item.icon && item.icon.startsWith('data:')) return item.icon;
-    // Look up the persistent icon cache: prefer project_id key, fall back to filename
-    if (item.project_id) {
-      const v = getIcon(`modrinth:${item.project_id}`) || getIcon(`curseforge:${item.project_id}`);
-      if (v) return v;
+  const updatesBusy = updateProgress !== null || downloadingMods.size > 0;
+
+  // The operation may finish while the confirmation is open. Do not leave a
+  // stale "close and interrupt?" dialog over an already completed update.
+  useEffect(() => {
+    if (!updatesBusy) setConfirmCloseUpdates(false);
+  }, [updatesBusy]);
+
+  const requestCloseUpdates = () => {
+    if (stoppingUpdates) return;
+    if (updatesBusy) {
+      setConfirmCloseUpdates(true);
+    } else {
+      dismissUpdateCheck(updateCheckKey);
     }
-    const fileKey = `file:${item.filename}`;
-    const v2 = getIcon(fileKey);
-    if (v2) return v2;
-    // Remote CDN icon: hand the remote URL to RemoteIcon — useRemoteImage
-    // fetches through cmd_fetch_icon_url, shows a shine while in flight and
-    // a letter only after a failed fetch (session cooldown).
-    if (item.icon && !item.icon.startsWith('data:') && item.icon.includes('/')) {
-      return item.icon;
-    }
-    return null;
   };
 
-  const filtered = useMemo(
-    () => items.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()) || p.filename.toLowerCase().includes(search.toLowerCase())),
-    [items, search]
-  );
+  const confirmAbortUpdates = () => {
+    // There is no safe way to abort an in-flight Tauri command from the
+    // renderer. Stop before the next file and keep the modal/progress visible
+    // until that current file has actually finished — never claim an instant
+    // cancellation while bytes are still arriving.
+    abortUpdatesRef.current = true;
+    setStoppingUpdates(true);
+    setConfirmCloseUpdates(false);
+  };
+
+  const filtered = useMemo(() => {
+    const query = search.toLowerCase();
+    return items.filter(
+      (p) =>
+        p.name.toLowerCase().includes(query) ||
+        p.filename.toLowerCase().includes(query),
+    );
+  }, [items, search]);
 
   const handleRowClick = useCallback((filename: string, e: React.MouseEvent) => {
     if (e.ctrlKey || e.metaKey) {
@@ -952,6 +1266,11 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
   const selectedItems = useMemo(getSelectedItems, [items, selectedFilenames]);
   const hasSelection = selectedFilenames.size > 0;
+  const activeResourcePacks = useMemo(() => items.filter((it) => it.enabled), [items]);
+  const selectedResourcePackPos =
+    subfolder === 'resourcepacks' && selectedItems.length === 1 && selectedItems[0].enabled
+      ? activeResourcePacks.findIndex((it) => it.filename === selectedItems[0].filename)
+      : -1;
   const compatTarget = useMemo(
     () => [mcVersion ? `MC ${mcVersion}` : '', loader && loader !== 'Vanilla' ? loader : ''].filter(Boolean).join(' / '),
     [mcVersion, loader]
@@ -965,20 +1284,31 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     // For name matching, also treat dashes as spaces so a filename-derived name
     // like "3d-skin-layers" matches the Modrinth title "3D Skin Layers".
     const normalizeName = (s: string) => s.toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+    // Provider-aware installed keys: a project id/name is only unique inside
+    // its catalog. The display provider is localized for local files, which
+    // deliberately maps to "unknown" and never matches a catalog project.
+    const normalizeProvider = (provider: string) => {
+      const p = provider.toLowerCase();
+      return p === 'modrinth' || p === 'curseforge' || p === 'local' ? p : 'unknown';
+    };
     const installedIds = new Set(
       items.flatMap((it) => {
+        const provider = normalizeProvider(it.provider);
         const ids: string[] = [];
-        if (it.slug) {
-          const n = normalizeSlug(it.slug);
-          ids.push(it.slug);
-          if (n !== it.slug) ids.push(n);
+        const values = [it.project_id, it.slug].filter(
+          (value): value is string => Boolean(value),
+        );
+        for (const value of values) {
+          ids.push(`provider:${provider}:${normalizeSlug(value)}`);
         }
         if (it.name) {
-          ids.push(`name:${normalizeName(it.name)}`);
+          ids.push(`name:${provider}:${normalizeName(it.name)}`);
           // Also add narrower variants: just slug-normalized name helps when
           // Modrinth slug and item slug happen to match space-for-dash.
           const slugForm = normalizeSlug(it.name);
-          if (slugForm !== normalizeName(it.name)) ids.push(`name:${slugForm}`);
+          if (slugForm !== normalizeName(it.name)) {
+            ids.push(`name:${provider}:${slugForm}`);
+          }
         }
         return ids;
       })
@@ -990,7 +1320,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         mcVersion={mcVersion}
         loader={loader}
         onClose={() => setShowBrowser(false)}
-        onInstalled={() => { loadItems(); }}
+        onInstalled={loadItems}
         installedProjectIds={installedIds}
       />
     );
@@ -1067,7 +1397,6 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
                   key={item.filename}
                   item={item}
                   isSelected={selectedFilenames.has(item.filename)}
-                  iconSrc={getItemIcon(item)}
                   iconsResolving={iconsResolving}
                   compatState={contentType === 'mod' ? compatibility[item.filename] : undefined}
                   compatTarget={compatTarget}
@@ -1084,7 +1413,6 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
                 item={item}
                 idx={idx}
                 isSelected={selectedFilenames.has(item.filename)}
-                iconSrc={getItemIcon(item)}
                 iconsResolving={iconsResolving}
                 compatState={contentType === 'mod' ? compatibility[item.filename] : undefined}
                 compatTarget={compatTarget}
@@ -1098,7 +1426,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
 
         {/* Bottom bar */}
         <div style={{ padding: '6px var(--space-2xl)', borderTop: '1px solid var(--surface-border)', display: 'flex', gap: 'var(--space-sm)', alignItems: 'center', flexShrink: 0 }}>
-          <div style={{ position: 'relative', flex: 1, maxWidth: 300 }}>
+          <div style={{ position: 'relative', flex: '1 1 300px', maxWidth: 300, minWidth: 0 }}>
             <Search size={14} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-tertiary)', zIndex: 1, pointerEvents: 'none' }} />
             <input className="input" type="text" value={search} onChange={(e) => setSearch(e.target.value)}
               placeholder={SEARCH_PLACEHOLDERS[contentType]}
@@ -1106,11 +1434,11 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
               style={{ paddingLeft: 32, fontSize: 'var(--font-size-sm)' }} />
           </div>
           {hasSelection && (
-            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>{t('common.items_selected', { n: selectedFilenames.size.toString() })}</span>
+            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', flexShrink: 0, whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>{t('common.items_selected', { n: selectedFilenames.size.toString() })}</span>
           )}
           <div style={{ flex: 1 }} />
-          <Button size="sm" variant="ghost" onClick={loadItems} disabled={loading} style={{ minWidth: 80 }}>
-            <RefreshCw size={14} className={loading ? 'icon-spin' : undefined} />
+          <Button size="sm" variant="ghost" onClick={loadItems} disabled={loading} style={{ minWidth: 80, flexShrink: 0 }}>
+            <RefreshIcon spinning={loading} minimumMs={BUILDS_REFRESH_MIN_SPIN_MS} />
             {t('common.refresh')}
           </Button>
         </div>
@@ -1125,9 +1453,14 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         <Button size="sm" variant="ghost" onClick={handleAddLocalFile} style={{ width: '100%', whiteSpace: 'normal' }}>
           <Package size={14} style={{ flexShrink: 0 }} /> {t('manager.add_file_btn')}
         </Button>
+        {contentType !== 'mod' && (
+          <Button size="sm" variant="ghost" onClick={handleAddLocalFolder} style={{ width: '100%', whiteSpace: 'normal' }}>
+            <FolderOpen size={14} style={{ flexShrink: 0 }} /> {t('manager.add_folder_btn')}
+          </Button>
+        )}
         <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
         <Button size="sm" variant="ghost" onClick={handleCheckUpdates} disabled={checkingUpdates} style={{ width: '100%', whiteSpace: 'normal' }}>
-          <RefreshCw size={14} className={checkingUpdates ? 'icon-spin' : undefined} style={{ flexShrink: 0 }} />
+          <RefreshIcon spinning={checkingUpdates} minimumMs={BUILDS_REFRESH_MIN_SPIN_MS} style={{ flexShrink: 0 }} />
           {t('common.check_updates')}
         </Button>
         {hasSelection && (
@@ -1135,22 +1468,66 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
             <Button size="sm" variant="ghost" onClick={toggleSelectedEnabled} style={{ width: '100%', whiteSpace: 'normal' }}>
               {selectedItems.every((m) => m.enabled) ? t('common.disable') : t('common.enable')}{selectedFilenames.size > 1 ? ` (${selectedFilenames.size})` : ''}
             </Button>
-            <Button size="sm" variant="ghost" onClick={removeSelected} style={{ width: '100%', color: 'var(--color-danger)', whiteSpace: 'normal' }}>
+            <Button size="sm" variant="ghost" onClick={requestRemoveSelected} style={{ width: '100%', color: 'var(--color-danger)', whiteSpace: 'normal' }}>
               <Trash2 size={14} style={{ flexShrink: 0 }} /> {t('common.remove')}{selectedFilenames.size > 1 ? ` (${selectedFilenames.size})` : ''}
             </Button>
           </>)}
+        {subfolder === 'resourcepacks' && selectedResourcePackPos >= 0 && (
+          <>
+            <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
+            <div style={{ display: 'flex', gap: 4 }}>
+              <Button
+                size="sm"
+                variant="ghost"
+                style={{ flex: 1, minWidth: 0, whiteSpace: 'normal' }}
+                disabled={reordering || selectedResourcePackPos <= 0}
+                onClick={() => moveResourcePack(selectedItems[0], 'up')}
+                title={t('manager.move_up')}
+              >
+                <ChevronUp size={14} style={{ flexShrink: 0 }} /> {t('manager.move_up')}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                style={{ flex: 1, minWidth: 0, whiteSpace: 'normal' }}
+                disabled={reordering || selectedResourcePackPos >= activeResourcePacks.length - 1}
+                onClick={() => moveResourcePack(selectedItems[0], 'down')}
+                title={t('manager.move_down')}
+              >
+                <ChevronDown size={14} style={{ flexShrink: 0 }} /> {t('manager.move_down')}
+              </Button>
+            </div>
+          </>
+        )}
         {hasSelection && selectedItems.length === 1 && (
           <>
             <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
             <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
               <div><strong>{t('manager.detail_file')}</strong> {selectedItems[0].filename}</div>
-              {selectedItems[0].version && <div><strong>{t('manager.detail_version')}</strong> {selectedItems[0].version}</div>}
+              <div><strong>{t('manager.detail_version')}</strong> {modVersionLabel(selectedItems[0].version, selectedItems[0].version_known, t('manager.version_unknown'))}</div>
               {selectedItems[0].provider && <div><strong>{t('manager.detail_provider')}</strong> {selectedItems[0].provider}</div>}
+              {(() => {
+                const loaders = normalizeModLoaders(selectedItems[0].loaders);
+                if (loaders.length === 0) return null;
+                return (
+                  <div>
+                    <strong>
+                      {t(loaders.length === 1 ? 'manager.detail_loader' : 'manager.detail_loaders')}
+                    </strong>{' '}
+                    {loaders.join(' / ')}
+                  </div>
+                );
+              })()}
             </div>
           </>
         )}
         <div style={{ flex: 1 }} />
         <div style={{ height: 1, background: 'var(--surface-border)', margin: '4px 0' }} />
+        {contentType === 'mod' && (
+          <Button size="sm" variant="ghost" onClick={() => setShowExport(true)} style={{ width: '100%', whiteSpace: 'normal' }}>
+            <List size={14} style={{ flexShrink: 0 }} /> {t('mod_export.button')}
+          </Button>
+        )}
         <Button size="sm" variant="ghost" onClick={onOpenFolder} style={{ width: '100%' }}>
           <FolderOpen size={14} /> {t('common.open_folder')}
         </Button>
@@ -1159,6 +1536,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       {/* Context menu */}
       {contextMenu && (() => {
         const ctxItem = items.find((it) => it.filename === contextMenu.filename);
+        const ctxActive = items.filter((it) => it.enabled);
+        const ctxPos = ctxItem
+          ? ctxActive.findIndex((it) => it.filename === ctxItem.filename)
+          : -1;
         return (
         <div style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y, zIndex: 9999, background: 'var(--surface-elevated)', border: '1px solid var(--surface-border)', borderRadius: 'var(--radius-md)', padding: 4, minWidth: 160, boxShadow: '0 8px 24px rgba(0,0,0,0.4)' }}>
           <button style={{ display: 'block', width: '100%', padding: '6px 12px', border: 'none', background: 'none', color: 'var(--text-primary)', fontSize: 'var(--font-size-sm)', textAlign: 'left', cursor: 'pointer', borderRadius: 'var(--radius-sm)' }}
@@ -1168,10 +1549,31 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
             disabled={!ctxItem}>
             {ctxItem?.enabled ? t('common.disable') : t('common.enable')}
           </button>
+          {subfolder === 'resourcepacks' && ctxItem?.enabled && (
+            <>
+              <button style={{ display: 'block', width: '100%', padding: '6px 12px', border: 'none', background: 'none', color: 'var(--text-primary)', fontSize: 'var(--font-size-sm)', textAlign: 'left', cursor: 'pointer', borderRadius: 'var(--radius-sm)' }}
+                onMouseEnter={(e) => e.currentTarget.style.background = 'var(--bg-secondary)'}
+                onMouseLeave={(e) => e.currentTarget.style.background = 'none'}
+                onClick={() => { moveResourcePack(ctxItem, 'up'); setContextMenu(null); }}
+                disabled={reordering || ctxPos <= 0}>
+                <ChevronUp size={12} style={{ marginRight: 6 }} /> {t('manager.move_up')}
+              </button>
+              <button style={{ display: 'block', width: '100%', padding: '6px 12px', border: 'none', background: 'none', color: 'var(--text-primary)', fontSize: 'var(--font-size-sm)', textAlign: 'left', cursor: 'pointer', borderRadius: 'var(--radius-sm)' }}
+                onMouseEnter={(e) => e.currentTarget.style.background = 'var(--bg-secondary)'}
+                onMouseLeave={(e) => e.currentTarget.style.background = 'none'}
+                onClick={() => { moveResourcePack(ctxItem, 'down'); setContextMenu(null); }}
+                disabled={reordering || ctxPos < 0 || ctxPos >= ctxActive.length - 1}>
+                <ChevronDown size={12} style={{ marginRight: 6 }} /> {t('manager.move_down')}
+              </button>
+            </>
+          )}
           <button style={{ display: 'block', width: '100%', padding: '6px 12px', border: 'none', background: 'none', color: 'var(--color-danger)', fontSize: 'var(--font-size-sm)', textAlign: 'left', cursor: 'pointer', borderRadius: 'var(--radius-sm)' }}
             onMouseEnter={(e) => e.currentTarget.style.background = 'var(--bg-secondary)'}
             onMouseLeave={(e) => e.currentTarget.style.background = 'none'}
-            onClick={() => { if (ctxItem) removeSingleItem(ctxItem.filename); setContextMenu(null); }}
+            onClick={() => {
+              if (ctxItem) requestRemoveOne(ctxItem.filename);
+              setContextMenu(null);
+            }}
             disabled={!ctxItem}>
             <Trash2 size={12} style={{ marginRight: 6 }} /> {t('common.remove')}
           </button>
@@ -1179,17 +1581,29 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         );
       })()}
 
+      {/* Mod list export — its own dialog, opened from the actions panel.
+          The selection is read at open time and is never persisted. */}
+      {contentType === 'mod' && (
+        <ModListExportDialog
+          open={showExport}
+          onClose={() => setShowExport(false)}
+          instanceName={instanceName}
+          items={items}
+          loading={loading}
+        />
+      )}
+
       {/* Update Dialog — shared modal (lg: scrim + glass sheet). Closing by
           overlay/Escape behaves like the old header ✕; the footer cancel
           stays disabled while the batch is running. */}
       <Modal
         open={!!updates}
-        onClose={() => dismissUpdateCheck(updateCheckKey)}
+        onClose={requestCloseUpdates}
         title={updates ? t('manager.updates_title', { count: updates.length.toString() }) : ''}
         maxWidth={600}
         footer={
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
-            <Button variant="ghost" onClick={() => dismissUpdateCheck(updateCheckKey)} disabled={!!updateProgress} style={{ opacity: updateProgress ? 0.5 : 1 }}>{t('common.cancel')}</Button>
+            <Button variant="ghost" onClick={requestCloseUpdates} disabled={stoppingUpdates}>{t('common.cancel')}</Button>
             <Button onClick={handleApplyAllUpdates} disabled={!!updateProgress}>
               {updateProgress ? '...' : t('manager.update_all', { count: (updates?.length ?? 0).toString() })}
             </Button>
@@ -1202,7 +1616,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontWeight: 500, fontSize: 'var(--font-size-sm)' }}>{u.name}</div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 2 }}>
-                  <span style={{ textDecoration: 'line-through', opacity: 0.6 }}>{u.oldVersion}</span>
+                  <span style={{ textDecoration: 'line-through', opacity: 0.6 }}>{modVersionLabel(u.oldVersion, undefined, t('manager.version_unknown'))}</span>
                   <ArrowRight size={10} color="var(--success)" />
                   <span style={{ color: 'var(--success)', fontWeight: 500 }}>{u.newVersion}</span>
                 </div>
@@ -1216,12 +1630,111 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         {updateProgress && (
           <div style={{ marginBottom: 'var(--space-md)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 4 }}>
-              <span>{t('manager.updating_progress', { current: updateProgress.current.toString(), total: updateProgress.total.toString() })}</span>
+              <span>
+                {stoppingUpdates
+                  ? t('manager.updates_stopping')
+                  : t('manager.updating_progress', { current: updateProgress.current.toString(), total: updateProgress.total.toString() })}
+              </span>
               <span>{Math.round((updateProgress.current / updateProgress.total) * 100)}%</span>
             </div>
             <div style={{ height: 6, background: 'var(--bg-secondary)', borderRadius: 3, overflow: 'hidden' }}>
               <div style={{ height: '100%', width: `${(updateProgress.current / updateProgress.total) * 100}%`, background: 'var(--primary)', borderRadius: 3, transition: 'width 0.3s ease' }} />
             </div>
+          </div>
+        )}
+      </Modal>
+
+      <ConfirmDialog
+        open={confirmCloseUpdates}
+        title={t('manager.close_updates_title')}
+        description={t('manager.close_updates_desc')}
+        confirmLabel={t('manager.close_updates_confirm')}
+        onConfirm={confirmAbortUpdates}
+        onCancel={() => setConfirmCloseUpdates(false)}
+      />
+
+      <ConfirmDialog
+        open={removeTargets !== null}
+        title={t('manager.remove_confirm_title')}
+        description={t('manager.remove_confirm_desc', {
+          count: String(removeTargets?.length ?? 0),
+        })}
+        confirmLabel={t('common.remove')}
+        busy={removing}
+        onConfirm={confirmRemove}
+        onCancel={() => { if (!removing) setRemoveTargets(null); }}
+      />
+
+      {/* Local import: a name conflict is never resolved silently. */}
+      <Modal
+        open={!!conflictPrompt}
+        onClose={() => { if (!importBusy) dismissImportPrompt(); }}
+        title={t('manager.local_conflict_title')}
+        maxWidth={520}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+            <Button variant="ghost" onClick={dismissImportPrompt} disabled={importBusy}>{t('common.cancel')}</Button>
+            <Button variant="ghost" onClick={() => resolveImportPrompt('keepBoth')} disabled={importBusy}>
+              {t('manager.local_conflict_keep_both')}
+            </Button>
+            <Button onClick={() => resolveImportPrompt('replace')} disabled={importBusy}>
+              {t('manager.local_conflict_replace')}
+            </Button>
+          </div>
+        }
+      >
+        {conflictPrompt && (
+          <div style={{ fontSize: 'var(--font-size-sm)', lineHeight: 1.5 }}>
+            {t('manager.local_conflict_body', {
+              name: conflictPrompt.result.conflictWith ?? conflictPrompt.result.filename,
+            })}
+          </div>
+        )}
+      </Modal>
+
+      {/* Local import: same content under a different name. */}
+      <Modal
+        open={!!duplicatePrompt}
+        onClose={() => { if (!importBusy) dismissImportPrompt(); }}
+        title={t('manager.local_duplicate_title')}
+        maxWidth={520}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+            <Button variant="ghost" onClick={dismissImportPrompt} disabled={importBusy}>{t('common.cancel')}</Button>
+            <Button onClick={() => resolveImportPrompt('keepBoth')} disabled={importBusy}>
+              {t('manager.local_duplicate_install')}
+            </Button>
+          </div>
+        }
+      >
+        {duplicatePrompt && (
+          <div style={{ fontSize: 'var(--font-size-sm)', lineHeight: 1.5 }}>
+            {t('manager.local_duplicate_body', {
+              name: duplicatePrompt.result.duplicateOf ?? duplicatePrompt.result.filename,
+            })}
+          </div>
+        )}
+      </Modal>
+
+      {/* Resource pack installed but absent from options.txt. */}
+      <Modal
+        open={!!activationPrompt}
+        onClose={() => { if (!importBusy) dismissImportPrompt(); }}
+        title={t('manager.local_activation_title')}
+        maxWidth={520}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-sm)' }}>
+            <Button variant="ghost" onClick={dismissImportPrompt} disabled={importBusy}>{t('manager.local_activation_later')}</Button>
+            <Button onClick={() => resolveImportPrompt('enable')} disabled={importBusy}>{t('common.enable')}</Button>
+          </div>
+        }
+      >
+        {activationPrompt && (
+          <div style={{ fontSize: 'var(--font-size-sm)', lineHeight: 1.5 }}>
+            <div>{t('manager.local_activation_body', { name: activationPrompt.name })}</div>
+            {isGameRunning && (
+              <div style={{ marginTop: 8, color: 'var(--text-tertiary)' }}>{t('manager.local_reload_hint')}</div>
+            )}
           </div>
         )}
       </Modal>

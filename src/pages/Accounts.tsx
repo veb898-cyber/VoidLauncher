@@ -8,14 +8,16 @@ import { Modal } from '../components/ui/Modal';
 import { CustomSelect } from '../components/ui/CustomSelect';
 import { Tooltip } from '../components/ui/Tooltip';
 import { ConfirmDialog } from '../components/ui/ConfirmDialog';
+import { RefreshIcon } from '../components/ui/RefreshIcon';
 import { EmptyState } from '../components/ui/EmptyState';
 import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { MicrosoftLoginCard } from '../components/MicrosoftLoginCard';
 import { SkinPreview } from '../components/accounts/SkinPreview';
 import { addToast } from '../components/ui/Toast';
-import { Ban, Check, RefreshCw, Plus, Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
+import { Ban, Check, Plus, Trash2, Shirt, UserRoundPlus, HelpCircle } from 'lucide-react';
 import { t } from '../lib/i18n';
-import { Avatar } from '../lib/remoteImage';
+import { Avatar, refreshPlayerHead } from '../lib/remoteImage';
+import { canRefreshSkin } from '../lib/skinRefresh';
 
 const ELYBY_SKINS_URL = 'https://ely.by/skins';
 
@@ -63,6 +65,7 @@ export function Accounts() {
   const capesByAccount = useAccountsStore((s) => s.capesByAccount);
   const capesLoadingByAccount = useAccountsStore((s) => s.capesLoadingByAccount);
   const capesErrorByAccount = useAccountsStore((s) => s.capesErrorByAccount);
+  const accountsError = useAccountsStore((s) => s.error);
 
   const [showAddOffline, setShowOffline] = useState(false);
   const [offlineName, setOfflineName] = useState('');
@@ -82,6 +85,7 @@ export function Accounts() {
   const [addingElyby, setAddingElyby] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<AccountEntry | null>(null);
   const [removing, setRemoving] = useState(false);
+  const [refreshingHead, setRefreshingHead] = useState<string | null>(null);
 
   useEffect(() => { loadAccounts(); }, [loadAccounts]);
 
@@ -168,6 +172,8 @@ export function Accounts() {
     setSwitching(true);
     try {
       await setDefaultAccount(selected.id);
+    } catch (e) {
+      addToast(t('accounts.make_active_error', { error: String(e) }), 'error');
     } finally {
       setSwitching(false);
     }
@@ -193,7 +199,7 @@ export function Accounts() {
   // (no toast — the picker itself shows the result); failure rolls the
   // marker back and surfaces the error.
   const handleSetCape = async (capeId: string | null) => {
-    if (!selected || capeSaving) return;
+    if (!selected || capeSaving || capesLoading) return;
     const accountId = selected.id;
     const prev = capes;
     applyCapes(accountId, prev.map((c) => ({ ...c, active: capeId !== null && c.id === capeId })));
@@ -206,7 +212,7 @@ export function Accounts() {
       const pngById = new Map(prev.map((c) => [c.id, c.png]));
       applyCapes(accountId, list.map((c) => ({ ...c, png: c.png || pngById.get(c.id) || '' })));
     } catch (e) {
-      if (selectedIdRef.current === accountId) applyCapes(accountId, prev);
+      applyCapes(accountId, prev);
       addToast(t('accounts.cape_update_error', { error: String(e) }), 'error');
     } finally {
       setCapeSaving(false);
@@ -229,8 +235,12 @@ export function Accounts() {
   const confirmSkinChange = async () => {
     if (!skinModalAccount) return;
     try {
-      await changeSkin(skinModalAccount.id, skinModalPath, skinVariant);
-      addToast(t('accounts.skin_updated_toast'), 'success');
+      const refreshed = await changeSkin(skinModalAccount.id, skinModalPath, skinVariant);
+      if (refreshed) {
+        addToast(t('accounts.skin_updated_toast'), 'success');
+      } else {
+        addToast(t('accounts.skin_refresh_error'), 'error');
+      }
       setSkinModalAccount(null);
       setSkinModalPath('');
     } catch (e) {
@@ -265,6 +275,27 @@ export function Accounts() {
         </div>
       </div>
 
+      {accountsError && (
+        <div
+          role="alert"
+          className="glass-card"
+          style={{
+            padding: 'var(--space-sm) var(--space-lg)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--space-sm)',
+            border: '1px solid var(--warning)',
+            color: 'var(--text-secondary)',
+            fontSize: 'var(--font-size-sm)',
+          }}
+        >
+          <span style={{ flex: 1 }}>{t('accounts.load_error', { error: accountsError })}</span>
+          <Button size="sm" variant="secondary" onClick={() => loadAccounts(true)}>
+            {t('common.retry')}
+          </Button>
+        </div>
+      )}
+
       {accounts.length === 0 ? (
         <div className="glass-card" style={{ padding: 'var(--space-lg)' }}>
           <EmptyState compact icon={<UserRoundPlus size={24} />} title={t('accounts.empty_text')} />
@@ -281,6 +312,7 @@ export function Accounts() {
                   <SkinPreview
                     uuid={selected.uuid ?? ''}
                     name={selected.name}
+                    provider={selected.account_type}
                     cape={selected.account_type === 'Microsoft' ? activeCapePng : null}
                   />
                 </div>
@@ -330,7 +362,7 @@ export function Accounts() {
                       border: isSelected ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
                     }}
                   >
-                    <Avatar uuid={acc.uuid ?? ''} name={acc.name} size={36} />
+                    <Avatar uuid={acc.uuid ?? ''} name={acc.name} provider={acc.account_type} size={36} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                         {acc.name}
@@ -361,7 +393,7 @@ export function Accounts() {
                     </div>
                     {/* Per-account actions live on the card itself — the same
                         quick icon row the list had before the redesign. */}
-                    <div style={{ display: 'flex', gap: 'var(--space-xs)', flexShrink: 0 }}>
+                    <div className="account-card__actions">
                       {acc.account_type === 'Microsoft' && (
                         <Tooltip content={t('accounts.btn_change_skin')}>
                           <Button
@@ -383,6 +415,37 @@ export function Accounts() {
                             onClick={(e) => { e.stopPropagation(); setShowElybySkinHelp(true); }}
                           >
                             <HelpCircle size={14} />
+                          </Button>
+                        </Tooltip>
+                      )}
+                      {canRefreshSkin(acc.account_type) && acc.uuid && (
+                        <Tooltip content={t('accounts.refresh_skin_btn')}>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            aria-label={t('accounts.refresh_skin_btn')}
+                            disabled={refreshingHead === acc.id}
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              setRefreshingHead(acc.id);
+                              try {
+                                const refreshed = await refreshPlayerHead(acc.uuid!, acc.account_type);
+                                if (refreshed) {
+                                  addToast(t('accounts.skin_refreshed'), 'info');
+                                } else {
+                                  addToast(t('accounts.skin_refresh_error'), 'error');
+                                }
+                              } catch (err) {
+                                addToast(
+                                  t('accounts.skin_update_error', { error: String(err) }),
+                                  'error',
+                                );
+                              } finally {
+                                setRefreshingHead(null);
+                              }
+                            }}
+                          >
+                            <RefreshIcon spinning={refreshingHead === acc.id} />
                           </Button>
                         </Tooltip>
                       )}
@@ -432,7 +495,7 @@ export function Accounts() {
                       {t('accounts.capes_load_error', { error: capesError })}
                     </div>
                     <Button size="sm" variant="secondary" onClick={retryCapes}>
-                      <RefreshCw size={14} style={{ marginRight: 6 }} />
+                      <RefreshIcon spinning={capesLoading} />
                       {t('common.retry')}
                     </Button>
                   </div>
@@ -442,7 +505,7 @@ export function Accounts() {
                       type="button"
                       className={`cape-tile${!capes.some((c) => c.active) ? ' cape-tile--active' : ''}`}
                       onClick={() => handleSetCape(null)}
-                      disabled={capeSaving}
+                      disabled={capeSaving || capesLoading}
                       title={t('accounts.cape_none')}
                     >
                       <span className="cape-thumb cape-thumb--none"><Ban size={18} /></span>
@@ -454,7 +517,7 @@ export function Accounts() {
                         type="button"
                         className={`cape-tile${c.active ? ' cape-tile--active' : ''}`}
                         onClick={() => { if (!c.active) handleSetCape(c.id); }}
-                        disabled={capeSaving}
+                        disabled={capeSaving || capesLoading}
                         title={c.alias}
                       >
                         {c.png ? (

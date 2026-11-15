@@ -40,6 +40,12 @@ struct FabricProfile {
 struct FabricLibrary {
     name: String,
     url: String,
+    /// Fabric's profile JSON does not currently publish hashes, but tolerate
+    /// and use them if a future/proxied metadata source provides them.
+    #[serde(default)]
+    sha1: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,8 +267,8 @@ pub async fn get_profile(mc_version: &str, loader_version: &str) -> Result<Loade
                 name: lib.name,
                 url: lib.url,
                 path,
-                sha1: None,
-                size: None,
+                sha1: lib.sha1.filter(|s| !s.is_empty()),
+                size: lib.size,
             })
         })
         .collect::<Result<Vec<_>>>()?;

@@ -5,7 +5,135 @@
 use crate::config::AppConfig;
 use crate::events;
 use crate::AppState;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, Runtime, State, Webview};
+
+/// Metadata shape expected by the JS `Update` class from
+/// `@tauri-apps/plugin-updater`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdaterCheckMetadata {
+    pub rid: tauri::ResourceId,
+    pub current_version: String,
+    pub version: String,
+    pub body: Option<String>,
+    pub raw_json: serde_json::Value,
+}
+
+/// Check for an update using exactly the requested connection policy.
+///
+/// The plugin's JS API only exposes a proxy URL and cannot force a direct
+/// connection, so the renderer calls this command instead of the plugin's
+/// `check` for both attempts. It uses the plugin's public `UpdaterExt` API and
+/// returns the same metadata/resource the plugin's own command would; the
+/// returned `Update` still performs the plugin's normal signature and
+/// installer validation.
+#[tauri::command]
+pub async fn cmd_updater_check<R: Runtime>(
+    webview: Webview<R>,
+    mode: String,
+) -> Result<Option<UpdaterCheckMetadata>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    // The renderer only chooses between the allowed attempt types; the
+    // backend still enforces the master switch and strict mode so a direct
+    // request cannot slip through even if the renderer asks for one.
+    let proxy_enabled = crate::download::proxy_enabled();
+    let proxy_only = crate::download::proxy_only_enabled();
+    let effective_mode = resolve_updater_mode(proxy_enabled, proxy_only, &mode)?;
+
+    let mut builder = webview.updater_builder();
+    match effective_mode {
+        "direct" => {
+            if proxy_enabled && proxy_only {
+                return Err("Proxy-only mode forbids a direct updater request".to_string());
+            }
+            builder = builder.no_proxy();
+        }
+        "proxy" => {
+            let url = crate::download::proxy_client_url()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "Updater proxy is not configured or usable".to_string())?;
+            let parsed =
+                reqwest::Url::parse(&url).map_err(|e| format!("Invalid updater proxy URL: {e}"))?;
+            builder = builder.proxy(parsed);
+        }
+        other => return Err(format!("Unknown updater mode: {other}")),
+    }
+
+    let updater = builder.build().map_err(|e| e.to_string())?;
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+
+    let metadata = UpdaterCheckMetadata {
+        rid: 0,
+        current_version: update.current_version.clone(),
+        version: update.version.clone(),
+        body: update.body.clone(),
+        raw_json: update.raw_json.clone(),
+    };
+    let rid = webview.resources_table().add(update);
+    Ok(Some(UpdaterCheckMetadata { rid, ..metadata }))
+}
+
+/// Resolve the attempt type the updater is allowed to use. Kept separate from
+/// the webview command so the parent/child proxy rules can be unit-tested:
+/// a disabled master switch always means direct, and strict mode rejects any
+/// direct attempt even if the renderer asks for one.
+fn resolve_updater_mode(
+    proxy_enabled: bool,
+    proxy_only: bool,
+    requested: &str,
+) -> Result<&str, String> {
+    if !proxy_enabled {
+        return Ok("direct");
+    }
+    match requested {
+        "proxy" => Ok("proxy"),
+        "direct" if proxy_only => {
+            Err("Proxy-only mode forbids a direct updater request".to_string())
+        }
+        "direct" => Ok("direct"),
+        other => Err(format!("Unknown updater mode: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod updater_mode_tests {
+    use super::resolve_updater_mode;
+
+    #[test]
+    fn master_switch_off_forces_direct_even_with_proxy_only_saved() {
+        assert_eq!(
+            resolve_updater_mode(false, true, "proxy").unwrap(),
+            "direct"
+        );
+        assert_eq!(
+            resolve_updater_mode(false, false, "proxy").unwrap(),
+            "direct"
+        );
+    }
+
+    #[test]
+    fn strict_mode_rejects_direct_but_allows_proxy() {
+        assert!(resolve_updater_mode(true, true, "direct").is_err());
+        assert_eq!(resolve_updater_mode(true, true, "proxy").unwrap(), "proxy");
+    }
+
+    #[test]
+    fn fallback_mode_allows_both_attempts() {
+        assert_eq!(
+            resolve_updater_mode(true, false, "direct").unwrap(),
+            "direct"
+        );
+        assert_eq!(resolve_updater_mode(true, false, "proxy").unwrap(), "proxy");
+    }
+
+    #[test]
+    fn unknown_modes_are_rejected() {
+        assert!(resolve_updater_mode(true, false, "bogus").is_err());
+    }
+}
 
 #[tauri::command]
 pub async fn cmd_rename_file(
@@ -266,7 +394,10 @@ async fn send_pinned(
     match client.get(url).send().await {
         Ok(r) => Ok(r),
         Err(e) => {
-            if crate::download::configured_proxy().is_some() {
+            if crate::download::proxy_enabled()
+                && !crate::download::proxy_only_enabled()
+                && crate::download::active_proxy_raw().is_some()
+            {
                 let direct = crate::download::pinned_http_client_direct(host, addrs)
                     .map_err(|e2| e2.to_string())?;
                 match direct.get(url).send().await {
@@ -369,11 +500,27 @@ pub async fn cmd_fetch_page_asset(url: String) -> Result<Option<String>, String>
     Ok(Some(format!("data:{};base64,{}", mime, b64)))
 }
 
+/// Apply the proxy policy from the still-unsaved Network settings values.
+/// Persistence remains `cmd_save_config`; this lets the parent/child switches
+/// take effect immediately while the user is editing them.
+#[tauri::command]
+pub fn cmd_apply_proxy_policy(
+    proxy_enabled: bool,
+    use_system_proxy: bool,
+    proxy_addr: String,
+    proxy_port: u16,
+    proxy_only: bool,
+) {
+    let proxy = crate::config::proxy_url_from(proxy_enabled, &proxy_addr, proxy_port);
+    crate::download::set_global_proxy_policy(proxy_enabled, use_system_proxy, proxy, proxy_only);
+}
+
 /// Check for launcher updates by fetching `latest.json` from GitHub through
-/// the launcher's HTTP stack (proxy with direct fallback). The URL is
-/// hardcoded here so the renderer cannot abuse this as an SSRF proxy; doing
-/// it in the backend (instead of a webview `fetch`) means users behind
-/// proxies that block raw.githubusercontent.com still get update checks.
+/// the launcher's HTTP stack (proxy first, direct fallback unless proxy-only
+/// mode is enabled). The URL is hardcoded here so the renderer cannot abuse
+/// this as an SSRF proxy; doing it in the backend (instead of a webview
+/// `fetch`) means users behind proxies that block raw.githubusercontent.com
+/// still get update checks.
 #[tauri::command]
 pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
     const LATEST_JSON_URL: &str =
@@ -396,6 +543,48 @@ pub async fn cmd_check_latest_version() -> Result<Option<String>, String> {
     Ok(v)
 }
 
+/// Proxy policy the Tauri updater plugin must follow.
+///
+/// The plugin's JS API accepts a proxy URL but cannot force a direct
+/// connection, so the renderer orchestrates the attempts:
+/// - `enabled=false`: direct only, regardless of `proxy_only`.
+/// - `enabled=true`, `proxy_url=Some`: proxy first; retry direct only when
+///   `proxy_only=false`.
+/// - `enabled=true`, `proxy_only=true`, `proxy_url=None`: refuse the request
+///   without calling the plugin (no proxy configured/unusable).
+/// - `enabled=true`, `proxy_only=false`, `proxy_url=None`: direct only — the
+///   proxy attempt is treated as already failed.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdaterProxyPolicy {
+    pub enabled: bool,
+    pub proxy_only: bool,
+    pub proxy_url: Option<String>,
+}
+
+/// Effective proxy policy for HTTP clients outside `download.rs` — currently
+/// the Tauri updater plugin, which has its own HTTP stack and accepts a proxy
+/// option. The scheme is resolved first so a SOCKS proxy is passed correctly.
+#[tauri::command]
+pub async fn cmd_updater_proxy_policy() -> UpdaterProxyPolicy {
+    crate::download::ensure_proxy_resolved().await;
+    let enabled = crate::download::proxy_enabled();
+    if !enabled {
+        return UpdaterProxyPolicy {
+            enabled: false,
+            proxy_only: false,
+            proxy_url: None,
+        };
+    }
+    let proxy_only = crate::download::proxy_only_enabled();
+    let proxy_url = crate::download::proxy_client_url().ok().flatten();
+    UpdaterProxyPolicy {
+        enabled: true,
+        proxy_only,
+        proxy_url,
+    }
+}
+
 // ==================== Launch State Commands ====================
 
 /// Return the names of all instances whose game processes are currently
@@ -413,6 +602,20 @@ pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Vec<String>, S
         config.data_dir.clone()
     };
     let mut running = state.launches.running_instances();
+    // A registry entry can outlive its process when the exit watcher missed an
+    // event. Re-verify the recorded identity before reporting it; a provably
+    // dead/reused PID is healed here instead of keeping the UI stuck.
+    running.retain(|name| {
+        let Some(identity) = state.launches.process_identity(name) else {
+            return true;
+        };
+        if crate::running_state::identity_is_dead(&identity) {
+            state.launches.clear_running(name);
+            false
+        } else {
+            true
+        }
+    });
     // Only games whose recorded process identity matches the live process are
     // adopted; a legacy or mismatched record is not presented as a running
     // game (and could be an unrelated process that received a recycled pid).
@@ -570,9 +773,40 @@ pub fn cmd_save_config(
 ) -> Result<(), String> {
     events::emit_log(&app, "info", "config", "Saving configuration...");
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let previous = config.clone();
+    // The renderer is not a trust boundary for numeric limits: clamp here so
+    // a bad IPC payload can never persist a 0 MB / multi-TB heap.
+    let mut new_config = new_config;
+    new_config.default_memory_mb = new_config
+        .default_memory_mb
+        .clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+    new_config.max_memory_mb = new_config
+        .max_memory_mb
+        .clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+    let gc = new_config.default_gc_preset.trim().to_lowercase();
+    new_config.default_gc_preset = match gc.as_str() {
+        "standard" | "g1gc" | "zgc" => gc,
+        _ => "g1gc".to_string(),
+    };
+    if !crate::config::AFTER_LAUNCH_ACTIONS.contains(&new_config.after_launch_action.as_str()) {
+        new_config.after_launch_action = "do_nothing".to_string();
+    }
+    // The renderer does not know about the migration marker; saving settings
+    // must not downgrade a current config back to the legacy schema.
+    new_config.config_version = crate::config::CONFIG_VERSION;
     *config = new_config;
-    config.save().map_err(|e| e.to_string())?;
-    crate::download::set_global_proxy(config.proxy_url());
+    if let Err(e) = config.save() {
+        // Keep the running session consistent with the disk: a failed write
+        // must not leave the launcher using values it did not persist.
+        *config = previous;
+        return Err(e.to_string());
+    }
+    crate::download::set_global_proxy_policy(
+        config.proxy_enabled,
+        config.use_system_proxy(),
+        config.proxy_url(),
+        config.proxy_only,
+    );
     events::emit_log(&app, "info", "config", "Configuration saved");
     Ok(())
 }
@@ -587,15 +821,36 @@ fn resolve_open_folder_path(
     base: &std::path::Path,
     target: &std::path::Path,
 ) -> Result<std::path::PathBuf, String> {
-    if !target.exists() {
-        std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
-    }
-    let target_canon = target
-        .canonicalize()
-        .map_err(|_| "Access denied: invalid folder path".to_string())?;
+    // The data directory itself is trusted and may be missing on the very
+    // first settings open. Create it before canonicalizing, but never create
+    // the requested target before the containment check below.
+    std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
     let base_canon = base
         .canonicalize()
         .map_err(|_| "Access denied: data folder unavailable".to_string())?;
+
+    // Never create a directory before proving that its nearest existing
+    // ancestor is inside the data directory. The old code created arbitrary
+    // paths first and only then rejected them.
+    if !target.exists() {
+        let mut ancestor = target;
+        while !ancestor.exists() {
+            ancestor = ancestor
+                .parent()
+                .ok_or_else(|| "Access denied: invalid folder path".to_string())?;
+        }
+        let ancestor_canon = ancestor
+            .canonicalize()
+            .map_err(|_| "Access denied: invalid folder path".to_string())?;
+        if !ancestor_canon.starts_with(&base_canon) {
+            return Err("Access denied: folder is outside the launcher data directory".to_string());
+        }
+        std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+    }
+
+    let target_canon = target
+        .canonicalize()
+        .map_err(|_| "Access denied: invalid folder path".to_string())?;
     if !target_canon.starts_with(&base_canon) {
         return Err("Access denied: folder is outside the launcher data directory".to_string());
     }
@@ -682,6 +937,21 @@ mod open_folder_tests {
         let got = resolve_open_folder_path(&base, &missing).unwrap();
         assert!(got.is_dir());
         assert!(got.starts_with(base.canonicalize().unwrap()));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn does_not_create_missing_folder_outside_base() {
+        let tmp =
+            std::env::temp_dir().join(format!("void-open-test-out-create-{}", std::process::id()));
+        let base = tmp.join("data");
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = tmp.join("outside").join("nested");
+        assert!(resolve_open_folder_path(&base, &outside).is_err());
+        assert!(
+            !outside.exists(),
+            "a rejected open_folder call must not create outside directories"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

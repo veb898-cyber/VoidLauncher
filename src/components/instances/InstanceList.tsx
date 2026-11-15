@@ -16,6 +16,7 @@ import { DuplicateInstanceModal } from './DuplicateInstanceModal';
 import { VerifyRepairModal } from './VerifyRepairModal';
 import { PackModal } from './PackModal';
 import { useEventStore } from '../../hooks/useGameEvents';
+import { isTerminalInstallStage } from '../../lib/installProgress';
 
 interface InstanceListProps {
   onCreateClick: () => void;
@@ -33,6 +34,8 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const selectInstance = useInstanceStore((s) => s.selectInstance);
   const launchGame = useInstanceStore((s) => s.launchGame);
   const deleteInstance = useInstanceStore((s) => s.deleteInstance);
+  const error = useInstanceStore((s) => s.error);
+  const clearError = useInstanceStore((s) => s.clearError);
   const isLaunching = useInstanceStore((s) => s.isLaunching);
   const installProgress = useEventStore((s) => s.installProgress);
 
@@ -45,9 +48,16 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
   const [packModalName, setPackModalName] = useState<string | null>(null);
   const [hasPack, setHasPack] = useState(false);
   const [backupBusy, setBackupBusy] = useState<string | null>(null);
+  const [setupBusy, setSetupBusy] = useState<string | null>(null);
   const editorInstance = editorName ? instances.find((i) => i.name === editorName) ?? null : null;
+  const contextInstance = contextMenu
+    ? instances.find((i) => i.name === contextMenu.name) ?? null
+    : null;
+  const contextSetup = contextInstance?.setup_state ?? null;
 
-  const installingName = installProgress?.instance_id || null;
+  const installingName = installProgress && !isTerminalInstallStage(installProgress.stage)
+    ? installProgress.instance_id
+    : null;
 
   // Close the context menu on any click outside of it.
   useEffect(() => {
@@ -98,6 +108,21 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
     setBackupBusy(null);
   };
 
+  // Rerun the idempotent preparation of an instance whose setup was
+  // interrupted after its files were imported. An interrupted *import* is
+  // rejected by the backend and must be re-imported instead.
+  const handleFinishSetup = async (name: string) => {
+    setSetupBusy(name);
+    try {
+      await invoke('cmd_finish_instance_setup', { name });
+      addToast(t('instances.setup_finished', { name }), 'success');
+      await useInstanceStore.getState().loadInstances();
+    } catch (e: any) {
+      addToast(t('instances.setup_finish_error', { error: e.toString() }), 'error');
+    }
+    setSetupBusy(null);
+  };
+
   return (
     <div
       className="instance-list"
@@ -127,6 +152,42 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
         </Button>
       </div>
 
+      {/* A failed initial load (permissions, locked data dir) must not look
+          like an empty library with no explanation. */}
+      {error && (
+        <div
+          role="alert"
+          style={{
+            margin: 'var(--space-sm)',
+            padding: 'var(--space-sm) var(--space-md)',
+            borderRadius: 'var(--radius-md)',
+            border: '1px solid hsla(352, 82%, 64%, 0.4)',
+            background: 'hsla(352, 76%, 44%, 0.12)',
+            color: 'var(--text-primary)',
+            fontSize: 'var(--font-size-xs)',
+            display: 'flex',
+            gap: 'var(--space-sm)',
+            alignItems: 'flex-start',
+          }}
+        >
+          <span style={{ flex: 1 }}>{error}</span>
+          <button
+            type="button"
+            onClick={clearError}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'var(--text-secondary)',
+              cursor: 'pointer',
+              padding: 0,
+              fontSize: 'var(--font-size-xs)',
+            }}
+          >
+            {t('common.dismiss')}
+          </button>
+        </div>
+      )}
+
       {/* List */}
       <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-sm)' }}>
         {instances.length === 0 ? (
@@ -135,6 +196,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           instances.map((instance) => {
             const isInstalling = installingName === instance.name;
             const isSelected = selectedInstance === instance.name;
+            const isPreparing = !!instance.setup_state;
 
             return (
               <div
@@ -208,7 +270,27 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
                   </div>
                   {isInstalling && (
                     <div style={{ marginTop: 4 }}>
-                      <ProgressBar percent={installProgress?.percent || 0} />
+                      <ProgressBar
+                        percent={installProgress?.percent || 0}
+                        indeterminate={!installProgress || installProgress.indeterminate || installProgress.total_bytes <= 0}
+                      />
+                    </div>
+                  )}
+                  {!isInstalling && isPreparing && (
+                    <div
+                      style={{
+                        marginTop: 4,
+                        fontSize: 'var(--font-size-xs)',
+                        color: 'var(--warning)',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {instance.setup_state?.stage === 'importing' &&
+                      instance.setup_state?.operation === 'import'
+                        ? t('instances.setup_interrupted')
+                        : t('instances.setup_incomplete')}
                     </div>
                   )}
                 </div>
@@ -230,12 +312,18 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
             className="ctx-menu"
             style={{
               left: Math.min(contextMenu.x, window.innerWidth - 200),
-              top: Math.min(contextMenu.y, window.innerHeight - 340),
+              top: Math.min(contextMenu.y, window.innerHeight - 380),
             }}
             onMouseDown={(e) => e.stopPropagation()}
           >
-            <ContextMenuItem icon={<Play size={14} fill="currentColor" />} label={t('instances.play')} disabled={isLaunching}
+            <ContextMenuItem icon={<Play size={14} fill="currentColor" />} label={t('instances.play')}
+              disabled={isLaunching || installingName === contextMenu.name || !!contextSetup}
               onClick={() => { launchGame(contextMenu.name); setContextMenu(null); }} />
+            {contextSetup?.stage === 'preparing' && (
+              <ContextMenuItem icon={<RefreshCw size={14} />} label={t('instances.setup_finish')}
+                disabled={setupBusy === contextMenu.name}
+                onClick={() => { handleFinishSetup(contextMenu.name); setContextMenu(null); }} />
+            )}
             <ContextMenuItem icon={<Settings size={14} />} label={t('instances.ctx_settings')}
               onClick={() => { setEditorName(contextMenu.name); setContextMenu(null); }} />
             <ContextMenuItem icon={<Copy size={14} />} label={t('instances.ctx_duplicate')} disabled={isLaunching}
@@ -303,7 +391,12 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
           open
           instance={editorInstance}
           onClose={() => setEditorName(null)}
-          onSaved={() => useInstanceStore.getState().loadInstances()}
+          onSaved={(newName) => {
+            const store = useInstanceStore.getState();
+            const wasSelected = store.selectedInstance === editorInstance.name;
+            store.loadInstances();
+            if (wasSelected) store.selectInstance(newName);
+          }}
         />
       )}
 

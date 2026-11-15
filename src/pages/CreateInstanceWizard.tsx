@@ -747,7 +747,6 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                           type="button"
                           className={`version-item${selectedVersion === v.id ? ' version-item--selected' : ''}`}
                           aria-pressed={selectedVersion === v.id}
-                          title={v.id}
                           onClick={() => handleVersionSelect(v.id)}
                         >
                           <span className="version-item__name">{v.id}</span>
@@ -929,6 +928,14 @@ export function CreateInstanceWizard({ open, onClose, onOpenModpacks, viaModpack
                   instanceName={importReportName}
                   retrying={retryingImport}
                   onRetry={handleRetryImport}
+                  onDismiss={() => {
+                    // The instance already exists and is usable. Closing the
+                    // wizard is the only way forward when no file can be
+                    // retried; without this the panel was a dead end.
+                    setImportReport(null);
+                    void loadInstances();
+                    onClose();
+                  }}
                 />
               )}
 

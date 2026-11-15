@@ -1,9 +1,12 @@
 mod accounts;
 mod atlauncher;
 mod auth;
+pub mod authlib_injector;
+mod bug_report;
 mod commands;
 pub mod config;
 mod content;
+mod crash_signals;
 mod curseforge;
 mod default_skin;
 mod diagnostics;
@@ -11,9 +14,12 @@ mod download;
 mod entry;
 mod error;
 mod events;
+mod external_minecraft;
 mod game_logs;
 mod i18n;
 mod import;
+mod install_progress;
+mod instance_readiness;
 pub mod instances;
 mod java;
 mod java_download;
@@ -25,10 +31,12 @@ pub mod modloaders;
 mod modrinth;
 mod packlock;
 mod playtime;
+mod recovery;
 mod rooms;
 mod running_state;
 mod server_ping;
 mod servers;
+mod single_instance;
 mod verify;
 pub mod versions;
 
@@ -42,7 +50,7 @@ use config::AppConfig;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tauri::{Manager, WindowEvent};
+use tauri::Manager;
 
 /// Global app state shared across all Tauri commands
 pub struct AppState {
@@ -74,26 +82,36 @@ pub struct PackWatcherHandle {
 /// command that downloads a file from a URL supplied by the frontend
 /// or by an upstream API, to prevent SSRF / file:// / mixed-content
 /// downgrade attacks.
+///
+/// The URL must be parsed with the same WHATWG parser reqwest uses. A manual
+/// split at `:`/`/` is not safe: `https://github.com:443@evil.example/x`
+/// would look like `github.com` to a naive parser while reqwest connects to
+/// `evil.example`. Userinfo is therefore rejected outright.
 pub(crate) fn is_allowed_download_host(url: &str) -> bool {
-    let url = url.trim();
-    if !url.to_ascii_lowercase().starts_with("https://") {
-        return false;
-    }
-    let after_scheme = &url[8..];
-    let host_end = after_scheme
-        .find(['/', ':', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let host = after_scheme[..host_end].to_ascii_lowercase();
-    if host.is_empty() {
-        return false;
-    }
-    download::is_host_allowed(&host)
+    download::validate_download_url(url).is_ok()
 }
 
 // ==================== App Builder ====================
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The launcher owns one shared data directory. Acquire the process-wide
+    // slot before the logger or config touches anything: a second process must
+    // not race repairs, downloads or instance edits. The guard lives until
+    // this function returns (i.e. for the whole Tauri event loop).
+    let _single_instance =
+        match single_instance::acquire_with_handoff(single_instance::APP_MUTEX_NAME) {
+            Ok(guard) => guard,
+            Err(single_instance::AcquireError::AlreadyRunning) => {
+                single_instance::show_already_running();
+                return;
+            }
+            Err(error) => {
+                single_instance::show_startup_error(&error.to_string());
+                return;
+            }
+        };
+
     // Panic hook: write to a known file so we can debug crashes
     let orig_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -122,7 +140,32 @@ pub fn run() {
     // renderer memory for the session (same as Prism Launcher).
     let _ = std::fs::remove_file(data_dir.join("icon_cache.json"));
 
-    download::set_global_proxy(config.proxy_url());
+    // Crash recovery: hidden `.void-setup-*.tmp` folders are never valid
+    // instances and are safe to remove. `.void-recovery-*` folders preserve
+    // an interrupted import and are reported instead of deleted.
+    let instances_dir = config.instances_dir();
+    let removed = instance_readiness::cleanup_abandoned_setup_dirs(&instances_dir);
+    if removed > 0 {
+        tracing::warn!(
+            target: "launcher",
+            "Removed {} abandoned setup folder(s) from a previous crash",
+            removed
+        );
+    }
+    for dir in instance_readiness::recovery_dirs(&instances_dir) {
+        tracing::warn!(
+            target: "launcher",
+            "Preserved data from an interrupted import: {} (kept until you remove it)",
+            dir.display()
+        );
+    }
+
+    download::set_global_proxy_policy(
+        config.proxy_enabled,
+        config.use_system_proxy(),
+        config.proxy_url(),
+        config.proxy_only,
+    );
     atlauncher::set_atl_cache_dir(config.data_dir.clone());
     modloaders::prism_meta::set_cache_dir(config.data_dir.clone());
 
@@ -241,7 +284,7 @@ pub fn run() {
         }
     }
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             events::set_app_handle(app.handle());
             Ok(())
@@ -249,6 +292,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(
@@ -288,6 +332,7 @@ pub fn run() {
             commands::versions::cmd_list_managed_java,
             commands::versions::cmd_remove_managed_java,
             commands::launcher::cmd_install_version,
+            commands::launcher::cmd_prepare_elyby_skins,
             commands::launcher::cmd_launch_game,
             commands::launcher::cmd_get_fabric_versions,
             commands::launcher::cmd_get_forge_versions,
@@ -302,11 +347,15 @@ pub fn run() {
             commands::misc::cmd_read_image_file,
             commands::misc::cmd_fetch_page_asset,
             commands::misc::cmd_check_latest_version,
+            commands::misc::cmd_apply_proxy_policy,
+            commands::misc::cmd_updater_proxy_policy,
+            commands::misc::cmd_updater_check,
             commands::misc::cmd_get_launch_state,
             commands::instances::cmd_check_instance_installed,
             commands::misc::cmd_detect_system_ram,
             commands::misc::cmd_get_installer_language,
             commands::heads::cmd_get_player_head,
+            commands::heads::cmd_invalidate_player_head,
             commands::heads::cmd_get_player_capes,
             commands::heads::cmd_set_player_cape,
             commands::mods::cmd_search_modrinth,
@@ -314,6 +363,7 @@ pub fn run() {
             commands::mods::cmd_get_modrinth_versions,
             commands::mods::cmd_get_curseforge_files,
             commands::mods::cmd_install_mod,
+            commands::mods::cmd_install_local_content,
             commands::mods::cmd_get_modrinth_project,
             commands::mods::cmd_get_modrinth_version_by_id,
             commands::mods::cmd_popular_modrinth,
@@ -340,6 +390,7 @@ pub fn run() {
             commands::launcher::cmd_emit_log,
             commands::launcher::cmd_list_game_logs,
             commands::launcher::cmd_read_game_log,
+            commands::launcher::cmd_read_game_log_incremental,
             commands::launcher::cmd_get_current_game_log,
             commands::launcher::cmd_delete_game_log,
             commands::launcher::cmd_open_instance_logs_folder,
@@ -350,8 +401,10 @@ pub fn run() {
             commands::instances::cmd_duplicate_instance,
             commands::instances::cmd_import_prism_instance,
             commands::instances::cmd_export_instance,
+            commands::export::cmd_save_export_file,
             commands::instances::cmd_probe_modpack,
             commands::instances::cmd_import_modpack,
+            commands::instances::cmd_finish_instance_setup,
             commands::instances::cmd_set_instance_icon,
             commands::instances::cmd_set_instance_banner,
             commands::instances::cmd_log_toast,
@@ -371,6 +424,8 @@ pub fn run() {
             commands::instances::cmd_delete_screenshot,
             commands::instances::cmd_read_screenshot,
             commands::instances::cmd_list_packs,
+            commands::instances::cmd_set_resource_pack_enabled,
+            commands::instances::cmd_set_resource_packs_order,
             commands::instances::cmd_get_pack_icon,
             commands::instances::cmd_watch_instance,
             commands::instances::cmd_unwatch_instance,
@@ -412,6 +467,11 @@ pub fn run() {
             commands::verify::cmd_repair_instance,
             commands::diagnostics::cmd_run_diagnostics,
             commands::diagnostics::cmd_analyze_crash,
+            commands::diagnostics::cmd_apply_crash_action,
+            commands::diagnostics::cmd_open_official_url,
+            bug_report::cmd_prepare_bug_report,
+            bug_report::cmd_get_bug_report_log,
+            bug_report::cmd_get_bug_report_crash,
             commands::servers::cmd_list_servers,
             commands::servers::cmd_add_server,
             commands::servers::cmd_update_server,
@@ -419,28 +479,104 @@ pub fn run() {
             commands::servers::cmd_ping_server,
             commands::launcher::cmd_stop_game,
         ])
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { .. } = event {
-                // Flush any active playtime session before the app exits.
-                // We do NOT call api.prevent_close() — we let the window close,
-                // but first we write the unpaid minutes to disk synchronously.
-                let state: tauri::State<'_, AppState> = window.state();
-                let now = Instant::now();
-                let flushed = playtime::flush_all_sessions(
-                    &state.active_sessions,
-                    &{
-                        match state.config.lock() {
-                            Ok(cfg) => cfg.data_dir.clone(),
-                            Err(_) => std::path::PathBuf::new(),
-                        }
-                    },
-                    now,
-                );
-                if flushed > 0 {
-                    tracing::info!(target: "launcher", "Flushed {} playtime session(s) on close", flushed);
-                }
-            }
-        })
-        .run(tauri::generate_context!())
-        .expect("Error while running VoidLauncher");
+        .build(tauri::generate_context!())
+        .expect("Error while building VoidLauncher");
+
+    // Playtime must be finalized only when the application really exits.
+    // `CloseRequested` is not final: the JS close guard may prevent the close
+    // (unsaved changes) or the user may cancel the confirmation. Flushing
+    // there would drain the live sessions and stop counting the running game.
+    app.run(|app_handle, event| {
+        if should_flush_playtime_on_run_event(&event) {
+            flush_playtime_on_exit(app_handle);
+        }
+    });
+}
+
+/// The final application-exit event is the only point where active playtime
+/// sessions may be drained.
+fn should_flush_playtime_on_run_event(event: &tauri::RunEvent) -> bool {
+    matches!(event, tauri::RunEvent::Exit)
+}
+
+/// Commit every still-active playtime session exactly once at app exit.
+fn flush_playtime_on_exit(app_handle: &tauri::AppHandle) {
+    let state: tauri::State<'_, AppState> = app_handle.state();
+    let data_dir = match state.config.lock() {
+        Ok(config) => config.data_dir.clone(),
+        Err(_) => return,
+    };
+    let flushed = playtime::flush_all_sessions(&state.active_sessions, &data_dir, Instant::now());
+    if flushed > 0 {
+        tracing::info!(
+            target: "launcher",
+            "Flushed {} playtime session(s) on exit",
+            flushed
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_lifecycle_tests {
+    use super::should_flush_playtime_on_run_event;
+
+    #[test]
+    fn playtime_is_flushed_only_on_application_exit() {
+        assert!(should_flush_playtime_on_run_event(&tauri::RunEvent::Exit));
+        assert!(!should_flush_playtime_on_run_event(&tauri::RunEvent::Ready));
+        assert!(!should_flush_playtime_on_run_event(
+            &tauri::RunEvent::MainEventsCleared
+        ));
+    }
+}
+
+#[cfg(test)]
+mod download_host_tests {
+    use super::is_allowed_download_host;
+
+    #[test]
+    fn accepts_allowlisted_https_hosts() {
+        assert!(is_allowed_download_host(
+            "https://cdn.modrinth.com/data/project/version/file.jar"
+        ));
+        assert!(is_allowed_download_host(
+            "https://raw.githubusercontent.com/owner/repo/main/file.jar"
+        ));
+        assert!(is_allowed_download_host(
+            "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+        ));
+    }
+
+    #[test]
+    fn rejects_userinfo_host_confusion() {
+        // `github.com:443` is userinfo; reqwest would connect to evil.example.
+        assert!(!is_allowed_download_host(
+            "https://github.com:443@evil.example/payload"
+        ));
+        assert!(!is_allowed_download_host(
+            "https://cdn.modrinth.com@evil.example/payload"
+        ));
+    }
+
+    #[test]
+    fn rejects_backslash_and_suffix_lookalikes() {
+        assert!(!is_allowed_download_host(
+            "https://evil.example\\.github.com/payload"
+        ));
+        assert!(!is_allowed_download_host(
+            "https://cdn.modrinth.com.evil.example/payload"
+        ));
+        assert!(!is_allowed_download_host(
+            "https://evilcdn.modrinth.com/payload"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_https_and_malformed_urls() {
+        assert!(!is_allowed_download_host(
+            "http://cdn.modrinth.com/file.jar"
+        ));
+        assert!(!is_allowed_download_host("file:///C:/Windows/System32"));
+        assert!(!is_allowed_download_host("not a url"));
+    }
 }

@@ -28,7 +28,7 @@ pub struct PeerInfo {
 }
 
 /// The resolved host endpoint used for joining and for the VoidLink bridge.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostInfo {
     pub node_key: String,
     pub host_name: String,

@@ -297,7 +297,7 @@ async fn download_installer(
 fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
     let mut libraries = Vec::new();
     for lib in &profile.libraries {
-        let (url, path) = if let Some(downloads) = &lib.downloads {
+        let (url, path, sha1, size) = if let Some(downloads) = &lib.downloads {
             if let Some(artifact) = &downloads.artifact {
                 let lib_path = artifact
                     .path
@@ -307,7 +307,12 @@ fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
                     .url
                     .clone()
                     .unwrap_or_else(|| format!("https://maven.neoforged.net/{}", lib_path));
-                (lib_url, lib_path)
+                (
+                    lib_url,
+                    lib_path,
+                    artifact.sha1.clone().filter(|s| !s.is_empty()),
+                    artifact.size,
+                )
             } else {
                 let path = maven_to_path(&lib.name);
                 let base = lib
@@ -319,7 +324,7 @@ fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
                 } else {
                     format!("{}/", base)
                 };
-                (format!("{}{}", base, path), path)
+                (format!("{}{}", base, path), path, None, None)
             }
         } else {
             let path = maven_to_path(&lib.name);
@@ -332,15 +337,15 @@ fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
             } else {
                 format!("{}/", base)
             };
-            (format!("{}{}", base, path), path)
+            (format!("{}{}", base, path), path, None, None)
         };
 
         libraries.push(LoaderLibrary {
             name: lib.name.clone(),
             url,
             path,
-            sha1: None,
-            size: None,
+            sha1,
+            size,
         });
     }
 

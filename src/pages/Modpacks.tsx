@@ -10,6 +10,10 @@ import { SlidingTabs } from '../components/ui/SlidingTabs';
 import { useT } from '../lib/i18n';
 import { useModpacksStore, type ModpacksTab, type MrHit, type CfHit, type AtlPack } from '../stores/modpacksStore';
 import { formatBytes, formatDownloads } from '../lib/format';
+import {
+  fileProgressPercent,
+  importProgressPercent,
+} from '../lib/downloadProgress';
 import { useSettingsStore } from '../stores/settingsStore';
 import { useRemoteImage, IconShine } from '../lib/remoteImage';
 import { ImportReportPanel } from '../components/import/ImportReportPanel';
@@ -69,29 +73,42 @@ function InstallProgressPanel({ installing, paused }: { installing: boolean; pau
     return msg;
   };
 
-  const fileHint = fileProgress && fileProgress.total > 0 ? (
+  const fileHint = fileProgress && fileProgress.downloaded > 0 ? (
     <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 4 }}>
-      {t('modpacks.file_progress', {
-        bytes: formatBytes(fileProgress.downloaded),
-        total: formatBytes(fileProgress.total),
-        percent: String(Math.round((fileProgress.downloaded / fileProgress.total) * 100)),
-      })}
+      {fileProgress.total != null && fileProgress.total > 0
+        ? t('modpacks.file_progress', {
+            bytes: formatBytes(fileProgress.downloaded),
+            total: formatBytes(fileProgress.total),
+            percent: String(Math.round(fileProgressPercent(fileProgress.downloaded, fileProgress.total) ?? 0)),
+          })
+        : t('modpacks.file_progress_unknown', {
+            bytes: formatBytes(fileProgress.downloaded),
+          })}
     </div>
   ) : null;
+
+  const progressPercent = progress
+    ? importProgressPercent(
+        progress,
+        progress.stage === 'files' || progress.stage === 'assets'
+          ? (fileProgress?.downloaded ?? 0)
+          : 0,
+      )
+    : null;
 
   return (
     <div style={{ marginTop: 'var(--space-md)' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', marginBottom: 4 }}>
         <span>{paused ? t('modpacks.paused') : (progress ? progressLabel(progress.stage, progress.message) : t('modpacks.installing'))}</span>
-        <span>{progress && progress.total > 0 ? `${Math.round((progress.current / progress.total) * 100)}%` : ''}</span>
+        <span>{progressPercent != null ? `${Math.round(progressPercent)}%` : ''}</span>
       </div>
       <div className="progress-track">
         <div className="progress-fill" style={{
           height: '100%',
-          width: progress && progress.total > 0 ? `${Math.min(100, (progress.current / progress.total) * 100)}%` : '100%',
+          width: progressPercent != null ? `${progressPercent}%` : '100%',
           background: paused ? 'var(--text-tertiary)' : 'var(--primary)',
           transition: 'width 0.2s ease',
-          animation: !paused && (!progress || progress.total === 0) ? 'indeterminate 1.2s ease-in-out infinite' : undefined,
+          animation: !paused && progressPercent == null ? 'indeterminate 1.2s ease-in-out infinite' : undefined,
         }} />
       </div>
       {!paused && fileHint}
@@ -170,10 +187,20 @@ export function Modpacks() {
   // state itself lives in the store so it survives page switches.
   useEffect(() => {
     const unsubs: (() => void)[] = [];
-    listen<any>('modpack_fetch_retry', (event) => store.onFetchRetry(event.payload)).then((fn) => unsubs.push(fn)).catch(() => {});
-    listen<any>('modpack_file_progress', (event) => store.onFileProgress(event.payload)).then((fn) => unsubs.push(fn)).catch(() => {});
-    listen<any>('import-progress', (event) => store.onImportProgress(event.payload)).then((fn) => unsubs.push(fn)).catch(() => {});
-    return () => { unsubs.forEach((fn) => fn()); };
+    let dead = false;
+    const register = (p: Promise<() => void>) => {
+      p.then((fn) => {
+        if (dead) fn();
+        else unsubs.push(fn);
+      }).catch(() => {});
+    };
+    register(listen<any>('modpack_fetch_retry', (event) => store.onFetchRetry(event.payload)));
+    register(listen<any>('modpack_file_progress', (event) => store.onFileProgress(event.payload)));
+    register(listen<any>('import-progress', (event) => store.onImportProgress(event.payload)));
+    return () => {
+      dead = true;
+      unsubs.forEach((fn) => fn());
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -529,7 +556,7 @@ export function Modpacks() {
 
       <div className="modpacks-main" style={{ display: 'flex', gap: 'var(--space-lg)', height: 'calc(100vh - 260px)', minHeight: 320 }}>
         {/* Results list */}
-        <div style={{ flex: 1, overflowY: 'auto', paddingRight: 2 }}>
+        <div className="modpacks-results" style={{ flex: 1, overflowY: 'auto', paddingRight: 2 }}>
           {loading && (
             <div>
               <ResultListSkeleton variant="card" rows={6} />
