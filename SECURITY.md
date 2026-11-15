@@ -19,22 +19,19 @@ version before reporting it.
 
 **Do not open a public issue for a security vulnerability.**
 
-If the repository has private vulnerability reporting enabled, use it:
+VoidLauncher uses GitHub's private vulnerability reporting:
 
 1. Open the repository's **Security** tab.
 2. Select **Report a vulnerability**.
-3. Describe the issue and submit the advisory.
+3. Describe the issue and submit the advisory privately.
 
-If the **Report a vulnerability** button is not available, private reporting has
-not been enabled yet. In that case, contact the maintainer
+If the **Report a vulnerability** button is not available, contact the maintainer
 [@veb898-cyber](https://github.com/veb898-cyber) through GitHub and ask for a
 private channel before sharing any details. Do not include exploit details in a
 public issue, discussion, pull request or social-media message.
 
-> **Maintainer note:** enable
-> **Settings → Code security and analysis → Private vulnerability reporting**
-> before announcing the private reporting link. The button is a repository
-> setting, not something this document can turn on.
+This security policy explains the reporting process; the private reporting
+setting itself is managed in the repository settings.
 
 ## What to include
 
