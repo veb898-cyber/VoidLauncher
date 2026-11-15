@@ -442,7 +442,6 @@ export function ServersManager({ instanceName }: Props) {
           size="sm"
           onClick={openAdd}
           disabled={instanceRunning}
-          title={instanceRunning ? t('servers.locked_running') : undefined}
           style={{ flexShrink: 0 }}
         >
           <Plus size={14} /> {t('servers.add')}
