@@ -260,22 +260,28 @@ Actions workflow runs the same test.
 5. Keep the PR up to date with `main`; do not force-push a branch that someone
    is reviewing unless the maintainer asks for it.
 6. A maintainer will review the change, may request tests or documentation, and
-   will merge it when CI is green.
+   will merge it once the required `Windows checks` status is green.
 
 Do not bump the project version in a normal contribution. Version bumps, tags,
 installer signing and releases are maintainer tasks.
 
-The pull-request workflow is `.github/workflows/ci.yml` and its job is named
-`Windows checks` (job id `check`). A maintainer should require that status check
-in the `main` branch protection rule after the workflow has run at least once.
+Pull requests are validated by `.github/workflows/ci.yml`. Its job is named
+`Windows checks` (job id `check`) and runs on Windows. `Windows checks` is a
+required status check for merging into `main`: a pull request cannot be merged
+while it is failing. All changes to `main` are published through pull requests;
+direct pushes are blocked by the repository ruleset.
 
 ## Release process (maintainers)
 
 Releases are built by the `publish.yml` workflow from a `vX.Y.Z` tag. The tag
 must match `package.json`, `src-tauri/tauri.conf.json` and
 `src-tauri/Cargo.toml`; the workflow refuses to build otherwise. The workflow
-also signs the installer, uploads it to the GitHub release and updates
-`latest.json` on `main` for the auto-updater.
+also signs the installer and uploads it to the GitHub release.
+
+The same workflow contains a step that updates `latest.json` on `main` for the
+auto-updater. Because `main` requires a pull request, verify that the manifest
+was actually updated after a release; if the direct update is blocked, publish
+it through a pull request instead of bypassing the ruleset.
 
 Signing keys and passwords are stored outside the repository (local key files
 or GitHub Actions secrets). Never commit them, print them in a workflow log or

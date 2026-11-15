@@ -90,8 +90,15 @@ describe('contributor documentation', () => {
     expect(security).toContain('Report a vulnerability');
     expect(security).toContain('Supported versions');
     expect(security).toContain('Do not open a public issue');
-    expect(security).toContain('private reporting has');
-    expect(security).toContain('Private vulnerability reporting');
+    expect(security).toContain('private vulnerability reporting');
+    expect(security).toContain('repository settings');
+    expect(security).not.toContain('Maintainer note');
+  });
+
+  it('describes the protected main workflow without stale setup advice', () => {
+    expect(contributing).toContain('required status check for merging into `main`');
+    expect(contributing).toContain('runs on Windows');
+    expect(contributing).not.toContain('after the workflow has run at least once');
   });
 
   it('keeps the branch-protection check name aligned with the workflow', () => {
