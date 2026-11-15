@@ -743,7 +743,7 @@ pub(crate) fn extract_zip_to_dir_budgeted(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
-        let entry_name = entry.name().to_string();
+        let entry_name = entry.name()?.to_string();
         if entry.is_dir() {
             continue;
         }
@@ -1033,7 +1033,10 @@ pub(crate) fn curseforge_overrides_prefix(manifest: &serde_json::Value) -> Resul
 
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
-fn read_zip_entry_text(entry: &mut zip::read::ZipFile<'_>, limit: u64) -> Option<String> {
+fn read_zip_entry_text<R: Read + ?Sized>(
+    entry: &mut zip::read::ZipFile<'_, R>,
+    limit: u64,
+) -> Option<String> {
     if entry.size() > limit {
         return None;
     }
@@ -1059,7 +1062,12 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
     check_archive_entry_count(archive.len())?;
 
     let names: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
+        .filter_map(|i| {
+            archive
+                .by_index(i)
+                .ok()
+                .and_then(|entry| entry.name().ok().map(|name| name.into_owned()))
+        })
         .collect();
 
     // Check Prism/MultiMC
@@ -1067,7 +1075,7 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         let mut cfg = String::new();
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
-                if entry.name() == "instance.cfg" {
+                if entry.name().ok().as_deref() == Some("instance.cfg") {
                     cfg = read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
                     break;
                 }
@@ -1093,7 +1101,7 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         let mut index_str = String::new();
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
-                if entry.name() == "modrinth.index.json" {
+                if entry.name().ok().as_deref() == Some("modrinth.index.json") {
                     index_str =
                         read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
                     break;
@@ -1126,7 +1134,7 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         let mut manifest_str = String::new();
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
-                if entry.name() == "manifest.json" {
+                if entry.name().ok().as_deref() == Some("manifest.json") {
                     manifest_str =
                         read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
                     break;
@@ -1164,7 +1172,7 @@ pub fn probe_modpack(path: &str) -> Result<ModpackMetadata> {
         let mut inst_str = String::new();
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
-                if entry.name() == "instance.json" {
+                if entry.name().ok().as_deref() == Some("instance.json") {
                     inst_str =
                         read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
                     break;
@@ -1319,7 +1327,12 @@ pub(crate) async fn import_modpack_reserved<'a>(
     let format = {
         let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
         let names: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
+            .filter_map(|i| {
+                archive
+                    .by_index(i)
+                    .ok()
+                    .and_then(|entry| entry.name().ok().map(|name| name.into_owned()))
+            })
             .collect();
         if names.iter().any(|n| n == "instance.cfg") {
             ModpackFormat::Prism
@@ -2440,7 +2453,7 @@ fn extract_mrpack_layers(
             let mut entry = archive
                 .by_index(i)
                 .map_err(|e| LauncherError::Instance(e.to_string()))?;
-            let entry_name = entry.name().to_string();
+            let entry_name = entry.name()?.to_string();
 
             if entry_name == "modrinth.index.json"
                 || entry_name.starts_with("overrides-server/")
@@ -2523,7 +2536,7 @@ pub(crate) async fn import_mrpack(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
-        if entry.name() == "modrinth.index.json" {
+        if entry.name().ok().as_deref() == Some("modrinth.index.json") {
             index_str = read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
             found = true;
             break;
@@ -2970,7 +2983,7 @@ pub(crate) async fn import_curseforge_pack(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
-        if entry.name() == "manifest.json" {
+        if entry.name().ok().as_deref() == Some("manifest.json") {
             manifest_str = read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
             found = true;
             break;
@@ -3028,7 +3041,7 @@ pub(crate) async fn import_curseforge_pack(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
-        let entry_name = entry.name().to_string();
+        let entry_name = entry.name()?.to_string();
 
         if entry_name == "manifest.json" {
             continue;
@@ -3419,8 +3432,8 @@ fn atl_strip_folder(entry_name: &str, folder: &[String]) -> Option<String> {
     Some(parts[folder.len()..].join("/"))
 }
 
-fn atl_copy_entry_to_file(
-    entry: &mut zip::read::ZipFile<'_>,
+fn atl_copy_entry_to_file<R: Read + ?Sized>(
+    entry: &mut zip::read::ZipFile<'_, R>,
     dest: &Path,
     max_bytes: u64,
 ) -> Result<()> {
@@ -3550,7 +3563,7 @@ pub(crate) fn atl_extract_mod_archive(
         if entry.is_dir() {
             continue;
         }
-        let entry_name = entry.name().to_string();
+        let entry_name = entry.name()?.to_string();
         check_safe_relative(&entry_name)?;
         // For `extract`, upstream copies only the extractFolder subtree; the
         // folder is a path inside the archive, not a destination folder.
@@ -3600,7 +3613,7 @@ fn import_atlauncher_pack(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
-        if entry.name() == "instance.json" {
+        if entry.name().ok().as_deref() == Some("instance.json") {
             inst_str = read_zip_entry_text(&mut entry, MAX_MANIFEST_BYTES).unwrap_or_default();
             break;
         }
@@ -3654,7 +3667,7 @@ fn import_atlauncher_pack(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
-        let entry_name = entry.name().to_string();
+        let entry_name = entry.name()?.to_string();
         if entry_name == "instance.json" || entry.is_dir() {
             continue;
         }
@@ -4206,6 +4219,48 @@ mod tests {
             "got: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn zip_extraction_rejects_traversal_entries_before_they_escape() {
+        // Regression for the ZIP 9 migration: entry names are fallible now and
+        // must still be validated before anything is written outside `dest`.
+        let zip = temp_probe_zip(
+            &format!("traversal_{}.zip", uuid::Uuid::new_v4().simple()),
+            &[("safe.txt", b"safe"), ("../escaped.txt", b"evil")],
+        );
+        let dest = layered_test_dir("traversal_extract");
+        let mut budget = ExtractBudget::with_limits(100, 100);
+        let error = extract_zip_to_dir_budgeted(&zip, &dest, &mut budget).unwrap_err();
+        assert!(
+            !error.to_string().is_empty(),
+            "a traversal entry must produce a clean error"
+        );
+        assert!(
+            !dest.parent().unwrap().join("escaped.txt").exists(),
+            "traversal entry must not escape the destination"
+        );
+        assert_eq!(std::fs::read(dest.join("safe.txt")).unwrap(), b"safe");
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    #[test]
+    fn zip_extraction_rejects_duplicate_destination_paths() {
+        let zip = temp_probe_zip(
+            &format!("duplicate_{}.zip", uuid::Uuid::new_v4().simple()),
+            &[("mods/A.jar", b"one"), ("mods/./A.jar", b"two")],
+        );
+        let dest = layered_test_dir("duplicate_extract");
+        let mut budget = ExtractBudget::with_limits(100, 100);
+        let error = extract_zip_to_dir_budgeted(&zip, &dest, &mut budget).unwrap_err();
+        assert!(
+            error.to_string().contains("Duplicate or conflicting"),
+            "got: {error}"
+        );
+        assert_eq!(std::fs::read(dest.join("mods/A.jar")).unwrap(), b"one");
+        let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_file(&zip);
     }
 

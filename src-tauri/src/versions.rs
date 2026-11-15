@@ -1249,7 +1249,7 @@ fn extract_natives_into(
                     e
                 ))
             })?;
-            let name = entry.name().replace('\\', "/");
+            let name = entry.name()?.replace('\\', "/");
             if name.starts_with("META-INF/") || name.ends_with('/') || name == NATIVES_MANIFEST {
                 continue;
             }

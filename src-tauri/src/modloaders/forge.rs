@@ -293,7 +293,9 @@ pub(crate) fn read_entry_from_jar<R: Read + std::io::Seek>(
 ) -> Option<String> {
     for i in 0..archive.len() {
         if let Ok(mut entry) = archive.by_index(i) {
-            let entry_name = entry.name().replace('\\', "/");
+            let Some(entry_name) = entry.name().ok().map(|name| name.replace('\\', "/")) else {
+                continue;
+            };
             if entry_name == name || entry_name.ends_with(&format!("/{}", name)) {
                 let mut content = String::new();
                 entry.read_to_string(&mut content).ok()?;
@@ -312,7 +314,9 @@ pub(crate) fn extract_entry_from_jar<R: Read + std::io::Seek>(
 ) -> bool {
     for i in 0..archive.len() {
         if let Ok(mut entry) = archive.by_index(i) {
-            let entry_name = entry.name().replace('\\', "/");
+            let Some(entry_name) = entry.name().ok().map(|name| name.replace('\\', "/")) else {
+                continue;
+            };
             if entry_name == name || entry_name.ends_with(&format!("/{}", name)) {
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent).ok();
@@ -1367,7 +1371,9 @@ fn extract_embedded_forge_jars<R: Read + std::io::Seek>(
     let embedded_maven_base = "maven/net/minecraftforge/forge";
     for i in 0..archive.len() {
         if let Ok(mut entry) = archive.by_index(i) {
-            let entry_name = entry.name().replace('\\', "/");
+            let Some(entry_name) = entry.name().ok().map(|name| name.replace('\\', "/")) else {
+                continue;
+            };
             if entry_name.starts_with(embedded_maven_base) && entry_name.ends_with(".jar") {
                 // Refuse path traversal: only entries that stay under the
                 // "maven/" root of the libraries dir may be written.

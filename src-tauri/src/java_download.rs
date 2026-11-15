@@ -721,7 +721,7 @@ fn extract_archive(archive_path: &Path, dest_dir: &Path) -> Result<()> {
             .by_index(i)
             .map_err(|e| LauncherError::Download(format!("Archive entry error: {}", e)))?;
 
-        let full_name = entry.name().to_string();
+        let full_name = entry.name()?.to_string();
 
         // Strip top-level directory from the path
         let relative = match full_name.split_once('/') {

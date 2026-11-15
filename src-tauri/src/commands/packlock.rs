@@ -2152,7 +2152,10 @@ async fn update_curseforge(
             let mut entry = archive
                 .by_index(i)
                 .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-            let name = entry.name().to_string();
+            let name = entry
+                .name()
+                .map(|name| name.into_owned())
+                .map_err(|error| format!("Cannot read pack entry name: {error}"))?;
             let Some(rel) = name.strip_prefix(&overrides_prefix) else {
                 continue;
             };
@@ -2273,7 +2276,10 @@ fn stage_repair_overrides(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map(|name| name.into_owned())
+            .map_err(|error| format!("Cannot read pack entry name: {error}"))?;
         let Some(rel) = prefix.relative(&name) else {
             continue;
         };
@@ -2338,7 +2344,10 @@ fn stage_mrpack_repair_overrides(
         let entry = archive
             .by_index(i)
             .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map(|name| name.into_owned())
+            .map_err(|error| format!("Cannot read pack entry name: {error}"))?;
         let Some(rel) = crate::import::extract_mrpack_override(&name) else {
             continue;
         };
@@ -2650,7 +2659,10 @@ fn stage_mrpack_overrides(
             let mut entry = archive
                 .by_index(i)
                 .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-            let name = entry.name().to_string();
+            let name = entry
+                .name()
+                .map(|name| name.into_owned())
+                .map_err(|error| format!("Cannot read pack entry name: {error}"))?;
             let Some(rel) = crate::import::extract_mrpack_override(&name) else {
                 continue;
             };
@@ -2693,7 +2705,10 @@ fn read_embedded_files(
         let entry = archive
             .by_index(i)
             .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map(|name| name.into_owned())
+            .map_err(|error| format!("Cannot read pack entry name: {error}"))?;
         if name == "modrinth.index.json"
             || name.starts_with("overrides-server/")
             || name.starts_with("server-overrides/")

@@ -240,7 +240,7 @@ async fn download_installer(
     let mut version_json_str = String::new();
     for i in 0..archive.len() {
         if let Ok(mut entry) = archive.by_index(i) {
-            if entry.name() == "install_profile.json" {
+            if entry.name().ok().as_deref() == Some("install_profile.json") {
                 entry
                     .read_to_string(&mut install_profile_str)
                     .map_err(|e| {
@@ -249,7 +249,7 @@ async fn download_installer(
                             e
                         ))
                     })?;
-            } else if entry.name() == "version.json" {
+            } else if entry.name().ok().as_deref() == Some("version.json") {
                 entry.read_to_string(&mut version_json_str).map_err(|e| {
                     LauncherError::ModLoader(format!("Failed to read version.json: {}", e))
                 })?;
@@ -597,7 +597,7 @@ pub async fn install(
         let mut s = String::new();
         for i in 0..archive.len() {
             if let Ok(mut entry) = archive.by_index(i) {
-                if entry.name() == "install_profile.json" {
+                if entry.name().ok().as_deref() == Some("install_profile.json") {
                     entry.read_to_string(&mut s).map_err(|e| {
                         LauncherError::ModLoader(format!(
                             "Failed to read install_profile.json: {}",
