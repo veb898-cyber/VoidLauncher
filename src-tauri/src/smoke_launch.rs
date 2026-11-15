@@ -497,7 +497,10 @@ async fn ensure_java(data_dir: &Path, major: u32) -> Result<(), String> {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("zip entry {}: {}", i, e))?;
-        let raw_name = entry.name().replace('\\', "/");
+        let raw_name = entry
+            .name()
+            .map_err(|e| format!("zip entry {}: {}", i, e))?
+            .replace('\\', "/");
         let is_dir = raw_name.ends_with('/') || raw_name.ends_with('\\');
         let parts: Vec<&str> = raw_name.split('/').filter(|p| !p.is_empty()).collect();
         if parts.is_empty() || is_dir {

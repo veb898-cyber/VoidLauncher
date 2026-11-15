@@ -2511,7 +2511,7 @@ fn read_pack_icon_from_zip(path: &std::path::Path) -> Option<String> {
         .filter_map(|i| {
             let e = archive.by_index(i).ok()?;
             let is_dir = e.is_dir();
-            let name = e.name().to_string();
+            let name = e.name().ok()?.into_owned();
             Some((name, is_dir))
         })
         .collect();
@@ -3084,7 +3084,7 @@ fn read_prism_pack_meta(zip_path: &Path) -> Result<PrismPackMeta> {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| LauncherError::Instance(e.to_string()))?;
-        let entry_name = entry.name().to_string();
+        let entry_name = entry.name()?.to_string();
         // Preflight every entry before the target directory is created: an
         // archive with a traversal path must fail cleanly.
         if crate::import::check_safe_relative(&entry_name).is_err() {
@@ -3288,7 +3288,7 @@ fn import_prism_pack_into(
                 continue;
             }
 
-            let entry_name = entry.name().to_string();
+            let entry_name = entry.name()?.to_string();
             // Reject traversal, absolute/rooted paths and drive prefixes before
             // mapping the entry into the target instance.
             if crate::import::check_safe_relative(&entry_name).is_err() {
@@ -4214,7 +4214,7 @@ fn extract_zip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Res
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().replace('\\', "/");
+        let name = entry.name()?.replace('\\', "/");
         if name.is_empty()
             || name.contains('\0')
             || name.contains(':')
@@ -5499,7 +5499,15 @@ version = 'hIibTfxn'
         let file = std::fs::File::open(&out).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .unwrap()
+                    .name()
+                    .ok()
+                    .map(|name| name.into_owned())
+                    .unwrap_or_default()
+            })
             .collect();
 
         assert!(names.contains(&"instance.cfg".to_string()), "{:?}", names);
@@ -6452,7 +6460,15 @@ version = 'hIibTfxn'
         let file = std::fs::File::open(path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().replace('\\', "/"))
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .unwrap()
+                    .name()
+                    .ok()
+                    .map(|name| name.replace('\\', "/"))
+                    .unwrap_or_default()
+            })
             .collect()
     }
 

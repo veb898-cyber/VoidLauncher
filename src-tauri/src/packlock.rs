@@ -361,7 +361,7 @@ pub fn pack_zip_info(zip_path: &Path) -> Result<PackArchiveInfo, String> {
             let mut entry = archive
                 .by_index(i)
                 .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-            if entry.name() == "manifest.json" {
+            if entry.name().ok().as_deref() == Some("manifest.json") {
                 entry
                     .read_to_string(&mut manifest_str)
                     .map_err(|e| format!("Cannot read manifest.json: {}", e))?;
@@ -388,7 +388,10 @@ pub fn pack_zip_info(zip_path: &Path) -> Result<PackArchiveInfo, String> {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map(|name| name.into_owned())
+            .map_err(|error| format!("Cannot read pack entry name: {error}"))?;
         if entry.is_dir() {
             continue;
         }
@@ -438,7 +441,7 @@ pub fn mrpack_zip_info(zip_path: &Path) -> Result<PackArchiveInfo, String> {
             let mut entry = archive
                 .by_index(i)
                 .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-            if entry.name() == "modrinth.index.json" {
+            if entry.name().ok().as_deref() == Some("modrinth.index.json") {
                 entry
                     .read_to_string(&mut index_str)
                     .map_err(|e| format!("Cannot read modrinth.index.json: {}", e))?;
@@ -464,7 +467,10 @@ pub fn mrpack_zip_info(zip_path: &Path) -> Result<PackArchiveInfo, String> {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| format!("Cannot read pack entry: {}", e))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map(|name| name.into_owned())
+            .map_err(|error| format!("Cannot read pack entry name: {error}"))?;
         if entry.is_dir() {
             continue;
         }
@@ -733,7 +739,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zw.start_file("manifest.json", opts).unwrap();
             let m = manifest(&[("5", "50")]).to_string();
             zw.write_all(m.as_bytes()).unwrap();
@@ -762,7 +768,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            let opts = zip::write::SimpleFileOptions::default();
             zw.start_file("modrinth.index.json", opts).unwrap();
             let idx = mrpack(&[mrpack_entry("p1", "v1", "mods/a.jar")]).to_string();
             zw.write_all(idx.as_bytes()).unwrap();

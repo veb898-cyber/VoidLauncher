@@ -985,6 +985,17 @@ fn content_root_marker(content_type: &str, name: &str) -> bool {
     }
 }
 
+fn archive_entry_name<R: std::io::Read + ?Sized>(
+    entry: &zip::read::ZipFile<'_, R>,
+) -> Result<String, LocalImportError> {
+    entry.name().map(|name| name.into_owned()).map_err(|error| {
+        LocalImportError::new(
+            "invalidArchive",
+            format!("Invalid archive entry name: {error}"),
+        )
+    })
+}
+
 fn normalized_archive_entry_name(raw: &str) -> Result<Option<String>, LocalImportError> {
     let name = raw.replace('\\', "/");
     let name = name.trim_start_matches("./");
@@ -1052,7 +1063,8 @@ fn inspect_pack_archive(
         if entry.is_dir() {
             continue;
         }
-        let Some(name) = normalized_archive_entry_name(entry.name())? else {
+        let raw_name = archive_entry_name(&entry)?;
+        let Some(name) = normalized_archive_entry_name(&raw_name)? else {
             continue;
         };
         let size = entry.size();
@@ -1210,7 +1222,8 @@ fn write_normalized_archive(
             if entry.is_dir() {
                 continue;
             }
-            let Some(name) = normalized_archive_entry_name(entry.name())? else {
+            let raw_name = archive_entry_name(&entry)?;
+            let Some(name) = normalized_archive_entry_name(&raw_name)? else {
                 continue;
             };
             let relative = match flatten_prefix {
@@ -1369,7 +1382,13 @@ fn validate_mod_archive(path: &std::path::Path) -> Result<(), LocalImportError> 
         if size > MAX_LOCAL_ARCHIVE_ENTRY_BYTES {
             return Err(LocalImportError::new(
                 "archiveTooLarge",
-                format!("JAR entry is too large: {}", entry.name()),
+                format!(
+                    "JAR entry is too large: {}",
+                    entry
+                        .name()
+                        .map(|name| name.into_owned())
+                        .unwrap_or_default()
+                ),
             ));
         }
         total = total.saturating_add(size);
@@ -1388,7 +1407,13 @@ fn validate_mod_archive(path: &std::path::Path) -> Result<(), LocalImportError> 
             let read = entry.read(&mut buffer).map_err(|error| {
                 LocalImportError::new(
                     "invalidArchive",
-                    format!("Cannot read JAR entry {}: {error}", entry.name()),
+                    format!(
+                        "Cannot read JAR entry {}: {error}",
+                        entry
+                            .name()
+                            .map(|name| name.into_owned())
+                            .unwrap_or_default()
+                    ),
                 )
             })?;
             if read == 0 {
@@ -3993,7 +4018,12 @@ fn read_nested_jar_meta<R: std::io::Read + std::io::Seek>(
 ) -> Option<ModMetaResult> {
     const MAX_NESTED_JAR_BYTES: u64 = 64 * 1024 * 1024;
     let candidates: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter_map(|i| {
+            archive
+                .by_index(i)
+                .ok()
+                .and_then(|file| file.name().ok().map(|name| name.into_owned()))
+        })
         .filter(|name| {
             (name.starts_with("META-INF/jarjar/") || name.starts_with("META-INF/jars/"))
                 && name.ends_with(".jar")
@@ -4934,7 +4964,10 @@ fn extract_icon_from_jar(
     // Scan all entries for icon-like files
     for i in 0..archive.len() {
         if let Ok(entry) = archive.by_index(i) {
-            let name = entry.name().to_string();
+            let name = entry
+                .name()
+                .map(|name| name.into_owned())
+                .unwrap_or_default();
             let lower = name.to_lowercase();
             if (lower.ends_with("icon.png")
                 || lower.ends_with("logo.png")
@@ -6430,10 +6463,13 @@ displayName="Autochef's Delight"
         let mut archive = zip::ZipArchive::new(file).unwrap();
         (0..archive.len())
             .filter_map(|index| {
-                archive
-                    .by_index(index)
-                    .ok()
-                    .map(|entry| entry.name().to_string())
+                archive.by_index(index).ok().map(|entry| {
+                    entry
+                        .name()
+                        .ok()
+                        .map(|name| name.into_owned())
+                        .unwrap_or_default()
+                })
             })
             .collect()
     }
