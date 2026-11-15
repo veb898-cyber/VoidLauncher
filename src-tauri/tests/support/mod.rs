@@ -431,13 +431,19 @@ pub fn assert_golden(name: &str, fixture: &Fixture, args: &[String]) {
         return;
     }
 
-    let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "read golden {}: {}\nrun with UPDATE_GOLDEN=1 to generate it",
-            path.display(),
-            e
-        )
-    });
+    let expected = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| {
+            panic!(
+                "read golden {}: {}\nrun with UPDATE_GOLDEN=1 to generate it",
+                path.display(),
+                e
+            )
+        })
+        // Git can check out text fixtures with CRLF when `core.autocrlf` is
+        // enabled on Windows. The golden content itself is always generated
+        // with LF, so normalize the checkout before comparing. `.gitattributes`
+        // keeps new checkouts LF; this keeps existing clones stable too.
+        .replace("\r\n", "\n");
     assert_eq!(
         text,
         expected,

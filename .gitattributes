@@ -1,0 +1,29 @@
+# VoidLauncher is developed primarily on Windows, but CI and contributors use
+# different Git line-ending settings. Keep text files LF in every checkout so
+# golden files, compiled source and test assertions are byte-stable.
+* text=auto eol=lf
+
+# Windows-native launchers must keep CRLF when opened in cmd.exe.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never be normalized or merged as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.jar binary
+*.zip binary
+*.gz binary
+*.exe binary
+*.msi binary
+*.dll binary
+*.so binary
+*.dylib binary
