@@ -6,6 +6,7 @@ import {
   buildManifest,
   compareVersions,
   parseTag,
+  parseVersion,
   serializeManifest,
   validateInstallerUrl,
   validateManifest,
@@ -55,6 +56,51 @@ test("rejects malformed release tags", () => {
   for (const tag of ["1.6.0", "v1.6", "v01.6.0", "v1.06.0", "v1.6.0/../x"]) {
     assert.throws(() => parseTag(tag), /tag|semantic/i, tag);
   }
+});
+
+test("rejects invalid SemVer prerelease and build identifiers", () => {
+  for (const tag of [
+    "v1.6.0-01",
+    "v1.6.0-00",
+    "v1.6.0-alpha.01",
+    "v1.6.0-",
+    "v1.6.0-.",
+    "v1.6.0-alpha..beta",
+    "v1.6.0-.alpha",
+    "v1.6.0-alpha.",
+    "v1.6.0+",
+    "v1.6.0+.",
+    "v1.6.0+build..meta",
+    "v1.6.0-alpha+build..meta",
+    "v1.6.0+build+meta",
+    "v1.6.0-α",
+  ]) {
+    assert.throws(
+      () => parseTag(tag),
+      /semantic|prerelease|build/i,
+      tag,
+    );
+  }
+});
+
+test("accepts valid SemVer prerelease and build metadata", () => {
+  for (const tag of [
+    "v1.6.0-0",
+    "v1.6.0-0A",
+    "v1.6.0-alpha-1",
+    "v1.6.0-alpha.1",
+    "v1.6.0+001",
+    "v1.6.0-alpha+build.001",
+  ]) {
+    assert.doesNotThrow(() => parseTag(tag), tag);
+  }
+});
+
+test("stores prerelease and build metadata without coercing core numbers", () => {
+  const parsed = parseVersion("1.6.0-alpha.1+build.001");
+  assert.deepEqual(parsed.core, ["1", "6", "0"]);
+  assert.deepEqual(parsed.prerelease, ["alpha", "1"]);
+  assert.deepEqual(parsed.build, ["build", "001"]);
 });
 
 test("rejects installers that do not belong to the tag version", () => {
@@ -167,12 +213,62 @@ test("validates a round-tripped manifest and rejects tampering", () => {
 });
 
 test("compares versions with SemVer precedence", () => {
+  const chain = [
+    "1.0.0-alpha",
+    "1.0.0-alpha.1",
+    "1.0.0-alpha.beta",
+    "1.0.0-beta",
+    "1.0.0-beta.2",
+    "1.0.0-beta.11",
+    "1.0.0-rc.1",
+    "1.0.0",
+  ];
+  for (let i = 0; i < chain.length - 1; i += 1) {
+    assert.equal(
+      compareVersions(chain[i], chain[i + 1]),
+      -1,
+      `${chain[i]} < ${chain[i + 1]}`,
+    );
+  }
   assert.equal(compareVersions("1.6.0", "1.5.9"), 1);
   assert.equal(compareVersions("1.10.0", "1.9.9"), 1);
   assert.equal(compareVersions("1.6.0", "1.6.0"), 0);
   assert.equal(compareVersions("1.6.0-rc.1", "1.6.0"), -1);
-  assert.equal(compareVersions("1.6.0-rc.2", "1.6.0-rc.10"), -1);
-  assert.equal(compareVersions("1.6.0-alpha", "1.6.0-beta"), -1);
+  assert.equal(compareVersions("1.6.0-1", "1.6.0-alpha"), -1);
+});
+
+test("compares arbitrarily large numeric identifiers without precision loss", () => {
+  // Number() would collapse these two 400-digit prerelease identifiers to
+  // Infinity and report equality.
+  const huge = "9".repeat(400);
+  const hugeMinusOne = `${"9".repeat(399)}8`;
+  assert.equal(compareVersions(`1.6.0-${huge}`, `1.6.0-${hugeMinusOne}`), 1);
+  assert.equal(compareVersions(`1.6.0-${hugeMinusOne}`, `1.6.0-${huge}`), -1);
+
+  // 9007199254740993 is above Number.MAX_SAFE_INTEGER; Number() rounds it to
+  // 9007199254740992 and would report equality.
+  assert.equal(
+    compareVersions("1.6.0-9007199254740993", "1.6.0-9007199254740992"),
+    1,
+  );
+  assert.equal(
+    compareVersions("1.6.0-9007199254740992", "1.6.0-9007199254740993"),
+    -1,
+  );
+
+  // Core numbers are also arbitrary precision in SemVer 2.0.0.
+  const hugeCore = "9".repeat(400);
+  const hugeCoreMinusOne = `${"9".repeat(399)}8`;
+  assert.equal(
+    compareVersions(`${hugeCore}.0.0`, `${hugeCoreMinusOne}.0.0`),
+    1,
+  );
+});
+
+test("ignores build metadata for precedence", () => {
+  assert.equal(compareVersions("1.6.0+build.1", "1.6.0+build.2"), 0);
+  assert.equal(compareVersions("1.6.0-alpha+001", "1.6.0-alpha+002"), 0);
+  assert.equal(compareVersions("1.6.0-alpha+z", "1.6.0-beta+a"), -1);
 });
 
 test("secret scanning rejects values and patterns but never echoes them", () => {

@@ -8,6 +8,8 @@ import { pathToFileURL } from "node:url";
 
 const VERSION_RE =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/;
+const IDENTIFIER_RE = /^[0-9A-Za-z-]+$/;
+const NUMERIC_RE = /^\d+$/;
 const PUB_DATE_RE =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
@@ -25,6 +27,26 @@ const SECRET_PATTERNS = [
   },
 ];
 
+function validateIdentifierList(text, label, { allowLeadingZeros }) {
+  const parts = text.split(".");
+  if (
+    parts.length === 0 ||
+    parts.some((part) => part.length === 0 || !IDENTIFIER_RE.test(part))
+  ) {
+    throw new Error(`${label} contains an empty or invalid identifier`);
+  }
+  if (!allowLeadingZeros) {
+    for (const part of parts) {
+      if (NUMERIC_RE.test(part) && part.length > 1 && part.startsWith("0")) {
+        throw new Error(
+          `${label} numeric identifiers must not have leading zeros`,
+        );
+      }
+    }
+  }
+  return parts;
+}
+
 export function parseVersion(value) {
   const text = String(value ?? "")
     .trim()
@@ -33,11 +55,30 @@ export function parseVersion(value) {
   if (!match) {
     throw new Error(`Invalid semantic version: ${JSON.stringify(value)}`);
   }
-  return {
-    version: text,
-    core: [Number(match[1]), Number(match[2]), Number(match[3])],
-    prerelease: match[4] ? match[4].split(".") : [],
-  };
+  try {
+    return {
+      version: text,
+      // Keep core numbers as strings: SemVer does not impose a size limit and
+      // Number would lose precision above Number.MAX_SAFE_INTEGER.
+      core: [match[1], match[2], match[3]],
+      prerelease:
+        match[4] === undefined
+          ? []
+          : validateIdentifierList(match[4], "Prerelease", {
+              allowLeadingZeros: false,
+            }),
+      build:
+        match[5] === undefined
+          ? []
+          : validateIdentifierList(match[5], "Build metadata", {
+              allowLeadingZeros: true,
+            }),
+    };
+  } catch (error) {
+    throw new Error(
+      `Invalid semantic version ${JSON.stringify(value)}: ${error.message}`,
+    );
+  }
 }
 
 export function parseTag(tag) {
@@ -46,6 +87,15 @@ export function parseTag(tag) {
     throw new Error(`Release tag must start with "v": ${JSON.stringify(tag)}`);
   }
   return parseVersion(text);
+}
+
+function compareNumericIdentifiers(left, right) {
+  // Both values are validated numeric strings without leading zeros. Compare
+  // by length first so arbitrarily large identifiers never pass through
+  // Number (which would lose precision above MAX_SAFE_INTEGER).
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
 }
 
 function comparePrerelease(left, right) {
@@ -60,11 +110,11 @@ function comparePrerelease(left, right) {
     if (i >= right.length) return 1;
     const a = left[i];
     const b = right[i];
-    const aNumeric = /^\d+$/.test(a);
-    const bNumeric = /^\d+$/.test(b);
+    const aNumeric = NUMERIC_RE.test(a);
+    const bNumeric = NUMERIC_RE.test(b);
     if (aNumeric && bNumeric) {
-      const diff = Number(a) - Number(b);
-      if (diff !== 0) return diff < 0 ? -1 : 1;
+      const diff = compareNumericIdentifiers(a, b);
+      if (diff !== 0) return diff;
     } else if (aNumeric !== bNumeric) {
       return aNumeric ? -1 : 1;
     } else if (a !== b) {
@@ -78,8 +128,10 @@ export function compareVersions(left, right) {
   const a = parseVersion(left);
   const b = parseVersion(right);
   for (let i = 0; i < 3; i += 1) {
-    if (a.core[i] !== b.core[i]) return a.core[i] < b.core[i] ? -1 : 1;
+    const diff = compareNumericIdentifiers(a.core[i], b.core[i]);
+    if (diff !== 0) return diff;
   }
+  // Build metadata is intentionally ignored for precedence (SemVer 2.0.0).
   return comparePrerelease(a.prerelease, b.prerelease);
 }
 
