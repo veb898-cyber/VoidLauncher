@@ -1,11 +1,30 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { formatPlayTime, formatRelativeTime } from './index';
+import { formatPlayTime, formatRelativeTime, t } from './index';
+import { en } from './en';
+import { ru } from './ru';
 import { useLanguageStore } from '../../stores/languageStore';
 
 const setLanguage = (language: 'en' | 'ru') =>
   useLanguageStore.setState({ language });
 
 afterEach(() => setLanguage('en'));
+
+describe('translation completeness', () => {
+  it('provides a Russian string for every English key', () => {
+    const missing = Object.keys(en).filter((key) => !(key in ru));
+    expect(missing).toEqual([]);
+  });
+});
+
+describe('translation interpolation', () => {  it('treats replacement-pattern characters in values literally', () => {
+    setLanguage('en');
+    const value = t('install.progress', { prepared: '$&', total: "$' and $1" });
+    expect(value).toContain('$&');
+    expect(value).toContain("$' and $1");
+    expect(value).not.toContain('{prepared}');
+    expect(value).not.toContain('{total}');
+  });
+});
 
 describe('formatPlayTime', () => {
   it('formats hours and minutes in English', () => {
@@ -20,6 +39,18 @@ describe('formatPlayTime', () => {
     expect(formatPlayTime(2 * 3600 + 3 * 60)).toBe('2 часа 3 минуты');
     expect(formatPlayTime(5 * 3600)).toBe('5 часов');
     expect(formatPlayTime(11 * 3600 + 11 * 60)).toBe('11 часов 11 минут');
+  });
+});
+
+describe('Ely.by fallback dialog strings', () => {
+  it('switches the localized dialog text with the interface language', () => {
+    setLanguage('en');
+    expect(t('elyby_skins.error_title')).toBe('Could not prepare Ely.by skins');
+    expect(t('elyby_skins.bypass')).toContain('without Ely.by');
+
+    setLanguage('ru');
+    expect(t('elyby_skins.error_title')).toBe('Не удалось подготовить скины Ely.by');
+    expect(t('elyby_skins.bypass')).toContain('без поддержки Ely.by');
   });
 });
 

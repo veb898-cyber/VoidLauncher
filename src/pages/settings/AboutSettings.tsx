@@ -1,15 +1,38 @@
+import { useCallback, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { RefreshCw } from 'lucide-react';
+import { Bug, ExternalLink } from 'lucide-react';
 import { Button } from '../../components/ui/Button';
+import { RefreshIcon } from '../../components/ui/RefreshIcon';
+import { Tooltip } from '../../components/ui/Tooltip';
+import { addToast } from '../../components/ui/Toast';
+import { BugReportModal } from '../../components/settings/BugReportModal';
+import { useInstanceStore } from '../../stores/instanceStore';
 import { useT } from '../../lib/i18n';
+import type { DiagReport } from '../../lib/diagnostics';
 import {
   APP_VERSION,
   useLatestVersion,
   getVersionComparison,
 } from '../../hooks/useLatestVersion';
 
+const REPOSITORY_URL = 'https://github.com/veb898-cyber/VoidLauncher';
+
 export function AboutSettings() {
   const t = useT();
+  const selectedInstance = useInstanceStore((s) => s.selectedInstance);
+  const [bugReportOpen, setBugReportOpen] = useState(false);
+
+  const runDiagnostics = useCallback(async (): Promise<DiagReport | null> => {
+    try {
+      return await invoke<DiagReport>('cmd_run_diagnostics', {
+        instanceName: selectedInstance ?? null,
+      });
+    } catch (error) {
+      addToast(t('bug.diagnostics_error', { error: String(error) }), 'error');
+      return null;
+    }
+  }, [selectedInstance, t]);
 
   return (
     <>
@@ -32,10 +55,50 @@ export function AboutSettings() {
             <br />
             {t('settings.about_disclaimer')}
           </p>
+          <div style={{ marginTop: 'var(--space-lg)' }}>
+            <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap' }}>
+              <Tooltip content={t('bug.open_hint')}>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setBugReportOpen(true)}
+                  aria-label={t('bug.open')}
+                >
+                  <Bug size={14} aria-hidden="true" />
+                  {t('bug.open')}
+                </Button>
+              </Tooltip>
+              <Tooltip content={t('settings.about_repo_tooltip')}>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={async () => {
+                    try {
+                      await openUrl(REPOSITORY_URL);
+                    } catch (error) {
+                      addToast(t('bug.open_error', { error: String(error) }), 'error');
+                    }
+                  }}
+                  aria-label={t('settings.about_repo_btn')}
+                >
+                  <ExternalLink size={14} aria-hidden="true" />
+                  {t('settings.about_repo_btn')}
+                </Button>
+              </Tooltip>
+            </div>
+          </div>
         </div>
       </section>
 
       <LatestVersionSection />
+
+      <BugReportModal
+        open={bugReportOpen}
+        onClose={() => setBugReportOpen(false)}
+        instanceName={selectedInstance}
+        diagReport={null}
+        onRunDiagnostics={runDiagnostics}
+      />
     </>
   );
 }
@@ -141,7 +204,7 @@ function LatestVersionSection() {
             </Button>
           )}
           <Button size="sm" variant="secondary" onClick={refresh} disabled={loading}>
-            <RefreshCw size={14} className={loading ? 'icon-spin' : undefined} />
+            <RefreshIcon spinning={loading} />
             {t('settings.latest_version_check_btn')}
           </Button>
         </div>

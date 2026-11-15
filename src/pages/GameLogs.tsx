@@ -2,15 +2,20 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { AlertTriangle, HelpCircle, XCircle, FileText, FileSearch, FolderOpen } from 'lucide-react';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { AlertTriangle, HelpCircle, XCircle, FileText, FileSearch, FolderOpen, Power, ExternalLink, Wrench } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
 import { addToast } from '../components/ui/Toast';
+import { Button } from '../components/ui/Button';
 import { CopyButton } from '../components/ui/CopyButton';
 import { Tooltip } from '../components/ui/Tooltip';
-import { CRASH_KEYS, VERDICT_KEYS, type CrashAnalysis } from '../lib/diagnostics';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
+import { VerifyRepairModal } from '../components/instances/VerifyRepairModal';
+import { CRASH_KEYS, CRASH_ACTION_KEYS, VERDICT_KEYS, type CrashAnalysis, type CrashAction } from '../lib/diagnostics';
+import { filterLogLines, getLineColor, getLineLevel } from '../lib/gameLogs';
 import {
-  LogToolbar, allLevelsOn, toLevelFilter,
+  LogToolbar, allLevelsOn,
   type LevelFilterState, type LogLevelFilter,
 } from '../components/LogToolbar';
 
@@ -30,35 +35,15 @@ const MAX_SHOWN_RUNS = 7;
 // unified session log, older ones are dropped.
 const MAX_DISPLAY_LINES = 100_000;
 
-/** Classify a raw log line into a severity bucket (module scope so the filter
-    memo can depend on it without re-creating it every render). */
-function getLineLevel(line: string): string {
-  const upper = line.toUpperCase();
-  if (/\[ERROR\]|\/ERROR\]/.test(line)) return 'error';
-  if (/\[WARN\]|\/WARN\]/.test(line)) return 'warn';
-  if (/\[DEBUG\]|\/DEBUG\]/.test(line)) return 'debug';
-  if (/\bEXCEPTION\b/.test(upper) || /\bFATAL\b/.test(upper)) return 'error';
-  if (/exit code [1-9]/.test(line) || /exit code \d{2,}/.test(line)) return 'error';
-  if (/FAILED/i.test(line) || /\bERROR\b/i.test(line)) return 'error';
-  if (/WARNING/i.test(line)) return 'warn';
-  return '';
-}
-
-function getLineColor(level: string): string {
-  switch (level) {
-    case 'error': return 'var(--color-danger)';
-    case 'warn': return 'var(--color-warning)';
-    case 'debug': return 'var(--text-tertiary)';
-    default: return 'var(--text-primary)';
-  }
-}
-
 export function GameLogs() {
   const t = useT();
   // Unified session log content: launcher setup messages AND the game's own
   // stdout/stderr interleaved in true chronological order (the backend pipes
   // are drained into the same file as they arrive — Prism-style console).
-  const [content, setContent] = useState('');
+  const [linesBuffer, setLinesBuffer] = useState<string[]>([]);
+  const byteOffsetRef = useRef<number>(0);
+  const fileTokenRef = useRef<string | null>(null);
+  const currentSessionPathRef = useRef<string | null>(null);
   const [loadingContent, setLoadingContent] = useState(true);
 
   // Recent runs (newest first), the path of the currently RUNNING run and
@@ -75,8 +60,13 @@ export function GameLogs() {
   const runsBtnRef = useRef<HTMLButtonElement>(null);
 
   // Crash analysis for the instance of the shown session.
-  const [analysis, setAnalysis] = useState<{ instance: string; data: CrashAnalysis } | null>(null);
+  const [analysis, setAnalysis] = useState<{ path: string; instance: string; data: CrashAnalysis } | null>(null);
+  const analysisSeq = useRef(0);
   const [analyzing, setAnalyzing] = useState(false);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [disableAction, setDisableAction] = useState<{ instance: string; action: CrashAction } | null>(null);
+  const [disabledFiles, setDisabledFiles] = useState<Set<string>>(new Set());
+  const [repairOpen, setRepairOpen] = useState(false);
 
   // Chronological console: oldest lines at the TOP, fresh ones appended at
   // the BOTTOM (like Prism's console). The view follows the bottom while
@@ -109,17 +99,48 @@ export function GameLogs() {
       target = target ?? all[0]?.path ?? null;
 
       if (!target) {
-        setContent('');
+        setLinesBuffer([]);
+        byteOffsetRef.current = 0;
+        fileTokenRef.current = null;
+        currentSessionPathRef.current = null;
         return;
       }
-      const text = await invoke<string>('cmd_read_game_log', {
-        path: target,
-        maxLines: MAX_DISPLAY_LINES,
-      });
+
+      if (currentSessionPathRef.current !== target) {
+        currentSessionPathRef.current = target;
+        byteOffsetRef.current = 0;
+        fileTokenRef.current = null;
+      }
+
+      const chunk = await invoke<{ lines: string[]; new_byte_offset: number; reset: boolean; file_token: string }>(
+        'cmd_read_game_log_incremental',
+        {
+          path: target,
+          byteOffset: byteOffsetRef.current,
+          initialMaxLines: MAX_DISPLAY_LINES,
+          fileToken: fileTokenRef.current,
+        }
+      );
       if (token !== loadTokenRef.current) return;
-      setContent(text);
+
+      byteOffsetRef.current = chunk.new_byte_offset;
+      fileTokenRef.current = chunk.file_token;
+
+      if (chunk.reset) {
+        setLinesBuffer(chunk.lines);
+      } else if (chunk.lines.length > 0) {
+        setLinesBuffer((prev) => {
+          const combined = prev.concat(chunk.lines);
+          if (combined.length > MAX_DISPLAY_LINES) {
+            return combined.slice(combined.length - MAX_DISPLAY_LINES);
+          }
+          return combined;
+        });
+      }
     } catch {
-      if (token === loadTokenRef.current) setContent('');
+      // A transient read error (AV lock, file being rotated) must not wipe
+      // the console: the offset is unchanged, so the next poll retries and
+      // the already-shown lines stay readable in the meantime.
     } finally {
       if (showLoading && token === loadTokenRef.current) setLoadingContent(false);
     }
@@ -144,7 +165,9 @@ export function GameLogs() {
       atBottomRef.current = true;
       selectedSessionRef.current = null;
       setSelectedSessionPath(null);
-      setContent('');
+      byteOffsetRef.current = 0;
+      fileTokenRef.current = null;
+      setLinesBuffer([]);
       loadContent(false);
     });
 
@@ -164,7 +187,7 @@ export function GameLogs() {
       const el = logContainerRef.current;
       el.scrollTo({ top: el.scrollHeight });
     }
-  }, [content]);
+  }, [linesBuffer]);
 
   const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
@@ -189,9 +212,11 @@ export function GameLogs() {
   const selectSession = (path: string) => {
     selectedSessionRef.current = path;
     setSelectedSessionPath(path);
+    byteOffsetRef.current = 0;
+    fileTokenRef.current = null;
     atBottomRef.current = true;
     setRunsOpen(false);
-    loadContent(false);
+    loadContent(true);
   };
 
   useEffect(() => {
@@ -215,6 +240,8 @@ export function GameLogs() {
   const analyzeCrash = useCallback(async () => {
     if (!shownSession) return;
     const instance = shownSession.instance_name;
+    const sessionPath = shownSession.path;
+    const seq = ++analysisSeq.current;
     setAnalyzing(true);
     try {
       // Pass the session path so the backend analyzes THIS run (crash
@@ -222,8 +249,9 @@ export function GameLogs() {
       // ever", which could be from an older launch.
       const data = await invoke<CrashAnalysis>('cmd_analyze_crash', {
         instanceName: instance,
-        sessionPath: shownSession.path,
+        sessionPath,
       });
+      if (seq !== analysisSeq.current) return;
       if (data.source === 'clean') {
         setAnalysis(null);
         addToast(t('game_logs.clean_run'), 'info');
@@ -234,16 +262,20 @@ export function GameLogs() {
         addToast(t('game_logs.no_crash'), 'info');
         return;
       }
-      setAnalysis({ instance, data });
+      setAnalysis({ path: sessionPath, instance, data });
     } catch (e) {
-      addToast(e instanceof Error ? e.message : String(e), 'error');
+      if (seq === analysisSeq.current) {
+        addToast(e instanceof Error ? e.message : String(e), 'error');
+      }
     } finally {
-      setAnalyzing(false);
+      if (seq === analysisSeq.current) setAnalyzing(false);
     }
   }, [shownSession, t]);
 
+  // The result belongs to ONE run: switching to another run (even of the
+  // same instance) must never show the previous run's crash analysis.
   const analysisVisible =
-    analysis !== null && shownSession !== null && analysis.instance === shownSession.instance_name;
+    analysis !== null && shownSession !== null && analysis.path === shownSession.path;
 
   const copyAnalysis = () => {
     if (!analysis) return '';
@@ -254,14 +286,54 @@ export function GameLogs() {
       t(entry.message, { culprit: analysis.data.culprit ?? '—' }),
       entry.hint ? t(entry.hint) : '',
       analysis.data.detail,
+      analysis.data.root_cause ?? '',
+      analysis.data.culprit_file ?? '',
+      (analysis.data.culprit_candidates ?? []).join(', '),
       analysis.data.report_path ?? '',
     ].filter(Boolean);
     return lines.join('\n');
   };
 
+  const runRecoveryAction = (action: CrashAction) => {
+    if (!shownSession) return;
+    if (action.kind === 'disable_mod') {
+      setDisableAction({ instance: shownSession.instance_name, action });
+      return;
+    }
+    if (action.kind === 'open_url') {
+      void invoke('cmd_open_official_url', { url: action.arg }).catch((e) => {
+        addToast(e instanceof Error ? e.message : String(e), 'error');
+      });
+      return;
+    }
+    if (action.kind === 'repair_files') {
+      setRepairOpen(true);
+    }
+  };
+
+  const confirmDisable = async () => {
+    if (!disableAction) return;
+    const file = disableAction.action.arg;
+    setActionBusy(file);
+    try {
+      await invoke('cmd_apply_crash_action', {
+        instanceName: disableAction.instance,
+        action: 'disable_mod',
+        arg: file,
+      });
+      setDisabledFiles((prev) => new Set(prev).add(file));
+      setDisableAction(null);
+      addToast(t('game_logs.action_done', { file }), 'success');
+    } catch (e) {
+      addToast(e instanceof Error ? e.message : String(e), 'error');
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
   // Chronological order (oldest → newest): render the file as-is, the view
   // auto-scrolls to the bottom. The backend already caps the tail.
-  const displayLines = useMemo(() => (content ? content.split('\n') : []), [content]);
+  const displayLines = linesBuffer;
 
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
@@ -277,13 +349,22 @@ export function GameLogs() {
   const needle = debouncedQuery.trim().toLowerCase();
   const filtering = needle !== '' || !levels.error || !levels.warn || !levels.info;
 
-  const visibleLines = useMemo(() => {
-    if (!filtering) return displayLines;
-    return displayLines.filter((line) => {
-      if (!levels[toLevelFilter(getLineLevel(line))]) return false;
-      return needle === '' || line.toLowerCase().includes(needle);
-    });
-  }, [displayLines, filtering, levels, needle]);
+  const visibleLines = useMemo(
+    () => filterLogLines(displayLines, needle, levels),
+    [displayLines, levels, needle],
+  );
+
+  const rowVirtualizer = useVirtualizer({
+    count: visibleLines.length,
+    getScrollElement: () => logContainerRef.current,
+    estimateSize: () => 22,
+    overscan: 20,
+    // Scroll-only movement is written straight to the item transforms and the
+    // sizer height. React re-renders only when the visible range changes,
+    // which removes the one-frame blank band that appeared when a fast wheel
+    // jumped across several estimated rows before React committed.
+    directDomUpdates: true,
+  });
 
   const toggleLevel = (level: LogLevelFilter) => {
     setLevels((prev) => ({ ...prev, [level]: !prev[level] }));
@@ -425,7 +506,11 @@ export function GameLogs() {
                     {verdictKey ? t(verdictKey) : a.verdict}
                   </span>
                   <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
-                    {a.source === 'crash-report' ? t('diag.source_crash_report') : t('diag.source_log')}
+                    {a.source === 'crash-report'
+                      ? t('diag.source_crash_report')
+                      : a.source === 'hs-error'
+                        ? t('diag.source_hs_error')
+                        : t('diag.source_log')}
                   </span>
                 </div>
 
@@ -435,6 +520,17 @@ export function GameLogs() {
                 {entry.hint && (
                   <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', marginBottom: 'var(--space-sm)' }}>
                     {t(entry.hint)}
+                  </div>
+                )}
+
+                {a.culprit_file && (
+                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-xs)', overflowWrap: 'anywhere' }}>
+                    {t('game_logs.culprit_file', { file: a.culprit_file })}
+                  </div>
+                )}
+                {!a.culprit_file && (a.culprit_candidates?.length ?? 0) > 1 && (
+                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-xs)', overflowWrap: 'anywhere' }}>
+                    {t('game_logs.culprit_candidates', { files: (a.culprit_candidates ?? []).join(', ') })}
                   </div>
                 )}
 
@@ -448,6 +544,43 @@ export function GameLogs() {
                     maxHeight: 160, overflowY: 'auto', userSelect: 'text',
                   }}>
                     {a.detail}
+                  </div>
+                )}
+
+                {a.root_cause && a.root_cause !== a.detail && (
+                  <div style={{
+                    fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)',
+                    marginBottom: 'var(--space-sm)', overflowWrap: 'anywhere',
+                  }}>
+                    <strong>{t('game_logs.root_cause')}:</strong> {a.root_cause}
+                  </div>
+                )}
+
+                {(a.actions ?? []).length > 0 && (
+                  <div style={{ display: 'flex', gap: 'var(--space-sm)', flexWrap: 'wrap', marginBottom: 'var(--space-sm)' }}>
+                    {(a.actions ?? []).map((action) => {
+                      const meta = CRASH_ACTION_KEYS[action.kind];
+                      const disabled = action.kind === 'disable_mod'
+                        && (disabledFiles.has(action.arg) || actionBusy === action.arg);
+                      const Icon = action.kind === 'disable_mod'
+                        ? Power
+                        : action.kind === 'open_url'
+                          ? ExternalLink
+                          : Wrench;
+                      return (
+                        <Button
+                          key={`${action.kind}:${action.arg}`}
+                          size="sm"
+                          variant={action.tone === 'danger' ? 'danger' : 'secondary'}
+                          onClick={() => runRecoveryAction(action)}
+                          disabled={disabled || actionBusy !== null}
+                          title={meta?.hint ? t(meta.hint) : undefined}
+                        >
+                          <Icon size={14} style={{ marginRight: 6 }} />
+                          {meta ? t(meta.label) : action.kind}
+                        </Button>
+                      );
+                    })}
                   </div>
                 )}
 
@@ -483,6 +616,7 @@ export function GameLogs() {
       <div className="log-container" ref={logContainerRef} style={{
         flex: 1,
         overflowY: 'auto',
+        overflowAnchor: 'none',
         borderRadius: 'var(--radius-lg)',
         padding: 'var(--space-md)',
         fontFamily: 'var(--font-mono)',
@@ -498,26 +632,43 @@ export function GameLogs() {
             {t('terminal.no_matches')}
           </div>
         ) : (
-          visibleLines.map((line, i) => {
-            const level = getLineLevel(line);
-            return (
-              <div key={i} className="log-line" style={{
-                padding: '1px var(--space-sm)',
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-all',
-                color: getLineColor(level),
-                borderRadius: 'var(--radius-sm)',
-                userSelect: 'text',
-                background: level === 'error' ? 'rgba(255, 60, 60, 0.06)' : level === 'warn' ? 'rgba(255, 180, 40, 0.06)' : 'transparent',
-                // Skip layout/paint for off-screen lines so a 100k-line
-                // log (Prism-sized) doesn't freeze the UI.
-                contentVisibility: 'auto',
-                containIntrinsicSize: 'auto 19px',
-              }}>
-                {line}
-              </div>
-            );
-          })
+          <div
+            ref={rowVirtualizer.containerRef}
+            style={{ position: 'relative' }}
+          >
+            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+              const line = visibleLines[virtualRow.index];
+              const level = getLineLevel(line);
+              return (
+                <div
+                  key={virtualRow.key}
+                  ref={rowVirtualizer.measureElement}
+                  data-index={virtualRow.index}
+                  className="log-line"
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    padding: '1px var(--space-sm)',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-all',
+                    color: getLineColor(level),
+                    borderRadius: 'var(--radius-sm)',
+                    userSelect: 'text',
+                    background:
+                      level === 'error'
+                        ? 'rgba(255, 60, 60, 0.06)'
+                        : level === 'warn'
+                        ? 'rgba(255, 180, 40, 0.06)'
+                        : 'transparent',
+                  }}
+                >
+                  {line}
+                </div>
+              );
+            })}
+          </div>
         )}
         {filtering && visibleLines.length > 0 && (
           <div style={{ color: 'var(--text-tertiary)', textAlign: 'center', paddingTop: 'var(--space-sm)' }}>
@@ -525,6 +676,24 @@ export function GameLogs() {
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={disableAction !== null}
+        title={t('game_logs.action_disable_confirm_title')}
+        description={t('game_logs.action_disable_confirm_text', {
+          file: disableAction?.action.arg ?? '',
+        })}
+        onConfirm={() => { void confirmDisable(); }}
+        onCancel={() => { if (actionBusy === null) setDisableAction(null); }}
+        confirmLabel={t('game_logs.action_disable_mod')}
+        busy={actionBusy !== null}
+      />
+
+      <VerifyRepairModal
+        open={repairOpen && !!shownSession}
+        onClose={() => setRepairOpen(false)}
+        instanceName={shownSession?.instance_name ?? ''}
+      />
     </div>
   );
 }

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation and README
+    url: https://github.com/veb898-cyber/VoidLauncher#readme
+    about: Installation, build instructions and project overview.
+  - name: Security policy
+    url: https://github.com/veb898-cyber/VoidLauncher/security/policy
+    about: Report a vulnerability privately. Do not open a public issue.
+  - name: Latest release
+    url: https://github.com/veb898-cyber/VoidLauncher/releases/latest
+    about: Download the newest Windows installer.

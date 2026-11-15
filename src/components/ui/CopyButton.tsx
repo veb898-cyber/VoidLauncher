@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { Check, Copy } from 'lucide-react';
 import { addToast } from './Toast';
 import { t } from '../../lib/i18n';
+import { copyTextToClipboard } from '../../lib/clipboard';
 
 const COPIED_VISIBLE_MS = 1400;
 
@@ -45,7 +46,10 @@ export function CopyButton({
 
   const handleClick = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(await text());
+      if (!(await copyTextToClipboard(await text()))) {
+        addToast(t('common.copy_failed'), 'error');
+        return;
+      }
       setCopied(true);
       if (timer.current !== null) window.clearTimeout(timer.current);
       timer.current = window.setTimeout(() => {

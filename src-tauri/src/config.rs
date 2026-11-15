@@ -1,6 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Hard bounds for any heap value the launcher will hand to the JVM.
+/// The UI and the global config use the same bounds; the per-instance value
+/// is additionally capped by the user's global `max_memory_mb`.
+pub const MIN_MEMORY_MB: u32 = 2048;
+pub const MAX_MEMORY_MB: u32 = 32768;
+
+/// Current config schema/migration marker. Bump only together with a
+/// deterministic, non-ambiguous migration.
+pub const CONFIG_VERSION: u32 = 1;
+
 /// Tiered memory recommendation based on total system RAM (in MB).
 ///
 ///   total ≤ 8192   → 4096 (4 GB)
@@ -46,9 +56,20 @@ pub struct AppConfig {
     pub default_gc_preset: String,
     /// Default JVM arguments
     pub default_jvm_args: Vec<String>,
+    /// Monotonic config migration marker. `0` (or a missing field) is an
+    /// untouched legacy config; new configs start at the current version.
+    /// Ambiguous preference changes (for example, whether `g1gc` was the old
+    /// default or an explicit user choice) are never guessed from this marker.
+    #[serde(default)]
+    pub config_version: u32,
     /// Custom Java path (None = auto-detect)
     pub java_path: Option<PathBuf>,
-    /// Close launcher when game starts
+    /// What to do with the launcher window after the game process has
+    /// successfully started: "do_nothing" | "minimize" | "close".
+    #[serde(default = "default_after_launch_action")]
+    pub after_launch_action: String,
+    /// Deprecated pre-1.6 setting: migrated into `after_launch_action`.
+    #[serde(default, skip_serializing)]
     pub close_on_launch: bool,
     /// Route all launcher HTTP traffic through a proxy
     #[serde(default)]
@@ -59,6 +80,15 @@ pub struct AppConfig {
     /// Proxy port (e.g. 8080)
     #[serde(default)]
     pub proxy_port: u16,
+    /// Use the Windows system proxy instead of the manual address above.
+    /// `None` (field absent) is migrated from the old automatic behaviour:
+    /// system proxy only when no manual proxy was configured.
+    #[serde(default)]
+    pub use_system_proxy: Option<bool>,
+    /// Never fall back to a direct connection after a proxy failure.
+    /// Defaults to true, including for configs written before this field.
+    #[serde(default = "default_proxy_only")]
+    pub proxy_only: bool,
     /// Show snapshots in version list
     pub show_snapshots: bool,
     /// Show old versions (alpha/beta)
@@ -66,6 +96,12 @@ pub struct AppConfig {
     /// CurseForge API key
     #[serde(default)]
     pub curseforge_api_key: String,
+    /// Load the pinned authlib-injector Java agent for Ely.by accounts so
+    /// skins work inside Minecraft. Has no effect on Microsoft/offline
+    /// accounts. Defaults to true for configs written before this field
+    /// existed.
+    #[serde(default = "default_elyby_skins_in_game")]
+    pub elyby_skins_in_game: bool,
 }
 
 fn default_client_id() -> String {
@@ -75,6 +111,20 @@ fn default_client_id() -> String {
 fn default_gc_preset() -> String {
     "g1gc".to_string()
 }
+
+fn default_elyby_skins_in_game() -> bool {
+    true
+}
+
+fn default_proxy_only() -> bool {
+    true
+}
+
+fn default_after_launch_action() -> String {
+    "do_nothing".to_string()
+}
+
+pub const AFTER_LAUNCH_ACTIONS: [&str; 3] = ["do_nothing", "minimize", "close"];
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -116,15 +166,19 @@ impl Default for AppConfig {
             // the preset). Only flags that are meaningful for EVERY preset
             // belong below.
             default_jvm_args: vec![
-                // Mods occasionally call System.gc() (often in loops) —
+                // Mods occasionally call System.gc() (often in loops) -
                 // disabling explicit GC prevents surprise Full GC pauses.
                 "-XX:+DisableExplicitGC".into(),
             ],
+            config_version: CONFIG_VERSION,
             java_path: None,
+            after_launch_action: default_after_launch_action(),
             close_on_launch: false,
             proxy_enabled: false,
             proxy_addr: String::new(),
             proxy_port: 0,
+            use_system_proxy: Some(true),
+            proxy_only: true,
             show_snapshots: false,
             show_old_versions: false,
             // CurseForge public API key taken from Prism Launcher's open-source
@@ -132,6 +186,7 @@ impl Default for AppConfig {
             // as an identifier, not a credential).
             curseforge_api_key: "$2a$10$wuAJuNZuted3NORVmpgUC.m8sI.pv1tOPKZyBgLFGjxFp/br0lZCC"
                 .into(),
+            elyby_skins_in_game: true,
         }
     }
 }
@@ -164,26 +219,43 @@ impl AppConfig {
         args.len() == legacy.len() && legacy.iter().zip(args).all(|(l, a)| *l == a)
     }
 
-    /// Migrate pre-0.1.7 defaults in a freshly loaded config so the new
-    /// Prism-style GC behaviour applies without the user touching settings:
-    ///   * 6 GB default on big-RAM machines → 8 GB (matches the tiered
-    ///     recommendation now that ≥ 24 GB RAM maps to 8 GB);
-    ///   * ZGC preset with less than 8 GB of heap → G1GC (ZGC requires
-    ///     8+ GB; on 6 GB it stalled the client during pack/server loads);
+    /// Migrate a freshly loaded config without guessing ambiguous user
+    /// preferences:
+    ///   * clamp impossible heap values;
+    ///   * record the config schema version once (legacy configs have no
+    ///     marker, so an explicit `g1gc`/6 GB choice is preserved rather than
+    ///     reinterpreted as an old default);
+    ///   * ZGC with less than 8 GB of heap → G1GC (ZGC cannot work there, and
+    ///     the launch path would fall back anyway);
     ///   * legacy server-style `default_jvm_args` → slim preset-neutral set.
     ///
     /// Returns true when something changed (caller should persist).
     fn migrate(&mut self) -> bool {
         let mut changed = false;
-        let total_ram = detect_total_ram_mb();
 
-        if total_ram >= 24 * 1024 && self.default_memory_mb == 6144 && self.max_memory_mb == 6144 {
-            self.default_memory_mb = 8192;
-            self.max_memory_mb = 8192;
+        // A hand-edited or corrupted config must never hand absurd heaps to
+        // the JVM (0 MB aborts, multi-TB values make Windows refuse to start).
+        let default_memory = self.default_memory_mb.clamp(MIN_MEMORY_MB, MAX_MEMORY_MB);
+        if default_memory != self.default_memory_mb {
+            self.default_memory_mb = default_memory;
+            changed = true;
+        }
+        let max_memory = self.max_memory_mb.clamp(MIN_MEMORY_MB, MAX_MEMORY_MB);
+        if max_memory != self.max_memory_mb {
+            self.max_memory_mb = max_memory;
+            changed = true;
+        }
+
+        if self.config_version < CONFIG_VERSION {
+            // Version 0 has no reliable record of whether a value was the old
+            // default or an explicit user choice. Never rewrite an ambiguous
+            // preference here: keep G1GC/6 GB exactly as stored. Only record
+            // that the schema has been seen.
+            self.config_version = CONFIG_VERSION;
             tracing::info!(
                 target: "config",
-                "Migrated default memory 6144 -> 8192 MB (system has {} MB RAM)",
-                total_ram
+                "Migrated config schema to version {} (user choices preserved)",
+                CONFIG_VERSION
             );
             changed = true;
         }
@@ -198,24 +270,6 @@ impl AppConfig {
             changed = true;
         }
 
-        // ZGC became the default for machines with >= 24 GB RAM (heaps >= 8 GB).
-        // Only flip untouched-looking configs: heap still at the recommended
-        // 8 GB and the old hard-coded "g1gc" default. A manual choice (any
-        // other memory value or preset) is left alone.
-        if total_ram >= 24 * 1024
-            && self.default_memory_mb >= 8192
-            && self.max_memory_mb >= 8192
-            && self.default_gc_preset.eq_ignore_ascii_case("g1gc")
-        {
-            self.default_gc_preset = "zgc".into();
-            tracing::info!(
-                target: "config",
-                "Migrated default GC preset g1gc -> zgc (system has {} MB RAM, heap {} MB)",
-                total_ram, self.default_memory_mb
-            );
-            changed = true;
-        }
-
         if Self::is_legacy_jvm_args(&self.default_jvm_args) {
             self.default_jvm_args = vec!["-XX:+DisableExplicitGC".into()];
             tracing::info!(
@@ -225,7 +279,58 @@ impl AppConfig {
             changed = true;
         }
 
+        // Pre-1.6 automatically used the Windows proxy when no manual proxy
+        // was configured. Preserve that, but make the source explicit: a
+        // configured manual proxy keeps manual mode, otherwise system mode.
+        if self.use_system_proxy.is_none() {
+            self.use_system_proxy = Some(!self.has_manual_proxy());
+            tracing::info!(
+                target: "config",
+                "Migrated proxy source to {}",
+                if self.use_system_proxy == Some(true) { "Windows system proxy" } else { "manual proxy" }
+            );
+            changed = true;
+        }
+
+        // Pre-1.6 had a single "close on launch" boolean. Keep the old
+        // preference: on -> close, off -> do nothing. The new selector value
+        // wins if it is already set (new configs never write the old field).
+        if self.close_on_launch {
+            if self.after_launch_action == "do_nothing" {
+                self.after_launch_action = "close".into();
+            }
+            self.close_on_launch = false;
+            changed = true;
+        }
+        if !AFTER_LAUNCH_ACTIONS.contains(&self.after_launch_action.as_str()) {
+            self.after_launch_action = default_after_launch_action();
+            changed = true;
+        }
+
         changed
+    }
+}
+
+/// Keep a copy of a config that failed to parse before the launcher replaces
+/// it with defaults. Without this a single bad byte silently discarded every
+/// user setting (data dir, Java path, proxy, API key) with no way back.
+fn backup_corrupt_config(path: &std::path::Path) {
+    let backup = path.with_file_name(format!(
+        "config.json.bad-{}",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    ));
+    match std::fs::copy(path, &backup) {
+        Ok(_) => tracing::warn!(
+            target: "config",
+            "Preserved unreadable config as {}",
+            backup.display()
+        ),
+        Err(e) => tracing::warn!(
+            target: "config",
+            "Could not preserve unreadable config at {}: {}",
+            path.display(),
+            e
+        ),
     }
 }
 
@@ -274,21 +379,27 @@ impl AppConfig {
                                 }
                                 return config;
                             }
-                            Err(e) => tracing::warn!(
-                                target: "config",
-                                "Failed to parse config at {}: {}; rewriting with defaults",
-                                config_path.display(),
-                                e
-                            ),
+                            Err(e) => {
+                                backup_corrupt_config(&config_path);
+                                tracing::warn!(
+                                    target: "config",
+                                    "Failed to parse config at {}: {}; rewriting with defaults",
+                                    config_path.display(),
+                                    e
+                                );
+                            }
                         }
                     }
                 }
-                Err(e) => tracing::warn!(
-                    target: "config",
-                    "Failed to read config at {}: {}; rewriting with defaults",
-                    config_path.display(),
-                    e
-                ),
+                Err(e) => {
+                    backup_corrupt_config(&config_path);
+                    tracing::warn!(
+                        target: "config",
+                        "Failed to read config at {}: {}; rewriting with defaults",
+                        config_path.display(),
+                        e
+                    );
+                }
             }
         } else {
             tracing::info!(
@@ -317,8 +428,9 @@ impl AppConfig {
         std::fs::create_dir_all(&self.data_dir)?;
         let config_path = self.data_dir.join("config.json");
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(config_path, json)?;
-        Ok(())
+        // Atomic replace: a crash or full disk during Save must leave the
+        // previous working config intact, never a truncated file.
+        crate::instances::write_file_atomic(&config_path, json.as_bytes())
     }
 
     /// Get versions directory
@@ -349,11 +461,27 @@ impl AppConfig {
     /// Proxy `host:port` for reqwest (`None` when disabled). The scheme is
     /// resolved automatically (HTTP first, then SOCKS5) in `download.rs`.
     pub fn proxy_url(&self) -> Option<String> {
-        if self.proxy_enabled && !self.proxy_addr.trim().is_empty() && self.proxy_port > 0 {
-            Some(format!("{}:{}", self.proxy_addr.trim(), self.proxy_port))
-        } else {
-            None
-        }
+        proxy_url_from(self.proxy_enabled, &self.proxy_addr, self.proxy_port)
+    }
+
+    /// Effective system-proxy choice after migration.
+    pub fn use_system_proxy(&self) -> bool {
+        self.use_system_proxy.unwrap_or(true)
+    }
+
+    fn has_manual_proxy(&self) -> bool {
+        !self.proxy_addr.trim().is_empty() && self.proxy_port > 0
+    }
+}
+
+/// Format a proxy `host:port`, or `None` when the master switch is off or the
+/// address/port are incomplete. Shared by the persisted config and the
+/// immediate (unsaved) preview from the Network settings tab.
+pub fn proxy_url_from(enabled: bool, addr: &str, port: u16) -> Option<String> {
+    if enabled && !addr.trim().is_empty() && port > 0 {
+        Some(format!("{}:{}", addr.trim(), port))
+    } else {
+        None
     }
 }
 
@@ -368,6 +496,256 @@ mod tests {
     #[test]
     fn proxy_url_disabled_by_default() {
         assert_eq!(base().proxy_url(), None);
+    }
+
+    #[test]
+    fn elyby_skins_are_enabled_by_default() {
+        assert!(base().elyby_skins_in_game);
+    }
+
+    #[test]
+    fn proxy_only_is_enabled_by_default() {
+        assert!(base().proxy_only);
+    }
+
+    #[test]
+    fn legacy_config_without_elyby_setting_defaults_to_true() {
+        // Every field that has no serde default; the new Ely.by flag is
+        // intentionally absent, exactly as in configs written before 1.5.x.
+        let legacy = serde_json::json!({
+            "data_dir": "C:\\VoidLauncher",
+            "default_memory_mb": 4096,
+            "max_memory_mb": 8192,
+            "default_jvm_args": ["-XX:+DisableExplicitGC"],
+            "java_path": null,
+            "close_on_launch": false,
+            "show_snapshots": false,
+            "show_old_versions": false
+        });
+        let config: AppConfig = serde_json::from_value(legacy).expect("legacy config parses");
+        assert!(config.elyby_skins_in_game);
+        assert!(config.proxy_only);
+        assert_eq!(
+            config.config_version, 0,
+            "a config without the marker is a legacy config"
+        );
+    }
+
+    #[test]
+    fn legacy_proxy_source_migrates_from_manual_or_automatic_system_mode() {
+        let mut manual = base();
+        manual.use_system_proxy = None;
+        manual.proxy_addr = "127.0.0.1".into();
+        manual.proxy_port = 8080;
+        assert!(manual.migrate());
+        assert_eq!(manual.use_system_proxy, Some(false));
+
+        let mut automatic = base();
+        automatic.use_system_proxy = None;
+        automatic.proxy_addr = String::new();
+        automatic.proxy_port = 0;
+        assert!(automatic.migrate());
+        assert_eq!(automatic.use_system_proxy, Some(true));
+    }
+
+    #[test]
+    fn explicit_proxy_source_is_preserved_and_new_default_is_system() {
+        assert!(base().use_system_proxy());
+
+        let mut manual = base();
+        manual.proxy_enabled = true;
+        manual.use_system_proxy = Some(false);
+        manual.proxy_addr = "127.0.0.1".into();
+        manual.proxy_port = 8080;
+        let _ = manual.migrate();
+        assert_eq!(manual.use_system_proxy, Some(false));
+        assert_eq!(manual.proxy_url(), Some("127.0.0.1:8080".into()));
+        assert_eq!(manual.proxy_addr, "127.0.0.1");
+        assert_eq!(manual.proxy_port, 8080);
+
+        let mut system = base();
+        system.use_system_proxy = Some(true);
+        system.proxy_addr = "10.0.0.1".into();
+        system.proxy_port = 3128;
+        let _ = system.migrate();
+        assert_eq!(system.use_system_proxy, Some(true));
+        assert_eq!(
+            system.proxy_addr, "10.0.0.1",
+            "manual settings must be kept"
+        );
+        assert_eq!(system.proxy_port, 3128);
+    }
+
+    #[test]
+    fn proxy_source_and_manual_values_survive_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("vl-config-proxy-{}", uuid::Uuid::new_v4()));
+        let mut config = base();
+        config.data_dir = dir.clone();
+        config.proxy_enabled = true;
+        config.use_system_proxy = Some(true);
+        config.proxy_addr = "10.0.0.7".into();
+        config.proxy_port = 3128;
+        config.proxy_only = true;
+        config.after_launch_action = "minimize".into();
+        config.save().unwrap();
+
+        let loaded = AppConfig::load(&dir);
+        assert!(loaded.proxy_enabled);
+        assert_eq!(loaded.use_system_proxy, Some(true));
+        assert_eq!(loaded.proxy_addr, "10.0.0.7");
+        assert_eq!(loaded.proxy_port, 3128);
+        assert!(loaded.proxy_only);
+        assert_eq!(loaded.after_launch_action, "minimize");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_migration_never_reinterprets_an_explicit_gc_choice() {
+        // A legacy config has no marker. Its stored g1gc may be the old
+        // default or an explicit choice; migration must preserve it.
+        let mut legacy = base();
+        legacy.config_version = 0;
+        legacy.default_gc_preset = "g1gc".into();
+        legacy.default_memory_mb = 8192;
+        legacy.max_memory_mb = 8192;
+        assert!(legacy.migrate(), "schema marker is recorded once");
+        assert_eq!(legacy.default_gc_preset, "g1gc");
+        assert_eq!(legacy.config_version, CONFIG_VERSION);
+        assert!(
+            !legacy.migrate(),
+            "a second run must not change anything (idempotent migration)"
+        );
+        assert_eq!(legacy.default_gc_preset, "g1gc");
+
+        // Explicit ZGC survives as long as the heap is large enough.
+        let mut zgc = base();
+        zgc.config_version = 0;
+        zgc.default_gc_preset = "zgc".into();
+        zgc.default_memory_mb = 8192;
+        zgc.max_memory_mb = 8192;
+        assert!(zgc.migrate());
+        assert_eq!(zgc.default_gc_preset, "zgc");
+
+        // The old 6 GB value is preserved too: it may be a deliberate choice.
+        let mut six_gb = base();
+        six_gb.config_version = 0;
+        six_gb.default_gc_preset = "g1gc".into();
+        six_gb.default_memory_mb = 6144;
+        six_gb.max_memory_mb = 6144;
+        assert!(six_gb.migrate());
+        assert_eq!(six_gb.default_memory_mb, 6144);
+        assert_eq!(six_gb.max_memory_mb, 6144);
+
+        // ZGC below the 8 GB floor is a safety correction: the JVM launch
+        // path would fall back to G1GC anyway.
+        let mut low = base();
+        low.config_version = 0;
+        low.default_gc_preset = "zgc".into();
+        low.default_memory_mb = 4096;
+        low.max_memory_mb = 4096;
+        assert!(low.migrate());
+        assert_eq!(low.default_gc_preset, "g1gc");
+    }
+
+    #[test]
+    fn absurd_memory_values_are_clamped() {
+        let mut low = base();
+        low.default_memory_mb = 0;
+        low.max_memory_mb = 1;
+        assert!(low.migrate());
+        assert_eq!(low.default_memory_mb, 2048);
+        assert_eq!(low.max_memory_mb, 2048);
+
+        let mut high = base();
+        high.default_memory_mb = 1_000_000;
+        high.max_memory_mb = u32::MAX;
+        assert!(high.migrate());
+        assert_eq!(high.default_memory_mb, 32768);
+        assert_eq!(high.max_memory_mb, 32768);
+    }
+
+    #[test]
+    fn config_save_replaces_atomically_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("vl-config-atomic-{}", uuid::Uuid::new_v4()));
+        let mut config = base();
+        config.data_dir = dir.clone();
+        config.default_memory_mb = 6144;
+        config.save().unwrap();
+
+        let path = dir.join("config.json");
+        let first: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(first["default_memory_mb"], 6144);
+        assert!(
+            !dir.join(".config.json.tmp").exists(),
+            "atomic save must not leave a temp file"
+        );
+
+        config.default_memory_mb = 8192;
+        config.save().unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(second["default_memory_mb"], 8192);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_config_is_preserved_before_defaults_are_written() {
+        let dir = std::env::temp_dir().join(format!("vl-config-corrupt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, b"{ definitely not json").unwrap();
+
+        let loaded = AppConfig::load(&dir);
+        assert_eq!(loaded.data_dir, dir);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"data_dir\""),
+            "a fresh valid config must be written"
+        );
+
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.bad-")
+            })
+            .expect("corrupt config must be backed up");
+        assert_eq!(
+            std::fs::read_to_string(backup.path()).unwrap(),
+            "{ definitely not json"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_close_on_launch_migrates_to_close_action() {
+        let mut c = base();
+        c.close_on_launch = true;
+        c.after_launch_action = "do_nothing".into();
+        assert!(c.migrate());
+        assert_eq!(c.after_launch_action, "close");
+        assert!(!c.close_on_launch);
+    }
+
+    #[test]
+    fn explicit_after_launch_action_survives_migration() {
+        let mut c = base();
+        c.after_launch_action = "minimize".into();
+        c.close_on_launch = false;
+        assert!(!c.migrate());
+        assert_eq!(c.after_launch_action, "minimize");
+
+        c.after_launch_action = "bogus".into();
+        assert!(c.migrate());
+        assert_eq!(c.after_launch_action, "do_nothing");
     }
 
     #[test]

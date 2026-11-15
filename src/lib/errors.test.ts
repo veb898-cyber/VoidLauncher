@@ -12,6 +12,17 @@ describe('friendlyErrorMessage', () => {
     expect(friendlyErrorMessage('request timed out', t)).toBe('t:errors.network');
   });
 
+  it('keeps Ely.by integration guidance ahead of generic network mapping', () => {
+    expect(
+      friendlyErrorMessage(
+        new Error(
+          'Ely.by Skin Integration could not be prepared: Cannot reach Ely.by: connection reset',
+        ),
+        t,
+      ),
+    ).toBe('t:errors.elyby_skins');
+  });
+
   it('maps access, disk and launch failures', () => {
     expect(friendlyErrorMessage('Access is denied. (os error 5)', t)).toBe(
       't:errors.access',

@@ -22,6 +22,9 @@ interface VerifyCategory {
   checked: number;
   issue_count: number;
   issues: VerifyIssue[];
+  verified: number;
+  unverified: number;
+  fingerprint_only?: boolean;
 }
 
 interface VerifyReport {
@@ -29,6 +32,7 @@ interface VerifyReport {
   repairable_count: number;
   content_issues: number;
   healthy: boolean;
+  mode: 'quick' | 'deep';
 }
 
 interface RepairSummary {
@@ -60,11 +64,15 @@ const KIND_LABELS: Record<string, MessageKey> = {
   invalid: 'verify.kind_invalid',
   unsafe: 'verify.kind_unsafe',
   outdated_loader: 'verify.kind_outdated_loader',
+  size_mismatch: 'verify.kind_size_mismatch',
+  hash_mismatch: 'verify.kind_hash_mismatch',
+  incomplete: 'verify.kind_incomplete',
 };
 
 /** Which part of an instance to scan: everything, launcher files only, or one
  * content folder. Matches `VerifyScope` in the backend. */
 type VerifyScope = 'all' | 'launcher' | 'mods' | 'resourcepacks' | 'shaderpacks';
+type VerifyMode = 'quick' | 'deep';
 
 /** In a content-only scope the "content" category shows the folder it scanned. */
 const SCOPE_CONTENT_LABELS: Partial<Record<VerifyScope, MessageKey>> = {
@@ -85,23 +93,25 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
   const [checking, setChecking] = useState(false);
   const [repairing, setRepairing] = useState(false);
   const [scope, setScope] = useState<VerifyScope>('all');
+  const [mode, setMode] = useState<VerifyMode>('deep');
   const [progress, setProgress] = useState<RepairProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [summary, setSummary] = useState<RepairSummary | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
-  // Per-scope results stay valid for the lifetime of the open dialog: switching
-  // the scope tab shows the stored result instead of re-scanning. The cache is
-  // dropped by «Проверить снова», by a repair, and on unmount (closing the
+  // Per-scope/mode results stay valid for the lifetime of the open dialog:
+  // switching a tab shows the stored result instead of re-scanning. The cache
+  // is dropped by «Проверить снова», by a repair, and on unmount (closing the
   // dialog) — owner: «результаты одни и те же, пока не закрою это окно или
   // пока не проведу проверку заново».
-  const cacheRef = useRef<Partial<Record<VerifyScope, VerifyReport>>>({});
+  const cacheRef = useRef<Partial<Record<string, VerifyReport>>>({});
   // Latest scan request wins: a slow reply for a previous scope must not
   // overwrite the report of the scope the user is looking at now.
   const requestSeq = useRef(0);
 
   const runVerify = useCallback(async (force = false) => {
+    const cacheKey = `${scope}:${mode}`;
     if (!force) {
-      const cached = cacheRef.current[scope];
+      const cached = cacheRef.current[cacheKey];
       if (cached) {
         requestSeq.current += 1;
         setReport(cached);
@@ -119,8 +129,9 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
       const result = await invoke<VerifyReport>('cmd_verify_instance', {
         instanceName,
         scope,
+        mode,
       });
-      cacheRef.current[scope] = result;
+      cacheRef.current[cacheKey] = result;
       if (seq === requestSeq.current) setReport(result);
     } catch (e) {
       if (seq === requestSeq.current) {
@@ -130,7 +141,7 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
     } finally {
       if (seq === requestSeq.current) setChecking(false);
     }
-  }, [instanceName, scope]);
+  }, [instanceName, scope, mode]);
 
   useEffect(() => {
     if (open) {
@@ -188,6 +199,7 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
 
   const busy = checking || repairing;
   const canRepair = !busy && (report?.repairable_count ?? 0) > 0;
+  const unverifiedTotal = report?.categories.reduce((sum, cat) => sum + cat.unverified, 0) ?? 0;
 
   return (
     <Modal
@@ -238,6 +250,25 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
         />
       </div>
 
+      {/* Quick is for routine checks; deep is the only mode that proves file
+          contents against the checksums and the content sidecars. */}
+      <div style={{ marginBottom: 'var(--space-sm)' }}>
+        <SlidingTabs<VerifyMode>
+          ariaLabel={t('verify.mode_label')}
+          className="wizard-switch"
+          style={{ borderBottom: 'none', marginBottom: 0, justifyContent: 'center' }}
+          active={mode}
+          onChange={setMode}
+          tabs={[
+            { id: 'quick', label: t('verify.mode_quick'), disabled: busy },
+            { id: 'deep', label: t('verify.mode_deep'), disabled: busy },
+          ]}
+        />
+        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', textAlign: 'center', marginTop: 4 }}>
+          {mode === 'quick' ? t('verify.mode_quick_hint') : t('verify.mode_deep_hint')}
+        </div>
+      </div>
+
       {checking && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', padding: 'var(--space-lg) 0', color: 'var(--text-secondary)' }}>
           <SnakeSpinner size={18} />
@@ -270,9 +301,13 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
           {/* Summary line */}
           {report.healthy ? (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', color: 'var(--success, #3fb950)', fontSize: 'var(--font-size-sm)' }}>
-              <CheckCircle2 size={16} />
-              <span>{t('verify.ok')}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', color: unverifiedTotal > 0 ? 'var(--text-secondary)' : 'var(--success, #3fb950)', fontSize: 'var(--font-size-sm)' }}>
+              {unverifiedTotal > 0 ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}
+              <span>
+                {unverifiedTotal > 0
+                  ? t('verify.ok_with_unverified', { n: unverifiedTotal })
+                  : t('verify.ok')}
+              </span>
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)', fontSize: 'var(--font-size-sm)' }}>
@@ -316,12 +351,22 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
                   <CheckCircle2 size={14} color="var(--success, #3fb950)" style={{ flexShrink: 0 }} />
                 )}
                 <span style={{ flex: 1, fontWeight: hasIssues ? 500 : 400 }}>{t(labelKey)}</span>
-                <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)' }}>
-                  {hasIssues
-                    ? `${cat.issue_count} / ${cat.checked || cat.issue_count}`
-                    : cat.checked > 0
-                      ? t('verify.checked_count', { n: cat.checked })
-                      : ''}
+                <span style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 1 }}>
+                  {(cat.verified > 0 || cat.unverified > 0) && (
+                    <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)', whiteSpace: 'nowrap' }}>
+                      {t(cat.fingerprint_only ? 'verify.hash_counts_local' : 'verify.hash_counts', {
+                        verified: cat.verified.toString(),
+                        unverified: cat.unverified.toString(),
+                      })}
+                    </span>
+                  )}
+                  <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)' }}>
+                    {hasIssues
+                      ? `${cat.issue_count} / ${cat.checked || cat.issue_count}`
+                      : cat.checked > 0
+                        ? t('verify.checked_count', { n: cat.checked })
+                        : ''}
+                  </span>
                 </span>
               </div>
             );
@@ -361,6 +406,12 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
                 )}
               </div>
             ))}
+
+          {report.categories.some((cat) => cat.fingerprint_only && cat.verified > 0) && (
+            <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-sm)' }}>
+              {t('verify.local_hash_note')}
+            </div>
+          )}
 
           {/* Content note */}
           {report.content_issues > 0 && (

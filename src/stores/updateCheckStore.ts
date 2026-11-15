@@ -58,3 +58,13 @@ export const useUpdateCheckStore = create<UpdateCheckState>((set) => ({
 }));
 
 export const EMPTY_UPDATE_CHECK: UpdateCheckEntry = { running: false, updates: null };
+
+/**
+ * Files a "check updates" action should inspect. An empty selection means the
+ * whole catalog; a non-empty one is scoped to exactly those filenames.
+ * Deduplication matters because a UI set can be rebuilt from several sources.
+ */
+export function updateCheckFiles(selected: Iterable<string>): string[] | null {
+  const unique = Array.from(new Set(selected));
+  return unique.length > 0 ? unique : null;
+}

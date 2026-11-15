@@ -146,7 +146,8 @@ export function AppearanceSettings() {
         {/* Liquid Glass is a separate experimental rendering mode, not a
             colour preset of the theme above: while it is on, the normal
             themes stay visible but locked, and the selected one is kept so
-            it can be restored on the way back. */}
+            it can be restored on the way back. The optimization switch on
+            the Launcher tab never disables it or its animated wallpaper. */}
         <div className="experimental-block">
           <div className="settings-row">
             <div className="settings-row__info">
@@ -165,7 +166,11 @@ export function AppearanceSettings() {
               )}
             </div>
             <div className="settings-row__control">
-              <Toggle checked={liquidGlass} onChange={setLiquidGlass} />
+              <Toggle
+                checked={liquidGlass}
+                onChange={setLiquidGlass}
+                ariaLabel={t('settings.lg_title')}
+              />
             </div>
           </div>
           {/* The backdrop only exists under Liquid Glass, so it is disabled

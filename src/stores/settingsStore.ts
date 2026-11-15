@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { withConfigDefaults } from '../lib/configDefaults';
 
 export interface AppConfig {
   data_dir: string;
@@ -10,16 +11,25 @@ export interface AppConfig {
   default_gc_preset: 'standard' | 'g1gc' | 'zgc';
   default_jvm_args: string[];
   java_path: string | null;
-  close_on_launch: boolean;
+  after_launch_action: 'do_nothing' | 'minimize' | 'close';
   proxy_enabled: boolean;
   proxy_addr: string;
   proxy_port: number;
+  /** Use the Windows system proxy instead of the manual address. */
+  use_system_proxy: boolean;
+  /** Never fall back to a direct connection after a proxy failure. */
+  proxy_only: boolean;
   // Kept for config save/load compatibility with the Rust struct
   // (fields are no longer editable in the UI).
   show_snapshots: boolean;
   show_old_versions: boolean;
   /** CurseForge API key — only used by Rust; not editable in the UI. */
   curseforge_api_key: string;
+  /**
+   * Load the pinned authlib-injector Java agent for Ely.by accounts.
+   * Microsoft/offline launches are unaffected.
+   */
+  elyby_skins_in_game: boolean;
 }
 
 export interface JavaInstallation {
@@ -53,7 +63,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     set({ isLoading: true });
     try {
       const config = await invoke<AppConfig>('cmd_get_config');
-      set({ config, loadError: null, isLoading: false });
+      set({ config: withConfigDefaults(config), loadError: null, isLoading: false });
     } catch (e) {
       console.error('Failed to load config:', e);
       set({ loadError: String(e), isLoading: false });
@@ -63,7 +73,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   saveConfig: async (config: AppConfig) => {
     try {
       await invoke('cmd_save_config', { newConfig: config });
-      set({ config });
+      set({ config: withConfigDefaults(config) });
     } catch (e) {
       console.error('Failed to save config:', e);
       // Re-throw so the UI can surface a real failure instead of a fake "saved".

@@ -92,7 +92,7 @@ interface ThemeState {
    *  overwritten by the Liquid Glass flag — it is what gets restored when
    *  Liquid Glass is switched off. */
   theme: Theme;
-  /** Experimental Liquid Glass appearance. A separate mode, not a theme. */
+  /** Liquid Glass appearance. A separate mode, not a theme. */
   liquidGlass: boolean;
   setTheme: (theme: Theme) => void;
   setLiquidGlass: (enabled: boolean) => void;
@@ -110,8 +110,7 @@ export const useThemeStore = create<ThemeState>((set, get) => {
     setTheme: (theme: Theme) => {
       // Locked while Liquid Glass is on: the normal theme cannot change
       // behind its back, so switching Liquid Glass off always restores the
-      // theme that was actually selected. The settings UI disables the
-      // control; this is the guard that holds even if something else calls it.
+      // theme that was actually selected.
       if (get().liquidGlass) return;
       set({ theme });
       applyAppearance(theme, false);

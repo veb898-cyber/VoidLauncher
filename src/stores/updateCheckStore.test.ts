@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { useUpdateCheckStore, type UpdateInfo } from './updateCheckStore';
+import { updateCheckFiles, useUpdateCheckStore, type UpdateInfo } from './updateCheckStore';
 
 function update(oldFilename: string, name = oldFilename): UpdateInfo {
   return {
@@ -64,5 +64,19 @@ describe('updateCheckStore', () => {
       running: false,
       updates: null,
     });
+  });
+});
+
+describe('updateCheckFiles', () => {
+  it('checks only the one selected file', () => {
+    expect(updateCheckFiles(['only.jar'])).toEqual(['only.jar']);
+  });
+
+  it('checks every selected file exactly once', () => {
+    expect(updateCheckFiles(['a.jar', 'b.jar', 'a.jar'])).toEqual(['a.jar', 'b.jar']);
+  });
+
+  it('returns null when nothing is selected (check the whole catalog)', () => {
+    expect(updateCheckFiles([])).toBeNull();
   });
 });

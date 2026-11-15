@@ -1,21 +1,27 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { create } from 'zustand';
+import { addToast } from '../components/ui/Toast';
 import { useLogStore } from '../stores/logStore';
 import type { LogEntry } from '../stores/logStore';
-import { useFocusStore, adjustRunningCount } from '../stores/focusStore';
+import { useFocusStore } from '../stores/focusStore';
+import { useSettingsStore, type AppConfig } from '../stores/settingsStore';
 import { t } from '../lib/i18n';
+import { afterLaunchWindowAction, applyAfterLaunchAction, type AfterLaunchWindowAction } from '../lib/afterLaunch';
 import { CRASH_KEYS, type CrashAnalysis } from '../lib/diagnostics';
-
-interface InstallProgress {
-  instance_id: string;
-  percent: number;
-  downloaded_bytes: number;
-  total_bytes: number;
-  stage: string;
-  message: string;
-}
+import {
+  applyRunningGameEvent,
+  runningSnapshotIsCurrent,
+} from '../lib/runningGames';
+import {
+  applyInstallProgress as reduceInstallProgress,
+  beginInstall as beginInstallState,
+  clearInstall as clearInstallState,
+  EMPTY_INSTALL_PROGRESS_STATE,
+  isTerminalInstallStage,
+  type InstallProgressEvent,
+} from '../lib/installProgress';
 
 interface LaunchEvent {
   instance_id: string;
@@ -31,37 +37,88 @@ interface LogPayload {
 }
 
 interface EventState {
-  installProgress: InstallProgress | null;
+  installProgress: InstallProgressEvent | null;
+  activeInstallId: string | null;
+  finishedInstallIds: string[];
+  beginInstall: (installId: string) => void;
+  applyInstallProgress: (event: InstallProgressEvent) => void;
+  clearInstall: (installId: string) => void;
   /** Names of the instances whose games are currently running (may be several). */
   runningGameIds: string[];
-  setInstallProgress: (p: InstallProgress | null) => void;
-  /** Add or remove a single instance from the running set. */
-  setRunningGameId: (id: string, running: boolean) => void;
-  /** Replace the whole running set (used when seeding from backend state). */
-  seedRunningGameIds: (ids: string[]) => void;
+  /** PID of each tracked run; guards against an older completion clearing a newer run. */
+  runningGamePids: Record<string, number>;
+  /** Incremented on every event so an older backend snapshot cannot overwrite it. */
+  runningStateVersion: number;
+  /** Add or remove a single instance from the running set; a stale completion PID is ignored. */
+  setRunningGameId: (id: string, running: boolean, pid?: number | null) => void;
+  /** Replace the whole set only if no event arrived since the request started. */
+  seedRunningGameIdsIfCurrent: (ids: string[], requestVersion: number) => boolean;
 }
 
 export const useEventStore = create<EventState>((set) => ({
-  installProgress: null,
+  ...EMPTY_INSTALL_PROGRESS_STATE,
+  beginInstall: (installId) =>
+    set((state) => beginInstallState(state, installId)),
+  applyInstallProgress: (event) =>
+    set((state) => reduceInstallProgress(state, event)),
+  clearInstall: (installId) =>
+    set((state) => clearInstallState(state, installId)),
   runningGameIds: [],
-  setInstallProgress: (p) => set({ installProgress: p }),
-  setRunningGameId: (id, running) =>
+  runningGamePids: {},
+  runningStateVersion: 0,
+  setRunningGameId: (id, running, pid) =>
     set((state) => {
-      if (!running) {
-        return { runningGameIds: state.runningGameIds.filter((g) => g !== id) };
-      }
-      return state.runningGameIds.includes(id)
-        ? state
-        : { runningGameIds: [...state.runningGameIds, id] };
+      const next = applyRunningGameEvent(
+        state.runningGameIds,
+        state.runningGamePids,
+        id,
+        running,
+        pid,
+      );
+      if (!next.changed) return state;
+      return {
+        runningGameIds: next.ids,
+        runningGamePids: next.pids,
+        runningStateVersion: state.runningStateVersion + 1,
+      };
     }),
-  seedRunningGameIds: (ids) => set({ runningGameIds: [...ids] }),
+  seedRunningGameIdsIfCurrent: (ids, requestVersion) => {
+    let applied = false;
+    set((state) => {
+      if (!runningSnapshotIsCurrent(requestVersion, state.runningStateVersion)) {
+        return state;
+      }
+      applied = true;
+      const pids: Record<string, number> = {};
+      for (const id of ids) {
+        const pid = state.runningGamePids[id];
+        if (pid != null) pids[id] = pid;
+      }
+      return {
+        runningGameIds: [...ids],
+        runningGamePids: pids,
+        runningStateVersion: state.runningStateVersion + 1,
+      };
+    });
+    return applied;
+  },
 }));
 
 export function useGameEvents() {
-  const { setInstallProgress, setRunningGameId, seedRunningGameIds } = useEventStore();
+  // Select the (stable) actions instead of subscribing to the whole store:
+  // install progress and running-state events arrive many times per second
+  // during an install, and a whole-store subscription re-rendered App (and
+  // therefore the page tree) for every one of them.
+  const applyInstallProgress = useEventStore((s) => s.applyInstallProgress);
+  const clearInstall = useEventStore((s) => s.clearInstall);
+  const setRunningGameId = useEventStore((s) => s.setRunningGameId);
+  const seedRunningGameIdsIfCurrent = useEventStore(
+    (s) => s.seedRunningGameIdsIfCurrent,
+  );
   const addLog = useLogStore((s) => s.addLog);
   const setWindowFocused = useFocusStore((s) => s.setWindowFocused);
   const setMinimized = useFocusStore((s) => s.setMinimized);
+  const lastWindowAction = useRef<AfterLaunchWindowAction>('none');
 
   useEffect(() => {
     // Race-safe event subscription. `listen()` is async — the returned
@@ -78,10 +135,15 @@ export function useGameEvents() {
     // badges survive a frontend reload while a game is still up.
     (async () => {
       try {
+        const requestVersion = useEventStore.getState().runningStateVersion;
         const ids = await invoke<string[]>('cmd_get_launch_state');
         if (!cancelled) {
-          seedRunningGameIds(ids);
-          useFocusStore.getState().setRunningCount(ids.length);
+          const applied = useEventStore
+            .getState()
+            .seedRunningGameIdsIfCurrent(ids, requestVersion);
+          if (applied) {
+            useFocusStore.getState().setRunningCount(ids.length);
+          }
         }
       } catch { /* ignore */ }
     })();
@@ -103,44 +165,69 @@ export function useGameEvents() {
         .catch((e) => { if (onError) onError(e); });
     };
 
-    register(listen<InstallProgress>('install_progress', (event) => {
+    register(listen<InstallProgressEvent>('install_progress', (event) => {
       const p = event.payload;
-      setInstallProgress(p);
-      if (p.stage === 'done') {
-        setTimeout(() => setInstallProgress(null), 2000);
+      applyInstallProgress(p);
+      if (isTerminalInstallStage(p.stage)) {
+        // Keep the terminal snapshot briefly for the overlay/hide transition,
+        // then remove it so stale events cannot resurrect a finished install.
+        const installId = p.install_id;
+        setTimeout(() => clearInstall(installId), 1500);
       }
     }));
 
     register(listen<LaunchEvent>('game_started', async (event) => {
       const p = event.payload;
       if (p.status === 'running') {
-        setRunningGameId(p.instance_id, true);
-        adjustRunningCount(1);
-        // Minimize the launcher only once the game process is actually
-        // running. If the launch fails before this point, the window stays
-        // visible so the user sees the error.
-        try {
-          const { getCurrentWindow } = await import('@tauri-apps/api/window');
-          await getCurrentWindow().minimize();
-        } catch { /* best-effort */ }
+        setRunningGameId(p.instance_id, true, p.pid);
+        useFocusStore
+          .getState()
+          .setRunningCount(useEventStore.getState().runningGameIds.length);
+        // Apply the configured after-launch action only once the game process
+        // is actually running. A failed launch never reaches this point, so
+        // the window stays visible with the error. Settings may not have been
+        // opened yet in this session, so read the config directly if needed.
+        let config = useSettingsStore.getState().config;
+        if (!config) {
+          try {
+            config = await invoke<AppConfig>('cmd_get_config');
+          } catch {
+            config = null;
+          }
+        }
+        const action = afterLaunchWindowAction(
+          p.status,
+          config?.after_launch_action,
+        );
+        lastWindowAction.current = action;
+        if (action !== 'none') {
+          try {
+            const { getCurrentWindow } = await import('@tauri-apps/api/window');
+            await applyAfterLaunchAction(action, getCurrentWindow());
+          } catch { /* best-effort */ }
+        }
       }
     }));
 
     register(listen<LaunchEvent>('launch_complete', async (event) => {
       const p = event.payload;
-      setRunningGameId(p.instance_id, false);
-      adjustRunningCount(-1);
-      // If the launcher minimized itself when the game started (see the
-      // `game_started` handler), restore it on a crash so the user actually
-      // sees the error. A non-zero exit code means the Java process died —
-      // surface it in the launcher log so users can find the cause without
-      // having to dig through Minecraft's own logs.
+      setRunningGameId(p.instance_id, false, p.pid);
+      useFocusStore
+        .getState()
+        .setRunningCount(useEventStore.getState().runningGameIds.length);
+      // If the launcher minimized itself when the game started, restore it on
+      // a crash so the user actually sees the error. "Do nothing" must not
+      // steal focus, and "close" means the launcher is already gone.
+      // A non-zero exit code means the Java process died — surface it in the
+      // launcher log even when the window action was "do nothing".
       if (p.exit_code !== null && p.exit_code !== undefined && p.exit_code !== 0) {
-        try {
-          const { getCurrentWindow } = await import('@tauri-apps/api/window');
-          await getCurrentWindow().unminimize();
-          await getCurrentWindow().setFocus();
-        } catch { /* best-effort */ }
+        if (lastWindowAction.current === 'minimize') {
+          try {
+            const { getCurrentWindow } = await import('@tauri-apps/api/window');
+            await getCurrentWindow().unminimize();
+            await getCurrentWindow().setFocus();
+          } catch { /* best-effort */ }
+        }
         addLog({
           level: 'error',
           source: 'launch',
@@ -170,6 +257,21 @@ export function useGameEvents() {
       addLog({ level, source: p.source, message: p.message });
     }));
 
+    register(
+      listen<{ kind: string; min_version?: string | null }>('launch_warning', (event) => {
+        if (event.payload.kind === 'elyby_skins_unsupported_mc') {
+          addToast(
+            t('errors.elyby_skins_unsupported_mc', {
+              version: event.payload.min_version ?? '1.7.2',
+            }),
+            'warning',
+          );
+        } else if (event.payload.kind === 'elyby_skins_bypassed') {
+          addToast(t('errors.elyby_skins_bypassed'), 'warning');
+        }
+      }),
+    );
+
     // Window focus tracking via Tauri events.
     // These fire on the webview window when OS focus or visibility changes.
     // Focus additionally RESYNCS the running-game set from the backend: a
@@ -179,10 +281,15 @@ export function useGameEvents() {
     // the live process table, so it is always the source of truth.
     const resyncRunningState = async () => {
       try {
+        const requestVersion = useEventStore.getState().runningStateVersion;
         const ids = await invoke<string[]>('cmd_get_launch_state');
         if (!cancelled) {
-          seedRunningGameIds(ids);
-          useFocusStore.getState().setRunningCount(ids.length);
+          const applied = useEventStore
+            .getState()
+            .seedRunningGameIdsIfCurrent(ids, requestVersion);
+          if (applied) {
+            useFocusStore.getState().setRunningCount(ids.length);
+          }
         }
       } catch { /* ignore */ }
     };
@@ -217,7 +324,7 @@ export function useGameEvents() {
         try { fn(); } catch { /* ignore */ }
       }
     };
-  }, [setInstallProgress, setRunningGameId, seedRunningGameIds, addLog, setWindowFocused, setMinimized]);
+  }, [applyInstallProgress, clearInstall, setRunningGameId, seedRunningGameIdsIfCurrent, addLog, setWindowFocused, setMinimized]);
 }
 
 export function emitFrontendLog(level: string, source: string, message: string) {

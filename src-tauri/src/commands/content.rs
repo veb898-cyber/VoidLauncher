@@ -4,8 +4,9 @@
 
 use crate::commands::instances::validate_instance_name;
 use crate::content::{
-    self, DepEdge, GraphInput, InstalledContent, InstalledProject, PlanFile, Resolution,
-    UnresolvedItem, VersionNode, DEP_EMBEDDED, DEP_INCOMPATIBLE, DEP_OPTIONAL, DEP_REQUIRED,
+    self, DepEdge, GraphInput, InstalledContent, InstalledProject, PlanFile, ProjectKey,
+    ProjectNameEntry, Resolution, UnresolvedItem, VersionNode, DEP_EMBEDDED, DEP_INCOMPATIBLE,
+    DEP_OPTIONAL, DEP_REQUIRED,
 };
 use crate::instances;
 use crate::modrinth;
@@ -62,24 +63,37 @@ fn valid_id(id: &str) -> bool {
 /// dedup because they are seeded first).
 ///
 /// Both providers run through the same worklist: Modrinth versions use raw
-/// version ids, CurseForge entries use the structured key `cf:{project_id}`
-/// in the resolve queue and `cf:{project_id}:{file_id}` as a concrete version
-/// id (a CF file, not a Modrinth version — never passed to the Modrinth API).
+/// version ids, while CurseForge concrete versions use
+/// `cf:{project_id}:{file_id}` (a CF file, not a Modrinth version — never
+/// passed to the Modrinth API). Project-only waiters and project metadata are
+/// keyed by [`ProjectKey`], so the same numeric id can exist in both catalogs.
 /// CurseForge dependency edges are always provider-pure, so a CF node's
 /// dependencies resolve against CF and vice versa.
+/// A concrete (pinned) required dependency only satisfies the edge when the
+/// exact version is installed. Any other installed version must be fetched so
+/// the resolver can replace it (or report a conflict).
+fn pinned_dependency_needs_fetch(installed_version: Option<&str>, required: &str) -> bool {
+    installed_version != Some(required)
+}
+
 struct GraphFetcher {
     mc_version: Option<String>,
     loader: Option<String>,
-    installed_pids: HashSet<String>,
+    installed_pids: HashSet<ProjectKey>,
+    /// Installed version per project, when the sidecar exposes one. A pinned
+    /// required dependency is only skipped when this exact version is present;
+    /// otherwise the pinned node must be fetched so the resolver can replace
+    /// the installed one (or surface a conflict).
+    installed_versions: HashMap<ProjectKey, String>,
     roots: HashSet<String>,
     nodes: HashMap<String, VersionNode>,
-    /// `project_id` → (title, icon) for every project the graph mentions,
-    /// including optional/incompatible targets that never get a node.
-    projects: HashMap<String, (String, Option<String>)>,
+    /// Full project identity → (title, icon) for every project the graph
+    /// mentions, including optional/incompatible targets without a node.
+    projects: HashMap<ProjectKey, (String, Option<String>)>,
     /// Project-only required edges still awaiting a version choice; filled in
     /// only when no node for the project exists (a pin elsewhere already
-    /// resolved it otherwise). CurseForge entries are keyed `cf:{pid}`.
-    need_resolve: HashSet<String>,
+    /// resolved it otherwise). Keyed by provider + project id.
+    need_resolve: HashSet<ProjectKey>,
     unresolved: Vec<UnresolvedItem>,
     attempted: HashSet<String>,
     queued: HashSet<String>,
@@ -95,13 +109,15 @@ impl GraphFetcher {
         root_version_ids: &[String],
         mc_version: Option<String>,
         loader: Option<String>,
-        installed_pids: HashSet<String>,
+        installed_pids: HashSet<ProjectKey>,
+        installed_versions: HashMap<ProjectKey, String>,
         cf_key: String,
     ) -> Self {
         Self {
             mc_version,
             loader,
             installed_pids,
+            installed_versions,
             roots: root_version_ids.iter().cloned().collect(),
             nodes: HashMap::new(),
             projects: HashMap::new(),
@@ -114,11 +130,12 @@ impl GraphFetcher {
         }
     }
 
-    async fn ensure_project(&mut self, pid: &str, cf: bool) {
-        if self.projects.contains_key(pid) {
+    async fn ensure_project(&mut self, key: &ProjectKey) {
+        if self.projects.contains_key(key) {
             return;
         }
-        let meta = if cf {
+        let pid = key.project_id();
+        let meta = if key.provider() == "curseforge" {
             match crate::curseforge::get_mod(pid.parse().unwrap_or(0), &self.cf_key).await {
                 Ok(p) => {
                     let url = p
@@ -137,14 +154,26 @@ impl GraphFetcher {
                 Err(_) => (pid.to_string(), None),
             }
         };
-        self.projects.insert(pid.to_string(), meta);
+        self.projects.insert(key.clone(), meta);
     }
 
-    fn project_name(&self, pid: &str) -> String {
+    fn project_name(&self, key: &ProjectKey) -> String {
         self.projects
-            .get(pid)
+            .get(key)
             .map(|(n, _)| n.clone())
-            .unwrap_or_else(|| pid.to_string())
+            .unwrap_or_else(|| key.project_id().to_string())
+    }
+
+    /// Cached project titles in the transport shape consumed by `GraphInput`.
+    fn graph_project_names(&self) -> Vec<ProjectNameEntry> {
+        self.projects
+            .iter()
+            .map(|(key, (title, _))| ProjectNameEntry {
+                provider: key.provider().to_string(),
+                project_id: key.project_id().to_string(),
+                name: title.clone(),
+            })
+            .collect()
     }
 
     fn enqueue(&mut self, queue: &mut VecDeque<String>, vid: &str) {
@@ -190,10 +219,11 @@ impl GraphFetcher {
         };
         let Some(cf_file) = file else { return Ok(()) };
 
-        self.ensure_project(pid_str, true).await;
+        let project_key = ProjectKey::new("curseforge", pid_str);
+        self.ensure_project(&project_key).await;
         let (name, icon) = self
             .projects
-            .get(pid_str)
+            .get(&project_key)
             .cloned()
             .unwrap_or_else(|| (pid_str.to_string(), None));
 
@@ -212,13 +242,14 @@ impl GraphFetcher {
                 continue;
             };
             let dep_pid = d.mod_id.to_string();
-            if kind == DEP_REQUIRED && !self.installed_pids.contains(&dep_pid) {
+            let dep_key = ProjectKey::new("curseforge", dep_pid.as_str());
+            if kind == DEP_REQUIRED && !self.installed_pids.contains(&dep_key) {
                 // Choice deferred to the resolve cycle (newest CF file for
                 // this instance's MC/loader).
-                self.need_resolve.insert(format!("cf:{}", dep_pid));
+                self.need_resolve.insert(dep_key);
             } else if kind != DEP_REQUIRED {
                 // Titles for optional entries and conflict messages.
-                self.ensure_project(&dep_pid, true).await;
+                self.ensure_project(&dep_key).await;
             }
             deps.push(DepEdge {
                 source_version_id: vid.clone(),
@@ -288,10 +319,11 @@ impl GraphFetcher {
                     continue;
                 };
 
-                self.ensure_project(&version.project_id, false).await;
+                let project_key = ProjectKey::new("modrinth", version.project_id.as_str());
+                self.ensure_project(&project_key).await;
                 let (name, icon) = self
                     .projects
-                    .get(&version.project_id)
+                    .get(&project_key)
                     .cloned()
                     .unwrap_or_else(|| (version.project_id.clone(), None));
 
@@ -305,12 +337,27 @@ impl GraphFetcher {
                         DEP_REQUIRED => match (&d.version_id, &d.project_id) {
                             // Explicit pin: fetch that exact version.
                             (Some(dep_vid), pid) => {
+                                let known_pid = pid.clone().or_else(|| {
+                                    self.nodes.get(dep_vid).map(|n| n.project_id.clone())
+                                });
                                 deps.push(DepEdge {
                                     source_version_id: vid.clone(),
                                     dep_type: DEP_REQUIRED.to_string(),
-                                    project_id: pid.clone(),
+                                    project_id: known_pid.clone(),
                                     version_id: Some(dep_vid.clone()),
                                 });
+                                if let Some(p) = &known_pid {
+                                    let dep_key = ProjectKey::new("modrinth", p.as_str());
+                                    // Skip only when the exact pinned version
+                                    // is installed. An older/other installed
+                                    // version must be fetched and planned.
+                                    if !pinned_dependency_needs_fetch(
+                                        self.installed_versions.get(&dep_key).map(String::as_str),
+                                        dep_vid,
+                                    ) {
+                                        continue;
+                                    }
+                                }
                                 self.enqueue(&mut queue, dep_vid);
                             }
                             // Project-only: defer the choice until every pin
@@ -322,8 +369,9 @@ impl GraphFetcher {
                                     project_id: Some(dep_pid.clone()),
                                     version_id: None,
                                 });
-                                if !self.installed_pids.contains(dep_pid.as_str()) {
-                                    self.need_resolve.insert(dep_pid.clone());
+                                let dep_key = ProjectKey::new("modrinth", dep_pid.as_str());
+                                if !self.installed_pids.contains(&dep_key) {
+                                    self.need_resolve.insert(dep_key);
                                 }
                             }
                             (None, None) => {}
@@ -331,7 +379,8 @@ impl GraphFetcher {
                         DEP_OPTIONAL => {
                             if let Some(pid) = &d.project_id {
                                 // Title so the UI can name the optional entry.
-                                self.ensure_project(pid, false).await;
+                                self.ensure_project(&ProjectKey::new("modrinth", pid.as_str()))
+                                    .await;
                             }
                             deps.push(DepEdge {
                                 source_version_id: vid.clone(),
@@ -343,7 +392,8 @@ impl GraphFetcher {
                         _ => {
                             // incompatible: title for the conflict message.
                             if let Some(pid) = &d.project_id {
-                                self.ensure_project(pid, false).await;
+                                self.ensure_project(&ProjectKey::new("modrinth", pid.as_str()))
+                                    .await;
                             }
                             deps.push(DepEdge {
                                 source_version_id: vid.clone(),
@@ -375,19 +425,19 @@ impl GraphFetcher {
             if self.need_resolve.is_empty() {
                 break;
             }
-            let pending: Vec<String> = std::mem::take(&mut self.need_resolve).into_iter().collect();
+            let pending: Vec<ProjectKey> =
+                std::mem::take(&mut self.need_resolve).into_iter().collect();
             for key in pending {
-                // `cf:{pid}` → CurseForge project, plain id → Modrinth.
-                let (pid, cf) = match key.strip_prefix("cf:") {
-                    Some(raw) => (raw.to_string(), true),
-                    None => (key.clone(), false),
-                };
-                if self.installed_pids.contains(&pid)
-                    || self.nodes.values().any(|n| n.project_id == pid)
+                if self.installed_pids.contains(&key)
+                    || self
+                        .nodes
+                        .values()
+                        .any(|n| ProjectKey::new(&n.provider, n.project_id.as_str()) == key)
                 {
                     continue;
                 }
-                if cf {
+                if key.provider() == "curseforge" {
+                    let pid = key.project_id().to_string();
                     let pid_num: u64 = match pid.parse() {
                         Ok(n) => n,
                         Err(_) => continue,
@@ -410,23 +460,27 @@ impl GraphFetcher {
                             self.enqueue(&mut queue, &vid);
                         }
                         Ok(_) => {
-                            self.ensure_project(&pid, true).await;
-                            let source = self.project_source_for(&pid);
+                            self.ensure_project(&key).await;
+                            let source = self.project_source_for(&key);
                             self.unresolved.push(UnresolvedItem {
+                                provider: key.provider().to_string(),
                                 project_id: pid.clone(),
-                                project_name: self.project_name(&pid),
-                                source_project_id: source.0,
+                                project_name: self.project_name(&key),
+                                source_provider: source.0.provider().to_string(),
+                                source_project_id: source.0.project_id().to_string(),
                                 source_name: source.1,
                                 reason: "no_compatible_version".to_string(),
                             });
                         }
                         Err(_) => {
-                            self.ensure_project(&pid, true).await;
-                            let source = self.project_source_for(&pid);
+                            self.ensure_project(&key).await;
+                            let source = self.project_source_for(&key);
                             self.unresolved.push(UnresolvedItem {
+                                provider: key.provider().to_string(),
                                 project_id: pid.clone(),
-                                project_name: self.project_name(&pid),
-                                source_project_id: source.0,
+                                project_name: self.project_name(&key),
+                                source_provider: source.0.provider().to_string(),
+                                source_project_id: source.0.project_id().to_string(),
                                 source_name: source.1,
                                 reason: "unavailable".to_string(),
                             });
@@ -435,7 +489,7 @@ impl GraphFetcher {
                     continue;
                 }
                 match modrinth::get_versions(
-                    &pid,
+                    key.project_id(),
                     self.mc_version.as_deref(),
                     self.loader.as_deref(),
                 )
@@ -448,23 +502,27 @@ impl GraphFetcher {
                     Ok(_) => {
                         // No version for this (MC, loader) — reported with a
                         // real project title for the warning panel.
-                        self.ensure_project(&pid, false).await;
-                        let source = self.project_source_for(&pid);
+                        self.ensure_project(&key).await;
+                        let source = self.project_source_for(&key);
                         self.unresolved.push(UnresolvedItem {
-                            project_id: pid.clone(),
-                            project_name: self.project_name(&pid),
-                            source_project_id: source.0,
+                            provider: key.provider().to_string(),
+                            project_id: key.project_id().to_string(),
+                            project_name: self.project_name(&key),
+                            source_provider: source.0.provider().to_string(),
+                            source_project_id: source.0.project_id().to_string(),
                             source_name: source.1,
                             reason: "no_compatible_version".to_string(),
                         });
                     }
                     Err(_) => {
-                        self.ensure_project(&pid, false).await;
-                        let source = self.project_source_for(&pid);
+                        self.ensure_project(&key).await;
+                        let source = self.project_source_for(&key);
                         self.unresolved.push(UnresolvedItem {
-                            project_id: pid.clone(),
-                            project_name: self.project_name(&pid),
-                            source_project_id: source.0,
+                            provider: key.provider().to_string(),
+                            project_id: key.project_id().to_string(),
+                            project_name: self.project_name(&key),
+                            source_provider: source.0.provider().to_string(),
+                            source_project_id: source.0.project_id().to_string(),
                             source_name: source.1,
                             reason: "unavailable".to_string(),
                         });
@@ -473,31 +531,92 @@ impl GraphFetcher {
             }
         }
 
+        // Back-fill project_id for all DepEdges where target version node is known
+        let vid_to_pid: std::collections::HashMap<String, String> = self
+            .nodes
+            .iter()
+            .map(|(vid, node)| (vid.clone(), node.project_id.clone()))
+            .collect();
+
+        for node in self.nodes.values_mut() {
+            for dep in &mut node.deps {
+                if dep.project_id.is_none() {
+                    if let Some(vid) = &dep.version_id {
+                        if let Some(pid) = vid_to_pid.get(vid) {
+                            dep.project_id = Some(pid.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // A required edge that named a concrete version but whose version
+        // fetch failed has no project_id yet, so the resolver's dep_key()
+        // cannot report it. Surface it here instead of silently installing
+        // the parent without its dependency.
+        let missing_required: Vec<UnresolvedItem> = self
+            .nodes
+            .values()
+            .flat_map(|node| {
+                node.deps.iter().filter_map(|dep| {
+                    if dep.dep_type != DEP_REQUIRED || dep.project_id.is_some() {
+                        return None;
+                    }
+                    let version_id = dep.version_id.as_deref()?;
+                    if self.nodes.contains_key(version_id) {
+                        return None;
+                    }
+                    Some(UnresolvedItem {
+                        provider: node.provider.clone(),
+                        project_id: version_id.to_string(),
+                        project_name: format!("Unknown dependency ({version_id})"),
+                        source_provider: node.provider.clone(),
+                        source_project_id: node.project_id.clone(),
+                        source_name: node.name.clone(),
+                        reason: "unavailable".to_string(),
+                    })
+                })
+            })
+            .collect();
+        self.unresolved.extend(missing_required);
+
+        let project_names = self.graph_project_names();
         Ok(GraphInput {
             nodes: self.nodes,
             roots: root_version_ids.to_vec(),
             unresolved: self.unresolved,
-            project_names: self
-                .projects
-                .into_iter()
-                .map(|(pid, (title, _))| (pid, title))
-                .collect(),
+            project_names,
         })
     }
 
     /// Best-effort attribution for a deferred project-only failure: the first
     /// node that references the project (dedup keeps one warning anyway).
-    fn project_source_for(&self, pid: &str) -> (String, String) {
+    fn project_source_for(&self, target: &ProjectKey) -> (ProjectKey, String) {
         for node in self.nodes.values() {
-            if node
-                .deps
-                .iter()
-                .any(|d| d.project_id.as_deref() == Some(pid))
-            {
-                return (node.project_id.clone(), node.name.clone());
+            let matches = node.deps.iter().any(|d| {
+                let Some(pid) = d.project_id.as_deref().or_else(|| {
+                    d.version_id
+                        .as_deref()
+                        .and_then(|vid| self.nodes.get(vid).map(|n| n.project_id.as_str()))
+                }) else {
+                    return false;
+                };
+                let provider = d
+                    .version_id
+                    .as_deref()
+                    .and_then(|vid| self.nodes.get(vid))
+                    .map(|n| n.provider.as_str())
+                    .unwrap_or(&node.provider);
+                ProjectKey::new(provider, pid) == *target
+            });
+            if matches {
+                return (
+                    ProjectKey::new(&node.provider, node.project_id.as_str()),
+                    node.name.clone(),
+                );
             }
         }
-        (String::new(), String::new())
+        (ProjectKey::new(target.provider(), ""), String::new())
     }
 }
 
@@ -548,17 +667,35 @@ pub async fn cmd_resolve_dependencies(
     let installed = content::list_installed(&dir, content_type);
     let installed_projects: Vec<InstalledProject> = installed
         .iter()
-        .filter_map(|c| {
-            Some(InstalledProject {
-                project_id: c.project_id.clone()?,
-                name: c.project_name.clone().unwrap_or_else(|| c.filename.clone()),
+        .map(|c| {
+            let stem = crate::instances::content_stem(&c.filename);
+            let pid = c
+                .project_id
+                .clone()
+                .unwrap_or_else(|| format!("local:{}", stem));
+            let name = c.project_name.clone().unwrap_or_else(|| stem.to_string());
+            InstalledProject {
+                provider: c.provider.clone(),
+                project_id: pid,
+                name,
                 version_id: c.version_id.clone(),
-            })
+            }
         })
         .collect();
     let installed_pids = installed_projects
         .iter()
-        .map(|p| p.project_id.clone())
+        .map(|p| ProjectKey::new(&p.provider, p.project_id.as_str()))
+        .collect();
+    let installed_versions = installed_projects
+        .iter()
+        .filter_map(|p| {
+            p.version_id.as_ref().map(|version| {
+                (
+                    ProjectKey::new(&p.provider, p.project_id.as_str()),
+                    version.clone(),
+                )
+            })
+        })
         .collect();
     let cf_key = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
@@ -570,6 +707,7 @@ pub async fn cmd_resolve_dependencies(
         mc_version,
         loader,
         installed_pids,
+        installed_versions,
         cf_key,
     );
     let graph = fetcher.run(&root_version_ids).await?;
@@ -698,4 +836,68 @@ async fn classify_cf_one(
         _ => None,
     };
     content::classify_compat(true, strict, loader_only)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_fetcher_projects_separate_same_id_by_provider() {
+        let mut fetcher = GraphFetcher::new(
+            &[],
+            None,
+            None,
+            HashSet::new(),
+            HashMap::new(),
+            String::new(),
+        );
+        fetcher.projects.insert(
+            ProjectKey::new("curseforge", "12345"),
+            ("CF Project".to_string(), Some("cf-icon".to_string())),
+        );
+        fetcher.projects.insert(
+            ProjectKey::new("modrinth", "12345"),
+            ("MR Project".to_string(), Some("mr-icon".to_string())),
+        );
+
+        assert_eq!(fetcher.projects.len(), 2);
+        assert_eq!(
+            fetcher.project_name(&ProjectKey::new("curseforge", "12345")),
+            "CF Project"
+        );
+        assert_eq!(
+            fetcher.project_name(&ProjectKey::new("modrinth", "12345")),
+            "MR Project"
+        );
+
+        let names = fetcher.graph_project_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().any(|entry| {
+            entry.provider == "curseforge"
+                && entry.project_id == "12345"
+                && entry.name == "CF Project"
+        }));
+        assert!(names.iter().any(|entry| {
+            entry.provider == "modrinth"
+                && entry.project_id == "12345"
+                && entry.name == "MR Project"
+        }));
+    }
+
+    #[test]
+    fn pinned_dependency_requires_the_exact_installed_version() {
+        assert!(
+            !pinned_dependency_needs_fetch(Some("v-required"), "v-required"),
+            "the exact installed version satisfies the pin"
+        );
+        assert!(
+            pinned_dependency_needs_fetch(Some("v-other"), "v-required"),
+            "a different installed version must be replaced/fetched"
+        );
+        assert!(
+            pinned_dependency_needs_fetch(None, "v-required"),
+            "an unversioned installed file cannot satisfy a concrete pin"
+        );
+    }
 }

@@ -178,7 +178,7 @@ export default function LiquidGlassWallpaper() {
     };
 
     const start = () => {
-      if (raf) return;
+      if (raf || !shouldRun()) return;
       last = 0;
       lastPaint = 0;
       raf = requestAnimationFrame(frame);

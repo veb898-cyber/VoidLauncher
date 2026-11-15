@@ -5,9 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>VoidLauncher</title>
     <meta name="description" content="VoidLauncher — A premium custom Minecraft launcher" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" />
     <script>
       (function(){
         try {
@@ -31,9 +28,15 @@
             document.documentElement.setAttribute('data-theme', t);
             document.documentElement.style.colorScheme = 'dark';
           }
-          // Liquid motion and the gooey trails are always on (no longer user
-          // settings); prefers-reduced-motion is honoured by the CSS media
-          // blocks and by useGooey in React. Must stay in sync with
+          // Optional interface-effect reduction. Applied before React so the
+          // first frame already uses the saved choice; the performance store
+          // migrates older profile data and re-applies the same value.
+          if (localStorage.getItem('voidlauncher-reduce-interface-effects') === '1') {
+            document.documentElement.setAttribute('data-reduce-effects', 'on');
+          }
+          // Liquid motion is always on; prefers-reduced-motion is honoured by
+          // the CSS media blocks and by useGooey in React. The optimization
+          // switch can also turn the gooey trails off. Must stay in sync with
           // src/stores/themeStore.ts.
           document.documentElement.setAttribute('data-motion', 'liquid');
           var f = localStorage.getItem('voidlauncher-font');

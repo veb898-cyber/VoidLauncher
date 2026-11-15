@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Tooltip } from './Tooltip';
 
@@ -70,6 +70,8 @@ export function CustomSelect<T extends string>({
   const wrapRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+  const listId = useId();
+  const optionId = (index: number) => `${listId}-option-${index}`;
 
   const selected = options.find((o) => o.value === value);
 
@@ -124,7 +126,13 @@ export function CustomSelect<T extends string>({
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        // The list is portaled, but the keydown still bubbles through
+        // document and then window, where Modal listens. Consume it here so
+        // one Escape closes only the dropdown, not the dialog around it.
+        e.preventDefault();
+        e.stopPropagation();
         setOpen(false);
+        triggerRef.current?.focus();
         return;
       }
       if (e.key === 'ArrowDown') {
@@ -191,8 +199,10 @@ export function CustomSelect<T extends string>({
   const list = open && pos ? (
     <ul
       ref={listRef}
+      id={listId}
       className={`custom-select__list ${pos.top === null ? 'custom-select__list--up' : ''}`}
       role="listbox"
+      aria-label={selected?.label}
       style={{
         position: 'fixed',
         left: pos.left,
@@ -209,6 +219,7 @@ export function CustomSelect<T extends string>({
         return (
           <li
             key={opt.value}
+            id={optionId(i)}
             role="option"
             aria-selected={isSelected}
             aria-disabled={opt.disabled}
@@ -264,8 +275,11 @@ export function CustomSelect<T extends string>({
         ref={triggerRef}
         className="custom-select__trigger input"
         onClick={() => setOpen((o) => !o)}
+        role="combobox"
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={open ? listId : undefined}
+        aria-activedescendant={open && focusIdx >= 0 ? optionId(focusIdx) : undefined}
         disabled={disabled}
       >
         <span className="custom-select__value">{selected?.label ?? ''}</span>

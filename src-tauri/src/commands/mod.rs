@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod content;
 pub mod diagnostics;
+pub mod export;
 pub mod heads;
 pub mod instances;
 pub mod launcher;

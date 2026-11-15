@@ -8,6 +8,50 @@ import { invoke } from '@tauri-apps/api/core';
 
 export type ProviderId = 'modrinth' | 'curseforge';
 
+/** Catalog provider preference is per content type, so opening resource packs
+ *  cannot inherit a CurseForge choice made in the mods catalog. */
+export const CONTENT_PROVIDER_STORAGE_PREFIX = 'voidlauncher.contentProvider';
+
+export function contentProviderStorageKey(contentType: string): string {
+  return `${CONTENT_PROVIDER_STORAGE_PREFIX}.${contentType}`;
+}
+
+/** Every catalog starts on Modrinth; only an explicit user choice persists. */
+export function readContentProviderPreference(contentType: string): ProviderId {
+  try {
+    return localStorage.getItem(contentProviderStorageKey(contentType)) === 'curseforge'
+      ? 'curseforge'
+      : 'modrinth';
+  } catch {
+    return 'modrinth';
+  }
+}
+
+export function writeContentProviderPreference(
+  contentType: string,
+  provider: ProviderId,
+): void {
+  try {
+    localStorage.setItem(contentProviderStorageKey(contentType), provider);
+  } catch {
+    /* preference is optional */
+  }
+}
+
+/** Identity of an async catalog request: provider plus a switch generation. */
+export interface ProviderRequestToken {
+  provider: ProviderId;
+  generation: number;
+}
+
+/** True only while both the provider and its generation are unchanged. */
+export function isCurrentProviderRequest(
+  request: ProviderRequestToken,
+  current: ProviderRequestToken,
+): boolean {
+  return request.provider === current.provider && request.generation === current.generation;
+}
+
 /** Normalized compatibility states returned by the backend classifier. */
 export type CompatState = 'compatible' | 'unverified' | 'incompatible' | 'unknown';
 
@@ -53,6 +97,8 @@ export interface ProviderVersion {
   project_id: string;
   name: string;
   version_number: string;
+  /** Modrinth release channel or CurseForge releaseType mapped to it. */
+  version_type?: string;
   game_versions?: string[];
   loaders?: string[];
   date_published?: string;
@@ -254,6 +300,8 @@ const curseforgeProvider: ContentProvider = {
         project_id: projectId,
         name: file.displayName,
         version_number: file.displayName,
+        version_type:
+          file.releaseType === 3 ? 'alpha' : file.releaseType === 2 ? 'beta' : 'release',
         game_versions: gameVersions.filter((v) => /^\d/.test(v)),
         loaders: gameVersions.filter((v) => CF_LOADERS.includes(v)),
         date_published: file.fileDate,

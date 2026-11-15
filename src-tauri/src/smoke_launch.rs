@@ -1257,8 +1257,9 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
         instances::get_instance(&instances_dir, &name)
             .map_err(|e| format!("reuse instance: {}", e))?
     } else {
-        let inst = Instance::new(&name, mc, 4096, "g1gc", loader_type(loader), None);
-        instances::create_instance(&instances_dir, &inst)
+        let inst = Instance::new(&name, mc, loader_type(loader), None);
+        let launches = crate::launch_state::LaunchRegistry::new();
+        instances::create_instance(&instances_dir, &inst, &launches)
             .map_err(|e| format!("create instance: {}", e))?;
         inst
     };
@@ -1319,6 +1320,8 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
             access_token: token,
             uuid,
             username,
+            user_type: "legacy",
+            authlib_injector: None,
         },
         None,
         None,

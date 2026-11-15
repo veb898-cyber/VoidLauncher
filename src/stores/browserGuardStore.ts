@@ -16,6 +16,9 @@ interface BrowserGuardState {
   /// Runs `action` immediately if nothing needs confirmation, otherwise opens
   /// the global confirmation dialog and stashes `action` until confirmed.
   askLeave: (action: () => void) => void;
+  /// Like askLeave, but only unsaved edits block the action. Used when closing
+  /// the window: a content-browser selection is not lost data.
+  askUnsaved: (action: () => void) => void;
   /// User confirmed leaving: discard selection/changes and run the stashed action.
   resolveLeave: () => void;
   cancelLeave: () => void;
@@ -30,6 +33,13 @@ export const useBrowserGuardStore = create<BrowserGuardState>((set, get) => ({
   clear: () => set({ pending: 0 }),
   askLeave: (action) => {
     if (get().pending > 0 || get().unsaved) {
+      set({ request: action });
+    } else {
+      action();
+    }
+  },
+  askUnsaved: (action) => {
+    if (get().unsaved) {
       set({ request: action });
     } else {
       action();

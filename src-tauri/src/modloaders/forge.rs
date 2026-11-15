@@ -709,7 +709,7 @@ fn build_profile(
 ) -> Result<LoaderProfile> {
     let mut libraries = Vec::new();
     for lib in libs {
-        let (url, path) = if let Some(downloads) = &lib.downloads {
+        let (url, path, sha1, size) = if let Some(downloads) = &lib.downloads {
             if let Some(artifact) = &downloads.artifact {
                 let lib_path = artifact
                     .path
@@ -723,7 +723,12 @@ fn build_profile(
                     Some(u) => u.clone(),
                     None => format!("https://maven.minecraftforge.net/{}", lib_path),
                 };
-                (lib_url, lib_path)
+                (
+                    lib_url,
+                    lib_path,
+                    artifact.sha1.clone().filter(|s| !s.is_empty()),
+                    artifact.size,
+                )
             } else {
                 let path = maven_to_path(&lib.name);
                 let base = lib
@@ -737,7 +742,7 @@ fn build_profile(
                 } else {
                     format!("{}/", base)
                 };
-                (format!("{}{}", base, path), path)
+                (format!("{}{}", base, path), path, None, None)
             }
         } else {
             let path = maven_to_path(&lib.name);
@@ -752,15 +757,15 @@ fn build_profile(
             } else {
                 format!("{}/", base)
             };
-            (format!("{}{}", base, path), path)
+            (format!("{}{}", base, path), path, None, None)
         };
 
         libraries.push(LoaderLibrary {
             name: lib.name.clone(),
             url,
             path,
-            sha1: None,
-            size: None,
+            sha1,
+            size,
         });
     }
 
@@ -1515,6 +1520,29 @@ pub async fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_artifact_hashes_and_sizes_reach_the_loader_profile() {
+        let lib: ForgeLibrary = serde_json::from_value(serde_json::json!({
+            "name": "example:library:1.0",
+            "downloads": {
+                "artifact": {
+                    "path": "example/library/1.0/library-1.0.jar",
+                    "url": "https://maven.example.invalid/library-1.0.jar",
+                    "sha1": "0123456789abcdef0123456789abcdef01234567",
+                    "size": 4242
+                }
+            }
+        }))
+        .expect("forge library fixture");
+        let profile = build_profile("Main".into(), vec![lib], None, None).unwrap();
+        let library = &profile.libraries[0];
+        assert_eq!(
+            library.sha1.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(library.size, Some(4242));
+    }
 
     #[test]
     fn forge_java_matrix() {

@@ -17,6 +17,46 @@ pub struct GameLogSession {
 /// Tracks the current game session log path
 static CURRENT_LOG_PATH: Mutex<Option<String>> = Mutex::new(None);
 
+/// Hard cap for ONE incremental update sent to the renderer. A crash-looping
+/// game can append hundreds of megabytes between two polls; without a cap the
+/// read allocates that whole delta (and serializes it over IPC). When the
+/// delta exceeds the cap only the newest complete lines are returned and the
+/// offset still advances, so later polls remain correct.
+pub const MAX_INCREMENTAL_LOG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Hard cap for the initial tail snapshot / "show last N lines" read. 100k
+/// lines of a pathological log can otherwise be arbitrarily large.
+const MAX_TAIL_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Cache of the `Instance:` header per session path. Session filenames are
+/// unique and the header never changes, so listing hundreds of sessions every
+/// second must not re-open and re-read every file.
+static LOG_HEADER_CACHE: Mutex<Option<HashMap<std::path::PathBuf, String>>> = Mutex::new(None);
+
+fn cached_instance_header(path: &std::path::Path) -> Option<String> {
+    {
+        let guard = LOG_HEADER_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cache) = guard.as_ref() {
+            if let Some(name) = cache.get(path) {
+                return Some(name.clone());
+            }
+        }
+    }
+    let name = read_instance_header(path)?;
+    let mut guard = LOG_HEADER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    // Keep the cache bounded when users accumulate years of sessions.
+    if cache.len() > 2000 {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), name.clone());
+    Some(name)
+}
+
 /// Sanitize an instance name for use inside a session filename.
 /// Shared by `create_game_log_file` and by `cmd_list_game_logs` so the
 /// frontend can filter sessions by instance without guessing the scheme.
@@ -407,7 +447,7 @@ pub fn list_game_log_sessions(data_dir: &Path) -> Vec<GameLogSession> {
         return Vec::new();
     }
 
-    let mut sessions: Vec<GameLogSession> = Vec::new();
+    let mut sessions: Vec<(Option<std::time::SystemTime>, GameLogSession)> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(&game_logs_dir) {
         for entry in entries.flatten() {
@@ -442,36 +482,35 @@ pub fn list_game_log_sessions(data_dir: &Path) -> Vec<GameLogSession> {
                         .last()
                         .unwrap_or(&file_name)
                         .to_string();
-                    let instance_name = read_instance_header(&path).unwrap_or(fallback_name);
+                    let instance_name = cached_instance_header(&path).unwrap_or(fallback_name);
 
-                    let started_at = if let Ok(modified) = meta.modified() {
+                    let modified = meta.modified().ok();
+                    let started_at = if let Some(modified) = modified {
                         let dt: chrono::DateTime<chrono::Local> = modified.into();
                         dt.format("%d/%m/%Y %H:%M:%S").to_string()
                     } else {
                         String::new()
                     };
 
-                    sessions.push(GameLogSession {
-                        path: path.to_string_lossy().to_string(),
-                        instance_name,
-                        started_at,
-                        size_bytes: meta.len(),
-                    });
+                    sessions.push((
+                        modified,
+                        GameLogSession {
+                            path: path.to_string_lossy().to_string(),
+                            instance_name,
+                            started_at,
+                            size_bytes: meta.len(),
+                        },
+                    ));
                 }
             }
         }
     }
 
-    // Sort by modification time, most recent first
-    sessions.sort_by(|a, b| {
-        let a_path = PathBuf::from(&a.path);
-        let b_path = PathBuf::from(&b.path);
-        let a_modified = a_path.metadata().ok().and_then(|m| m.modified().ok());
-        let b_modified = b_path.metadata().ok().and_then(|m| m.modified().ok());
-        b_modified.cmp(&a_modified)
-    });
-
-    sessions
+    // Sort by modification time, most recent first. The timestamp was already
+    // read from metadata above: hundreds of sessions must not be re-stat'ed on
+    // every poll.
+    sessions.sort_by_key(|b| std::cmp::Reverse(b.0));
+    sessions.into_iter().map(|(_, session)| session).collect()
 }
 
 /// Read a game log file and return its content (with line limit)
@@ -495,23 +534,35 @@ pub fn read_game_log(path: &str, max_lines: Option<usize>) -> Result<String, Str
 /// The returned bool is `true` when the file held more lines than `max` (i.e.
 /// the result is a truncated tail rather than the complete file).
 fn read_tail_lossy(path: &str, max: usize) -> (String, bool) {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return (String::new(), false),
+    let Ok(file) = std::fs::File::open(path) else {
+        return (String::new(), false);
     };
+    let (bytes, truncated, _, _) = read_tail_bytes_from(&file, max);
+    (String::from_utf8_lossy(&bytes).to_string(), truncated)
+}
+
+/// Read the trailing `max` lines through an already-open handle. Returns the
+/// raw bytes, whether the result was truncated to `max` lines, the absolute
+/// offset the returned tail starts at and the file length captured before
+/// reading. The read is capped to that length, so a log being appended to
+/// cannot return bytes beyond the offset the caller will store next.
+fn read_tail_bytes_from(file: &std::fs::File, max: usize) -> (Vec<u8>, bool, u64, u64) {
     let file_len = match file.metadata() {
         Ok(m) => m.len(),
-        Err(_) => return (String::new(), false),
+        Err(_) => return (Vec::new(), false, 0, 0),
     };
     if max == 0 {
-        return (String::new(), true);
+        return (Vec::new(), true, file_len, file_len);
     }
     const CHUNK: u64 = 64 * 1024;
 
     use std::io::Read;
     use std::io::Seek;
     use std::io::SeekFrom;
-    let mut reader = file;
+    let mut reader = match file.try_clone() {
+        Ok(f) => f,
+        Err(_) => return (Vec::new(), false, 0, file_len),
+    };
 
     // Collect, newest-first, the *absolute byte offsets* of newline characters,
     // walking backwards in 64 KiB blocks. We gather up to `max + 1` so that
@@ -521,7 +572,13 @@ fn read_tail_lossy(path: &str, max: usize) -> (String, bool) {
     let mut boundaries: Vec<u64> = Vec::with_capacity(max + 1);
     let mut block_end: u64 = file_len;
     let mut buf = vec![0u8; CHUNK as usize];
-    while block_end > 0 && boundaries.len() < max + 1 {
+    // Stop the backwards scan at the same byte budget used for the read:
+    // a multi-gigabyte file with very long lines must not be walked end to
+    // end just to discover it has fewer than `max` newlines.
+    while block_end > 0
+        && boundaries.len() < max + 1
+        && file_len.saturating_sub(block_end) < MAX_TAIL_LOG_BYTES
+    {
         let read_start = block_end.saturating_sub(CHUNK);
         let len = (block_end - read_start) as usize;
         if reader.seek(SeekFrom::Start(read_start)).is_err() {
@@ -557,16 +614,43 @@ fn read_tail_lossy(path: &str, max: usize) -> (String, bool) {
         // Fewer newlines than asked for — include the whole file.
         0
     };
-    let truncated = tail_start > 0;
+    let mut truncated = tail_start > 0;
+    let mut tail_start = tail_start;
+    // Cap the byte window as well as the line count. A file with very long
+    // lines can otherwise force a huge allocation from a "last 100k lines"
+    // request. Skip the leading partial line so the caller never receives a
+    // spliced line.
+    let mut drop_leading_partial = false;
+    if file_len.saturating_sub(tail_start) > MAX_TAIL_LOG_BYTES {
+        tail_start = file_len - MAX_TAIL_LOG_BYTES;
+        truncated = true;
+        drop_leading_partial = true;
+    }
 
     let mut tail = Vec::new();
     if reader.seek(SeekFrom::Start(tail_start)).is_err() {
-        return (String::new(), truncated);
+        return (Vec::new(), truncated, tail_start, file_len);
     }
-    if reader.read_to_end(&mut tail).is_err() {
-        return (String::new(), truncated);
+    // Never read beyond the length captured above: bytes appended while this
+    // function runs must be returned by the next poll, not twice.
+    let remaining = file_len.saturating_sub(tail_start);
+    let mut limited = reader.take(remaining);
+    if limited.read_to_end(&mut tail).is_err() {
+        return (Vec::new(), truncated, tail_start, file_len);
     }
-    (String::from_utf8_lossy(&tail).to_string(), truncated)
+    if drop_leading_partial {
+        match tail.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                tail.drain(..=pos);
+                tail_start += pos as u64 + 1;
+            }
+            None => {
+                // One giant unterminated line fills the whole window.
+                return (Vec::new(), true, file_len, file_len);
+            }
+        }
+    }
+    (tail, truncated, tail_start, file_len)
 }
 
 pub fn delete_game_log(data_dir: &Path, path: &str) -> Result<(), String> {
@@ -590,6 +674,316 @@ pub fn validate_log_path(data_dir: &Path, path: &str) -> Result<String, String> 
         return Err("Access denied: log file is outside the game logs directory".to_string());
     }
     Ok(file_canon.to_string_lossy().to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IncrementalLogChunk {
+    pub lines: Vec<String>,
+    pub new_byte_offset: u64,
+    pub reset: bool,
+    pub file_token: String,
+}
+
+#[cfg(windows)]
+fn get_file_identity(file: &std::fs::File) -> (u64, u64) {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct BY_HANDLE_FILE_INFORMATION {
+        dw_file_attributes: u32,
+        ft_creation_time: [u32; 2],
+        ft_last_access_time: [u32; 2],
+        ft_last_write_time: [u32; 2],
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+    extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            info: *mut BY_HANDLE_FILE_INFORMATION,
+        ) -> i32;
+    }
+
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let handle = file.as_raw_handle();
+    let res = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+    if res != 0 {
+        let info = unsafe { info.assume_init() };
+        let file_index = ((info.n_file_index_high as u64) << 32) | (info.n_file_index_low as u64);
+        let vol_and_time = ((info.dw_volume_serial_number as u64) << 32)
+            ^ (((info.ft_creation_time[1] as u64) << 32) | (info.ft_creation_time[0] as u64));
+        (file_index, vol_and_time)
+    } else {
+        use std::os::windows::fs::MetadataExt;
+        if let Ok(meta) = file.metadata() {
+            (meta.creation_time(), meta.file_attributes() as u64)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn get_file_identity(file: &std::fs::File) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = file.metadata() {
+        (meta.ino(), meta.dev())
+    } else {
+        (0, 0)
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn get_file_identity(_file: &std::fs::File) -> (u64, u64) {
+    (0, 0)
+}
+
+/// Build a token that detects log rotation, replacement and in-place rewrites
+/// across incremental polls.
+///
+/// Guarantees:
+/// - File identity (volume serial + file index on Windows, inode/dev on Unix)
+///   is always hashed, so replacing the file is detected even when the new
+///   file has the same size and prefix.
+/// - Truncation is also detected by the caller (`file_len < byte_offset`).
+/// - For acknowledged offsets up to 256 KiB the whole `0..byte_offset` range is
+///   hashed: any in-place change there is detected deterministically.
+/// - For larger offsets only a bounded sample is hashed: the first 4 KiB, the
+///   last 4 KiB before the offset and 16 checkpoints of 256 bytes. A small,
+///   isolated in-place rewrite in an unsampled middle region can therefore go
+///   undetected until the offset advances over it. Append-only writes (the
+///   normal log path) never invalidate the token because acknowledged bytes do
+///   not change.
+///
+/// If `GetFileInformationByHandle` fails, identity falls back to creation time
+/// and file attributes, which is weaker than the volume/file-index pair; the
+/// content sample is still included.
+pub fn compute_file_token(file: &std::fs::File, byte_offset: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let (id1, id2) = get_file_identity(file);
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::Hasher;
+    hasher.write_u64(id1);
+    hasher.write_u64(id2);
+
+    let mut f = match file.try_clone() {
+        Ok(cloned) => cloned,
+        Err(_) => return format!("{:016x}", hasher.finish()),
+    };
+
+    // 1. Always sample first line (up to 512 bytes)
+    let mut header = [0u8; 512];
+    let _ = f.seek(SeekFrom::Start(0));
+    let n = f.read(&mut header).unwrap_or(0);
+    let first_line = if let Some(pos) = header[..n].iter().position(|&b| b == b'\n') {
+        &header[..=pos]
+    } else {
+        &header[..n]
+    };
+    hasher.write(first_line);
+
+    // 2. Bind to acknowledged bytes in 0..byte_offset.
+    // In an append-only file, past bytes never change on subsequent polls.
+    // In an in-place rewrite, past bytes differ and trigger a reset.
+    if byte_offset > 0 {
+        const MAX_FULL_HASH_BYTES: u64 = 256 * 1024; // 256 KB
+        if byte_offset <= MAX_FULL_HASH_BYTES {
+            // For files/offsets up to 256 KB, read and hash the entire acknowledged range 0..byte_offset.
+            // This provides 100% deterministic detection of any modification in any part of the file.
+            let _ = f.seek(SeekFrom::Start(0));
+            let mut buf = vec![0u8; byte_offset as usize];
+            if f.read_exact(&mut buf).is_ok() {
+                hasher.write(&buf);
+            } else if let Ok(read_bytes) = f.read(&mut buf) {
+                hasher.write(&buf[..read_bytes]);
+            }
+        } else {
+            // For large files (> 256 KB), full re-reads every second would degrade I/O.
+            // We use multi-point checkpoint sampling:
+            // - Head window: first 4 KB
+            // - Tail window: last 4 KB before byte_offset
+            // - 16 evenly distributed checkpoints across the middle span
+            let mut chunk = [0u8; 4096];
+            let _ = f.seek(SeekFrom::Start(0));
+            if let Ok(rn) = f.read(&mut chunk) {
+                hasher.write(&chunk[..rn]);
+            }
+
+            let tail_start = byte_offset.saturating_sub(4096);
+            if f.seek(SeekFrom::Start(tail_start)).is_ok() {
+                if let Ok(rn) = f.read(&mut chunk) {
+                    hasher.write(&chunk[..rn]);
+                }
+            }
+
+            let middle_start = 4096u64;
+            let middle_end = tail_start;
+            if middle_end > middle_start {
+                let span = middle_end - middle_start;
+                let step = span / 17;
+                let mut cp_buf = [0u8; 256];
+                for i in 1..=16 {
+                    let pos = middle_start + step * i;
+                    if f.seek(SeekFrom::Start(pos)).is_ok() {
+                        if let Ok(rn) = f.read(&mut cp_buf) {
+                            hasher.write(&cp_buf[..rn]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    format!("{:016x}", hasher.finish())
+}
+
+pub fn read_game_log_incremental(
+    path: &str,
+    byte_offset: u64,
+    initial_max_lines: Option<usize>,
+    file_token: Option<&str>,
+) -> Result<IncrementalLogChunk, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return Err(format!("Cannot open log file: {}", e)),
+    };
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    let file_len = meta.len();
+    let current_token = compute_file_token(&file, byte_offset);
+    let token_mismatch = match file_token {
+        Some(expected) => expected != current_token,
+        None => false,
+    };
+
+    // If offset is 0, or file has been truncated / rotated (file_len < byte_offset),
+    // or file identity has changed (token mismatch)
+    if byte_offset == 0 || file_len < byte_offset || token_mismatch {
+        // The UI asks for 100k lines; never let a bad caller request an
+        // unbounded tail allocation.
+        let max = initial_max_lines.unwrap_or(100_000).min(100_000);
+        // Read through the same handle whose identity/token was computed. Only
+        // complete lines are returned, and the next offset points right after
+        // the last newline: a line that is still being written is delivered by
+        // the next poll instead of being split in two.
+        let (mut tail_bytes, _, tail_start, _) = read_tail_bytes_from(&file, max);
+        let complete_len = tail_bytes
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+        tail_bytes.truncate(complete_len);
+        let lines: Vec<String> = String::from_utf8_lossy(&tail_bytes)
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        let new_byte_offset = tail_start + complete_len as u64;
+        let token_for_new_offset = compute_file_token(&file, new_byte_offset);
+        return Ok(IncrementalLogChunk {
+            lines,
+            new_byte_offset,
+            reset: true,
+            file_token: token_for_new_offset,
+        });
+    }
+
+    if file_len == byte_offset {
+        return Ok(IncrementalLogChunk {
+            lines: Vec::new(),
+            new_byte_offset: file_len,
+            reset: false,
+            file_token: current_token,
+        });
+    }
+
+    let mut reader = file;
+    let delta = file_len - byte_offset;
+    // A huge unread delta is delivered as its newest complete lines only.
+    // The middle is dropped deliberately (the log file itself is untouched)
+    // and the offset advances past it, so the next poll stays cheap and
+    // correct instead of replaying hundreds of megabytes over IPC.
+    let read_start = if delta > MAX_INCREMENTAL_LOG_BYTES {
+        file_len - MAX_INCREMENTAL_LOG_BYTES
+    } else {
+        byte_offset
+    };
+    let capped = read_start > byte_offset;
+    reader
+        .seek(SeekFrom::Start(read_start))
+        .map_err(|e| e.to_string())?;
+    let bytes_to_read = (file_len - read_start) as usize;
+    let mut buffer = vec![0u8; bytes_to_read];
+    reader.read_exact(&mut buffer).map_err(|e| e.to_string())?;
+
+    // The cap starts mid-line: drop that partial first line.
+    let mut first_returned_byte = read_start;
+    if capped {
+        match buffer.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                buffer.drain(..=pos);
+                first_returned_byte += pos as u64 + 1;
+            }
+            None => {
+                // The whole capped window is one unterminated line.
+                let token = compute_file_token(&reader, file_len);
+                return Ok(IncrementalLogChunk {
+                    lines: Vec::new(),
+                    new_byte_offset: file_len,
+                    reset: false,
+                    file_token: token,
+                });
+            }
+        }
+        tracing::warn!(
+            target: "launcher",
+            "Game log grew by {} bytes between polls; delivered only the newest {} bytes",
+            delta,
+            MAX_INCREMENTAL_LOG_BYTES
+        );
+    }
+
+    // Find the last newline in buffer.
+    // If a line is partially written (no newline yet) or a multi-byte UTF-8 character
+    // is split across the read boundary, we ONLY advance up to the last complete newline!
+    if let Some(last_nl) = buffer.iter().rposition(|&b| b == b'\n') {
+        let valid_bytes = &buffer[..=last_nl];
+        let text = String::from_utf8_lossy(valid_bytes);
+        let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+        let new_byte_offset = first_returned_byte + (last_nl as u64) + 1;
+        let token_for_new_offset = compute_file_token(&reader, new_byte_offset);
+
+        Ok(IncrementalLogChunk {
+            lines,
+            new_byte_offset,
+            reset: false,
+            file_token: token_for_new_offset,
+        })
+    } else if bytes_to_read > 64 * 1024 {
+        // Line exceeds 64KB without newline: yield to avoid unbounded buffer stalling
+        let text = String::from_utf8_lossy(&buffer);
+        let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+        let token_for_new_offset = compute_file_token(&reader, file_len);
+
+        Ok(IncrementalLogChunk {
+            lines,
+            new_byte_offset: file_len,
+            reset: false,
+            file_token: token_for_new_offset,
+        })
+    } else {
+        // Line is not completed yet; wait for the rest of the line and newline to be written
+        Ok(IncrementalLogChunk {
+            lines: Vec::new(),
+            new_byte_offset: byte_offset,
+            reset: false,
+            file_token: current_token,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -767,6 +1161,760 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn test_read_game_log_incremental_incomplete_line_and_utf8_safety() {
+        let temp =
+            std::env::temp_dir().join(format!("voidlauncher-inc-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let log_file = temp.join("session.log");
+
+        // 1. Write initial line
+        std::fs::write(&log_file, "Line 1: Started\n").unwrap();
+        let c1 = read_game_log_incremental(log_file.to_str().unwrap(), 0, None, None).unwrap();
+        assert_eq!(c1.lines, vec!["Line 1: Started"]);
+        assert!(c1.reset);
+
+        // 2. Append incomplete line with Cyrillic (no trailing newline)
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_file)
+            .unwrap();
+        use std::io::Write;
+        // "Ошибка: " without \n
+        f.write_all("Ошибка: ".as_bytes()).unwrap();
+        drop(f);
+
+        // Incremental read should NOT cut or consume the incomplete line
+        let c2 = read_game_log_incremental(
+            log_file.to_str().unwrap(),
+            c1.new_byte_offset,
+            None,
+            Some(&c1.file_token),
+        )
+        .unwrap();
+        assert!(
+            c2.lines.is_empty(),
+            "Incomplete line without newline must not be yielded"
+        );
+        assert_eq!(
+            c2.new_byte_offset, c1.new_byte_offset,
+            "Offset must not advance past incomplete line"
+        );
+
+        // 3. Complete the line with Cyrillic and trailing newline
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_file)
+            .unwrap();
+        f.write_all("сбой сети\n".as_bytes()).unwrap();
+        drop(f);
+
+        // Incremental read now yields the entire complete line cleanly without UTF-8 corruption
+        let c3 = read_game_log_incremental(
+            log_file.to_str().unwrap(),
+            c2.new_byte_offset,
+            None,
+            Some(&c2.file_token),
+        )
+        .unwrap();
+        assert_eq!(c3.lines, vec!["Ошибка: сбой сети"]);
+        assert!(!c3.reset);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_read_game_log_incremental_reset_does_not_split_partial_last_line() {
+        let temp =
+            std::env::temp_dir().join(format!("voidlauncher-inc-partial-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let log_file = temp.join("session.log");
+        std::fs::write(&log_file, "line1\npartial").unwrap();
+
+        let c1 = read_game_log_incremental(log_file.to_str().unwrap(), 0, None, None).unwrap();
+        assert!(c1.reset);
+        assert_eq!(c1.lines, vec!["line1"]);
+        assert_eq!(
+            c1.new_byte_offset,
+            "line1\n".len() as u64,
+            "offset must stop after the last complete line"
+        );
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_file)
+                .unwrap();
+            f.write_all(b" rest\n").unwrap();
+            f.flush().unwrap();
+        }
+        let c2 = read_game_log_incremental(
+            log_file.to_str().unwrap(),
+            c1.new_byte_offset,
+            None,
+            Some(&c1.file_token),
+        )
+        .unwrap();
+        assert!(!c2.reset);
+        assert_eq!(c2.lines, vec!["partial rest"]);
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_read_game_log_incremental_appended_and_reset() {
+        let dir = std::env::temp_dir().join(format!("vl_incr_log_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.log");
+
+        // 1. Initial write of 3 lines
+        std::fs::write(&path, "line 1\nline 2\nline 3\n").unwrap();
+
+        let chunk1 = read_game_log_incremental(path.to_str().unwrap(), 0, Some(50), None).unwrap();
+        assert!(chunk1.reset);
+        assert_eq!(chunk1.lines, vec!["line 1", "line 2", "line 3"]);
+        assert!(chunk1.new_byte_offset > 0);
+
+        // 2. No changes
+        let chunk2 = read_game_log_incremental(
+            path.to_str().unwrap(),
+            chunk1.new_byte_offset,
+            Some(50),
+            Some(&chunk1.file_token),
+        )
+        .unwrap();
+        assert!(!chunk2.reset);
+        assert!(chunk2.lines.is_empty());
+        assert_eq!(chunk2.new_byte_offset, chunk1.new_byte_offset);
+
+        // 3. Append 2 lines
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"line 4\nline 5\n").unwrap();
+        drop(file);
+
+        let chunk3 = read_game_log_incremental(
+            path.to_str().unwrap(),
+            chunk1.new_byte_offset,
+            Some(50),
+            Some(&chunk1.file_token),
+        )
+        .unwrap();
+        assert!(!chunk3.reset);
+        assert_eq!(chunk3.lines, vec!["line 4", "line 5"]);
+        assert!(chunk3.new_byte_offset > chunk1.new_byte_offset);
+
+        // 4. Truncation / reset
+        std::fs::write(&path, "fresh line\n").unwrap();
+        let chunk4 = read_game_log_incremental(
+            path.to_str().unwrap(),
+            chunk3.new_byte_offset,
+            Some(50),
+            Some(&chunk3.file_token),
+        )
+        .unwrap();
+        assert!(chunk4.reset);
+        assert_eq!(chunk4.lines, vec!["fresh line"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_read_game_log_incremental_detects_replacement_by_larger_file() {
+        let dir = std::env::temp_dir().join(format!("vl_incr_replace_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("latest.log");
+
+        // 1. File 1: small file
+        std::fs::write(&log_path, "Run 1: line 1\nRun 1: line 2\n").unwrap();
+        let chunk1 = read_game_log_incremental(log_path.to_str().unwrap(), 0, None, None).unwrap();
+        assert!(chunk1.reset);
+        assert_eq!(chunk1.lines, vec!["Run 1: line 1", "Run 1: line 2"]);
+        let offset1 = chunk1.new_byte_offset;
+        let token1 = chunk1.file_token.clone();
+        assert!(!token1.is_empty());
+
+        // 2. Replace file 1 with file 2 that is SUBSTANTIALLY LARGER than offset1
+        // (so file_len > byte_offset is strictly true, which would fool a naive length check)
+        let large_run2 =
+            "Run 2: this is a completely new session with lots of initialization data\n".repeat(10);
+        std::fs::write(&log_path, &large_run2).unwrap();
+        let file_len2 = std::fs::metadata(&log_path).unwrap().len();
+        assert!(
+            file_len2 > offset1,
+            "New file must be larger than previous offset"
+        );
+
+        // 3. Read incrementally passing previous offset1 and token1
+        let chunk2 =
+            read_game_log_incremental(log_path.to_str().unwrap(), offset1, None, Some(&token1))
+                .unwrap();
+
+        // 4. Verification: file replacement was detected via token mismatch!
+        assert!(
+            chunk2.reset,
+            "Replacement by larger file must trigger reset!"
+        );
+        assert_ne!(
+            chunk2.file_token, token1,
+            "File token must change for replaced file"
+        );
+        assert_eq!(chunk2.lines.len(), 10);
+        assert_eq!(
+            chunk2.lines[0],
+            "Run 2: this is a completely new session with lots of initialization data"
+        );
+        assert_eq!(chunk2.new_byte_offset, file_len2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_game_log_incremental_detects_in_place_rewrite_with_same_first_line() {
+        let dir = std::env::temp_dir().join(format!("vl_in_place_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("latest.log");
+
+        // 1. Initial write: file with header and first lines
+        let header = "VoidLauncher Game Log - Session Header\n";
+        let initial_content = format!("{}Old run line 2\nOld run line 3\n", header);
+        std::fs::write(&log_path, &initial_content).unwrap();
+
+        // Read initial content
+        let chunk1 = read_game_log_incremental(log_path.to_str().unwrap(), 0, None, None).unwrap();
+        assert!(chunk1.reset);
+        assert_eq!(chunk1.lines.len(), 3);
+        assert_eq!(chunk1.lines[0], "VoidLauncher Game Log - Session Header");
+        let offset1 = chunk1.new_byte_offset;
+        let token1 = chunk1.file_token.clone();
+
+        // 2. Overwrite the EXACT SAME file object in place (truncate = true)
+        // Keep the exact same first line (header), but completely rewrite subsequent lines
+        // with content that makes the new file size substantially LARGER than offset1.
+        let mut rewritten_content = header.to_string();
+        for i in 1..=10 {
+            rewritten_content.push_str(&format!("Completely fresh run session line {}\n", i));
+        }
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(rewritten_content.as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+
+        let new_len = std::fs::metadata(&log_path).unwrap().len();
+        assert!(
+            new_len > offset1,
+            "New file must be larger than old offset1"
+        );
+
+        // 3. Read incrementally passing old offset1 and token1
+        let chunk2 =
+            read_game_log_incremental(log_path.to_str().unwrap(), offset1, None, Some(&token1))
+                .unwrap();
+
+        // 4. Assert that in-place rewrite is detected and resets the stream
+        assert!(
+            chunk2.reset,
+            "In-place rewrite with same header must trigger reset!"
+        );
+        assert_ne!(
+            chunk2.file_token, token1,
+            "Token must change when past content is rewritten"
+        );
+        assert_eq!(chunk2.lines.len(), 11);
+        assert_eq!(chunk2.lines[0], "VoidLauncher Game Log - Session Header");
+        assert_eq!(chunk2.lines[1], "Completely fresh run session line 1");
+        assert_eq!(chunk2.new_byte_offset, new_len);
+
+        // 5. Subsequent append to the new file does NOT reset
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(b"Appended line 12\n").unwrap();
+            f.flush().unwrap();
+        }
+        let chunk3 = read_game_log_incremental(
+            log_path.to_str().unwrap(),
+            chunk2.new_byte_offset,
+            None,
+            Some(&chunk2.file_token),
+        )
+        .unwrap();
+        assert!(!chunk3.reset, "Subsequent normal append must NOT reset");
+        assert_eq!(chunk3.lines, vec!["Appended line 12"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_game_log_incremental_detects_rewrite_in_middle_of_file() {
+        let dir = std::env::temp_dir().join(format!("vl_mid_rewrite_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("latest.log");
+
+        // 1. Create a substantial log file: e.g. 4000 bytes
+        // Header line (50 bytes)
+        let header = "VoidLauncher Game Log - Header Line Prefix Info\n";
+        // Fill prefix (256 bytes total with header)
+        let mut prefix = header.to_string();
+        while prefix.len() < 256 {
+            prefix.push_str("P_PAD_LINE_HEADER_DATA_1234567890\n");
+        }
+        let prefix_bytes = prefix.as_bytes()[..256].to_vec();
+
+        // Middle section (e.g. 2000 bytes)
+        let middle_original = "ORIGINAL_MIDDLE_DATA_LINE_ENTRY_00000000000000000\n".repeat(40);
+
+        // Tail section (e.g. 100 bytes ending at byte_offset)
+        let tail =
+            "SUFFIX_DATA_PRESERVED_LAST_64_BYTES_LINE_ENTRY_END_001234567890\nSUFFIX_PAD_DATA\n";
+        assert!(tail.len() >= 64);
+
+        let mut initial_file = Vec::new();
+        initial_file.extend_from_slice(&prefix_bytes);
+        initial_file.extend_from_slice(middle_original.as_bytes());
+        initial_file.extend_from_slice(tail.as_bytes());
+
+        let target_offset = initial_file.len() as u64;
+
+        // Write initial file and read it
+        std::fs::write(&log_path, &initial_file).unwrap();
+        let chunk1 = read_game_log_incremental(log_path.to_str().unwrap(), 0, None, None).unwrap();
+        assert!(chunk1.reset);
+        assert_eq!(chunk1.new_byte_offset, target_offset);
+        let token1 = chunk1.file_token.clone();
+
+        // 2. Overwrite the SAME file object in place (truncate = true)
+        // Strictly preserve:
+        // - file identity (same path, in-place write)
+        // - first line
+        // - first 256 bytes (prefix_bytes)
+        // - last 64 bytes before target_offset
+        // Change ONLY the data strictly in between!
+        let middle_modified = "MODIFIED_TAMPERED_MIDDLE_DATA_LINE_ZZZZZZZZZZZZZZ\n".repeat(40);
+        assert_eq!(middle_original.len(), middle_modified.len());
+
+        let mut rewritten_file = Vec::new();
+        rewritten_file.extend_from_slice(&prefix_bytes);
+        rewritten_file.extend_from_slice(middle_modified.as_bytes());
+        rewritten_file.extend_from_slice(tail.as_bytes());
+        assert_eq!(rewritten_file.len() as u64, target_offset);
+
+        // Make the new file LARGER than target_offset
+        rewritten_file.extend_from_slice(
+            b"EXTRA_NEW_DATA_BEYOND_OLD_OFFSET_LINE_001\nEXTRA_NEW_DATA_LINE_002\n",
+        );
+        let new_len = rewritten_file.len() as u64;
+        assert!(new_len > target_offset);
+
+        // Verify that the test setup strictly preserved the first 256 bytes and last 64 bytes before target_offset
+        assert_eq!(&rewritten_file[..256], &initial_file[..256]);
+        assert_eq!(
+            &rewritten_file[target_offset as usize - 64..target_offset as usize],
+            &initial_file[target_offset as usize - 64..target_offset as usize]
+        );
+
+        // Overwrite in place
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(&rewritten_file).unwrap();
+            f.flush().unwrap();
+        }
+
+        // 3. Read incrementally passing old target_offset and token1
+        let chunk2 = read_game_log_incremental(
+            log_path.to_str().unwrap(),
+            target_offset,
+            None,
+            Some(&token1),
+        )
+        .unwrap();
+
+        // 4. Assert that change between checked regions is detected and triggers reset!
+        assert!(
+            chunk2.reset,
+            "Modification in middle of file must trigger reset!"
+        );
+        assert_ne!(
+            chunk2.file_token, token1,
+            "Token must change when middle data is modified"
+        );
+        assert_eq!(chunk2.new_byte_offset, new_len);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_game_log_incremental_large_file_checkpoint_sampling_detects_modification() {
+        let dir = std::env::temp_dir().join(format!("vl_large_cp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("large_session.log");
+
+        // 1. Build a log file strictly > 256 KB (e.g. 300_000 bytes)
+        let header = "VoidLauncher Game Log - Large File Checkpoint Test\n";
+        let mut initial_data = Vec::with_capacity(300_000);
+        initial_data.extend_from_slice(header.as_bytes());
+
+        // Fill up to exactly 300_000 bytes with lines
+        let fill_line = b"[INFO] Regular game log entry data line 0123456789abcdef\n";
+        while initial_data.len() + fill_line.len() <= 300_000 {
+            initial_data.extend_from_slice(fill_line);
+        }
+        while initial_data.len() < 300_000 {
+            initial_data.push(b'\n');
+        }
+        let target_offset = 300_000u64;
+        assert_eq!(initial_data.len() as u64, target_offset);
+        assert!(
+            target_offset > 256 * 1024,
+            "File must exceed 256 KB threshold"
+        );
+
+        std::fs::write(&log_path, &initial_data).unwrap();
+        let chunk1 = read_game_log_incremental(log_path.to_str().unwrap(), 0, None, None).unwrap();
+        assert!(chunk1.reset);
+        assert_eq!(chunk1.new_byte_offset, target_offset);
+        let token1 = chunk1.file_token.clone();
+
+        // 2. Overwrite the SAME file in place:
+        // - Preserve head (first 4096 bytes)
+        // - Preserve tail (last 4096 bytes before target_offset)
+        // - Alter bytes at checkpoint 8 (approx offset 141_416)
+        // - Append extra bytes so new_len > target_offset
+        let middle_start = 4096u64;
+        let tail_start = target_offset - 4096;
+        let step = (tail_start - middle_start) / 17;
+        let cp8_pos = (middle_start + step * 8) as usize;
+
+        let mut modified_data = initial_data.clone();
+        for i in 0..256 {
+            modified_data[cp8_pos + i] = b'Z';
+        }
+        // Extra data beyond target_offset
+        modified_data.extend_from_slice(b"[INFO] Extra appended data beyond target_offset\n");
+        let new_len = modified_data.len() as u64;
+        assert!(new_len > target_offset);
+
+        // Verify head and tail were preserved
+        assert_eq!(&modified_data[..4096], &initial_data[..4096]);
+        assert_eq!(
+            &modified_data[tail_start as usize..target_offset as usize],
+            &initial_data[tail_start as usize..target_offset as usize]
+        );
+
+        // In-place rewrite
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(&modified_data).unwrap();
+            f.flush().unwrap();
+        }
+
+        // 3. Read incrementally passing old target_offset and token1
+        let chunk2 = read_game_log_incremental(
+            log_path.to_str().unwrap(),
+            target_offset,
+            None,
+            Some(&token1),
+        )
+        .unwrap();
+
+        // 4. Verification: checkpoint sampling detected the modification and triggered reset
+        assert!(
+            chunk2.reset,
+            "Modification in sampled checkpoint must trigger reset"
+        );
+        assert_ne!(
+            chunk2.file_token, token1,
+            "Token must change when sampled checkpoint is altered"
+        );
+        assert_eq!(chunk2.new_byte_offset, new_len);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_game_log_incremental_large_file_append_only_does_not_reset() {
+        let dir = std::env::temp_dir().join(format!("vl_large_app_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("large_append.log");
+
+        // 1. Build a log file strictly > 256 KB (e.g. 300_000 bytes)
+        let header = "VoidLauncher Game Log - Large Append Test\n";
+        let mut initial_data = Vec::with_capacity(300_000);
+        initial_data.extend_from_slice(header.as_bytes());
+
+        let fill_line = b"[INFO] Large game session regular line entry 0123456789\n";
+        while initial_data.len() + fill_line.len() <= 300_000 {
+            initial_data.extend_from_slice(fill_line);
+        }
+        while initial_data.len() < 300_000 {
+            initial_data.push(b'\n');
+        }
+        let target_offset = 300_000u64;
+        assert_eq!(initial_data.len() as u64, target_offset);
+        assert!(
+            target_offset > 256 * 1024,
+            "File must exceed 256 KB threshold"
+        );
+
+        std::fs::write(&log_path, &initial_data).unwrap();
+
+        // Initial read
+        let chunk1 = read_game_log_incremental(log_path.to_str().unwrap(), 0, None, None).unwrap();
+        assert!(chunk1.reset);
+        assert_eq!(chunk1.new_byte_offset, target_offset);
+        let token1 = chunk1.file_token.clone();
+
+        // 2. Normal append-only write of new lines at the end of the file
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(b"[INFO] Freshly appended line 1 in large session\n")
+                .unwrap();
+            f.write_all(b"[INFO] Freshly appended line 2 in large session\n")
+                .unwrap();
+            f.flush().unwrap();
+        }
+
+        // 3. Read incrementally with target_offset and token1
+        let chunk2 = read_game_log_incremental(
+            log_path.to_str().unwrap(),
+            target_offset,
+            None,
+            Some(&token1),
+        )
+        .unwrap();
+
+        // 4. Verification: NO false reset; lines smoothly yielded
+        assert!(
+            !chunk2.reset,
+            "Append-only growth must NOT trigger reset for large files"
+        );
+        assert_eq!(
+            chunk2.lines,
+            vec![
+                "[INFO] Freshly appended line 1 in large session",
+                "[INFO] Freshly appended line 2 in large session",
+            ]
+        );
+        assert!(chunk2.new_byte_offset > target_offset);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_huge_incremental_delta_is_capped_and_later_reads_stay_correct() {
+        let dir = std::env::temp_dir().join(format!("vl_log_cap_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("cap.log");
+        std::fs::write(&log_path, "start\n").unwrap();
+
+        let first = read_game_log_incremental(log_path.to_str().unwrap(), 0, None, None).unwrap();
+        assert!(first.reset);
+
+        // Append well over the per-poll cap in one burst, ending with
+        // recognizable lines.
+        let filler = b"[INFO] filler log line 0123456789abcdef\n";
+        let mut burst = Vec::new();
+        while burst.len() as u64 <= MAX_INCREMENTAL_LOG_BYTES + 512 * 1024 {
+            burst.extend_from_slice(filler);
+        }
+        burst.extend_from_slice(b"[INFO] LAST-A\n[INFO] LAST-B\n");
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(&burst).unwrap();
+            f.flush().unwrap();
+        }
+        let file_len = std::fs::metadata(&log_path).unwrap().len();
+
+        let second = read_game_log_incremental(
+            log_path.to_str().unwrap(),
+            first.new_byte_offset,
+            None,
+            Some(&first.file_token),
+        )
+        .unwrap();
+        assert!(!second.reset, "a large append is not a rotation");
+        assert!(
+            second.new_byte_offset > first.new_byte_offset,
+            "the offset must advance past the dropped middle"
+        );
+        assert!(second.new_byte_offset <= file_len);
+        assert!(
+            second
+                .lines
+                .last()
+                .is_some_and(|line| line.contains("LAST-B")),
+            "the newest lines must survive the cap: {:?}",
+            second.lines.last()
+        );
+        assert!(
+            second.lines.len() < (MAX_INCREMENTAL_LOG_BYTES / 8) as usize,
+            "the returned chunk must respect the byte cap"
+        );
+
+        // Reading continues correctly after the capped chunk.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(b"[INFO] AFTER-CAP\n").unwrap();
+            f.flush().unwrap();
+        }
+        let third = read_game_log_incremental(
+            log_path.to_str().unwrap(),
+            second.new_byte_offset,
+            None,
+            Some(&second.file_token),
+        )
+        .unwrap();
+        assert_eq!(third.lines, vec!["[INFO] AFTER-CAP"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_game_log_incremental_large_file_sequential_polling_stability() {
+        let dir = std::env::temp_dir().join(format!("vl_seq_poll_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("seq_poll.log");
+
+        // 1. Create a large file (> 256 KB, e.g. 300_000 bytes)
+        let header = "VoidLauncher Game Log - Sequential Polling Test\n";
+        let mut initial_data = Vec::with_capacity(300_000);
+        initial_data.extend_from_slice(header.as_bytes());
+
+        let fill_line = b"[INFO] Base game session log line 0123456789abcdefghijklmnopqrst\n";
+        while initial_data.len() + fill_line.len() <= 300_000 {
+            initial_data.extend_from_slice(fill_line);
+        }
+        while initial_data.len() < 300_000 {
+            initial_data.push(b'\n');
+        }
+        let target_offset = 300_000u64;
+        assert_eq!(initial_data.len() as u64, target_offset);
+        assert!(
+            target_offset > 256 * 1024,
+            "File must exceed 256 KB threshold"
+        );
+
+        std::fs::write(&log_path, &initial_data).unwrap();
+
+        // Step 1: Initial read of large file
+        let chunk1 = read_game_log_incremental(log_path.to_str().unwrap(), 0, None, None).unwrap();
+        assert!(chunk1.reset);
+        assert_eq!(chunk1.new_byte_offset, target_offset);
+        let offset1 = chunk1.new_byte_offset;
+        let token1 = chunk1.file_token.clone();
+
+        // Step 2: Append several lines and perform incremental read (Poll 2)
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(b"[INFO] Poll 2 appended line A\n").unwrap();
+            f.write_all(b"[INFO] Poll 2 appended line B\n").unwrap();
+            f.flush().unwrap();
+        }
+        let chunk2 =
+            read_game_log_incremental(log_path.to_str().unwrap(), offset1, None, Some(&token1))
+                .unwrap();
+        assert!(!chunk2.reset, "Poll 2 must NOT trigger reset");
+        assert_eq!(
+            chunk2.lines,
+            vec![
+                "[INFO] Poll 2 appended line A",
+                "[INFO] Poll 2 appended line B"
+            ]
+        );
+        let offset2 = chunk2.new_byte_offset;
+        let token2 = chunk2.file_token.clone();
+        assert!(offset2 > offset1);
+
+        // Step 3 & 4: Next poll without ANY changes to file (Poll 3)
+        let chunk3 =
+            read_game_log_incremental(log_path.to_str().unwrap(), offset2, None, Some(&token2))
+                .unwrap();
+        assert!(
+            !chunk3.reset,
+            "Poll 3 without changes must NOT trigger reset"
+        );
+        assert!(
+            chunk3.lines.is_empty(),
+            "Poll 3 without changes must return empty lines"
+        );
+        assert_eq!(chunk3.new_byte_offset, offset2);
+        let offset3 = chunk3.new_byte_offset;
+        let token3 = chunk3.file_token.clone();
+        assert_eq!(
+            token3, token2,
+            "Token must remain identical when file did not change"
+        );
+
+        // Step 5: Append more lines and perform third read (Poll 4)
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&log_path)
+                .unwrap();
+            f.write_all(b"[INFO] Poll 4 appended line C\n").unwrap();
+            f.write_all(b"[INFO] Poll 4 appended line D\n").unwrap();
+            f.flush().unwrap();
+        }
+        let chunk4 =
+            read_game_log_incremental(log_path.to_str().unwrap(), offset3, None, Some(&token3))
+                .unwrap();
+        assert!(
+            !chunk4.reset,
+            "Poll 4 with new lines must NOT trigger reset"
+        );
+        assert_eq!(
+            chunk4.lines,
+            vec![
+                "[INFO] Poll 4 appended line C",
+                "[INFO] Poll 4 appended line D"
+            ]
+        );
+        assert!(chunk4.new_byte_offset > offset3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- output reader completion (smoke diagnostics) ---------------------
 
     /// A stream that yields `lines` and then blocks until `release` is set,

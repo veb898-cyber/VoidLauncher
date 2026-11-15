@@ -1,10 +1,14 @@
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '../../components/ui/Button';
+import { CustomSelect } from '../../components/ui/CustomSelect';
 import { Toggle } from '../../components/ui/Toggle';
 import { addToast } from '../../components/ui/Toast';
 import { useT } from '../../lib/i18n';
 import type { AppConfig } from '../../stores/settingsStore';
+import { useToastSettingsStore } from '../../stores/toastSettingsStore';
+import { useSkinSettingsStore } from '../../stores/skinSettingsStore';
+import { usePerformanceStore } from '../../stores/performanceStore';
 import type { UpdateConfig } from './types';
 
 interface LauncherSettingsProps {
@@ -15,6 +19,39 @@ interface LauncherSettingsProps {
 export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps) {
   const t = useT();
   const [clearingCache, setClearingCache] = useState(false);
+  const toastSuccess = useToastSettingsStore((s) => s.success);
+  const toastWarning = useToastSettingsStore((s) => s.warning);
+  const toastError = useToastSettingsStore((s) => s.error);
+  const setToastCategory = useToastSettingsStore((s) => s.setCategory);
+  const skinRefreshMode = useSkinSettingsStore((s) => s.refreshMode);
+  const setSkinRefreshMode = useSkinSettingsStore((s) => s.setRefreshMode);
+  const reduceInterfaceEffects = usePerformanceStore(
+    (s) => s.reduceInterfaceEffects,
+  );
+  const setReduceInterfaceEffects = usePerformanceStore(
+    (s) => s.setReduceInterfaceEffects,
+  );
+
+  const toastRows = [
+    {
+      key: 'success' as const,
+      checked: toastSuccess,
+      title: t('settings.toast_success_title'),
+      desc: t('settings.toast_success_desc'),
+    },
+    {
+      key: 'warning' as const,
+      checked: toastWarning,
+      title: t('settings.toast_warning_title'),
+      desc: t('settings.toast_warning_desc'),
+    },
+    {
+      key: 'error' as const,
+      checked: toastError,
+      title: t('settings.toast_error_title'),
+      desc: t('settings.toast_error_desc'),
+    },
+  ];
 
   return (
     <>
@@ -23,15 +60,84 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
 
         <div className="settings-row">
           <div className="settings-row__info">
-            <div className="settings-row__title">{t('settings.close_on_launch_title')}</div>
+            <div className="settings-row__title">{t('settings.after_launch_title')}</div>
             <div className="settings-row__desc">
-              {t('settings.close_on_launch_desc')}
+              {t('settings.after_launch_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control" style={{ width: 240 }}>
+            <CustomSelect
+              value={config.after_launch_action}
+              options={[
+                { value: 'do_nothing', label: t('settings.after_launch_nothing') },
+                { value: 'minimize', label: t('settings.after_launch_minimize') },
+                { value: 'close', label: t('settings.after_launch_close') },
+              ]}
+              onChange={(v) => updateConfig('after_launch_action', v as AppConfig['after_launch_action'])}
+            />
+          </div>
+        </div>
+
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.skin_refresh_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.skin_refresh_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control" style={{ width: 240 }}>
+            <CustomSelect
+              value={skinRefreshMode}
+              options={[
+                { value: 'auto', label: t('settings.skin_refresh_auto') },
+                { value: 'manual', label: t('settings.skin_refresh_manual') },
+              ]}
+              onChange={(v) => setSkinRefreshMode(v === 'manual' ? 'manual' : 'auto')}
+            />
+          </div>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <h2 className="settings-section__title">{t('settings.group_notifications')}</h2>
+
+        {toastRows.map((row) => (
+          <div className="settings-row" key={row.key}>
+            <div className="settings-row__info">
+              <div className="settings-row__title">{row.title}</div>
+              <div className="settings-row__desc">{row.desc}</div>
+            </div>
+            <div className="settings-row__control">
+              <Toggle
+                checked={row.checked}
+                onChange={(v) => setToastCategory(row.key, v)}
+                ariaLabel={row.title}
+              />
+            </div>
+          </div>
+        ))}
+      </section>
+
+      <section className="settings-section">
+        <h2 className="settings-section__title">{t('settings.group_elyby')}</h2>
+
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.elyby_skins_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.elyby_skins_desc')}
+            </div>
+            <div
+              className="settings-row__desc"
+              style={{ marginTop: 6, maxWidth: 720 }}
+            >
+              {t('settings.elyby_skins_note')}
             </div>
           </div>
           <div className="settings-row__control">
             <Toggle
-              checked={config.close_on_launch}
-              onChange={(v) => updateConfig('close_on_launch', v)}
+              checked={config.elyby_skins_in_game}
+              onChange={(v) => updateConfig('elyby_skins_in_game', v)}
             />
           </div>
         </div>
@@ -96,6 +202,32 @@ export function LauncherSettings({ config, updateConfig }: LauncherSettingsProps
             >
               {t('settings.clear_cache_btn')}
             </Button>
+          </div>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <h2 className="settings-section__title">
+          {t('settings.optimization_title')}
+        </h2>
+        <p className="settings-section__desc">
+          {t('settings.optimization_desc')}
+        </p>
+        <div className="settings-row">
+          <div className="settings-row__info">
+            <div className="settings-row__title">
+              {t('settings.optimization_reduce_title')}
+            </div>
+            <div className="settings-row__desc">
+              {t('settings.optimization_reduce_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control">
+            <Toggle
+              checked={reduceInterfaceEffects}
+              onChange={setReduceInterfaceEffects}
+              ariaLabel={t('settings.optimization_reduce_title')}
+            />
           </div>
         </div>
       </section>

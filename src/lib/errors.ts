@@ -20,6 +20,9 @@ interface Rule {
 // Ordered: the first match wins (e.g. a download timeout is a network
 // problem even when the message mentions Java).
 const RULES: Rule[] = [
+  // Keep the Ely.by integration's actionable guidance even when the root
+  // cause is a network failure (the generic network rule would hide it).
+  { test: /Ely\.by Skin Integration/i, key: 'errors.elyby_skins' },
   { test: /timed? ?out|timeout|connection (reset|refused|aborted|closed)|dns|unreachable|no such host|failed to lookup|network|proxy/i, key: 'errors.network' },
   { test: /access is denied|access denied|permission denied|\(os error 5\)/i, key: 'errors.access' },
   { test: /no space left|not enough (disk )?space|disk full/i, key: 'errors.disk' },

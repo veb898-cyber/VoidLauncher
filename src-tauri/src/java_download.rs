@@ -1,7 +1,8 @@
 use crate::error::{LauncherError, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -70,12 +71,28 @@ const MANAGED_JAVA_DIR: &str = "java";
 type ClientSlot = OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>>;
 type JavaListSlot = OnceLock<Mutex<Option<(Instant, Vec<AvailableJavaVersion>)>>>;
 
-/// HTTP client without auto-decompression — prevents "error decoding response body"
+/// One async lock per Java major. Two instances needing Java 21 must never
+/// share the archive/runtime paths concurrently; Java 17 and Java 21 remain
+/// independent and can download in parallel.
+static JAVA_DOWNLOAD_LOCKS: OnceLock<Mutex<HashMap<u32, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+fn java_download_lock(major_version: u32) -> Arc<tokio::sync::Mutex<()>> {
+    let locks = JAVA_DOWNLOAD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(major_version)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+/// HTTP client without auto-decompression вЂ” prevents "error decoding response body"
 /// when the server sends brotli/deflate despite us not requesting it.
 /// Rebuilt automatically when the proxy setting changes.
-fn download_client() -> reqwest::Result<reqwest::Client> {
+fn download_client() -> Result<reqwest::Client> {
     static CLIENT: ClientSlot = OnceLock::new();
-    let proxy = crate::download::resolved_proxy_url(crate::download::active_proxy_raw());
+    let proxy = crate::download::proxy_client_url()?;
     let mut slot = CLIENT
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -91,9 +108,9 @@ fn download_client() -> reqwest::Result<reqwest::Client> {
             .user_agent(concat!("VoidLauncher/", env!("CARGO_PKG_VERSION")));
         match &proxy {
             Some(p) => {
-                if let Ok(pp) = reqwest::Proxy::all(p.clone()) {
-                    builder = builder.proxy(pp);
-                }
+                // A malformed proxy must fail loudly: silently dropping it
+                // would turn a proxied request into a direct one.
+                builder = builder.proxy(reqwest::Proxy::all(p.clone())?);
             }
             None => {
                 // Truly direct: ignore HTTP_PROXY-style env variables so the
@@ -218,7 +235,7 @@ pub async fn list_available_java_versions() -> Result<Vec<AvailableJavaVersion>>
 
 /// Download and install a Java runtime by major version.
 ///
-/// Emits a terminal `"error"` progress event when it fails — the UI listens
+/// Emits a terminal `"error"` progress event when it fails вЂ” the UI listens
 /// for the event (launch-time setup modal, Settings spinner) and without it a
 /// failed download left the modal/spinner claiming progress forever.
 pub async fn download_java_runtime(
@@ -226,6 +243,11 @@ pub async fn download_java_runtime(
     data_dir: &Path,
     app: &AppHandle,
 ) -> Result<ManagedJavaRuntime> {
+    // Serialize only the same major. The guard is held across the whole
+    // resolve/download/extract/publish sequence, so the second caller waits
+    // and then reuses the published runtime instead of corrupting it.
+    let lock = java_download_lock(major_version);
+    let _guard = lock.lock().await;
     let result = download_java_runtime_inner(major_version, data_dir, app).await;
     if let Err(e) = &result {
         let _ = app.emit(
@@ -239,6 +261,52 @@ pub async fn download_java_runtime(
         );
     }
     result
+}
+
+/// Remove a temporary archive on every return path (success included).
+struct RemoveFileOnDrop(PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Remove an unpublished extraction directory unless ownership was handed to
+/// the final runtime path.
+struct RemoveDirOnDrop {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Remove leftovers from a crashed run of this same Java major. Must be called
+/// with the per-major lock held, so any matching path is guaranteed dead.
+fn cleanup_stale_staging(java_dir: &Path, major_version: u32) {
+    let Ok(entries) = std::fs::read_dir(java_dir) else {
+        return;
+    };
+    let dir_prefix = format!(".jdk-{}-", major_version);
+    let file_prefix = format!(".java-{}-", major_version);
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let is_staging_dir =
+            name.starts_with(&dir_prefix) && name.ends_with(".tmp") && path.is_dir();
+        let is_archive = name.starts_with(&file_prefix) && name.ends_with(".zip") && path.is_file();
+        if is_staging_dir {
+            let _ = std::fs::remove_dir_all(&path);
+        } else if is_archive {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 async fn download_java_runtime_inner(
@@ -264,10 +332,16 @@ async fn download_java_runtime_inner(
 
     tracing::info!(target: "launcher", "Starting download of Java {} runtime", major_version);
 
-    // If already extracted and valid, return it
-    if extract_marker.exists() {
+    // If a usable runtime is already on disk, return it. Probe even when the
+    // marker is missing: a crash between publish and marker write must not
+    // force a full re-download.
+    if runtime_dir.exists() {
         if let Some(java_exe) = find_java_in_dir(&runtime_dir) {
             if let Some(install) = crate::java::probe_java_by_path(&java_exe) {
+                if !extract_marker.exists() {
+                    let _ = std::fs::write(&extract_marker, b"1");
+                }
+                emit_progress(100.0, "done", "Java is ready");
                 return Ok(ManagedJavaRuntime {
                     major_version,
                     path: java_exe,
@@ -278,14 +352,29 @@ async fn download_java_runtime_inner(
                 });
             }
         }
-        let _ = std::fs::remove_dir_all(&runtime_dir);
+        // The marker/runtime is invalid. Do not delete it yet: the new
+        // extraction is staged and verified first.
     }
 
-    std::fs::create_dir_all(&runtime_dir)?;
+    std::fs::create_dir_all(&java_dir)?;
+    // A crashed earlier attempt may have left same-major staging dirs or
+    // archives behind. The per-major lock means nothing can still be using
+    // them. Other Java majors are untouched.
+    cleanup_stale_staging(&java_dir, major_version);
+    let staging_dir = java_dir.join(format!(
+        ".jdk-{}-{}.tmp",
+        major_version,
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&staging_dir)?;
+    let mut staging_guard = RemoveDirOnDrop {
+        path: staging_dir.clone(),
+        keep: false,
+    };
 
     // Ensure the proxy scheme (HTTP vs SOCKS5) is resolved before the first
     // Adoptium request. Without this, a system-detected SOCKS proxy would be
-    // tried as HTTP — the connection opens (port is listening) but the proxy
+    // tried as HTTP вЂ” the connection opens (port is listening) but the proxy
     // never responds, causing a multi-minute hang before the timeout fires.
     crate::download::ensure_proxy_resolved().await;
 
@@ -392,7 +481,7 @@ async fn download_java_runtime_inner(
     // bytes before extraction.
     let expected_checksum = pkg.checksum.clone();
 
-    // The archive name becomes a local file name, and the link is fetched —
+    // The archive name becomes a local file name, and the link is fetched вЂ”
     // both come from remote metadata, so neither is trusted blindly.
     crate::import::check_safe_file_name(&pkg.name)
         .map_err(|_| LauncherError::Download("Adoptium returned an invalid package name".into()))?;
@@ -402,7 +491,12 @@ async fn download_java_runtime_inner(
         ));
     }
 
-    let archive_path = java_dir.join(&pkg.name);
+    let archive_path = java_dir.join(format!(
+        ".java-{}-{}.zip",
+        major_version,
+        uuid::Uuid::new_v4().simple()
+    ));
+    let _archive_guard = RemoveFileOnDrop(archive_path.clone());
     let pkg_name = pkg.name.clone();
     let pkg_link = pkg.link.clone();
 
@@ -473,7 +567,7 @@ async fn download_java_runtime_inner(
 
     // Phase 3: Validate the file is actually a ZIP archive, then verify its
     // integrity BEFORE extraction. A mismatched checksum means the bytes do
-    // not match what Adoptium published — do not unpack untrusted content.
+    // not match what Adoptium published вЂ” do not unpack untrusted content.
     {
         let mut header = [0u8; 4];
         use std::io::Read;
@@ -481,7 +575,7 @@ async fn download_java_runtime_inner(
             .map_err(|e| LauncherError::Download(format!("Cannot open downloaded file: {}", e)))?;
         f.read_exact(&mut header).ok();
         if header != [0x50, 0x4b, 0x03, 0x04] {
-            // Not a ZIP file — likely an MSI installer
+            // Not a ZIP file вЂ” likely an MSI installer
             let _ = std::fs::remove_file(&archive_path);
             return Err(LauncherError::Download(format!(
                 "Downloaded file is not a ZIP archive. Java {} may only have an MSI installer available from Adoptium.",
@@ -497,27 +591,47 @@ async fn download_java_runtime_inner(
     emit_progress(85.0, "extracting", "Extracting archive...");
 
     let archive_clone = archive_path.clone();
-    let runtime_clone = runtime_dir.clone();
-    tokio::task::spawn_blocking(move || extract_archive(&archive_clone, &runtime_clone))
+    let staging_clone = staging_dir.clone();
+    tokio::task::spawn_blocking(move || extract_archive(&archive_clone, &staging_clone))
         .await
         .map_err(|e| LauncherError::Download(format!("Extraction task failed: {}", e)))??;
 
-    let _ = std::fs::remove_file(&archive_path);
-
-    // Phase 4: Verify
+    // Phase 4: verify the staged runtime before publishing it.
     emit_progress(95.0, "verifying", "Verifying Java installation...");
-    std::fs::write(&extract_marker, b"1")?;
-
-    let java_exe = find_java_in_dir(&runtime_dir).ok_or_else(|| {
+    let staged_java = find_java_in_dir(&staging_dir).ok_or_else(|| {
         tracing::error!(target: "launcher", "java.exe not found after extraction of Java {}", major_version);
         LauncherError::Download("Failed to find java.exe after extraction".to_string())
     })?;
-
-    let install = crate::java::probe_java_by_path(&java_exe).ok_or_else(|| {
+    let install = crate::java::probe_java_by_path(&staged_java).ok_or_else(|| {
         tracing::error!(target: "launcher", "Failed to verify extracted Java {} runtime", major_version);
         LauncherError::Download("Failed to verify extracted Java runtime".to_string())
     })?;
 
+    // Publish: the old runtime was already proven unusable (or absent), and
+    // the new one is fully extracted and probed. Only now remove/replace the
+    // public directory, then write the completion marker.
+    if runtime_dir.exists() {
+        std::fs::remove_dir_all(&runtime_dir).map_err(|e| {
+            LauncherError::Download(format!(
+                "Could not replace the existing Java {} runtime (is a game using it?): {}",
+                major_version, e
+            ))
+        })?;
+    }
+    std::fs::rename(&staging_dir, &runtime_dir).map_err(|e| {
+        LauncherError::Download(format!(
+            "Could not publish the Java {} runtime: {}",
+            major_version, e
+        ))
+    })?;
+    staging_guard.keep = true;
+    std::fs::write(&extract_marker, b"1")?;
+
+    let java_exe = find_java_in_dir(&runtime_dir).ok_or_else(|| {
+        LauncherError::Download(
+            "Java runtime was published but java.exe is no longer visible".to_string(),
+        )
+    })?;
     emit_progress(100.0, "done", "Java installed successfully");
     tracing::info!(target: "launcher", "Successfully installed Java {} ({})", major_version, install.version);
     Ok(ManagedJavaRuntime {
@@ -755,7 +869,7 @@ mod tests {
         assert!(verify_archive_checksum(&file, None).is_ok());
         assert!(verify_archive_checksum(&file, Some("")).is_ok());
         assert!(verify_archive_checksum(&file, Some("   ")).is_ok());
-        // Not a 64-char hex digest (e.g. sha512 or an unexpected scheme) — tolerate.
+        // Not a 64-char hex digest (e.g. sha512 or an unexpected scheme) вЂ” tolerate.
         assert!(verify_archive_checksum(&file, Some("deadbeef")).is_ok());
         assert!(
             verify_archive_checksum(&file, Some("0123456789abcdef".repeat(8).as_str())).is_ok()
@@ -815,5 +929,86 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[tokio::test]
+    async fn same_java_major_is_serialized_but_other_majors_are_not_blocked() {
+        let lock21 = java_download_lock(21);
+        let guard21 = lock21.lock().await;
+
+        let same_major = tokio::spawn(async move {
+            let lock = java_download_lock(21);
+            let _guard = lock.lock().await;
+            21u32
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !same_major.is_finished(),
+            "a second Java 21 download must wait for the first"
+        );
+
+        let other_major = tokio::time::timeout(Duration::from_secs(1), async {
+            let lock = java_download_lock(17);
+            let _guard = lock.lock().await;
+            17u32
+        })
+        .await
+        .expect("a different Java major must not be serialized behind 21");
+        assert_eq!(other_major, 17);
+
+        drop(guard21);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), same_major)
+                .await
+                .expect("the same-major waiter must resume after release")
+                .unwrap(),
+            21
+        );
+    }
+
+    #[test]
+    fn stale_same_major_staging_is_removed_without_touching_other_majors() {
+        let dir = unique("stale_staging");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale_dir = dir.join(".jdk-21-deadbeef.tmp");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        let stale_zip = dir.join(".java-21-deadbeef.zip");
+        std::fs::write(&stale_zip, b"partial").unwrap();
+        let other_dir = dir.join(".jdk-17-live.tmp");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let final_dir = dir.join("jdk-21");
+        std::fs::create_dir_all(&final_dir).unwrap();
+
+        cleanup_stale_staging(&dir, 21);
+        assert!(!stale_dir.exists(), "same-major staging must be removed");
+        assert!(!stale_zip.exists(), "same-major archive must be removed");
+        assert!(other_dir.exists(), "another major's download must survive");
+        assert!(final_dir.exists(), "the published runtime is never touched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temporary_archive_and_staging_directory_are_removed_on_drop() {
+        let dir = unique("guards");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join(".download.tmp");
+        std::fs::write(&archive, b"partial").unwrap();
+        {
+            let _guard = RemoveFileOnDrop(archive.clone());
+        }
+        assert!(!archive.exists());
+
+        let staging = dir.join(".jdk.tmp");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("file"), b"partial").unwrap();
+        {
+            let _guard = RemoveDirOnDrop {
+                path: staging.clone(),
+                keep: false,
+            };
+        }
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

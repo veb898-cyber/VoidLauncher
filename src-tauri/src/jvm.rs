@@ -13,10 +13,10 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 pub enum GcPreset {
     /// No special GC flags. Caller is responsible for any flags they want.
     Standard,
-    /// Prism Launcher's default G1GC set — tuned for interactive Minecraft
+    /// Prism Launcher's default G1GC set вЂ” tuned for interactive Minecraft
     /// clients (texture/pack loading, world gen, connecting to servers).
     G1gcPrism,
-    /// Modern ZGC — low pause times, requires Java 17+ and 8+ GB of heap.
+    /// Modern ZGC вЂ” low pause times, requires Java 17+ and 8+ GB of heap.
     ModernZgc,
 }
 
@@ -102,6 +102,10 @@ pub fn build_jvm_args(
     memory_mb: u32,
     java_major: u32,
 ) -> (Vec<String>, GcPreset) {
+    // Defence in depth: direct callers/tests may pass raw values from an old
+    // instance file. The launch path already clamps per-instance memory; this
+    // guarantees the JVM never receives 0/absurd heaps from any caller.
+    let memory_mb = memory_mb.clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
     let mut args: Vec<String> = Vec::new();
 
     // Memory is set FIRST so subsequent flags operate on a known heap size.
@@ -111,7 +115,7 @@ pub fn build_jvm_args(
     // Java 9+ module system flags: required for Minecraft 1.17+ to access
     // JDK-internal APIs via reflection. Also prevents JVM from failing when
     // classpath JARs (notably the obfuscated client.jar) contain classes in
-    // the unnamed default package — modern JDKs scan classpath entries for
+    // the unnamed default package вЂ” modern JDKs scan classpath entries for
     // automatic module derivation and reject unnamed-package classes.
     if java_major >= 9 {
         args.push("--add-opens".into());
@@ -164,7 +168,7 @@ pub fn build_jvm_args(
             // (or instance.jvm_args) provide whatever they want.
         }
         GcPreset::G1gcPrism => {
-            // Prism Launcher's default client GC set. Prism never uses ZGC —
+            // Prism Launcher's default client GC set. Prism never uses ZGC вЂ”
             // G1GC with fixed region sizing and a short pause target is what
             // avoids the "freeze while loading packs / joining servers" stalls
             // that aggressive server-style tuning (or ZGC on a small heap)
@@ -182,7 +186,7 @@ pub fn build_jvm_args(
             args.push("-Xss4M".into());
             // Note: `-XX:+G1UnlockCommercialFeatures` was never a valid
             // HotSpot flag. The actual flag was `-XX:+UnlockCommercialFeatures`
-            // (Java 8 only), which we intentionally skip — it had no effect
+            // (Java 8 only), which we intentionally skip вЂ” it had no effect
             // on G1GC performance and was removed in Java 9+.
         }
         GcPreset::ModernZgc => {
@@ -191,7 +195,7 @@ pub fn build_jvm_args(
             // of ZGC's overhead on young-object-heavy workloads like Minecraft.
             // On Java 17-20 the flag is unknown and would abort the JVM. On
             // Java 23 it was deprecated and on Java 24 removed (JEP 474 made
-            // generational mode the default) — there it only prints
+            // generational mode the default) вЂ” there it only prints
             // "Ignoring option ZGenerational; support was removed" on every
             // launch. Add it for Java 21-22 only.
             if (21..=22).contains(&java_major) {
@@ -218,7 +222,7 @@ pub fn build_jvm_args(
 /// so when the launcher picks its own GC preset we MUST remove every
 /// GC-selection flag from the upstream manifest first.
 ///
-/// The launcher preset (chosen by the user) is authoritative — anything
+/// The launcher preset (chosen by the user) is authoritative вЂ” anything
 /// pre-baked into the manifest or a loader profile is dropped here.
 /// Flags that merely *tune* an already-selected GC (e.g.
 /// `-XX:MaxGCPauseMillis=50`, `-XX:+UseStringDeduplication`) are kept
@@ -263,10 +267,10 @@ pub fn strip_gc_selection_flags(args: &[String]) -> Vec<String> {
 /// sees the preset), this runs over everything: custom user args, loader
 /// profile args and version-manifest args alike.
 ///
-/// * `-XX:+G1UnlockCommercialFeatures` — never existed in any HotSpot
+/// * `-XX:+G1UnlockCommercialFeatures` вЂ” never existed in any HotSpot
 ///   version; old Forge profiles shipped it incorrectly and newer JVMs abort
 ///   on unknown `-XX` options. Always removed.
-/// * `-XX:[+-]ZGenerational` — deprecated in Java 23 and removed in Java 24
+/// * `-XX:[+-]ZGenerational` вЂ” deprecated in Java 23 and removed in Java 24
 ///   (JEP 474 made generational mode the default), where passing it only
 ///   prints "Ignoring option ZGenerational; support was removed". Removed for
 ///   Java >= 23.
@@ -335,7 +339,7 @@ mod tests {
 
     #[test]
     fn zgc_falls_back_at_6gb() {
-        // 6 GB is below the 8 GB ZGC floor — the preset that caused the
+        // 6 GB is below the 8 GB ZGC floor вЂ” the preset that caused the
         // "freeze while loading packs / joining servers" stalls must not
         // apply there.
         let (_, eff) = build_jvm_args(GcPreset::ModernZgc, 6144, 21);
@@ -349,14 +353,14 @@ mod tests {
         assert!(args.contains(&"-XX:+UseZGC".to_string()));
         // Generational ZGC (JEP 439) applies on Java 21-22
         assert!(args.contains(&"-XX:+ZGenerational".to_string()));
-        // ZGC is production since JDK 15 — no experimental unlock needed
+        // ZGC is production since JDK 15 вЂ” no experimental unlock needed
         assert!(!args.contains(&"-XX:+UnlockExperimentalVMOptions".to_string()));
     }
 
     #[test]
     fn zgc_java_23_and_newer_omit_generational_flag() {
         // `-XX:+ZGenerational` is deprecated in Java 23 and removed in Java 24
-        // (JEP 474) — there it only prints "Ignoring option ZGenerational;
+        // (JEP 474) вЂ” there it only prints "Ignoring option ZGenerational;
         // support was removed" on every launch, so it must not be added.
         for major in [23u32, 24, 25] {
             let (args, eff) = build_jvm_args(GcPreset::ModernZgc, 8192, major);
@@ -371,6 +375,15 @@ mod tests {
     }
 
     #[test]
+    fn clamps_absurd_memory_before_building_xmx() {
+        let (args, _) = build_jvm_args(GcPreset::G1gcPrism, 0, 21);
+        assert!(args.iter().any(|a| a == "-Xmx2048M"));
+        let (args, _) = build_jvm_args(GcPreset::G1gcPrism, 1_000_000, 21);
+        assert!(args.iter().any(|a| a == "-Xmx32768M"));
+        assert!(!args.iter().any(|a| a.contains("1000000")));
+    }
+
+    #[test]
     fn strip_removed_jvm_flags_drops_zgenerational_on_java_23_plus() {
         let mut args = s(&["-XX:+ZGenerational", "-Xmx4G"]);
         strip_removed_jvm_flags(&mut args, 23);
@@ -380,7 +393,7 @@ mod tests {
         strip_removed_jvm_flags(&mut args, 24);
         assert_eq!(args, s(&["-Xmx4G"]));
 
-        // Java 21/22 still accept the flag — it must survive.
+        // Java 21/22 still accept the flag вЂ” it must survive.
         let mut args = s(&["-XX:+ZGenerational"]);
         strip_removed_jvm_flags(&mut args, 22);
         assert_eq!(args, s(&["-XX:+ZGenerational"]));
@@ -397,7 +410,7 @@ mod tests {
 
     #[test]
     fn zgc_java_17_omits_generational_flag() {
-        // `-XX:+ZGenerational` does not exist on Java 17 — it must not be
+        // `-XX:+ZGenerational` does not exist on Java 17 вЂ” it must not be
         // passed or the JVM aborts with "Unrecognized VM option".
         let (args, eff) = build_jvm_args(GcPreset::ModernZgc, 8192, 17);
         assert_eq!(eff, GcPreset::ModernZgc);
@@ -464,7 +477,7 @@ mod tests {
 
     #[test]
     fn strip_accepts_lowercase_xx_prefix() {
-        // Some launchers/tools pass `-xx:+UseG1GC` — we still strip it.
+        // Some launchers/tools pass `-xx:+UseG1GC` вЂ” we still strip it.
         let out = strip_gc_selection_flags(&s(&["-xx:+UseG1GC", "-Xmx4G"]));
         assert_eq!(out, s(&["-Xmx4G"]));
     }

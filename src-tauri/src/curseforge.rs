@@ -81,6 +81,10 @@ pub struct CfModDetail {
     pub download_count: u64,
     #[serde(rename = "dateModified")]
     pub date_modified: String,
+    /// CurseForge project class (`6` mod, `12` resource pack, `6552` shader).
+    /// Absent/unknown must never be treated as a mod by import/repair.
+    #[serde(rename = "classId", default)]
+    pub class_id: Option<u32>,
 }
 
 #[allow(dead_code)]
@@ -178,6 +182,10 @@ pub struct CfBulkMod {
     pub id: u64,
     #[serde(default)]
     pub name: String,
+    /// Project class from the bulk metadata endpoint. Missing means the API
+    /// did not resolve the project; callers must report it instead of guessing.
+    #[serde(rename = "classId", default)]
+    pub class_id: Option<u32>,
     #[serde(rename = "latestFiles", default)]
     pub latest_files: Vec<CfFile>,
     #[serde(rename = "latestFilesIndexes", default)]
@@ -192,6 +200,60 @@ pub fn loader_type_id(loader: &str) -> Option<u32> {
         "neoforge" => Some(6),
         _ => None,
     }
+}
+
+/// Content classes VoidLauncher can install from a CurseForge modpack.
+/// Unknown classes are deliberately not mapped to `mods/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CfContentClass {
+    Mod,
+    ResourcePack,
+    ShaderPack,
+}
+
+impl CfContentClass {
+    pub fn from_class_id(class_id: u32) -> Option<Self> {
+        match class_id {
+            6 => Some(Self::Mod),
+            12 => Some(Self::ResourcePack),
+            6552 => Some(Self::ShaderPack),
+            _ => None,
+        }
+    }
+
+    pub fn folder(self) -> &'static str {
+        match self {
+            Self::Mod => "mods",
+            Self::ResourcePack => "resourcepacks",
+            Self::ShaderPack => "shaderpacks",
+        }
+    }
+
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::Mod => "mod",
+            Self::ResourcePack => "resourcepack",
+            Self::ShaderPack => "shader",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mod => "mod",
+            Self::ResourcePack => "resource pack",
+            Self::ShaderPack => "shader pack",
+        }
+    }
+}
+
+/// Resolve a CurseForge project class from bulk project metadata. A missing
+/// entry is not evidence that the project is a mod.
+pub fn content_class_from_bulk(projects: &[CfBulkMod], project_id: u64) -> Option<CfContentClass> {
+    projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .and_then(|project| project.class_id)
+        .and_then(CfContentClass::from_class_id)
 }
 
 /// CurseForge classId for a VoidLauncher project type (verified against
@@ -233,10 +295,25 @@ pub fn sort_files_newest_first(files: &mut Vec<CfFile>) {
     files.sort_by(|a, b| b.file_date.cmp(&a.file_date));
 }
 
+/// Host of an API URL. Authenticated requests must carry their credential to
+/// this exact host only; redirects are otherwise refused.
+fn api_host(url: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        crate::error::LauncherError::Download(format!("Invalid CurseForge URL: {e}"))
+    })?;
+    parsed
+        .host_str()
+        .map(|host| host.to_ascii_lowercase())
+        .ok_or_else(|| {
+            crate::error::LauncherError::Download("CurseForge URL has no host".to_string())
+        })
+}
+
 async fn api_get<T: serde::de::DeserializeOwned>(url: &str, api_key: &str) -> Result<T> {
     crate::download::ensure_proxy_resolved().await;
-    let client = crate::download::global_http_client()?;
-    let response = crate::download::get_with_retry(
+    let host = api_host(url)?;
+    let client = crate::download::http_client_for_exact_host(&host)?;
+    let response = crate::download::get_with_retry_same_host(
         client
             .get(url)
             .header("x-api-key", api_key)
@@ -247,6 +324,7 @@ async fn api_get<T: serde::de::DeserializeOwned>(url: &str, api_key: &str) -> Re
         "CurseForge",
         4,
         &[500, 1000, 2000],
+        &host,
     )
     .await?;
 
@@ -271,13 +349,15 @@ async fn api_get_once<T: serde::de::DeserializeOwned>(
     api_key: &str,
     timeout_secs: u64,
 ) -> Result<T> {
-    let client = crate::download::global_http_client()?;
-    let response = crate::download::send_with_fallback(
+    let host = api_host(url)?;
+    let client = crate::download::http_client_for_exact_host(&host)?;
+    let response = crate::download::send_with_fallback_same_host(
         client
             .get(url)
             .header("x-api-key", api_key)
             .header("Accept", "application/json")
             .timeout(std::time::Duration::from_secs(timeout_secs)),
+        &host,
     )
     .await?;
     if !response.status().is_success() {
@@ -303,8 +383,9 @@ async fn api_post<T: serde::de::DeserializeOwned, B: serde::Serialize + ?Sized>(
     body: &B,
 ) -> Result<T> {
     crate::download::ensure_proxy_resolved().await;
-    let client = crate::download::global_http_client()?;
-    let response = crate::download::get_with_retry(
+    let host = api_host(url)?;
+    let client = crate::download::http_client_for_exact_host(&host)?;
+    let response = crate::download::get_with_retry_same_host(
         client
             .post(url)
             .header("x-api-key", api_key)
@@ -314,6 +395,7 @@ async fn api_post<T: serde::de::DeserializeOwned, B: serde::Serialize + ?Sized>(
         "CurseForge",
         2,
         &[500],
+        &host,
     )
     .await?;
 
@@ -343,11 +425,13 @@ pub struct CfSearchQuery<'a> {
     pub limit: u32,
 }
 
-/// Search with optional classId (e.g. 4471 = modpacks), categoryId and sort.
-pub async fn search_mods_filtered(
-    query: &CfSearchQuery<'_>,
-    api_key: &str,
-) -> Result<CfSearchResponse> {
+/// Constructs the search query URL for CurseForge API.
+///
+/// For categories that do not use mod loaders (such as Resource Packs [class 12],
+/// Shaders [class 6552], Worlds [class 17], Data Packs [class 6945]), the `modLoaderType`
+/// filter is omitted even if provided, because CurseForge will return zero results
+/// when `modLoaderType` is applied to non-mod categories.
+pub fn build_search_url(query: &CfSearchQuery<'_>) -> String {
     let CfSearchQuery {
         query,
         mc_version,
@@ -378,13 +462,29 @@ pub async fn search_mods_filtered(
     if let Some(v) = mc_version {
         params.push(format!("gameVersion={}", urlencoding::encode(v)));
     }
-    if let Some(l) = loader {
+
+    // Resource packs (12), shaders (6552), worlds (17), datapacks (6945) do not have a mod loader.
+    // Specifying modLoaderType for these classes causes CurseForge API to return 0 hits.
+    let effective_loader = match class_id {
+        Some(12) | Some(6552) | Some(17) | Some(6945) => None,
+        _ => loader,
+    };
+
+    if let Some(l) = effective_loader {
         if let Some(id) = loader_type_id(l) {
             params.push(format!("modLoaderType={}", id));
         }
     }
 
-    let url = format!("{}/v1/mods/search?{}", BASE_URL, params.join("&"));
+    format!("{}/v1/mods/search?{}", BASE_URL, params.join("&"))
+}
+
+/// Search with optional classId (e.g. 4471 = modpacks), categoryId and sort.
+pub async fn search_mods_filtered(
+    query: &CfSearchQuery<'_>,
+    api_key: &str,
+) -> Result<CfSearchResponse> {
+    let url = build_search_url(query);
     api_get(&url, api_key).await
 }
 
@@ -435,6 +535,16 @@ pub async fn get_mods_by_ids(mod_ids: &[u64], api_key: &str) -> Result<Vec<CfBul
     let body = serde_json::json!({ "modIds": mod_ids });
     let resp: CfDataResponse<Vec<CfBulkMod>> = api_post(&url, api_key, &body).await?;
     Ok(resp.data)
+}
+
+/// Bulk metadata in bounded batches. CurseForge rejects very large id arrays,
+/// and one failed batch must not silently downgrade every project to "mod".
+pub async fn get_mods_by_ids_chunked(mod_ids: &[u64], api_key: &str) -> Result<Vec<CfBulkMod>> {
+    let mut out = Vec::new();
+    for chunk in mod_ids.chunks(100) {
+        out.extend(get_mods_by_ids(chunk, api_key).await?);
+    }
+    Ok(out)
 }
 
 pub async fn get_files_by_ids(file_ids: &[u64], api_key: &str) -> Result<Vec<CfFile>> {
@@ -594,7 +704,14 @@ pub async fn download_cf_native(
         if i > 0 {
             let mut part = dest.as_os_str().to_os_string();
             part.push(".part");
-            let _ = std::fs::remove_file(std::path::PathBuf::from(part));
+            let part = std::path::PathBuf::from(part);
+            let _ = std::fs::remove_file(&part);
+            // The identity sidecar belongs to the previous host's URL; leaving
+            // it would make the next attempt look like a resume of a different
+            // artifact (harmless, but noisy and confusing in logs).
+            let mut meta = dest.as_os_str().to_os_string();
+            meta.push(".part.meta");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(meta));
         }
         match crate::download::download_to_part(
             url,
@@ -664,6 +781,63 @@ mod tests {
             hashes: vec![],
             is_available: available,
         }
+    }
+
+    #[test]
+    fn build_search_url_omits_mod_loader_for_resourcepacks_and_shaders() {
+        // Class 6 (mods): modLoaderType should be included
+        let mod_q = CfSearchQuery {
+            query: "sodium",
+            mc_version: Some("1.21.1"),
+            loader: Some("fabric"),
+            class_id: Some(6),
+            category_id: None,
+            index: None,
+            offset: 0,
+            limit: 20,
+        };
+        let mod_url = build_search_url(&mod_q);
+        assert!(
+            mod_url.contains("modLoaderType=4"),
+            "Mods must have modLoaderType"
+        );
+        assert!(mod_url.contains("classId=6"));
+
+        // Class 12 (resourcepack): modLoaderType must be omitted even if loader is specified
+        let rp_q = CfSearchQuery {
+            query: "faithful",
+            mc_version: Some("1.21.1"),
+            loader: Some("fabric"),
+            class_id: Some(12),
+            category_id: None,
+            index: None,
+            offset: 0,
+            limit: 20,
+        };
+        let rp_url = build_search_url(&rp_q);
+        assert!(
+            !rp_url.contains("modLoaderType"),
+            "Resource packs must NOT include modLoaderType"
+        );
+        assert!(rp_url.contains("classId=12"));
+
+        // Class 6552 (shader): modLoaderType must be omitted
+        let shader_q = CfSearchQuery {
+            query: "complementary",
+            mc_version: Some("1.21.1"),
+            loader: Some("forge"),
+            class_id: Some(6552),
+            category_id: None,
+            index: None,
+            offset: 0,
+            limit: 20,
+        };
+        let shader_url = build_search_url(&shader_q);
+        assert!(
+            !shader_url.contains("modLoaderType"),
+            "Shaders must NOT include modLoaderType"
+        );
+        assert!(shader_url.contains("classId=6552"));
     }
 
     #[test]
@@ -778,5 +952,19 @@ mod tests {
         let resp: CfDataResponse<Vec<CfFile>> = serde_json::from_str(json).unwrap();
         assert_eq!(resp.data[0].sha1_hash(), Some("abc"));
         assert_eq!(resp.data[0].is_available, Some(true));
+    }
+
+    #[test]
+    fn api_host_matches_the_configured_api_origin() {
+        assert_eq!(
+            api_host(&format!("{BASE_URL}/v1/mods/1")).expect("API URL"),
+            "api.curseforge.com"
+        );
+        assert_eq!(
+            api_host("https://API.CurseForge.com/v1/mods").expect("API URL"),
+            "api.curseforge.com"
+        );
+        assert!(api_host("not a url").is_err());
+        assert!(api_host("mailto:test@example.com").is_err());
     }
 }

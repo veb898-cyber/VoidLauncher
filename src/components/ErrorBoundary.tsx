@@ -5,6 +5,10 @@ import { t } from '../lib/i18n';
 
 interface Props {
   children: ReactNode;
+  /** Reset the error state when this key changes (e.g. the active page). */
+  resetKey?: string;
+  /** Optional lightweight fallback for chrome components. */
+  fallback?: ReactNode;
 }
 
 interface State {
@@ -22,12 +26,21 @@ export class ErrorBoundary extends Component<Props, State> {
     return { hasError: true, error };
   }
 
+  componentDidUpdate(prevProps: Props) {
+    if (this.state.hasError && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ hasError: false, error: null });
+    }
+  }
+
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
     console.error('ErrorBoundary caught:', error, errorInfo);
   }
 
   render() {
     if (this.state.hasError) {
+      if (this.props.fallback !== undefined) {
+        return this.props.fallback;
+      }
       return (
         <div
           style={{

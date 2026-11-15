@@ -368,7 +368,8 @@ fn collect_instance(
 
     // Instance memory vs. physical RAM.
     let total_mb = crate::config::detect_total_ram_mb();
-    let alloc_mb = instance.memory_mb.unwrap_or(config.default_memory_mb) as u64;
+    let alloc_mb =
+        instance.effective_memory_mb(config.default_memory_mb, config.max_memory_mb) as u64;
     if total_mb > 0 && alloc_mb > total_mb {
         issues.push(DiagIssue {
             id: "memory".into(),
@@ -407,6 +408,13 @@ fn collect_instance(
 }
 
 // ══════════════════════════ entry point ══════════════════════════
+
+/// System inventory checks for the bug-report screen. Unlike
+/// `run_diagnostics`, this does not run the full instance file verification
+/// or network probes.
+pub(crate) fn system_checks(config: &AppConfig) -> Vec<DiagCheck> {
+    collect_system(config).checks
+}
 
 /// Gather the full diagnostics report. Instance checks run on a worker
 /// thread (the verify scan walks thousands of files); the network probes
@@ -525,9 +533,25 @@ pub struct CrashAnalysis {
     pub kind: String,
     /// Mod/file suspected to cause the crash, when extractable.
     pub culprit: Option<String>,
+    /// Jar in this instance's mods folder matching the culprit, if any.
+    #[serde(default)]
+    pub culprit_file: Option<String>,
+    /// All jars that matched the culprit. More than one means the analyzer
+    /// deliberately refuses to pick a file or offer automatic disabling.
+    #[serde(default)]
+    pub culprit_candidates: Vec<String>,
     /// Evidence: the first log line matching the classification.
     pub detail: String,
-    /// `"crash-report"` | `"session-log"` | `"latest-log"` | `"clean"` | `"none"`.
+    /// Last `Caused by:` line, when the evidence has a chain.
+    #[serde(default)]
+    pub root_cause: Option<String>,
+    /// Exit code from the run's unified log, when recorded.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// Safe follow-up actions; never applied without an explicit click.
+    #[serde(default)]
+    pub actions: Vec<crate::recovery::CrashAction>,
+    /// `"crash-report"` | `"session-log"` | `"latest-log"` | `"hs-error"` | `"clean"` | `"none"`.
     pub source: String,
     /// Absolute path of the crash report, when one exists (for opening it).
     pub report_path: Option<String>,
@@ -878,15 +902,21 @@ fn fabric_loader_outdated(text: &str) -> Option<LoaderOutdatedHint> {
 
 /// `classify_crash` + the run-level refinement: a generic "mods are
 /// incompatible" hit is sharpened to `loader_outdated` when the log shows a
-/// mod demanding a newer loader. Returns `(kind, verdict, detail, culprit)`.
-fn classify_run_crash(text: &str) -> Option<(String, &'static str, String, Option<String>)> {
+/// mod demanding a newer loader. Returns a full signal so the caller can keep
+/// the jar name the loader printed.
+fn classify_run_crash_full(text: &str) -> Option<crate::crash_signals::CrashSignal> {
+    // Loader refusal blocks and native JVM reports are stronger than the
+    // generic keyword rules: they name the exact requirement or module.
+    if let Some(signal) = crate::crash_signals::analyze_text(text) {
+        return Some(signal);
+    }
     let (rule, detail, culprit) = classify_crash(text)?;
-    let mut kind = rule.kind.to_string();
+    let mut kind = rule.kind;
     let mut detail = detail;
     let mut culprit = culprit;
     if rule.kind == "mod_dependency" {
         if let Some(hint) = fabric_loader_outdated(text) {
-            kind = "loader_outdated".to_string();
+            kind = "loader_outdated";
             if let Some(d) = hint.detail {
                 detail = d;
             }
@@ -895,7 +925,19 @@ fn classify_run_crash(text: &str) -> Option<(String, &'static str, String, Optio
             }
         }
     }
-    Some((kind, rule.verdict, detail, culprit))
+    Some(crate::crash_signals::CrashSignal {
+        kind,
+        verdict: rule.verdict,
+        detail,
+        culprit,
+        file: None,
+    })
+}
+
+/// Compatibility wrapper used by the classifier tests.
+#[cfg(test)]
+fn classify_run_crash(text: &str) -> Option<(String, &'static str, String, Option<String>)> {
+    classify_run_crash_full(text).map(|s| (s.kind.to_string(), s.verdict, s.detail, s.culprit))
 }
 
 const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
@@ -917,7 +959,10 @@ fn read_report(path: &Path) -> Option<String> {
         let mut taken = file.take(MAX_REPORT_BYTES);
         taken.read_to_end(&mut buf).ok()?;
     }
-    String::from_utf8(buf).ok()
+    // Crash files are usually UTF-8, but a mod can print legacy Windows
+    // code-page bytes. Lossy decoding keeps the ASCII keywords usable instead
+    // of throwing the whole report away.
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Read the tail of a possibly huge log file.
@@ -928,7 +973,7 @@ fn read_tail(path: &Path, cap: u64) -> Option<String> {
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::new();
     file.take(cap).read_to_end(&mut buf).ok()?;
-    String::from_utf8(buf).ok()
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Newest crash report in the instance (by mtime), `.txt` or `.txt.gz`.
@@ -963,6 +1008,41 @@ fn newest_crash_report(
     best.map(|(_, p)| p)
 }
 
+/// Newest HotSpot fatal-error log (`hs_err_pid*.log`) inside the run window.
+/// The JVM writes it to the game working directory (the instance folder), and
+/// some loaders redirect it under `logs/`.
+fn newest_hs_err(
+    mc_dir: &Path,
+    window: Option<(std::time::SystemTime, std::time::SystemTime)>,
+) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for dir in [mc_dir.to_path_buf(), mc_dir.join("logs")] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if !name.starts_with("hs_err_pid") || !name.ends_with(".log") {
+                continue;
+            }
+            let path = entry.path();
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if let Some((from, to)) = window {
+                if mtime < from || mtime > to {
+                    continue;
+                }
+            }
+            if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                best = Some((mtime, path));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// The exit line the last pipe-reader appends to the session log:
 /// "[INFO] [launch] Game exited with code N". Last occurrence wins (the
 /// final line is chronologically last).
@@ -979,6 +1059,133 @@ fn exit_code_from_session_log(text: &str) -> Option<i32> {
         rest = after;
     }
     found
+}
+
+/// Compare a loader's mod id/name with the jars actually installed. The
+/// manager's sidecar is the cheapest and most authoritative link; jar metadata
+/// is the fallback for hand-dropped files. This deliberately returns one file
+/// only, and only on an exact normalized match.
+fn find_mod_files(mc_dir: &Path, culprit: &str) -> Vec<String> {
+    let want = culprit.trim().trim_matches(['\'', '"']).to_lowercase();
+    if want.is_empty() || want.len() > 200 {
+        return Vec::new();
+    }
+    let mods = mc_dir.join("mods");
+    if let (Ok(root), Ok(mods_canon)) =
+        (std::fs::canonicalize(mc_dir), std::fs::canonicalize(&mods))
+    {
+        if !mods_canon.starts_with(&root) {
+            return Vec::new();
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(&mods) else {
+        return Vec::new();
+    };
+    let mut exact: Vec<String> = Vec::new();
+    let mut fuzzy: Vec<String> = Vec::new();
+    for entry in entries.flatten().take(500) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !path.is_file() || name.starts_with('.') || name.ends_with(".disabled") {
+            continue;
+        }
+        if !name.to_lowercase().ends_with(".jar") {
+            continue;
+        }
+        if name.to_lowercase() == want || name.to_lowercase() == format!("{want}.jar") {
+            exact.push(name.clone());
+            continue;
+        }
+        let sidecar = crate::content::InstalledContent::read(&mods, &name, "mod");
+        let sidecar_matches = sidecar
+            .project_name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(culprit))
+            || sidecar
+                .project_id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(culprit));
+        if sidecar_matches {
+            exact.push(name.clone());
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(std::io::BufReader::new(file)) else {
+            continue;
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        if let Ok(mut entry) = archive.by_name("fabric.mod.json") {
+            let mut text = String::new();
+            if entry.read_to_string(&mut text).is_ok() {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                        candidates.push(id.to_lowercase());
+                    }
+                    if let Some(title) = json.get("name").and_then(|v| v.as_str()) {
+                        candidates.push(title.to_lowercase());
+                    }
+                }
+            }
+        }
+        for toml_name in ["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
+            if let Ok(mut entry) = archive.by_name(toml_name) {
+                let mut text = String::new();
+                if entry.read_to_string(&mut text).is_ok() {
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if let Some((key, value)) = line.split_once('=') {
+                            let key = key.trim().to_lowercase();
+                            if key == "modid" || key == "displayname" {
+                                let value = value.trim().trim_matches('"').to_lowercase();
+                                if !value.is_empty() {
+                                    candidates.push(value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if candidates.contains(&want) {
+            exact.push(name.clone());
+            continue;
+        }
+        let stem = name.trim_end_matches(".jar").to_lowercase();
+        let normalized: String = stem.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let wanted: String = want.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if !wanted.is_empty() && normalized == wanted {
+            fuzzy.push(name);
+        }
+    }
+    let mut found = if exact.is_empty() { fuzzy } else { exact };
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Unique match only. Ambiguous ids (two jars declaring the same mod id, or
+/// two versions side by side) intentionally return `None`; the caller must
+/// not disable a file on a coin flip.
+#[cfg(test)]
+fn find_mod_file(mc_dir: &Path, culprit: &str) -> Option<String> {
+    let mut files = find_mod_files(mc_dir, culprit);
+    (files.len() == 1).then(|| files.remove(0))
+}
+
+/// Exit code 0 alone is not proof of a clean run: Minecraft can catch a
+/// game-loop exception, log a crash marker and return from `main` normally.
+fn is_clean_run(
+    exit_code: Option<i32>,
+    has_crash_report: bool,
+    has_hs_err: bool,
+    session_text: Option<&str>,
+) -> bool {
+    exit_code == Some(0)
+        && !has_crash_report
+        && !has_hs_err
+        && !session_text.is_some_and(crate::crash_signals::reports_crash)
 }
 
 /// Analyze a specific run of an instance. The run is identified by its
@@ -1028,66 +1235,134 @@ pub fn analyze_crash(
     });
 
     let report_path = newest_crash_report(&mc_dir.join("crash-reports"), window);
+    let hs_err_path = newest_hs_err(&mc_dir, window);
+    // Read the run's unified log once: it carries the exit code and is the
+    // main fallback when no crash report was written.
+    let session_text = session.and_then(|s| read_tail(s, MAX_LOG_TAIL_BYTES));
+    let exit_code = session_text.as_deref().and_then(exit_code_from_session_log);
 
-    if let Some(path) = &report_path {
-        if let Some(text) = read_report(path) {
-            if let Some((kind, verdict, detail, culprit)) = classify_run_crash(&text) {
-                return Ok(CrashAnalysis {
-                    verdict: verdict.to_string(),
-                    kind,
-                    culprit,
-                    detail,
-                    source: "crash-report".into(),
-                    report_path: Some(path.to_string_lossy().to_string()),
-                });
+    let build = |signal: crate::crash_signals::CrashSignal,
+                 source: &str,
+                 report_path: Option<PathBuf>,
+                 evidence_text: &str|
+     -> CrashAnalysis {
+        let mod_related = matches!(
+            signal.kind,
+            "mod_crash"
+                | "mod_conflict"
+                | "missing_class"
+                | "missing_dependency"
+                | "mod_version_mismatch"
+                | "wrong_loader"
+                | "wrong_game"
+                | "duplicate_mod"
+        );
+        let culprit_candidates = if mod_related {
+            if let Some(file) = signal
+                .file
+                .as_deref()
+                .filter(|f| mc_dir.join("mods").join(f).is_file())
+            {
+                vec![file.to_string()]
+            } else {
+                signal
+                    .culprit
+                    .as_deref()
+                    .map(|c| find_mod_files(&mc_dir, c))
+                    .unwrap_or_default()
             }
-            // A report exists but matches nothing known: still hand the
-            // user the file, with an honest "unknown" verdict.
-            return Ok(CrashAnalysis {
-                verdict: "unknown".into(),
-                kind: "unknown".into(),
-                culprit: None,
-                detail: first_line(&text),
-                source: "crash-report".into(),
-                report_path: Some(path.to_string_lossy().to_string()),
-            });
+        } else {
+            Vec::new()
+        };
+        let culprit_file = if culprit_candidates.len() == 1 {
+            culprit_candidates.first().cloned()
+        } else {
+            None
+        };
+        let actions = crate::recovery::plan(signal.kind, culprit_file.as_deref(), evidence_text);
+        CrashAnalysis {
+            verdict: signal.verdict.to_string(),
+            kind: signal.kind.to_string(),
+            culprit: signal.culprit,
+            culprit_file,
+            culprit_candidates,
+            detail: signal.detail,
+            root_cause: crate::crash_signals::root_cause(evidence_text),
+            exit_code,
+            actions,
+            source: source.into(),
+            report_path: report_path.map(|p| p.to_string_lossy().to_string()),
+        }
+    };
+
+    // A HotSpot fatal-error log is the most precise source for native and
+    // driver failures. Prefer it when it actually classifies as one; a normal
+    // mod crash can otherwise still use the richer Minecraft crash report.
+    if let Some(path) = &hs_err_path {
+        if let Some(text) = read_report(path) {
+            if let Some(signal) = classify_run_crash_full(&text) {
+                if matches!(
+                    signal.kind,
+                    "native_crash" | "graphics_driver" | "system_memory"
+                ) {
+                    return Ok(build(signal, "hs-error", Some(path.clone()), &text));
+                }
+            }
         }
     }
 
-    // No crash report for this run — read the run's own unified log (full
-    // stdout/stderr stream; catches early startup failures that never reach
-    // a crash report).
-    let session_text = session.and_then(|s| read_tail(s, MAX_LOG_TAIL_BYTES));
+    if let Some(path) = &report_path {
+        if let Some(text) = read_report(path) {
+            if let Some(signal) = classify_run_crash_full(&text) {
+                return Ok(build(signal, "crash-report", Some(path.clone()), &text));
+            }
+            // A report exists but matches nothing known: still hand the
+            // user the file, with an honest "unknown" verdict.
+            return Ok(build(
+                crate::crash_signals::CrashSignal {
+                    kind: "unknown",
+                    verdict: "unknown",
+                    detail: first_line(&text),
+                    culprit: None,
+                    file: None,
+                },
+                "crash-report",
+                Some(path.clone()),
+                &text,
+            ));
+        }
+    }
 
-    // A confirmed clean exit (code 0) with no crash report in the window is
+    // A confirmed clean exit (code 0) with no crash artifacts in the window is
     // not a crash. This gate MUST run before the log classification: healthy
     // sessions routinely contain benign WARN noise ("Error loading class: …
     // ClassNotFoundException" for optional compat hooks) that would
     // otherwise be reported as a possible cause. A real startup failure
     // exits non-zero and is still classified below.
-    if let Some(text) = &session_text {
-        if exit_code_from_session_log(text) == Some(0) {
-            return Ok(CrashAnalysis {
-                verdict: "unknown".into(),
-                kind: "clean".into(),
-                culprit: None,
-                detail: String::new(),
-                source: "clean".into(),
-                report_path: None,
-            });
-        }
+    if is_clean_run(
+        exit_code,
+        report_path.is_some(),
+        hs_err_path.is_some(),
+        session_text.as_deref(),
+    ) {
+        return Ok(CrashAnalysis {
+            verdict: "unknown".into(),
+            kind: "clean".into(),
+            culprit: None,
+            culprit_file: None,
+            culprit_candidates: Vec::new(),
+            detail: String::new(),
+            root_cause: None,
+            exit_code,
+            actions: Vec::new(),
+            source: "clean".into(),
+            report_path: None,
+        });
     }
 
     if let Some(text) = &session_text {
-        if let Some((kind, verdict, detail, culprit)) = classify_run_crash(text) {
-            return Ok(CrashAnalysis {
-                verdict: verdict.to_string(),
-                kind,
-                culprit,
-                detail,
-                source: "session-log".into(),
-                report_path: None,
-            });
+        if let Some(signal) = classify_run_crash_full(text) {
+            return Ok(build(signal, "session-log", None, text));
         }
     }
 
@@ -1107,15 +1382,8 @@ pub fn analyze_crash(
         .unwrap_or(true);
     if latest_is_current {
         if let Some(text) = read_tail(&latest, MAX_LOG_TAIL_BYTES) {
-            if let Some((kind, verdict, detail, culprit)) = classify_run_crash(&text) {
-                return Ok(CrashAnalysis {
-                    verdict: verdict.to_string(),
-                    kind,
-                    culprit,
-                    detail,
-                    source: "latest-log".into(),
-                    report_path: None,
-                });
+            if let Some(signal) = classify_run_crash_full(&text) {
+                return Ok(build(signal, "latest-log", None, &text));
             }
         }
     }
@@ -1124,9 +1392,14 @@ pub fn analyze_crash(
         verdict: "unknown".into(),
         kind: "unknown".into(),
         culprit: None,
+        culprit_file: None,
+        culprit_candidates: Vec::new(),
         detail: String::new(),
+        root_cause: None,
+        exit_code,
+        actions: crate::recovery::plan("unknown", None, ""),
         source: "none".into(),
-        report_path: None,
+        report_path: hs_err_path.map(|p| p.to_string_lossy().to_string()),
     })
 }
 
@@ -1149,6 +1422,106 @@ mod tests {
     /// `classify_run_crash` without the detail, for the refinement tests.
     fn classify_run(text: &str) -> Option<(String, &'static str, Option<String>)> {
         classify_run_crash(text).map(|(kind, verdict, _, culprit)| (kind, verdict, culprit))
+    }
+
+    #[test]
+    fn culprit_is_resolved_to_the_installed_jar() {
+        use std::io::Write;
+        let dir =
+            std::env::temp_dir().join(format!("voidlauncher_diag_culprit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mods = dir.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        let file = std::fs::File::create(mods.join("sodium-fabric-0.5.8.jar")).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(br#"{"id":"sodium","name":"Sodium"}"#)
+            .unwrap();
+        zip.finish().unwrap();
+
+        assert_eq!(
+            find_mod_file(&dir, "sodium").as_deref(),
+            Some("sodium-fabric-0.5.8.jar")
+        );
+        assert_eq!(
+            find_mod_file(&dir, "sodium-fabric-0.5.8.jar").as_deref(),
+            Some("sodium-fabric-0.5.8.jar")
+        );
+        assert_eq!(find_mod_file(&dir, "not-installed"), None);
+
+        // A second jar with the same mod id is ambiguous: the analyzer must
+        // report both and refuse to pick one for automatic disabling.
+        let file = std::fs::File::create(mods.join("sodium-0.6.0.jar")).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(br#"{"id":"sodium","name":"Sodium"}"#)
+            .unwrap();
+        zip.finish().unwrap();
+        let all = find_mod_files(&dir, "sodium");
+        assert_eq!(
+            all.len(),
+            2,
+            "both jars must be kept as candidates: {all:?}"
+        );
+        assert_eq!(find_mod_file(&dir, "sodium"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_utf8_log_bytes_do_not_discard_the_evidence() {
+        let dir =
+            std::env::temp_dir().join(format!("voidlauncher_diag_nonutf8_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.log");
+        let mut bytes = vec![0xFF, 0xFE, b'\n'];
+        bytes.extend_from_slice(b"java.lang.OutOfMemoryError: Java heap space\n");
+        std::fs::write(&path, bytes).unwrap();
+        let text = read_tail(&path, 4096).expect("lossy decoding must keep the log");
+        assert!(text.contains("OutOfMemoryError"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hs_err_is_only_used_inside_the_run_window() {
+        let dir =
+            std::env::temp_dir().join(format!("voidlauncher_diag_hserr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hs_err_pid123.log"), b"# Problematic frame:").unwrap();
+        let now = std::time::SystemTime::now();
+        let in_window = (
+            now - std::time::Duration::from_secs(10),
+            now + std::time::Duration::from_secs(10),
+        );
+        assert!(newest_hs_err(&dir, Some(in_window)).is_some());
+        let old_window = (
+            std::time::UNIX_EPOCH,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+        );
+        assert!(newest_hs_err(&dir, Some(old_window)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_exit_does_not_hide_a_crash_marker() {
+        assert!(is_clean_run(Some(0), false, false, Some("normal shutdown")));
+        assert!(!is_clean_run(
+            Some(0),
+            false,
+            false,
+            Some("[Render thread/ERROR]: Unhandled game exception")
+        ));
+        assert!(!is_clean_run(Some(0), true, false, Some("normal shutdown")));
+        assert!(!is_clean_run(Some(0), false, true, Some("normal shutdown")));
+        assert!(!is_clean_run(
+            Some(1),
+            false,
+            false,
+            Some("normal shutdown")
+        ));
     }
 
     #[test]
@@ -1207,19 +1580,25 @@ mod tests {
             detail.contains("Replace mod 'Fabric Loader'"),
             "detail: {detail}"
         );
-        assert_eq!(culprit.as_deref(), Some("Fabric Language Kotlin"));
+        assert_eq!(
+            culprit.as_deref(),
+            Some("fabric-language-kotlin"),
+            "the stable mod id is the useful value for resolving the jar"
+        );
     }
 
     #[test]
-    fn fabric_incompatible_mods_without_loader_blame_stays_generic() {
-        // A mod clash that has nothing to do with the loader version keeps
-        // the generic kind — never a wrong "update the loader" verdict.
+    fn fabric_incompatible_mods_without_loader_blame_names_the_missing_dependency() {
+        // A mod clash that has nothing to do with the loader version must not
+        // become "update the loader"; the specific missing dependency is the
+        // more useful verdict.
         let text = "[08:20:58] [main/ERROR]: Incompatible mods found!\n\
                     net.fabricmc.loader.impl.FormattedException: Some of your mods are incompatible with the game or each other!\n\
                     \t - Mod 'Cool Mod' (coolmod) 1.0.0 requires any version of fabric-api, which is missing!";
-        let (kind, verdict, _) = classify_run(text).expect("fabric should classify");
-        assert_eq!(kind, "mod_dependency");
+        let (kind, verdict, _, culprit) = classify_run_crash(text).expect("fabric should classify");
+        assert_eq!(kind, "missing_dependency");
         assert_eq!(verdict, "likely");
+        assert_eq!(culprit.as_deref(), Some("coolmod"));
     }
 
     #[test]

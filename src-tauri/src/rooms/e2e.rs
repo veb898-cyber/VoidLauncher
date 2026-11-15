@@ -2,7 +2,7 @@
 //!
 //! This is a *harness* that exercises the Rooms control plane over **real TCP
 //! sockets bound to `127.0.0.1`**. It validates:
-//!   * room lifecycle: create → advertise port → leave → re-create;
+//!   * room lifecycle: create в†’ advertise port в†’ leave в†’ re-create;
 //!   * the VoidLink HTTP bridge (hand-rolled server + reqwest client), port
 //!     propagation and room-code authorization;
 //!   * state persistence across a simulated app restart (new manager).
@@ -17,7 +17,7 @@
 //!
 //! The bridge binds an **ephemeral** loopback port (not the production
 //! `VOID_LINK_PORT`) so the harness is safe to run alongside the rest of the
-//! suite — the `java` self-spawn test re-runs this binary as a child, and a
+//! suite вЂ” the `java` self-spawn test re-runs this binary as a child, and a
 //! fixed port would collide with the parent's bridge.
 //!
 //! Run: `cargo test rooms::e2e -- --nocapture`
@@ -27,13 +27,26 @@ use super::peer_discovery::{peers_from_status, resolve_host_for_room};
 use super::room_state::{valid_room_id, RoomRole, RoomStateManager};
 use super::tailscale::{PeerNode, TailscaleStatus};
 use super::void_link::{
-    bind_addr, ensure_void_link_server, query_host_status, stop_void_link_server, void_link_server,
-    VOID_LINK_PORT,
+    bind_addr, ensure_void_link_server, query_host_status_for_test, stop_void_link_server,
+    void_link_server, VOID_LINK_PORT,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const HOST_IP: &str = "127.0.0.1";
+
+/// The production bridge is a process-global singleton. Tests that exercise
+/// that singleton must not interleave with each other (one test's stop/replace
+/// would otherwise abort another test's listener); the rest of the suite still
+/// runs in parallel.
+fn void_link_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn port_accepts_connections(ip: &str, port: u16) -> bool {
+    tokio::net::TcpStream::connect((ip, port)).await.is_ok()
+}
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -55,6 +68,24 @@ async fn pick_free_port() -> u16 {
     let port = l.local_addr().expect("local addr").port();
     drop(l);
     port
+}
+
+/// Bind the global VoidLink bridge on a free port, retrying when another
+/// parallel test grabs the ephemeral port between `pick_free_port` and the
+/// actual bind. Without the retry the full suite occasionally failed in this
+/// E2E test only because of scheduling.
+async fn bind_bridge_on_free_port(ip: &str, state: &Arc<RoomStateManager>) -> u16 {
+    for _ in 0..20 {
+        let port = pick_free_port().await;
+        state.set_void_link_port(port).expect("set bridge port");
+        if ensure_void_link_server(ip.to_string(), state.clone())
+            .await
+            .is_ok()
+        {
+            return port;
+        }
+    }
+    panic!("VoidLink bridge could not bind after 20 attempts");
 }
 
 /// Send a raw HTTP/1.1 request over loopback and return (status_code, body).
@@ -139,7 +170,7 @@ async fn room_control_plane_lifecycle_over_loopback() {
     println!("[e2e] bridge listening on {}:{}", HOST_IP, port);
 
     // ---------- 3. GUEST: no port advertised yet ----------
-    let pre = query_host_status(HOST_IP, port, &code)
+    let pre = query_host_status_for_test(HOST_IP, port, &code)
         .await
         .expect("query before port");
     assert_eq!(pre.room_id, code, "bridge echoes room id");
@@ -148,7 +179,7 @@ async fn room_control_plane_lifecycle_over_loopback() {
 
     // ---------- 4. HOST: advertise the LAN port ----------
     host.set_minecraft_port(Some(45678)).expect("set port");
-    let post = query_host_status(HOST_IP, port, &code)
+    let post = query_host_status_for_test(HOST_IP, port, &code)
         .await
         .expect("query after port");
     assert_eq!(post.mc_port, Some(45678), "guest sees advertised port");
@@ -156,7 +187,9 @@ async fn room_control_plane_lifecycle_over_loopback() {
 
     // ---------- 5. Auth: wrong / missing code rejected ----------
     assert!(
-        query_host_status(HOST_IP, port, "ZZZZ-9999").await.is_err(),
+        query_host_status_for_test(HOST_IP, port, "ZZZZ-9999")
+            .await
+            .is_err(),
         "wrong room code must be rejected"
     );
     let (code403, _) = raw_http(
@@ -189,7 +222,9 @@ async fn room_control_plane_lifecycle_over_loopback() {
     host.leave().expect("leave");
     assert_eq!(host.role(), RoomRole::None, "role after leave");
     assert!(
-        query_host_status(HOST_IP, port, &code).await.is_err(),
+        query_host_status_for_test(HOST_IP, port, &code)
+            .await
+            .is_err(),
         "bridge must deny after the host left"
     );
     println!("[e2e] leave -> role=None, bridge denies");
@@ -199,7 +234,7 @@ async fn room_control_plane_lifecycle_over_loopback() {
     let code2 = again.room_id.clone().expect("new room id");
     assert!(valid_room_id(&code2), "re-created code shape: {}", code2);
     host.set_minecraft_port(Some(45679)).expect("set port 2");
-    let reread = query_host_status(HOST_IP, port, &code2)
+    let reread = query_host_status_for_test(HOST_IP, port, &code2)
         .await
         .expect("query re-created room");
     assert_eq!(
@@ -275,6 +310,7 @@ async fn room_control_plane_lifecycle_over_loopback() {
 /// never binds the fixed production port.
 #[tokio::test]
 async fn void_link_flag_recovers_after_start_error() {
+    let _serial = void_link_test_lock().lock().await;
     let dir = temp_dir("flag");
     let state = Arc::new(RoomStateManager::new(&dir));
 
@@ -296,54 +332,150 @@ async fn void_link_flag_recovers_after_start_error() {
 /// listener never outlives the room.
 #[tokio::test]
 async fn void_link_bridge_tracks_room_and_rebinds() {
+    let _serial = void_link_test_lock().lock().await;
     let dir = temp_dir("bridge");
     let state = Arc::new(RoomStateManager::new(&dir));
     let row = state.create_room(None).expect("create room");
     let code = row.room_id.expect("room id");
 
-    let port_a = pick_free_port().await;
-    state.set_void_link_port(port_a).unwrap();
-    ensure_void_link_server(HOST_IP.into(), state.clone())
-        .await
-        .expect("first bind");
-    let q = query_host_status(HOST_IP, port_a, &code)
+    let port_a = bind_bridge_on_free_port(HOST_IP, &state).await;
+    let q = query_host_status_for_test(HOST_IP, port_a, &code)
         .await
         .expect("bridge serves");
     assert_eq!(q.room_id, code, "first bind answers");
 
-    // Same IP again → idempotent reuse, the live handler keeps answering.
+    // Same IP again в†’ idempotent reuse, the live handler keeps answering.
     ensure_void_link_server(HOST_IP.into(), state.clone())
         .await
         .expect("idempotent same ip");
-    let q2 = query_host_status(HOST_IP, port_a, &code)
+    let q2 = query_host_status_for_test(HOST_IP, port_a, &code)
         .await
         .expect("still serves");
     assert_eq!(q2.room_id, code, "idempotent call must not kill the bridge");
 
-    // IP change → the old listener is aborted and a fresh one answers on the
+    // IP change в†’ the old listener is aborted and a fresh one answers on the
     // NEW address (rebind with the current tailnet IP).
-    let port_b = pick_free_port().await;
-    state.set_void_link_port(port_b).unwrap();
-    ensure_void_link_server("127.0.0.2".into(), state.clone())
-        .await
-        .expect("rebind new ip");
+    let port_b = bind_bridge_on_free_port("127.0.0.2", &state).await;
     assert!(
-        query_host_status(HOST_IP, port_a, &code).await.is_err(),
+        query_host_status_for_test(HOST_IP, port_a, &code)
+            .await
+            .is_err(),
         "old listener must be aborted on IP change"
     );
-    let q3 = query_host_status("127.0.0.2", port_b, &code)
+    let q3 = query_host_status_for_test("127.0.0.2", port_b, &code)
         .await
         .expect("new bridge serves");
     assert_eq!(q3.room_id, code, "rebound bridge answers");
 
-    // Leave → the bridge never outlives the room session.
+    // Leave в†’ the bridge never outlives the room session.
     state.leave().expect("leave");
-    stop_void_link_server();
+    stop_void_link_server().await;
     assert!(
-        query_host_status("127.0.0.2", port_b, &code).await.is_err(),
+        query_host_status_for_test("127.0.0.2", port_b, &code)
+            .await
+            .is_err(),
         "bridge must be stopped on leave"
     );
 
     std::fs::remove_dir_all(&dir).ok();
     println!("[e2e] bridge idempotent / rebind / torn down on leave");
+}
+
+/// Regression for the parallel-suite failure: the invalid-IP start must fail
+/// before it touches the global bridge. The old order aborted the live listener
+/// first, so another test (or a real status poll with a bad Tailscale IP) could
+/// stop a healthy room bridge.
+#[tokio::test]
+async fn invalid_ip_does_not_stop_a_live_bridge() {
+    let _serial = void_link_test_lock().lock().await;
+    let dir = temp_dir("invalid-preserve");
+    let state = Arc::new(RoomStateManager::new(&dir));
+    let row = state.create_room(None).expect("create room");
+    let code = row.room_id.expect("room id");
+    let port = bind_bridge_on_free_port(HOST_IP, &state).await;
+
+    let before = query_host_status_for_test(HOST_IP, port, &code)
+        .await
+        .expect("bridge serves before invalid start");
+    assert_eq!(before.room_id, code);
+
+    let err = ensure_void_link_server("not-an-ip".into(), state.clone()).await;
+    assert!(err.is_err(), "invalid tailnet IP must fail");
+
+    let after = query_host_status_for_test(HOST_IP, port, &code)
+        .await
+        .expect("invalid IP must not abort a healthy bridge");
+    assert_eq!(after.room_id, code);
+
+    stop_void_link_server().await;
+    assert!(!port_accepts_connections(HOST_IP, port).await);
+    std::fs::remove_dir_all(&dir).ok();
+    println!("[e2e] invalid start preserves the live bridge");
+}
+
+/// Regression for the leave/status-poll race: `ensure` must not recreate a
+/// listener after the room role has been cleared.
+#[tokio::test]
+async fn ensure_does_not_recreate_a_bridge_after_leave() {
+    let _serial = void_link_test_lock().lock().await;
+    let dir = temp_dir("left-room");
+    let state = Arc::new(RoomStateManager::new(&dir));
+    state.create_room(None).expect("create room");
+    let port = pick_free_port().await;
+    state.set_void_link_port(port).expect("set port");
+    state.leave().expect("leave");
+
+    ensure_void_link_server(HOST_IP.into(), state.clone())
+        .await
+        .expect("a non-host start is a no-op");
+    assert!(
+        !port_accepts_connections(HOST_IP, port).await,
+        "a status poll must not recreate the bridge after leave"
+    );
+
+    stop_void_link_server().await;
+    std::fs::remove_dir_all(&dir).ok();
+    println!("[e2e] ensure is a no-op after leave");
+}
+
+/// Concurrent starts on different loopback IPs previously could both bind and
+/// overwrite the global slot, orphaning the first listener. Stop must also wait
+/// for an in-flight start instead of returning while the task is not installed.
+#[tokio::test]
+async fn concurrent_bridge_starts_leave_no_orphan_listener() {
+    let _serial = void_link_test_lock().lock().await;
+    let dir = temp_dir("concurrent-starts");
+    let state = Arc::new(RoomStateManager::new(&dir));
+    state.create_room(None).expect("create room");
+    let port = pick_free_port().await;
+    state.set_void_link_port(port).expect("set port");
+
+    let mut starts = Vec::new();
+    for index in 0..16 {
+        let ip = if index % 2 == 0 {
+            "127.0.0.1"
+        } else {
+            "127.0.0.2"
+        };
+        let state = state.clone();
+        starts.push(tokio::spawn(async move {
+            ensure_void_link_server(ip.to_string(), state).await
+        }));
+    }
+    for start in starts {
+        assert!(start.await.expect("start task").is_ok());
+    }
+
+    stop_void_link_server().await;
+    assert!(
+        !port_accepts_connections("127.0.0.1", port).await,
+        "no orphan listener may survive on the first address"
+    );
+    assert!(
+        !port_accepts_connections("127.0.0.2", port).await,
+        "no orphan listener may survive on the second address"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    println!("[e2e] concurrent starts leave no orphan bridge");
 }

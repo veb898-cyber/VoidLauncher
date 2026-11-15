@@ -37,6 +37,12 @@ pub enum LauncherError {
 
     #[error("Mod loader error: {0}")]
     ModLoader(String),
+
+    /// The file changed after it was read and before the replacement write.
+    /// Callers must re-read and let the user decide; they must not overwrite
+    /// the newer contents.
+    #[error("File changed concurrently: {0}")]
+    Conflict(String),
 }
 
 impl serde::Serialize for LauncherError {

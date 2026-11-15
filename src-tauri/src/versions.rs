@@ -837,6 +837,33 @@ pub(crate) fn collect_downloads_for(
     versions_dir: &Path,
     target: TargetArch,
 ) -> Result<Vec<(String, PathBuf, String, u64)>> {
+    collect_downloads_for_impl(version_info, libraries_dir, versions_dir, target, false)
+}
+
+/// Full install plan: unlike [`collect_downloads_for`], existing library files
+/// are kept in the list. The downloader validates the cache and counts valid
+/// cached files as completed work; invalid cached files are re-downloaded.
+pub fn collect_download_plan(
+    version_info: &VersionInfo,
+    libraries_dir: &Path,
+    versions_dir: &Path,
+) -> Result<Vec<(String, PathBuf, String, u64)>> {
+    collect_downloads_for_impl(
+        version_info,
+        libraries_dir,
+        versions_dir,
+        TargetArch::current(),
+        true,
+    )
+}
+
+fn collect_downloads_for_impl(
+    version_info: &VersionInfo,
+    libraries_dir: &Path,
+    versions_dir: &Path,
+    target: TargetArch,
+    include_cached: bool,
+) -> Result<Vec<(String, PathBuf, String, u64)>> {
     // Returns: (url, local_path, sha1, size)
     let mut files = Vec::new();
 
@@ -873,7 +900,7 @@ pub(crate) fn collect_downloads_for(
             // Main artifact
             if let Some(artifact) = &downloads.artifact {
                 let lib_path = checked_remote_join(libraries_dir, &artifact.path)?;
-                if !lib_path.exists() {
+                if include_cached || !lib_path.exists() {
                     files.push((
                         artifact.url.clone(),
                         lib_path,
@@ -895,7 +922,7 @@ pub(crate) fn collect_downloads_for(
                             native_artifact.get("size").and_then(|s| s.as_u64()),
                         ) {
                             let native_path = checked_remote_join(libraries_dir, path)?;
-                            if !native_path.exists() {
+                            if include_cached || !native_path.exists() {
                                 files.push((url.to_string(), native_path, sha1.to_string(), size));
                             }
                         }
@@ -905,9 +932,17 @@ pub(crate) fn collect_downloads_for(
         } else if let Some(url_base) = &lib.url {
             let path = maven_to_path(&lib.name);
             let lib_path = checked_remote_join(libraries_dir, &path)?;
-            if !lib_path.exists() {
+            let url = format!("{}{}", url_base, path);
+            // Maven fallback artifacts have no publisher checksum or size, so
+            // existence alone is not proof of a usable cache. Keep a file only
+            // when its local integrity manifest proves it is still the bytes we
+            // downloaded; otherwise it is planned for download/replacement.
+            if include_cached
+                || !lib_path.exists()
+                || !crate::download::verify_integrity_manifest(&lib_path, &url)
+            {
                 files.push((
-                    format!("{}{}", url_base, path),
+                    url,
                     lib_path,
                     String::new(), // no sha1 available
                     0,
@@ -2102,6 +2137,53 @@ mod tests {
         )
         .expect_err("traversal in maven name must fail");
         assert!(err.to_string().contains("Unsafe path"), "got: {}", err);
+    }
+
+    #[test]
+    fn collect_download_plan_includes_valid_cached_libraries() {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_download_plan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let libraries = dir.join("libraries");
+        let versions = dir.join("versions");
+        let library_rel = "com/example/good/1.0/good-1.0.jar";
+        let library_path = libraries.join(library_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        std::fs::create_dir_all(library_path.parent().unwrap()).unwrap();
+        std::fs::write(&library_path, b"cached").unwrap();
+
+        let vi = version_info_with_libraries(serde_json::json!([{
+            "name": "com.example:good:1.0",
+            "downloads": {
+                "artifact": {
+                    "path": library_rel,
+                    "sha1": "",
+                    "size": 6,
+                    "url": "https://libraries.minecraft.net/good.jar"
+                }
+            }
+        }]));
+
+        let missing = collect_downloads(&vi, &libraries, &versions).unwrap();
+        assert_eq!(
+            missing.len(),
+            1,
+            "only the missing client jar is downloaded"
+        );
+        assert!(missing[0].1.ends_with("client.jar"));
+
+        let plan = collect_download_plan(&vi, &libraries, &versions).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert!(
+            plan.iter().any(|(_, path, _, _)| path == &library_path),
+            "cached libraries stay in the full plan"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

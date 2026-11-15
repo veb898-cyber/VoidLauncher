@@ -213,9 +213,11 @@ impl RoomStateManager {
 
     pub fn set_host(&self, host: Option<HostInfo>) -> crate::error::Result<()> {
         let mut row = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if row.host.as_ref().map(|h| h.node_key.as_str())
-            == host.as_ref().map(|h| h.node_key.as_str())
-        {
+        // Compare the whole endpoint, not just node_key. A node can stay the
+        // same while its `online`, MagicDNS name or tailnet IP changes after a
+        // reconnect; returning early on node_key alone left guests stuck on
+        // the old endpoint/offline state forever.
+        if row.host == host {
             return Ok(());
         }
         row.host = host;
@@ -432,6 +434,51 @@ mod tests {
         assert_eq!(mgr.room_id().as_deref(), Some("ABCD-1234"));
         assert_eq!(mgr.role(), RoomRole::Guest);
         assert!(mgr.join_room("nope").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_node_key_still_updates_online_dns_and_ip() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_rooms_host_update_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mgr = RoomStateManager::new(&dir);
+        mgr.join_room("ABCD-1234").unwrap();
+
+        let host = |online: bool, dns: &str, ip: &str| HostInfo {
+            node_key: "node-key-1".into(),
+            host_name: "gaming-pc".into(),
+            dns_name: dns.into(),
+            tailnet_ips: vec![ip.into()],
+            online,
+        };
+
+        mgr.set_host(Some(host(true, "old.tail.ts.net", "100.64.0.1")))
+            .unwrap();
+        // Same node_key, but the host went offline: guests must see it.
+        mgr.set_host(Some(host(false, "old.tail.ts.net", "100.64.0.1")))
+            .unwrap();
+        assert!(!mgr.snapshot().host.unwrap().online);
+
+        // Reconnect with a new MagicDNS name and IP.
+        mgr.set_host(Some(host(true, "new.tail.ts.net", "100.64.0.9")))
+            .unwrap();
+        let current = mgr.snapshot().host.expect("host");
+        assert!(current.online);
+        assert_eq!(current.dns(), Some("new.tail.ts.net"));
+        assert_eq!(current.ip(), Some("100.64.0.9"));
+
+        // The update is persisted, not only in memory.
+        let reloaded = RoomStateManager::new(&dir);
+        let persisted = reloaded.snapshot().host.expect("persisted host");
+        assert_eq!(persisted.dns(), Some("new.tail.ts.net"));
+        assert_eq!(persisted.ip(), Some("100.64.0.9"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

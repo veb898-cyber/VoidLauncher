@@ -3,11 +3,266 @@ use crate::modloaders::LoaderProfile;
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Validate one on-disk path component. Free-form world names may start with
+/// a dot, so instance-specific restrictions live in
+/// [`validate_instance_dir_name`].
+pub(crate) fn validate_path_component(name: &str, what: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(LauncherError::Instance(format!("{} is required.", what)));
+    }
+    if name != name.trim() {
+        return Err(LauncherError::Instance(format!(
+            "{} may not start or end with spaces.",
+            what
+        )));
+    }
+    if name.ends_with('.') {
+        return Err(LauncherError::Instance(format!(
+            "{} may not end with a dot.",
+            what
+        )));
+    }
+    if name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.contains(':')
+    {
+        return Err(LauncherError::Instance(format!(
+            "{} contains invalid path characters.",
+            what
+        )));
+    }
+    if name == "." || name == ".." {
+        return Err(LauncherError::Instance(format!(
+            "Invalid {}: '{}'.",
+            what, name
+        )));
+    }
+    // Windows reserves the device name itself and any extension of it
+    // (`CON`, `CON.txt`, ...), so inspect the stem.
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem.as_str()) {
+        return Err(LauncherError::Instance(format!(
+            "'{}' is a reserved name.",
+            name
+        )));
+    }
+    for ch in name.chars() {
+        if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+            return Err(LauncherError::Instance(format!(
+                "{} contains an invalid character: {:?}",
+                what, ch
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a name used as an instance directory. This is the single
+/// backend gate for IPC-provided names and metadata read from disk: it
+/// guarantees the joined path stays one level below `instances_dir`.
+pub(crate) fn validate_instance_dir_name(name: &str, what: &str) -> Result<()> {
+    validate_path_component(name, what)?;
+    if name.starts_with('.') {
+        return Err(LauncherError::Instance(format!(
+            "{} may not start with a dot.",
+            what
+        )));
+    }
+    Ok(())
+}
+
+/// Process-wide name registry for instance directory operations. The
+/// single-instance mutex already excludes another launcher process; this
+/// registry closes the intra-process gap between "target does not exist" and
+/// the actual rename/copy/delete. Import reservations use the same keys, so
+/// create/import/rename/duplicate/restore/delete cannot occupy one target at
+/// the same time.
+static INSTANCE_NAME_REGISTRY: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn normalized_instance_base(instances_dir: &Path) -> PathBuf {
+    let absolute = if instances_dir.is_absolute() {
+        instances_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(instances_dir)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    // Two lexical paths can name the same directory through a junction or a
+    // symlink. Resolve the real path when it exists so create/rename/delete
+    // and import all share one registry key. If it does not exist yet, the
+    // lexical key is the best available and all callers still agree on it.
+    std::fs::canonicalize(&normalized)
+        .map(strip_verbatim_prefix)
+        .unwrap_or(normalized)
+}
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{}", rest))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest.to_string())
+    } else {
+        path
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
+}
+
+fn instance_name_key(instances_dir: &Path, name: &str) -> String {
+    format!(
+        "{}\u{0}{}",
+        normalized_instance_base(instances_dir)
+            .to_string_lossy()
+            .to_lowercase(),
+        name.to_lowercase()
+    )
+}
+
+#[derive(Debug)]
+pub(crate) struct InstanceNameReservation {
+    keys: Vec<String>,
+}
+
+impl InstanceNameReservation {
+    /// Atomically reserve one or more names. Fails instead of waiting: the
+    /// caller returns a clear "operation in progress" error to the user.
+    pub(crate) fn acquire(instances_dir: &Path, names: &[&str]) -> Result<Self> {
+        for name in names {
+            validate_instance_dir_name(name, "Instance name")?;
+        }
+        let mut keys: Vec<String> = names
+            .iter()
+            .map(|name| instance_name_key(instances_dir, name))
+            .collect();
+        keys.sort();
+        keys.dedup();
+
+        let registry = INSTANCE_NAME_REGISTRY.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut held = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if keys.iter().any(|key| held.contains(key)) {
+            return Err(LauncherError::Instance(
+                "Another operation is already creating, renaming or deleting this instance. \
+                 Try again in a moment."
+                    .to_string(),
+            ));
+        }
+        for key in &keys {
+            held.insert(key.clone());
+        }
+        Ok(Self { keys })
+    }
+}
+
+impl Drop for InstanceNameReservation {
+    fn drop(&mut self) {
+        let registry = INSTANCE_NAME_REGISTRY.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut held = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in &self.keys {
+            held.remove(key);
+        }
+    }
+}
+
+/// Deserialize `memory_mb` without letting one bad field make the whole
+/// instance unreadable. Older/hand-edited files can contain `null`, `0`,
+/// negative numbers or absurd values; those must not turn a valid instance
+/// into an invisible/broken one. Negative/zero values inherit the global
+/// default; oversized values are capped and then re-capped by the global
+/// `max_memory_mb` at launch/save time.
+fn deserialize_optional_memory_mb<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct MemoryVisitor;
+
+    impl<'de> Visitor<'de> for MemoryVisitor {
+        type Value = Option<u32>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("an optional non-negative integer memory value")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(MemoryVisitor)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+            Ok(if value <= 0 {
+                None
+            } else {
+                Some(value.min(crate::config::MAX_MEMORY_MB as i64) as u32)
+            })
+        }
+
+        fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+            Ok(if value == 0 {
+                None
+            } else {
+                Some(value.min(crate::config::MAX_MEMORY_MB as u64) as u32)
+            })
+        }
+
+        fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(if !value.is_finite() || value <= 0.0 {
+                None
+            } else {
+                Some(value.min(crate::config::MAX_MEMORY_MB as f64) as u32)
+            })
+        }
+    }
+
+    deserializer.deserialize_option(MemoryVisitor)
+}
 
 /// Instance configuration
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -23,6 +278,7 @@ pub struct Instance {
     /// Cached loader profile (main class override, libraries, args)
     pub loader_profile: Option<LoaderProfile>,
     /// Custom JVM memory in MB (None = use global default)
+    #[serde(default, deserialize_with = "deserialize_optional_memory_mb")]
     pub memory_mb: Option<u32>,
     /// Custom JVM arguments (None = use global default)
     pub jvm_args: Option<Vec<String>>,
@@ -63,15 +319,12 @@ pub struct Resolution {
 }
 
 impl Instance {
-    /// Create a new vanilla instance with sensible memory/GC defaults.
-    /// `default_memory_mb` should be the tiered recommendation (4/6/8 GB) from
-    /// `config::recommended_memory_mb`.
-    /// `default_gc_preset` should be "standard" | "g1gc" | "zgc".
+    /// Create a new instance that inherits the launcher's global memory/GC
+    /// defaults. Explicit per-instance overrides are written only when the
+    /// user changes them in the editor.
     pub fn new(
         name: &str,
         mc_version: &str,
-        default_memory_mb: u32,
-        default_gc_preset: &str,
         loader: LoaderType,
         loader_version: Option<String>,
     ) -> Self {
@@ -81,12 +334,12 @@ impl Instance {
             loader,
             loader_version,
             loader_profile: None,
-            // Pre-fill with the recommended default so the slider sits at the
-            // optimal position the moment the instance is created, even if the
-            // user never opens the editor. The user can still override.
-            memory_mb: Some(default_memory_mb),
+            // None = inherit the current global default at launch time. Do
+            // not copy the value here: a copied value would freeze the old
+            // default and make later global changes invisible.
+            memory_mb: None,
             jvm_args: None,
-            gc_preset: Some(default_gc_preset.to_string()),
+            gc_preset: None,
             java_path: None,
             resolution: None,
             icon: None,
@@ -96,6 +349,45 @@ impl Instance {
             play_time_seconds: 0,
             notes: String::new(),
         }
+    }
+
+    /// Effective memory at launch: the explicit per-instance override wins,
+    /// otherwise the current global default is inherited. The result is always
+    /// within [MIN_MEMORY_MB, global max], so a hand-edited/old instance can
+    /// never hand `-Xmx0M` or a multi-terabyte value to the JVM.
+    pub fn effective_memory_mb(&self, default_memory_mb: u32, max_memory_mb: u32) -> u32 {
+        let ceiling =
+            max_memory_mb.clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+        let chosen = self.memory_mb.unwrap_or(default_memory_mb);
+        let effective = chosen.clamp(crate::config::MIN_MEMORY_MB, ceiling);
+        if effective != chosen {
+            tracing::warn!(
+                target: "launcher",
+                "Instance '{}' memory {} MB is outside the allowed range; using {} MB (global limit {} MB)",
+                self.name,
+                chosen,
+                effective,
+                ceiling
+            );
+        }
+        effective
+    }
+
+    /// Clamp an explicitly stored per-instance value for persistence.
+    /// `None` stays `None` (inherit the global default).
+    pub fn normalized_memory_mb(&self, max_memory_mb: u32) -> Option<u32> {
+        self.memory_mb.map(|value| {
+            value.clamp(
+                crate::config::MIN_MEMORY_MB,
+                max_memory_mb.clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB),
+            )
+        })
+    }
+
+    /// Effective GC preset at launch: explicit override, otherwise the
+    /// current global default. Memory and GC inherit independently.
+    pub fn effective_gc_preset<'a>(&'a self, default_gc_preset: &'a str) -> &'a str {
+        self.gc_preset.as_deref().unwrap_or(default_gc_preset)
     }
 
     /// Get the instance directory path
@@ -138,6 +430,12 @@ pub fn list_instances(instances_dir: &Path) -> Result<Vec<Instance>> {
         if !dir_path.is_dir() {
             continue;
         }
+        // Restore staging/park directories are dot-prefixed. They may contain
+        // a valid instance.json after an interrupted restore, but they are
+        // never real instances and must not appear in the picker.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let json_path = dir_path.join("instance.json");
         let cfg_path = dir_path.join("instance.cfg");
 
@@ -177,15 +475,51 @@ pub fn list_instances(instances_dir: &Path) -> Result<Vec<Instance>> {
     Ok(instances)
 }
 
-/// Create a new instance
-pub fn create_instance(instances_dir: &Path, instance: &Instance) -> Result<()> {
-    let dir = instance.dir(instances_dir);
-    if dir.exists() {
-        return Err(LauncherError::Instance(format!(
-            "Instance '{}' already exists",
-            instance.name
-        )));
-    }
+/// One instance plus its transient readiness state for the UI.
+///
+/// `setup_state` is computed from the on-disk marker on every listing, never
+/// persisted into `instance.json`, so a completed setup cannot leave a stale
+/// "incomplete" flag behind.
+#[derive(Debug, serde::Serialize)]
+pub struct InstanceSummary {
+    #[serde(flatten)]
+    pub instance: Instance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_state: Option<crate::instance_readiness::InstanceSetupState>,
+}
+
+/// List instances annotated with their setup/readiness state.
+pub fn list_instance_summaries(instances_dir: &Path) -> Result<Vec<InstanceSummary>> {
+    let instances = list_instances(instances_dir)?;
+    Ok(instances
+        .into_iter()
+        .map(|instance| {
+            let setup_state = crate::instance_readiness::setup_state(&instance.dir(instances_dir));
+            InstanceSummary {
+                instance,
+                setup_state,
+            }
+        })
+        .collect())
+}
+
+/// Create a new instance.
+///
+/// The whole creation runs under an [`crate::import::InstanceReservation`]:
+/// the instance is not launchable until its directories and metadata are
+/// written and the readiness marker is retired.
+pub fn create_instance(
+    instances_dir: &Path,
+    instance: &Instance,
+    launches: &crate::launch_state::LaunchRegistry,
+) -> Result<()> {
+    validate_instance_dir_name(&instance.name, "Instance name")?;
+    let mut reservation = crate::import::InstanceReservation::reserve(
+        instances_dir,
+        &instance.name,
+        launches,
+        "create",
+    )?;
 
     // Create directory structure
     std::fs::create_dir_all(instance.minecraft_dir(instances_dir))?;
@@ -194,33 +528,58 @@ pub fn create_instance(instances_dir: &Path, instance: &Instance) -> Result<()> 
     std::fs::create_dir_all(instance.minecraft_dir(instances_dir).join("shaderpacks"))?;
     std::fs::create_dir_all(instance.minecraft_dir(instances_dir).join("config"))?;
 
-    // Save instance config
-    save_instance(instances_dir, instance, None)?;
+    // The reservation already holds the name, so write without acquiring it
+    // again.
+    save_instance_reserved(instances_dir, instance, None)?;
 
-    Ok(())
+    // Metadata exists; nothing else is needed for a fresh vanilla instance.
+    reservation.commit()
 }
 
 /// Save instance config to disk, plus Prism-compatible instance.cfg and pack.png.
 /// If `old_name` differs from `instance.name`, the instance directory is renamed first.
+///
+/// This is the public entry point: it validates both names and reserves the
+/// source and target before touching the filesystem.
 pub fn save_instance(
     instances_dir: &Path,
     instance: &Instance,
     old_name: Option<&str>,
 ) -> Result<()> {
+    validate_instance_dir_name(&instance.name, "Instance name")?;
+    let mut names = vec![instance.name.as_str()];
+    if let Some(prev) = old_name {
+        validate_instance_dir_name(prev, "Instance name")?;
+        names.push(prev);
+    }
+    let _reservation = InstanceNameReservation::acquire(instances_dir, &names)?;
+    save_instance_reserved(instances_dir, instance, old_name)
+}
+
+/// Write instance metadata and move the directory if needed. The caller must
+/// already hold [`InstanceNameReservation`] for the old and new names.
+pub(crate) fn save_instance_reserved(
+    instances_dir: &Path,
+    instance: &Instance,
+    old_name: Option<&str>,
+) -> Result<()> {
+    validate_instance_dir_name(&instance.name, "Instance name")?;
+    if let Some(prev) = old_name {
+        validate_instance_dir_name(prev, "Instance name")?;
+    }
+
     // Rename directory if name changed
     if let Some(prev) = old_name {
         if prev != instance.name {
             let old_dir = instances_dir.join(prev);
             let new_dir = instances_dir.join(&instance.name);
-            if old_dir.exists() && !new_dir.exists() {
-                // Try rename first; on Windows this may fail with Access Denied
-                // if any file handle is still open. Fall back to copy + delete.
-                if let Err(rename_err) = std::fs::rename(&old_dir, &new_dir) {
-                    tracing::warn!(target: "launcher", "fs::rename failed ({}), falling back to copy+delete", rename_err);
-                    copy_dir_recursive(&old_dir, &new_dir)?;
-                    std::fs::remove_dir_all(&old_dir)?;
-                }
+            if !old_dir.exists() {
+                return Err(LauncherError::Instance(format!(
+                    "Instance '{}' no longer exists",
+                    prev
+                )));
             }
+            move_directory_safely(&old_dir, &new_dir, &instance.name)?;
         }
     }
 
@@ -231,7 +590,20 @@ pub fn save_instance(
     if !config_dir.exists() {
         std::fs::create_dir_all(config_dir)?;
     }
-    let json = serde_json::to_string_pretty(instance)?;
+    let json = {
+        // Persist only values the JVM can safely receive. The global limit is
+        // applied again in cmd_save_instance/effective_memory_mb; this absolute
+        // clamp also covers imports and legacy callers.
+        let mut stored = instance.clone();
+        stored.memory_mb = stored
+            .memory_mb
+            .map(|value| value.clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB));
+        stored.gc_preset = stored.gc_preset.and_then(|value| {
+            let normalized = value.trim().to_lowercase();
+            matches!(normalized.as_str(), "standard" | "g1gc" | "zgc").then_some(normalized)
+        });
+        serde_json::to_string_pretty(&stored)?
+    };
     write_file_atomic(&config_path, json.as_bytes())?;
 
     // Write Prism-compatible instance.cfg
@@ -248,15 +620,55 @@ pub fn save_instance(
     Ok(())
 }
 
+/// Save metadata for an instance that must already exist. This is the variant
+/// for long-running operations (loader install, post-import preparation): if
+/// the directory disappeared while the operation was working, it must fail
+/// instead of recreating a ghost instance with only a config file.
+pub(crate) fn save_instance_existing_reserved(
+    instances_dir: &Path,
+    instance: &Instance,
+    old_name: Option<&str>,
+) -> Result<()> {
+    validate_instance_dir_name(&instance.name, "Instance name")?;
+    if let Some(prev) = old_name {
+        validate_instance_dir_name(prev, "Instance name")?;
+    }
+    let will_move = old_name.is_some_and(|prev| prev != instance.name);
+    if !will_move && !instances_dir.join(&instance.name).exists() {
+        return Err(LauncherError::Instance(format!(
+            "Instance '{}' no longer exists",
+            instance.name
+        )));
+    }
+    save_instance_reserved(instances_dir, instance, old_name)
+}
+
+/// Public entry point for editing an existing instance without recreating it.
+pub fn save_instance_existing(
+    instances_dir: &Path,
+    instance: &Instance,
+    old_name: Option<&str>,
+) -> Result<()> {
+    validate_instance_dir_name(&instance.name, "Instance name")?;
+    let mut names = vec![instance.name.as_str()];
+    if let Some(prev) = old_name {
+        validate_instance_dir_name(prev, "Instance name")?;
+        names.push(prev);
+    }
+    let _reservation = InstanceNameReservation::acquire(instances_dir, &names)?;
+    save_instance_existing_reserved(instances_dir, instance, old_name)
+}
+
 /// Write a file atomically: the contents go to a sibling temp file first,
 /// which is then renamed over the target. A crash or power loss mid-save
 /// can never leave a truncated/half-written config behind — the old file
 /// stays intact until the final rename.
 ///
-/// If the direct rename is blocked (Windows sharing violation), the old
-/// file is parked as `.bak` instead of being deleted: the new file is
-/// swapped in, and the backup is removed only after that succeeds. If the
-/// swap fails too, the backup is restored — the config is never lost.
+/// If the direct rename is blocked (Windows sharing violation), a `.bak`
+/// copy is made while the original stays in place; the new file is swapped
+/// in and the backup is removed only after that succeeds. A concurrent
+/// reader therefore never observes a missing file, and a failed swap leaves
+/// the original untouched.
 pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -282,8 +694,12 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
                 let _ = std::fs::remove_file(&tmp_path);
                 return Err(first_err.into());
             }
+            // Keep the original in place while the replacement is prepared:
+            // a concurrent reader must never observe the file missing. A copy
+            // (not a rename) also leaves the live file usable if the second
+            // rename still fails.
             let _ = std::fs::remove_file(&bak_path);
-            if let Err(e) = std::fs::rename(path, &bak_path) {
+            if let Err(e) = std::fs::copy(path, &bak_path) {
                 let _ = std::fs::remove_file(&tmp_path);
                 return Err(e.into());
             }
@@ -293,16 +709,9 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
                     Ok(())
                 }
                 Err(e) => {
-                    // Put the original back; keep .bak if even that fails so
-                    // the data is still recoverable manually.
-                    if let Err(restore_err) = std::fs::rename(&bak_path, path) {
-                        tracing::error!(
-                            target: "launcher",
-                            "Failed to restore config backup {:?}: {} (backup kept)",
-                            bak_path, restore_err
-                        );
-                    }
+                    // The original was never moved, so it is still intact.
                     let _ = std::fs::remove_file(&tmp_path);
+                    let _ = std::fs::remove_file(&bak_path);
                     Err(e.into())
                 }
             }
@@ -312,6 +721,8 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
 
 /// Delete an instance
 pub fn delete_instance(instances_dir: &Path, name: &str) -> Result<()> {
+    validate_instance_dir_name(name, "Instance name")?;
+    let _reservation = InstanceNameReservation::acquire(instances_dir, &[name])?;
     let dir = instances_dir.join(name);
     if !dir.exists() {
         return Err(LauncherError::Instance(format!(
@@ -325,6 +736,7 @@ pub fn delete_instance(instances_dir: &Path, name: &str) -> Result<()> {
 
 /// Get an instance by name (supports both instance.json and instance.cfg)
 pub fn get_instance(instances_dir: &Path, name: &str) -> Result<Instance> {
+    validate_instance_dir_name(name, "Instance name")?;
     let dir = instances_dir.join(name);
     let json_path = dir.join("instance.json");
     let cfg_path = dir.join("instance.cfg");
@@ -372,41 +784,59 @@ pub fn duplicate_instance(
     name: &str,
     new_name: &str,
     exclude: DuplicateExclusions,
+    launches: &crate::launch_state::LaunchRegistry,
 ) -> Result<Instance> {
+    validate_instance_dir_name(name, "Instance name")?;
+    validate_instance_dir_name(new_name, "Instance name")?;
+    // Keep the source stable while it is copied, and publish the copy through
+    // the same readiness lifecycle as every other creation path: the target
+    // carries a pending marker until the copied metadata is rewritten.
+    let _source_guard = InstanceNameReservation::acquire(instances_dir, &[name])?;
     let src = instances_dir.join(name);
-    let dst = instances_dir.join(new_name);
     if !src.exists() {
         return Err(LauncherError::Instance(format!(
             "Instance '{}' not found",
             name
         )));
     }
-    if dst.exists() {
+    if crate::instance_readiness::read_pending(&src).is_some() {
         return Err(LauncherError::Instance(format!(
-            "Instance '{}' already exists",
-            new_name
+            "Instance '{}' is not fully set up yet. Finish its setup before duplicating it.",
+            name
         )));
     }
-    // A partially copied directory (disk full, a file locked by antivirus)
-    // must not be left behind as a broken "instance" — remove what WE just
-    // created (the existence check above guarantees it is ours).
-    if let Err(e) = copy_dir_filtered(&src, &dst, "", &|rel| duplicate_skip(rel, exclude)) {
-        let _ = std::fs::remove_dir_all(&dst);
-        return Err(e);
-    }
-    // Read and update the instance config
-    let mut instance = get_instance(instances_dir, new_name)?;
+    let mut reservation = crate::import::InstanceReservation::reserve(
+        instances_dir,
+        new_name,
+        launches,
+        "duplicate",
+    )?;
+    let dst = instances_dir.join(new_name);
+    copy_dir_filtered(&src, &dst, "", &|rel| duplicate_skip(rel, exclude))?;
+    // Read and update the instance config.
+    let mut instance = match get_instance(instances_dir, new_name) {
+        Ok(instance) => instance,
+        Err(e) => {
+            return Err(e);
+        }
+    };
     instance.name = new_name.to_string();
     instance.last_played = None;
     instance.play_time_seconds = 0;
     instance.created_at = Utc::now().to_rfc3339();
-    save_instance(instances_dir, &instance, None)?;
+    save_instance_reserved(instances_dir, &instance, None)?;
+    reservation.commit()?;
     Ok(instance)
 }
 
 /// Paths (relative to the instance root, `/`-separated) a duplicate leaves
 /// behind. Directories matched here are not descended into at all.
 fn duplicate_skip(rel: &str, exclude: DuplicateExclusions) -> bool {
+    // Readiness/ownership markers belong to one directory only; a copy must
+    // never inherit them.
+    if rel == crate::instance_readiness::PENDING_MARKER || rel == ".void-import-owner" {
+        return true;
+    }
     // Backup history and parked stashes always stay with the source.
     if rel == ".backups" || rel.starts_with(".backups/") {
         return true;
@@ -430,6 +860,142 @@ fn duplicate_skip(rel: &str, exclude: DuplicateExclusions) -> bool {
 
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     copy_dir_filtered(src, dst, "", &|_| false)
+}
+
+/// Hidden sibling used for an atomic copy/rename. A UUID keeps concurrent
+/// operations from sharing a staging path.
+fn unique_instance_sibling(target: &Path, tag: &str) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| LauncherError::Instance("Instance path has no parent".into()))?;
+    Ok(parent.join(format!(
+        ".voidlauncher-{}-{}.tmp",
+        tag,
+        uuid::Uuid::new_v4().simple()
+    )))
+}
+
+/// Copy an instance tree into a hidden staging directory, then rename it into
+/// place. A pre-existing target is never merged into or overwritten: the
+/// final rename fails and the staging copy is removed, leaving the source
+/// untouched.
+fn copy_tree_to_new_path(src: &Path, dst: &Path, skip: &dyn Fn(&str) -> bool) -> Result<()> {
+    if dst.exists() {
+        return Err(LauncherError::Instance(format!(
+            "An instance named '{}' already exists",
+            dst.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("?")
+        )));
+    }
+    let staging = unique_instance_sibling(dst, "copy")?;
+    if let Err(e) = copy_dir_filtered(src, &staging, "", skip) {
+        let _ = remove_dir_all_force(&staging);
+        return Err(e);
+    }
+    match std::fs::rename(&staging, dst) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = remove_dir_all_force(&staging);
+            Err(LauncherError::Instance(format!(
+                "Could not install the copied instance at '{}': {}. The source instance was not changed.",
+                dst.display(),
+                e
+            )))
+        }
+    }
+}
+
+/// Rename a directory while never merging into an existing target. If the
+/// direct rename is blocked on Windows, copy to a hidden sibling, rename that
+/// into place, and only then remove the original. A failed copy leaves the
+/// original untouched.
+fn move_directory_safely(old_dir: &Path, new_dir: &Path, instance_name: &str) -> Result<()> {
+    move_directory_with(old_dir, new_dir, instance_name, &|from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+fn move_directory_with(
+    old_dir: &Path,
+    new_dir: &Path,
+    instance_name: &str,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    if new_dir.exists() {
+        // A case-only rename resolves to the same Windows directory; anything
+        // else would merge two instances. Never overwrite the other one.
+        let same_dir = old_dir
+            .canonicalize()
+            .ok()
+            .zip(new_dir.canonicalize().ok())
+            .is_some_and(|(old, new)| old == new);
+        if !same_dir {
+            return Err(LauncherError::Instance(format!(
+                "An instance named '{}' already exists",
+                instance_name
+            )));
+        }
+        if old_dir.file_name() == new_dir.file_name() {
+            return Ok(());
+        }
+        return rename_case_only(old_dir, new_dir);
+    }
+
+    match rename(old_dir, new_dir) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            tracing::warn!(
+                target: "launcher",
+                "fs::rename failed ({}), falling back to copy+delete",
+                rename_err
+            );
+            copy_tree_to_new_path(old_dir, new_dir, &|_| false)?;
+            if let Err(e) = remove_dir_all_force(old_dir) {
+                return Err(LauncherError::Instance(format!(
+                    "Instance '{}' was copied to '{}' but the original could not be removed: {}. \
+                     Both copies are intact; close the game or Explorer windows and remove '{}' manually.",
+                    instance_name,
+                    new_dir.display(),
+                    e,
+                    old_dir.display()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Case-only rename through a hidden intermediate name so a failure can be
+/// rolled back. If the rollback itself fails, the instance is preserved at
+/// the reported staging path.
+fn rename_case_only(old_dir: &Path, new_dir: &Path) -> Result<()> {
+    let staging = unique_instance_sibling(old_dir, "rename")?;
+    std::fs::rename(old_dir, &staging).map_err(|error| {
+        LauncherError::Instance(format!(
+            "Could not rename instance directory '{}': {}",
+            old_dir.display(),
+            error
+        ))
+    })?;
+    match std::fs::rename(&staging, new_dir) {
+        Ok(()) => Ok(()),
+        Err(error) => match std::fs::rename(&staging, old_dir) {
+            Ok(()) => Err(LauncherError::Instance(format!(
+                "Could not rename instance directory '{}': {}",
+                old_dir.display(),
+                error
+            ))),
+            Err(rollback) => Err(LauncherError::Instance(format!(
+                "Could not rename instance directory '{}': {}; restoring the original name also failed ({}). \
+                 The instance is preserved at '{}'.",
+                old_dir.display(),
+                error,
+                rollback,
+                staging.display()
+            ))),
+        },
+    }
 }
 
 /// Recursive copy that asks `skip` about each entry's path relative to the
@@ -718,13 +1284,39 @@ pub fn delete_screenshot(instances_dir: &Path, instance_name: &str, filename: &s
 /// List resource packs or shader packs (returns entries without icon - fetch via cmd_get_pack_icon)
 pub fn list_packs(instances_dir: &Path, name: &str, pack_type: &str) -> Result<Vec<PackEntry>> {
     let instance = get_instance(instances_dir, name)?;
-    let packs_dir = instance.minecraft_dir(instances_dir).join(pack_type);
+    let mc_dir = instance.minecraft_dir(instances_dir);
+    let packs_dir = mc_dir.join(pack_type);
     let mut packs = Vec::new();
     if !packs_dir.exists() {
         return Ok(packs);
     }
     // Roll back any file parked by an interrupted update before listing.
     recover_stashed_content_files(&packs_dir);
+
+    // Auto-migration for resource packs: un-rename any *.disabled back to *.zip
+    // without activating them in options.txt, preserving disabled state cleanly.
+    if pack_type == "resourcepacks" {
+        if let Ok(entries) = std::fs::read_dir(&packs_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if let Some(clean) = fname.strip_suffix(".disabled") {
+                    let target = packs_dir.join(clean);
+                    if !target.exists() {
+                        let _ = std::fs::rename(&p, target);
+                    }
+                }
+            }
+        }
+    }
+
+    let active_resource_packs = if pack_type == "resourcepacks" {
+        let options_path = mc_dir.join("options.txt");
+        read_options_resource_packs(&options_path).0
+    } else {
+        Vec::new()
+    };
+
     // Load Prism metadata once for the whole listing (was re-read per file).
     let packwiz = load_packwiz_index_cached(&packs_dir);
     for entry in std::fs::read_dir(&packs_dir)? {
@@ -760,24 +1352,34 @@ pub fn list_packs(instances_dir: &Path, name: &str, pack_type: &str) -> Result<V
         // or pack.mcmeta's pack_format, which are not the pack's own version.
         let (provider, version, project_id, project_name) =
             read_pack_sidecar(&path, &packwiz).unwrap_or_default();
-        // Name resolution: sidecar project_name > pack.mcmeta pack.name/description > filename
-        let name = if !project_name.is_empty() {
-            Some(project_name)
+
+        let (explicit_name, pack_desc) = if is_dir {
+            read_pack_meta_from_dir(&path)
         } else {
-            if is_dir {
-                read_pack_name_from_dir(&path)
-            } else {
-                read_pack_name_from_zip(&path)
-            }
-        }
-        .unwrap_or_else(|| {
-            let stem = Path::new(&filename)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&filename);
-            let stem = stem.strip_suffix(".disabled").unwrap_or(stem);
-            strip_minecraft_color_codes(stem)
-        });
+            read_pack_meta_from_zip(&path)
+        };
+
+        // Name resolution priority:
+        // 1. Sidecar project_name (Modrinth/CurseForge display name)
+        // 2. Explicit pack.name in pack.mcmeta (if provided)
+        // 3. Clean filename stem without .zip/.disabled
+        // Note: pack.description is NEVER used as the pack's name.
+        let name = if !project_name.is_empty() {
+            project_name
+        } else if let Some(n) = explicit_name {
+            n
+        } else {
+            clean_pack_stem_for_mc(&filename, &instance.mc_version)
+        };
+
+        let description = pack_desc.unwrap_or_default();
+
+        let enabled = if pack_type == "resourcepacks" {
+            is_pack_enabled_in_list(&filename, &active_resource_packs)
+        } else {
+            !filename.ends_with(".disabled")
+        };
+
         packs.push(PackEntry {
             filename,
             name,
@@ -786,10 +1388,351 @@ pub fn list_packs(instances_dir: &Path, name: &str, pack_type: &str) -> Result<V
             provider,
             version,
             project_id,
+            description,
+            enabled,
         });
     }
-    packs.sort_by(|a, b| a.name.cmp(&b.name));
+    if pack_type == "resourcepacks" {
+        // options.txt stores resource packs from lowest to highest priority;
+        // the game UI (and this list) shows the highest priority first.
+        packs.sort_by(|a, b| {
+            let pa = active_resource_pack_priority(&a.filename, &active_resource_packs);
+            let pb = active_resource_pack_priority(&b.filename, &active_resource_packs);
+            match (pa, pb) {
+                (Some(pa), Some(pb)) => pb.cmp(&pa).then_with(|| a.name.cmp(&b.name)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.cmp(&b.name),
+            }
+        });
+    } else {
+        packs.sort_by(|a, b| a.name.cmp(&b.name));
+    }
     Ok(packs)
+}
+
+/// Position of `filename` in the active resource-pack list (0 = lowest
+/// priority). Returns `None` for a pack that is not active.
+fn active_resource_pack_priority(filename: &str, active: &[String]) -> Option<usize> {
+    let clean = filename.strip_suffix(".disabled").unwrap_or(filename);
+    active.iter().position(|id| {
+        let id = id.strip_prefix("file/").unwrap_or(id);
+        id == clean
+    })
+}
+
+/// Write file contents atomically with retry and safe rollback on Windows.
+/// Ensures the target file is never left truncated or missing if replacement fails.
+fn atomic_write_file_impl<R>(target: &Path, content: &str, mut rename_fn: R) -> std::io::Result<()>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = target.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+
+    let mut last_err = None;
+    // 1. Direct atomic replace
+    for _ in 0..5 {
+        match rename_fn(&tmp, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+
+    // 2. Safe fallback:
+    // If target exists, move target -> old, move tmp -> target, then delete old.
+    // If moving tmp -> target fails, immediately restore old -> target so original is untouched.
+    if target.exists() {
+        let old = target.with_extension("old");
+        let _ = std::fs::remove_file(&old);
+        if rename_fn(target, &old).is_ok() {
+            if rename_fn(&tmp, target).is_ok() {
+                let _ = std::fs::remove_file(&old);
+                return Ok(());
+            } else {
+                let _ = rename_fn(&old, target);
+                let _ = std::fs::remove_file(&tmp);
+                return Err(last_err
+                    .unwrap_or_else(|| std::io::Error::other("Failed to replace target file")));
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&tmp);
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("Failed to atomically write file")))
+}
+
+pub(crate) fn atomic_write_file(target: &Path, content: &str) -> std::io::Result<()> {
+    atomic_write_file_impl(target, content, |from, to| std::fs::rename(from, to))
+}
+
+/// Read active resource packs from options.txt.
+/// Returns (active_pack_identifiers, line_ending).
+pub fn read_options_resource_packs(path: &Path) -> (Vec<String>, String) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return (Vec::new(), "\n".to_string());
+    };
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+    .to_string();
+    for line in content.lines() {
+        if let Some(val_str) = line.strip_prefix("resourcePacks:") {
+            if let Ok(packs) = serde_json::from_str::<Vec<String>>(val_str.trim()) {
+                return (packs, line_ending);
+            }
+        }
+    }
+    (Vec::new(), line_ending)
+}
+
+/// Check if a pack filename is active in the given list of identifiers.
+pub fn is_pack_enabled_in_list(filename: &str, active_packs: &[String]) -> bool {
+    let clean_target = filename.strip_suffix(".disabled").unwrap_or(filename);
+    active_packs.iter().any(|id| {
+        if id == clean_target {
+            return true;
+        }
+        if let Some(rest) = id.strip_prefix("file/") {
+            if rest == clean_target {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Read options.txt while distinguishing "missing" from a real read error.
+///
+/// A temporary ACL/AV/encoding failure must never be treated as an empty file:
+/// the resource-pack toggles rewrite the whole file and would otherwise erase
+/// every keybind, graphics and audio setting.
+fn read_options_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LauncherError::Instance(format!(
+            "Failed to read options.txt: {error}"
+        ))),
+    }
+}
+
+/// Modify options.txt to enable or disable a resource pack.
+pub fn set_options_resource_pack_enabled(path: &Path, filename: &str, enabled: bool) -> Result<()> {
+    let clean_target = filename.strip_suffix(".disabled").unwrap_or(filename);
+    if clean_target.is_empty() || clean_target.contains(['/', '\\']) {
+        return Err(LauncherError::Instance(
+            "Invalid resource pack filename".to_string(),
+        ));
+    }
+    let content = read_options_file(path)?.unwrap_or_default();
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    let mut lines: Vec<String> = if content.is_empty() {
+        Vec::new()
+    } else {
+        content.lines().map(|s| s.to_string()).collect()
+    };
+
+    let mut pack_line_idx = None;
+    let mut current_packs: Vec<String> = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(val_str) = line.strip_prefix("resourcePacks:") {
+            pack_line_idx = Some(idx);
+            match serde_json::from_str::<Vec<String>>(val_str.trim()) {
+                Ok(packs) => current_packs = packs,
+                Err(error) => {
+                    return Err(LauncherError::Instance(format!(
+                        "Cannot parse resourcePacks in options.txt: {error}"
+                    )))
+                }
+            }
+            break;
+        }
+    }
+
+    if current_packs.is_empty() && pack_line_idx.is_none() {
+        current_packs.push("vanilla".to_string());
+    }
+
+    if enabled {
+        let is_already_enabled = current_packs.iter().any(|id| {
+            id == clean_target || id.strip_prefix("file/").is_some_and(|s| s == clean_target)
+        });
+        if !is_already_enabled {
+            current_packs.push(format!("file/{}", clean_target));
+        }
+    } else {
+        current_packs.retain(|id| {
+            let is_match =
+                id == clean_target || id.strip_prefix("file/").is_some_and(|s| s == clean_target);
+            !is_match
+        });
+    }
+
+    let json_packs = serde_json::to_string(&current_packs).map_err(|e| {
+        LauncherError::Instance(format!("Failed to serialize resource packs: {}", e))
+    })?;
+    let new_pack_line = format!("resourcePacks:{}", json_packs);
+
+    if let Some(idx) = pack_line_idx {
+        lines[idx] = new_pack_line;
+    } else {
+        lines.push(new_pack_line);
+    }
+
+    let mut new_content = lines.join(line_ending);
+    new_content.push_str(line_ending);
+
+    if path.exists() {
+        let bak_path = path.with_extension("txt.bak");
+        let _ = std::fs::copy(path, bak_path);
+    }
+
+    atomic_write_file(path, &new_content)
+        .map_err(|e| LauncherError::Instance(format!("Failed to write options.txt: {}", e)))
+}
+
+/// Reorder the active resource packs in options.txt.
+///
+/// `filenames` follows the on-disk contract: lowest priority first, highest
+/// priority last (the UI shows the reverse order and reverses it before
+/// calling). Only packs that are already active are touched: a name that is
+/// currently disabled is ignored instead of being silently enabled. Non-file
+/// system packs (`vanilla`, `mod_resources`, ...) keep their order.
+pub fn set_options_resource_packs_order(path: &Path, filenames: &[String]) -> Result<()> {
+    let Some(content) = read_options_file(path)? else {
+        // Reordering must not invent options.txt.
+        return Ok(());
+    };
+    let line_ending = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    let mut lines: Vec<String> = if content.is_empty() {
+        Vec::new()
+    } else {
+        content.lines().map(|s| s.to_string()).collect()
+    };
+
+    let mut pack_line_idx = None;
+    let mut current_packs: Vec<String> = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(val_str) = line.strip_prefix("resourcePacks:") {
+            pack_line_idx = Some(idx);
+            match serde_json::from_str::<Vec<String>>(val_str.trim()) {
+                Ok(packs) => current_packs = packs,
+                Err(error) => {
+                    return Err(LauncherError::Instance(format!(
+                        "Cannot parse resourcePacks in options.txt: {error}"
+                    )))
+                }
+            }
+            break;
+        }
+    }
+
+    // Nothing to reorder and no line to preserve: never invent an empty
+    // resource-pack list for an instance whose options.txt is absent.
+    if pack_line_idx.is_none() && current_packs.is_empty() {
+        return Ok(());
+    }
+
+    let mut system_packs = Vec::new();
+    let mut active_files: Vec<(String, String)> = Vec::new();
+    for id in current_packs {
+        if let Some(clean) = id.strip_prefix("file/") {
+            active_files.push((clean.to_string(), id));
+        } else {
+            system_packs.push(id);
+        }
+    }
+
+    let mut ordered_files = Vec::new();
+    let mut used = vec![false; active_files.len()];
+    for filename in filenames {
+        let clean = filename.strip_suffix(".disabled").unwrap_or(filename);
+        if clean.is_empty() || clean.contains(['/', '\\']) {
+            return Err(LauncherError::Instance(
+                "Invalid resource pack filename".to_string(),
+            ));
+        }
+        if let Some(pos) = active_files.iter().position(|(name, _)| name == clean) {
+            if !used[pos] {
+                used[pos] = true;
+                ordered_files.push(active_files[pos].1.clone());
+            }
+        }
+    }
+    // An active pack omitted from the request is kept: the command reorders,
+    // it does not enable or disable packs as a side effect.
+    for (pos, (_, id)) in active_files.iter().enumerate() {
+        if !used[pos] {
+            ordered_files.push(id.clone());
+        }
+    }
+
+    let mut new_packs = system_packs;
+    new_packs.extend(ordered_files);
+
+    let json_packs = serde_json::to_string(&new_packs).map_err(|e| {
+        LauncherError::Instance(format!("Failed to serialize resource packs: {}", e))
+    })?;
+    let new_pack_line = format!("resourcePacks:{}", json_packs);
+
+    if let Some(idx) = pack_line_idx {
+        lines[idx] = new_pack_line;
+    } else {
+        lines.push(new_pack_line);
+    }
+
+    let mut new_content = lines.join(line_ending);
+    new_content.push_str(line_ending);
+
+    if path.exists() {
+        let bak_path = path.with_extension("txt.bak");
+        let _ = std::fs::copy(path, bak_path);
+    }
+
+    atomic_write_file(path, &new_content)
+        .map_err(|e| LauncherError::Instance(format!("Failed to write options.txt: {}", e)))
+}
+
+pub fn set_resource_pack_enabled(
+    instances_dir: &Path,
+    instance_name: &str,
+    filename: &str,
+    enabled: bool,
+) -> Result<()> {
+    let instance = get_instance(instances_dir, instance_name)?;
+    let options_path = instance.minecraft_dir(instances_dir).join("options.txt");
+    set_options_resource_pack_enabled(&options_path, filename, enabled)
+}
+
+pub fn set_resource_packs_order(
+    instances_dir: &Path,
+    instance_name: &str,
+    filenames: &[String],
+) -> Result<()> {
+    let instance = get_instance(instances_dir, instance_name)?;
+    let options_path = instance.minecraft_dir(instances_dir).join("options.txt");
+    set_options_resource_packs_order(&options_path, filenames)
 }
 
 /// Read the icon for a single pack (mirrors mod icon approach)
@@ -861,8 +1804,14 @@ pub(crate) fn read_sidecar_meta(
 
 /// Remove sidecar metadata in both layouts (used when a content file is deleted).
 pub(crate) fn remove_sidecar_meta(content_dir: &std::path::Path, filename: &str) {
-    let _ = std::fs::remove_file(sidecar_meta_path(content_dir, filename));
-    let _ = std::fs::remove_file(legacy_sidecar_path(content_dir, filename));
+    let meta = sidecar_meta_path(content_dir, filename);
+    if crate::import::ensure_no_reparse_points(content_dir, &meta).is_ok() {
+        let _ = std::fs::remove_file(meta);
+    }
+    let legacy = legacy_sidecar_path(content_dir, filename);
+    if crate::import::ensure_no_reparse_points(content_dir, &legacy).is_ok() {
+        let _ = std::fs::remove_file(legacy);
+    }
 }
 
 /// Suffix for a content file parked aside while its replacement downloads.
@@ -879,6 +1828,10 @@ pub(crate) fn stash_old_content_files(
     content_dir: &std::path::Path,
     old_filename: &str,
 ) -> std::result::Result<Vec<(PathBuf, PathBuf)>, String> {
+    if let Some(base) = content_dir.parent() {
+        crate::import::ensure_no_reparse_points(base, content_dir)
+            .map_err(|e| format!("Refusing to park content through a junction/symlink: {e}"))?;
+    }
     // `old_filename` is untrusted frontend input: strip any path components
     // so it can never escape the content directory.
     let old = std::path::Path::new(old_filename)
@@ -886,15 +1839,17 @@ pub(crate) fn stash_old_content_files(
         .and_then(|n| n.to_str())
         .filter(|n| !n.is_empty() && *n != "." && *n != "..")
         .ok_or("Invalid old file name")?;
-    let base = content_stem(old);
+    // Park only this exact file and its enabled/disabled twin. A same-stem
+    // file of the other extension (e.g. `Foo.zip` next to `Foo.jar`) is a
+    // different content item and must never be deleted by a successful
+    // replacement of `Foo.jar`.
+    let enabled = old.strip_suffix(".disabled").unwrap_or(old).to_string();
+    let disabled = format!("{enabled}.disabled");
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for c in [
-        content_dir.join(old),
-        content_dir.join(format!("{}.jar", base)),
-        content_dir.join(format!("{}.zip", base)),
-    ] {
-        if !candidates.contains(&c) {
-            candidates.push(c);
+    for name in [&enabled, &disabled] {
+        let candidate = content_dir.join(name);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
         }
     }
     let mut stashed = Vec::new();
@@ -957,6 +1912,11 @@ pub(crate) fn discard_stashed_files(stashed: &[(PathBuf, PathBuf)]) {
 /// if the original name is free the park is restored, if it is taken the park
 /// is stale and gets removed.
 pub(crate) fn recover_stashed_content_files(content_dir: &std::path::Path) {
+    if let Some(base) = content_dir.parent() {
+        if crate::import::ensure_no_reparse_points(base, content_dir).is_err() {
+            return;
+        }
+    }
     let Ok(entries) = std::fs::read_dir(content_dir) else {
         return;
     };
@@ -971,7 +1931,11 @@ pub(crate) fn recover_stashed_content_files(content_dir: &std::path::Path) {
         let park = entry.path();
         let orig = content_dir.join(base);
         if orig.exists() {
-            let _ = std::fs::remove_file(&park);
+            if park.is_dir() {
+                let _ = std::fs::remove_dir_all(&park);
+            } else {
+                let _ = std::fs::remove_file(&park);
+            }
         } else {
             let _ = std::fs::rename(&park, &orig);
         }
@@ -1051,7 +2015,7 @@ fn packwiz_index_stamp(content_dir: &Path) -> u64 {
 /// Cached variant used by the content listings. `list_packs` alone calls
 /// `read_pack_sidecar` once per file; without this cache every file re-read and
 /// re-parsed the whole `.index/` directory (O(N²) on large Prism packs).
-fn load_packwiz_index_cached(content_dir: &Path) -> HashMap<String, PackwizMeta> {
+pub(crate) fn load_packwiz_index_cached(content_dir: &Path) -> HashMap<String, PackwizMeta> {
     let stamp = packwiz_index_stamp(content_dir);
     let cache = PACKWIZ_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock() {
@@ -1123,6 +2087,13 @@ pub(crate) fn load_packwiz_index(content_dir: &Path) -> HashMap<String, PackwizM
                 meta.version = ver.to_string();
             } else if let Some(ver) = v.get("version").and_then(|n| n.as_str()) {
                 meta.version = ver.to_string();
+            } else if let Some(ver) = v
+                .get("update")
+                .and_then(|u| u.get("modrinth"))
+                .and_then(|m| m.get("version"))
+                .and_then(|m| m.as_str())
+            {
+                meta.version = ver.to_string();
             }
             if let Some(pid) = v
                 .get("update")
@@ -1192,14 +2163,16 @@ fn read_pack_sidecar(
 }
 
 /// Normalize a raw provider string from sidecar/packwiz metadata to the
-/// display form used in the UI (mods and packs alike).
+/// display form used in the UI (mods and packs alike). Unknown historical
+/// values are loader names (`Fabric`, `Forge`, ...), never download sources;
+/// they must not leak into the provider/source column.
 pub(crate) fn normalize_provider(raw: &str) -> String {
     match raw.to_lowercase().as_str() {
         "modrinth" => "Modrinth".to_string(),
         "curseforge" => "CurseForge".to_string(),
         "local" => "Local".to_string(),
         "atlauncher" => "ATLauncher".to_string(),
-        other => other.to_string(),
+        _ => "Local".to_string(),
     }
 }
 
@@ -1495,6 +2468,14 @@ pub struct PackEntry {
     pub version: String,
     #[serde(default)]
     pub project_id: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_pack_enabled")]
+    pub enabled: bool,
+}
+
+fn default_pack_enabled() -> bool {
+    true
 }
 
 fn read_pack_icon_from_dir(path: &std::path::Path) -> Option<String> {
@@ -1579,11 +2560,17 @@ fn try_read_zip_image<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> Option<String> {
-    let mut file = archive.by_name(name).ok()?;
+    const MAX_PACK_ICON_BYTES: u64 = 8 * 1024 * 1024;
+    let file = archive.by_name(name).ok()?;
+    if file.size() > MAX_PACK_ICON_BYTES {
+        return None;
+    }
     let mut buf = Vec::new();
     use std::io::Read;
-    file.read_to_end(&mut buf).ok()?;
-    if buf.is_empty() {
+    file.take(MAX_PACK_ICON_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.is_empty() || buf.len() as u64 > MAX_PACK_ICON_BYTES {
         return None;
     }
     let lower = name.to_lowercase();
@@ -1595,69 +2582,146 @@ fn try_read_zip_image<R: std::io::Read + std::io::Seek>(
     Some(format!("data:{};base64,{}", mime, base64_encode(&buf)))
 }
 
-fn extract_pack_name_from_json(json: &serde_json::Value) -> Option<String> {
-    // Prefer pack.name (human-readable) over pack.description (often an internal identifier).
-    let raw = extract_text_field(&json["pack"]["name"])
-        .or_else(|| extract_text_field(&json["pack"]["description"]))?;
+/// Extract a clean stem name from a pack filename, properly stripping `.disabled`
+/// before stripping archive extensions (`.zip` / `.jar`) and removing Minecraft color codes.
+pub(crate) fn clean_pack_stem(filename: &str) -> String {
+    let mut s = filename;
+    if let Some(without_disabled) = s.strip_suffix(".disabled") {
+        s = without_disabled;
+    }
+    if let Some(without_zip) = s.strip_suffix(".zip") {
+        s = without_zip;
+    } else if let Some(without_jar) = s.strip_suffix(".jar") {
+        s = without_jar;
+    }
+    strip_minecraft_color_codes(s).trim().to_string()
+}
 
-    let stripped = strip_minecraft_color_codes(&raw);
-    // Strip common HTML tags used in descriptions
+/// Filename fallback for a pack title. Metadata (`pack.name` / sidecar) still
+/// wins; when only the filename exists, drop an exact trailing instance
+/// Minecraft-version suffix such as `"Faithful 32x - 26.3"`. Only the current
+/// instance version is removed, so a genuine version in the pack name stays.
+pub(crate) fn clean_pack_stem_for_mc(filename: &str, mc_version: &str) -> String {
+    let stem = clean_pack_stem(filename);
+    strip_mc_version_suffix(&stem, mc_version).unwrap_or(stem)
+}
+
+fn strip_mc_version_suffix(stem: &str, mc_version: &str) -> Option<String> {
+    let mc_version = mc_version.trim();
+    if mc_version.is_empty() {
+        return None;
+    }
+    for suffix in [
+        format!(" - {mc_version}"),
+        format!(" ({mc_version})"),
+        format!(" [{mc_version}]"),
+        format!("_{mc_version}"),
+        format!("-{mc_version}"),
+    ] {
+        if let Some(rest) = stem.strip_suffix(&suffix) {
+            let rest = rest.trim_end_matches([' ', '-', '_']).trim();
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Recursively extract text from Minecraft JSON text components (strings, objects with "text" / "extra", or arrays).
+pub(crate) fn extract_minecraft_text(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(s) => {
+            out.push_str(s);
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::String(text)) = map.get("text") {
+                out.push_str(text);
+            }
+            if let Some(extra) = map.get("extra") {
+                extract_minecraft_text(extra, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                extract_minecraft_text(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse Minecraft text component into clean plain text stripped of color codes and HTML tags.
+pub(crate) fn parse_minecraft_text(value: &serde_json::Value) -> Option<String> {
+    let mut out = String::new();
+    extract_minecraft_text(value, &mut out);
+    let stripped = strip_minecraft_color_codes(&out);
     let clean = stripped
         .replace("<br>", " ")
         .replace("<br/>", " ")
         .replace("</br>", " ");
-    let clean = clean.trim().to_string();
-    if clean.is_empty() {
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
         None
     } else {
-        Some(clean)
+        Some(trimmed.to_string())
     }
 }
 
-/// Extract text from a Minecraft JSON text component (string, object with "text", or array).
-fn extract_text_field(value: &serde_json::Value) -> Option<String> {
-    if let Some(s) = value.as_str() {
-        Some(s.to_string())
-    } else if let Some(obj) = value.as_object() {
-        obj.get("text")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    } else if let Some(arr) = value.as_array() {
-        let mut result = String::new();
-        for item in arr {
-            if let Some(obj) = item.as_object() {
-                if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                    result.push_str(text);
-                }
-            } else if let Some(s) = item.as_str() {
-                result.push_str(s);
-            }
-        }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    } else {
-        None
+/// Read pack explicit name and description from pack.mcmeta JSON.
+///
+/// In Minecraft, `pack.description` is NOT a title/name — it is descriptive text.
+/// `explicit_name` is only returned if `pack.name` is present; otherwise None.
+pub(crate) fn read_pack_meta_from_json(
+    json: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
+    let pack = &json["pack"];
+    let explicit_name = pack.get("name").and_then(parse_minecraft_text);
+    let description = pack.get("description").and_then(parse_minecraft_text);
+    (explicit_name, description)
+}
+
+fn read_pack_meta_from_dir(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    const MAX_MCMETA_BYTES: u64 = 1024 * 1024;
+    let Ok(mut file) = std::fs::File::open(path.join("pack.mcmeta")) else {
+        return (None, None);
+    };
+    if file.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_MCMETA_BYTES {
+        return (None, None);
     }
+    let mut content = String::new();
+    if std::io::Read::read_to_string(&mut file, &mut content).is_err() {
+        return (None, None);
+    }
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return (None, None);
+    };
+    read_pack_meta_from_json(&json)
 }
 
-fn read_pack_name_from_dir(path: &std::path::Path) -> Option<String> {
-    let content = std::fs::read_to_string(path.join("pack.mcmeta")).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    extract_pack_name_from_json(&json)
-}
-
-fn read_pack_name_from_zip(path: &std::path::Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
-    let mcmeta = archive.by_name("pack.mcmeta").ok()?;
+fn read_pack_meta_from_zip(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return (None, None);
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return (None, None);
+    };
+    let Ok(mcmeta) = archive.by_name("pack.mcmeta") else {
+        return (None, None);
+    };
+    const MAX_MCMETA_BYTES: u64 = 1024 * 1024;
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut std::io::BufReader::new(mcmeta), &mut bytes).ok()?;
-    let content = String::from_utf8(bytes).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    extract_pack_name_from_json(&json)
+    let mut reader = std::io::BufReader::new(mcmeta).take(MAX_MCMETA_BYTES);
+    if std::io::Read::read_to_end(&mut reader, &mut bytes).is_err() {
+        return (None, None);
+    }
+    let Ok(content) = String::from_utf8(bytes) else {
+        return (None, None);
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return (None, None);
+    };
+    read_pack_meta_from_json(&json)
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {
@@ -1676,16 +2740,20 @@ fn dir_size(path: &std::path::Path) -> u64 {
 }
 
 fn read_image_as_base64(path: &std::path::Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
+    const MAX_ICON_BYTES: u64 = 8 * 1024 * 1024;
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_ICON_BYTES {
+        return None;
+    }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    if buf.is_empty() {
+    file.take(MAX_ICON_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.is_empty() || buf.len() as u64 > MAX_ICON_BYTES {
         return None;
     }
     Some(format!("data:image/png;base64,{}", base64_encode(&buf)))
 }
 
-fn base64_encode(data: &[u8]) -> String {
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -1834,51 +2902,90 @@ pub fn write_pack_png(instances_dir: &Path, instance_name: &str, icon_data: &str
     }
 }
 
-/// Try to parse a Prism instance.cfg into our Instance format
-pub fn parse_prism_cfg(cfg_path: &std::path::Path) -> Option<Instance> {
-    let content = std::fs::read_to_string(cfg_path).ok()?;
-    let dir = cfg_path.parent()?;
-    let dir_name = dir.file_name()?.to_string_lossy().to_string();
+/// Values read from a Prism/MultiMC `instance.cfg` that map onto our model.
+struct PrismCfgFields {
+    name: Option<String>,
+    memory_mb: Option<u32>,
+    jvm_args: Option<Vec<String>>,
+}
 
-    let mut name = dir_name.clone();
-    let mut icon_data = None;
+fn parse_prism_cfg_text(content: &str) -> PrismCfgFields {
+    let mut name = None;
+    let mut max_mem: Option<u32> = None;
+    let mut override_memory = false;
+    let mut jvm_args_raw: Option<String> = None;
+    let mut override_java_args = false;
 
-    // Read pack.png
-    let png_path = dir.join("pack.png");
-    if png_path.exists() {
-        icon_data = read_image_as_base64(&png_path);
-    }
-
-    // Parse INI lines
     for line in content.lines() {
         let line = line.trim();
         if line.starts_with('[') || line.starts_with('#') || line.is_empty() {
             continue;
         }
-        if let Some(eq) = line.find('=') {
-            let key = line[..eq].trim();
-            let val = line[eq + 1..].trim();
-            if key == "name" {
-                name = val.to_string();
-            }
+        let Some(eq) = line.find('=') else { continue };
+        let key = line[..eq].trim();
+        let val = line[eq + 1..].trim();
+        if key.eq_ignore_ascii_case("name") && !val.is_empty() {
+            name = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("MaxMemAlloc") {
+            max_mem = val.parse::<u32>().ok().filter(|m| *m > 0);
+        } else if key.eq_ignore_ascii_case("OverrideMemory") {
+            override_memory = val.eq_ignore_ascii_case("true");
+        } else if key.eq_ignore_ascii_case("JvmArgs") {
+            jvm_args_raw = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("OverrideJavaArgs") {
+            override_java_args = val.eq_ignore_ascii_case("true");
         }
     }
 
+    PrismCfgFields {
+        name,
+        memory_mb: override_memory.then_some(max_mem).flatten(),
+        jvm_args: override_java_args
+            .then_some(jvm_args_raw)
+            .flatten()
+            .filter(|raw| !raw.trim().is_empty())
+            .map(|raw| raw.split_whitespace().map(str::to_string).collect()),
+    }
+}
+
+/// Try to parse a Prism instance.cfg into our Instance format.
+///
+/// Version and loader come from the sibling `mmc-pack.json`: a folder with a
+/// cfg but no usable mmc-pack is not a launchable instance and is refused
+/// instead of being presented as Vanilla with an empty version.
+pub fn parse_prism_cfg(cfg_path: &std::path::Path) -> Option<Instance> {
+    let content = std::fs::read_to_string(cfg_path).ok()?;
+    let dir = cfg_path.parent()?;
+    let dir_name = dir.file_name()?.to_string_lossy().to_string();
+    let fields = parse_prism_cfg_text(&content);
+
+    let pack_content = std::fs::read_to_string(dir.join("mmc-pack.json")).ok()?;
+    let (mc_version, loader, loader_version) = parse_prism_mmc_pack(&pack_content).ok()?;
+    if mc_version.trim().is_empty() {
+        tracing::warn!(
+            target: "launcher",
+            "Prism instance at {} has no Minecraft version in mmc-pack.json",
+            dir.display()
+        );
+        return None;
+    }
+
+    let icon_data = read_image_as_base64(&dir.join("pack.png"));
     let now = chrono::Utc::now().to_rfc3339();
     Some(Instance {
-        name,
-        mc_version: String::new(),
-        loader: LoaderType::Vanilla,
-        loader_version: None,
+        name: fields.name.unwrap_or(dir_name),
+        mc_version,
+        loader,
+        loader_version,
         loader_profile: None,
-        memory_mb: None,
-        jvm_args: None,
+        memory_mb: fields.memory_mb,
+        jvm_args: fields.jvm_args,
         gc_preset: None,
         java_path: None,
         resolution: None,
         icon: icon_data,
         banner: None,
-        created_at: now.clone(),
+        created_at: now,
         last_played: None,
         play_time_seconds: 0,
         notes: String::new(),
@@ -1893,12 +3000,11 @@ fn parse_prism_mmc_pack(content: &str) -> Result<(String, LoaderType, Option<Str
     let mut loader = LoaderType::Vanilla;
     let mut loader_version: Option<String> = None;
 
-    let Ok(pack) = serde_json::from_str::<serde_json::Value>(content) else {
-        return Ok((mc_version, loader, loader_version));
-    };
-    let Some(components) = pack["components"].as_array() else {
-        return Ok((mc_version, loader, loader_version));
-    };
+    let pack = serde_json::from_str::<serde_json::Value>(content)
+        .map_err(|e| LauncherError::Instance(format!("Invalid Prism mmc-pack.json: {}", e)))?;
+    let components = pack["components"].as_array().ok_or_else(|| {
+        LauncherError::Instance("Invalid Prism mmc-pack.json: missing components array".to_string())
+    })?;
 
     for comp in components {
         let uid = comp["uid"].as_str().unwrap_or("");
@@ -1934,6 +3040,19 @@ fn parse_prism_mmc_pack(content: &str) -> Result<(String, LoaderType, Option<Str
         }
     }
 
+    if mc_version.trim().is_empty() {
+        return Err(LauncherError::Instance(
+            "Prism mmc-pack.json does not name a Minecraft version".to_string(),
+        ));
+    }
+    if !matches!(loader, LoaderType::Vanilla)
+        && loader_version.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return Err(LauncherError::Instance(
+            "Prism mmc-pack.json names a mod loader without a version".to_string(),
+        ));
+    }
+
     Ok((mc_version, loader, loader_version))
 }
 
@@ -1946,6 +3065,8 @@ struct PrismPackMeta {
     mc_version: String,
     loader: LoaderType,
     loader_version: Option<String>,
+    memory_mb: Option<u32>,
+    jvm_args: Option<Vec<String>>,
 }
 
 /// Read `instance.cfg` (name) + `mmc-pack.json` (version/loader) in one pass.
@@ -1955,6 +3076,7 @@ fn read_prism_pack_meta(zip_path: &Path) -> Result<PrismPackMeta> {
         .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
 
     let mut found = false;
+    let mut pack_found = false;
     let mut cfg_content = String::new();
     let mut pack_content = String::new();
 
@@ -1977,6 +3099,7 @@ fn read_prism_pack_meta(zip_path: &Path) -> Result<PrismPackMeta> {
                 entry.read_to_string(&mut cfg_content).ok();
             }
             "mmc-pack.json" => {
+                pack_found = true;
                 entry.read_to_string(&mut pack_content).ok();
             }
             _ => {}
@@ -1989,67 +3112,38 @@ fn read_prism_pack_meta(zip_path: &Path) -> Result<PrismPackMeta> {
         ));
     }
 
-    let pack_name = cfg_content
-        .lines()
-        .find_map(|line| {
-            let line = line.trim();
-            line.strip_prefix("name=").map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| {
-            zip_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("imported")
-                .to_string()
-        });
+    if !pack_found {
+        return Err(LauncherError::Instance(
+            "Not a valid Prism instance pack: missing mmc-pack.json (cannot determine the Minecraft version)".to_string(),
+        ));
+    }
+
+    let fields = parse_prism_cfg_text(&cfg_content);
+    let pack_name = fields.name.unwrap_or_else(|| {
+        zip_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported")
+            .to_string()
+    });
     let (mc_version, loader, loader_version) = parse_prism_mmc_pack(&pack_content)?;
     Ok(PrismPackMeta {
         pack_name,
         mc_version,
         loader,
         loader_version,
+        memory_mb: fields.memory_mb,
+        jvm_args: fields.jvm_args,
     })
 }
 
 fn validate_prism_instance_name(name: &str) -> Result<()> {
-    let trimmed = name.trim();
-    if trimmed.is_empty()
-        || trimmed.chars().count() < 3
-        || trimmed.chars().count() > 64
-        || trimmed.contains("..")
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.contains('\0')
-        || trimmed.contains('<')
-        || trimmed.contains('>')
-        || trimmed.contains(':')
-        || trimmed.contains('"')
-        || trimmed.contains('|')
-        || trimmed.contains('?')
-        || trimmed.contains('*')
-        || trimmed.chars().any(|c| c.is_control())
-        || trimmed.starts_with(' ')
-        || trimmed.starts_with('.')
-    {
-        return Err(LauncherError::Instance(format!(
-            "Invalid instance name in Prism pack: '{}'",
-            name
-        )));
+    let invalid =
+        || LauncherError::Instance(format!("Invalid instance name in Prism pack: '{}'", name));
+    if name != name.trim() || !(3..=64).contains(&name.chars().count()) {
+        return Err(invalid());
     }
-    let windows_reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if windows_reserved
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case(trimmed))
-    {
-        return Err(LauncherError::Instance(format!(
-            "Invalid instance name in Prism pack: '{}'",
-            name
-        )));
-    }
-    Ok(())
+    validate_instance_dir_name(name, "Instance name").map_err(|_| invalid())
 }
 
 /// Import a Prism Launcher instance.zip into VoidLauncher instances dir.
@@ -2062,8 +3156,19 @@ fn validate_prism_instance_name(name: &str) -> Result<()> {
 /// logs) and Prism metadata files are not carried over.
 ///
 /// The pack's own `instance.cfg` name is used when no explicit name is given.
-pub fn import_prism_pack(instances_dir: &Path, zip_path: &str) -> Result<Instance> {
-    import_prism_pack_as(instances_dir, zip_path, None)
+pub fn import_prism_pack(
+    instances_dir: &Path,
+    zip_path: &str,
+    launches: &crate::launch_state::LaunchRegistry,
+) -> Result<Instance> {
+    import_prism_pack_as(instances_dir, zip_path, None, launches)
+}
+
+/// Name a Prism archive carries for a standalone import. Legacy IPC needs the
+/// same name the old `import_prism_pack` would have chosen before it can use
+/// the shared import/prepare orchestration.
+pub(crate) fn prism_pack_default_name(zip_path: &str) -> Result<String> {
+    Ok(read_prism_pack_meta(Path::new(zip_path))?.pack_name)
 }
 
 /// Import a Prism archive under a caller-chosen instance name. The name is
@@ -2074,6 +3179,7 @@ pub fn import_prism_pack_as(
     instances_dir: &Path,
     zip_path: &str,
     instance_name: Option<&str>,
+    launches: &crate::launch_state::LaunchRegistry,
 ) -> Result<Instance> {
     let zip = std::path::Path::new(zip_path);
     // Parse first: an invalid/corrupt archive must fail before the target
@@ -2087,10 +3193,13 @@ pub fn import_prism_pack_as(
     validate_prism_instance_name(&chosen)?;
 
     // Atomic ownership: a concurrent import of the same name fails here
-    // instead of both importers merging into one directory.
-    let mut reservation = crate::import::InstanceReservation::reserve(instances_dir, &chosen)?;
+    // instead of both importers merging into one directory. The reservation
+    // also blocks launches until the archive is fully imported.
+    let mut reservation =
+        crate::import::InstanceReservation::reserve(instances_dir, &chosen, launches, "import")?;
     let instance = import_prism_pack_into(instances_dir, zip_path, &chosen, Some(meta))?;
-    reservation.commit();
+    reservation.set_stage(crate::instance_readiness::SetupStage::Preparing)?;
+    reservation.commit()?;
     Ok(instance)
 }
 
@@ -2130,6 +3239,8 @@ fn import_prism_pack_into(
         mc_version,
         loader,
         loader_version,
+        memory_mb,
+        jvm_args,
     } = meta;
     if name != pack_name {
         tracing::info!(
@@ -2166,6 +3277,8 @@ fn import_prism_pack_into(
     {
         let mut archive = zip::ZipArchive::new(std::fs::File::open(zip_path)?)
             .map_err(|e| LauncherError::Instance(format!("Invalid ZIP: {}", e)))?;
+        crate::import::check_archive_entry_count(archive.len())?;
+        let mut extract_budget = crate::import::ExtractBudget::new();
 
         for i in 0..archive.len() {
             let mut entry = archive
@@ -2217,7 +3330,12 @@ fn import_prism_pack_into(
             };
 
             let Some(relative) = relative else { continue };
-            crate::import::write_extracted(&target_dir, &relative, &mut entry)?;
+            crate::import::write_extracted_budgeted(
+                &target_dir,
+                &relative,
+                &mut entry,
+                &mut extract_budget,
+            )?;
         }
     }
 
@@ -2242,8 +3360,8 @@ fn import_prism_pack_into(
         loader,
         loader_version,
         loader_profile: None,
-        memory_mb: None,
-        jvm_args: None,
+        memory_mb,
+        jvm_args,
         gc_preset: None,
         java_path: None,
         resolution: None,
@@ -2254,7 +3372,7 @@ fn import_prism_pack_into(
         play_time_seconds: 0,
         notes: String::new(),
     };
-    save_instance(instances_dir, &instance, None)?;
+    save_instance_reserved(instances_dir, &instance, None)?;
 
     tracing::info!(
         target: "launcher",
@@ -2287,11 +3405,18 @@ fn import_prism_pack_into(
 pub fn export_instance(instances_dir: &Path, name: &str, output_path: &str) -> Result<()> {
     use zip::write::SimpleFileOptions;
 
+    let _reservation = InstanceNameReservation::acquire(instances_dir, &[name])?;
     let instance = get_instance(instances_dir, name)?;
     let instance_dir = instance.dir(instances_dir);
     if !instance_dir.exists() {
         return Err(LauncherError::Instance(format!(
             "Instance '{}' not found",
+            name
+        )));
+    }
+    if crate::instance_readiness::read_pending(&instance_dir).is_some() {
+        return Err(LauncherError::Instance(format!(
+            "Instance '{}' is not fully set up. Finish its setup before exporting it.",
             name
         )));
     }
@@ -2386,11 +3511,26 @@ fn add_minecraft_dir_to_zip(
         if is_junk(&name) {
             continue;
         }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!(target: "launcher", "Skipping unreadable export entry {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        if crate::import::is_unsafe_reparse_point(&metadata) {
+            tracing::warn!(
+                target: "launcher",
+                "Skipping junction/symlink while exporting: {}",
+                path.display()
+            );
+            continue;
+        }
         let zip_path = format!("{}/{}", prefix, name);
-        if path.is_dir() {
+        if metadata.is_dir() {
             zip.add_directory(&zip_path, options)?;
             add_minecraft_dir_to_zip(zip, &path, &zip_path, options)?;
-        } else {
+        } else if metadata.is_file() {
             zip.start_file(&zip_path, options)?;
             let mut file = std::fs::File::open(&path)?;
             std::io::copy(&mut file, zip)?;
@@ -2417,15 +3557,33 @@ fn add_dir_contents_to_zip(
         if skip(&name) {
             continue;
         }
+        // Never follow a junction/symlink: in the best case the archive would
+        // capture data from outside the instance, in the worst case a cyclic
+        // junction makes the walk recurse forever.
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!(target: "launcher", "Skipping unreadable backup entry {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        if crate::import::is_unsafe_reparse_point(&metadata) {
+            tracing::warn!(
+                target: "launcher",
+                "Skipping junction/symlink while archiving: {}",
+                path.display()
+            );
+            continue;
+        }
         let zip_path = if prefix.is_empty() {
             name.clone()
         } else {
             format!("{}/{}", prefix, name)
         };
-        if path.is_dir() {
+        if metadata.is_dir() {
             zip.add_directory(&zip_path, options)?;
             add_dir_contents_to_zip(zip, &path, &zip_path, options, skip)?;
-        } else {
+        } else if metadata.is_file() {
             zip.start_file(&zip_path, options)?;
             let mut file = std::fs::File::open(&path)?;
             std::io::copy(&mut file, zip)?;
@@ -2918,6 +4076,13 @@ pub fn restore_world(
     };
 
     let target_dir = saves_dir.join(&target_world);
+    let mc_dir = instance.minecraft_dir(instances_dir);
+    crate::import::ensure_no_reparse_points(&mc_dir, &target_dir).map_err(|e| {
+        LauncherError::Instance(format!(
+            "Refusing to restore a world through a junction/symlink: {}",
+            e
+        ))
+    })?;
     if mode != "replace" && target_dir.exists() {
         return Err(LauncherError::Instance(format!(
             "A world named '{}' already exists",
@@ -2937,6 +4102,13 @@ pub fn restore_world(
         .join(instance_name)
         .join(".backups")
         .join(format!(".restore-tmp-{}", restore_token));
+    let instance_dir = instance.dir(instances_dir);
+    crate::import::ensure_no_reparse_points(&instance_dir, &tmp_dir).map_err(|e| {
+        LauncherError::Instance(format!(
+            "Refusing to extract a world backup through a junction/symlink: {}",
+            e
+        ))
+    })?;
     if tmp_dir.exists() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -3034,6 +4206,7 @@ fn extract_zip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Res
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| LauncherError::Instance(format!("Invalid backup archive: {}", e)))?;
     std::fs::create_dir_all(dest)?;
+    let mut extract_budget = crate::import::ExtractBudget::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -3053,18 +4226,7 @@ fn extract_zip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Res
                 name
             )));
         }
-        let out_path = dest.join(&name);
-        if !out_path.starts_with(dest) {
-            return Err(LauncherError::Instance(format!(
-                "Backup entry escapes the restore directory: {}",
-                name
-            )));
-        }
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut out = std::fs::File::create(&out_path)?;
-        std::io::copy(&mut entry, &mut out)?;
+        crate::import::write_extracted_budgeted(dest, &name, &mut entry, &mut extract_budget)?;
     }
     Ok(())
 }
@@ -3074,6 +4236,7 @@ fn extract_zip_to_dir(zip_path: &std::path::Path, dest: &std::path::Path) -> Res
 /// screenshots and the `.backups` directory are excluded.
 pub fn backup_instance(instances_dir: &Path, name: &str) -> Result<BackupInfo> {
     use zip::write::SimpleFileOptions;
+    let _reservation = InstanceNameReservation::acquire(instances_dir, &[name])?;
     let instance = get_instance(instances_dir, name)?;
     let inst_dir = instance.dir(instances_dir);
     if !inst_dir.is_dir() {
@@ -3370,6 +4533,7 @@ fn restore_instance_with(
     new_name: Option<&str>,
     rename: &dyn RenameOp,
 ) -> Result<()> {
+    validate_instance_dir_name(name, "Instance name")?;
     validate_backup_filename(backup_filename)?;
     // No `get_instance` here on purpose: restore must work even when the
     // live instance's metadata is what got damaged.
@@ -3391,20 +4555,14 @@ fn restore_instance_with(
     let target_name = match mode {
         "replace" => name.to_string(),
         "as_new" => {
-            let n = new_name.unwrap_or("").trim();
-            if n.is_empty()
-                || n.len() > 64
-                || n.contains('/')
-                || n.contains('\\')
-                || n.contains(':')
-                || n.contains('\0')
-                || n.contains("..")
-            {
+            let n = new_name.unwrap_or("");
+            if n.chars().count() > 64 {
                 return Err(LauncherError::Instance(format!(
                     "Invalid instance name: '{}'",
                     n
                 )));
             }
+            validate_instance_dir_name(n, "Instance name")?;
             n.to_string()
         }
         _ => {
@@ -3414,6 +4572,9 @@ fn restore_instance_with(
             )))
         }
     };
+    // Reserve the source and target before checking the target. This closes
+    // the gap between "does not exist" and the directory swap.
+    let _reservation = InstanceNameReservation::acquire(instances_dir, &[name, &target_name])?;
     let target_dir = instances_dir.join(&target_name);
     if mode == "as_new" && target_dir.exists() {
         return Err(LauncherError::Instance(format!(
@@ -3658,6 +4819,117 @@ mod tests {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
+    #[test]
+    fn new_instance_inherits_global_memory_and_gc() {
+        let instance = Instance::new("Inherited", "1.20.1", LoaderType::Vanilla, None);
+        assert_eq!(instance.memory_mb, None, "must inherit global memory");
+        assert_eq!(instance.gc_preset, None, "must inherit global GC");
+    }
+
+    #[test]
+    fn effective_memory_and_gc_inherit_independently() {
+        let mut instance = Instance::new("Inherited", "1.20.1", LoaderType::Vanilla, None);
+        assert_eq!(instance.effective_memory_mb(4096, 8192), 4096);
+        assert_eq!(instance.effective_gc_preset("g1gc"), "g1gc");
+
+        instance.memory_mb = Some(6144);
+        assert_eq!(instance.effective_memory_mb(4096, 8192), 6144);
+        assert_eq!(
+            instance.effective_gc_preset("g1gc"),
+            "g1gc",
+            "memory override must not pin the GC default"
+        );
+
+        instance.gc_preset = Some("zgc".into());
+        assert_eq!(instance.effective_memory_mb(4096, 8192), 6144);
+        assert_eq!(instance.effective_gc_preset("g1gc"), "zgc");
+
+        instance.memory_mb = None;
+        assert_eq!(instance.effective_memory_mb(8192, 8192), 8192);
+    }
+
+    #[test]
+    fn per_instance_memory_is_clamped_to_safe_bounds_and_global_limit() {
+        let mut instance = Instance::new("Bounded", "1.20.1", LoaderType::Vanilla, None);
+
+        // 0 and absurd values must never reach -Xmx.
+        instance.memory_mb = Some(0);
+        assert_eq!(instance.effective_memory_mb(4096, 8192), 2048);
+        instance.memory_mb = Some(1_000_000);
+        assert_eq!(instance.effective_memory_mb(4096, 8192), 8192);
+        instance.memory_mb = Some(16_384);
+        assert_eq!(instance.effective_memory_mb(4096, 8192), 8192);
+
+        // A global default below the floor is also clamped.
+        instance.memory_mb = None;
+        assert_eq!(instance.effective_memory_mb(0, 8192), 2048);
+
+        // Persisted values are normalized to the same absolute bounds.
+        instance.memory_mb = Some(16_384);
+        assert_eq!(instance.normalized_memory_mb(8192), Some(8192));
+        assert_eq!(instance.normalized_memory_mb(32768), Some(16_384));
+        instance.memory_mb = None;
+        assert_eq!(instance.normalized_memory_mb(8192), None);
+    }
+
+    #[test]
+    fn legacy_or_corrupt_memory_json_does_not_break_instance_loading() {
+        // Negative / zero / absurd / null values must be tolerated instead of
+        // failing the whole instance.json deserialize.
+        for (raw, expected) in [
+            ("-4096", None),
+            ("0", None),
+            ("null", None),
+            ("999999999999", Some(crate::config::MAX_MEMORY_MB)),
+            ("6144", Some(6144)),
+        ] {
+            let json = format!(
+                r#"{{"name":"Old","mc_version":"1.20.1","loader":"Vanilla","loader_version":null,
+                   "loader_profile":null,"memory_mb":{raw},"jvm_args":null,"java_path":null,
+                   "resolution":null,"icon":null,"created_at":"2024-01-01T00:00:00Z",
+                   "last_played":null,"play_time_seconds":0,"notes":""}}"#
+            );
+            let loaded: Instance =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("raw {raw}: {e}"));
+            assert_eq!(loaded.memory_mb, expected, "raw value {raw}");
+            assert!(loaded.effective_memory_mb(4096, 8192) >= 2048);
+        }
+    }
+
+    #[test]
+    fn explicit_instance_memory_and_gc_survive_roundtrip() {
+        let mut instance = Instance::new("Custom", "1.20.1", LoaderType::Vanilla, None);
+        instance.memory_mb = Some(6144);
+        instance.gc_preset = Some("zgc".into());
+
+        let json = serde_json::to_string(&instance).unwrap();
+        let loaded: Instance = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.memory_mb, Some(6144));
+        assert_eq!(loaded.gc_preset.as_deref(), Some("zgc"));
+    }
+
+    #[test]
+    fn legacy_instance_without_memory_or_gc_fields_inherits() {
+        let json = r#"{
+            "name": "Legacy",
+            "mc_version": "1.20.1",
+            "loader": "Vanilla",
+            "loader_version": null,
+            "loader_profile": null,
+            "jvm_args": null,
+            "java_path": null,
+            "resolution": null,
+            "icon": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_played": null,
+            "play_time_seconds": 0,
+            "notes": ""
+        }"#;
+        let loaded: Instance = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.memory_mb, None);
+        assert_eq!(loaded.gc_preset, None);
+    }
+
     fn build_prism_zip(path: &Path) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip_w = zip::ZipWriter::new(file);
@@ -3734,6 +5006,27 @@ version = '1.2.3'
         dir
     }
 
+    fn vanilla_instance(name: &str) -> Instance {
+        Instance {
+            name: name.into(),
+            mc_version: "1.20.1".into(),
+            loader: LoaderType::Vanilla,
+            loader_version: None,
+            loader_profile: None,
+            memory_mb: None,
+            jvm_args: None,
+            gc_preset: None,
+            java_path: None,
+            resolution: None,
+            icon: None,
+            banner: None,
+            created_at: Utc::now().to_rfc3339(),
+            last_played: None,
+            play_time_seconds: 0,
+            notes: String::new(),
+        }
+    }
+
     #[test]
     fn delete_screenshot_rejects_path_traversal() {
         let dir = temp_dir("shots");
@@ -3806,7 +5099,12 @@ version = '1.2.3'
         build_prism_zip(&zip_path);
 
         let instances_dir = dir.join("instances");
-        let instance = import_prism_pack(&instances_dir, zip_path.to_str().unwrap()).unwrap();
+        let instance = import_prism_pack(
+            &instances_dir,
+            zip_path.to_str().unwrap(),
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .unwrap();
 
         assert_eq!(instance.name, "Test Pack");
         assert_eq!(instance.mc_version, "1.20.1");
@@ -4023,7 +5321,19 @@ version = 'hIibTfxn'
     }
 
     #[test]
-    fn prism_import_handles_packs_without_mmc_pack_json() {
+    fn prism_default_name_matches_the_archive_cfg() {
+        let dir = temp_dir("prism_default_name");
+        let zip_path = dir.join("pack.zip");
+        build_prism_zip(&zip_path);
+        assert_eq!(
+            prism_pack_default_name(zip_path.to_str().unwrap()).unwrap(),
+            "Test Pack"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prism_import_rejects_packs_without_mmc_pack_json() {
         let dir = temp_dir("nocfg");
         let zip_path = dir.join("pack.zip");
         let file = std::fs::File::create(&zip_path).unwrap();
@@ -4036,15 +5346,82 @@ version = 'hIibTfxn'
         zip_w.finish().unwrap();
 
         let instances_dir = dir.join("instances");
-        let instance = import_prism_pack(&instances_dir, zip_path.to_str().unwrap()).unwrap();
+        let err = import_prism_pack(
+            &instances_dir,
+            zip_path.to_str().unwrap(),
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .expect_err("a Prism pack without version metadata must not become Vanilla");
+        assert!(
+            err.to_string().contains("mmc-pack.json"),
+            "error must name the missing metadata: {err}"
+        );
+        assert!(
+            !instances_dir.join("Old Pack").exists(),
+            "the failed import must not leave an empty-version instance"
+        );
 
-        assert_eq!(instance.name, "Old Pack");
-        assert_eq!(instance.mc_version, "");
-        assert_eq!(instance.loader, LoaderType::Vanilla);
-        assert!(instances_dir
-            .join("Old Pack")
-            .join(".minecraft/mods/old.jar")
-            .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prism_folder_without_version_metadata_is_not_presented_as_vanilla() {
+        let dir = temp_dir("prism_folder_no_pack");
+        let inst = dir.join("Broken");
+        std::fs::create_dir_all(&inst).unwrap();
+        std::fs::write(inst.join("instance.cfg"), b"[General]\nname=Broken\n").unwrap();
+        assert!(
+            parse_prism_cfg(&inst.join("instance.cfg")).is_none(),
+            "a cfg without mmc-pack.json cannot yield a launchable version"
+        );
+
+        std::fs::write(
+            inst.join("mmc-pack.json"),
+            br#"{"components":[{"uid":"net.minecraft","version":"1.20.1"},{"uid":"net.fabricmc.fabric-loader","version":"0.15.11"}],"formatVersion":1}"#,
+        )
+        .unwrap();
+        let parsed = parse_prism_cfg(&inst.join("instance.cfg")).expect("valid Prism folder");
+        assert_eq!(parsed.mc_version, "1.20.1");
+        assert_eq!(parsed.loader, LoaderType::Fabric);
+        assert_eq!(parsed.loader_version.as_deref(), Some("0.15.11"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prism_import_reads_version_loader_memory_and_jvm_args() {
+        let dir = temp_dir("prism_settings");
+        let zip_path = dir.join("pack.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip_w = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default();
+        zip_w.start_file("instance.cfg", opts).unwrap();
+        zip_w.write_all(
+            b"[General]\nname=Settings Pack\nOverrideMemory=true\nMaxMemAlloc=6144\nOverrideJavaArgs=true\nJvmArgs=-XX:+UseG1GC -Dfoo=bar\n",
+        )
+        .unwrap();
+        zip_w.start_file("mmc-pack.json", opts).unwrap();
+        zip_w
+            .write_all(
+                br#"{"components":[{"uid":"net.minecraft","version":"1.20.1"},{"uid":"net.fabricmc.fabric-loader","version":"0.15.11"}],"formatVersion":1}"#,
+            )
+            .unwrap();
+        zip_w.finish().unwrap();
+
+        let instances_dir = dir.join("instances");
+        let instance = import_prism_pack(
+            &instances_dir,
+            zip_path.to_str().unwrap(),
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .unwrap();
+        assert_eq!(instance.mc_version, "1.20.1");
+        assert_eq!(instance.loader, LoaderType::Fabric);
+        assert_eq!(instance.memory_mb, Some(6144));
+        assert_eq!(
+            instance.jvm_args.as_deref(),
+            Some(["-XX:+UseG1GC".to_string(), "-Dfoo=bar".to_string()].as_slice())
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4171,6 +5548,31 @@ version = 'hIibTfxn'
     }
 
     #[test]
+    fn export_refuses_an_instance_that_is_not_ready() {
+        let dir = temp_dir("export_pending");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("PendingExport", "1.20.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        crate::instance_readiness::write_pending(
+            &instances_dir.join("PendingExport"),
+            &crate::instance_readiness::PendingSetup {
+                stage: crate::instance_readiness::SetupStage::Preparing,
+                operation: "import".to_string(),
+                started_at: "2026-11-14T00:00:00Z".to_string(),
+                token: "export-owner".to_string(),
+            },
+        )
+        .unwrap();
+
+        let out = dir.join("export.zip");
+        let err = export_instance(&instances_dir, "PendingExport", out.to_str().unwrap())
+            .expect_err("a partially prepared instance must not be exported as ready");
+        assert!(err.to_string().contains("not fully set up"), "got: {err}");
+        assert!(!out.exists(), "no archive may be produced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn prism_export_round_trip_preserves_instance() {
         let dir = temp_dir("round_trip");
         let src_dir = dir.join("src_instances");
@@ -4184,7 +5586,12 @@ version = 'hIibTfxn'
         export_instance(&src_dir, "RoundTrip", out.to_str().unwrap()).unwrap();
 
         let dst_dir = dir.join("dst_instances");
-        let imported = import_prism_pack(&dst_dir, out.to_str().unwrap()).unwrap();
+        let imported = import_prism_pack(
+            &dst_dir,
+            out.to_str().unwrap(),
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .unwrap();
         assert_eq!(imported.name, "RoundTrip");
         assert_eq!(imported.mc_version, "1.20.1");
         assert_eq!(imported.loader, LoaderType::Forge);
@@ -4213,7 +5620,12 @@ version = 'hIibTfxn'
         zip_w.finish().unwrap();
 
         let instances_dir = dir.join("instances");
-        let err = import_prism_pack(&instances_dir, zip_path.to_str().unwrap()).unwrap_err();
+        let err = import_prism_pack(
+            &instances_dir,
+            zip_path.to_str().unwrap(),
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("Quilt"),
             "error must name Quilt: {}",
@@ -4247,7 +5659,12 @@ version = 'hIibTfxn'
         zip_w.finish().unwrap();
 
         let instances_dir = dir.join("instances");
-        let err = import_prism_pack(&instances_dir, zip_path.to_str().unwrap()).unwrap_err();
+        let err = import_prism_pack(
+            &instances_dir,
+            zip_path.to_str().unwrap(),
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("Unsafe path"),
             "error must name the unsafe path: {}",
@@ -4263,6 +5680,16 @@ version = 'hIibTfxn'
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_loader_names_are_not_shown_as_download_providers() {
+        assert_eq!(normalize_provider("Fabric"), "Local");
+        assert_eq!(normalize_provider("forge"), "Local");
+        assert_eq!(normalize_provider("NeoForge"), "Local");
+        assert_eq!(normalize_provider("modrinth"), "Modrinth");
+        assert_eq!(normalize_provider("curseforge"), "CurseForge");
+        assert_eq!(normalize_provider("atlauncher"), "ATLauncher");
     }
 
     #[test]
@@ -4371,7 +5798,8 @@ version = 'hIibTfxn'
 
         let packs = list_packs(&instances_dir, "P", "resourcepacks").unwrap();
         assert_eq!(packs.len(), 1);
-        assert_eq!(packs[0].filename, "Faithful 32x - 26.3.zip.disabled");
+        assert_eq!(packs[0].filename, "Faithful 32x - 26.3.zip");
+        assert!(!packs[0].enabled);
         assert_eq!(packs[0].name, "Faithful 32x");
         assert_eq!(packs[0].version, "26.3");
         assert_eq!(packs[0].provider, "Modrinth");
@@ -4490,6 +5918,29 @@ version = 'hIibTfxn'
             b"old-bytes"
         );
         assert!(!dir.join("sodium-0.5.8.jar.voidlauncher-old").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replacing_a_jar_never_deletes_a_same_stem_zip_sibling() {
+        let dir = temp_dir("stash_sibling_extension");
+        std::fs::write(dir.join("Foo.jar"), b"old-jar").unwrap();
+        std::fs::write(dir.join("Foo.zip"), b"unrelated-zip").unwrap();
+
+        let stashed = stash_old_content_files(&dir, "Foo.jar").unwrap();
+        assert_eq!(stashed.len(), 1, "only the replaced jar is parked");
+        assert!(dir.join("Foo.zip").exists());
+
+        std::fs::write(dir.join("Foo.jar"), b"new-jar").unwrap();
+        discard_stashed_files(&stashed);
+
+        assert_eq!(std::fs::read(dir.join("Foo.jar")).unwrap(), b"new-jar");
+        assert_eq!(
+            std::fs::read(dir.join("Foo.zip")).unwrap(),
+            b"unrelated-zip",
+            "a different content item with the same stem must survive"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5061,6 +6512,103 @@ version = 'hIibTfxn'
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn backup_and_export_do_not_follow_junctions_outside_the_instance() {
+        use std::os::windows::process::CommandExt;
+        let dir = temp_dir("backup_junction");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("JunctionPack", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"do-not-archive").unwrap();
+        let link = instance
+            .minecraft_dir(&instances_dir)
+            .join("linked-outside");
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .raw_arg(format!(
+                "mklink /J \"{}\" \"{}\"",
+                link.display(),
+                outside.display()
+            ))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("skipping backup junction test: mklink /J failed");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // Export: the junction must not be followed (and must not loop).
+        let export_path = dir.join("export.zip");
+        export_instance(
+            &instances_dir,
+            "JunctionPack",
+            export_path.to_str().unwrap(),
+        )
+        .unwrap();
+        let exported = zip_entry_names(&export_path);
+        assert!(
+            !exported.iter().any(|n| n.contains("linked-outside")),
+            "export captured data outside the instance: {:?}",
+            exported
+        );
+
+        // Backup: same guarantee.
+        let info = backup_instance(&instances_dir, "JunctionPack").unwrap();
+        let zip_path = instances_dir
+            .join("JunctionPack")
+            .join(".backups")
+            .join("instances")
+            .join(&info.filename);
+        let backed_up = zip_entry_names(&zip_path);
+        assert!(
+            !backed_up.iter().any(|n| n.contains("linked-outside")),
+            "backup captured data outside the instance: {:?}",
+            backed_up
+        );
+        assert!(
+            std::fs::read(outside.join("secret.txt")).unwrap() == b"do-not-archive",
+            "the junction target must stay untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_and_export_reserve_the_instance_against_rename_and_delete() {
+        let dir = temp_dir("inst_read_reservation");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("ReadMe", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+        let out = dir.join("export.zip");
+
+        // A rename/delete reservation (acquired by the competing operation)
+        // must make both read operations fail instead of archiving a moving
+        // directory.
+        {
+            let _competitor =
+                InstanceNameReservation::acquire(&instances_dir, &["ReadMe"]).unwrap();
+            assert!(backup_instance(&instances_dir, "ReadMe").is_err());
+            assert!(export_instance(&instances_dir, "ReadMe", out.to_str().unwrap()).is_err());
+            assert!(!out.exists());
+        }
+
+        // Once the competing operation is gone, backup and export succeed and
+        // their own guards are released for the next operation.
+        backup_instance(&instances_dir, "ReadMe").expect("backup after release");
+        export_instance(&instances_dir, "ReadMe", out.to_str().unwrap()).expect("export");
+        assert!(out.is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn restore_instance_replace_recovers_content_and_keeps_backup_history() {
         let dir = temp_dir("inst_restore_replace");
@@ -5460,6 +7008,33 @@ version = 'hIibTfxn'
     }
 
     #[test]
+    fn restore_as_new_respects_a_reserved_target_name() {
+        let (dir, instances_dir, _instance, backup) =
+            restore_replace_fixture("restore_reserved_target");
+        let guard = InstanceNameReservation::acquire(&instances_dir, &["TargetPack"]).unwrap();
+
+        let err = restore_instance(
+            &instances_dir,
+            "Locked",
+            &backup.filename,
+            "as_new",
+            Some("TargetPack"),
+        )
+        .expect_err("restore must not claim a reserved target");
+        assert!(err.to_string().contains("Another operation"), "got: {err}");
+        assert!(
+            !instances_dir.join("TargetPack").exists(),
+            "the reserved target must not be created"
+        );
+        assert!(
+            instances_dir.join("Locked").join("instance.json").is_file(),
+            "the source instance must stay intact"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn restore_move_aside_failure_keeps_the_original_and_backup() {
         let (dir, instances_dir, instance, backup) =
             restore_replace_fixture("restore_locked_aside");
@@ -5667,8 +7242,14 @@ version = 'hIibTfxn'
         std::fs::create_dir_all(&backups).unwrap();
         std::fs::write(backups.join("Src__old.zip"), b"zip-bytes").unwrap();
 
-        let copy = duplicate_instance(&instances_dir, "Src", "Dst", DuplicateExclusions::default())
-            .unwrap();
+        let copy = duplicate_instance(
+            &instances_dir,
+            "Src",
+            "Dst",
+            DuplicateExclusions::default(),
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .unwrap();
 
         assert_eq!(copy.name, "Dst");
         assert_eq!(copy.play_time_seconds, 0);
@@ -5694,6 +7275,52 @@ version = 'hIibTfxn'
     }
 
     #[test]
+    fn duplicate_never_publishes_an_incomplete_target() {
+        let dir = temp_dir("dup_readiness");
+        let instances_dir = dir.join("instances");
+        let instance = test_instance("Src", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &instance, None).unwrap();
+        make_instance_files(&instances_dir, &instance);
+        std::fs::write(
+            instances_dir.join("Src").join(".void-instance-pending"),
+            br#"{"stage":"importing","operation":"import","started_at":"2026-11-14T00:00:00Z","token":"x"}"#,
+        )
+        .unwrap();
+
+        // A partial source must never be cloned into a launchable instance.
+        let launches = crate::launch_state::LaunchRegistry::new();
+        let err = duplicate_instance(
+            &instances_dir,
+            "Src",
+            "Dst",
+            DuplicateExclusions::default(),
+            &launches,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not fully set up"), "got: {err}");
+        assert!(!instances_dir.join("Dst").exists());
+
+        // A complete source produces a target with no inherited marker and a
+        // launch slot that is free again.
+        std::fs::remove_file(instances_dir.join("Src").join(".void-instance-pending")).unwrap();
+        let copy = duplicate_instance(
+            &instances_dir,
+            "Src",
+            "Dst",
+            DuplicateExclusions::default(),
+            &launches,
+        )
+        .unwrap();
+        assert_eq!(copy.name, "Dst");
+        assert!(
+            crate::instance_readiness::read_pending(&instances_dir.join("Dst")).is_none(),
+            "duplicating must not copy the source's setup marker"
+        );
+        assert!(launches.begin_launch("Dst").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn duplicate_instance_excludes_picked_content() {
         let dir = temp_dir("dup_exclude");
         let instances_dir = dir.join("instances");
@@ -5709,7 +7336,14 @@ version = 'hIibTfxn'
             screenshots: true,
             logs: true,
         };
-        duplicate_instance(&instances_dir, "Src", "Dst", exclude).unwrap();
+        duplicate_instance(
+            &instances_dir,
+            "Src",
+            "Dst",
+            exclude,
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .unwrap();
 
         let dst_mc = instances_dir.join("Dst").join(".minecraft");
         // Metadata + mods always travel.
@@ -5860,6 +7494,955 @@ version = 'hIibTfxn'
         assert_eq!(copy.mc_version, "1.21.1");
         assert!(instances_dir.join("Source").exists(), "original untouched");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_options_resource_packs_roundtrip_and_preserve_settings() {
+        let dir = temp_dir("options_test");
+        let options_path = dir.join("options.txt");
+
+        let initial_content = "fov:70.0\r\nsoundCategory_master:1.0\r\nresourcePacks:[\"vanilla\",\"mod_resources\"]\r\ngamma:1.0\r\n";
+        std::fs::write(&options_path, initial_content).unwrap();
+
+        // 1. Enable pack
+        set_options_resource_pack_enabled(&options_path, "Faithful.zip", true).unwrap();
+
+        let (packs, _) = read_options_resource_packs(&options_path);
+        assert_eq!(packs, vec!["vanilla", "mod_resources", "file/Faithful.zip"]);
+
+        // Check settings preserved and backup created
+        let new_content = std::fs::read_to_string(&options_path).unwrap();
+        assert!(new_content.contains("fov:70.0"));
+        assert!(new_content.contains("soundCategory_master:1.0"));
+        assert!(new_content.contains("gamma:1.0"));
+
+        let bak_path = dir.join("options.txt.bak");
+        assert!(bak_path.exists());
+        let bak_content = std::fs::read_to_string(&bak_path).unwrap();
+        assert_eq!(bak_content, initial_content);
+
+        // 2. Disable pack
+        set_options_resource_pack_enabled(&options_path, "Faithful.zip", false).unwrap();
+        let (packs_after_disable, _) = read_options_resource_packs(&options_path);
+        assert_eq!(packs_after_disable, vec!["vanilla", "mod_resources"]);
+
+        // 3. Disable with .disabled suffix argument (should also match)
+        set_options_resource_pack_enabled(&options_path, "Faithful.zip", true).unwrap();
+        set_options_resource_pack_enabled(&options_path, "Faithful.zip.disabled", false).unwrap();
+        let (packs_disabled_again, _) = read_options_resource_packs(&options_path);
+        assert_eq!(packs_disabled_again, vec!["vanilla", "mod_resources"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn options_read_error_is_never_treated_as_an_empty_file() {
+        let dir = temp_dir("options_unreadable");
+        let options_path = dir.join("options.txt");
+        // Invalid UTF-8 is a realistic read error on legacy/localized files.
+        let original = vec![0xFF, 0xFE, 0x00, 0x41];
+        std::fs::write(&options_path, &original).unwrap();
+
+        assert!(set_options_resource_pack_enabled(&options_path, "A.zip", true).is_err());
+        assert_eq!(std::fs::read(&options_path).unwrap(), original);
+        assert!(set_options_resource_packs_order(&options_path, &["A.zip".into()]).is_err());
+        assert_eq!(std::fs::read(&options_path).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_resource_packs_line_is_not_rewritten() {
+        let dir = temp_dir("options_bad_packs");
+        let options_path = dir.join("options.txt");
+        let original = "fov:70.0\nresourcePacks:not-json\ngamma:1.0\n";
+        std::fs::write(&options_path, original).unwrap();
+
+        assert!(set_options_resource_pack_enabled(&options_path, "A.zip", true).is_err());
+        assert_eq!(std::fs::read_to_string(&options_path).unwrap(), original);
+        assert!(set_options_resource_packs_order(&options_path, &["A.zip".into()]).is_err());
+        assert_eq!(std::fs::read_to_string(&options_path).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_options_resource_packs_order_preserves_system_packs() {
+        let dir = temp_dir("options_order_test");
+        let options_path = dir.join("options.txt");
+
+        let initial_content =
+            "resourcePacks:[\"vanilla\",\"mod_resources\",\"file/PackA.zip\",\"file/PackB.zip\"]\n";
+        std::fs::write(&options_path, initial_content).unwrap();
+
+        set_options_resource_packs_order(&options_path, &["PackB.zip".into(), "PackA.zip".into()])
+            .unwrap();
+
+        let (packs, _) = read_options_resource_packs(&options_path);
+        assert_eq!(
+            packs,
+            vec![
+                "vanilla",
+                "mod_resources",
+                "file/PackB.zip",
+                "file/PackA.zip"
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_options_resource_packs_order_ignores_inactive_and_duplicate_names() {
+        let dir = temp_dir("options_order_active_only");
+        let options_path = dir.join("options.txt");
+
+        std::fs::write(
+            &options_path,
+            "resourcePacks:[\"vanilla\",\"file/PackA.zip\",\"file/PackB.zip\"]\n",
+        )
+        .unwrap();
+
+        set_options_resource_packs_order(
+            &options_path,
+            &[
+                "Disabled.zip".into(),
+                "PackB.zip".into(),
+                "PackB.zip".into(),
+                "PackA.zip".into(),
+            ],
+        )
+        .unwrap();
+
+        let (packs, _) = read_options_resource_packs(&options_path);
+        assert_eq!(packs, vec!["vanilla", "file/PackB.zip", "file/PackA.zip"]);
+        assert!(
+            !is_pack_enabled_in_list("Disabled.zip", &packs),
+            "a disabled pack must never be enabled by a reorder"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_options_resource_packs_order_keeps_unmentioned_active_packs() {
+        let dir = temp_dir("options_order_keep_unmentioned");
+        let options_path = dir.join("options.txt");
+
+        std::fs::write(
+            &options_path,
+            "resourcePacks:[\"vanilla\",\"file/A.zip\",\"file/B.zip\",\"file/C.zip\"]\n",
+        )
+        .unwrap();
+
+        set_options_resource_packs_order(&options_path, &["C.zip".into()]).unwrap();
+
+        let (packs, _) = read_options_resource_packs(&options_path);
+        assert_eq!(
+            packs,
+            vec!["vanilla", "file/C.zip", "file/A.zip", "file/B.zip"],
+            "an active pack omitted from the request must stay active"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resource_pack_commands_reject_path_separators() {
+        let dir = temp_dir("options_reject_paths");
+        let options_path = dir.join("options.txt");
+        std::fs::write(
+            &options_path,
+            "resourcePacks:[\"vanilla\",\"file/Valid.zip\"]\n",
+        )
+        .unwrap();
+
+        assert!(set_options_resource_pack_enabled(&options_path, "../Evil.zip", true).is_err());
+        assert!(set_options_resource_packs_order(&options_path, &["../Evil.zip".into()]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&options_path).unwrap(),
+            "resourcePacks:[\"vanilla\",\"file/Valid.zip\"]\n",
+            "rejected input must not modify options.txt"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_options_resource_packs_order_does_not_create_missing_options_file() {
+        let dir = temp_dir("options_order_missing");
+        let options_path = dir.join("options.txt");
+
+        set_options_resource_packs_order(&options_path, &["A.zip".into()]).unwrap();
+
+        assert!(
+            !options_path.exists(),
+            "reordering must not invent options.txt"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_packs_resourcepacks_sorted_by_options_priority() {
+        let dir = temp_dir("list_packs_priority");
+        let instances_dir = dir.join("instances");
+        let instance_name = "PriorityTest";
+        save_instance(&instances_dir, &vanilla_instance(instance_name), None).unwrap();
+
+        let mc_dir = instances_dir.join(instance_name).join(".minecraft");
+        let rp_dir = mc_dir.join("resourcepacks");
+        std::fs::create_dir_all(&rp_dir).unwrap();
+        for name in ["A.zip", "B.zip", "C.zip", "D.zip"] {
+            std::fs::write(rp_dir.join(name), b"dummy").unwrap();
+        }
+
+        // options.txt is low -> high priority: B, C, A. D is not active.
+        std::fs::write(
+            mc_dir.join("options.txt"),
+            "resourcePacks:[\"vanilla\",\"file/B.zip\",\"file/C.zip\",\"file/A.zip\"]\n",
+        )
+        .unwrap();
+
+        let packs = list_packs(&instances_dir, instance_name, "resourcepacks").unwrap();
+        let filenames: Vec<&str> = packs.iter().map(|p| p.filename.as_str()).collect();
+        assert_eq!(
+            filenames,
+            vec!["A.zip", "C.zip", "B.zip", "D.zip"],
+            "highest-priority active pack must be listed first"
+        );
+        assert!(packs[0].enabled && packs[1].enabled && packs[2].enabled);
+        assert!(!packs[3].enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_packs_fallback_name_drops_only_instance_mc_suffix() {
+        let dir = temp_dir("list_packs_mc_name");
+        let instances_dir = dir.join("instances");
+        let instance_name = "NameTest";
+        save_instance(&instances_dir, &vanilla_instance(instance_name), None).unwrap();
+
+        let mc_dir = instances_dir.join(instance_name).join(".minecraft");
+        let rp_dir = mc_dir.join("resourcepacks");
+        std::fs::create_dir_all(&rp_dir).unwrap();
+        std::fs::write(rp_dir.join("Faithful 32x - 1.20.1.zip"), b"PK\x03\x04dummy").unwrap();
+        std::fs::write(rp_dir.join("Faithful 32x - 26.3.zip"), b"PK\x03\x04dummy").unwrap();
+
+        let packs = list_packs(&instances_dir, instance_name, "resourcepacks").unwrap();
+        let names: Vec<(&str, &str)> = packs
+            .iter()
+            .map(|p| (p.filename.as_str(), p.name.as_str()))
+            .collect();
+        assert!(names.contains(&("Faithful 32x - 1.20.1.zip", "Faithful 32x")));
+        // A suffix for another MC version may be part of the real pack name.
+        assert!(names.contains(&("Faithful 32x - 26.3.zip", "Faithful 32x - 26.3")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_pack_enabled_in_list_matching() {
+        let list = vec![
+            "vanilla".to_string(),
+            "mod_resources".to_string(),
+            "file/FreshAnimations.zip".to_string(),
+            "BareBones.zip".to_string(),
+        ];
+
+        assert!(is_pack_enabled_in_list("FreshAnimations.zip", &list));
+        assert!(is_pack_enabled_in_list(
+            "FreshAnimations.zip.disabled",
+            &list
+        ));
+        assert!(is_pack_enabled_in_list("BareBones.zip", &list));
+        assert!(!is_pack_enabled_in_list("OtherPack.zip", &list));
+    }
+
+    #[test]
+    fn clean_pack_stem_strips_extensions_and_color_codes() {
+        assert_eq!(clean_pack_stem("Faithful 32x.zip"), "Faithful 32x");
+        assert_eq!(clean_pack_stem("Faithful 32x.zip.disabled"), "Faithful 32x");
+        assert_eq!(clean_pack_stem("Bare_Bones.jar"), "Bare_Bones");
+        assert_eq!(clean_pack_stem("Bare_Bones.jar.disabled"), "Bare_Bones");
+        assert_eq!(clean_pack_stem("§6Fancy Pack§r.zip"), "Fancy Pack");
+        assert_eq!(clean_pack_stem("FolderPack"), "FolderPack");
+    }
+
+    #[test]
+    fn pack_filename_fallback_removes_only_the_instance_mc_version() {
+        assert_eq!(
+            clean_pack_stem_for_mc("Faithful 32x - 26.3.zip", "26.3"),
+            "Faithful 32x"
+        );
+        assert_eq!(
+            clean_pack_stem_for_mc("Faithful 32x (1.20.1).zip", "1.20.1"),
+            "Faithful 32x"
+        );
+        assert_eq!(
+            clean_pack_stem_for_mc("Faithful 32x - 1.20.1.zip", "26.3"),
+            "Faithful 32x - 1.20.1",
+            "a suffix for another MC version may be part of the pack name"
+        );
+        assert_eq!(
+            clean_pack_stem_for_mc("Faithful 32x.zip", "26.3"),
+            "Faithful 32x"
+        );
+        assert_eq!(
+            clean_pack_stem_for_mc("26.3.zip", "26.3"),
+            "26.3",
+            "never reduce a name to an empty string"
+        );
+    }
+
+    #[test]
+    fn parse_minecraft_text_handles_strings_objects_and_recursive_extra() {
+        // String
+        let v1 = serde_json::json!("Simple description");
+        assert_eq!(
+            parse_minecraft_text(&v1).as_deref(),
+            Some("Simple description")
+        );
+
+        // Object with text and nested extra
+        let v2 = serde_json::json!({
+            "text": "Root",
+            "extra": [
+                {
+                    "text": " Child",
+                    "extra": [
+                        { "text": " Leaf", "color": "green" }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(
+            parse_minecraft_text(&v2).as_deref(),
+            Some("Root Child Leaf")
+        );
+
+        // Array with color codes
+        let v3 = serde_json::json!([
+            { "text": "§eWarning: " },
+            { "text": "§aAll good!" }
+        ]);
+        assert_eq!(
+            parse_minecraft_text(&v3).as_deref(),
+            Some("Warning: All good!")
+        );
+    }
+
+    #[test]
+    fn read_pack_meta_tolerates_corrupt_archives_and_missing_files() {
+        let dir = temp_dir("pack_meta_corrupt");
+        let broken_zip = dir.join("broken.zip");
+        std::fs::write(&broken_zip, b"not a zip archive").unwrap();
+
+        assert_eq!(read_pack_meta_from_zip(&broken_zip), (None, None));
+        assert_eq!(read_pack_meta_from_dir(&dir), (None, None));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_pack_meta_from_json_separates_name_and_description() {
+        // Standard vanilla pack.mcmeta (only description)
+        let standard = serde_json::json!({
+            "pack": {
+                "pack_format": 15,
+                "description": "§6A nice pack description§r\nBy Dev"
+            }
+        });
+        let (name, desc) = read_pack_meta_from_json(&standard);
+        assert_eq!(
+            name, None,
+            "Vanilla pack.mcmeta has no pack.name, name must be None"
+        );
+        assert_eq!(desc.as_deref(), Some("A nice pack description\nBy Dev"));
+
+        // Extended pack.mcmeta with explicit pack.name
+        let extended = serde_json::json!({
+            "pack": {
+                "name": "Custom Pack Name",
+                "pack_format": 15,
+                "description": "Some description"
+            }
+        });
+        let (name2, desc2) = read_pack_meta_from_json(&extended);
+        assert_eq!(name2.as_deref(), Some("Custom Pack Name"));
+        assert_eq!(desc2.as_deref(), Some("Some description"));
+    }
+
+    #[test]
+    fn test_list_packs_resourcepacks_auto_migrates_and_reads_options() {
+        let dir = temp_dir("list_packs_test");
+        let instances_dir = dir.join("instances");
+        let instance_name = "PackTest";
+
+        let inst = Instance {
+            name: instance_name.into(),
+            mc_version: "1.20.1".into(),
+            loader: LoaderType::Vanilla,
+            loader_version: None,
+            loader_profile: None,
+            memory_mb: None,
+            jvm_args: None,
+            gc_preset: None,
+            java_path: None,
+            resolution: None,
+            icon: None,
+            banner: None,
+            created_at: Utc::now().to_rfc3339(),
+            last_played: None,
+            play_time_seconds: 0,
+            notes: String::new(),
+        };
+        save_instance(&instances_dir, &inst, None).unwrap();
+
+        let mc_dir = instances_dir.join(instance_name).join(".minecraft");
+        let rp_dir = mc_dir.join("resourcepacks");
+        std::fs::create_dir_all(&rp_dir).unwrap();
+
+        // Create one pack as .disabled and one pack as active
+        std::fs::write(rp_dir.join("OldDisabledPack.zip.disabled"), b"dummy").unwrap();
+        std::fs::write(rp_dir.join("ActivePack.zip"), b"dummy").unwrap();
+
+        // Write options.txt with only ActivePack enabled
+        let options_content = "resourcePacks:[\"vanilla\",\"file/ActivePack.zip\"]\n";
+        std::fs::write(mc_dir.join("options.txt"), options_content).unwrap();
+
+        let packs = list_packs(&instances_dir, instance_name, "resourcepacks").unwrap();
+
+        // Verify OldDisabledPack was migrated on disk
+        assert!(
+            rp_dir.join("OldDisabledPack.zip").exists(),
+            "Migrated to .zip"
+        );
+        assert!(
+            !rp_dir.join("OldDisabledPack.zip.disabled").exists(),
+            "Old .disabled removed"
+        );
+
+        // Verify active statuses
+        let active = packs
+            .iter()
+            .find(|p| p.filename == "ActivePack.zip")
+            .expect("ActivePack found");
+        assert!(active.enabled, "ActivePack should be enabled");
+
+        let old = packs
+            .iter()
+            .find(|p| p.filename == "OldDisabledPack.zip")
+            .expect("OldDisabledPack found");
+        assert!(
+            !old.enabled,
+            "OldDisabledPack should be disabled in options.txt"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_atomic_write_file_roundtrip_and_safety() {
+        let dir = temp_dir("atomic_test");
+        let target = dir.join("options.txt");
+
+        // 1. Initial write
+        atomic_write_file(&target, "version:1\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "version:1\n");
+
+        // 2. Replacement
+        atomic_write_file(&target, "version:2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "version:2\n");
+        assert!(
+            !dir.join("options.tmp").exists(),
+            "tmp file must be cleaned up"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_atomic_write_file_failure_leaves_original_intact() {
+        let dir = temp_dir("atomic_fail_test");
+        let target = dir.join("options.txt");
+        let original_content = "original:true\n";
+        atomic_write_file(&target, original_content).unwrap();
+
+        // Simulate write failure by creating options.tmp as a directory so std::fs::write(&tmp, ...) fails
+        let tmp = target.with_extension("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let res = atomic_write_file(&target, "corrupted:true\n");
+        assert!(res.is_err(), "Must return error when tmp cannot be written");
+
+        // Verify original file is 100% intact and was not lost or truncated
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original_content);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_atomic_write_file_rollback_when_replace_fails() {
+        let dir = temp_dir("atomic_rollback_test");
+        let target = dir.join("options.txt");
+        let old = target.with_extension("old");
+        let tmp = target.with_extension("tmp");
+        let original_content = "original:true\ngameplay:smooth\n";
+        atomic_write_file(&target, original_content).unwrap();
+
+        // Custom rename function to simulate:
+        // 1. Direct replace (tmp -> target) fails (e.g. Windows sharing violation)
+        // 2. Safe fallback: rename target -> old succeeds
+        // 3. Rename tmp -> target fails (e.g. AV scan / permission denied on new destination)
+        // 4. Rollback: rename old -> target succeeds
+        let rename_mock = |from: &Path, to: &Path| -> std::io::Result<()> {
+            if from == tmp && to == target {
+                // Fail any attempt to rename tmp -> target
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Simulated rename tmp -> target failure",
+                ))
+            } else {
+                // Allow target -> old and old -> target
+                std::fs::rename(from, to)
+            }
+        };
+
+        let res = atomic_write_file_impl(&target, "new_broken_content:true\n", rename_mock);
+
+        // 1. Operation must return an error
+        assert!(
+            res.is_err(),
+            "Must report error when replacing target fails"
+        );
+
+        // 2. Original options.txt must be restored from .old and be 100% intact
+        assert!(target.exists(), "Target file options.txt must exist");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            original_content,
+            "Target file options.txt must contain original content intact"
+        );
+
+        // 3. options.old must no longer exist (moved back to options.txt)
+        assert!(
+            !old.exists(),
+            "options.old must be moved back to options.txt"
+        );
+
+        // 4. Temporary file options.tmp must be cleaned up
+        assert!(!tmp.exists(), "Temporary file options.tmp must be removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_instance_never_overwrites_an_existing_instance() {
+        let dir = temp_dir("save_duplicate_name");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let alpha = Instance::new("Alpha", "1.20.1", LoaderType::Vanilla, None);
+        let beta = Instance::new("Beta", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &alpha, None).unwrap();
+        save_instance(&instances_dir, &beta, None).unwrap();
+
+        let beta_config = instances_dir.join("Beta").join("instance.json");
+        let beta_before = std::fs::read_to_string(&beta_config).unwrap();
+
+        let mut renamed = alpha.clone();
+        renamed.name = "Beta".to_string();
+        let error = save_instance(&instances_dir, &renamed, Some("Alpha")).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "got: {error}");
+
+        assert_eq!(
+            std::fs::read_to_string(&beta_config).unwrap(),
+            beta_before,
+            "the existing instance's metadata must stay untouched"
+        );
+        assert!(
+            instances_dir.join("Alpha").join("instance.json").is_file(),
+            "the source instance must not be renamed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn case_only_rename_is_allowed_and_updates_metadata() {
+        let dir = temp_dir("case_only_rename");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let original = Instance::new("Alpha", "1.20.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &original, None).unwrap();
+
+        let mut renamed = original.clone();
+        renamed.name = "alpha".to_string();
+        save_instance(&instances_dir, &renamed, Some("Alpha")).unwrap();
+
+        let listed = list_instances(&instances_dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "alpha");
+        let on_disk = std::fs::read_dir(&instances_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .find(|name| name.eq_ignore_ascii_case("alpha"))
+            .expect("the instance directory must still exist");
+        assert_eq!(on_disk, "alpha", "the on-disk casing must change");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_marker(root: &Path, marker: &str, bytes: &[u8]) {
+        let path = root.join(".minecraft").join(marker);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn save_instance_rejects_unsafe_old_and_new_names() {
+        let dir = temp_dir("unsafe_instance_names");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let good = Instance::new("Good", "1.20.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &good, None).unwrap();
+        write_marker(&instances_dir.join("Good"), "keep.txt", b"keep");
+
+        let bad_names = [
+            "",
+            ".",
+            "..",
+            "../Outside",
+            "..\\Outside",
+            "/Outside",
+            "\\Outside",
+            "C:\\Outside",
+            "C:Outside",
+            "Sub/Child",
+            "Sub\\Child",
+            "CON",
+            "CON.txt",
+            "Name.",
+            " Name",
+            "Name ",
+            "bad:name",
+            "bad?name",
+        ];
+        for bad in bad_names {
+            let mut instance = good.clone();
+            instance.name = bad.to_string();
+            assert!(
+                save_instance(&instances_dir, &instance, None).is_err(),
+                "new name {bad:?} must be rejected"
+            );
+
+            let mut renamed = good.clone();
+            renamed.name = "Renamed".to_string();
+            assert!(
+                save_instance(&instances_dir, &renamed, Some(bad)).is_err(),
+                "old name {bad:?} must be rejected"
+            );
+            assert!(
+                !instances_dir.join("Renamed").exists(),
+                "a rejected rename must not create the target for {bad:?}"
+            );
+            assert_eq!(
+                std::fs::read(instances_dir.join("Good").join(".minecraft/keep.txt")).unwrap(),
+                b"keep",
+                "the source instance must stay intact for {bad:?}"
+            );
+        }
+        assert!(!dir.join("Outside").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn instance_name_reservation_blocks_competing_directory_operations() {
+        let dir = temp_dir("instance_name_registry");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let source = Instance::new("Source", "1.20.1", LoaderType::Vanilla, None);
+        let target = Instance::new("Target", "1.21.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &source, None).unwrap();
+        save_instance(&instances_dir, &target, None).unwrap();
+        write_marker(&instances_dir.join("Target"), "keep.txt", b"target");
+        write_marker(&instances_dir.join("Source"), "source.txt", b"source");
+        let target_config = instances_dir.join("Target").join("instance.json");
+        let target_before = std::fs::read_to_string(&target_config).unwrap();
+
+        let guard = InstanceNameReservation::acquire(&instances_dir, &["Target"]).unwrap();
+        assert!(
+            InstanceNameReservation::acquire(&instances_dir, &["target"]).is_err(),
+            "the registry must be case-insensitive"
+        );
+        assert!(
+            duplicate_instance(
+                &instances_dir,
+                "Source",
+                "Target",
+                DuplicateExclusions::default(),
+                &crate::launch_state::LaunchRegistry::new(),
+            )
+            .is_err(),
+            "a copy must not target a reserved name"
+        );
+        assert!(
+            delete_instance(&instances_dir, "Target").is_err(),
+            "a delete must not remove a reserved name"
+        );
+        let created = Instance::new("Target", "1.22.1", LoaderType::Vanilla, None);
+        assert!(
+            create_instance(
+                &instances_dir,
+                &created,
+                &crate::launch_state::LaunchRegistry::new()
+            )
+            .is_err(),
+            "a create must not claim a reserved name"
+        );
+        let mut renamed = source.clone();
+        renamed.name = "Target".to_string();
+        assert!(
+            save_instance(&instances_dir, &renamed, Some("Source")).is_err(),
+            "a rename must not claim a reserved target"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&target_config).unwrap(),
+            target_before,
+            "the reserved target must stay untouched"
+        );
+        assert_eq!(
+            std::fs::read(instances_dir.join("Source").join(".minecraft/source.txt")).unwrap(),
+            b"source",
+            "the source must stay intact"
+        );
+        drop(guard);
+        assert!(InstanceNameReservation::acquire(&instances_dir, &["Target"]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn name_reservation_canonicalizes_junction_aliases() {
+        use std::os::windows::process::CommandExt;
+        let dir = temp_dir("instance_alias_registry");
+        let real = dir.join("real-instances");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = dir.join("alias-instances");
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .raw_arg(format!(
+                "mklink /J \"{}\" \"{}\"",
+                alias.display(),
+                real.display()
+            ))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !status.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("skipping junction alias test: privilege unavailable");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        // Two lexical paths to the same directory must share one registry key.
+        let guard = InstanceNameReservation::acquire(&real, &["Pack"]).expect("real path");
+        assert!(
+            InstanceNameReservation::acquire(&alias, &["Pack"]).is_err(),
+            "a junction alias must not bypass the name reservation"
+        );
+        drop(guard);
+        assert!(InstanceNameReservation::acquire(&alias, &["Pack"]).is_ok());
+
+        let _ = std::fs::remove_dir(&alias);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_renames_to_the_same_target_have_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = temp_dir("concurrent_rename");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+        let alpha = Instance::new("Alpha", "1.20.1", LoaderType::Vanilla, None);
+        let bravo = Instance::new("Bravo", "1.20.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &alpha, None).unwrap();
+        save_instance(&instances_dir, &bravo, None).unwrap();
+        write_marker(&instances_dir.join("Alpha"), "alpha.txt", b"alpha");
+        write_marker(&instances_dir.join("Bravo"), "bravo.txt", b"bravo");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for mut instance in [alpha, bravo] {
+            let instances_dir = instances_dir.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let old_name = instance.name.clone();
+                instance.name = "Target".to_string();
+                barrier.wait();
+                save_instance(&instances_dir, &instance, Some(&old_name))
+                    .map(|_| old_name)
+                    .map_err(|e| e.to_string())
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("rename worker must not panic"))
+            .collect();
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one rename may win: {results:?}"
+        );
+
+        let target = instances_dir.join("Target");
+        assert!(target.join("instance.json").is_file());
+        let alpha_marker = target.join(".minecraft/alpha.txt").is_file();
+        let bravo_marker = target.join(".minecraft/bravo.txt").is_file();
+        assert_ne!(
+            alpha_marker, bravo_marker,
+            "the target must contain exactly one source tree, never a merge"
+        );
+
+        let loser_dir = if alpha_marker {
+            instances_dir.join("Bravo")
+        } else {
+            instances_dir.join("Alpha")
+        };
+        assert!(
+            loser_dir.join("instance.json").is_file(),
+            "the losing source instance must stay intact"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&instances_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".voidlauncher-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no copy/rename staging directories may remain: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_fallback_never_merges_and_removes_the_source_only_after_success() {
+        let dir = temp_dir("copy_fallback");
+        let source = dir.join("Source");
+        std::fs::create_dir_all(source.join(".minecraft/mods")).unwrap();
+        std::fs::write(source.join(".minecraft/mods/source.jar"), b"source").unwrap();
+        std::fs::write(source.join("instance.json"), b"{}").unwrap();
+
+        let existing = dir.join("Existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("keep.txt"), b"keep").unwrap();
+        let err = copy_tree_to_new_path(&source, &existing, &|_| false).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+        assert_eq!(std::fs::read(existing.join("keep.txt")).unwrap(), b"keep");
+        assert!(source.join(".minecraft/mods/source.jar").is_file());
+
+        // Simulate fs::rename failing (Windows sharing violation): the
+        // fallback copies to a hidden sibling, renames it into place, and only
+        // then removes the source.
+        let moved = dir.join("Moved");
+        move_directory_with(&source, &moved, "Source", &|_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated locked directory",
+            ))
+        })
+        .expect("the copy fallback must succeed");
+        assert_eq!(
+            std::fs::read(moved.join(".minecraft/mods/source.jar")).unwrap(),
+            b"source"
+        );
+        assert!(!source.exists(), "the source is removed after a full copy");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".voidlauncher-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging must be cleaned: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_instances_ignores_restore_staging_directories() {
+        let dir = temp_dir("list_ignores_staging");
+        let instances_dir = dir.join("instances");
+        std::fs::create_dir_all(&instances_dir).unwrap();
+
+        let real = Instance::new("Real", "1.20.1", LoaderType::Vanilla, None);
+        save_instance(&instances_dir, &real, None).unwrap();
+
+        let staging = instances_dir.join(".void-restore-tmp-test");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join("instance.json"),
+            serde_json::to_string(&real).unwrap(),
+        )
+        .unwrap();
+
+        let listed = list_instances(&instances_dir).unwrap();
+        assert_eq!(listed.len(), 1, "staging directory must be hidden");
+        assert_eq!(listed[0].name, "Real");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_summaries_expose_pending_state_without_persisting_it() {
+        let dir = temp_dir("summary_pending");
+        let instances_dir = dir.join("instances");
+        let instance = Instance::new("Pack", "1.20.1", LoaderType::Vanilla, None);
+        create_instance(
+            &instances_dir,
+            &instance,
+            &crate::launch_state::LaunchRegistry::new(),
+        )
+        .unwrap();
+
+        let ready = list_instance_summaries(&instances_dir).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert!(
+            ready[0].setup_state.is_none(),
+            "a ready instance has no pending state"
+        );
+
+        crate::instance_readiness::write_pending(
+            &instances_dir.join("Pack"),
+            &crate::instance_readiness::PendingSetup {
+                stage: crate::instance_readiness::SetupStage::Preparing,
+                operation: "import".to_string(),
+                started_at: "2026-11-14T00:00:00Z".to_string(),
+                token: "summary-owner".to_string(),
+            },
+        )
+        .unwrap();
+
+        let pending = list_instance_summaries(&instances_dir).unwrap();
+        let state = pending[0].setup_state.as_ref().expect("pending state");
+        assert_eq!(state.stage, "preparing");
+        assert_eq!(state.operation, "import");
+
+        // The state is derived from the marker, never written into metadata.
+        let raw = std::fs::read_to_string(instances_dir.join("Pack/instance.json")).unwrap();
+        assert!(
+            !raw.contains("setup_state"),
+            "readiness must not leak into instance.json"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
