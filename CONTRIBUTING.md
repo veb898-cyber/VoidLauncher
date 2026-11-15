@@ -278,10 +278,13 @@ must match `package.json`, `src-tauri/tauri.conf.json` and
 `src-tauri/Cargo.toml`; the workflow refuses to build otherwise. The workflow
 also signs the installer and uploads it to the GitHub release.
 
-The same workflow contains a step that updates `latest.json` on `main` for the
-auto-updater. Because `main` requires a pull request, verify that the manifest
-was actually updated after a release; if the direct update is blocked, publish
-it through a pull request instead of bypassing the ruleset.
+The same workflow generates and validates `latest.json`, then opens (or updates)
+a pull request from `release/latest-json-vX.Y.Z` to `main` using a GitHub App
+installation token. The PR changes only `latest.json`; the required
+`Windows checks` must pass and a maintainer merges it normally. Reruns update
+the same branch and PR without force-pushing. The App needs `Contents: write`
+and `Pull requests: write`, stored as `RELEASE_APP_ID` and
+`RELEASE_APP_PRIVATE_KEY`; never add a ruleset bypass or use a PAT for this.
 
 Signing keys and passwords are stored outside the repository (local key files
 or GitHub Actions secrets). Never commit them, print them in a workflow log or

@@ -5,17 +5,32 @@ import workflow from '../../.github/workflows/publish.yml?raw';
  * Static regression checks for the release workflow. These do not run the
  * release (that requires secrets and a tag), but they lock in the properties
  * that previously made publishes fail or leak:
- *   - `latest.json` must be committed on top of the CURRENT main, not the
- *     detached tag commit (a non-fast-forward push otherwise);
+ *   - `latest.json` must be published through a PR, never pushed to `main`;
+ *   - the PR branch/PR must be created with a minimally scoped App token;
+ *   - the token may only be requested after the installer was signed;
  *   - the tag must match every version file before anything is built;
  *   - the signing key must never be echoed (no `set -x`).
  */
 describe('release workflow', () => {
-  it('updates latest.json on the current main with retries', () => {
-    expect(workflow).toContain('git fetch origin main');
-    expect(workflow).toContain('git checkout -B latest-json-update FETCH_HEAD');
-    expect(workflow).toContain('git push origin HEAD:main');
-    expect(workflow).toContain('attempt=$((attempt + 1))');
+  it('publishes latest.json through a pull request instead of pushing to main', () => {
+    expect(workflow).not.toContain('git push');
+    expect(workflow).not.toContain('HEAD:main');
+    expect(workflow).toContain('release/latest-json-v');
+    expect(workflow).toContain('publish-latest-json.mjs');
+  });
+
+  it('creates a minimally scoped GitHub App token after signing', () => {
+    expect(workflow).toContain('actions/create-github-app-token@v3');
+    expect(workflow).toContain('secrets.RELEASE_APP_ID');
+    expect(workflow).toContain('secrets.RELEASE_APP_PRIVATE_KEY');
+    expect(workflow).toContain('permission-contents: write');
+    expect(workflow).toContain('permission-pull-requests: write');
+    expect(workflow.indexOf('Create GitHub App token')).toBeGreaterThan(
+      workflow.indexOf('Sign installer and generate latest.json'),
+    );
+    expect(workflow.indexOf('Publish latest.json via pull request')).toBeGreaterThan(
+      workflow.indexOf('Create GitHub App token'),
+    );
   });
 
   it('verifies that the tag matches every project version', () => {

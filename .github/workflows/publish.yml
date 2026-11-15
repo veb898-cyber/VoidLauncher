@@ -52,6 +52,14 @@ jobs:
             exit 1
           fi
 
+      # Fail before the expensive build when the App credentials are missing or
+      # malformed. The script only prints generic messages, never the values.
+      - name: Check release App secrets
+        env:
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: node .github/scripts/check-release-app-secrets.mjs
+
       # Build the installer. We deliberately do NOT pass
       # `includeUpdaterJson: true` here: when that step's internal signing
       # fails (wrong TAURI_SIGNING_PRIVATE_KEY secret, etc.) tauri-action
@@ -78,6 +86,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           # -e: exit on error; -u: fail on unset vars.
           # Do NOT use -x here: bash -x expands and prints every command,
@@ -91,7 +100,6 @@ jobs:
           echo "Tag:           $TAG"
           echo "Installer:     $INSTALLER"
           echo "OS:            $(uname -a)"
-          echo "Secret length: ${#TAURI_SIGNING_PRIVATE_KEY}"
 
           # ── 1. Normalize the secret to a base64 string the CLI expects ──
           #
@@ -131,7 +139,7 @@ jobs:
             exit 1
           fi
           rm -f raw_secret.txt decoded.txt
-          echo "Key for CLI length: ${#KEY_FOR_CLI}"
+          echo "Signing key accepted."
 
           # ── 2. Fetch the freshly-uploaded installer from the release ──
           gh release download "$TAG" --pattern "$INSTALLER" --output installer.exe
@@ -160,98 +168,63 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
             node_modules/.bin/tauri signer sign installer.exe
 
-          # ── 4. Extract the base64 signature from the .sig file ──
+          # ── 4. Generate and validate latest.json ──
           #
-          # `sign_file` in tauri-cli writes the base64-encoded SignatureBox to
-          # `<file>.sig` (not `.minisig`). The file contains only the base64
-          # string — no comments, no headers — so `cat` is enough.
-          if [ ! -f installer.exe.sig ]; then
-            echo "::error::Signing produced no .sig file"
-            ls -la
-            exit 1
-          fi
-          echo "::group::.sig contents (first 200 chars)"
-          head -c 200 installer.exe.sig
-          echo
-          echo "::endgroup::"
-          SIGNATURE=$(tr -d '\r\n ' < installer.exe.sig)
-          echo "Signature length: ${#SIGNATURE}"
-          if [ "${#SIGNATURE}" -lt 80 ]; then
-            echo "::error::Signature looks too short / invalid"
-            exit 1
-          fi
-          if ! printf '%s' "$SIGNATURE" | grep -qE '^[A-Za-z0-9+/=]+$'; then
-            echo "::error::Signature is not valid base64"
-            exit 1
-          fi
+          # The generator reads the .sig file directly (so the signature never
+          # has to be echoed), validates the tag/version/URL/signature, and
+          # refuses to emit a manifest containing one of the signing secrets.
+          node .github/scripts/latest-json.mjs generate \
+            --tag "$TAG" \
+            --repository "$REPOSITORY" \
+            --installer "$INSTALLER" \
+            --signature-file installer.exe.sig \
+            --notes "Release $TAG" \
+            --output latest.json \
+            --forbid-env TAURI_SIGNING_PRIVATE_KEY,TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          node .github/scripts/latest-json.mjs validate \
+            --file latest.json \
+            --tag "$TAG" \
+            --repository "$REPOSITORY" \
+            --installer "$INSTALLER" \
+            --signature-file installer.exe.sig \
+            --forbid-env TAURI_SIGNING_PRIVATE_KEY,TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 
-          # ── 5. Generate latest.json ──
-          URL="https://github.com/${{ github.repository }}/releases/download/$TAG/$INSTALLER"
-          PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          cat > latest.json <<EOF
-          {
-            "version": "${TAG_NO_V}",
-            "notes": "Release ${TAG}",
-            "pub_date": "${PUB_DATE}",
-            "platforms": {
-              "windows-x86_64": {
-                "signature": "${SIGNATURE}",
-                "url": "${URL}"
-              }
-            }
-          }
-          EOF
-
-          echo "::group::latest.json"
+          echo "::group::latest.json (public updater manifest)"
           cat latest.json
           echo "::endgroup::"
 
-          # ── 6. Cleanup secrets & intermediates ──
+          # ── 5. Cleanup secrets & intermediates ──
           rm -f raw_secret.txt decoded.txt installer.exe installer.exe.sig
 
-      - name: Commit latest.json to main
+      # Installation token with exactly the permissions needed to create the
+      # release branch and its pull request. It is requested only after the
+      # installer was built and signed, and it is revoked at job end.
+      - name: Create GitHub App token for release PR
+        id: release-app-token
+        uses: actions/create-github-app-token@v3.3.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # Publishes latest.json through a protected-branch PR. There is no git
+      # push here and no write to main: the script uses the GitHub API to
+      # create/update release/latest-json-vX.Y.Z and its PR. Reruns update the
+      # same branch/PR without force and without empty commits.
+      - name: Publish latest.json via pull request
         shell: bash
+        env:
+          GH_TOKEN: ${{ steps.release-app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: |
-          set -eu
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # `actions/checkout` on a tag push leaves a detached HEAD at the tag
-          # commit. Committing there and pushing `HEAD:main` only works while
-          # main still equals the tag; any commit merged after the tag makes it
-          # a non-fast-forward. Keep the generated manifest, move onto the
-          # CURRENT main, and retry if another commit lands during the push.
-          MANIFEST="$RUNNER_TEMP/voidlauncher-latest.json"
-          cp latest.json "$MANIFEST"
-
-          # Sanity guard: if the file ever does contain a conflict marker
-          # (e.g. someone manually committed a half-resolved file), fail loudly
-          # instead of shipping a broken updater manifest.
-          if grep -E '^(<{7}|={7}|>{7})' "$MANIFEST" >/dev/null 2>&1; then
-            echo "::error::latest.json contains merge conflict markers. Aborting."
-            exit 1
-          fi
-
-          attempt=1
-          while [ "$attempt" -le 5 ]; do
-            git fetch origin main
-            # Drop the generated file before switching branches (it would
-            # otherwise block the checkout if main has a different copy).
-            git restore latest.json 2>/dev/null || true
-            git checkout -B latest-json-update FETCH_HEAD
-            cp "$MANIFEST" latest.json
-            git add latest.json
-            if git diff --cached --quiet; then
-              echo "latest.json is already current on main; nothing to commit."
-              exit 0
-            fi
-            git commit -m "chore: update latest.json for ${{ github.ref_name }}"
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-            echo "::warning::push raced with a newer main commit; retrying (attempt $attempt)"
-            attempt=$((attempt + 1))
-            sleep $((attempt * 3))
-          done
-          echo "::error::Could not update latest.json after 5 attempts."
-          exit 1
+          set -euo pipefail
+          node .github/scripts/publish-latest-json.mjs \
+            --repo "$REPOSITORY" \
+            --tag "$TAG" \
+            --manifest latest.json \
+            --installer "VoidLauncher_${TAG#v}_x64-setup.exe" \
+            --forbid-env GH_TOKEN,TAURI_SIGNING_PRIVATE_KEY,TAURI_SIGNING_PRIVATE_KEY_PASSWORD,RELEASE_APP_PRIVATE_KEY

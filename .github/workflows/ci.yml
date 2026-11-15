@@ -49,6 +49,9 @@ jobs:
       - name: Frontend tests
         run: npm test
 
+      - name: Release script tests
+        run: node --test .github/scripts/latest-json.test.mjs .github/scripts/publish-latest-json.test.mjs .github/scripts/check-release-app-secrets.test.mjs .github/scripts/release-workflow.test.mjs
+
       - name: Frontend build
         run: npm run build
 
