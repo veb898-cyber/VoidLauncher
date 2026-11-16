@@ -1329,6 +1329,7 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
         None,
         None,
         Some(&java),
+        crate::config::detect_total_ram_mb(),
     ) {
         Ok(c) => c,
         Err(e) => return Err(format!("launch spawn error: {}", e)),

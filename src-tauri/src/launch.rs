@@ -5,7 +5,10 @@ use crate::java::{
     describe_explicit_rejection, detect_java_installations, resolve_java, JavaChoice,
     JavaInstallation, JavaRequirement,
 };
-use crate::jvm::{build_jvm_args, strip_gc_selection_flags, strip_removed_jvm_flags, GcPreset};
+use crate::jvm::{
+    build_jvm_args, enforce_memory_flags, strip_gc_selection_flags, strip_heap_sizing_flags,
+    strip_removed_jvm_flags, GcPreset,
+};
 use crate::versions::{get_game_arguments_for, get_jvm_arguments_for, VersionInfo};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -251,6 +254,7 @@ pub struct LaunchProfileRequest<'a> {
     pub game_dir: &'a Path,
     pub default_memory_mb: u32,
     pub max_memory_mb: u32,
+    pub total_ram_mb: u64,
     pub default_gc_preset: &'a str,
     pub default_jvm_args: &'a [String],
 }
@@ -575,23 +579,26 @@ pub fn build_launch_profile(
     //   - Memory: instance override > launcher default. Xms == Xmx.
     //   - Preset: instance override > default_gc_preset (safe default).
     //   - Any custom instance.jvm_args are appended AFTER the preset.
-    let memory_mb = instance.effective_memory_mb(request.default_memory_mb, request.max_memory_mb);
+    let memory_mb = instance.effective_memory_mb(
+        request.default_memory_mb,
+        request.max_memory_mb,
+        request.total_ram_mb,
+    );
     let preset_str = instance.effective_gc_preset(request.default_gc_preset);
     let requested_preset = GcPreset::from_str(preset_str);
     let (mut jvm_args, effective_preset) =
         build_jvm_args(requested_preset, memory_mb, request.java_major);
-    tracing::info!(target: "launcher", "Memory: Xms=Xmx={}M, preset={:?} (requested {:?})",
-              memory_mb, effective_preset, requested_preset);
 
     // User-provided custom args go AFTER the preset so they can override
     // anything it decided. Instance-level args take priority over the global
     // default. Both are stripped of GC-selection flags: the chosen preset is
-    // the single source of truth for which GC the JVM starts with.
+    // the single source of truth for which GC the JVM starts with. Heap sizing
+    // flags are stripped too: the launcher-computed memory wins.
     let user_args = instance
         .jvm_args
         .as_deref()
         .unwrap_or(request.default_jvm_args);
-    for arg in strip_gc_selection_flags(user_args) {
+    for arg in strip_heap_sizing_flags(&strip_gc_selection_flags(user_args)) {
         jvm_args.push(arg);
     }
 
@@ -643,7 +650,7 @@ pub fn build_launch_profile(
     // (Forge/NeoForge in particular) sometimes include their own GC selector,
     // so those are stripped too РІР‚вЂќ the user's chosen preset wins.
     if let Some(profile) = &instance.loader_profile {
-        let loader_args = strip_gc_selection_flags(&profile.jvm_args);
+        let loader_args = strip_heap_sizing_flags(&strip_gc_selection_flags(&profile.jvm_args));
         let mut i = 0;
         while i < loader_args.len() {
             let raw = &loader_args[i];
@@ -686,8 +693,8 @@ pub fn build_launch_profile(
     for a in &version_jvm_args {
         tracing::debug!(target: "launcher", "  raw: {}", a);
     }
-    let version_jvm_args = strip_gc_selection_flags(&version_jvm_args);
-    tracing::debug!(target: "launcher", "After GC-strip ({} remaining):", version_jvm_args.len());
+    let version_jvm_args = strip_heap_sizing_flags(&strip_gc_selection_flags(&version_jvm_args));
+    tracing::debug!(target: "launcher", "After GC/heap strip ({} remaining):", version_jvm_args.len());
     for a in &version_jvm_args {
         tracing::debug!(target: "launcher", "  kept: {}", a);
     }
@@ -705,6 +712,15 @@ pub fn build_launch_profile(
     // was removed in Java 23+/24 (JEP 474) where it only prints an
     // "Ignoring option" warning on every launch.
     strip_removed_jvm_flags(&mut jvm_args, request.java_major);
+
+    // The launcher-computed heap is the single source of truth. Every heap
+    // sizing flag from user args, the loader profile and the version manifest
+    // was removed above; this re-asserts exactly one -Xms/-Xmx pair so no
+    // source can enlarge the safe limit behind the user's back. Logging after
+    // this step reflects the flags the JVM really receives.
+    enforce_memory_flags(&mut jvm_args, memory_mb);
+    tracing::info!(target: "launcher", "Memory: Xms=Xmx={}M, preset={:?} (requested {:?})",
+              memory_mb, effective_preset, requested_preset);
 
     // Ely.by in-game skins: authlib-injector is a JVM agent, not a classpath
     // entry and not a mod. It is only present for Ely.by accounts when the
@@ -971,6 +987,7 @@ pub fn prepare_and_build_launch_profile(
     session_log_path: Option<&str>,
     java_major: u32,
     target_arch: crate::versions::TargetArch,
+    total_ram_mb: u64,
 ) -> Result<(LaunchProfile, PathBuf)> {
     let prepared = prepare_launch_files(config, instance, version_info, target_arch)?;
 
@@ -991,6 +1008,7 @@ pub fn prepare_and_build_launch_profile(
         game_dir: &prepared.game_dir,
         default_memory_mb: config.default_memory_mb,
         max_memory_mb: config.max_memory_mb,
+        total_ram_mb,
         default_gc_preset: &config.default_gc_preset,
         default_jvm_args: &config.default_jvm_args,
     };
@@ -1013,6 +1031,7 @@ pub fn build_launch_command(
     java_path: PathBuf,
     java_major: u32,
     target_arch: crate::versions::TargetArch,
+    total_ram_mb: u64,
 ) -> Result<LaunchCommand> {
     tracing::info!(target: "launcher", "Building launch command for instance: {}", instance.name);
     tracing::info!(target: "launcher", "MC version: {}", instance.mc_version);
@@ -1028,6 +1047,7 @@ pub fn build_launch_command(
         session_log_path,
         java_major,
         target_arch,
+        total_ram_mb,
     )?;
     Ok(profile.to_command(java_path, game_dir))
 }
@@ -1069,6 +1089,7 @@ pub fn spawn_launch(
 /// downloaded and re-probed) by the prepare phase; when present it is used
 /// verbatim, so prepare and spawn always run the same JVM and its probed
 /// architecture drives the native selection. `None` resolves the JVM here.
+#[allow(clippy::too_many_arguments)]
 pub fn launch_minecraft(
     config: &AppConfig,
     instance: &Instance,
@@ -1077,6 +1098,7 @@ pub fn launch_minecraft(
     server: Option<(&str, Option<u16>)>,
     session_log_path: Option<&str>,
     prepared_java: Option<&crate::java::JavaInstallation>,
+    total_ram_mb: u64,
 ) -> Result<std::process::Child> {
     tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
 
@@ -1115,6 +1137,7 @@ pub fn launch_minecraft(
         session_log_path,
         java_major,
         target_arch,
+        total_ram_mb,
     )?;
     let command = profile.to_command(java_path.clone(), game_dir.clone());
 
@@ -1561,6 +1584,7 @@ mod tests {
             game_dir: &game_dir,
             default_memory_mb: 4096,
             max_memory_mb: 8192,
+            total_ram_mb: 0,
             default_gc_preset: "g1gc",
             default_jvm_args: &default_jvm_args,
         };
@@ -1576,6 +1600,137 @@ mod tests {
             profile.jvm_args.first().map(String::as_str),
             Some("-Xms4096M")
         );
+    }
+
+    #[test]
+    fn launch_profile_heap_cannot_be_overridden_by_any_argument_source() {
+        let root = std::env::temp_dir().join(format!(
+            "voidlauncher-heap-guard-{}-does-not-exist",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let version: VersionInfo = serde_json::from_value(serde_json::json!({
+            "id": "1.20.1",
+            "type": "release",
+            "mainClass": "synthetic.Main",
+            "arguments": {
+                "game": ["--username", "${auth_player_name}"],
+                "jvm": [
+                    "-cp", "${classpath}",
+                    "-Xmx12G",
+                    "-XX:MaxHeapSize=12g",
+                    "-Dmanifest.arg=1"
+                ]
+            },
+            "libraries": [],
+            "downloads": { "client": { "sha1": "", "size": 0, "url": "" } },
+            "assetIndex": { "id": "1", "sha1": "", "size": 0, "totalSize": 0, "url": "" },
+            "assets": "1"
+        }))
+        .expect("synthetic version JSON");
+
+        let mut instance = crate::instances::Instance::new(
+            "HeapGuard",
+            "1.20.1",
+            crate::instances::LoaderType::Forge,
+            Some("47.2.0".to_string()),
+        );
+        // Old config: 8 GB instance value on an 8 GB machine (safe ceiling 6 GB).
+        instance.memory_mb = Some(8192);
+        instance.gc_preset = Some("zgc".into());
+        instance.jvm_args = Some(vec![
+            "-Xms8192M".into(),
+            "-Xmx8192M".into(),
+            "-XX:InitialHeapSize=8192m".into(),
+            "-XX:MaxRAMPercentage=90".into(),
+            "-Duser.arg=1".into(),
+        ]);
+        instance.loader_profile = Some(crate::modloaders::LoaderProfile {
+            main_class: "synthetic.LoaderMain".into(),
+            libraries: Vec::new(),
+            jvm_args: vec![
+                "-Xmx16384M".into(),
+                "-XX:MaxHeapSize=16g".into(),
+                "-Dloader.arg=1".into(),
+            ],
+            game_args: Vec::new(),
+            legacy_args: false,
+        });
+
+        let client_jar = root.join("versions/1.20.1/client.jar");
+        let entry_jar = root.join("versions/1.20.1/entry/VoidLauncherEntry.jar");
+        let files = [client_jar, entry_jar].into_iter().collect();
+        let fs = FakeLaunchFs { files, srg: false };
+        let auth = LaunchAuth {
+            access_token: "token",
+            uuid: "uuid",
+            username: "Player",
+            user_type: "msa",
+            authlib_injector: None,
+        };
+        let default_jvm_args = vec!["-XX:+DisableExplicitGC".to_string()];
+        let versions_dir = root.join("versions");
+        let libraries_dir = root.join("libraries");
+        let assets_dir = root.join("assets");
+        let game_dir = root.join("instances/HeapGuard/.minecraft");
+        let request = LaunchProfileRequest {
+            instance: &instance,
+            version_info: &version,
+            auth: &auth,
+            server: None,
+            session_log_path: None,
+            java_major: 21,
+            target_arch: crate::versions::TargetArch::X86_64,
+            versions_dir: &versions_dir,
+            libraries_dir: &libraries_dir,
+            assets_dir: &assets_dir,
+            game_dir: &game_dir,
+            default_memory_mb: 8192,
+            max_memory_mb: 8192,
+            total_ram_mb: 8 * 1024,
+            default_gc_preset: "g1gc",
+            default_jvm_args: &default_jvm_args,
+        };
+
+        let profile = build_launch_profile(&request, &fs).expect("profile builds");
+
+        // Exactly one authoritative heap pair, using the safe 6 GB ceiling,
+        // regardless of user/loader/manifest flags that asked for more.
+        let heap_flags: Vec<String> = profile
+            .jvm_args
+            .iter()
+            .filter(|arg| {
+                let lower = arg.to_ascii_lowercase();
+                lower.starts_with("-xms")
+                    || lower.starts_with("-xmx")
+                    || lower.starts_with("-xx:maxheapsize")
+                    || lower.starts_with("-xx:initialheapsize")
+                    || lower.starts_with("-xx:softmaxheapsize")
+                    || lower.starts_with("-xx:maxram")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            heap_flags,
+            vec!["-Xms6144M".to_string(), "-Xmx6144M".to_string()],
+            "unexpected heap flags: {:?}",
+            profile.jvm_args
+        );
+
+        // ZGC needs 8 GB, so the same capped 6144 MB makes the GC decision
+        // fall back consistently with the flags the JVM actually receives.
+        assert!(profile.jvm_args.iter().any(|arg| arg == "-XX:+UseG1GC"));
+        assert!(!profile.jvm_args.iter().any(|arg| arg == "-XX:+UseZGC"));
+
+        // Unrelated custom args survive.
+        for expected in ["-Duser.arg=1", "-Dloader.arg=1", "-Dmanifest.arg=1"] {
+            assert!(
+                profile.jvm_args.iter().any(|arg| arg == expected),
+                "missing {expected} in {:?}",
+                profile.jvm_args
+            );
+        }
     }
 
     #[test]
@@ -1614,6 +1769,7 @@ mod tests {
             game_dir: &root,
             default_memory_mb: 4096,
             max_memory_mb: 8192,
+            total_ram_mb: 0,
             default_gc_preset: "g1gc",
             default_jvm_args: &default_jvm_args,
         };
@@ -1726,6 +1882,7 @@ mod tests {
                 game_dir: &root.join("instances/Arch/.minecraft"),
                 default_memory_mb: 4096,
                 max_memory_mb: 8192,
+                total_ram_mb: 0,
                 default_gc_preset: "g1gc",
                 default_jvm_args: &default_jvm_args,
             };

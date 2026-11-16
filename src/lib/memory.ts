@@ -49,6 +49,32 @@ export function getMaxMemoryMb(totalRamMb: number): number {
   return getSafeMaxMemoryMb(totalRamMb) ?? MIN_MEMORY_MB;
 }
 
+/**
+ * UI/launch ceiling for a specific instance editor session.
+ *
+ * - unknown RAM (`null` / 0) leaves the global cap (or hard cap) in place and
+ *   never invents an 8 GB machine;
+ * - a known system below 4 GB gets the hard floor and `ramInsufficient=true`;
+ * - a known safe ceiling is additionally capped by the global limit.
+ */
+export function getEffectiveMemoryLimitMb(
+  configMaxMb: number | null,
+  totalRamMb: number | null,
+): { maxMb: number; ramKnown: boolean; ramInsufficient: boolean } {
+  const ramKnown = totalRamMb != null && totalRamMb > 0;
+  const safe = ramKnown ? getSafeMaxMemoryMb(totalRamMb) : null;
+  const ramInsufficient = ramKnown && safe === null;
+  if (ramInsufficient) {
+    return { maxMb: MIN_MEMORY_MB, ramKnown, ramInsufficient };
+  }
+  const configBound = configMaxMb ?? MAX_MEMORY_MB;
+  const maxMb = Math.max(
+    MIN_MEMORY_MB,
+    safe !== null ? Math.min(safe, configBound) : configBound,
+  );
+  return { maxMb, ramKnown, ramInsufficient };
+}
+
 /** Round any MB value to the nearest 512 MB step. */
 export function snapToMemoryStep(mb: number): number {
   return Math.max(MIN_MEMORY_MB, Math.round(mb / MEMORY_STEP_MB) * MEMORY_STEP_MB);

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_MEMORY_MB,
   MIN_MEMORY_MB,
+  getEffectiveMemoryLimitMb,
   getMaxMemoryMb,
   getRecommendedMemoryMb,
   getSafeMaxMemoryMb,
@@ -40,6 +41,36 @@ describe('getSafeMaxMemoryMb', () => {
     expect(getSafeMaxMemoryMb(0)).toBeNull();
     expect(getSafeMaxMemoryMb(3 * 1024)).toBeNull();
     expect(getSafeMaxMemoryMb(-1)).toBeNull();
+  });
+});
+
+describe('getEffectiveMemoryLimitMb', () => {
+  it('does not invent 8 GB when RAM is unknown', () => {
+    expect(getEffectiveMemoryLimitMb(8192, null)).toEqual({
+      maxMb: 8192,
+      ramKnown: false,
+      ramInsufficient: false,
+    });
+    expect(getEffectiveMemoryLimitMb(8192, 0)).toEqual({
+      maxMb: 8192,
+      ramKnown: false,
+      ramInsufficient: false,
+    });
+  });
+
+  it('reports insufficient RAM and keeps the hard floor', () => {
+    expect(getEffectiveMemoryLimitMb(8192, 3 * 1024)).toEqual({
+      maxMb: MIN_MEMORY_MB,
+      ramKnown: true,
+      ramInsufficient: true,
+    });
+  });
+
+  it('caps known RAM by both the safe ceiling and the global limit', () => {
+    expect(getEffectiveMemoryLimitMb(8192, 8 * 1024).maxMb).toBe(6144);
+    expect(getEffectiveMemoryLimitMb(8192, 32 * 1024).maxMb).toBe(8192);
+    expect(getEffectiveMemoryLimitMb(32768, 32 * 1024).maxMb).toBe(26112);
+    expect(getEffectiveMemoryLimitMb(null, 32 * 1024).maxMb).toBe(26112);
   });
 });
 

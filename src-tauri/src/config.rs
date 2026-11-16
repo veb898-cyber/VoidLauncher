@@ -58,6 +58,23 @@ pub fn max_safe_memory_mb(total_ram_mb: u64) -> Option<u32> {
     (floored >= u64::from(MIN_MEMORY_MB)).then_some(floored as u32)
 }
 
+/// Effective memory ceiling used by both the launch path and the UI contract.
+///
+/// Unknown RAM keeps the stored global limit (the historical behavior); known
+/// RAM is capped by the safe maximum, and a known system below the safe floor
+/// is limited to the minimum heap. This is an execution-time cap only; stored
+/// config/instance values are never rewritten by this helper.
+pub fn effective_memory_ceiling(max_memory_mb: u32, total_ram_mb: u64) -> u32 {
+    let global = max_memory_mb.clamp(MIN_MEMORY_MB, MAX_MEMORY_MB);
+    if total_ram_mb == 0 {
+        return global;
+    }
+    match max_safe_memory_mb(total_ram_mb) {
+        Some(safe) => global.min(safe).max(MIN_MEMORY_MB),
+        None => MIN_MEMORY_MB,
+    }
+}
+
 /// Default memory pair for a fresh config.
 ///
 /// `default_memory_mb` is the tiered recommendation, but never above the
@@ -88,14 +105,43 @@ pub fn validate_memory_cap(
     if new_max_mb <= previous_max_mb {
         return Ok(());
     }
-    if let Some(safe) = max_safe_memory_mb(total_ram_mb) {
-        if new_max_mb > safe {
-            return Err(format!(
-                "The memory limit cannot exceed the safe maximum for this system \
-                 ({} MB). Lower the limit or use the detected value.",
-                safe
-            ));
-        }
+    let Some(safe) = max_safe_memory_mb(total_ram_mb) else {
+        return Err("The safe memory maximum is unknown on this system. \
+             Raising the memory limit is not allowed until RAM detection succeeds."
+            .to_string());
+    };
+    if new_max_mb > safe {
+        return Err(format!(
+            "The memory limit cannot exceed the safe maximum for this system \
+             ({} MB). Lower the limit or use the detected value.",
+            safe
+        ));
+    }
+    Ok(())
+}
+
+/// The same explicit-growth rule for the default heap. Existing values above
+/// the safe maximum are preserved, but an attempt to increase them is rejected
+/// until the user chooses a value within the detected ceiling.
+pub fn validate_default_memory_cap(
+    previous_mb: u32,
+    new_mb: u32,
+    total_ram_mb: u64,
+) -> Result<(), String> {
+    if new_mb <= previous_mb {
+        return Ok(());
+    }
+    let Some(safe) = max_safe_memory_mb(total_ram_mb) else {
+        return Err("The safe memory maximum is unknown on this system. \
+             Raising the default memory is not allowed until RAM detection succeeds."
+            .to_string());
+    };
+    if new_mb > safe {
+        return Err(format!(
+            "The default memory cannot exceed the safe maximum for this system \
+             ({} MB). Lower it or use the detected value.",
+            safe
+        ));
     }
     Ok(())
 }
@@ -640,6 +686,52 @@ mod tests {
         // only a further increase is rejected.
         assert!(validate_memory_cap(32768, 32768, 8 * 1024).is_ok());
         assert!(validate_memory_cap(8192, 16384, 8 * 1024).is_err());
+    }
+
+    #[test]
+    fn effective_memory_ceiling_matches_the_safe_limit_contract() {
+        assert_eq!(effective_memory_ceiling(8192, 8 * 1024), 6144);
+        assert_eq!(effective_memory_ceiling(32768, 16 * 1024), 12800);
+        assert_eq!(effective_memory_ceiling(32768, 32 * 1024), 26112);
+        assert_eq!(
+            effective_memory_ceiling(8192, 32 * 1024),
+            8192,
+            "a lower global limit wins"
+        );
+        assert_eq!(
+            effective_memory_ceiling(8192, 0),
+            8192,
+            "unknown RAM keeps the existing global behavior"
+        );
+        assert_eq!(
+            effective_memory_ceiling(8192, 3 * 1024),
+            MIN_MEMORY_MB,
+            "known tiny RAM is reduced to the minimum heap"
+        );
+    }
+
+    #[test]
+    fn memory_limit_cannot_rise_when_the_safe_maximum_is_unknown() {
+        // Unknown RAM and a known tiny system both have no safe ceiling.
+        for total_ram_mb in [0, 3 * 1024] {
+            assert!(validate_memory_cap(8192, 8192, total_ram_mb).is_ok());
+            assert!(validate_memory_cap(8192, 4096, total_ram_mb).is_ok());
+            assert!(validate_memory_cap(8192, 12288, total_ram_mb).is_err());
+            assert!(validate_memory_cap(8192, 32768, total_ram_mb).is_err());
+        }
+    }
+
+    #[test]
+    fn default_memory_can_only_rise_to_the_safe_maximum() {
+        assert!(validate_default_memory_cap(8192, 8192, 32 * 1024).is_ok());
+        assert!(validate_default_memory_cap(8192, 4096, 32 * 1024).is_ok());
+        assert!(validate_default_memory_cap(8192, 26112, 32 * 1024).is_ok());
+        assert!(validate_default_memory_cap(8192, 26624, 32 * 1024).is_err());
+        assert!(validate_default_memory_cap(32768, 32768, 8 * 1024).is_ok());
+        assert!(validate_default_memory_cap(8192, 16384, 8 * 1024).is_err());
+        assert!(validate_default_memory_cap(4096, 4096, 0).is_ok());
+        assert!(validate_default_memory_cap(4096, 8192, 0).is_err());
+        assert!(validate_default_memory_cap(2048, 4096, 3 * 1024).is_err());
     }
 
     #[test]

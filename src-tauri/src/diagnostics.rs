@@ -369,7 +369,8 @@ fn collect_instance(
     // Instance memory vs. physical RAM.
     let total_mb = crate::config::detect_total_ram_mb();
     let alloc_mb =
-        instance.effective_memory_mb(config.default_memory_mb, config.max_memory_mb) as u64;
+        instance.effective_memory_mb(config.default_memory_mb, config.max_memory_mb, total_mb)
+            as u64;
     if total_mb > 0 && alloc_mb > total_mb {
         issues.push(DiagIssue {
             id: "memory".into(),

@@ -232,6 +232,7 @@ impl Fixture {
             self.java_path(),
             self.java_major(),
             test_target_arch(),
+            0,
         )
         .unwrap_or_else(|e| panic!("build launch command: {}", e))
     }
@@ -260,6 +261,7 @@ impl Fixture {
             self.java_path(),
             self.java_major(),
             target_arch,
+            0,
         )
         .unwrap_or_else(|e| panic!("build launch command: {}", e))
     }
@@ -292,6 +294,7 @@ impl Fixture {
             session_log,
             self.java_major(),
             target_arch,
+            0,
         )
         .unwrap_or_else(|e| panic!("build launch profile: {}", e))
         .0
@@ -312,6 +315,7 @@ impl Fixture {
             self.java_path(),
             self.java_major(),
             target_arch,
+            0,
         ) {
             Ok(_) => panic!("expected launch command build to fail"),
             Err(e) => e.to_string(),

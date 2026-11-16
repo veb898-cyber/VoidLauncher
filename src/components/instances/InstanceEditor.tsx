@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
@@ -12,10 +12,11 @@ import { Toggle } from '../ui/Toggle';
 import { addToast } from '../ui/Toast';
 import { CustomSelect, type SelectOption } from '../ui/CustomSelect';
 import {
+  MAX_MEMORY_MB,
   MIN_MEMORY_MB,
   MEMORY_STEP_MB,
-  getSafeMaxMemoryMb,
-  resolveInitialMemoryMb,
+  getEffectiveMemoryLimitMb,
+  getRecommendedMemoryMb,
 } from '../../lib/memory';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useBrowserGuardStore } from '../../stores/browserGuardStore';
@@ -91,17 +92,18 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const [javaPath, setJavaPath] = useState(instance.java_path || '');
   const [resWidth, setResWidth] = useState(instance.resolution?.width?.toString() || '');
   const [resHeight, setResHeight] = useState(instance.resolution?.height?.toString() || '');
-  const [systemRamMb, setSystemRamMb] = useState<number>(8192);
+  const [systemRamMb, setSystemRamMb] = useState<number | null>(null);
   const [baseline, setBaseline] = useState('');
   const [confirmClose, setConfirmClose] = useState(false);
   const [loaderModalOpen, setLoaderModalOpen] = useState(false);
+  const baselineMemoryRef = useRef<{ memoryMb: number; useDefaultMemory: boolean } | null>(null);
 
-  // Values that arrive asynchronously (system RAM, the global config) are
-  // read through this ref by the one-time initializer below. They must not be
-  // effect dependencies: when detection finished a second later, the effect
+  // Values that arrive asynchronously (the global config) are read through
+  // this ref by the one-time initializer below. They must not be effect
+  // dependencies: when the config finished loading a second later, the effect
   // used to re-run and wipe everything the user had already typed.
-  const defaultsRef = useRef({ globalDefaultMemoryMb, globalDefaultGcPreset, globalDefaultJvmArgs, systemRamMb });
-  defaultsRef.current = { globalDefaultMemoryMb, globalDefaultGcPreset, globalDefaultJvmArgs, systemRamMb };
+  const defaultsRef = useRef({ globalDefaultMemoryMb, globalDefaultGcPreset, globalDefaultJvmArgs });
+  defaultsRef.current = { globalDefaultMemoryMb, globalDefaultGcPreset, globalDefaultJvmArgs };
   const initializedForRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -114,19 +116,24 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     const {
       globalDefaultMemoryMb: globalMemory,
       globalDefaultJvmArgs: globalJvm,
-      systemRamMb: ram,
     } = defaultsRef.current;
-    // Initial memory resolves in this order:
-    //   1. instance.memory_mb (explicit per-instance value)
-    //   2. global default_memory_mb from Settings (synced)
-    //   3. tiered RAM recommendation (4/6/8 GB) as final fallback
-    const resolvedMemory = resolveInitialMemoryMb(
-      instance.memory_mb, ram, globalMemory
+    // Keep the stored value as-is (within the absolute hard bounds). The
+    // effective limit is shown separately and Save is blocked if the value is
+    // above it; detection finishing later must never silently rewrite a saved
+    // instance setting.
+    const initialMemory = instance.memory_mb ?? globalMemory ?? getRecommendedMemoryMb(0);
+    const resolvedMemory = Math.min(
+      MAX_MEMORY_MB,
+      Math.max(MIN_MEMORY_MB, initialMemory),
     );
     setName(instance.name);
     setNotes(instance.notes || '');
     setMemoryMb(resolvedMemory);
     setUseDefaultMemory(instance.memory_mb == null);
+    baselineMemoryRef.current = {
+      memoryMb: resolvedMemory,
+      useDefaultMemory: instance.memory_mb == null,
+    };
     const initialJvmArgs = instance.jvm_args != null
       ? instance.jvm_args.join(' ')
       : globalJvm.join(' ');
@@ -152,7 +159,10 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
 
   // A closed editor must re-initialize the next time it is opened.
   useEffect(() => {
-    if (!open) initializedForRef.current = null;
+    if (!open) {
+      initializedForRef.current = null;
+      baselineMemoryRef.current = null;
+    }
   }, [open]);
 
   const dirty =
@@ -190,30 +200,39 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
         const total = await invoke<number>('cmd_detect_system_ram');
         if (!cancelled && total > 0) setSystemRamMb(total);
       } catch {
-        /* fall back to default 8192 */
+        /* leave RAM unknown; never invent a size */
       }
     })();
     return () => { cancelled = true; };
   }, [open]);
 
-  // Dynamic max memory: min(total - 2 GB, 80% of total), floored to step,
-  // also capped by the global Settings limit so the slider never promises a
-  // value the backend will silently clamp on save.
+  // Effective max memory: the safe RAM ceiling, also capped by the global
+  // Settings limit. Unknown RAM must not be replaced with a fake 8 GB value;
+  // a known system below 4 GB gets the hard floor and a warning.
   const configMaxMemoryMb = globalConfig?.max_memory_mb ?? null;
-  const safeRamMaxMb = getSafeMaxMemoryMb(systemRamMb);
-  const maxMemoryMb = useMemo(() => {
-    const ramMax = safeRamMaxMb ?? MIN_MEMORY_MB;
-    return configMaxMemoryMb
-      ? Math.max(MIN_MEMORY_MB, Math.min(ramMax, configMaxMemoryMb))
-      : ramMax;
-  }, [safeRamMaxMb, configMaxMemoryMb]);
-
-  // Clamp the memory value when bounds change (e.g., system RAM detected after open)
-  useEffect(() => {
-    setMemoryMb((m) => Math.min(Math.max(m, MIN_MEMORY_MB), maxMemoryMb));
-  }, [maxMemoryMb]);
+  const {
+    maxMb: maxMemoryMb,
+    ramInsufficient,
+  } = getEffectiveMemoryLimitMb(configMaxMemoryMb, systemRamMb);
+  const memoryAboveLimit = memoryMb > maxMemoryMb;
+  const effectiveMemoryMb = Math.min(memoryMb, maxMemoryMb);
 
   const handleSave = async () => {
+    const baselineMemory = baselineMemoryRef.current;
+    const memoryChanged =
+      !baselineMemory ||
+      baselineMemory.memoryMb !== memoryMb ||
+      baselineMemory.useDefaultMemory !== useDefaultMemory;
+    if (memoryChanged && memoryAboveLimit) {
+      addToast(
+        t('instance_editor.memory_above_limit', {
+          selected: (memoryMb / 1024).toFixed(1),
+          max: (maxMemoryMb / 1024).toFixed(1),
+        }),
+        'error',
+      );
+      return;
+    }
     try {
       // The field shows the global defaults when this instance has no
       // override. Saving that unchanged value must keep it as "inherit"
@@ -264,10 +283,10 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     if (selected) setJavaPath(selected);
   };
 
-  const systemRamGb = (systemRamMb / 1024).toFixed(1);
+  const systemRamGb = systemRamMb != null ? (systemRamMb / 1024).toFixed(1) : null;
   const allocatedGb = (memoryMb / 1024).toFixed(1);
   const maxGb = (maxMemoryMb / 1024).toFixed(1);
-  const zgcDisabled = memoryMb < 8192;
+  const zgcDisabled = effectiveMemoryMb < 8192;
 
   return (
     <>
@@ -330,7 +349,9 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
           <label className="input__label" style={{ display: 'block', marginBottom: 6 }}>
             {t('instance_editor.memory_label')} <strong>{allocatedGb} {gb}</strong>
             <span style={{ color: 'var(--text-tertiary)', marginLeft: 8, fontSize: 'var(--font-size-xs)' }}>
-              {t('instance_editor.memory_max_info', { maxGb, systemRamGb })}
+              {systemRamGb != null
+                ? t('instance_editor.memory_max_info', { maxGb, systemRamGb })
+                : t('instance_editor.memory_unknown_ram_short')}
             </span>
           </label>
           <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', marginBottom: 6 }}>
@@ -364,7 +385,34 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
             <span>{t('instance_editor.memory_min_label', { gb: (MIN_MEMORY_MB / 1024).toFixed(1) })}</span>
             <span>{t('instance_editor.memory_max_label', { maxGb })}</span>
           </div>
-          {safeRamMaxMb == null && (
+          {memoryAboveLimit && (
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 'var(--font-size-xs)',
+                color: 'var(--color-warning)',
+                lineHeight: 1.45,
+              }}
+            >
+              {t('instance_editor.memory_above_limit', {
+                selected: allocatedGb,
+                max: maxGb,
+              })}
+            </div>
+          )}
+          {systemRamMb == null && (
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 'var(--font-size-xs)',
+                color: 'var(--text-tertiary)',
+                lineHeight: 1.45,
+              }}
+            >
+              {t('instance_editor.memory_unknown_ram')}
+            </div>
+          )}
+          {ramInsufficient && (
             <div
               style={{
                 marginTop: 6,

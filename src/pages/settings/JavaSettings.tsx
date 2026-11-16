@@ -12,6 +12,7 @@ import { Tooltip } from '../../components/ui/Tooltip';
 import { addToast } from '../../components/ui/Toast';
 import {
   MAX_MEMORY_MB,
+  MIN_MEMORY_MB,
   getRecommendedMemoryMb,
   getSafeMaxMemoryMb,
   snapToMemoryStep,
@@ -92,14 +93,24 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
   }, []);
 
   const safeMaxMb = systemRamMb == null ? null : getSafeMaxMemoryMb(systemRamMb);
-  const currentLimitMb = Math.min(config.max_memory_mb, MAX_MEMORY_MB);
-  const memoryAboveLimit = config.default_memory_mb > currentLimitMb;
+  const storedLimitMb = Math.min(config.max_memory_mb, MAX_MEMORY_MB);
+  const ramKnown = systemRamMb != null;
+  const ramInsufficient = ramKnown && safeMaxMb == null;
+  const uiLimitMb = safeMaxMb != null
+    ? Math.min(storedLimitMb, safeMaxMb)
+    : ramInsufficient
+      ? Math.min(storedLimitMb, MIN_MEMORY_MB)
+      : Math.max(
+          MIN_MEMORY_MB,
+          Math.min(storedLimitMb, config.default_memory_mb),
+        );
+  const memoryAboveLimit = config.default_memory_mb > uiLimitMb;
   const canRaiseLimit =
     safeMaxMb != null &&
-    safeMaxMb > currentLimitMb &&
+    safeMaxMb > storedLimitMb &&
     (!memoryAboveLimit || safeMaxMb >= config.default_memory_mb);
-  const limitAboveSafe = safeMaxMb != null && currentLimitMb > safeMaxMb;
-  const zgcBlocked = config.default_memory_mb < 8192;
+  const limitAboveSafe = safeMaxMb != null && storedLimitMb > safeMaxMb;
+  const zgcBlocked = Math.min(config.default_memory_mb, uiLimitMb) < 8192;
   const formatGb = (mb: number) => (mb / 1024).toFixed(1).replace(/\.0$/, '');
 
   return (
@@ -215,7 +226,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               className="input"
               type="number"
               min="2048"
-              max={currentLimitMb}
+              max={uiLimitMb}
               step="512"
               value={config.default_memory_mb}
               onChange={(e) => {
@@ -224,7 +235,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
                 const parsed = parseInt(e.target.value, 10) || 2048;
                 updateConfig(
                   'default_memory_mb',
-                  Math.min(currentLimitMb, Math.max(2048, parsed)),
+                  Math.min(uiLimitMb, Math.max(2048, parsed)),
                 );
               }}
               style={{ width: 100, textAlign: 'center' }}
@@ -244,7 +255,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
                   );
                   updateConfig(
                     'default_memory_mb',
-                    Math.min(recommended, currentLimitMb),
+                    Math.min(recommended, uiLimitMb),
                   );
                 }}
                 id="reset-memory-btn"
@@ -259,7 +270,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
           <div className="settings-row__info">
             <div className="settings-row__desc">
               {t('settings.memory_limit_current', {
-                limit: formatGb(currentLimitMb),
+                limit: formatGb(storedLimitMb),
               })}
               {safeMaxMb != null && (
                 <>
@@ -274,14 +285,14 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               <div className="settings-row__note settings-row__note--active">
                 {t('settings.memory_limit_exceeded', {
                   selected: formatGb(config.default_memory_mb),
-                  effective: formatGb(currentLimitMb),
+                  effective: formatGb(uiLimitMb),
                 })}
               </div>
             )}
             {limitAboveSafe && (
               <div className="settings-row__note settings-row__note--active">
                 {t('settings.memory_limit_above_safe', {
-                  limit: formatGb(currentLimitMb),
+                  limit: formatGb(storedLimitMb),
                   safe: formatGb(safeMaxMb!),
                 })}
               </div>

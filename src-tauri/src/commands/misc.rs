@@ -801,6 +801,12 @@ pub fn cmd_save_config(
         total_ram_mb,
     )
     .map_err(|e| e.to_string())?;
+    crate::config::validate_default_memory_cap(
+        previous.default_memory_mb,
+        new_config.default_memory_mb,
+        total_ram_mb,
+    )
+    .map_err(|e| e.to_string())?;
     // The renderer does not know about the migration marker; saving settings
     // must not downgrade a current config back to the legacy schema.
     new_config.config_version = crate::config::CONFIG_VERSION;

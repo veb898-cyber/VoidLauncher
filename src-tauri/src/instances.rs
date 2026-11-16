@@ -353,35 +353,65 @@ impl Instance {
 
     /// Effective memory at launch: the explicit per-instance override wins,
     /// otherwise the current global default is inherited. The result is always
-    /// within [MIN_MEMORY_MB, global max], so a hand-edited/old instance can
-    /// never hand `-Xmx0M` or a multi-terabyte value to the JVM.
-    pub fn effective_memory_mb(&self, default_memory_mb: u32, max_memory_mb: u32) -> u32 {
-        let ceiling =
+    /// within [MIN_MEMORY_MB, effective ceiling], where the ceiling is the
+    /// smaller of the global limit and the safe maximum for detected RAM.
+    /// Unknown RAM preserves the historical global-limit behavior.
+    pub fn effective_memory_mb(
+        &self,
+        default_memory_mb: u32,
+        max_memory_mb: u32,
+        total_ram_mb: u64,
+    ) -> u32 {
+        let global_ceiling =
             max_memory_mb.clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+        let ceiling = crate::config::effective_memory_ceiling(max_memory_mb, total_ram_mb);
         let chosen = self.memory_mb.unwrap_or(default_memory_mb);
         let effective = chosen.clamp(crate::config::MIN_MEMORY_MB, ceiling);
         if effective != chosen {
             tracing::warn!(
                 target: "launcher",
-                "Instance '{}' memory {} MB is outside the allowed range; using {} MB (global limit {} MB)",
+                "Instance '{}' memory {} MB is outside the allowed range; using {} MB (global limit {} MB, effective ceiling {} MB)",
                 self.name,
                 chosen,
                 effective,
+                global_ceiling,
                 ceiling
             );
         }
         effective
     }
 
-    /// Clamp an explicitly stored per-instance value for persistence.
-    /// `None` stays `None` (inherit the global default).
-    pub fn normalized_memory_mb(&self, max_memory_mb: u32) -> Option<u32> {
-        self.memory_mb.map(|value| {
-            value.clamp(
-                crate::config::MIN_MEMORY_MB,
-                max_memory_mb.clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB),
-            )
-        })
+    /// Normalize an explicit instance memory update without rewriting a legacy
+    /// value that the user did not change. `previous` is the stored value
+    /// before this save; unchanged values above the new ceiling are preserved
+    /// (they are capped at launch), while any *new* value above the ceiling is
+    /// rejected so the backend never silently clamps a deliberate edit.
+    pub fn normalize_memory_update(
+        value: Option<u32>,
+        previous: Option<u32>,
+        ceiling: u32,
+    ) -> std::result::Result<Option<u32>, String> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if Some(value) == previous {
+            return Ok(Some(value));
+        }
+        let ceiling = ceiling.clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+        if value < crate::config::MIN_MEMORY_MB {
+            return Err(format!(
+                "Instance memory must be at least {} MB.",
+                crate::config::MIN_MEMORY_MB
+            ));
+        }
+        if value > ceiling {
+            return Err(format!(
+                "Instance memory cannot exceed the safe limit for this system \
+                 ({} MB). Lower the value or use the global default.",
+                ceiling
+            ));
+        }
+        Ok(Some(value))
     }
 
     /// Effective GC preset at launch: explicit override, otherwise the
@@ -4829,11 +4859,11 @@ mod tests {
     #[test]
     fn effective_memory_and_gc_inherit_independently() {
         let mut instance = Instance::new("Inherited", "1.20.1", LoaderType::Vanilla, None);
-        assert_eq!(instance.effective_memory_mb(4096, 8192), 4096);
+        assert_eq!(instance.effective_memory_mb(4096, 8192, 0), 4096);
         assert_eq!(instance.effective_gc_preset("g1gc"), "g1gc");
 
         instance.memory_mb = Some(6144);
-        assert_eq!(instance.effective_memory_mb(4096, 8192), 6144);
+        assert_eq!(instance.effective_memory_mb(4096, 8192, 0), 6144);
         assert_eq!(
             instance.effective_gc_preset("g1gc"),
             "g1gc",
@@ -4841,11 +4871,11 @@ mod tests {
         );
 
         instance.gc_preset = Some("zgc".into());
-        assert_eq!(instance.effective_memory_mb(4096, 8192), 6144);
+        assert_eq!(instance.effective_memory_mb(4096, 8192, 0), 6144);
         assert_eq!(instance.effective_gc_preset("g1gc"), "zgc");
 
         instance.memory_mb = None;
-        assert_eq!(instance.effective_memory_mb(8192, 8192), 8192);
+        assert_eq!(instance.effective_memory_mb(8192, 8192, 0), 8192);
     }
 
     #[test]
@@ -4854,22 +4884,82 @@ mod tests {
 
         // 0 and absurd values must never reach -Xmx.
         instance.memory_mb = Some(0);
-        assert_eq!(instance.effective_memory_mb(4096, 8192), 2048);
+        assert_eq!(instance.effective_memory_mb(4096, 8192, 0), 2048);
         instance.memory_mb = Some(1_000_000);
-        assert_eq!(instance.effective_memory_mb(4096, 8192), 8192);
+        assert_eq!(instance.effective_memory_mb(4096, 8192, 0), 8192);
         instance.memory_mb = Some(16_384);
-        assert_eq!(instance.effective_memory_mb(4096, 8192), 8192);
+        assert_eq!(instance.effective_memory_mb(4096, 8192, 0), 8192);
 
         // A global default below the floor is also clamped.
         instance.memory_mb = None;
-        assert_eq!(instance.effective_memory_mb(0, 8192), 2048);
+        assert_eq!(instance.effective_memory_mb(0, 8192, 0), 2048);
+    }
 
-        // Persisted values are normalized to the same absolute bounds.
-        instance.memory_mb = Some(16_384);
-        assert_eq!(instance.normalized_memory_mb(8192), Some(8192));
-        assert_eq!(instance.normalized_memory_mb(32768), Some(16_384));
+    #[test]
+    fn launch_memory_respects_safe_ceiling_and_global_limit() {
+        let mut instance = Instance::new("Safe", "1.20.1", LoaderType::Vanilla, None);
+
+        // 8 GB system: an old 8 GB default/limit is capped to the 6 GB safe ceiling.
+        instance.memory_mb = Some(8192);
+        assert_eq!(instance.effective_memory_mb(8192, 8192, 8 * 1024), 6144);
+
+        // 16 GB and 32 GB systems use their safe ceilings when below the stored max.
         instance.memory_mb = None;
-        assert_eq!(instance.normalized_memory_mb(8192), None);
+        assert_eq!(instance.effective_memory_mb(32768, 32768, 16 * 1024), 12800);
+        assert_eq!(instance.effective_memory_mb(32768, 32768, 32 * 1024), 26112);
+
+        // A lower global limit wins.
+        instance.memory_mb = Some(16384);
+        assert_eq!(instance.effective_memory_mb(8192, 8192, 32 * 1024), 8192);
+
+        // Unknown RAM keeps the previous global-limit behavior.
+        instance.memory_mb = Some(8192);
+        assert_eq!(instance.effective_memory_mb(8192, 8192, 0), 8192);
+
+        // Known tiny RAM uses the minimum heap and warns via the launch path.
+        assert_eq!(instance.effective_memory_mb(8192, 8192, 3 * 1024), 2048);
+    }
+
+    #[test]
+    fn gc_check_and_jvm_use_the_same_capped_memory() {
+        let mut instance = Instance::new("ZgcCap", "1.20.1", LoaderType::Vanilla, None);
+        instance.memory_mb = Some(8192);
+        let memory_mb = instance.effective_memory_mb(8192, 8192, 8 * 1024);
+        assert_eq!(memory_mb, 6144);
+
+        let decision = crate::jvm::decide_gc(crate::jvm::GcPreset::ModernZgc, memory_mb, 21);
+        assert_eq!(
+            decision.fallback,
+            Some(crate::jvm::GcFallbackReason::HeapTooSmall { memory_mb: 6144 })
+        );
+
+        let (args, effective) =
+            crate::jvm::build_jvm_args(crate::jvm::GcPreset::ModernZgc, memory_mb, 21);
+        assert_eq!(effective, crate::jvm::GcPreset::G1gcPrism);
+        assert!(args.iter().any(|arg| arg == "-Xmx6144M"));
+        assert!(!args.iter().any(|arg| arg == "-Xmx8192M"));
+    }
+
+    #[test]
+    fn instance_memory_save_preserves_legacy_but_rejects_new_unsafe_values() {
+        // An unchanged legacy value above the new ceiling is preserved.
+        assert_eq!(
+            Instance::normalize_memory_update(Some(8192), Some(8192), 6144),
+            Ok(Some(8192))
+        );
+        // Lowering is allowed, and unchanged `None` stays inherited.
+        assert_eq!(
+            Instance::normalize_memory_update(Some(6144), Some(8192), 6144),
+            Ok(Some(6144))
+        );
+        assert_eq!(
+            Instance::normalize_memory_update(None, Some(8192), 6144),
+            Ok(None)
+        );
+        // A genuinely new value above the ceiling is rejected, not clamped.
+        assert!(Instance::normalize_memory_update(Some(8192), Some(4096), 6144).is_err());
+        assert!(Instance::normalize_memory_update(Some(8192), None, 6144).is_err());
+        assert!(Instance::normalize_memory_update(Some(1024), None, 6144).is_err());
     }
 
     #[test]
@@ -4892,7 +4982,7 @@ mod tests {
             let loaded: Instance =
                 serde_json::from_str(&json).unwrap_or_else(|e| panic!("raw {raw}: {e}"));
             assert_eq!(loaded.memory_mb, expected, "raw value {raw}");
-            assert!(loaded.effective_memory_mb(4096, 8192) >= 2048);
+            assert!(loaded.effective_memory_mb(4096, 8192, 0) >= 2048);
         }
     }
 
