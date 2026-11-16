@@ -10,6 +10,7 @@ use crate::install_progress::{self, InstallProgressTracker};
 use crate::instances;
 use crate::is_allowed_download_host;
 use crate::java_download;
+use crate::jvm::{self, GcFallbackReason, GcPreset};
 use crate::launch;
 use crate::modloaders;
 use crate::playtime;
@@ -1127,6 +1128,45 @@ pub async fn cmd_launch_game(
     let prepared_java =
         ensure_java_for_launch(&app, &data_dir, &version_info, &instance, &config).await?;
     let launch_target = crate::versions::TargetArch::from_java_arch(prepared_java.arch);
+
+    // The actual JVM is known now. Resolve the same preset/heap the launch
+    // profile will use and surface a visible warning if ZGC cannot apply.
+    // This is intentionally before spawning so the user sees G1GC, not a
+    // silently substituted preset.
+    let requested_gc = GcPreset::from_str(instance.effective_gc_preset(&config.default_gc_preset));
+    let effective_memory_mb =
+        instance.effective_memory_mb(config.default_memory_mb, config.max_memory_mb);
+    let gc_decision = jvm::decide_gc(
+        requested_gc,
+        effective_memory_mb,
+        prepared_java.major_version,
+    );
+    if let Some(reason) = gc_decision.fallback {
+        let detail = match reason {
+            GcFallbackReason::JavaUnknown => "the Java version could not be determined".to_string(),
+            GcFallbackReason::JavaTooOld { java_major } => {
+                format!("Java {} is older than Java 17", java_major)
+            }
+            GcFallbackReason::HeapTooSmall { memory_mb } => {
+                format!("the heap is {} MB, below the 8 GB floor", memory_mb)
+            }
+        };
+        events::emit_log(
+            &app,
+            "warn",
+            "launch",
+            &format!(
+                "ZGC requested for '{}', but {}; using G1GC.",
+                instance_name, detail
+            ),
+        );
+        events::emit_gc_launch_warning(
+            &app,
+            reason.kind(),
+            prepared_java.major_version,
+            effective_memory_mb,
+        );
+    }
 
     // Self-heal: ensure the version's files (client.jar, libraries, and the
     // native classifier JARs of the chosen JVM's architecture) are on disk.

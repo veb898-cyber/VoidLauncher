@@ -232,6 +232,22 @@ pub fn emit_launch_warning(app: &AppHandle, kind: &str, min_version: Option<&str
     );
 }
 
+/// Visible warning when the requested ZGC preset cannot be applied.
+///
+/// The log line carrying the same details is emitted separately by the launch
+/// command; this event is the frontend toast (forced visible, independent of
+/// the optional warning-toast preference).
+pub fn emit_gc_launch_warning(app: &AppHandle, kind: &str, java_major: u32, memory_mb: u32) {
+    let _ = app.emit(
+        "launch_warning",
+        serde_json::json!({
+            "kind": kind,
+            "java_major": java_major,
+            "memory_mb": memory_mb,
+        }),
+    );
+}
+
 /// Spawn a background task that bridges broadcast channel → Tauri events
 /// Spawn a background task that bridges the install-progress broadcast
 /// channel to Tauri events.

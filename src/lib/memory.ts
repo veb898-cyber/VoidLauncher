@@ -2,7 +2,7 @@
  * Memory allocation helpers.
  *
  * Recommendations:
- *   total RAM  ≤ 8 GB  → 4 GB default
+ *   total RAM  < 16 GB → 4 GB default
  *   total RAM  = 16 GB → 6 GB default
  *   total RAM  ≥ 24 GB → 8 GB default (so ZGC preset is selectable)
  *
@@ -10,6 +10,7 @@
  */
 
 export const MIN_MEMORY_MB = 2048;        // 2 GB
+export const MAX_MEMORY_MB = 32768;       // 32 GB, matches the backend hard cap
 export const MEMORY_STEP_MB = 512;
 export const SYSTEM_RESERVE_MB = 2048;    // always leave 2 GB for the OS
 export const MAX_MEMORY_PCT = 0.8;        // ... or 80% of total, whichever is lower
@@ -19,19 +20,33 @@ export function getRecommendedMemoryMb(totalRamMb: number): number {
   if (totalRamMb <= 0) return 4096;
   if (totalRamMb >= 24 * 1024) return 8192;   // ≥ 24 GB → 8 GB
   if (totalRamMb >= 16 * 1024) return 6144;   // = 16 GB  → 6 GB
-  return 4096;                                // ≤ 8 GB   → 4 GB
+  return 4096;                                // < 16 GB  → 4 GB
 }
 
 /**
- * Dynamic max slider value:
- *   min(total - 2 GB, 80% of total), floored to 512 MB, hard floor 2 GB.
+ * Safe global memory ceiling for a known RAM total.
+ *
+ * Reserves 2 GB or 20% for the OS, whichever is larger, caps at the absolute
+ * backend limit and snaps to the 512 MB grid. `null` means the system cannot
+ * safely provide even the minimum heap (or RAM is unknown), so callers must
+ * keep the existing limit instead of inventing a new one.
+ */
+export function getSafeMaxMemoryMb(totalRamMb: number): number | null {
+  if (!Number.isFinite(totalRamMb) || totalRamMb < 4096) return null;
+  const usable = Math.max(totalRamMb - SYSTEM_RESERVE_MB, 0);
+  const percentCap = Math.floor(totalRamMb * MAX_MEMORY_PCT);
+  const safe = Math.min(usable, percentCap, MAX_MEMORY_MB);
+  const floored = Math.floor(safe / MEMORY_STEP_MB) * MEMORY_STEP_MB;
+  return floored >= MIN_MEMORY_MB ? floored : null;
+}
+
+/**
+ * Legacy hard-floor helper used by the instance editor and initial-value
+ * resolution. Prefer `getSafeMaxMemoryMb` when deciding what to offer in the
+ * UI: it can return `null` for systems below the safe minimum.
  */
 export function getMaxMemoryMb(totalRamMb: number): number {
-  const reserveBased = Math.max(totalRamMb - SYSTEM_RESERVE_MB, 0);
-  const pctBased = Math.floor(totalRamMb * MAX_MEMORY_PCT);
-  const dynamic = Math.max(0, Math.min(reserveBased, pctBased));
-  const floored = Math.floor(dynamic / MEMORY_STEP_MB) * MEMORY_STEP_MB;
-  return Math.max(MIN_MEMORY_MB, floored);
+  return getSafeMaxMemoryMb(totalRamMb) ?? MIN_MEMORY_MB;
 }
 
 /** Round any MB value to the nearest 512 MB step. */
