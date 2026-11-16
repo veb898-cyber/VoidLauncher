@@ -358,6 +358,9 @@ export const en = {
   'instance_editor.gc_zgc_warning':    'Requires Java 17+ and at least 8 GB of RAM.',
   'instance_editor.gc_zgc_launch_note':'Java compatibility is checked at launch. If this instance uses Java below 17, the launcher will apply G1GC and show a warning.',
   'instance_editor.memory_low_ram':    'Not enough RAM for a safe allocation (less than 4 GB). The minimum will be used; launch stability may suffer.',
+  'instance_editor.memory_unknown_ram_short': 'total RAM is unknown',
+  'instance_editor.memory_unknown_ram': 'Could not determine the system RAM. The memory limit comes from global settings; the saved instance value is not changed.',
+  'instance_editor.memory_above_limit': '{selected} GB is selected, but the maximum is {max} GB. Lower the value before saving.',
 
   // JVM args
   'instance_editor.jvm_label':         'JVM Arguments',
@@ -402,7 +405,7 @@ export const en = {
   'settings.memory_limit_raise':       'Allow up to {safe} GB',
   'settings.memory_limit_exceeded':    '{selected} GB is selected, but {effective} GB is used because of the current limit. Raise the limit or lower the value.',
   'settings.memory_limit_above_safe':  'The current limit ({limit} GB) is above the safe maximum ({safe} GB). The value was kept; raising it further is not recommended.',
-  'settings.memory_limit_unknown':     'Could not determine the system RAM. The current limit was not changed.',
+  'settings.memory_limit_unknown':     'Could not determine the system RAM. The current limit is kept; increasing memory is unavailable until detection succeeds.',
   'settings.memory_limit_low_ram':     'Not enough RAM for a safe limit (less than 4 GB). The current limit was not changed.',
 
   'settings.gc_title':                 'Default GC Preset',

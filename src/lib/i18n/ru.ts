@@ -361,6 +361,9 @@ export const ru: Record<string, string> = {
   'instance_editor.gc_zgc_warning':    'Требуется Java 17+ и минимум 8 GB RAM.',
   'instance_editor.gc_zgc_launch_note':'Совместимость с Java проверяется при запуске. Если сборка использует Java ниже 17, лаунчер применит G1GC и покажет предупреждение.',
   'instance_editor.memory_low_ram':    'Недостаточно RAM для безопасного выделения (менее 4 ГБ). Будет использован минимальный объём; запуск может быть нестабильным.',
+  'instance_editor.memory_unknown_ram_short': 'объём RAM не определён',
+  'instance_editor.memory_unknown_ram': 'Не удалось определить объём RAM. Ограничение памяти берётся из глобальных настроек; сохранённое значение сборки не изменяется.',
+  'instance_editor.memory_above_limit': 'Выбрано {selected} ГБ, но максимум {max} ГБ. Уменьшите значение перед сохранением.',
 
   // JVM args
   'instance_editor.jvm_label':         'JVM-аргументы',
@@ -405,7 +408,7 @@ export const ru: Record<string, string> = {
   'settings.memory_limit_raise':       'Разрешить до {safe} ГБ',
   'settings.memory_limit_exceeded':    'Выбрано {selected} ГБ, применяется {effective} ГБ из-за текущего лимита. Увеличьте лимит или уменьшите значение.',
   'settings.memory_limit_above_safe':  'Текущий лимит {limit} ГБ выше безопасного максимума {safe} ГБ. Значение сохранено; повышать его не рекомендуется.',
-  'settings.memory_limit_unknown':     'Не удалось определить объём RAM. Текущий лимит не изменён.',
+  'settings.memory_limit_unknown':     'Не удалось определить объём RAM. Текущий лимит сохранён; повышение памяти недоступно, пока определение не удастся.',
   'settings.memory_limit_low_ram':     'Недостаточно RAM для безопасного лимита (менее 4 ГБ). Текущий лимит не изменён.',
 
   'settings.gc_title':                 'Пресет GC по умолчанию',
