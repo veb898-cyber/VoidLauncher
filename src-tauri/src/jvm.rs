@@ -319,6 +319,102 @@ pub fn strip_gc_selection_flags(args: &[String]) -> Vec<String> {
     out
 }
 
+/// Remove every argument that can change the JVM heap size, or the RAM basis
+/// the JVM would derive that size from.
+///
+/// The launcher computes one authoritative heap (`-Xms` == `-Xmx`) from the
+/// instance/global value and the safe maximum for detected RAM. Custom JVM
+/// args, loader profiles and version manifests are remote/user input and must
+/// never be able to enlarge (or shrink) that heap behind the safety check, so
+/// all sizing forms are removed before the launcher re-asserts its own pair:
+///
+/// * `-Xms<size>` / `-Xmx<size>` (also the split `-Xmx <size>` form);
+/// * `-XX:InitialHeapSize=<n>` / `-XX:MaxHeapSize=<n>`;
+/// * `-XX:SoftMaxHeapSize=<n>` (soft cap could otherwise contradict the pair);
+/// * RAM-based sizing: `-XX:MaxRAM=<n>`, `-XX:{Max,Initial,Min}RAMPercentage=<n>`,
+///   `-XX:{Max,Initial,Min}RAMFraction=<n>` and `-XX:+AggressiveHeap`.
+///
+/// Unrelated args (GC tuning, `-D` properties, module flags, `-Xss`) are kept
+/// verbatim. Returns a new vector; the input slice is not modified.
+pub fn strip_heap_sizing_flags(args: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if is_heap_sizing_arg(arg) {
+            i += 1;
+            // `-Xmx` / `-Xms` without an attached value is not valid for
+            // HotSpot, but some launchers emit it as a separate token pair.
+            // Drop the size token too so it cannot be mistaken for a
+            // class/main argument.
+            let bare_pair = {
+                let lower = arg.to_ascii_lowercase();
+                lower == "-xmx" || lower == "-xms"
+            };
+            if bare_pair && i < args.len() && looks_like_memory_size(&args[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    out
+}
+
+/// Re-assert the launcher-computed heap as the only heap configuration in a
+/// fully assembled JVM argument list.
+///
+/// All heap-sizing flags are stripped (including a higher `-Xmx` injected by
+/// user args, a loader profile or the version manifest) and exactly one
+/// `-Xms<memory>M` / `-Xmx<memory>M` pair is placed at the front. The rest of
+/// the list keeps its order, so GC flags and custom args still work.
+pub fn enforce_memory_flags(args: &mut Vec<String>, memory_mb: u32) {
+    let memory_mb = memory_mb.clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+    let mut filtered = strip_heap_sizing_flags(args);
+    filtered.insert(0, format!("-Xmx{}M", memory_mb));
+    filtered.insert(0, format!("-Xms{}M", memory_mb));
+    *args = filtered;
+}
+
+/// Does this argument set the initial/maximum heap (directly or through a RAM
+/// basis)? Matching is case-insensitive and accepts both `-XX:` and `-xx:`.
+fn is_heap_sizing_arg(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    if lower.starts_with("-xms") || lower.starts_with("-xmx") {
+        return true;
+    }
+    if lower == "-xx:+aggressiveheap" {
+        return true;
+    }
+    let Some(rest) = lower.strip_prefix("-xx:") else {
+        return false;
+    };
+    const HEAP_OPTIONS: &[&str] = &[
+        "maxheapsize=",
+        "initialheapsize=",
+        "softmaxheapsize=",
+        "maxram=",
+        "maxrampercentage=",
+        "initialrampercentage=",
+        "minrampercentage=",
+        "maxramfraction=",
+        "initialramfraction=",
+        "minramfraction=",
+    ];
+    HEAP_OPTIONS.iter().any(|opt| rest.starts_with(opt))
+}
+
+/// Conservative check for the size token of a split `-Xmx 4G` pair.
+fn looks_like_memory_size(value: &str) -> bool {
+    let value = value.trim();
+    let digits = match value.as_bytes().last() {
+        Some(b'k' | b'K' | b'm' | b'M' | b'g' | b'G' | b't' | b'T') => &value[..value.len() - 1],
+        _ => value,
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Remove flags that are invalid or obsolete on the detected Java version
 /// from a fully assembled argument list. Unlike `build_jvm_args` (which only
 /// sees the preset), this runs over everything: custom user args, loader
@@ -588,6 +684,66 @@ mod tests {
         // `-XX:+UseG1GCFoo` is NOT a real flag and must not be stripped.
         let out = strip_gc_selection_flags(&s(&["-XX:+UseG1GCFoo", "-Xmx4G"]));
         assert_eq!(out, s(&["-XX:+UseG1GCFoo", "-Xmx4G"]));
+    }
+
+    #[test]
+    fn heap_strip_removes_direct_and_equivalent_sizing_flags() {
+        let out = strip_heap_sizing_flags(&s(&[
+            "-Xms8G",
+            "-Xmx8192M",
+            "-XX:InitialHeapSize=8192m",
+            "-XX:MaxHeapSize=8192m",
+            "-XX:SoftMaxHeapSize=8192m",
+            "-XX:MaxRAM=16g",
+            "-XX:MaxRAMPercentage=80",
+            "-XX:InitialRAMPercentage=50",
+            "-XX:MinRAMPercentage=40",
+            "-XX:MaxRAMFraction=2",
+            "-XX:+AggressiveHeap",
+            "-xmx12g",
+            "-Dmanifest.arg=1",
+        ]));
+        assert_eq!(out, s(&["-Dmanifest.arg=1"]));
+    }
+
+    #[test]
+    fn heap_strip_handles_split_size_pairs() {
+        let out = strip_heap_sizing_flags(&s(&["-Xmx", "8g", "-Xms", "2048", "-Xmx", "-Dfoo=bar"]));
+        assert_eq!(out, s(&["-Dfoo=bar"]));
+    }
+
+    #[test]
+    fn heap_strip_keeps_unrelated_args() {
+        let out = strip_heap_sizing_flags(&s(&[
+            "-XX:+UseG1GC",
+            "-XX:MaxGCPauseMillis=50",
+            "-Xss4M",
+            "-Dfile.encoding=UTF-8",
+            "-p",
+            "mods",
+        ]));
+        assert_eq!(out.len(), 6, "unrelated args must stay, got: {:?}", out);
+    }
+
+    #[test]
+    fn enforce_memory_flags_leaves_one_authoritative_pair() {
+        let mut args = s(&[
+            "-Xmx8192M",
+            "-XX:+UseG1GC",
+            "-Dfoo=bar",
+            "-XX:MaxHeapSize=16g",
+            "-Xms8192M",
+        ]);
+        enforce_memory_flags(&mut args, 6144);
+        assert_eq!(
+            args,
+            s(&["-Xms6144M", "-Xmx6144M", "-XX:+UseG1GC", "-Dfoo=bar"])
+        );
+
+        // Absurd values are clamped to the absolute bounds.
+        let mut args = s(&["-Dfoo=bar"]);
+        enforce_memory_flags(&mut args, 0);
+        assert_eq!(args, s(&["-Xms2048M", "-Xmx2048M", "-Dfoo=bar"]));
     }
 
     #[test]
