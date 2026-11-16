@@ -360,7 +360,7 @@ export const en = {
   'instance_editor.memory_low_ram':    'Not enough RAM for a safe allocation (less than 4 GB). The minimum will be used; launch stability may suffer.',
   'instance_editor.memory_unknown_ram_short': 'total RAM is unknown',
   'instance_editor.memory_unknown_ram': 'Could not determine the system RAM. The memory limit comes from global settings; the saved instance value is not changed.',
-  'instance_editor.memory_above_limit': '{selected} GB is selected, but the maximum is {max} GB. Lower the value before saving.',
+  'instance_editor.memory_above_limit': '{selected} GB is selected, but the maximum is {max} GB. Lower the value to change memory.',
 
   // JVM args
   'instance_editor.jvm_label':         'JVM Arguments',

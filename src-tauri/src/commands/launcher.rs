@@ -1134,8 +1134,9 @@ pub async fn cmd_launch_game(
     // This is intentionally before spawning so the user sees G1GC, not a
     // silently substituted preset.
     let requested_gc = GcPreset::from_str(instance.effective_gc_preset(&config.default_gc_preset));
+    let total_ram_mb = crate::config::detect_total_ram_mb();
     let effective_memory_mb =
-        instance.effective_memory_mb(config.default_memory_mb, config.max_memory_mb);
+        instance.effective_memory_mb(config.default_memory_mb, config.max_memory_mb, total_ram_mb);
     let gc_decision = jvm::decide_gc(
         requested_gc,
         effective_memory_mb,
@@ -1343,6 +1344,7 @@ pub async fn cmd_launch_game(
                 launch_server.as_deref().map(|h| (h, server_port)),
                 launch_session_log.as_deref(),
                 Some(&launch_java),
+                total_ram_mb,
             )
             .map_err(|e| e.to_string())
         })

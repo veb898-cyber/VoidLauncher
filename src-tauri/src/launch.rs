@@ -251,6 +251,7 @@ pub struct LaunchProfileRequest<'a> {
     pub game_dir: &'a Path,
     pub default_memory_mb: u32,
     pub max_memory_mb: u32,
+    pub total_ram_mb: u64,
     pub default_gc_preset: &'a str,
     pub default_jvm_args: &'a [String],
 }
@@ -575,7 +576,11 @@ pub fn build_launch_profile(
     //   - Memory: instance override > launcher default. Xms == Xmx.
     //   - Preset: instance override > default_gc_preset (safe default).
     //   - Any custom instance.jvm_args are appended AFTER the preset.
-    let memory_mb = instance.effective_memory_mb(request.default_memory_mb, request.max_memory_mb);
+    let memory_mb = instance.effective_memory_mb(
+        request.default_memory_mb,
+        request.max_memory_mb,
+        request.total_ram_mb,
+    );
     let preset_str = instance.effective_gc_preset(request.default_gc_preset);
     let requested_preset = GcPreset::from_str(preset_str);
     let (mut jvm_args, effective_preset) =
@@ -971,6 +976,7 @@ pub fn prepare_and_build_launch_profile(
     session_log_path: Option<&str>,
     java_major: u32,
     target_arch: crate::versions::TargetArch,
+    total_ram_mb: u64,
 ) -> Result<(LaunchProfile, PathBuf)> {
     let prepared = prepare_launch_files(config, instance, version_info, target_arch)?;
 
@@ -991,6 +997,7 @@ pub fn prepare_and_build_launch_profile(
         game_dir: &prepared.game_dir,
         default_memory_mb: config.default_memory_mb,
         max_memory_mb: config.max_memory_mb,
+        total_ram_mb,
         default_gc_preset: &config.default_gc_preset,
         default_jvm_args: &config.default_jvm_args,
     };
@@ -1013,6 +1020,7 @@ pub fn build_launch_command(
     java_path: PathBuf,
     java_major: u32,
     target_arch: crate::versions::TargetArch,
+    total_ram_mb: u64,
 ) -> Result<LaunchCommand> {
     tracing::info!(target: "launcher", "Building launch command for instance: {}", instance.name);
     tracing::info!(target: "launcher", "MC version: {}", instance.mc_version);
@@ -1028,6 +1036,7 @@ pub fn build_launch_command(
         session_log_path,
         java_major,
         target_arch,
+        total_ram_mb,
     )?;
     Ok(profile.to_command(java_path, game_dir))
 }
@@ -1069,6 +1078,7 @@ pub fn spawn_launch(
 /// downloaded and re-probed) by the prepare phase; when present it is used
 /// verbatim, so prepare and spawn always run the same JVM and its probed
 /// architecture drives the native selection. `None` resolves the JVM here.
+#[allow(clippy::too_many_arguments)]
 pub fn launch_minecraft(
     config: &AppConfig,
     instance: &Instance,
@@ -1077,6 +1087,7 @@ pub fn launch_minecraft(
     server: Option<(&str, Option<u16>)>,
     session_log_path: Option<&str>,
     prepared_java: Option<&crate::java::JavaInstallation>,
+    total_ram_mb: u64,
 ) -> Result<std::process::Child> {
     tracing::info!(target: "launcher", "Starting launch for instance: {}", instance.name);
 
@@ -1115,6 +1126,7 @@ pub fn launch_minecraft(
         session_log_path,
         java_major,
         target_arch,
+        total_ram_mb,
     )?;
     let command = profile.to_command(java_path.clone(), game_dir.clone());
 
@@ -1561,6 +1573,7 @@ mod tests {
             game_dir: &game_dir,
             default_memory_mb: 4096,
             max_memory_mb: 8192,
+            total_ram_mb: 0,
             default_gc_preset: "g1gc",
             default_jvm_args: &default_jvm_args,
         };
@@ -1614,6 +1627,7 @@ mod tests {
             game_dir: &root,
             default_memory_mb: 4096,
             max_memory_mb: 8192,
+            total_ram_mb: 0,
             default_gc_preset: "g1gc",
             default_jvm_args: &default_jvm_args,
         };
@@ -1726,6 +1740,7 @@ mod tests {
                 game_dir: &root.join("instances/Arch/.minecraft"),
                 default_memory_mb: 4096,
                 max_memory_mb: 8192,
+                total_ram_mb: 0,
                 default_gc_preset: "g1gc",
                 default_jvm_args: &default_jvm_args,
             };

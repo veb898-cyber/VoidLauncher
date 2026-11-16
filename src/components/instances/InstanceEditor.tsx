@@ -96,6 +96,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const [baseline, setBaseline] = useState('');
   const [confirmClose, setConfirmClose] = useState(false);
   const [loaderModalOpen, setLoaderModalOpen] = useState(false);
+  const baselineMemoryRef = useRef<{ memoryMb: number; useDefaultMemory: boolean } | null>(null);
 
   // Values that arrive asynchronously (the global config) are read through
   // this ref by the one-time initializer below. They must not be effect
@@ -129,6 +130,10 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     setNotes(instance.notes || '');
     setMemoryMb(resolvedMemory);
     setUseDefaultMemory(instance.memory_mb == null);
+    baselineMemoryRef.current = {
+      memoryMb: resolvedMemory,
+      useDefaultMemory: instance.memory_mb == null,
+    };
     const initialJvmArgs = instance.jvm_args != null
       ? instance.jvm_args.join(' ')
       : globalJvm.join(' ');
@@ -154,7 +159,10 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
 
   // A closed editor must re-initialize the next time it is opened.
   useEffect(() => {
-    if (!open) initializedForRef.current = null;
+    if (!open) {
+      initializedForRef.current = null;
+      baselineMemoryRef.current = null;
+    }
   }, [open]);
 
   const dirty =
@@ -210,7 +218,12 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   const effectiveMemoryMb = Math.min(memoryMb, maxMemoryMb);
 
   const handleSave = async () => {
-    if (memoryAboveLimit) {
+    const baselineMemory = baselineMemoryRef.current;
+    const memoryChanged =
+      !baselineMemory ||
+      baselineMemory.memoryMb !== memoryMb ||
+      baselineMemory.useDefaultMemory !== useDefaultMemory;
+    if (memoryChanged && memoryAboveLimit) {
       addToast(
         t('instance_editor.memory_above_limit', {
           selected: (memoryMb / 1024).toFixed(1),

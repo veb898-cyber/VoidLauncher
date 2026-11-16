@@ -363,7 +363,7 @@ export const ru: Record<string, string> = {
   'instance_editor.memory_low_ram':    'Недостаточно RAM для безопасного выделения (менее 4 ГБ). Будет использован минимальный объём; запуск может быть нестабильным.',
   'instance_editor.memory_unknown_ram_short': 'объём RAM не определён',
   'instance_editor.memory_unknown_ram': 'Не удалось определить объём RAM. Ограничение памяти берётся из глобальных настроек; сохранённое значение сборки не изменяется.',
-  'instance_editor.memory_above_limit': 'Выбрано {selected} ГБ, но максимум {max} ГБ. Уменьшите значение перед сохранением.',
+  'instance_editor.memory_above_limit': 'Выбрано {selected} ГБ, максимум {max} ГБ. Уменьшите значение, чтобы изменить память.',
 
   // JVM args
   'instance_editor.jvm_label':         'JVM-аргументы',

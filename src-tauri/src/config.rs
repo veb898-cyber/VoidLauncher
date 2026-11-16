@@ -58,6 +58,23 @@ pub fn max_safe_memory_mb(total_ram_mb: u64) -> Option<u32> {
     (floored >= u64::from(MIN_MEMORY_MB)).then_some(floored as u32)
 }
 
+/// Effective memory ceiling used by both the launch path and the UI contract.
+///
+/// Unknown RAM keeps the stored global limit (the historical behavior); known
+/// RAM is capped by the safe maximum, and a known system below the safe floor
+/// is limited to the minimum heap. This is an execution-time cap only; stored
+/// config/instance values are never rewritten by this helper.
+pub fn effective_memory_ceiling(max_memory_mb: u32, total_ram_mb: u64) -> u32 {
+    let global = max_memory_mb.clamp(MIN_MEMORY_MB, MAX_MEMORY_MB);
+    if total_ram_mb == 0 {
+        return global;
+    }
+    match max_safe_memory_mb(total_ram_mb) {
+        Some(safe) => global.min(safe).max(MIN_MEMORY_MB),
+        None => MIN_MEMORY_MB,
+    }
+}
+
 /// Default memory pair for a fresh config.
 ///
 /// `default_memory_mb` is the tiered recommendation, but never above the
@@ -669,6 +686,28 @@ mod tests {
         // only a further increase is rejected.
         assert!(validate_memory_cap(32768, 32768, 8 * 1024).is_ok());
         assert!(validate_memory_cap(8192, 16384, 8 * 1024).is_err());
+    }
+
+    #[test]
+    fn effective_memory_ceiling_matches_the_safe_limit_contract() {
+        assert_eq!(effective_memory_ceiling(8192, 8 * 1024), 6144);
+        assert_eq!(effective_memory_ceiling(32768, 16 * 1024), 12800);
+        assert_eq!(effective_memory_ceiling(32768, 32 * 1024), 26112);
+        assert_eq!(
+            effective_memory_ceiling(8192, 32 * 1024),
+            8192,
+            "a lower global limit wins"
+        );
+        assert_eq!(
+            effective_memory_ceiling(8192, 0),
+            8192,
+            "unknown RAM keeps the existing global behavior"
+        );
+        assert_eq!(
+            effective_memory_ceiling(8192, 3 * 1024),
+            MIN_MEMORY_MB,
+            "known tiny RAM is reduced to the minimum heap"
+        );
     }
 
     #[test]

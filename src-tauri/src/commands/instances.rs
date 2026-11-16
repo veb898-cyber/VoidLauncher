@@ -235,10 +235,23 @@ pub async fn cmd_save_instance(
         let config = state.config.lock().map_err(|e| e.to_string())?;
         (config.instances_dir(), config.max_memory_mb)
     };
-    // Backend is the source of truth: never persist an impossible heap just
-    // because a hand-edited/corrupted JSON or a non-UI caller supplied one.
+    let total_ram_mb = crate::config::detect_total_ram_mb();
+    let memory_ceiling = crate::config::effective_memory_ceiling(max_memory_mb, total_ram_mb);
+    let previous_memory_mb = instances::get_instance(
+        &instances_dir,
+        old_name.as_deref().unwrap_or(&instance.name),
+    )
+    .ok()
+    .and_then(|previous| previous.memory_mb);
+    // Backend is the source of truth: a new value above the safe ceiling is
+    // rejected, while an unchanged legacy value is preserved (launch applies
+    // the effective cap) and is never rewritten by an unrelated save.
     let mut instance = instance;
-    instance.memory_mb = instance.normalized_memory_mb(max_memory_mb);
+    instance.memory_mb = instances::Instance::normalize_memory_update(
+        instance.memory_mb,
+        previous_memory_mb,
+        memory_ceiling,
+    )?;
 
     // Renaming moves the instance directory; stop the content watcher first
     // so Windows does not reject the move with "access denied".
