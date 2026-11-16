@@ -14,7 +14,7 @@ import { CustomSelect, type SelectOption } from '../ui/CustomSelect';
 import {
   MIN_MEMORY_MB,
   MEMORY_STEP_MB,
-  getMaxMemoryMb,
+  getSafeMaxMemoryMb,
   resolveInitialMemoryMb,
 } from '../../lib/memory';
 import { useSettingsStore } from '../../stores/settingsStore';
@@ -200,12 +200,13 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
   // also capped by the global Settings limit so the slider never promises a
   // value the backend will silently clamp on save.
   const configMaxMemoryMb = globalConfig?.max_memory_mb ?? null;
+  const safeRamMaxMb = getSafeMaxMemoryMb(systemRamMb);
   const maxMemoryMb = useMemo(() => {
-    const ramMax = getMaxMemoryMb(systemRamMb);
+    const ramMax = safeRamMaxMb ?? MIN_MEMORY_MB;
     return configMaxMemoryMb
       ? Math.max(MIN_MEMORY_MB, Math.min(ramMax, configMaxMemoryMb))
       : ramMax;
-  }, [systemRamMb, configMaxMemoryMb]);
+  }, [safeRamMaxMb, configMaxMemoryMb]);
 
   // Clamp the memory value when bounds change (e.g., system RAM detected after open)
   useEffect(() => {
@@ -363,6 +364,18 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
             <span>{t('instance_editor.memory_min_label', { gb: (MIN_MEMORY_MB / 1024).toFixed(1) })}</span>
             <span>{t('instance_editor.memory_max_label', { maxGb })}</span>
           </div>
+          {safeRamMaxMb == null && (
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 'var(--font-size-xs)',
+                color: 'var(--color-warning)',
+                lineHeight: 1.45,
+              }}
+            >
+              {t('instance_editor.memory_low_ram')}
+            </div>
+          )}
           {globalDefaultMemoryMb && globalDefaultMemoryMb !== memoryMb && (
             <div style={{ marginTop: 6 }}>
               <Tooltip content={t('instance_editor.gc_default_tooltip', { gb: (globalDefaultMemoryMb / 1024).toFixed(1) })}>

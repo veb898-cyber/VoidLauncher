@@ -360,6 +360,7 @@ export const ru: Record<string, string> = {
   'instance_editor.gc_zgc_unavailable':'Недоступно: ZGC требует Java 17+ и минимум 8 GB RAM (сейчас {allocatedGb} GB).',
   'instance_editor.gc_zgc_warning':    'Требуется Java 17+ и минимум 8 GB RAM.',
   'instance_editor.gc_zgc_launch_note':'Совместимость с Java проверяется при запуске. Если сборка использует Java ниже 17, лаунчер применит G1GC и покажет предупреждение.',
+  'instance_editor.memory_low_ram':    'Недостаточно RAM для безопасного выделения (менее 4 ГБ). Будет использован минимальный объём; запуск может быть нестабильным.',
 
   // JVM args
   'instance_editor.jvm_label':         'JVM-аргументы',
