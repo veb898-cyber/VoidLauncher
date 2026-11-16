@@ -258,16 +258,42 @@ export function useGameEvents() {
     }));
 
     register(
-      listen<{ kind: string; min_version?: string | null }>('launch_warning', (event) => {
-        if (event.payload.kind === 'elyby_skins_unsupported_mc') {
+      listen<{
+        kind: string;
+        min_version?: string | null;
+        java_major?: number | null;
+        memory_mb?: number | null;
+      }>('launch_warning', (event) => {
+        const { kind, min_version, java_major, memory_mb } = event.payload;
+        if (kind === 'elyby_skins_unsupported_mc') {
           addToast(
             t('errors.elyby_skins_unsupported_mc', {
-              version: event.payload.min_version ?? '1.7.2',
+              version: min_version ?? '1.7.2',
             }),
             'warning',
           );
-        } else if (event.payload.kind === 'elyby_skins_bypassed') {
+        } else if (kind === 'elyby_skins_bypassed') {
           addToast(t('errors.elyby_skins_bypassed'), 'warning');
+        } else if (kind === 'gc_zgc_fallback_java') {
+          addToast(
+            t('errors.gc_zgc_fallback_java', {
+              version: String(java_major ?? '?'),
+            }),
+            'warning',
+            { force: true },
+          );
+        } else if (kind === 'gc_zgc_fallback_heap') {
+          addToast(
+            t('errors.gc_zgc_fallback_heap', {
+              gb: ((memory_mb ?? 0) / 1024).toFixed(1),
+            }),
+            'warning',
+            { force: true },
+          );
+        } else if (kind === 'gc_zgc_fallback_unknown_java') {
+          addToast(t('errors.gc_zgc_fallback_unknown_java'), 'warning', {
+            force: true,
+          });
         }
       }),
     );

@@ -9,7 +9,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Supported GC preset strategies. Serialized as lowercase strings
 /// in the Instance config: "standard" | "g1gc" | "zgc".
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcPreset {
     /// No special GC flags. Caller is responsible for any flags they want.
     Standard,
@@ -18,6 +18,38 @@ pub enum GcPreset {
     G1gcPrism,
     /// Modern ZGC вЂ” low pause times, requires Java 17+ and 8+ GB of heap.
     ModernZgc,
+}
+
+/// Why a requested ZGC preset cannot be used for this launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcFallbackReason {
+    /// The Java probe did not produce a usable major version.
+    JavaUnknown,
+    /// The selected JVM is older than Java 17.
+    JavaTooOld { java_major: u32 },
+    /// The effective heap is below ZGC's 8 GB floor.
+    HeapTooSmall { memory_mb: u32 },
+}
+
+/// The preset that will actually be used and, when it differs from the
+/// request, the concrete reason. Launch code uses this to surface a visible
+/// warning instead of silently changing the user's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcDecision {
+    pub requested: GcPreset,
+    pub effective: GcPreset,
+    pub fallback: Option<GcFallbackReason>,
+}
+
+impl GcFallbackReason {
+    /// Stable machine-readable kind for the frontend warning event.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::JavaUnknown => "gc_zgc_fallback_unknown_java",
+            Self::JavaTooOld { .. } => "gc_zgc_fallback_java",
+            Self::HeapTooSmall { .. } => "gc_zgc_fallback_heap",
+        }
+    }
 }
 
 impl GcPreset {
@@ -87,16 +119,47 @@ fn parse_java_major(output: &str) -> u32 {
     0
 }
 
+/// Decide which GC preset can actually be used for this heap/Java pair.
+///
+/// ZGC requires Java 17+ and at least 8 GB of heap. Unknown Java (`0`) is
+/// treated as unsupported rather than optimistically assumed compatible.
+pub fn decide_gc(requested: GcPreset, memory_mb: u32, java_major: u32) -> GcDecision {
+    let fallback = match requested {
+        GcPreset::ModernZgc => {
+            if java_major == 0 {
+                Some(GcFallbackReason::JavaUnknown)
+            } else if java_major < 17 {
+                Some(GcFallbackReason::JavaTooOld { java_major })
+            } else if memory_mb < 8192 {
+                Some(GcFallbackReason::HeapTooSmall { memory_mb })
+            } else {
+                None
+            }
+        }
+        GcPreset::Standard | GcPreset::G1gcPrism => None,
+    };
+    GcDecision {
+        requested,
+        effective: if fallback.is_some() {
+            GcPreset::G1gcPrism
+        } else {
+            requested
+        },
+        fallback,
+    }
+}
+
 /// Build the JVM argument list for a given preset, memory budget, and Java major version.
 ///
 /// Returns a tuple of (final_args, effective_preset). The effective preset may differ
 /// from the requested one if safety rules forced a fallback (e.g. ZGC -> G1GC).
+/// Use [`decide_gc`] when the caller also needs the concrete fallback reason for
+/// a user-visible warning.
 ///
 /// - Xms and Xmx are always set equal, using the supplied `memory_mb`.
 /// - The flag list never includes the user's custom args; those should be appended
 ///   by the caller AFTER this function returns.
-/// - ZGC requires Java >= 17 AND >= 8 GB of heap. If either condition fails,
-///   the preset silently downgrades to G1GC and a warning is logged.
+/// - ZGC requires Java >= 17 AND >= 8 GB of heap.
 pub fn build_jvm_args(
     requested: GcPreset,
     memory_mb: u32,
@@ -138,29 +201,23 @@ pub fn build_jvm_args(
         args.push("java.desktop/java.awt=ALL-UNNAMED".into());
     }
 
-    let effective = match requested {
-        GcPreset::Standard => GcPreset::Standard,
-        GcPreset::G1gcPrism => GcPreset::G1gcPrism,
-        GcPreset::ModernZgc => {
-            if java_major < 17 {
-                tracing::warn!(
-                    target: "launcher",
-                    "ZGC requires Java 17+ (detected: {}). Falling back to G1GC.",
-                    java_major
-                );
-                GcPreset::G1gcPrism
-            } else if memory_mb < 8192 {
-                tracing::warn!(
-                    target: "launcher",
-                    "ZGC requires at least 8 GB of heap (allocated: {} MB). Falling back to G1GC.",
-                    memory_mb
-                );
-                GcPreset::G1gcPrism
-            } else {
-                GcPreset::ModernZgc
+    let decision = decide_gc(requested, memory_mb, java_major);
+    if let Some(reason) = decision.fallback {
+        tracing::warn!(
+            target: "launcher",
+            "Requested {:?}, but {:?} is not usable ({}); using G1GC.",
+            requested,
+            GcPreset::ModernZgc,
+            match reason {
+                GcFallbackReason::JavaUnknown => "Java version is unknown".to_string(),
+                GcFallbackReason::JavaTooOld { java_major } =>
+                    format!("Java {} is older than 17", java_major),
+                GcFallbackReason::HeapTooSmall { memory_mb } =>
+                    format!("heap {} MB is below 8192 MB", memory_mb),
             }
-        }
-    };
+        );
+    }
+    let effective = decision.effective;
 
     match effective {
         GcPreset::Standard => {
@@ -323,6 +380,50 @@ mod tests {
         assert!(!args.contains(&"-XX:+G1UnlockCommercialFeatures".to_string()));
         assert!(args.iter().any(|a| a == "-Xms4096M"));
         assert!(args.iter().any(|a| a == "-Xmx4096M"));
+    }
+
+    #[test]
+    fn gc_decision_reports_concrete_fallback_reason() {
+        assert_eq!(
+            decide_gc(GcPreset::ModernZgc, 8192, 0),
+            GcDecision {
+                requested: GcPreset::ModernZgc,
+                effective: GcPreset::G1gcPrism,
+                fallback: Some(GcFallbackReason::JavaUnknown),
+            }
+        );
+        assert_eq!(
+            decide_gc(GcPreset::ModernZgc, 8192, 11),
+            GcDecision {
+                requested: GcPreset::ModernZgc,
+                effective: GcPreset::G1gcPrism,
+                fallback: Some(GcFallbackReason::JavaTooOld { java_major: 11 }),
+            }
+        );
+        assert_eq!(
+            decide_gc(GcPreset::ModernZgc, 6144, 21),
+            GcDecision {
+                requested: GcPreset::ModernZgc,
+                effective: GcPreset::G1gcPrism,
+                fallback: Some(GcFallbackReason::HeapTooSmall { memory_mb: 6144 }),
+            }
+        );
+        assert_eq!(
+            decide_gc(GcPreset::ModernZgc, 8192, 21),
+            GcDecision {
+                requested: GcPreset::ModernZgc,
+                effective: GcPreset::ModernZgc,
+                fallback: None,
+            }
+        );
+        assert_eq!(
+            decide_gc(GcPreset::G1gcPrism, 4096, 8),
+            GcDecision {
+                requested: GcPreset::G1gcPrism,
+                effective: GcPreset::G1gcPrism,
+                fallback: None,
+            }
+        );
     }
 
     #[test]

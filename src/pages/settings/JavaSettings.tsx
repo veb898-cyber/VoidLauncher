@@ -10,7 +10,12 @@ import { CustomSelect } from '../../components/ui/CustomSelect';
 import { SnakeSpinner } from '../../components/ui/SnakeSpinner';
 import { Tooltip } from '../../components/ui/Tooltip';
 import { addToast } from '../../components/ui/Toast';
-import { getRecommendedMemoryMb, snapToMemoryStep } from '../../lib/memory';
+import {
+  MAX_MEMORY_MB,
+  getRecommendedMemoryMb,
+  getSafeMaxMemoryMb,
+  snapToMemoryStep,
+} from '../../lib/memory';
 import { useT } from '../../lib/i18n';
 import type { UpdateConfig } from './types';
 
@@ -44,6 +49,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
   const [checkingJava, setCheckingJava] = useState(false);
   const [javaError, setJavaError] = useState(false);
   const [javaRefreshing, setJavaRefreshing] = useState(false);
+  const [systemRamMb, setSystemRamMb] = useState<number | null>(null);
 
   const loadJavaVersions = useCallback(async () => {
     setCheckingJava(true);
@@ -69,6 +75,32 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
     detectJava();
     loadJavaVersions();
   }, [detectJava, loadJavaVersions]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const total = await invoke<number>('cmd_detect_system_ram');
+        if (!cancelled) setSystemRamMb(total > 0 ? total : null);
+      } catch {
+        if (!cancelled) setSystemRamMb(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const safeMaxMb = systemRamMb == null ? null : getSafeMaxMemoryMb(systemRamMb);
+  const currentLimitMb = Math.min(config.max_memory_mb, MAX_MEMORY_MB);
+  const memoryAboveLimit = config.default_memory_mb > currentLimitMb;
+  const canRaiseLimit =
+    safeMaxMb != null &&
+    safeMaxMb > currentLimitMb &&
+    (!memoryAboveLimit || safeMaxMb >= config.default_memory_mb);
+  const limitAboveSafe = safeMaxMb != null && currentLimitMb > safeMaxMb;
+  const zgcBlocked = config.default_memory_mb < 8192;
+  const formatGb = (mb: number) => (mb / 1024).toFixed(1).replace(/\.0$/, '');
 
   return (
     <>
@@ -183,17 +215,21 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               className="input"
               type="number"
               min="2048"
-              max="32768"
+              max={currentLimitMb}
               step="512"
               value={config.default_memory_mb}
               onChange={(e) => {
                 // `max` only constrains the spinner arrows: typed values must
                 // be clamped too, or a typo is persisted and handed to the JVM.
                 const parsed = parseInt(e.target.value, 10) || 2048;
-                updateConfig('default_memory_mb', Math.min(32768, Math.max(2048, parsed)));
+                updateConfig(
+                  'default_memory_mb',
+                  Math.min(currentLimitMb, Math.max(2048, parsed)),
+                );
               }}
               style={{ width: 100, textAlign: 'center' }}
               id="min-memory-input"
+              aria-label={t('settings.memory_title')}
             />
             <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>{t('settings.memory_unit')}</span>
             <Tooltip content={t('settings.memory_reset_tooltip')}>
@@ -201,9 +237,15 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
                 className="btn btn--secondary btn--sm"
                 onClick={async () => {
                   const totalMb = await detectSystemRam();
-                  // Tiered: 4 / 6 / 8 GB depending on total RAM, snapped to 512 MB step
-                  const recommended = snapToMemoryStep(getRecommendedMemoryMb(totalMb));
-                  updateConfig('default_memory_mb', recommended);
+                  // Tiered: 4 / 6 / 8 GB depending on total RAM, snapped to
+                  // 512 MB step, but never above the current explicit cap.
+                  const recommended = snapToMemoryStep(
+                    getRecommendedMemoryMb(totalMb),
+                  );
+                  updateConfig(
+                    'default_memory_mb',
+                    Math.min(recommended, currentLimitMb),
+                  );
                 }}
                 id="reset-memory-btn"
               >
@@ -213,12 +255,78 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
           </div>
         </div>
 
+        <div className="settings-row" style={{ paddingTop: 0 }}>
+          <div className="settings-row__info">
+            <div className="settings-row__desc">
+              {t('settings.memory_limit_current', {
+                limit: formatGb(currentLimitMb),
+              })}
+              {safeMaxMb != null && (
+                <>
+                  {' '}
+                  {t('settings.memory_limit_safe', {
+                    safe: formatGb(safeMaxMb),
+                  })}
+                </>
+              )}
+            </div>
+            {memoryAboveLimit && (
+              <div className="settings-row__note settings-row__note--active">
+                {t('settings.memory_limit_exceeded', {
+                  selected: formatGb(config.default_memory_mb),
+                  effective: formatGb(currentLimitMb),
+                })}
+              </div>
+            )}
+            {limitAboveSafe && (
+              <div className="settings-row__note settings-row__note--active">
+                {t('settings.memory_limit_above_safe', {
+                  limit: formatGb(currentLimitMb),
+                  safe: formatGb(safeMaxMb!),
+                })}
+              </div>
+            )}
+            {systemRamMb == null && (
+              <div className="settings-row__note settings-row__note--locked">
+                {t('settings.memory_limit_unknown')}
+              </div>
+            )}
+            {systemRamMb != null && safeMaxMb == null && (
+              <div className="settings-row__note settings-row__note--active">
+                {t('settings.memory_limit_low_ram')}
+              </div>
+            )}
+          </div>
+          <div className="settings-row__control">
+            {canRaiseLimit && (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => updateConfig('max_memory_mb', safeMaxMb!)}
+                id="raise-memory-limit-btn"
+              >
+                {t('settings.memory_limit_raise', {
+                  safe: formatGb(safeMaxMb),
+                })}
+              </Button>
+            )}
+          </div>
+        </div>
+
         <div className="settings-row">
           <div className="settings-row__info">
             <div className="settings-row__title">{t('settings.gc_title')}</div>
             <div className="settings-row__desc">
               {t('settings.gc_desc')}
             </div>
+            <div className="settings-row__note settings-row__note--locked">
+              {t('settings.gc_zgc_note')}
+            </div>
+            {config.default_gc_preset === 'zgc' && zgcBlocked && (
+              <div className="settings-row__note settings-row__note--active">
+                {t('settings.gc_zgc_unavailable')}
+              </div>
+            )}
           </div>
           <div className="settings-row__control" style={{ width: 320 }}>
             <CustomSelect
@@ -226,7 +334,14 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
               options={[
                 { value: 'standard', label: t('instance_editor.gc_standard'), description: t('instance_editor.gc_standard_short') },
                 { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: t('instance_editor.gc_g1gc_short') },
-                { value: 'zgc', label: t('instance_editor.gc_zgc'), description: t('instance_editor.gc_zgc_req') },
+                {
+                  value: 'zgc',
+                  label: t('instance_editor.gc_zgc'),
+                  description: zgcBlocked
+                    ? t('settings.gc_zgc_unavailable_short')
+                    : t('instance_editor.gc_zgc_req'),
+                  disabled: zgcBlocked,
+                },
               ]}
               onChange={(v) => updateConfig('default_gc_preset', v)}
             />

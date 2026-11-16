@@ -3,9 +3,15 @@ use std::path::PathBuf;
 
 /// Hard bounds for any heap value the launcher will hand to the JVM.
 /// The UI and the global config use the same bounds; the per-instance value
-/// is additionally capped by the user's global `max_memory_mb`.
+/// is additionally capped by the global `max_memory_mb` system ceiling.
 pub const MIN_MEMORY_MB: u32 = 2048;
 pub const MAX_MEMORY_MB: u32 = 32768;
+
+/// Amount of RAM reserved for Windows and other processes, in MB.
+const SYSTEM_MEMORY_RESERVE_MB: u64 = 2048;
+/// Maximum share of total RAM the launcher may hand to Minecraft.
+const MAX_MEMORY_PERCENT: u64 = 80;
+const MEMORY_STEP_MB: u64 = 512;
 
 /// Current config schema/migration marker. Bump only together with a
 /// deterministic, non-ambiguous migration.
@@ -31,6 +37,69 @@ pub fn recommended_memory_mb(total_ram_mb: u64) -> u32 {
     4096
 }
 
+/// Safe global memory ceiling for a known RAM total.
+///
+/// Leaves 2 GB or 20% for the OS, whichever is larger, caps at
+/// [`MAX_MEMORY_MB`] and snaps down to the 512 MB grid. `None` means the
+/// system cannot safely provide even the minimum heap (or RAM is unknown):
+/// callers must preserve the existing configured limit instead of inventing
+/// a new one.
+///
+/// Keep this formula in lockstep with `getSafeMaxMemoryMb` in
+/// `src/lib/memory.ts`; both sides enforce the same contract.
+pub fn max_safe_memory_mb(total_ram_mb: u64) -> Option<u32> {
+    if total_ram_mb < 4096 {
+        return None;
+    }
+    let usable = total_ram_mb.saturating_sub(SYSTEM_MEMORY_RESERVE_MB);
+    let percent_cap = total_ram_mb.saturating_mul(MAX_MEMORY_PERCENT) / 100;
+    let safe = usable.min(percent_cap).min(u64::from(MAX_MEMORY_MB));
+    let floored = (safe / MEMORY_STEP_MB) * MEMORY_STEP_MB;
+    (floored >= u64::from(MIN_MEMORY_MB)).then_some(floored as u32)
+}
+
+/// Default memory pair for a fresh config.
+///
+/// `default_memory_mb` is the tiered recommendation, but never above the
+/// safe ceiling. Unknown RAM (0) keeps the historical 4 GB fallback; a known
+/// system below 4 GB gets the minimum heap rather than an unsafe "safe max".
+fn default_memory_limits(total_ram_mb: u64) -> (u32, u32) {
+    let recommended = recommended_memory_mb(total_ram_mb);
+    let max_memory_mb = match max_safe_memory_mb(total_ram_mb) {
+        Some(safe) => safe,
+        // RAM detection failed: keep the historical conservative fallback.
+        None if total_ram_mb == 0 => recommended.clamp(MIN_MEMORY_MB, MAX_MEMORY_MB),
+        // Known tiny system: do not claim a safe heap above the hard floor.
+        None => MIN_MEMORY_MB,
+    };
+    let max_memory_mb = max_memory_mb.clamp(MIN_MEMORY_MB, MAX_MEMORY_MB);
+    let default_memory_mb = recommended.clamp(MIN_MEMORY_MB, max_memory_mb);
+    (default_memory_mb, max_memory_mb)
+}
+
+/// Guard an explicit memory-limit change: an existing limit may be lowered or
+/// kept, but raising it is allowed only up to the safe maximum for this
+/// machine. Unknown RAM leaves the caller's existing UI decision untouched.
+pub fn validate_memory_cap(
+    previous_max_mb: u32,
+    new_max_mb: u32,
+    total_ram_mb: u64,
+) -> Result<(), String> {
+    if new_max_mb <= previous_max_mb {
+        return Ok(());
+    }
+    if let Some(safe) = max_safe_memory_mb(total_ram_mb) {
+        if new_max_mb > safe {
+            return Err(format!(
+                "The memory limit cannot exceed the safe maximum for this system \
+                 ({} MB). Lower the limit or use the detected value.",
+                safe
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Detect total system RAM in MB using sysinfo. Returns 0 on failure.
 pub fn detect_total_ram_mb() -> u64 {
     use sysinfo::System;
@@ -47,9 +116,12 @@ pub struct AppConfig {
     /// Microsoft Azure App Client ID for OAuth2 (code-only, not editable in UI)
     #[serde(default = "default_client_id")]
     pub client_id: String,
-    /// Default JVM initial memory (Xms) in MB
+    /// Default JVM initial memory (Xms) in MB. Also used as Xmx for the
+    /// default heap; the actual value is capped by `max_memory_mb`.
     pub default_memory_mb: u32,
-    /// Default JVM max memory (Xmx) in MB
+    /// Global memory ceiling (MB). It is a system-safety limit, not a second
+    /// heap value; the launch path caps both default and per-instance memory
+    /// with it. Existing values are never raised automatically.
     pub max_memory_mb: u32,
     /// Default GC preset for new instances: "standard" | "g1gc" | "zgc"
     #[serde(default = "default_gc_preset")]
@@ -132,12 +204,15 @@ impl Default for AppConfig {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("VoidLauncher");
 
-        // Auto-pick a sensible memory default based on system RAM on first launch.
+        // Auto-pick a sensible memory default based on system RAM on first
+        // launch. New installs also get the safe system ceiling; existing
+        // configs keep their stored max_memory_mb (no ambiguous migration).
         let total_ram = detect_total_ram_mb();
-        let recommended = recommended_memory_mb(total_ram);
+        let (default_memory_mb, max_memory_mb) = default_memory_limits(total_ram);
         // ZGC is the default on machines with >= 24 GB RAM (heap >= 8 GB):
-        // low pause times win over G1GC there, and `build_jvm_args` still
-        // falls back to G1GC if Java < 17 or the heap is too small.
+        // low pause times win over G1GC there. The launch path validates the
+        // actual instance Java and reports a visible fallback warning when
+        // ZGC cannot be used.
         let gc_default = if total_ram >= 24 * 1024 {
             "zgc"
         } else {
@@ -145,16 +220,16 @@ impl Default for AppConfig {
         };
         tracing::info!(
             target: "config",
-            "First launch: detected {} MB RAM, defaulting to {} MB, GC preset {}",
-            total_ram, recommended, gc_default
+            "First launch: detected {} MB RAM, defaulting to {} MB (limit {} MB), GC preset {}",
+            total_ram, default_memory_mb, max_memory_mb, gc_default
         );
 
         Self {
             data_dir,
             // Default uses Prism Launcher's registered Azure App ID
             client_id: "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb".into(),
-            default_memory_mb: recommended,
-            max_memory_mb: recommended,
+            default_memory_mb,
+            max_memory_mb,
             default_gc_preset: gc_default.into(),
             // NOTE: This list must NOT contain a GC selector flag
             // (UseG1GC / UseZGC / UseParallelGC / …) — the chosen preset
@@ -225,8 +300,6 @@ impl AppConfig {
     ///   * record the config schema version once (legacy configs have no
     ///     marker, so an explicit `g1gc`/6 GB choice is preserved rather than
     ///     reinterpreted as an old default);
-    ///   * ZGC with less than 8 GB of heap → G1GC (ZGC cannot work there, and
-    ///     the launch path would fall back anyway);
     ///   * legacy server-style `default_jvm_args` → slim preset-neutral set.
     ///
     /// Returns true when something changed (caller should persist).
@@ -256,16 +329,6 @@ impl AppConfig {
                 target: "config",
                 "Migrated config schema to version {} (user choices preserved)",
                 CONFIG_VERSION
-            );
-            changed = true;
-        }
-
-        if self.default_gc_preset.eq_ignore_ascii_case("zgc") && self.default_memory_mb < 8192 {
-            self.default_gc_preset = "g1gc".into();
-            tracing::info!(
-                target: "config",
-                "Migrated default GC preset zgc -> g1gc (ZGC needs >= 8 GB heap, current: {} MB)",
-                self.default_memory_mb
             );
             changed = true;
         }
@@ -469,6 +532,29 @@ impl AppConfig {
         self.use_system_proxy.unwrap_or(true)
     }
 
+    /// Validate the memory/GC pair before it is persisted.
+    ///
+    /// This deliberately returns an error instead of silently clamping: the
+    /// renderer shows the same limits, so a rejected save means the user saw
+    /// an invalid combination and should fix it (or raise the explicit cap).
+    pub fn validate_memory_and_gc(&self) -> Result<(), String> {
+        if self.default_memory_mb > self.max_memory_mb {
+            return Err(format!(
+                "Default memory ({} MB) exceeds the global memory limit ({} MB). \
+                 Increase the limit or lower the default memory.",
+                self.default_memory_mb, self.max_memory_mb
+            ));
+        }
+        if self.default_gc_preset.eq_ignore_ascii_case("zgc") && self.default_memory_mb < 8192 {
+            return Err(
+                "ZGC requires at least 8 GB of heap. Increase the default memory \
+                 or choose the G1GC preset."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     fn has_manual_proxy(&self) -> bool {
         !self.proxy_addr.trim().is_empty() && self.proxy_port > 0
     }
@@ -491,6 +577,69 @@ mod tests {
 
     fn base() -> AppConfig {
         AppConfig::default()
+    }
+
+    #[test]
+    fn safe_memory_ceiling_matches_the_frontend_contract() {
+        assert_eq!(max_safe_memory_mb(0), None);
+        assert_eq!(max_safe_memory_mb(3 * 1024), None);
+        assert_eq!(max_safe_memory_mb(4 * 1024), Some(2048));
+        assert_eq!(max_safe_memory_mb(8 * 1024), Some(6144));
+        assert_eq!(max_safe_memory_mb(16 * 1024), Some(12800));
+        assert_eq!(max_safe_memory_mb(24 * 1024), Some(19456));
+        assert_eq!(max_safe_memory_mb(32 * 1024), Some(26112));
+        assert_eq!(
+            max_safe_memory_mb(64 * 1024),
+            Some(MAX_MEMORY_MB),
+            "the 512 MB cap must never exceed the backend hard limit"
+        );
+    }
+
+    #[test]
+    fn fresh_config_memory_defaults_follow_the_safe_ceiling() {
+        assert_eq!(default_memory_limits(0), (4096, 4096));
+        assert_eq!(default_memory_limits(3 * 1024), (2048, 2048));
+        assert_eq!(default_memory_limits(4 * 1024), (2048, 2048));
+        assert_eq!(default_memory_limits(8 * 1024), (4096, 6144));
+        assert_eq!(default_memory_limits(16 * 1024), (6144, 12800));
+        assert_eq!(default_memory_limits(24 * 1024), (8192, 19456));
+        assert_eq!(default_memory_limits(32 * 1024), (8192, 26112));
+        assert_eq!(default_memory_limits(64 * 1024), (8192, MAX_MEMORY_MB));
+    }
+
+    #[test]
+    fn memory_and_gc_validation_rejects_untruthful_pairs() {
+        let mut config = base();
+        config.default_memory_mb = 8192;
+        config.max_memory_mb = 6144;
+        assert!(config.validate_memory_and_gc().is_err());
+
+        config.max_memory_mb = 8192;
+        config.default_gc_preset = "zgc".into();
+        config.default_memory_mb = 6144;
+        assert!(config.validate_memory_and_gc().is_err());
+
+        config.default_memory_mb = 8192;
+        assert!(config.validate_memory_and_gc().is_ok());
+
+        config.default_gc_preset = "g1gc".into();
+        config.default_memory_mb = 4096;
+        assert!(config.validate_memory_and_gc().is_ok());
+    }
+
+    #[test]
+    fn memory_limit_can_only_rise_to_the_safe_maximum() {
+        // Existing 8 GB cap on a 32 GB system: the safe ceiling is ~25.5 GB.
+        assert!(validate_memory_cap(8192, 8192, 32 * 1024).is_ok());
+        assert!(validate_memory_cap(8192, 4096, 32 * 1024).is_ok());
+        assert!(validate_memory_cap(8192, 26112, 32 * 1024).is_ok());
+        assert!(validate_memory_cap(8192, 26624, 32 * 1024).is_err());
+        assert!(validate_memory_cap(8192, 32768, 32 * 1024).is_err());
+
+        // A legacy value above the safe ceiling is preserved while unchanged;
+        // only a further increase is rejected.
+        assert!(validate_memory_cap(32768, 32768, 8 * 1024).is_ok());
+        assert!(validate_memory_cap(8192, 16384, 8 * 1024).is_err());
     }
 
     #[test]
@@ -529,6 +678,37 @@ mod tests {
             config.config_version, 0,
             "a config without the marker is a legacy config"
         );
+    }
+
+    #[test]
+    fn legacy_memory_cap_is_preserved_on_load() {
+        let dir = std::env::temp_dir().join(format!("vl-config-memory-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = serde_json::json!({
+            "data_dir": dir,
+            "default_memory_mb": 4096,
+            "max_memory_mb": 4096,
+            "default_jvm_args": ["-XX:+DisableExplicitGC"],
+            "java_path": null,
+            "show_snapshots": false,
+            "show_old_versions": false
+        });
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = AppConfig::load(&dir);
+        assert_eq!(
+            loaded.default_memory_mb, 4096,
+            "a stored default must survive migration"
+        );
+        assert_eq!(
+            loaded.max_memory_mb, 4096,
+            "a stored memory cap must never be raised automatically"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -611,6 +791,10 @@ mod tests {
         legacy.max_memory_mb = 8192;
         assert!(legacy.migrate(), "schema marker is recorded once");
         assert_eq!(legacy.default_gc_preset, "g1gc");
+        assert_eq!(
+            legacy.max_memory_mb, 8192,
+            "an existing memory cap must never be raised by migration"
+        );
         assert_eq!(legacy.config_version, CONFIG_VERSION);
         assert!(
             !legacy.migrate(),
@@ -637,15 +821,15 @@ mod tests {
         assert_eq!(six_gb.default_memory_mb, 6144);
         assert_eq!(six_gb.max_memory_mb, 6144);
 
-        // ZGC below the 8 GB floor is a safety correction: the JVM launch
-        // path would fall back to G1GC anyway.
+        // An explicit low-heap ZGC choice is preserved rather than rewritten;
+        // Settings marks it invalid and the launch path reports the fallback.
         let mut low = base();
         low.config_version = 0;
         low.default_gc_preset = "zgc".into();
         low.default_memory_mb = 4096;
         low.max_memory_mb = 4096;
         assert!(low.migrate());
-        assert_eq!(low.default_gc_preset, "g1gc");
+        assert_eq!(low.default_gc_preset, "zgc");
     }
 
     #[test]

@@ -188,7 +188,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
     (async () => {
       try {
         const total = await invoke<number>('cmd_detect_system_ram');
-        if (!cancelled) setSystemRamMb(total);
+        if (!cancelled && total > 0) setSystemRamMb(total);
       } catch {
         /* fall back to default 8192 */
       }
@@ -399,7 +399,25 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
                 ? <span style={{ color: 'var(--color-warning)' }}>{t('instance_editor.gc_zgc_unavailable', { allocatedGb })}</span>
                 : <>{t('instance_editor.gc_zgc_desc')} <span style={{ color: 'var(--color-warning)' }}>{t('instance_editor.gc_zgc_warning')}</span></>
             )}
+            {gcPreset === 'inherit' && globalDefaultGcPreset === 'zgc' && zgcDisabled && (
+              <div style={{ color: 'var(--color-warning)', marginTop: 4 }}>
+                {t('instance_editor.gc_zgc_unavailable', { allocatedGb })}
+              </div>
+            )}
           </div>
+          {(gcPreset === 'zgc' ||
+            (gcPreset === 'inherit' && globalDefaultGcPreset === 'zgc')) && (
+            <div
+              style={{
+                fontSize: 'var(--font-size-xs)',
+                color: 'var(--text-tertiary)',
+                marginTop: 4,
+                lineHeight: 1.45,
+              }}
+            >
+              {t('instance_editor.gc_zgc_launch_note')}
+            </div>
+          )}
         </div>
 
         <Input

@@ -772,6 +772,7 @@ pub fn cmd_save_config(
     new_config: AppConfig,
 ) -> Result<(), String> {
     events::emit_log(&app, "info", "config", "Saving configuration...");
+    let total_ram_mb = crate::config::detect_total_ram_mb();
     let mut config = state.config.lock().map_err(|e| e.to_string())?;
     let previous = config.clone();
     // The renderer is not a trust boundary for numeric limits: clamp here so
@@ -791,6 +792,15 @@ pub fn cmd_save_config(
     if !crate::config::AFTER_LAUNCH_ACTIONS.contains(&new_config.after_launch_action.as_str()) {
         new_config.after_launch_action = "do_nothing".to_string();
     }
+    new_config
+        .validate_memory_and_gc()
+        .map_err(|e| e.to_string())?;
+    crate::config::validate_memory_cap(
+        previous.max_memory_mb,
+        new_config.max_memory_mb,
+        total_ram_mb,
+    )
+    .map_err(|e| e.to_string())?;
     // The renderer does not know about the migration marker; saving settings
     // must not downgrade a current config back to the legacy schema.
     new_config.config_version = crate::config::CONFIG_VERSION;

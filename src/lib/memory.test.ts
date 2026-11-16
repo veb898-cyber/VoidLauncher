@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  MAX_MEMORY_MB,
   MIN_MEMORY_MB,
   getMaxMemoryMb,
   getRecommendedMemoryMb,
+  getSafeMaxMemoryMb,
   resolveInitialMemoryMb,
   snapToMemoryStep,
 } from './memory';
@@ -21,14 +23,34 @@ describe('getRecommendedMemoryMb', () => {
   });
 });
 
-describe('getMaxMemoryMb', () => {
-  it('reserves 2 GB for the OS and stays on the 512 MB grid', () => {
-    expect(getMaxMemoryMb(8 * 1024)).toBe(6144);
-    expect(getMaxMemoryMb(16 * 1024)).toBe(12800);
-    expect(getMaxMemoryMb(64 * 1024)).toBe(52224);
+describe('getSafeMaxMemoryMb', () => {
+  it('reserves 2 GB or 20%, whichever is larger, and snaps to 512 MB', () => {
+    expect(getSafeMaxMemoryMb(4 * 1024)).toBe(2048);
+    expect(getSafeMaxMemoryMb(8 * 1024)).toBe(6144);
+    expect(getSafeMaxMemoryMb(16 * 1024)).toBe(12800);
+    expect(getSafeMaxMemoryMb(24 * 1024)).toBe(19456);
+    expect(getSafeMaxMemoryMb(32 * 1024)).toBe(26112);
   });
 
-  it('never returns less than the hard floor', () => {
+  it('never exceeds the backend hard cap', () => {
+    expect(getSafeMaxMemoryMb(64 * 1024)).toBe(MAX_MEMORY_MB);
+  });
+
+  it('returns null when the system cannot safely provide the minimum heap', () => {
+    expect(getSafeMaxMemoryMb(0)).toBeNull();
+    expect(getSafeMaxMemoryMb(3 * 1024)).toBeNull();
+    expect(getSafeMaxMemoryMb(-1)).toBeNull();
+  });
+});
+
+describe('getMaxMemoryMb', () => {
+  it('uses the safe maximum where one exists', () => {
+    expect(getMaxMemoryMb(8 * 1024)).toBe(6144);
+    expect(getMaxMemoryMb(16 * 1024)).toBe(12800);
+    expect(getMaxMemoryMb(64 * 1024)).toBe(MAX_MEMORY_MB);
+  });
+
+  it('keeps the hard floor for legacy callers on tiny/unknown RAM', () => {
     expect(getMaxMemoryMb(1024)).toBe(MIN_MEMORY_MB);
     expect(getMaxMemoryMb(0)).toBe(MIN_MEMORY_MB);
   });

@@ -13,6 +13,8 @@ interface ToastData {
   type: ToastType;
   /** How many times this exact toast arrived while it was on screen. */
   count: number;
+  /** Launch-critical warnings stay visible even if the category is off. */
+  force?: boolean;
 }
 
 interface ToastItemProps {
@@ -101,17 +103,26 @@ function isCategoryEnabled(type: ToastType): boolean {
  * A category switched off in Settings only hides the bubble: the call is
  * still written to the launcher log, and the operation/error handling that
  * produced it is untouched.
+ *
+ * `force` is reserved for launch-critical notices that must remain visible
+ * even when the user disabled that toast category (currently GC fallbacks).
  */
-export function addToast(message: string, type: ToastType = 'info') {
-  if (isCategoryEnabled(type)) {
+export function addToast(
+  message: string,
+  type: ToastType = 'info',
+  options?: { force?: boolean },
+) {
+  if (options?.force || isCategoryEnabled(type)) {
     const existing = toasts.find((t) => t.message === message && t.type === type);
     if (existing) {
       toasts = toasts.map((t) =>
-        t.id === existing.id ? { ...t, count: t.count + 1 } : t
+        t.id === existing.id
+          ? { ...t, count: t.count + 1, force: t.force || Boolean(options?.force) }
+          : t
       );
     } else {
       const id = `toast-${++idCounter}`;
-      toasts = [...toasts, { id, message, type, count: 1 }];
+      toasts = [...toasts, { id, message, type, count: 1, force: options?.force }];
     }
     toastListeners.forEach((l) => l(toasts));
   }
@@ -129,7 +140,9 @@ useToastSettingsStore.subscribe((state, previous) => {
   ) {
     return;
   }
-  const next = toasts.filter((toast) => isCategoryEnabled(toast.type));
+  const next = toasts.filter(
+    (toast) => toast.force || isCategoryEnabled(toast.type),
+  );
   if (next.length === toasts.length) return;
   toasts = next;
   toastListeners.forEach((l) => l(toasts));
