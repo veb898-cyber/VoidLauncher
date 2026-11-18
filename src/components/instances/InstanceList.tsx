@@ -147,7 +147,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
         <span style={{ fontWeight: 600, fontSize: 'var(--font-size-sm)', textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--text-secondary)' }}>
           {t('instances.page_title')}
         </span>
-        <Button size="sm" onClick={onCreateClick}>
+        <Button size="sm" onClick={onCreateClick} aria-label={t('home.empty_cta')}>
           <Plus size={14} />
         </Button>
       </div>
@@ -201,7 +201,17 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
             return (
               <div
                 key={instance.name}
+                className="instance-list__row"
+                role="button"
+                tabIndex={0}
+                aria-pressed={isSelected}
+                aria-label={instance.name}
                 onClick={() => useBrowserGuardStore.getState().askLeave(() => selectInstance(instance.name))}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter' && e.key !== ' ') return;
+                  e.preventDefault();
+                  useBrowserGuardStore.getState().askLeave(() => selectInstance(instance.name));
+                }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setContextMenu({ x: e.clientX, y: e.clientY, name: instance.name });
@@ -411,6 +421,7 @@ export function InstanceList({ onCreateClick }: InstanceListProps) {
         }}
         onCancel={() => setDeleteConfirmName(null)}
         confirmLabel={t('common.delete')}
+        variant="danger"
       />
     </div>
   );

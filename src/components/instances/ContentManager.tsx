@@ -150,7 +150,7 @@ interface ContentRowProps {
   /** Normalized compatibility state; only `incompatible`/`unverified` show a badge. */
   compatState?: CompatState;
   compatTarget: string;
-  onRowClick: (filename: string, e: React.MouseEvent) => void;
+  onRowClick: (filename: string, e: { ctrlKey: boolean; metaKey: boolean }) => void;
   onContext: (e: React.MouseEvent, filename: string) => void;
   onToggle: (item: ContentItem) => void;
 }
@@ -215,7 +215,7 @@ function CompatBadge({ state, target }: { state?: CompatState; target: string })
 /// Memoized table row. With ~250 mods, re-rendering the whole table on every
 /// parent state change (selection, search, icon cache updates) caused visible
 /// UI jank; with memo only the actually-changed rows re-render.
-const ContentRow = memo(function ContentRow({
+export const ContentRow = memo(function ContentRow({
   item, idx, isSelected, iconsResolving, compatState,
   compatTarget,
   onRowClick, onContext, onToggle,
@@ -227,11 +227,10 @@ const ContentRow = memo(function ContentRow({
   return (
     <div
       className={`content-list-row content-list-row--table${idx % 2 === 1 ? ' content-list-row--alt' : ''}${isSelected ? ' content-list-row--selected' : ''}`}
-      onClick={(e) => onRowClick(item.filename, e)}
       onContextMenu={(e) => { e.preventDefault(); onContext(e, item.filename); }}
       style={{
         display: 'grid', gridTemplateColumns: '28px 36px 1fr 1fr 80px 28px',
-        padding: '4px var(--space-2xl)', alignItems: 'center', cursor: 'pointer',
+        padding: '4px var(--space-2xl)', alignItems: 'center',
         borderBottom: '1px solid var(--surface-border)',
         opacity: item.enabled ? 1 : 0.45,
         transition: 'background 0.12s',
@@ -239,34 +238,61 @@ const ContentRow = memo(function ContentRow({
       }}
     >
       <div style={{ display: 'flex', justifyContent: 'center' }}>
-        <div onClick={(e) => { e.stopPropagation(); onToggle(item); }}
-          style={{ width: 16, height: 16, borderRadius: 3, cursor: 'pointer', border: '1.5px solid ' + (!item.enabled ? 'var(--text-tertiary)' : 'var(--primary)'), background: !item.enabled ? 'transparent' : 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s' }}>
+        <button
+          type="button"
+          role="checkbox"
+          aria-checked={item.enabled}
+          aria-label={`${item.enabled ? t('common.disable') : t('common.enable')}: ${item.name}`}
+          className="content-list-toggle"
+          onClick={() => onToggle(item)}
+          style={{ width: 16, height: 16, padding: 0, borderRadius: 3, cursor: 'pointer', border: '1.5px solid ' + (!item.enabled ? 'var(--text-tertiary)' : 'var(--primary)'), background: !item.enabled ? 'transparent' : 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s' }}>
           {item.enabled && <Check size={10} color="white" strokeWidth={3} />}
+        </button>
+      </div>
+      <button
+        type="button"
+        className="content-list-row-select"
+        aria-pressed={isSelected}
+        aria-label={item.name}
+        onClick={(e) => onRowClick(item.filename, e)}
+        style={{
+          gridColumn: '2 / -1',
+          display: 'grid',
+          gridTemplateColumns: '36px 1fr 1fr 80px 28px',
+          alignItems: 'center',
+          padding: 0,
+          border: 0,
+          background: 'transparent',
+          color: 'inherit',
+          textAlign: 'left',
+          cursor: 'pointer',
+          minWidth: 0,
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'center' }}>
+          <RemoteIcon
+            url={iconSrc}
+            letter={item.name.charAt(0)}
+            size={28}
+            radius={4}
+            fontSize={10}
+            pending={iconsResolving && !iconSrc}
+          />
         </div>
-      </div>
-      <div style={{ display: 'flex', justifyContent: 'center' }}>
-        <RemoteIcon
-          url={iconSrc}
-          letter={item.name.charAt(0)}
-          size={28}
-          radius={4}
-          fontSize={10}
-          pending={iconsResolving && !iconSrc}
-        />
-      </div>
-      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }}>
-        {item.name}
-      </div>
-      <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {versionLabel}
-        {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
-      </div>
-      <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
-        {item.provider || ''}
-      </div>
-      <div>
-        <CompatBadge state={compatState} target={compatTarget} />
-      </div>
+        <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8 }}>
+          {item.name}
+        </div>
+        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {versionLabel}
+          {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
+        </div>
+        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+          {item.provider || ''}
+        </div>
+        <div>
+          <CompatBadge state={compatState} target={compatTarget} />
+        </div>
+      </button>
     </div>
   );
 });
@@ -277,7 +303,7 @@ const ContentRow = memo(function ContentRow({
 /// table reading — name left, version in the middle, source right — on a
 /// single tall line (icon height rules the card), and the gaps between cards
 /// stay at 4px so even long lists don't stretch too far.
-const ContentCardRow = memo(function ContentCardRow({
+export const ContentCardRow = memo(function ContentCardRow({
   item, isSelected, iconsResolving, compatState,
   compatTarget,
   onRowClick, onContext, onToggle,
@@ -288,54 +314,80 @@ const ContentCardRow = memo(function ContentCardRow({
   const loadersLabel = modLoadersLabel(item.loaders);
   return (
     <div
-      className={`glass-card${isSelected ? ' glass-card--selected' : ''}`}
-      onClick={(e) => onRowClick(item.filename, e)}
+      className={`glass-card content-list-card${isSelected ? ' glass-card--selected' : ''}`}
       onContextMenu={(e) => { e.preventDefault(); onContext(e, item.filename); }}
       style={{
         display: 'flex', alignItems: 'center', gap: 'var(--space-sm)',
-        padding: '8px var(--space-lg)', cursor: 'pointer',
+        padding: '8px var(--space-lg)',
         opacity: item.enabled ? 1 : 0.45,
         transition: 'background 0.12s',
       }}
     >
-      <div onClick={(e) => { e.stopPropagation(); onToggle(item); }}
-        style={{ width: 16, height: 16, borderRadius: 3, cursor: 'pointer', border: '1.5px solid ' + (!item.enabled ? 'var(--text-tertiary)' : 'var(--primary)'), background: !item.enabled ? 'transparent' : 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s', flexShrink: 0 }}>
+      <button
+        type="button"
+        role="checkbox"
+        aria-checked={item.enabled}
+        aria-label={`${item.enabled ? t('common.disable') : t('common.enable')}: ${item.name}`}
+        className="content-list-toggle"
+        onClick={() => onToggle(item)}
+        style={{ width: 16, height: 16, padding: 0, borderRadius: 3, cursor: 'pointer', border: '1.5px solid ' + (!item.enabled ? 'var(--text-tertiary)' : 'var(--primary)'), background: !item.enabled ? 'transparent' : 'var(--primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s', flexShrink: 0 }}>
         {item.enabled && <Check size={10} color="white" strokeWidth={3} />}
-      </div>
-      <div style={{ display: 'flex', flexShrink: 0 }}>
-        <RemoteIcon
-          url={iconSrc}
-          letter={item.name.charAt(0)}
-          size={28}
-          radius={4}
-          fontSize={10}
-          pending={iconsResolving && !iconSrc}
-        />
-      </div>
-      <div style={{ flex: 1, minWidth: 0, display: 'grid', gridTemplateColumns: '1fr 1fr 80px', gap: 'var(--space-sm)', alignItems: 'center' }}>
-        <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {item.name}
-          </div>
-          {item.description ? (
-            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {item.description}
+      </button>
+      <button
+        type="button"
+        className="content-list-card-select"
+        aria-pressed={isSelected}
+        aria-label={item.name}
+        onClick={(e) => onRowClick(item.filename, e)}
+        style={{
+          flex: 1,
+          minWidth: 0,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'var(--space-sm)',
+          padding: 0,
+          border: 0,
+          background: 'transparent',
+          color: 'inherit',
+          textAlign: 'left',
+          cursor: 'pointer',
+        }}
+      >
+        <div style={{ display: 'flex', flexShrink: 0 }}>
+          <RemoteIcon
+            url={iconSrc}
+            letter={item.name.charAt(0)}
+            size={28}
+            radius={4}
+            fontSize={10}
+            pending={iconsResolving && !iconSrc}
+          />
+        </div>
+        <div style={{ flex: 1, minWidth: 0, display: 'grid', gridTemplateColumns: '1fr 1fr 80px', gap: 'var(--space-sm)', alignItems: 'center' }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 'var(--font-size-sm)', fontWeight: 500, paddingRight: 8, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {item.name}
             </div>
-          ) : null}
+            {item.description ? (
+              <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {item.description}
+              </div>
+            ) : null}
+          </div>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {versionLabel}
+            {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
+          </div>
+          <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {item.provider || ''}
+          </div>
         </div>
-        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {versionLabel}
-          {loadersLabel ? <span style={{ color: 'var(--text-tertiary)' }}> · {loadersLabel}</span> : null}
-        </div>
-        <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {item.provider || ''}
-        </div>
-      </div>
-      {compatState && (
-        <div style={{ flexShrink: 0 }}>
-          <CompatBadge state={compatState} target={compatTarget} />
-        </div>
-      )}
+        {compatState && (
+          <div style={{ flexShrink: 0 }}>
+            <CompatBadge state={compatState} target={compatTarget} />
+          </div>
+        )}
+      </button>
     </div>
   );
 });
@@ -1244,7 +1296,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     );
   }, [items, search]);
 
-  const handleRowClick = useCallback((filename: string, e: React.MouseEvent) => {
+  const handleRowClick = useCallback((filename: string, e: { ctrlKey: boolean; metaKey: boolean }) => {
     if (e.ctrlKey || e.metaKey) {
       setSelectedFilenames((prev) => {
         const next = new Set(prev);
@@ -1649,6 +1701,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         title={t('manager.close_updates_title')}
         description={t('manager.close_updates_desc')}
         confirmLabel={t('manager.close_updates_confirm')}
+        variant="primary"
         onConfirm={confirmAbortUpdates}
         onCancel={() => setConfirmCloseUpdates(false)}
       />
@@ -1660,6 +1713,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           count: String(removeTargets?.length ?? 0),
         })}
         confirmLabel={t('common.remove')}
+        variant="danger"
         busy={removing}
         onConfirm={confirmRemove}
         onCancel={() => { if (!removing) setRemoveTargets(null); }}

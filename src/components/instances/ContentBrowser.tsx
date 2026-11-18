@@ -1771,7 +1771,15 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                     style={{ flexShrink: 0, alignSelf: 'flex-start' }}>
                     {isInstalled(selected.project_id, selected.slug, selected.title) ? <><Check size={12} /> {t('content.already_installed')}</> : isAdded(selected.project_id, selected.slug, selected.title) ? <><Check size={12} /> {t('content.added_btn')}</> : <><Download size={12} /> {t('content.add_btn')}</>}
                   </Button>
-                  <X size={16} style={{ cursor: 'pointer', color: 'var(--text-tertiary)', flexShrink: 0 }} onClick={() => setSelected(null)} />
+                  <button
+                    type="button"
+                    className="btn btn--ghost btn--sm"
+                    aria-label={t('common.close')}
+                    onClick={() => setSelected(null)}
+                    style={{ padding: 2, height: 'auto', alignSelf: 'flex-start' }}
+                  >
+                    <X size={16} />
+                  </button>
                 </div>
 
                 {/* Full description */}
@@ -1803,29 +1811,40 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                       {versions.slice(0, versionLimit).map((v: any) => {
                         const file = v.files?.[0];
                         const alreadyAdded = selectedItems.some((m) => m.filename === file?.filename);
+                        const addVersion = () => {
+                          if (alreadyAdded || !file) return;
+                          const item: SelectedItem = {
+                            name: selected.title, iconUrl: selected.icon_url ?? undefined,
+                            downloadUrl: file.url, filename: file.filename,
+                            source: providerId, projectId: selected.project_id,
+                            versionId: v.id,
+                            versionName: v.name || v.version_number,
+                            sha1: file.hashes?.sha1,
+                            fileId: file.file_id,
+                            size: file.size,
+                          };
+                          const next = pinSameProjectVersion(selectedItemsRef.current, item);
+                          commitSelectedItems(next);
+                          // A pinned version goes through the same backend
+                          // resolution as "add latest" (item 14).
+                          applyResolution(next);
+                        };
                         return (
-                          <div key={v.id} onClick={() => {
-                            if (!alreadyAdded && file) {
-                              const item: SelectedItem = {
-                                name: selected.title, iconUrl: selected.icon_url ?? undefined,
-                                downloadUrl: file.url, filename: file.filename,
-                                source: providerId, projectId: selected.project_id,
-                                versionId: v.id,
-                                versionName: v.name || v.version_number,
-                                sha1: file.hashes?.sha1,
-                                fileId: file.file_id,
-                                size: file.size,
-                              };
-                              const next = pinSameProjectVersion(selectedItemsRef.current, item);
-                              commitSelectedItems(next);
-                              // A pinned version goes through the same backend
-                              // resolution as "add latest" (item 14).
-                              applyResolution(next);
-                            }
-                          }}
+                          <div
+                            key={v.id}
+                            className="content-version-row"
+                            role="button"
+                            tabIndex={alreadyAdded || !file ? -1 : 0}
+                            aria-disabled={alreadyAdded || !file}
+                            onClick={addVersion}
+                            onKeyDown={(e) => {
+                              if (e.key !== 'Enter' && e.key !== ' ') return;
+                              e.preventDefault();
+                              addVersion();
+                            }}
                             style={{
                               display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                              padding: '8px 12px', cursor: 'pointer', fontSize: 'var(--font-size-sm)',
+                              padding: '8px 12px', cursor: alreadyAdded || !file ? 'default' : 'pointer', fontSize: 'var(--font-size-sm)',
                               background: alreadyAdded ? 'hsla(150, 60%, 50%, 0.08)' : 'transparent',
                               borderBottom: '1px solid var(--surface-border)',
                             }}>
@@ -1859,7 +1878,14 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
             {selectedItems.map((m, i) => (
               <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 999, background: m.isDependency ? 'var(--warning-dim)' : 'var(--primary-dim)', fontSize: 11, whiteSpace: 'nowrap', flexShrink: 0 }}>
                 {m.name}
-                <X size={10} style={{ cursor: 'pointer' }} onClick={() => removeItem(i)} />
+                <button
+                  type="button"
+                  className="selection-chip__remove"
+                  aria-label={t('content.remove_item', { name: m.name })}
+                  onClick={() => removeItem(i)}
+                >
+                  <X size={10} />
+                </button>
               </div>
             ))}
           </div>
@@ -1884,6 +1910,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           }}
           onCancel={() => setShowLeaveConfirm(false)}
           confirmLabel={t('common.leave')}
+          variant="primary"
         />,
         document.body
       )}

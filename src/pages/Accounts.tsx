@@ -342,17 +342,7 @@ export function Accounts() {
                   <div
                     key={acc.id}
                     className="glass-card account-card"
-                    role="button"
-                    tabIndex={0}
-                    aria-pressed={isSelected}
                     onClick={() => setSelectedId(acc.id)}
-                    onKeyDown={(e) => {
-                      if (e.target !== e.currentTarget) return;
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        setSelectedId(acc.id);
-                      }
-                    }}
                     style={{
                       /* Tightened side padding/gaps (12px, 8px, 6px) purely to
                          free row width: with both badges (АКТИВЕН +
@@ -362,35 +352,43 @@ export function Accounts() {
                       border: isSelected ? '1px solid var(--primary)' : '1px solid var(--surface-border)',
                     }}
                   >
-                    <Avatar uuid={acc.uuid ?? ''} name={acc.name} provider={acc.account_type} size={36} />
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                        {acc.name}
-                        {acc.default && (
-                          <span style={{ fontSize: 10, background: 'var(--primary)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}>
-                            {t('accounts.badge_active')}
-                          </span>
-                        )}
-                        {acc.account_type === 'Microsoft' && (
-                          <span style={{ fontSize: 10, background: 'var(--success)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}>
-                            {t('accounts.badge_licensed')}
-                          </span>
-                        )}
-                        {acc.account_type === 'Microsoft' && acc.has_ms_session === false && (
-                          <Tooltip content={t('accounts.needs_login_hint')}>
-                            <span
-                              style={{ fontSize: 10, background: 'var(--warning)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}
-                            >
-                              {t('accounts.badge_needs_login')}
+                    <button
+                      type="button"
+                      className="account-card__select"
+                      aria-pressed={isSelected}
+                      aria-label={`${t('accounts.select_account')}: ${acc.name}`}
+                      onClick={(e) => { e.stopPropagation(); setSelectedId(acc.id); }}
+                    >
+                      <Avatar uuid={acc.uuid ?? ''} name={acc.name} provider={acc.account_type} size={36} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                          {acc.name}
+                          {acc.default && (
+                            <span style={{ fontSize: 10, background: 'var(--primary)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}>
+                              {t('accounts.badge_active')}
                             </span>
-                          </Tooltip>
-                        )}
+                          )}
+                          {acc.account_type === 'Microsoft' && (
+                            <span style={{ fontSize: 10, background: 'var(--success)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}>
+                              {t('accounts.badge_licensed')}
+                            </span>
+                          )}
+                          {acc.account_type === 'Microsoft' && acc.has_ms_session === false && (
+                            <Tooltip content={t('accounts.needs_login_hint')}>
+                              <span
+                                style={{ fontSize: 10, background: 'var(--warning)', color: 'white', padding: '2px 6px', borderRadius: 999, whiteSpace: 'nowrap' }}
+                              >
+                                {t('accounts.badge_needs_login')}
+                              </span>
+                            </Tooltip>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          {getTypeLabel(acc.account_type)}
+                          {acc.uuid && ` • ${acc.uuid.substring(0, 8)}...`}
+                        </div>
                       </div>
-                      <div style={{ fontSize: 'var(--font-size-sm)', color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {getTypeLabel(acc.account_type)}
-                        {acc.uuid && ` • ${acc.uuid.substring(0, 8)}...`}
-                      </div>
-                    </div>
+                    </button>
                     {/* Per-account actions live on the card itself — the same
                         quick icon row the list had before the redesign. */}
                     <div className="account-card__actions">
@@ -399,7 +397,7 @@ export function Accounts() {
                           <Button
                             size="sm"
                             variant="ghost"
-                            aria-label={t('accounts.btn_change_skin')}
+                            aria-label={`${t('accounts.btn_change_skin')}: ${acc.name}`}
                             onClick={(e) => { e.stopPropagation(); handleSkinChange(acc); }}
                           >
                             <Shirt size={14} />
@@ -411,7 +409,7 @@ export function Accounts() {
                           <Button
                             size="sm"
                             variant="ghost"
-                            aria-label={t('accounts.elyby_skin_help_btn')}
+                            aria-label={`${t('accounts.elyby_skin_help_btn')}: ${acc.name}`}
                             onClick={(e) => { e.stopPropagation(); setShowElybySkinHelp(true); }}
                           >
                             <HelpCircle size={14} />
@@ -423,7 +421,7 @@ export function Accounts() {
                           <Button
                             size="sm"
                             variant="ghost"
-                            aria-label={t('accounts.refresh_skin_btn')}
+                            aria-label={`${t('accounts.refresh_skin_btn')}: ${acc.name}`}
                             disabled={refreshingHead === acc.id}
                             onClick={async (e) => {
                               e.stopPropagation();
@@ -453,7 +451,7 @@ export function Accounts() {
                         <Button
                           size="sm"
                           variant="ghost"
-                          aria-label={t('accounts.remove_btn')}
+                          aria-label={`${t('accounts.remove_btn')}: ${acc.name}`}
                           onClick={(e) => { e.stopPropagation(); setRemoveTarget(acc); }}
                           style={{ color: 'var(--color-danger)' }}
                         >
@@ -600,6 +598,7 @@ export function Accounts() {
         title={t('accounts.remove_title')}
         description={t('accounts.remove_confirm', { name: removeTarget?.name ?? '' })}
         confirmLabel={t('accounts.remove_btn')}
+        variant="danger"
         busy={removing}
         onCancel={() => { if (!removing) setRemoveTarget(null); }}
         onConfirm={() => { if (removeTarget) handleRemoveAccount(removeTarget); }}

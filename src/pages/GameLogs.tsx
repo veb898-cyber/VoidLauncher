@@ -6,6 +6,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { AlertTriangle, HelpCircle, XCircle, FileText, FileSearch, FolderOpen, Power, ExternalLink, Wrench } from 'lucide-react';
 import { useT } from '../lib/i18n';
 import { formatSize } from '../lib/format';
+import { labelWithInstance } from '../lib/accessibleLabel';
 import { addToast } from '../components/ui/Toast';
 import { Button } from '../components/ui/Button';
 import { CopyButton } from '../components/ui/CopyButton';
@@ -383,6 +384,8 @@ export function GameLogs() {
           <button
             ref={runsBtnRef}
             className="game-logs-picker-trigger"
+            aria-label={labelWithInstance(t('game_logs.runs'), shownSession?.instance_name)}
+            aria-expanded={runsOpen}
             onClick={toggleRuns}
           >
             <span className={`game-logs-picker-dot${shownSession?.path === currentPath ? ' game-logs-picker-dot--live' : ''}`} />
@@ -686,6 +689,7 @@ export function GameLogs() {
         onConfirm={() => { void confirmDisable(); }}
         onCancel={() => { if (actionBusy === null) setDisableAction(null); }}
         confirmLabel={t('game_logs.action_disable_mod')}
+        variant="primary"
         busy={actionBusy !== null}
       />
 
