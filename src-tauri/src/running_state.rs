@@ -279,16 +279,40 @@ pub fn remove_pid_file(data_dir: &Path, instance: &str) {
 /// True when the process recorded in `identity` is provably gone or its PID now
 /// belongs to a different process. `Unavailable` is deliberately false: an
 /// unreadable process must not be treated as dead.
-pub fn identity_is_dead(identity: &ProcessIdentity) -> bool {
-    identity_is_dead_with(identity, &SystemProbe)
+/// Three-state result of probing a recorded process identity. `Unknown` means
+/// the pid may still be alive but its identity could not be read (access
+/// denied, transient OS error); callers must not treat it as either alive or
+/// dead without a bounded retry policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityLiveness {
+    Alive,
+    Dead,
+    Unknown,
 }
 
-fn identity_is_dead_with(identity: &ProcessIdentity, probe: &dyn ProcessProbe) -> bool {
+pub fn identity_liveness(identity: &ProcessIdentity) -> IdentityLiveness {
+    identity_liveness_with(identity, &SystemProbe)
+}
+
+fn identity_liveness_with(
+    identity: &ProcessIdentity,
+    probe: &dyn ProcessProbe,
+) -> IdentityLiveness {
     match probe.probe(identity.pid) {
-        IdentityProbe::Gone => true,
-        IdentityProbe::Found(actual) => actual != *identity,
-        IdentityProbe::Unavailable => false,
+        IdentityProbe::Gone => IdentityLiveness::Dead,
+        IdentityProbe::Found(actual) if actual == *identity => IdentityLiveness::Alive,
+        IdentityProbe::Found(_) => IdentityLiveness::Dead,
+        IdentityProbe::Unavailable => IdentityLiveness::Unknown,
     }
+}
+
+pub fn identity_is_dead(identity: &ProcessIdentity) -> bool {
+    identity_liveness(identity) == IdentityLiveness::Dead
+}
+
+#[allow(dead_code)]
+fn identity_is_dead_with(identity: &ProcessIdentity, probe: &dyn ProcessProbe) -> bool {
+    identity_liveness_with(identity, probe) == IdentityLiveness::Dead
 }
 
 /// Records found on disk, split by whether their process identity could be
@@ -688,6 +712,36 @@ mod tests {
         assert_eq!(
             check_record(&record(4242, Some(&game)), &probe),
             RecordState::Unverified
+        );
+    }
+
+    #[test]
+    fn identity_liveness_distinguishes_alive_dead_and_unknown() {
+        let game = identity(4242, r"C:\Java\bin\java.exe", CREATED);
+        let alive = FakeProbe::new(&[(4242, IdentityProbe::Found(game.clone()))]);
+        assert_eq!(
+            identity_liveness_with(&game, &alive),
+            IdentityLiveness::Alive
+        );
+
+        let gone = FakeProbe::new(&[]);
+        assert_eq!(identity_liveness_with(&game, &gone), IdentityLiveness::Dead);
+
+        let reused = FakeProbe::new(&[(
+            4242,
+            IdentityProbe::Found(identity(4242, r"C:\Windows\explorer.exe", CREATED)),
+        )]);
+        assert_eq!(
+            identity_liveness_with(&game, &reused),
+            IdentityLiveness::Dead,
+            "a reused pid with a different identity is dead for this game"
+        );
+
+        let unavailable = FakeProbe::new(&[(4242, IdentityProbe::Unavailable)]);
+        assert_eq!(
+            identity_liveness_with(&game, &unavailable),
+            IdentityLiveness::Unknown,
+            "an unreadable identity is not an immediate false death"
         );
     }
 

@@ -246,6 +246,24 @@ impl LaunchRegistry {
         }
     }
 
+    /// Like [`Self::clear_running`], but only when the entry still belongs to
+    /// the exact process identity the caller probed. This prevents a lifecycle
+    /// checker from deleting a newer run that reused the same instance name.
+    pub fn clear_running_if_identity(&self, instance: &str, identity: &ProcessIdentity) -> bool {
+        let key = Self::key(instance);
+        let mut inner = self.lock();
+        match inner.entries.get(&key) {
+            Some(entry)
+                if entry.phase == LaunchPhase::Running
+                    && entry.identity.as_ref() == Some(identity) =>
+            {
+                inner.entries.remove(&key);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Register a game recovered from a persisted pid file, together with the
     /// identity that was verified for it. Never downgrades a live reservation:
     /// a launch that is still preparing stays `Starting`.
@@ -400,6 +418,29 @@ mod tests {
         );
         assert_eq!(registry.phase("Pack"), Some(LaunchPhase::Starting));
         assert!(registry.release("Pack", second));
+    }
+
+    #[test]
+    fn identity_scoped_clear_does_not_remove_a_newer_run() {
+        let registry = LaunchRegistry::new();
+        let token = registry.begin_launch("Pack").expect("reserve");
+        let first = ProcessIdentity {
+            pid: 42,
+            exe: "c:\\java\\bin\\java.exe".into(),
+            created: 100,
+        };
+        let other = ProcessIdentity {
+            created: 200,
+            ..first.clone()
+        };
+        assert!(registry.mark_running("Pack", token, Some(first.clone())));
+        assert!(
+            !registry.clear_running_if_identity("Pack", &other),
+            "a different process identity must not clear the entry"
+        );
+        assert_eq!(registry.phase("Pack"), Some(LaunchPhase::Running));
+        assert!(registry.clear_running_if_identity("Pack", &first));
+        assert_eq!(registry.phase("Pack"), None);
     }
 
     #[test]

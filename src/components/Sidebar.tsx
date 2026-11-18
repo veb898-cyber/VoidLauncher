@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { Liquid } from 'liquid-gooey';
 import { useAuthStore } from '../stores/authStore';
 import { useAccountsStore } from '../stores/accountsStore';
+import { useSettingsStore } from '../stores/settingsStore';
 import { GameRunningBadge } from './launch/GameRunningBadge';
 import { Tooltip } from './ui/Tooltip';
 import { t } from '../lib/i18n';
@@ -20,6 +21,9 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const accounts = useAccountsStore((s) => s.accounts);
   const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const gooey = useGooey();
+  // Experimental Rooms is opt-in: the tab must not exist until it is enabled
+  // in Settings -> Experimental features.
+  const roomsEnabled = useSettingsStore((s) => s.config?.rooms_enabled ?? false);
   const sidebarRef = useRef<HTMLElement>(null);
   const itemRefs = useRef(new Map<string, HTMLButtonElement>());
   // Null until measured, so the accent mounts already at its place instead
@@ -44,7 +48,9 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
   const navItems = [
     { id: 'home', icon: <HomeIcon />, label: t('sidebar.home') },
     { id: 'instances', icon: <InstancesIcon />, label: t('sidebar.instances') },
-    { id: 'rooms', icon: <RoomsIcon />, label: t('sidebar.rooms') },
+    ...(roomsEnabled
+      ? [{ id: 'rooms', icon: <RoomsIcon />, label: t('sidebar.rooms') }]
+      : []),
     { id: 'accounts', icon: <AccountsIcon />, label: t('sidebar.accounts') },
     { id: 'terminal', icon: <TerminalIcon />, label: t('sidebar.terminal') },
   ];
@@ -67,7 +73,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
       top: b.top - s.top + (b.height - ACCENT_HEIGHT) / 2,
       left: b.left - s.left - 8,
     });
-  }, [activePage]);
+  }, [activePage, roomsEnabled]);
 
   useLayoutEffect(measure, [measure]);
 
@@ -91,7 +97,7 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
     : undefined;
 
   return (
-    <nav className="sidebar" ref={sidebarRef}>
+    <nav className="sidebar" ref={sidebarRef} aria-label={t('sidebar.nav_label')}>
       {/* The sliding active-item accent (was a per-item ::before that
           teleported). With gooey it rides a liquid group: the blob hides
           under the crisp bar at rest and trails it while it travels.
@@ -128,7 +134,10 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
           <Tooltip key={item.id} content={item.label}>
             <button
               ref={itemRef(item.id)}
+              type="button"
               className={`sidebar__item ${activePage === item.id ? 'sidebar__item--active' : ''}`}
+              aria-label={item.label}
+              aria-current={activePage === item.id ? 'page' : undefined}
               onClick={() => onNavigate(item.id)}
             >
               {item.icon}
@@ -141,45 +150,58 @@ export function Sidebar({ activePage, onNavigate }: SidebarProps) {
         <GameRunningBadge />
         <button
           ref={itemRef('settings')}
+          type="button"
           className={`sidebar__item ${activePage === 'settings' ? 'sidebar__item--active' : ''}`}
+          aria-label={t('settings.title')}
+          aria-current={activePage === 'settings' ? 'page' : undefined}
           onClick={() => onNavigate('settings')}
         >
           <SettingsIcon />
         </button>
         <div className="sidebar__separator" />
         {licensed ? (
-          <div
-            className="sidebar__avatar"
-            onClick={() => onNavigate('accounts')}
-          >
-            {/* The 2px border eats into the 36px box (border-box), so the head
-                must fill the 32px content box — otherwise it renders at 36px
-                and gets clipped, which reads as an over-zoomed avatar. */}
-            <Avatar
-              uuid={licensed.uuid ?? ''}
-              name={licensed.name}
-              provider={licensed.account_type}
-              size={36}
-              style={{ width: '100%', height: '100%' }}
-            />
-          </div>
+          <Tooltip content={t('sidebar.accounts')}>
+            <button
+              type="button"
+              className="sidebar__avatar"
+              aria-label={`${t('sidebar.accounts')}: ${licensed.name}`}
+              onClick={() => onNavigate('accounts')}
+            >
+              {/* The 2px border eats into the 36px box (border-box), so the head
+                  must fill the 32px content box — otherwise it renders at 36px
+                  and gets clipped, which reads as an over-zoomed avatar. */}
+              <Avatar
+                uuid={licensed.uuid ?? ''}
+                name={licensed.name}
+                provider={licensed.account_type}
+                size={36}
+                style={{ width: '100%', height: '100%' }}
+              />
+            </button>
+          </Tooltip>
         ) : isLoggedIn && profile ? (
-          <div
-            className="sidebar__avatar"
-            onClick={() => onNavigate('accounts')}
-          >
-            <Avatar
-              uuid={profile.id}
-              name={profile.name}
-              provider="Microsoft"
-              size={36}
-              style={{ width: '100%', height: '100%' }}
-            />
-          </div>
+          <Tooltip content={t('sidebar.accounts')}>
+            <button
+              type="button"
+              className="sidebar__avatar"
+              aria-label={`${t('sidebar.accounts')}: ${profile.name}`}
+              onClick={() => onNavigate('accounts')}
+            >
+              <Avatar
+                uuid={profile.id}
+                name={profile.name}
+                provider="Microsoft"
+                size={36}
+                style={{ width: '100%', height: '100%' }}
+              />
+            </button>
+          </Tooltip>
         ) : (
           <Tooltip content={t('sidebar.login')}>
             <button
+              type="button"
               className="sidebar__item"
+              aria-label={t('sidebar.login')}
               onClick={() => onNavigate('login')}
             >
               <LoginIcon />

@@ -43,10 +43,17 @@ export function useRoomEvents() {
     };
 
     register(listen<RoomProgress>('room_progress', (event) => {
-      setProgress(event.payload);
+      const payload = event.payload;
+      // A finished install/login leaves the setup card on its next step; the
+      // completed progress bar must not sit at 100% forever.
+      const finished = (payload.stage === 'install' || payload.stage === 'login') && payload.fraction >= 1;
+      setProgress(finished ? null : payload);
     }));
 
     register(listen<RoomErrorPayload>('room_error', (event) => {
+      // A failed background step (install/login) must not leave the progress
+      // bar frozen at its last fraction.
+      setProgress(null);
       addToast(event.payload.message, 'error');
     }));
 

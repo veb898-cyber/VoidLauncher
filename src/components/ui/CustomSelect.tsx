@@ -24,6 +24,8 @@ interface CustomSelectProps<T extends string> {
    * (e.g. normal themes while Liquid Glass is active).
    */
   disabled?: boolean;
+  /** Accessible name for the trigger when no visible <label> is associated. */
+  ariaLabel?: string;
 }
 
 const LIST_GAP = 4;
@@ -63,6 +65,7 @@ export function CustomSelect<T extends string>({
   className = '',
   openUpward = false,
   disabled = false,
+  ariaLabel,
 }: CustomSelectProps<T>) {
   const [open, setOpen] = useState(false);
   const [focusIdx, setFocusIdx] = useState<number>(-1);
@@ -276,6 +279,7 @@ export function CustomSelect<T extends string>({
         className="custom-select__trigger input"
         onClick={() => setOpen((o) => !o)}
         role="combobox"
+        aria-label={ariaLabel}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? listId : undefined}

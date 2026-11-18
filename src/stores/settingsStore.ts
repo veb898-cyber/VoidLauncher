@@ -30,6 +30,8 @@ export interface AppConfig {
    * Microsoft/offline launches are unaffected.
    */
   elyby_skins_in_game: boolean;
+  /** Show the experimental Rooms (multiplayer over Tailscale) interface. */
+  rooms_enabled: boolean;
 }
 
 export interface JavaInstallation {

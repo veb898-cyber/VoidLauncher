@@ -1074,6 +1074,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn newest_session_is_scoped_to_each_running_instance() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_gamelogs_two_games_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let logs_dir = dir.join("logs").join("game");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        let alpha_old = logs_dir.join("Alpha_20260101_120000.log");
+        let alpha_new = logs_dir.join("Alpha_20260102_120000.log");
+        let beta = logs_dir.join("Beta_20260103_120000.log");
+        std::fs::write(&alpha_old, "old\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::fs::write(&alpha_new, "new\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::fs::write(&beta, "beta\n").unwrap();
+
+        assert_eq!(
+            newest_session_for_instance(&dir, "Alpha"),
+            Some(alpha_new),
+            "the other running game must not win"
+        );
+        assert_eq!(newest_session_for_instance(&dir, "Beta"), Some(beta));
+        assert!(newest_session_for_instance(&dir, "Gamma").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Manual crash analysis passes the listed instance_name to the
     /// instance lookup, so it must be the REAL name from the log header —
     /// the sanitized filename stem can never be resolved back to an

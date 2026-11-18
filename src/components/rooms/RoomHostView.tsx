@@ -9,69 +9,107 @@ import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { useRoomStore } from '../../stores/roomStore';
 import { useInstanceStore } from '../../stores/instanceStore';
 import type { Instance } from '../../stores/instanceStore';
-import { useEventStore } from '../../hooks/useGameEvents';
 import type { RoomStatus } from '../../stores/roomStore';
 import { useT } from '../../lib/i18n';
 import { copyTextToClipboard } from '../../lib/clipboard';
 import { addToast } from '../ui/Toast';
+import { resolveHostInstanceSelection } from './hostInstanceSelection';
 
 interface RoomHostViewProps {
   status: RoomStatus;
   instances: Instance[];
+  /** False while the instance list is still being fetched on first load. */
+  instancesLoaded: boolean;
 }
 
 /** Host side: share the room code, launch the world and advertise its LAN port. */
-export function RoomHostView({ status, instances }: RoomHostViewProps) {
+export function RoomHostView({ status, instances, instancesLoaded }: RoomHostViewProps) {
   const t = useT();
   const leave = useRoomStore((s) => s.leave);
   const busy = useRoomStore((s) => s.busy);
+  const invitation = useRoomStore((s) => s.invitation);
+  const loadInvitation = useRoomStore((s) => s.loadInvitation);
   const detectMinecraftPort = useRoomStore((s) => s.detectMinecraftPort);
-  const reportMinecraftPort = useRoomStore((s) => s.reportMinecraftPort);
+  const setHostInstance = useRoomStore((s) => s.setHostInstance);
   const openAdminConsole = useRoomStore((s) => s.openAdminConsole);
   const launchGame = useInstanceStore((s) => s.launchGame);
-  const runningIds = useEventStore((s) => s.runningGameIds);
 
-  const [selected, setSelected] = useState<string>(instances[0]?.name ?? '');
+  const [selected, setSelected] = useState<string>('');
+  const [missingSavedInstance, setMissingSavedInstance] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
   const [detectingPort, setDetectingPort] = useState(false);
+  // An explicit choice stays visible until the backend status confirms it;
+  // otherwise a status poll carrying the previous binding would snap back.
+  const pendingSelectionRef = useRef<string | null>(null);
 
-  // Instances this component has positively seen running (fed by the
-  // game_started/launch_complete events in useGameEvents). Used to distinguish
-  // "game exited" from "launch state not seeded yet" during app startup.
-  const seenRunningRef = useRef<Set<string>>(new Set());
-
+  // Restore the registered instance from the backend. This effect only
+  // changes the local select value: it never registers an instance, so simply
+  // opening the page cannot clear the active room's LAN port.
   useEffect(() => {
-    if (!selected && instances.length > 0) setSelected(instances[0].name);
-  }, [instances, selected]);
+    const result = resolveHostInstanceSelection({
+      savedInstance: status.hostInstance ?? null,
+      instanceNames: instances.map((instance) => instance.name),
+      instancesLoaded,
+      currentSelection: selected,
+      pendingSelection: pendingSelectionRef.current,
+    });
+    pendingSelectionRef.current = result.pendingSelection;
+    setMissingSavedInstance(result.missingSavedInstance);
+    if (result.selection !== selected) setSelected(result.selection);
+  }, [status.hostInstance, instances, instancesLoaded, selected]);
 
-  // While the host's game is running but the LAN port is not known yet, scan
-  // the live game log periodically until "Open to LAN" prints the port.
-  useEffect(() => {
-    if (status.minecraftPort) return;
-    if (!selected || !runningIds.includes(selected)) return;
-    const id = window.setInterval(() => { detectMinecraftPort(); }, 4000);
-    return () => window.clearInterval(id);
-  }, [status.minecraftPort, selected, runningIds, detectMinecraftPort]);
-
-  // Stop advertising the LAN port once the world the host shared has exited:
-  // `launch_complete` drops the instance from runningGameIds, and a stale
-  // port would keep the guest's "Join world" live against a closed world.
-  // Only fires after this component positively saw the instance running, so a
-  // still-live world is never cleared (e.g. during the async launch-state
-  // seed right after the app starts).
-  useEffect(() => {
-    for (const id of runningIds) seenRunningRef.current.add(id);
-    if (
-      status.minecraftPort &&
-      !runningIds.includes(selected) &&
-      seenRunningRef.current.has(selected)
-    ) {
-      seenRunningRef.current.delete(selected);
-      reportMinecraftPort(null);
+  // Explicit user choice: register exactly this instance. The backend clears
+  // the previous port and starts the monitor for the new game.
+  const selectHostInstance = async (name: string) => {
+    if (!name || name === selected) return;
+    const previous = selected;
+    pendingSelectionRef.current = name;
+    setSelected(name);
+    const saved = await setHostInstance(name);
+    if (!saved && pendingSelectionRef.current === name) {
+      pendingSelectionRef.current = null;
+      setSelected(previous);
     }
-  }, [selected, runningIds, status.minecraftPort, reportMinecraftPort]);
+  };
+
+  const launchSelected = async () => {
+    if (!selected) return;
+    if (status.hostInstance !== selected) {
+      pendingSelectionRef.current = selected;
+      const saved = await setHostInstance(selected);
+      if (!saved) {
+        pendingSelectionRef.current = null;
+        return;
+      }
+    }
+    launchGame(selected);
+  };
+
+  const detectSelectedPort = async () => {
+    if (!selected) return;
+    setDetectingPort(true);
+    try {
+      if (status.hostInstance !== selected) {
+        pendingSelectionRef.current = selected;
+        const saved = await setHostInstance(selected);
+        if (!saved) {
+          pendingSelectionRef.current = null;
+          return;
+        }
+      }
+      await detectMinecraftPort(selected);
+    } finally {
+      setDetectingPort(false);
+    }
+  };
+
+  // The invitation is fetched separately so `cmd_room_status` (polled every
+  // few seconds) never carries the room secret.
+  useEffect(() => {
+    if (status.role === 'host') void loadInvitation();
+  }, [status.role, status.roomId, loadInvitation]);
 
   const options: SelectOption<string>[] = instances.map((i) => ({
     value: i.name,
@@ -79,9 +117,12 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
     description: `${i.mc_version} · ${i.loader}`,
   }));
 
-  const copyCode = async () => {
-    if (!status.roomId) return;
-    if (await copyTextToClipboard(status.roomId)) {
+  const copyInvitation = async () => {
+    if (!invitation) {
+      addToast(t('rooms.invitation_not_ready'), 'error');
+      return;
+    }
+    if (await copyTextToClipboard(invitation)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } else {
@@ -107,21 +148,24 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
           </Button>
         </div>
 
-        <div
-          onClick={copyCode}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); copyCode(); } }}
+        <button
+          type="button"
+          onClick={copyInvitation}
+          aria-label={t('rooms.copy')}
           style={{
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
             gap: 'var(--space-md)',
+            width: '100%',
             background: 'var(--surface-glass)',
             border: '1px solid var(--surface-border)',
             borderRadius: 'var(--radius-md)',
             padding: 'var(--space-lg) var(--space-xl)',
             marginTop: 'var(--space-lg)',
+            color: 'inherit',
+            font: 'inherit',
+            textAlign: 'left',
             cursor: 'pointer',
             transition: 'border-color 200ms ease-out, background 200ms ease-out',
           }}
@@ -135,10 +179,10 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
             </div>
           </div>
           {copied ? <Check size={22} color="var(--success)" /> : <Copy size={22} color="var(--text-secondary)" />}
-        </div>
+        </button>
 
         <p style={{ margin: 'var(--space-md) 0 0', fontSize: 'var(--font-size-sm)', color: 'var(--text-tertiary)' }}>
-          {copied ? t('rooms.copied') : t('rooms.copy')}
+          {copied ? t('rooms.copied') : t('rooms.host_copy_hint')}
         </p>
       </div>
 
@@ -151,13 +195,25 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
               {t('rooms.host_instance_label')}
             </label>
             {options.length > 0 ? (
-              <CustomSelect<string> value={selected} options={options} onChange={setSelected} />
-            ) : (
+              <CustomSelect<string>
+                value={selected}
+                options={options}
+                onChange={selectHostInstance}
+                ariaLabel={t('rooms.host_instance_label')}
+              />
+            ) : instancesLoaded ? (
               <p style={{ color: 'var(--text-tertiary)', margin: 0 }}>{t('rooms.no_instances')}</p>
+            ) : (
+              <p style={{ color: 'var(--text-tertiary)', margin: 0 }}>{t('rooms.instances_loading')}</p>
+            )}
+            {missingSavedInstance && (
+              <p style={{ margin: 'var(--space-xs) 0 0', color: 'var(--color-warning)', fontSize: 'var(--font-size-sm)', lineHeight: 1.45 }}>
+                {t('rooms.host_instance_missing')}
+              </p>
             )}
           </div>
           <Button
-            onClick={() => { if (selected) launchGame(selected); }}
+            onClick={launchSelected}
             disabled={!selected}
           >
             <Play size={16} style={{ marginRight: 6 }} />
@@ -168,15 +224,8 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
         <div style={{ display: 'flex', gap: 'var(--space-md)', alignItems: 'center', marginTop: 'var(--space-lg)', flexWrap: 'wrap' }}>
           <Button
             variant="secondary"
-            disabled={detectingPort}
-            onClick={async () => {
-              setDetectingPort(true);
-              try {
-                await detectMinecraftPort();
-              } finally {
-                setDetectingPort(false);
-              }
-            }}
+            disabled={!selected || detectingPort}
+            onClick={detectSelectedPort}
           >
             <RefreshIcon spinning={detectingPort} size={16} />
             {t('rooms.host_detect')}
@@ -232,12 +281,19 @@ export function RoomHostView({ status, instances }: RoomHostViewProps) {
         open={confirmLeave}
         title={t('rooms.leave_confirm_title')}
         description={t('rooms.leave_confirm_host_desc')}
+        confirmLabel={t('rooms.leave')}
+        variant="primary"
         busy={busy}
         onCancel={() => setConfirmLeave(false)}
         onConfirm={() => { leave(); }}
       />
 
-      <RoomShareHelpModal open={showHelp} onClose={() => setShowHelp(false)} code={status.roomId} />
+      <RoomShareHelpModal
+        open={showHelp}
+        onClose={() => setShowHelp(false)}
+        code={status.roomId}
+        invitation={invitation}
+      />
     </div>
   );
 }

@@ -25,6 +25,10 @@ pub enum JoinMechanism {
 pub trait MinecraftDiscovery: Send + Sync {
     /// Find the advertised "Open to LAN" port in game output. `None` when
     /// the world isn't open yet (or output has nothing LAN-related).
+    ///
+    /// Kept for the one-shot/e2e helpers; the live host monitor uses the
+    /// chronological [`LanPortTracker`] instead of scanning a tail window.
+    #[allow(dead_code)]
     fn detect_mc_port(&self, log_text: &str) -> Option<u16>;
 
     /// Which join mechanism applies to `mc_version`, if any.
@@ -161,9 +165,67 @@ fn extract_port_after(lower_line: &str, needle: &str) -> Option<u16> {
 }
 
 /// Compose an endpoint string for the UI, e.g. `host.tail1234.ts.net:45565`
-/// or `100.x.y.z:45565`.
+/// or `100.x.y.z:45565`. IPv6 literals are bracketed (`[fd7a::1]:45565`) so
+/// the result is also a valid Minecraft/Quick Play target.
 pub fn compose_endpoint(host: &str, port: u16) -> String {
-    format!("{}:{}", host.trim_end_matches('.'), port)
+    let host = host.trim_end_matches('.');
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+/// Chronological LAN state tracker.
+///
+/// Unlike [`MinecraftDiscovery::detect_mc_port`], which answers "what is the
+/// newest LAN event in this text", this tracker consumes events in order and
+/// keeps the last confirmed state. A chunk without any LAN line therefore does
+/// **not** clear a previously advertised port: only an explicit stop event
+/// does. The host monitor uses it with an incremental file cursor.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LanPortTracker {
+    port: Option<u16>,
+}
+
+impl LanPortTracker {
+    pub fn new() -> Self {
+        Self { port: None }
+    }
+
+    /// Forget the current world's port (new session, truncated log, game exit).
+    pub fn reset(&mut self) {
+        self.port = None;
+    }
+
+    /// Feed one complete log line. Lines are expected without their trailing
+    /// newline; partial lines are carried by the file cursor, not here.
+    pub fn observe_line(&mut self, line: &str) {
+        let lower = line.to_ascii_lowercase();
+        if LAN_STOP_PHRASES.iter().any(|phrase| lower.contains(phrase)) {
+            self.port = None;
+            return;
+        }
+        if LAN_PHRASES.iter().any(|phrase| lower.contains(phrase)) {
+            if let Some(port) = extract_port_after(&lower, "port") {
+                if port > 0 {
+                    self.port = Some(port);
+                }
+            }
+        }
+    }
+
+    /// Convenience for one-shot scans in tests.
+    #[cfg(test)]
+    pub fn observe_text(&mut self, text: &str) {
+        for line in text.lines() {
+            self.observe_line(line);
+        }
+    }
+
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
 }
 
 /// High-level facade used by the command layer.
@@ -182,10 +244,6 @@ impl Default for MinecraftConnector {
 impl MinecraftConnector {
     pub fn discovery(&self) -> &dyn MinecraftDiscovery {
         self.discovery.as_ref()
-    }
-
-    pub fn detect_port(&self, log_text: &str) -> Option<u16> {
-        self.discovery.detect_mc_port(log_text)
     }
 }
 
@@ -234,6 +292,43 @@ mod tests {
             "[..] [Server thread/INFO]: Stopping server\n",
         );
         assert_eq!(LanLogDiscovery.detect_mc_port(log), None);
+    }
+
+    #[test]
+    fn tracker_keeps_the_port_when_new_lines_have_no_lan_event() {
+        let mut tracker = LanPortTracker::new();
+        tracker.observe_line("[..] Local game hosted on port 45565");
+        assert_eq!(tracker.port(), Some(45565));
+
+        // Thousands of unrelated lines must not be interpreted as "closed".
+        for _ in 0..6_000 {
+            tracker.observe_line("[..] [Render thread/INFO]: unrelated output");
+        }
+        assert_eq!(tracker.port(), Some(45565));
+
+        tracker.observe_line("[..] [Server thread/INFO]: Stopping server");
+        assert_eq!(tracker.port(), None);
+    }
+
+    #[test]
+    fn tracker_handles_reopening_and_ignores_port_zero() {
+        let mut tracker = LanPortTracker::new();
+        tracker.observe_text(
+            "[..] Local game hosted on port 11111\n\
+             [..] Stopping server\n\
+             [..] Local game hosted on port 22222",
+        );
+        assert_eq!(tracker.port(), Some(22222));
+
+        tracker.observe_line("[..] Local game hosted on port 0");
+        assert_eq!(tracker.port(), Some(22222));
+    }
+
+    #[test]
+    fn tracker_reports_no_port_until_an_open_event_arrives() {
+        let mut tracker = LanPortTracker::new();
+        tracker.observe_line("[..] Done (5.2s)! For help, type \"help\"");
+        assert_eq!(tracker.port(), None);
     }
 
     #[test]
@@ -336,5 +431,14 @@ mod tests {
             compose_endpoint("host.tail1234.ts.net.", 45565),
             "host.tail1234.ts.net:45565"
         );
+    }
+
+    #[test]
+    fn endpoint_brackets_ipv6_literals() {
+        assert_eq!(
+            compose_endpoint("fd7a:115c:a1e0::1", 45565),
+            "[fd7a:115c:a1e0::1]:45565"
+        );
+        assert_eq!(compose_endpoint("[fd7a::1]", 1), "[fd7a::1]:1");
     }
 }

@@ -43,6 +43,8 @@ function App() {
   const loadConfig = useSettingsStore((s) => s.loadConfig);
   const loadAccounts = useAccountsStore((s) => s.loadAccounts);
   const isFrozen = useFocusStore((s) => s.isFrozen);
+  const roomsEnabled = useSettingsStore((s) => s.config?.rooms_enabled ?? false);
+  const configLoaded = useSettingsStore((s) => s.config != null);
 
   const [javaSetupVisible, setJavaSetupVisible] = useState(false);
   const leavePending = useBrowserGuardStore((s) => s.pending);
@@ -172,6 +174,15 @@ function App() {
     document.documentElement.dataset.page = activePage;
   }, [activePage]);
 
+  // The experimental Rooms tab disappears when the feature is disabled; a
+  // page that was already open falls back to Home instead of rendering a
+  // hidden feature.
+  useEffect(() => {
+    if (configLoaded && !roomsEnabled && activePage === 'rooms') {
+      setActivePage('home');
+    }
+  }, [configLoaded, roomsEnabled, activePage]);
+
   const renderPage = () => {
     switch (activePage) {
       case 'home':
@@ -185,7 +196,7 @@ function App() {
       case 'accounts':
         return <Accounts />;
       case 'rooms':
-        return <Rooms />;
+        return roomsEnabled ? <Rooms /> : <Home onNavigate={navigate} />;
       case 'settings':
         return <Settings />;
       default:
@@ -262,6 +273,7 @@ function App() {
         onConfirm={() => useBrowserGuardStore.getState().resolveLeave()}
         onCancel={() => useBrowserGuardStore.getState().cancelLeave()}
         confirmLabel={t('common.leave')}
+        variant={leaveUnsaved && leavePending === 0 ? 'danger' : 'primary'}
       />
     </>
   );

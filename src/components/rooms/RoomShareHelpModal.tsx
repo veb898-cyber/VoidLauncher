@@ -11,6 +11,7 @@ interface RoomShareHelpModalProps {
   open: boolean;
   onClose: () => void;
   code: string | null;
+  invitation: string | null;
 }
 
 /**
@@ -18,14 +19,17 @@ interface RoomShareHelpModalProps {
  * has no public API, so the host creates the invitation link manually in the
  * Tailscale admin console. Explains that step in plain language.
  */
-export function RoomShareHelpModal({ open, onClose, code }: RoomShareHelpModalProps) {
+export function RoomShareHelpModal({ open, onClose, code, invitation }: RoomShareHelpModalProps) {
   const t = useT();
   const openAdminConsole = useRoomStore((s) => s.openAdminConsole);
   const [copied, setCopied] = useState(false);
 
-  const copyCode = async () => {
-    if (!code) return;
-    if (await copyTextToClipboard(code)) {
+  const copyInvitation = async () => {
+    if (!invitation) {
+      addToast(t('rooms.invitation_not_ready'), 'error');
+      return;
+    }
+    if (await copyTextToClipboard(invitation)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } else {
@@ -37,7 +41,7 @@ export function RoomShareHelpModal({ open, onClose, code }: RoomShareHelpModalPr
     t('rooms.share_help_step1'),
     t('rooms.share_help_step2'),
     t('rooms.share_help_step3'),
-    t('rooms.share_help_step4', { code: code ?? '—' }),
+    t('rooms.share_help_step4'),
   ];
 
   return (
@@ -63,26 +67,39 @@ export function RoomShareHelpModal({ open, onClose, code }: RoomShareHelpModalPr
       </ol>
 
       {code && (
-        <div
-          onClick={copyCode}
+        <button
+          type="button"
+          onClick={copyInvitation}
+          aria-label={t('rooms.copy')}
           style={{
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
             gap: 'var(--space-md)',
+            width: '100%',
             background: 'var(--surface-glass)',
             border: '1px solid var(--surface-border)',
             borderRadius: 'var(--radius-md)',
             padding: 'var(--space-md) var(--space-lg)',
-            marginBottom: 'var(--space-lg)',
-            cursor: 'pointer',
+            marginBottom: 'var(--space-sm)',
+            color: 'inherit',
+            font: 'inherit',
+            textAlign: 'left',
+            cursor: invitation ? 'pointer' : 'default',
+            opacity: invitation ? 1 : 0.6,
           }}
         >
           <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--font-size-lg)', letterSpacing: '2px' }}>
             {code}
           </span>
           {copied ? <Check size={18} color="var(--success)" /> : <Copy size={18} color="var(--text-secondary)" />}
-        </div>
+        </button>
+      )}
+
+      {code && (
+        <p style={{ margin: '0 0 var(--space-lg)', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
+          {t('rooms.share_help_copy_note')}
+        </p>
       )}
 
       <p

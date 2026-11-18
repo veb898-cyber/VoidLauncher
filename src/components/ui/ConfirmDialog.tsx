@@ -11,9 +11,15 @@ interface ConfirmDialogProps {
   confirmLabel?: string;
   cancelLabel?: string;
   busy?: boolean;
+  /**
+   * Visual weight of the confirm action. Destructive actions (delete,
+   * irreversible cleanup) use `danger`; ordinary/reversible confirmations
+   * (leave a room, install, disable a feature) use `primary`.
+   */
+  variant?: 'danger' | 'primary';
 }
 
-/** Small confirmation modal with danger confirm button (e.g. destructive actions). */
+/** Small confirmation modal for explicit, user-approved actions. */
 export function ConfirmDialog({
   open,
   title,
@@ -23,6 +29,7 @@ export function ConfirmDialog({
   confirmLabel,
   cancelLabel,
   busy = false,
+  variant = 'primary',
 }: ConfirmDialogProps) {
   const t = useT();
 
@@ -30,6 +37,7 @@ export function ConfirmDialog({
     <Modal
       open={open}
       onClose={onCancel}
+      dismissible={!busy}
       title={title}
       maxWidth={440}
       footer={
@@ -37,7 +45,7 @@ export function ConfirmDialog({
           <Button variant="ghost" onClick={onCancel} disabled={busy}>
             {cancelLabel ?? t('common.cancel')}
           </Button>
-          <Button variant="danger" onClick={onConfirm} loading={busy} disabled={busy}>
+          <Button variant={variant} onClick={onConfirm} loading={busy} disabled={busy}>
             {confirmLabel ?? t('common.confirm')}
           </Button>
         </div>

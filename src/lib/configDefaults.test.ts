@@ -19,6 +19,14 @@ const base = {
 } as unknown as AppConfig;
 
 describe('withConfigDefaults', () => {
+  it('keeps the experimental Rooms feature disabled for a legacy config', () => {
+    expect(withConfigDefaults(base).rooms_enabled).toBe(false);
+  });
+
+  it('keeps an explicit Rooms opt-in', () => {
+    expect(withConfigDefaults({ ...base, rooms_enabled: true }).rooms_enabled).toBe(true);
+  });
+
   it('enables Ely.by in-game skins for a legacy config without the field', () => {
     expect(withConfigDefaults(base).elyby_skins_in_game).toBe(true);
   });

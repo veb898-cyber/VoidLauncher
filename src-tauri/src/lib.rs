@@ -287,6 +287,40 @@ pub fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
             events::set_app_handle(app.handle());
+            // A room persisted while Rooms was enabled must not keep a hidden
+            // bridge or a temporary Tailscale hostname after the feature was
+            // turned off. Tear it down in the background (Tailscale CLI calls
+            // can take seconds and must never delay startup).
+            let state = app.state::<AppState>();
+            let rooms_disabled = !state
+                .config
+                .lock()
+                .map(|c| c.rooms_enabled)
+                .unwrap_or(false);
+            if rooms_disabled
+                && (state.room_state.role() != rooms::room_state::RoomRole::None
+                    || state.room_state.previous_hostname().is_some())
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = handle.state::<AppState>();
+                    if let Err(e) = commands::rooms::teardown_room_session(&state).await {
+                        tracing::warn!(target: "rooms", "Startup room teardown failed: {}", e);
+                    }
+                });
+            } else if state.room_state.role() == rooms::room_state::RoomRole::Host
+                && state.room_state.host_instance().is_some()
+            {
+                // Minecraft can outlive the launcher. Resume the host monitor
+                // and VoidLink bridge only after the persisted pid record is
+                // verified against the live process; otherwise clear the stale
+                // state.
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = handle.state::<AppState>();
+                    commands::rooms::resume_host_after_startup(handle.clone(), state).await;
+                });
+            }
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -454,6 +488,11 @@ pub fn run() {
             commands::modpacks::cmd_install_modrinth_modpack,
             commands::rooms::cmd_room_status,
             commands::rooms::cmd_room_check_link,
+            commands::rooms::cmd_room_install_tailscale,
+            commands::rooms::cmd_room_login,
+            commands::rooms::cmd_room_session_active,
+            commands::rooms::cmd_room_invitation,
+            commands::rooms::cmd_room_set_host_instance,
             commands::rooms::cmd_room_create_host,
             commands::rooms::cmd_room_join_guest,
             commands::rooms::cmd_room_leave,
