@@ -36,10 +36,9 @@ export function AboutSettings() {
 
   return (
     <>
-      <section className="settings-section">
-        <h2 className="settings-section__title">{t('settings.section_about')}</h2>
+      <section className="settings-section" data-setting-id="app_version">
         <div className="glass-card" style={{ padding: 'var(--space-xl)' }}>
-          <div style={{ fontWeight: 700, fontSize: 'var(--font-size-xl)', marginBottom: 'var(--space-sm)' }}>
+          <h2 style={{ fontWeight: 700, fontSize: 'var(--font-size-xl)', margin: '0 0 var(--space-sm)' }}>
             <span style={{
               background: 'var(--gradient-primary)',
               WebkitBackgroundClip: 'text',
@@ -49,7 +48,7 @@ export function AboutSettings() {
             </span>
             {' '}
             <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-md)', fontWeight: 400 }}>{t('settings.about_version', { version: APP_VERSION })}</span>
-          </div>
+          </h2>
           <p style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>
             {t('settings.about_desc')}
             <br />
@@ -118,7 +117,7 @@ function LatestVersionSection() {
     : 'var(--text-secondary)';
 
   return (
-    <section className="settings-section">
+    <section className="settings-section" data-setting-id="latest_version_check">
       <h2 className="settings-section__title">{t('settings.latest_version_label')}</h2>
       <div
         className="glass-card"

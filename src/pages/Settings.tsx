@@ -1,33 +1,40 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Coffee, Globe, Info, Palette, ScanSearch, SlidersHorizontal } from 'lucide-react';
+import { Coffee, FlaskConical, Globe, Info, Palette, ScanSearch, SlidersHorizontal } from 'lucide-react';
 import { useSettingsStore, type AppConfig } from '../stores/settingsStore';
 import { useBrowserGuardStore } from '../stores/browserGuardStore';
 import { useLanguageStore } from '../stores/languageStore';
 import { useFontStore } from '../stores/fontStore';
 import { Button } from '../components/ui/Button';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import { RefreshIcon } from '../components/ui/RefreshIcon';
-import { SlidingTabs, type SlidingTabDef } from '../components/ui/SlidingTabs';
+import { SlidingTabs, slidingPanelId, slidingTabId, type SlidingTabDef } from '../components/ui/SlidingTabs';
 import { addToast } from '../components/ui/Toast';
 import { useT } from '../lib/i18n';
 import { JavaSettings } from './settings/JavaSettings';
 import { AppearanceSettings } from './settings/AppearanceSettings';
-import { LauncherSettings } from './settings/LauncherSettings';
+import { GeneralSettings } from './settings/GeneralSettings';
 import { NetworkSettings } from './settings/NetworkSettings';
 import { DiagnosticsSettings } from './settings/DiagnosticsSettings';
 import { AboutSettings } from './settings/AboutSettings';
+import { ExperimentalSettings } from './settings/ExperimentalSettings';
+import {
+  SETTINGS_CATEGORY_IDS,
+  SETTINGS_CATEGORY_LABEL_KEYS,
+  initialSettingsCategory,
+  type SettingsCategory,
+} from './settings/settingsLayout';
 import type { UpdateConfig } from './settings/types';
 
-const CATEGORY_IDS = [
-  'java',
-  'appearance',
-  'launcher',
-  'network',
-  'diagnostics',
-  'about',
-] as const;
-
-type SettingsCategory = (typeof CATEGORY_IDS)[number];
+const CATEGORY_ICONS: Record<SettingsCategory, ReactNode> = {
+  general: <SlidersHorizontal size={15} aria-hidden />,
+  appearance: <Palette size={15} aria-hidden />,
+  java: <Coffee size={15} aria-hidden />,
+  network: <Globe size={15} aria-hidden />,
+  experimental: <FlaskConical size={15} aria-hidden />,
+  diagnostics: <ScanSearch size={15} aria-hidden />,
+  about: <Info size={15} aria-hidden />,
+};
 
 export function Settings() {
   const t = useT();
@@ -40,7 +47,9 @@ export function Settings() {
   const font = useFontStore((s) => s.font);
   const [localConfig, setLocalConfig] = useState<AppConfig | null>(config);
   const [saveSuccess, setSaveSuccess] = useState(false);
-  const [category, setCategory] = useState<SettingsCategory>('java');
+  const [pendingRoomsDisable, setPendingRoomsDisable] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [category, setCategory] = useState<SettingsCategory>(initialSettingsCategory);
   const pageRef = useRef<HTMLDivElement>(null);
   // Network toggles apply immediately (so downloads react before Save), which
   // means leaving the page with unsaved edits must restore the persisted
@@ -86,17 +95,40 @@ export function Settings() {
     return () => { useBrowserGuardStore.getState().setUnsaved(false); };
   }, [dirty]);
 
-  const handleSave = useCallback(async () => {
-    if (!localConfig) return;
+  const performSave = useCallback(async (cfg: AppConfig) => {
+    setSaving(true);
     try {
-      await saveConfig(localConfig);
+      await saveConfig(cfg);
       setSaveSuccess(true);
       addToast(t('settings.save_success'), 'success');
       setTimeout(() => setSaveSuccess(false), 2000);
     } catch (e) {
       addToast(t('settings.save_error', { error: String(e) }), 'error');
+    } finally {
+      setSaving(false);
     }
-  }, [localConfig, saveConfig, t]);
+  }, [saveConfig, t]);
+
+  const handleSave = useCallback(async () => {
+    if (!localConfig) return;
+    // Turning the experimental Rooms feature off during an active session
+    // must warn first: the backend will end the room (guest loses access,
+    // bridge stops, room code is cleared) as part of this save.
+    const disablingRooms = !!config?.rooms_enabled && !localConfig.rooms_enabled;
+    if (disablingRooms) {
+      try {
+        const active = await invoke<boolean>('cmd_room_session_active');
+        if (active) {
+          setPendingRoomsDisable(true);
+          return;
+        }
+      } catch {
+        // A status probe failure must not block disabling the feature; the
+        // backend teardown is still safe when there is no room.
+      }
+    }
+    await performSave(localConfig);
+  }, [localConfig, config, performSave]);
 
   const handleCategoryChange = useCallback((next: SettingsCategory) => {
     if (next === category) return;
@@ -131,32 +163,23 @@ export function Settings() {
     );
   }
 
-  const tabs: SlidingTabDef<SettingsCategory>[] = [
-    {
-      id: 'java',
-      label: <><Coffee size={15} aria-hidden /> {t('settings.section_java')}</>,
-    },
-    {
-      id: 'appearance',
-      label: <><Palette size={15} aria-hidden /> {t('settings.section_appearance')}</>,
-    },
-    {
-      id: 'launcher',
-      label: <><SlidersHorizontal size={15} aria-hidden /> {t('settings.section_launcher')}</>,
-    },
-    {
-      id: 'network',
-      label: <><Globe size={15} aria-hidden /> {t('settings.section_network')}</>,
-    },
-    {
-      id: 'diagnostics',
-      label: <><ScanSearch size={15} aria-hidden /> {t('settings.section_diagnostics')}</>,
-    },
-    {
-      id: 'about',
-      label: <><Info size={15} aria-hidden /> {t('settings.section_about')}</>,
-    },
-  ];
+  const tabs: SlidingTabDef<SettingsCategory>[] = SETTINGS_CATEGORY_IDS.map((id) => ({
+    id,
+    label: <>{CATEGORY_ICONS[id]} {t(SETTINGS_CATEGORY_LABEL_KEYS[id])}</>,
+  }));
+
+  // One page per category, keyed by the same ids as the tab row. The Record
+  // type makes a missing or unknown category a compile error, so the active
+  // tab can never point at a page that does not exist.
+  const pages: Record<SettingsCategory, ReactNode> = {
+    general: <GeneralSettings config={localConfig} updateConfig={updateConfig} />,
+    appearance: <AppearanceSettings />,
+    java: <JavaSettings config={localConfig} updateConfig={updateConfig} />,
+    network: <NetworkSettings config={localConfig} updateConfig={updateConfig} />,
+    experimental: <ExperimentalSettings config={localConfig} updateConfig={updateConfig} />,
+    diagnostics: <DiagnosticsSettings />,
+    about: <AboutSettings />,
+  };
 
   const pageClass = (id: SettingsCategory) =>
     `settings-page${category === id ? ' settings-page--active' : ''}`;
@@ -176,36 +199,46 @@ export function Settings() {
         onChange={handleCategoryChange}
         ariaLabel={t('settings.nav_label')}
         className="settings-nav"
+        controlsPanels
+        idPrefix="settings-tabs"
       />
 
       <div className="settings-pages">
-        <div className={pageClass('java')} hidden={category !== 'java'}>
-          <JavaSettings config={localConfig} updateConfig={updateConfig} />
-        </div>
-        <div className={pageClass('appearance')} hidden={category !== 'appearance'}>
-          <AppearanceSettings />
-        </div>
-        <div className={pageClass('launcher')} hidden={category !== 'launcher'}>
-          <LauncherSettings config={localConfig} updateConfig={updateConfig} />
-        </div>
-        <div className={pageClass('network')} hidden={category !== 'network'}>
-          <NetworkSettings config={localConfig} updateConfig={updateConfig} />
-        </div>
-        <div className={pageClass('diagnostics')} hidden={category !== 'diagnostics'}>
-          <DiagnosticsSettings />
-        </div>
-        <div className={pageClass('about')} hidden={category !== 'about'}>
-          <AboutSettings />
-        </div>
+        {SETTINGS_CATEGORY_IDS.map((id) => (
+          <div
+            key={id}
+            className={pageClass(id)}
+            hidden={category !== id}
+            role="tabpanel"
+            id={slidingPanelId('settings-tabs', id)}
+            aria-labelledby={slidingTabId('settings-tabs', id)}
+          >
+            {pages[id]}
+          </div>
+        ))}
       </div>
 
       {dirty && (
         <div className="settings-save-fab">
-          <button className="btn btn--primary" onClick={handleSave} id="save-settings-btn">
+          <button className="btn btn--primary" onClick={handleSave} id="save-settings-btn" disabled={saving}>
             {saveSuccess ? `✓ ${t('settings.save_btn')}` : t('settings.save_btn')}
           </button>
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingRoomsDisable}
+        title={t('settings.rooms_disable_title')}
+        description={t('settings.rooms_disable_desc')}
+        confirmLabel={t('settings.rooms_disable_confirm')}
+        variant="primary"
+        busy={saving}
+        onCancel={() => setPendingRoomsDisable(false)}
+        onConfirm={() => {
+          setPendingRoomsDisable(false);
+          if (localConfig) void performSave(localConfig);
+        }}
+      />
     </div>
   );
 }

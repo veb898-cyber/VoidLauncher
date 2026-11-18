@@ -81,8 +81,8 @@ export function DiagnosticsSettings() {
     : <Circle size={15} color="var(--text-tertiary)" />;
 
   return (
-    <section className="settings-section">
-      <h2 className="settings-section__title">{t('settings.section_diagnostics')}</h2>
+    <section className="settings-section" data-setting-id="diagnostics_run">
+      <h2 className="settings-section__title">{t('settings.diagnostics_heading')}</h2>
       <p className="settings-section__desc">{t('diag.desc')}</p>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', marginBottom: 'var(--space-md)', flexWrap: 'wrap' }}>
@@ -97,6 +97,7 @@ export function DiagnosticsSettings() {
           <div style={{ width: 260 }}>
             <CustomSelect
               value={diagInstance ?? ''}
+              ariaLabel={t('diag.instance_label')}
               options={[
                 ...instances.map((i) => ({
                   value: i.name,
