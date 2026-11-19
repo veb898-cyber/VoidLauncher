@@ -91,9 +91,20 @@ pub struct FileProgressPayload {
     pub downloaded: u64,
     /// `None` when the server did not provide a trustworthy total size.
     pub total: Option<u64>,
+    /// Opaque id of the UI operation that owns this download. Content installs
+    /// set it so events for the same filename in another instance/operation
+    /// cannot be applied to the wrong card. Background downloads leave it unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
-pub fn emit_file_progress(url: &str, file_name: &str, downloaded: u64, total: Option<u64>) {
+pub fn emit_file_progress(
+    url: &str,
+    file_name: &str,
+    downloaded: u64,
+    total: Option<u64>,
+    request_id: Option<&str>,
+) {
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.emit(
             "modpack_file_progress",
@@ -102,6 +113,7 @@ pub fn emit_file_progress(url: &str, file_name: &str, downloaded: u64, total: Op
                 file_name: file_name.to_string(),
                 downloaded,
                 total,
+                request_id: request_id.map(str::to_string),
             },
         );
     }

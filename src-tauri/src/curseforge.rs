@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::integrity::HashSpec;
 use serde::{Deserialize, Serialize};
 
 const BASE_URL: &str = "https://api.curseforge.com";
@@ -115,6 +116,10 @@ pub struct CfHash {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CfFile {
     pub id: u64,
+    /// Project id the file belongs to. `default` keeps old fixtures/cached
+    /// payloads parseable; content installation requires an exact match.
+    #[serde(rename = "modId", default)]
+    pub mod_id: u64,
     #[serde(rename = "displayName")]
     pub display_name: String,
     #[serde(rename = "fileName")]
@@ -681,15 +686,13 @@ pub async fn download_cf_native(
     mod_id: u64,
     file_id: u64,
     file_name: &str,
-    expected_sha1: &str,
+    expected: &HashSpec,
+    expected_size: Option<u64>,
     dest: &std::path::Path,
     api_key: &str,
 ) -> Result<()> {
     // Already on disk with the wanted hash (interrupted-apply resume).
-    if dest.exists()
-        && !expected_sha1.is_empty()
-        && crate::download::verify_sha1(dest, expected_sha1)?
-    {
+    if dest.exists() && expected.verify_file(dest)? {
         return Ok(());
     }
     let candidates = download_url_candidates(mod_id, file_id, file_name, api_key).await;
@@ -713,12 +716,15 @@ pub async fn download_cf_native(
             meta.push(".part.meta");
             let _ = std::fs::remove_file(std::path::PathBuf::from(meta));
         }
-        match crate::download::download_to_part(
+        let timeout = expected_size
+            .map(crate::download::timeout_for_size)
+            .unwrap_or_else(crate::download::timeout_for_unknown_size);
+        match crate::download::download_to_part_verified(
             url,
             dest,
-            expected_sha1,
-            None,
-            Some(crate::download::timeout_for_unknown_size()),
+            expected,
+            expected_size,
+            Some(timeout),
         )
         .await
         {
@@ -770,6 +776,7 @@ mod tests {
     fn cf_file(id: u64, name: &str, date: &str, available: Option<bool>) -> CfFile {
         CfFile {
             id,
+            mod_id: 0,
             display_name: name.to_string(),
             file_name: format!("{}.jar", name),
             download_url: None,
@@ -937,6 +944,7 @@ mod tests {
         let json = r#"{
             "data": [{
                 "id": 9254760,
+                "modId": 238222,
                 "displayName": "19.69.0.456 for NeoForge 1.21.1",
                 "fileName": "jei-1.21.1-neoforge-19.69.0.456.jar",
                 "downloadUrl": "https://edge.forgecdn.net/files/9254/760/jei.jar",
@@ -950,6 +958,7 @@ mod tests {
             }]
         }"#;
         let resp: CfDataResponse<Vec<CfFile>> = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.data[0].mod_id, 238222);
         assert_eq!(resp.data[0].sha1_hash(), Some("abc"));
         assert_eq!(resp.data[0].is_available, Some(true));
     }

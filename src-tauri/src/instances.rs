@@ -1834,6 +1834,16 @@ pub(crate) fn read_sidecar_meta(
 
 /// Remove sidecar metadata in both layouts (used when a content file is deleted).
 pub(crate) fn remove_sidecar_meta(content_dir: &std::path::Path, filename: &str) {
+    // Callers normally pass a safe file name, but this helper is also reachable
+    // with legacy/update names. Never let a path component escape the content
+    // directory while cleaning metadata.
+    let Some(filename) = std::path::Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+    else {
+        return;
+    };
     let meta = sidecar_meta_path(content_dir, filename);
     if crate::import::ensure_no_reparse_points(content_dir, &meta).is_ok() {
         let _ = std::fs::remove_file(meta);
@@ -1841,6 +1851,13 @@ pub(crate) fn remove_sidecar_meta(content_dir: &std::path::Path, filename: &str)
     let legacy = legacy_sidecar_path(content_dir, filename);
     if crate::import::ensure_no_reparse_points(content_dir, &legacy).is_ok() {
         let _ = std::fs::remove_file(legacy);
+    }
+    // Historical full-filename variant (`foo.jar.voidlauncher.json`) is still
+    // read as a fallback; clean it too so a future file with this name cannot
+    // inherit stale metadata.
+    let full_legacy = content_dir.join(format!("{filename}.voidlauncher.json"));
+    if crate::import::ensure_no_reparse_points(content_dir, &full_legacy).is_ok() {
+        let _ = std::fs::remove_file(full_legacy);
     }
 }
 
@@ -5823,12 +5840,14 @@ version = 'hIibTfxn'
         let meta = read_sidecar_meta(&mods, "bar.zip").unwrap();
         assert_eq!(meta["provider"], "curseforge");
 
-        // Removal cleans both layouts
+        // Removal cleans both layouts and the historical full-filename variant
         std::fs::write(mods.join(".index").join("baz.voidlauncher.json"), "{}").unwrap();
         std::fs::write(mods.join("baz.voidlauncher.json"), "{}").unwrap();
+        std::fs::write(mods.join("baz.jar.voidlauncher.json"), "{}").unwrap();
         remove_sidecar_meta(&mods, "baz.jar");
         assert!(!mods.join(".index").join("baz.voidlauncher.json").exists());
         assert!(!mods.join("baz.voidlauncher.json").exists());
+        assert!(!mods.join("baz.jar.voidlauncher.json").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

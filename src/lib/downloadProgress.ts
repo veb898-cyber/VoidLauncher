@@ -16,6 +16,8 @@ export interface FileProgressPayload {
   downloaded: number;
   /** Null when the server did not provide a trustworthy Content-Length. */
   total: number | null;
+  /** Opaque id of the content-install request that owns this download. */
+  request_id?: string | null;
 }
 
 function clamp(value: number, min: number, max: number): number {

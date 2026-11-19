@@ -7,7 +7,6 @@ use crate::content;
 use crate::curseforge;
 use crate::download;
 use crate::instances;
-use crate::is_allowed_download_host;
 use crate::modrinth;
 use crate::AppState;
 use std::io::Read as _;
@@ -596,8 +595,9 @@ pub async fn cmd_check_mod_updates(
             let installed_hash = mod_file.hash.as_deref().unwrap_or("");
             // Compare only like-for-like: sha512 used to be substituted for
             // the missing sha1, so the comparison never matched and every
-            // check reported a phantom update. No sha1 → report the update
-            // without a hash guard (expected_sha1 empty = no verification).
+            // check reported a phantom update. If Modrinth has no SHA-1, the
+            // frontend cross-check is empty; the install command still resolves
+            // the strongest provider hash before downloading.
             let file_hash = primary_file
                 .hashes
                 .get("sha1")
@@ -857,20 +857,6 @@ fn read_sidecar_fields(mods_dir: &std::path::Path, filename: &str) -> SidecarFie
         },
         None => SidecarFields::default(),
     }
-}
-
-/// Extract a local filesystem path from a `file://` URI (as passed by the UI
-/// for local mod installation, e.g. `file://C:\path\to\mod.jar`). Accepts the
-/// `file:///C:/...` variant too. Returns an error for anything not file-based.
-fn local_path_from_uri(uri: &str) -> Result<std::path::PathBuf, String> {
-    let rest = uri
-        .strip_prefix("file://")
-        .ok_or_else(|| "Local install requires a file:// path".to_string())?
-        .trim_start_matches('/');
-    if rest.is_empty() || rest == "." || rest == ".." {
-        return Err("Empty or invalid local file path".to_string());
-    }
-    Ok(std::path::PathBuf::from(rest))
 }
 
 // ==================== Local content import ====================
@@ -2461,10 +2447,10 @@ fn install_local_content_into(
             format!("Cannot install local content: {error}"),
         ));
     }
-    discard_local_stash(&stashed);
 
     let hash = download::hash_file_sha1(&target_path).ok();
-    let _ = content::write_sidecar(
+    let snapshots = snapshot_sidecars(&content_dir, &[target_name.as_str()]);
+    if let Err(error) = content::write_sidecar(
         &content_dir,
         &target_name,
         &content::SidecarWrite {
@@ -2477,7 +2463,24 @@ fn install_local_content_into(
             file_id: None,
             hash: hash.as_deref(),
         },
-    );
+    ) {
+        // A local file without coherent metadata is not a successful install:
+        // remove it and put back whatever content occupied the target before.
+        remove_local_path(&target_path);
+        restore_local_stash(&stashed);
+        let metadata_restore = restore_sidecars(&content_dir, &snapshots);
+        let metadata_note = metadata_restore
+            .err()
+            .map(|restore| format!("; metadata restore failed: {restore}"))
+            .unwrap_or_default();
+        return Err(LocalImportError::new(
+            "installFailed",
+            format!(
+                "Installed file could not be recorded; previous content was restored{metadata_note}: {error}"
+            ),
+        ));
+    }
+    discard_local_stash(&stashed);
 
     Ok(local_import_result(
         LocalImportStatus::Installed,
@@ -2538,144 +2541,154 @@ pub async fn cmd_install_local_content(
     .map_err(|error| LocalImportError::new("installFailed", error.to_string()))?
 }
 
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub async fn cmd_install_mod(
-    state: State<'_, AppState>,
-    instance_name: String,
-    modrinth_version_id: Option<String>,
-    curseforge_file_id: Option<i32>,
-    file_name: String,
-    download_url: String,
-    project_id: Option<String>,
-    project_name: Option<String>,
-    version_number: Option<String>,
-    provider: String,
-    subfolder: Option<String>,
-) -> Result<String, String> {
-    validate_instance_name(&instance_name)?;
-    let _guard =
-        crate::commands::instances::InstanceMutationGuard::acquire(state.inner(), &instance_name)?;
-
-    // Content subfolder: mods (default), resourcepacks, shaderpacks.
-    // Local drag-drop / file picker for packs must land in the right folder
-    // so list_packs finds the file and its sidecar.
-    const ALLOWED: &[&str] = &["mods", "resourcepacks", "shaderpacks"];
-    let safe_subfolder = subfolder
-        .unwrap_or_else(|| "mods".to_string())
-        .trim_matches('/')
-        .trim_matches('\\')
-        .to_string();
-    if !ALLOWED
-        .iter()
-        .any(|s| s.eq_ignore_ascii_case(&safe_subfolder))
-    {
-        return Err(format!("Subfolder '{}' is not allowed.", safe_subfolder));
+fn parse_positive_content_id(value: Option<&str>, label: &str) -> Result<u64, String> {
+    let raw = value.unwrap_or("").trim();
+    if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("Invalid {label}"));
     }
-    let safe_subfolder = safe_subfolder.to_lowercase();
-
-    let (content_dir, safe_name, dest) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
-        let content_dir = instance
-            .minecraft_dir(&config.instances_dir())
-            .join(&safe_subfolder);
-        let _ = std::fs::create_dir_all(&content_dir);
-        let safe_name = std::path::Path::new(&file_name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("Invalid file name")?
-            .to_string();
-        let dest = content_dir.join(&safe_name);
-        (content_dir, safe_name, dest)
-    };
-
-    // Local file installation: the UI passes a `file://` URI in `download_url`
-    // and `provider: "local"`. Copy the file into the content dir instead of
-    // downloading it — the HTTPS/host allowlist checks below only apply to
-    // remote downloads.
-    if provider == "local" {
-        let local_path = local_path_from_uri(&download_url)?;
-        let content_type = content::content_type_for_dir(&safe_subfolder);
-        let options_path = content_dir
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("options.txt");
-        let result = install_local_content_into(
-            &content_dir,
-            Some(&options_path),
-            &local_path,
-            content_type,
-            LocalConflictPolicy::Reject,
-            None,
-        )
-        .map_err(|error| error.message)?;
-        return match result.status {
-            LocalImportStatus::Installed | LocalImportStatus::AlreadyInstalled => {
-                Ok(result.filename)
-            }
-            LocalImportStatus::DuplicateContent => Err(format!(
-                "{} is already installed as {}",
-                local_path.display(),
-                result.duplicate_of.unwrap_or_default()
-            )),
-            LocalImportStatus::Conflict => Err(format!(
-                "{} already exists with different content",
-                result.filename
-            )),
-        };
-    }
-
-    // Validate the URL is HTTPS and points to a known Modrinth / CurseForge CDN.
-    if !download_url.starts_with("https://") {
-        return Err("Download URL must be HTTPS.".to_string());
-    }
-    if !is_allowed_download_host(&download_url) {
-        return Err(format!(
-            "Download host is not in the allowlist: {}",
-            download_url
-        ));
-    }
-    if let Some(base) = content_dir.parent() {
-        crate::import::ensure_no_reparse_points(base, &dest).map_err(|e| e.to_string())?;
-    }
-    if let Err(e) = download::download_file(&download_url, &dest, "").await {
-        // A failed transfer must not leave a partial/corrupt file in the
-        // mods folder (it would be listed as an installed mod).
-        let _ = std::fs::remove_file(&dest);
-        return Err(e.to_string());
-    }
-    // No SHA1 is available for mod downloads — at least verify the result is
-    // a real JAR archive and not an error page / bogus response.
-    if let Err(e) = download::verify_zip_magic(&dest) {
-        let _ = std::fs::remove_file(&dest);
-        return Err(e.to_string());
-    }
-    let final_name = safe_name.clone();
-
-    // Write unified sidecar metadata (`.index/` folder, same layout as
-    // Prism) so the installed file can be tracked back to its source,
-    // including hash/installed_at for later compatibility & update checks.
-    let hash = download::hash_file_sha1(&dest).ok();
-    let _ = content::write_sidecar(
-        &content_dir,
-        &safe_name,
-        &content::SidecarWrite {
-            provider: &provider,
-            content_type: content::content_type_for_dir(&safe_subfolder),
-            project_id: project_id.as_deref(),
-            project_name: project_name.as_deref(),
-            version_id: modrinth_version_id.as_deref(),
-            version_number: version_number.as_deref(),
-            file_id: curseforge_file_id.map(|id| id.to_string()).as_deref(),
-            hash: hash.as_deref(),
-        },
-    );
-
-    Ok(final_name)
+    raw.parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| format!("Invalid {label}"))
 }
 
+/// One sidecar file captured before an install publishes new metadata.
+struct SidecarSnapshotEntry {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+/// Every metadata file `read_sidecar_meta` can consult for `filename`:
+/// the current `.index/` layout plus both historical next-to-file variants.
+fn sidecar_snapshot_paths(content_dir: &std::path::Path, filename: &str) -> Vec<PathBuf> {
+    let Some(filename) = std::path::Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+    else {
+        return Vec::new();
+    };
+    vec![
+        crate::instances::sidecar_meta_path(content_dir, filename),
+        crate::instances::legacy_sidecar_path(content_dir, filename),
+        content_dir.join(format!("{filename}.voidlauncher.json")),
+    ]
+}
+
+fn snapshot_sidecars(
+    content_dir: &std::path::Path,
+    filenames: &[&str],
+) -> Vec<SidecarSnapshotEntry> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for filename in filenames {
+        for path in sidecar_snapshot_paths(content_dir, filename) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            // Never follow a junction/symlink while capturing rollback data.
+            let contents = if crate::import::ensure_no_reparse_points(content_dir, &path).is_ok()
+                && path.is_file()
+            {
+                std::fs::read(&path).ok()
+            } else {
+                None
+            };
+            SidecarSnapshotEntry { path, contents }
+        })
+        .collect()
+}
+
+/// Best-effort restoration of the exact sidecar bytes captured before an
+/// install. Failure here is reported by the install's error path; the content
+/// file itself is restored by `restore_stashed_files`.
+fn restore_sidecars(
+    content_dir: &std::path::Path,
+    snapshots: &[SidecarSnapshotEntry],
+) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    for snapshot in snapshots {
+        if crate::import::ensure_no_reparse_points(content_dir, &snapshot.path).is_err() {
+            errors.push(format!("{}: unsafe metadata path", snapshot.path.display()));
+            continue;
+        }
+        match &snapshot.contents {
+            Some(contents) => {
+                if let Some(parent) = snapshot.path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(error) = std::fs::write(&snapshot.path, contents) {
+                    errors.push(format!("{}: {error}", snapshot.path.display()));
+                }
+            }
+            None => {
+                if snapshot.path.is_file() {
+                    if let Err(error) = std::fs::remove_file(&snapshot.path) {
+                        errors.push(format!("{}: {error}", snapshot.path.display()));
+                    }
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Publish the verified file's sidecar as part of the same install result.
+///
+/// The file has already been downloaded and verified, but a verified file with
+/// stale/missing metadata is not a successful install: update checks, deep
+/// verification and dependency resolution all read this sidecar. If the write
+/// fails, remove the new file, restore the parked old file(s), and put the old
+/// sidecar bytes back. Only after a successful write may the old file/metadata
+/// be discarded.
+fn commit_verified_install<F>(
+    content_dir: &std::path::Path,
+    dest: &std::path::Path,
+    final_name: &str,
+    old_filename: Option<&str>,
+    stashed: &[(PathBuf, PathBuf)],
+    write_sidecar: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    let mut names = vec![final_name];
+    if let Some(old) = old_filename {
+        names.push(old);
+    }
+    let snapshots = snapshot_sidecars(content_dir, &names);
+
+    if let Err(error) = write_sidecar() {
+        let _ = std::fs::remove_file(dest);
+        crate::instances::restore_stashed_files(stashed);
+        let metadata_restore = restore_sidecars(content_dir, &snapshots);
+        let metadata_note = metadata_restore
+            .err()
+            .map(|restore| format!("; metadata restore failed: {restore}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "Installed file could not be recorded; previous content was restored{metadata_note}: {error}"
+        ));
+    }
+
+    crate::instances::discard_stashed_files(stashed);
+    if let Some(old) = old_filename {
+        crate::instances::cleanup_old_sidecar_after_update(content_dir, old, final_name);
+    }
+    Ok(())
+}
+
+/// Install remote catalog content after resolving its URL, size and checksum
+/// from Modrinth/CurseForge metadata. The frontend URL/checksum are selectors
+/// and cross-checks only; neither is used as the download source of truth.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_download_to_folder(
@@ -2692,33 +2705,12 @@ pub async fn cmd_download_to_folder(
     old_filename: Option<String>,
     expected_sha1: String,
     file_id: Option<String>,
+    request_id: Option<String>,
 ) -> Result<String, String> {
     validate_instance_name(&instance_name)?;
     let _guard =
         crate::commands::instances::InstanceMutationGuard::acquire(state.inner(), &instance_name)?;
-    // CurseForge chain mode: no direct URL in the plan — the backend
-    // resolves (project id, file id) → signed URL → CDN mirrors here. Only
-    // this mode may bypass the HTTPS/allowlist pre-checks (each candidate is
-    // still validated inside the download layer).
-    let numeric = |v: &Option<String>| {
-        v.as_deref()
-            .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-    };
-    let cf_native = download_url.is_empty()
-        && provider.eq_ignore_ascii_case("curseforge")
-        && numeric(&project_id)
-        && numeric(&file_id);
-    if !cf_native {
-        if !download_url.starts_with("https://") {
-            return Err("Download URL must be HTTPS.".to_string());
-        }
-        if !is_allowed_download_host(&download_url) {
-            return Err(format!(
-                "Download host is not in the allowlist: {}",
-                download_url
-            ));
-        }
-    }
+
     // Whitelist allowed subfolders under the instance .minecraft dir.
     const ALLOWED: &[&str] = &["mods", "resourcepacks", "shaderpacks", "config"];
     let safe_subfolder = subfolder.trim_matches('/').trim_matches('\\');
@@ -2734,33 +2726,99 @@ pub async fn cmd_download_to_folder(
     {
         return Err("Subfolder contains invalid characters.".to_string());
     }
-    let (dest_dir, safe_name) = {
+
+    let provider = provider.trim().to_ascii_lowercase();
+    if !matches!(provider.as_str(), "modrinth" | "curseforge") {
+        return Err("Unsupported content provider; remote installs are restricted to Modrinth and CurseForge.".to_string());
+    }
+
+    let request_id = request_id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    if let Some(ref id) = request_id {
+        if id.len() > 128
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err("Invalid install request id.".to_string());
+        }
+    }
+
+    let (instances_dir, curseforge_api_key) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        let instance = instances::get_instance(&config.instances_dir(), &instance_name)
-            .map_err(|e| e.to_string())?;
-        let dest_dir = instance
-            .minecraft_dir(&config.instances_dir())
-            .join(safe_subfolder);
+        (config.instances_dir(), config.curseforge_api_key.clone())
+    };
+
+    // Provider metadata is the source of truth for URL, file identity, size
+    // and checksum. The frontend only supplies the selection identifiers and
+    // an optional SHA-1 cross-check.
+    let resolved = match provider.as_str() {
+        "modrinth" => {
+            let project = project_id.as_deref().unwrap_or("").trim();
+            let version = version_id.as_deref().unwrap_or("").trim();
+            if project.is_empty() {
+                return Err("Modrinth project id is required.".to_string());
+            }
+            if version.is_empty() {
+                return Err("Modrinth version id is required.".to_string());
+            }
+            let version_info = modrinth::get_version_by_id(version).await.map_err(|e| {
+                format!("Modrinth metadata lookup failed for version {version}: {e}")
+            })?;
+            if version_info.id != version {
+                return Err(format!(
+                    "Modrinth returned metadata for version {} instead of the requested {version}",
+                    version_info.id
+                ));
+            }
+            crate::content_install::resolve_modrinth(
+                &version_info,
+                project,
+                &file_name,
+                &download_url,
+                &expected_sha1,
+            )
+            .map_err(|e| e.to_string())?
+        }
+        "curseforge" => {
+            let project =
+                parse_positive_content_id(project_id.as_deref(), "CurseForge project id")?;
+            let file = parse_positive_content_id(file_id.as_deref(), "CurseForge file id")?;
+            crate::content_install::ensure_api_key(&curseforge_api_key)
+                .map_err(|e| e.to_string())?;
+            let files = curseforge::get_files_by_ids(&[file], &curseforge_api_key)
+                .await
+                .map_err(|e| format!("CurseForge metadata lookup failed for file {file}: {e}"))?;
+            crate::content_install::resolve_curseforge(&files, project, file, &expected_sha1)
+                .map_err(|e| e.to_string())?
+        }
+        _ => unreachable!("provider was validated above"),
+    };
+
+    let (dest_dir, safe_name) = {
+        let instance =
+            instances::get_instance(&instances_dir, &instance_name).map_err(|e| e.to_string())?;
+        let dest_dir = instance.minecraft_dir(&instances_dir).join(safe_subfolder);
         let _ = std::fs::create_dir_all(&dest_dir);
-        let safe_name = std::path::Path::new(&file_name)
+        let safe_name = std::path::Path::new(&resolved.file_name)
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or("Invalid file name")?
+            .ok_or("Invalid file name returned by provider")?
             .to_string();
         (dest_dir, safe_name)
     };
+
     // No caller-provided old filename? Resolve it from the sidecar index by
     // project id: installing another version of an already-installed project
     // (or a dependency that is already present) must replace the old file
     // instead of adding a second jar next to it.
     let old_filename = match old_filename {
         Some(f) => Some(f),
-        None => project_id.as_deref().and_then(|pid| {
-            content::list_installed(&dest_dir, content::content_type_for_dir(safe_subfolder))
-                .into_iter()
-                .find(|ic| ic.project_id.as_deref() == Some(pid))
-                .map(|ic| ic.filename)
-        }),
+        None => content::list_installed(&dest_dir, content::content_type_for_dir(safe_subfolder))
+            .into_iter()
+            .find(|ic| ic.project_id.as_deref() == Some(resolved.project_id.as_str()))
+            .map(|ic| ic.filename),
     };
     // An update of a DISABLED file must stay disabled: the `.disabled`
     // suffix is the enable switch the game honors, and dropping it silently
@@ -2778,80 +2836,119 @@ pub async fn cmd_download_to_folder(
     if let Some(base) = dest_dir.parent() {
         crate::import::ensure_no_reparse_points(base, &dest).map_err(|e| e.to_string())?;
     }
-    // Park any old file aside (rename, never delete): the previous code
-    // deleted the old jar before the network transfer started, so a failed
-    // download left the user with no mod at all — and, due to a stem bug,
-    // usually did not even match the real filename, leaving duplicates.
-    // On failure the parked file is restored; on success it is removed
-    // together with its stale sidecar.
-    let stashed = match old_filename {
-        Some(ref raw) => crate::instances::stash_old_content_files(&dest_dir, raw)?,
-        None => Vec::new(),
-    };
-    let downloaded = async {
-        if cf_native {
-            let pid = project_id
-                .as_deref()
-                .unwrap_or("")
-                .parse::<u64>()
-                .unwrap_or(0);
-            let fid = file_id.as_deref().unwrap_or("").parse::<u64>().unwrap_or(0);
-            let key = {
-                let config = state.config.lock().map_err(|e| e.to_string())?;
-                config.curseforge_api_key.clone()
-            };
-            curseforge::download_cf_native(pid, fid, &safe_name, &expected_sha1, &dest, &key)
-                .await
-                .map_err(|e| e.to_string())?;
-        } else {
-            download::download_file(&download_url, &dest, &expected_sha1)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        // When no SHA1 is available, at least verify the result is a real
-        // archive (JAR/ZIP magic) and not an HTML error page / bogus body.
-        if expected_sha1.is_empty() && (safe_name.ends_with(".jar") || safe_name.ends_with(".zip"))
-        {
-            download::verify_zip_magic(&dest).map_err(|e| e.to_string())?;
-        }
-        Ok::<(), String>(())
+    // A pre-existing file at this exact name may be untracked (another
+    // project, a manual drop). It is parked below together with the tracked
+    // old file so a failed download or sidecar write can restore whichever
+    // content the user had before this attempt.
+    let dest_existed = dest.exists();
+    // Park the tracked old file and any untracked file already occupying the
+    // new name. A later sidecar failure must be able to restore both, not just
+    // the file the sidecar index knew about.
+    let mut stashed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if let Some(ref raw) = old_filename {
+        stashed.extend(crate::instances::stash_old_content_files(&dest_dir, raw)?);
     }
-    .await;
+    if dest.exists() {
+        match crate::instances::stash_old_content_files(&dest_dir, &final_name) {
+            Ok(more) => stashed.extend(more),
+            Err(error) => {
+                crate::instances::restore_stashed_files(&stashed);
+                return Err(error);
+            }
+        }
+    }
+
+    let downloaded = {
+        let _progress_guard = request_id
+            .as_deref()
+            .map(|id| download::register_file_progress_id(&dest, id));
+
+        async {
+            match resolved.provider {
+                "modrinth" => {
+                    let url = resolved
+                        .url
+                        .as_deref()
+                        .ok_or("Modrinth metadata has no download URL")?;
+                    if let Some(size) = resolved.size {
+                        download::download_file_sized_verified(url, &dest, &resolved.hash, size)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    } else {
+                        download::download_file_verified(url, &dest, &resolved.hash)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                "curseforge" => {
+                    let project = resolved
+                        .project_id
+                        .parse::<u64>()
+                        .map_err(|_| "CurseForge project id was not resolved".to_string())?;
+                    let file = resolved
+                        .file_id
+                        .as_deref()
+                        .ok_or("CurseForge file id was not resolved")?
+                        .parse::<u64>()
+                        .map_err(|_| "CurseForge file id was not resolved".to_string())?;
+                    curseforge::download_cf_native(
+                        project,
+                        file,
+                        &resolved.file_name,
+                        &resolved.hash,
+                        resolved.size,
+                        &dest,
+                        &curseforge_api_key,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+                _ => return Err("Unsupported content provider".to_string()),
+            }
+            Ok::<(), String>(())
+        }
+        .await
+    };
     if let Err(e) = downloaded {
-        // The replacement is unusable: drop it (it may exist after a
-        // zip-magic failure) and put the old file back where it was.
-        let _ = std::fs::remove_file(&dest);
+        // The pipeline never publishes unverified bytes. Any pre-existing
+        // target was parked above, so removing only a newly created
+        // destination is safe; restore_stashed_files puts back the parked
+        // content (tracked old file and/or untracked same-name file).
+        if !dest_existed {
+            let _ = std::fs::remove_file(&dest);
+        }
         crate::instances::restore_stashed_files(&stashed);
         return Err(e);
     }
-    // Replacement verified — the parked old file is no longer needed.
-    crate::instances::discard_stashed_files(&stashed);
-    if let Some(ref raw_old) = old_filename {
-        crate::instances::cleanup_old_sidecar_after_update(&dest_dir, raw_old, &final_name);
-    }
-
-    // Write unified sidecar metadata (`.index/` folder) so the installed file
-    // can be tracked back to its source. The verified SHA1 (or a freshly
-    // computed one when the API had none) feeds the hash-based update check.
-    let hash = if expected_sha1.is_empty() {
-        download::hash_file_sha1(&dest).ok()
-    } else {
-        Some(expected_sha1.clone())
-    };
-    let _ = content::write_sidecar(
+    // A verified file is only a successful install once its metadata is
+    // recorded. If the sidecar cannot be written, commit_verified_install
+    // removes this file and restores the parked old file(s) and sidecar bytes.
+    let hash = resolved
+        .sha1
+        .or_else(|| download::hash_file_sha1(&dest).ok());
+    commit_verified_install(
         &dest_dir,
+        &dest,
         &final_name,
-        &content::SidecarWrite {
-            provider: &provider,
-            content_type: content::content_type_for_dir(safe_subfolder),
-            project_id: project_id.as_deref(),
-            project_name: project_name.as_deref(),
-            version_id: version_id.as_deref(),
-            version_number: version_number.as_deref(),
-            file_id: file_id.as_deref(),
-            hash: hash.as_deref(),
+        old_filename.as_deref(),
+        &stashed,
+        || {
+            content::write_sidecar(
+                &dest_dir,
+                &final_name,
+                &content::SidecarWrite {
+                    provider: resolved.provider,
+                    content_type: content::content_type_for_dir(safe_subfolder),
+                    project_id: Some(&resolved.project_id),
+                    project_name: project_name.as_deref(),
+                    version_id: Some(&resolved.version_id),
+                    version_number: version_number.as_deref(),
+                    file_id: resolved.file_id.as_deref(),
+                    hash: hash.as_deref(),
+                },
+            )
         },
-    );
+    )?;
 
     Ok(final_name)
 }
@@ -3696,8 +3793,8 @@ fn build_mod_metadata(
 }
 
 /// Read the Modrinth/CurseForge project slug from the sidecar metadata
-/// (`.index/` layout, legacy layout as fallback) that `cmd_install_mod`
-/// writes at download time.
+/// (`.index/` layout, legacy layout as fallback) that the content install
+/// paths write at download time.
 fn read_mod_sidecar_slug(mods_dir: &std::path::Path, filename: &str) -> Option<String> {
     let json = crate::instances::read_sidecar_meta(mods_dir, filename)?;
     json["project_id"].as_str().map(|s| s.to_string())
@@ -5349,20 +5446,6 @@ version="1.0.0"
     }
 
     #[test]
-    fn local_file_uri_accepts_windows_paths_and_rejects_remote_urls() {
-        assert_eq!(
-            local_path_from_uri(r"file://C:\Temp\mod.jar").unwrap(),
-            std::path::PathBuf::from(r"C:\Temp\mod.jar")
-        );
-        assert_eq!(
-            local_path_from_uri("file:///C:/Temp/mod.jar").unwrap(),
-            std::path::PathBuf::from("C:/Temp/mod.jar")
-        );
-        assert!(local_path_from_uri("https://example.com/mod.jar").is_err());
-        assert!(local_path_from_uri("file://").is_err());
-    }
-
-    #[test]
     fn pack_description_is_not_used_as_a_title() {
         let dir = test_dir("pack-description-title");
         let zip_path = dir.join("Faithful 32x - 26.3.zip");
@@ -6522,6 +6605,212 @@ displayName="Autochef's Delight"
         let installed = content::InstalledContent::read(&content, &result.filename, "mod");
         assert_eq!(installed.provider, "local");
         assert!(installed.project_id.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_install_commits_new_sidecar_and_drops_old_file() {
+        let dir = test_dir("verified-sidecar-success");
+        let mods = dir.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        let old = mods.join("demo-1.0.jar");
+        std::fs::write(&old, b"old-content").unwrap();
+        content::write_sidecar(
+            &mods,
+            "demo-1.0.jar",
+            &content::SidecarWrite {
+                provider: "modrinth",
+                content_type: "mod",
+                project_id: Some("project-1"),
+                project_name: Some("Demo"),
+                version_id: Some("version-1"),
+                version_number: Some("1.0"),
+                file_id: None,
+                hash: Some("old-hash"),
+            },
+        )
+        .unwrap();
+        std::fs::write(mods.join("demo-1.0.jar.voidlauncher.json"), "{}").unwrap();
+        let stashed = crate::instances::stash_old_content_files(&mods, "demo-1.0.jar").unwrap();
+
+        let new = mods.join("demo-2.0.jar");
+        std::fs::write(&new, b"new-content").unwrap();
+        commit_verified_install(
+            &mods,
+            &new,
+            "demo-2.0.jar",
+            Some("demo-1.0.jar"),
+            &stashed,
+            || {
+                content::write_sidecar(
+                    &mods,
+                    "demo-2.0.jar",
+                    &content::SidecarWrite {
+                        provider: "modrinth",
+                        content_type: "mod",
+                        project_id: Some("project-1"),
+                        project_name: Some("Demo"),
+                        version_id: Some("version-2"),
+                        version_number: Some("2.0"),
+                        file_id: None,
+                        hash: Some("new-hash"),
+                    },
+                )
+            },
+        )
+        .unwrap();
+
+        assert!(!old.exists(), "the replaced file must be discarded");
+        assert_eq!(std::fs::read(&new).unwrap(), b"new-content");
+        let installed = content::InstalledContent::read(&mods, "demo-2.0.jar", "mod");
+        assert_eq!(installed.project_id.as_deref(), Some("project-1"));
+        assert_eq!(installed.version_id.as_deref(), Some("version-2"));
+        assert_eq!(installed.hash.as_deref(), Some("new-hash"));
+        assert!(
+            !mods
+                .join(".index")
+                .join("demo-1.0.voidlauncher.json")
+                .exists(),
+            "old-stem sidecar must be removed"
+        );
+        assert!(
+            !mods.join("demo-1.0.jar.voidlauncher.json").exists(),
+            "historical full-filename sidecar must be removed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecar_write_failure_rolls_back_same_named_update() {
+        let dir = test_dir("verified-sidecar-rollback-same");
+        let mods = dir.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        let target = mods.join("demo.jar");
+        std::fs::write(&target, b"old-content").unwrap();
+        content::write_sidecar(
+            &mods,
+            "demo.jar",
+            &content::SidecarWrite {
+                provider: "modrinth",
+                content_type: "mod",
+                project_id: Some("project-1"),
+                project_name: Some("Demo"),
+                version_id: Some("version-1"),
+                version_number: Some("1.0"),
+                file_id: None,
+                hash: Some("old-hash"),
+            },
+        )
+        .unwrap();
+        let old_sidecar =
+            std::fs::read(mods.join(".index").join("demo.voidlauncher.json")).unwrap();
+        let stashed = crate::instances::stash_old_content_files(&mods, "demo.jar").unwrap();
+
+        std::fs::write(&target, b"new-content").unwrap();
+        let error = commit_verified_install(
+            &mods,
+            &target,
+            "demo.jar",
+            Some("demo.jar"),
+            &stashed,
+            || {
+                std::fs::write(
+                    mods.join(".index").join("demo.voidlauncher.json"),
+                    "partial",
+                )
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Err(std::io::Error::other("injected sidecar failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("previous content was restored"),
+            "got: {error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"old-content");
+        assert_eq!(
+            std::fs::read(mods.join(".index").join("demo.voidlauncher.json")).unwrap(),
+            old_sidecar,
+            "old sidecar bytes must be restored"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidecar_write_failure_restores_old_file_without_sidecar() {
+        let dir = test_dir("verified-sidecar-rollback-no-meta");
+        let mods = dir.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        let target = mods.join("demo.jar");
+        std::fs::write(&target, b"old-content").unwrap();
+        std::fs::create_dir_all(mods.join(".index")).unwrap();
+        let stashed = crate::instances::stash_old_content_files(&mods, "demo.jar").unwrap();
+
+        std::fs::write(&target, b"new-content").unwrap();
+        commit_verified_install(
+            &mods,
+            &target,
+            "demo.jar",
+            Some("demo.jar"),
+            &stashed,
+            || {
+                std::fs::write(
+                    mods.join(".index").join("demo.voidlauncher.json"),
+                    "partial",
+                )
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Err(std::io::Error::other("injected sidecar failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"old-content");
+        assert!(!mods.join(".index").join("demo.voidlauncher.json").exists());
+        assert!(!mods.join("demo.voidlauncher.json").exists());
+        assert!(!mods.join("demo.jar.voidlauncher.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_import_rolls_back_when_sidecar_cannot_be_written() {
+        let dir = test_dir("local-sidecar-fail");
+        let source = dir.join("example.jar");
+        write_jar(
+            &source,
+            &[(
+                "fabric.mod.json",
+                r#"{"id":"examplemod","name":"Example Mod","version":"1.0.0"}"#,
+            )],
+        );
+        let content = dir.join("mods");
+        std::fs::create_dir_all(content.join(".index")).unwrap();
+        // A directory at the sidecar path makes std::fs::write fail.
+        std::fs::create_dir_all(content.join(".index").join("example.voidlauncher.json")).unwrap();
+
+        let error = local_test_install(
+            &content,
+            None,
+            &source,
+            "mod",
+            LocalConflictPolicy::Reject,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "installFailed");
+        assert!(
+            !content.join("example.jar").exists(),
+            "the new local file must be rolled back with its metadata"
+        );
+        assert!(!content.join("example.jar.voidlauncher.json").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
