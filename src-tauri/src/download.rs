@@ -24,7 +24,7 @@ const MAX_SINGLE_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// Global pause flag for modpack installs: when set, the currently active
 /// download stops at the next chunk (keeping the .part file) and install
 /// commands fail with `LauncherError::Paused`. Resuming re-runs the install
-/// and `download_to_part` continues from the saved offset via Range.
+/// and `download_to_part_verified` continues from the saved offset via Range.
 static PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 // Test-only fault injection for the file-operation paths that cannot be
@@ -1312,16 +1312,75 @@ pub type FileChunkObserver = Arc<dyn Fn(u64, Option<u64>, u64) + Send + Sync>;
 type FileProgressCallback = Arc<dyn Fn(&Path, u64, Option<u64>, u64) + Send + Sync>;
 type FileDoneCallback = Arc<dyn Fn(&Path, u64) + Send + Sync>;
 
-pub(crate) async fn download_to_part(
+/// Per-destination request ids used to label `modpack_file_progress` events.
+///
+/// The event name is shared by modpack installs, content installs and repairs.
+/// A filename is not unique (two instances/projects can install `sodium.jar`),
+/// so the content-install command registers an opaque id for its destination
+/// path and the download loop echoes it in every progress event. The guard
+/// removes the entry on every exit path, including errors and panics.
+static FILE_PROGRESS_IDS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+
+fn file_progress_ids() -> &'static Mutex<HashMap<PathBuf, String>> {
+    FILE_PROGRESS_IDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) struct FileProgressIdGuard {
+    path: PathBuf,
+    id: String,
+}
+
+impl Drop for FileProgressIdGuard {
+    fn drop(&mut self) {
+        let mut ids = file_progress_ids()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A newer request may have replaced this entry while the old guard was
+        // still alive; only remove the id this guard owns.
+        if ids
+            .get(&self.path)
+            .is_some_and(|current| current == &self.id)
+        {
+            ids.remove(&self.path);
+        }
+    }
+}
+
+pub(crate) fn register_file_progress_id(path: &Path, request_id: &str) -> FileProgressIdGuard {
+    let id = request_id.to_string();
+    file_progress_ids()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), id.clone());
+    FileProgressIdGuard {
+        path: path.to_path_buf(),
+        id,
+    }
+}
+
+fn file_progress_id(path: &Path) -> Option<String> {
+    file_progress_ids()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .cloned()
+}
+
+/// Typed variant of the legacy partial-download entry point for callers that
+/// already resolved a provider hash. The empty-string "no hash" behavior is
+/// deliberately absent.
+pub(crate) async fn download_to_part_verified(
     url: &str,
     path: &std::path::Path,
-    expected_sha1: &str,
+    expected: &HashSpec,
     expected_size: Option<u64>,
     timeout: Option<Duration>,
 ) -> Result<()> {
-    download_to_part_observed(url, path, expected_sha1, expected_size, timeout, None).await
+    download_to_part_observed_with_hash(url, path, Some(expected), expected_size, timeout, None)
+        .await
 }
 
+#[cfg(test)]
 pub(crate) async fn download_to_part_observed(
     url: &str,
     path: &std::path::Path,
@@ -1354,6 +1413,7 @@ async fn download_to_part_observed_with_hash(
     // the same library/asset path, and a fixed `.part` file cannot serve two
     // concurrent transfers.
     let _path_guard = download_path_lock(path).lock_owned().await;
+    let progress_request_id = file_progress_id(path);
     // Auto-upgrade http:// to https://, then run the same URL policy for
     // every caller. This happens before any filesystem or network side
     // effect, so a spoofed URL can never initiate a request.
@@ -1649,7 +1709,13 @@ async fn download_to_part_observed_with_hash(
         if let Some(observer) = observer {
             observer(offset, progress_total, 0);
         }
-        crate::events::emit_file_progress(&url, &file_name, offset, progress_total);
+        crate::events::emit_file_progress(
+            &url,
+            &file_name,
+            offset,
+            progress_total,
+            progress_request_id.as_deref(),
+        );
 
         // Stream the body chunk by chunk — flat memory usage even for large
         // files, and interrupted transfers keep their partial bytes.
@@ -1744,6 +1810,7 @@ async fn download_to_part_observed_with_hash(
                                             &file_name,
                                             downloaded,
                                             progress_total,
+                                            progress_request_id.as_deref(),
                                         );
                                     }
                                 }
@@ -1779,7 +1846,13 @@ async fn download_to_part_observed_with_hash(
                     observer(offset + received, progress_total, network_since_emit);
                 }
             }
-            crate::events::emit_file_progress(&url, &file_name, offset + received, progress_total);
+            crate::events::emit_file_progress(
+                &url,
+                &file_name,
+                offset + received,
+                progress_total,
+                progress_request_id.as_deref(),
+            );
             offset += received;
             // A clean EOF is not proof of a complete transfer when the
             // server announced a body length: a proxy can terminate the
@@ -1932,10 +2005,6 @@ pub async fn download_file_observed(
 ///
 /// The file is written to `.part`, verified before publication, and only then
 /// atomically renamed. This is the preferred entry point for new callers.
-///
-/// The follow-up content-install PR migrates remote installs to this function;
-/// it is kept here as the stable foundation for that migration.
-#[allow(dead_code)]
 pub async fn download_file_verified(url: &str, path: &Path, expected: &HashSpec) -> Result<()> {
     download_file_observed_with_hash(url, path, Some(expected), None).await
 }
@@ -2040,6 +2109,18 @@ pub async fn download_file_sized(
     size_bytes: u64,
 ) -> Result<()> {
     download_file_sized_observed(url, path, expected_sha1, size_bytes, None).await
+}
+
+/// Download a sized file and verify it against a typed hash. This is the
+/// content-install path: it keeps the size-scaled timeout and streaming
+/// progress while making an empty hash unrepresentable.
+pub async fn download_file_sized_verified(
+    url: &str,
+    path: &Path,
+    expected: &HashSpec,
+    size_bytes: u64,
+) -> Result<()> {
+    download_file_sized_observed_with_hash(url, path, Some(expected), size_bytes, None).await
 }
 
 pub async fn download_file_sized_observed(
@@ -2802,6 +2883,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn progress_request_ids_are_scoped_to_the_registered_path() {
+        let path = std::env::temp_dir().join(format!(
+            "voidlauncher_progress_id_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let other = path.with_extension("other");
+
+        assert!(file_progress_id(&path).is_none());
+        let first = register_file_progress_id(&path, "first");
+        assert_eq!(file_progress_id(&path).as_deref(), Some("first"));
+        assert!(file_progress_id(&other).is_none());
+
+        // A newer request for the same path must not be erased by the older
+        // guard going out of scope.
+        let second = register_file_progress_id(&path, "second");
+        drop(first);
+        assert_eq!(file_progress_id(&path).as_deref(), Some("second"));
+        drop(second);
+        assert!(file_progress_id(&path).is_none());
+    }
+
     #[cfg(windows)]
     #[test]
     fn lock_keys_resolve_directory_aliases() {
@@ -3272,6 +3379,23 @@ mod tests {
         assert_eq!(std::fs::read(&sha512_dest).unwrap(), body);
         assert_clean(&part_path_for(&sha512_dest), &part_meta_path(&sha512_dest));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verified_sized_download_accepts_sha256() {
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("verified_sized");
+        let dest = dir.join("sized.bin");
+        let body = b"hello";
+        let expected = HashSpec::sha256(&sha256_hex(body)).unwrap();
+        let server = spawn_mock(vec![MockSpec::ok(body)]).await;
+
+        download_file_sized_verified(&server.url, &dest, &expected, body.len() as u64)
+            .await
+            .expect("sized SHA-256 verified download");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

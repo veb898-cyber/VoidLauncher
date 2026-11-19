@@ -66,6 +66,14 @@ import { installCompletionAction, returnToInstalledContent } from '../../lib/con
 
 type Hit = ProviderProject;
 
+/** Unique per install attempt, echoed by the backend on every progress event. */
+let installRequestSeq = 0;
+function nextInstallRequestId(): string {
+  installRequestSeq += 1;
+  const nonce = Math.random().toString(36).slice(2, 8);
+  return `content-${Date.now().toString(36)}-${installRequestSeq.toString(36)}-${nonce}`;
+}
+
 export interface SelectedItem {
   name: string;
   iconUrl?: string;
@@ -234,7 +242,10 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   const [downloadCards, setDownloadCards] = useState<DownloadCardMap>({});
   const downloadCardsRef = useRef<DownloadCardMap>({});
   const [downloadSummary, setDownloadSummary] = useState<{ success: number; failed: number } | null>(null);
-  const activeFileRef = useRef<{ key: string; filename: string; url: string } | null>(null);
+  const activeFileRef = useRef<{
+    key: string;
+    requestId: string;
+  } | null>(null);
   const installBusyRef = useRef(false);
   const [popularOffset, setPopularOffset] = useState(0);
   const [resultsOffset, setResultsOffset] = useState(0);
@@ -308,8 +319,8 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
   }, []);
 
   // Real byte progress for the file currently being installed. The backend
-  // emits this for every download; matching the destination file name keeps
-  // unrelated background downloads out of this pane.
+  // echoes the request id registered by this install command, so an unrelated
+  // download with the same filename cannot move this pane's progress.
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
@@ -318,8 +329,10 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
       const active = activeFileRef.current;
       if (!active) return;
       const payload = event.payload;
-      if (payload.file_name && payload.file_name !== active.filename) return;
-      if (active.url && payload.url && payload.url !== active.url) return;
+      // The request id is unique per install attempt, so a same-named file in
+      // another instance/project (or a late event from the previous attempt)
+      // can never move this card's progress.
+      if (payload.request_id !== active.requestId) return;
       setFileProgress(payload);
       commitDownloadCards(
         applyCardChunk(
@@ -1031,12 +1044,17 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
     let failed = 0;
     for (const item of items) {
       const key = downloadCardKey(item);
-      activeFileRef.current = { key, filename: item.filename, url: item.downloadUrl };
+      const requestId = nextInstallRequestId();
+      // The backend resolves the download URL from provider metadata, so it
+      // may differ from the catalog URL (or be empty for CurseForge). The
+      // request id is the stable identity; the filename is only displayed.
+      activeFileRef.current = { key, requestId };
       setFileProgress({
-        url: item.downloadUrl,
+        url: '',
         file_name: item.filename,
         downloaded: 0,
         total: item.size && item.size > 0 ? item.size : null,
+        request_id: requestId,
       });
       commitDownloadCards(startCard(downloadCardsRef.current, key, item.size));
       try {
@@ -1052,6 +1070,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
           provider: item.source || 'modrinth',
           expectedSha1: item.sha1 || '',
           fileId: item.fileId ?? null,
+          requestId,
         });
         success++;
         commitDownloadCards(completeCard(downloadCardsRef.current, key));
@@ -1809,7 +1828,7 @@ export function ContentBrowser({ instanceName, contentType, mcVersion, loader, o
                     </div>
                     <div style={{ maxHeight: 240, overflowY: 'auto', borderRadius: 'var(--radius-md)', border: '1px solid var(--surface-border)' }}>
                       {versions.slice(0, versionLimit).map((v: any) => {
-                        const file = v.files?.[0];
+                        const file = v.files?.find((f: any) => f.primary) || v.files?.[0];
                         const alreadyAdded = selectedItems.some((m) => m.filename === file?.filename);
                         const addVersion = () => {
                           if (alreadyAdded || !file) return;

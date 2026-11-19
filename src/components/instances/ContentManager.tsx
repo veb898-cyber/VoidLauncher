@@ -1195,6 +1195,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
         oldFilename: update.oldFilename,
         expectedSha1: update.expectedSha1 || '',
         fileId: update.fileId ?? null,
+        requestId: null,
       });
       if (!silent) logUiMessage(t('manager.updated_toast', { name: update.name, version: update.newVersion }), 'info', 'ui');
       removeUpdate(updateCheckKey, update.oldFilename);
@@ -1231,6 +1232,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           oldFilename: u.oldFilename,
           expectedSha1: u.expectedSha1 || '',
           fileId: u.fileId ?? null,
+          requestId: null,
         });
         successes.push(u.name);
       } catch (e: any) { errors.push({ name: u.name, error: e.toString() }); }
