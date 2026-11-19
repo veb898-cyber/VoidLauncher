@@ -1,6 +1,6 @@
 use crate::error::{LauncherError, Result};
+use crate::integrity::HashSpec;
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1064,12 +1064,24 @@ fn download_progress_total(
         })
 }
 
-/// Validate a completed download file: SHA1 check or JSON-content rejection.
+/// Validate a completed download file through the legacy SHA-1 API.
+///
+/// An empty value keeps the historical "no hash available" behavior; a
+/// non-empty malformed value is rejected before any download starts instead of
+/// being silently treated as "no verification".
+#[cfg(test)]
 fn validate_download(path: &std::path::Path, expected_sha1: &str) -> Result<()> {
-    if !expected_sha1.is_empty() {
-        if !verify_sha1(path, expected_sha1)? {
+    let expected = HashSpec::from_sha1(expected_sha1)?;
+    validate_download_with_hash(path, expected.as_ref())
+}
+
+/// Validate a completed download against a typed hash.
+fn validate_download_with_hash(path: &std::path::Path, expected: Option<&HashSpec>) -> Result<()> {
+    if let Some(expected) = expected {
+        if !expected.verify_file(path)? {
             return Err(LauncherError::Download(format!(
-                "SHA1 mismatch for {}",
+                "{} mismatch for {}",
+                expected.algorithm().to_ascii_uppercase(),
                 path.display()
             )));
         }
@@ -1202,8 +1214,20 @@ fn reject_linked_partial(path: &Path) -> Result<()> {
 /// is only safe when this matches; otherwise the bytes on disk belong to a
 /// different file and must never be treated as a head start (or, when no
 /// SHA1 is available, as the final file).
+#[cfg(test)]
 fn download_identity(url: &str, expected_sha1: &str, expected_size: Option<u64>) -> String {
     format!("{}\n{}\n{}", url, expected_sha1, expected_size.unwrap_or(0))
+}
+
+/// Identity for a typed hash. SHA-1 uses the bare hex payload so resumable
+/// downloads created by older launcher versions keep their identity.
+fn download_identity_with_hash(
+    url: &str,
+    expected: Option<&HashSpec>,
+    expected_size: Option<u64>,
+) -> String {
+    let hash = expected.map(HashSpec::identity_payload).unwrap_or_default();
+    format!("{}\n{}\n{}", url, hash, expected_size.unwrap_or(0))
 }
 
 /// Drop a stale `.part` whose sidecar identity does not match the current
@@ -1233,6 +1257,21 @@ fn prepare_partial_download(path: &Path, identity: &str) -> u64 {
 /// 429/5xx/408 are transient and worth retrying; other 4xx (404, 403,
 /// malformed request) are permanent for this URL and should fail fast so the
 /// caller can move to a mirror.
+/// Backoff between candidate retries. Tests compress this so a public-API
+/// retry-exhaustion test does not spend half a minute sleeping; production
+/// keeps the historical exponential delay.
+fn retry_backoff(attempt: u32) -> Duration {
+    #[cfg(test)]
+    {
+        let _ = attempt;
+        Duration::from_millis(1)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(2u64.pow(attempt))
+    }
+}
+
 fn is_transient_download_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status == reqwest::StatusCode::REQUEST_TIMEOUT
@@ -1287,6 +1326,26 @@ pub(crate) async fn download_to_part_observed(
     url: &str,
     path: &std::path::Path,
     expected_sha1: &str,
+    expected_size: Option<u64>,
+    timeout: Option<Duration>,
+    observer: Option<&FileChunkObserver>,
+) -> Result<()> {
+    let expected = HashSpec::from_sha1(expected_sha1)?;
+    download_to_part_observed_with_hash(
+        url,
+        path,
+        expected.as_ref(),
+        expected_size,
+        timeout,
+        observer,
+    )
+    .await
+}
+
+async fn download_to_part_observed_with_hash(
+    url: &str,
+    path: &std::path::Path,
+    expected: Option<&HashSpec>,
     expected_size: Option<u64>,
     timeout: Option<Duration>,
     observer: Option<&FileChunkObserver>,
@@ -1353,7 +1412,7 @@ pub(crate) async fn download_to_part_observed(
     // A .part without a matching identity sidecar cannot be trusted: the
     // target path may be reused for another artifact/version, and resuming
     // would splice two files together.
-    let identity = download_identity(&url, expected_sha1, expected_size);
+    let identity = download_identity_with_hash(&url, expected, expected_size);
     let mut offset = prepare_partial_download(path, &identity);
     if let Err(e) = std::fs::write(&meta_path, &identity) {
         return Err(terminal_download_error(format!(
@@ -1484,7 +1543,7 @@ pub(crate) async fn download_to_part_observed(
         }
 
         // Reject non-binary responses (only when no SHA1 to validate)
-        if expected_sha1.is_empty() && attempt == 1 {
+        if expected.is_none() && attempt == 1 {
             if let Some(ct) = response.headers().get("content-type") {
                 let ct_str = ct.to_str().unwrap_or("");
                 if is_rejected_content_type(ct_str) {
@@ -1772,7 +1831,7 @@ pub(crate) async fn download_to_part_observed(
     }
 
     // Validate the .part file content
-    if let Err(e) = validate_download(&part_path, expected_sha1) {
+    if let Err(e) = validate_download_with_hash(&part_path, expected) {
         return Err(terminal_download_error(e.to_string()));
     }
 
@@ -1865,16 +1924,47 @@ pub async fn download_file_observed(
     expected_sha1: &str,
     observer: Option<FileChunkObserver>,
 ) -> Result<()> {
+    let expected = HashSpec::from_sha1(expected_sha1)?;
+    download_file_observed_with_hash(url, path, expected.as_ref(), observer).await
+}
+
+/// Download a single file and verify it against a typed hash.
+///
+/// The file is written to `.part`, verified before publication, and only then
+/// atomically renamed. This is the preferred entry point for new callers.
+///
+/// The follow-up content-install PR migrates remote installs to this function;
+/// it is kept here as the stable foundation for that migration.
+#[allow(dead_code)]
+pub async fn download_file_verified(url: &str, path: &Path, expected: &HashSpec) -> Result<()> {
+    download_file_observed_with_hash(url, path, Some(expected), None).await
+}
+
+async fn download_file_observed_with_hash(
+    url: &str,
+    path: &Path,
+    expected: Option<&HashSpec>,
+    observer: Option<FileChunkObserver>,
+) -> Result<()> {
     tracing::info!(target: "launcher", url = %url, "Downloading {}", path.display());
 
     // Check if file exists with correct hash
-    if path.exists() && !expected_sha1.is_empty() && verify_sha1(path, expected_sha1)? {
-        tracing::debug!(target: "launcher", "SHA1 verified: {}", path.display());
-        if let Some(observer) = observer.as_ref() {
-            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            observer(size, Some(size), 0);
+    if path.exists() {
+        if let Some(expected) = expected {
+            if expected.verify_file(path)? {
+                tracing::debug!(
+                    target: "launcher",
+                    "{} verified: {}",
+                    expected.algorithm().to_ascii_uppercase(),
+                    path.display()
+                );
+                if let Some(observer) = observer.as_ref() {
+                    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    observer(size, Some(size), 0);
+                }
+                return Ok(());
+            }
         }
-        return Ok(());
     }
 
     let candidates: Vec<String> = std::iter::once(url.to_string())
@@ -1899,10 +1989,10 @@ pub async fn download_file_observed(
             MAX_RETRIES
         };
         for attempt in 1..=attempts {
-            match download_to_part_observed(
+            match download_to_part_observed_with_hash(
                 candidate,
                 path,
-                expected_sha1,
+                expected,
                 None,
                 Some(timeout_for_unknown_size()),
                 observer.as_ref(),
@@ -1914,7 +2004,7 @@ pub async fn download_file_observed(
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < attempts {
-                        sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                        sleep(retry_backoff(attempt)).await;
                     }
                 }
             }
@@ -1959,17 +2049,37 @@ pub async fn download_file_sized_observed(
     size_bytes: u64,
     observer: Option<FileChunkObserver>,
 ) -> Result<()> {
+    let expected = HashSpec::from_sha1(expected_sha1)?;
+    download_file_sized_observed_with_hash(url, path, expected.as_ref(), size_bytes, observer).await
+}
+
+async fn download_file_sized_observed_with_hash(
+    url: &str,
+    path: &Path,
+    expected: Option<&HashSpec>,
+    size_bytes: u64,
+    observer: Option<FileChunkObserver>,
+) -> Result<()> {
     tracing::info!(target: "launcher", url = %url, size = size_bytes, "Downloading {} (sized)", path.display());
 
-    if path.exists() && !expected_sha1.is_empty() && verify_sha1(path, expected_sha1)? {
-        tracing::debug!(target: "launcher", "SHA1 verified: {}", path.display());
-        if let Some(observer) = observer.as_ref() {
-            let size = std::fs::metadata(path)
-                .map(|m| m.len())
-                .unwrap_or(size_bytes);
-            observer(size, Some(size), 0);
+    if path.exists() {
+        if let Some(expected) = expected {
+            if expected.verify_file(path)? {
+                tracing::debug!(
+                    target: "launcher",
+                    "{} verified: {}",
+                    expected.algorithm().to_ascii_uppercase(),
+                    path.display()
+                );
+                if let Some(observer) = observer.as_ref() {
+                    let size = std::fs::metadata(path)
+                        .map(|m| m.len())
+                        .unwrap_or(size_bytes);
+                    observer(size, Some(size), 0);
+                }
+                return Ok(());
+            }
         }
-        return Ok(());
     }
 
     let timeout = timeout_for_size(size_bytes);
@@ -1992,10 +2102,10 @@ pub async fn download_file_sized_observed(
             MAX_RETRIES
         };
         for attempt in 1..=attempts {
-            match download_to_part_observed(
+            match download_to_part_observed_with_hash(
                 candidate,
                 path,
-                expected_sha1,
+                expected,
                 Some(size_bytes),
                 Some(timeout),
                 observer.as_ref(),
@@ -2007,7 +2117,7 @@ pub async fn download_file_sized_observed(
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < attempts {
-                        sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                        sleep(retry_backoff(attempt)).await;
                     }
                 }
             }
@@ -2570,45 +2680,32 @@ pub fn verify_zip_magic(path: &std::path::Path) -> Result<()> {
 /// Used for pinned third-party runtime components (authlib-injector): their
 /// origin publishes a SHA-256, not the SHA-1 used by Minecraft metadata.
 pub fn hash_file_sha256(path: &std::path::Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
+    crate::integrity::hash_file_sha256(path)
 }
 
 /// Verify a SHA-256 hex digest without loading the whole file into memory.
 pub fn verify_sha256(path: &std::path::Path, expected: &str) -> Result<bool> {
-    Ok(hash_file_sha256(path)?.eq_ignore_ascii_case(expected))
+    crate::integrity::verify_sha256(path, expected)
 }
 
 /// Compute SHA1 hash of a file and return hex string
 pub fn hash_file_sha1(path: &std::path::Path) -> Result<String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha1::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
+    crate::integrity::hash_file_sha1(path)
 }
 
 /// Verify file SHA1 hash without loading the whole file into memory.
 pub fn verify_sha1(path: &std::path::Path, expected: &str) -> Result<bool> {
-    Ok(hash_file_sha1(path)? == expected)
+    crate::integrity::verify_sha1(path, expected)
+}
+
+/// Compute a SHA-512 hash as lowercase hexadecimal.
+///
+/// The download layer itself only needs SHA-1 and SHA-256 today; this helper
+/// is used by integrity tests and is available to the upcoming content-install
+/// migration.
+#[allow(dead_code)]
+pub fn hash_file_sha512(path: &std::path::Path) -> Result<String> {
+    crate::integrity::hash_file_sha512(path)
 }
 
 /// Reject archive entry paths that could escape their extraction directory:
@@ -3117,6 +3214,184 @@ mod tests {
         assert!(validate_download(&empty, "").is_ok());
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&empty);
+    }
+
+    #[test]
+    fn validate_download_with_hash_accepts_sha256_and_rejects_mismatch() {
+        let p = temp_file("val_sha256.bin", b"abc");
+        let good =
+            HashSpec::sha256("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+                .unwrap();
+        assert!(validate_download_with_hash(&p, Some(&good)).is_ok());
+        let bad = HashSpec::sha256(&"0".repeat(64)).unwrap();
+        let err = validate_download_with_hash(&p, Some(&bad)).unwrap_err();
+        assert!(err.to_string().contains("SHA256 mismatch"), "got: {err}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn download_identity_with_hash_keeps_sha1_compatible_and_separates_algorithms() {
+        let sha1 = HashSpec::sha1(&"a".repeat(40)).unwrap();
+        let sha256 = HashSpec::sha256(&"b".repeat(64)).unwrap();
+        let url = "https://cdn.modrinth.com/file.jar";
+        assert_eq!(
+            download_identity_with_hash(url, Some(&sha1), Some(10)),
+            format!("{url}\n{}\n10", "a".repeat(40))
+        );
+        assert_eq!(
+            download_identity_with_hash(url, Some(&sha256), Some(10)),
+            format!("{url}\nsha256:{}\n10", "b".repeat(64))
+        );
+        assert_eq!(
+            download_identity_with_hash(url, None, Some(10)),
+            format!("{url}\n\n10")
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_download_accepts_sha256_and_sha512() {
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("verified_algorithms");
+        let body = b"hello";
+
+        let server = spawn_mock(vec![MockSpec::ok(body)]).await;
+        let sha256_dest = dir.join("sha256.bin");
+        let sha256 = HashSpec::sha256(&sha256_hex(body)).unwrap();
+        download_file_verified(&server.url, &sha256_dest, &sha256)
+            .await
+            .expect("SHA-256 verified download");
+        assert_eq!(std::fs::read(&sha256_dest).unwrap(), body);
+        assert_clean(&part_path_for(&sha256_dest), &part_meta_path(&sha256_dest));
+
+        let server = spawn_mock(vec![MockSpec::ok(body)]).await;
+        let sha512_dest = dir.join("sha512.bin");
+        let sha512 = HashSpec::sha512(&sha512_hex(body)).unwrap();
+        download_file_verified(&server.url, &sha512_dest, &sha512)
+            .await
+            .expect("SHA-512 verified download");
+        assert_eq!(std::fs::read(&sha512_dest).unwrap(), body);
+        assert_clean(&part_path_for(&sha512_dest), &part_meta_path(&sha512_dest));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verified_download_uses_a_valid_cache_without_network() {
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("verified_cache");
+        let dest = dir.join("cached.bin");
+        std::fs::write(&dest, b"hello").unwrap();
+        let server = spawn_mock(vec![MockSpec::status(500)]).await;
+
+        let expected = HashSpec::sha256(&sha256_hex(b"hello")).unwrap();
+        download_file_verified(&server.url, &dest, &expected)
+            .await
+            .expect("cached file must be accepted");
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verified_download_mismatch_never_publishes_or_replaces_target() {
+        let _proxy = direct_proxy_lock().await;
+        let body = b"new-content";
+        let wrong = HashSpec::sha256(&"0".repeat(64)).unwrap();
+
+        for (tag, existing) in [
+            (
+                "verified_mismatch_existing",
+                Some(b"old-content".as_slice()),
+            ),
+            ("verified_mismatch_absent", None),
+        ] {
+            let dir = mock_dir(tag);
+            let dest = dir.join("artifact.bin");
+            if let Some(existing) = existing {
+                std::fs::write(&dest, existing).unwrap();
+            }
+            let server = spawn_mock(vec![MockSpec::ok(body)]).await;
+
+            let err = download_to_part_observed_with_hash(
+                &server.url,
+                &dest,
+                Some(&wrong),
+                None,
+                Some(Duration::from_secs(10)),
+                None,
+            )
+            .await
+            .expect_err("wrong SHA-256 must fail");
+
+            assert!(err.to_string().contains("SHA256 mismatch"), "got: {err}");
+            match existing {
+                Some(existing) => assert_eq!(std::fs::read(&dest).unwrap(), existing),
+                None => assert!(!dest.exists(), "a failed download must not publish"),
+            }
+            assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+            assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_verified_download_exhausts_retries_without_publishing() {
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("verified_retry_exhaustion");
+        let dest = dir.join("artifact.bin");
+        std::fs::write(&dest, b"old-content").unwrap();
+        let body = b"new-content";
+        let wrong = HashSpec::sha256(&"0".repeat(64)).unwrap();
+        let server = spawn_mock(vec![MockSpec::ok(body); MAX_RETRIES as usize]).await;
+
+        let err = download_file_verified(&server.url, &dest, &wrong)
+            .await
+            .expect_err("wrong SHA-256 must fail after retries");
+
+        assert!(err.to_string().contains("SHA256 mismatch"), "got: {err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old-content");
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        assert_eq!(
+            server.hits.load(Ordering::SeqCst),
+            MAX_RETRIES as usize,
+            "every retry must be attempted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verified_download_replaces_a_corrupted_cache_only_after_verification() {
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("verified_corrupt_cache");
+        let dest = dir.join("cached.bin");
+        std::fs::write(&dest, b"corrupted").unwrap();
+        let body = b"hello";
+        let expected = HashSpec::sha256(&sha256_hex(body)).unwrap();
+        let server = spawn_mock(vec![MockSpec::ok(body)]).await;
+
+        download_file_verified(&server.url, &dest, &expected)
+            .await
+            .expect("corrupted cache must be replaced");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        assert_clean(&part_path_for(&dest), &part_meta_path(&dest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_download_rejects_malformed_sha1_before_network() {
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("malformed_sha1");
+        let dest = dir.join("artifact.bin");
+        let server = spawn_mock(vec![MockSpec::ok(b"hello")]).await;
+
+        let err = download_file(&server.url, &dest, "not-a-hash")
+            .await
+            .expect_err("malformed SHA-1 must fail");
+        assert!(err.to_string().contains("Invalid SHA1 hash"), "got: {err}");
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4608,6 +4883,28 @@ mod tests {
             .finalize()
             .iter()
             .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn sha512_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha512};
+        let mut hasher = Sha512::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
             .collect()
     }
 
