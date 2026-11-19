@@ -262,17 +262,6 @@ export function Home({ onNavigate }: HomeProps) {
                   selectInstance(inst.name);
                   onNavigate('instances');
                 })}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    useBrowserGuardStore.getState().askLeave(() => {
-                      selectInstance(inst.name);
-                      onNavigate('instances');
-                    });
-                  }
-                }}
               >
                 <div className="instance-card__banner" style={isGradientBanner(inst.banner) ? {
                   background: getGradientValue(inst.banner),
@@ -304,11 +293,10 @@ export function Home({ onNavigate }: HomeProps) {
                   )}
                 </div>
                 <div className="instance-card__body instance-card__body--horizontal">
-                  <div
+                  <button
+                    type="button"
                     className="instance-card__icon icon-editable"
                     style={{ position: 'relative', cursor: 'pointer' }}
-                    role="button"
-                    tabIndex={0}
                     aria-label={t('home.change_icon')}
                     aria-haspopup="menu"
                     onClick={(e) => {
@@ -326,12 +314,6 @@ export function Home({ onNavigate }: HomeProps) {
                       setMenuInstance(menuInstance === inst.name ? null : inst.name);
                       setBannerPickerFor(null);
                     }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        (e.currentTarget as HTMLElement).click();
-                      }
-                    }}
                   >
                     {inst.icon ? (
                       <img src={inst.icon} alt={inst.name} />
@@ -340,8 +322,19 @@ export function Home({ onNavigate }: HomeProps) {
                         <Package size={20} />
                       </div>
                     )}
-                  </div>
-                  <div className="instance-card__info">
+                  </button>
+                  <button
+                    type="button"
+                    className="instance-card__open instance-card__info"
+                    aria-label={`${t('home.open_instance')}: ${inst.name}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      useBrowserGuardStore.getState().askLeave(() => {
+                        selectInstance(inst.name);
+                        onNavigate('instances');
+                      });
+                    }}
+                  >
                     <div className="instance-card__name">{inst.name}</div>
                     <div className="instance-card__meta">
                       <span className="instance-card__version">{inst.mc_version}</span>
@@ -352,7 +345,7 @@ export function Home({ onNavigate }: HomeProps) {
                         </span>
                       )}
                     </div>
-                  </div>
+                  </button>
                 </div>
                 <div className="instance-card__actions">
                   <span className="instance-card__playtime">
@@ -437,21 +430,15 @@ export function Home({ onNavigate }: HomeProps) {
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 'var(--space-xs)', marginBottom: 'var(--space-sm)' }}>
                         {BANNER_PRESETS.map((p) => (
                           <Tooltip key={p.id} content={bannerLabel(p.id)}>
-                            <div
-                              role="button"
-                              tabIndex={0}
+                            <button
+                              type="button"
                               aria-label={bannerLabel(p.id)}
                               aria-pressed={inst.banner === `gradient:${p.id}`}
                               onClick={() => setBanner(inst.name, `gradient:${p.id}`)}
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter' || e.key === ' ') {
-                                  e.preventDefault();
-                                  setBanner(inst.name, `gradient:${p.id}`);
-                                }
-                              }}
                               style={{
                                 width: '100%',
                                 aspectRatio: '16/9',
+                                padding: 0,
                                 borderRadius: 'var(--radius-sm)',
                                 background: p.gradient,
                                 cursor: 'pointer',

@@ -5,6 +5,7 @@
 use crate::config::AppConfig;
 use crate::events;
 use crate::AppState;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager, Runtime, State, Webview};
 
 /// Metadata shape expected by the JS `Update` class from
@@ -633,8 +634,34 @@ pub fn cmd_get_launch_state(state: State<'_, AppState>) -> Result<Vec<String>, S
 
 // ==================== Cache Commands ====================
 
+/// Process-wide gate for the destructive cache command. The UI already
+/// serializes its button, but a second IPC caller must not be able to run a
+/// parallel `remove_dir_all` over the same directories.
+static CACHE_CLEAR_RUNNING: AtomicBool = AtomicBool::new(false);
+
+struct CacheClearGuard;
+
+impl CacheClearGuard {
+    fn acquire() -> Result<Self, String> {
+        if CACHE_CLEAR_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("Cache clearing is already in progress.".to_string());
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for CacheClearGuard {
+    fn drop(&mut self) {
+        CACHE_CLEAR_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_clear_cache(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
+    let _guard = CacheClearGuard::acquire()?;
     let data_dir = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         config.data_dir.clone()
@@ -666,11 +693,33 @@ pub async fn cmd_clear_cache(app: AppHandle, state: State<'_, AppState>) -> Resu
     .map_err(|e| e.to_string())?
 }
 
+/// True for a symlink or a Windows reparse point (junction). `dir_size` must
+/// not traverse these: the target can be outside the cache tree, can be a
+/// user directory, or can form a cycle.
+fn is_reparse_or_symlink(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn dir_size(path: &std::path::Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        let meta = entry.metadata()?;
+        let meta = std::fs::symlink_metadata(entry.path())?;
+        if is_reparse_or_symlink(&meta) {
+            continue;
+        }
         if meta.is_dir() {
             total += dir_size(&entry.path()).unwrap_or(0);
         } else {
@@ -757,6 +806,59 @@ mod installer_language_tests {
     }
 }
 
+#[cfg(test)]
+mod cache_tests {
+    use super::{dir_size, CacheClearGuard};
+
+    #[test]
+    fn cache_clear_guard_is_exclusive_and_released() {
+        let first = CacheClearGuard::acquire().expect("first clear starts");
+        assert!(
+            CacheClearGuard::acquire().is_err(),
+            "a parallel clear must be rejected"
+        );
+        drop(first);
+        let second = CacheClearGuard::acquire().expect("guard is released on drop");
+        drop(second);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dir_size_does_not_follow_a_junction() {
+        let base = std::env::temp_dir().join(format!(
+            "vl_cache_size_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let assets = base.join("assets");
+        let sentinel = base.join("sentinel");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::create_dir_all(&sentinel).unwrap();
+        std::fs::write(assets.join("cached.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(sentinel.join("precious.bin"), vec![0u8; 4096]).unwrap();
+
+        let junction = assets.join("junction");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&sentinel)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            // Some locked-down test hosts disallow junction creation. Do not
+            // turn that environment limitation into a false failure.
+            std::fs::remove_dir_all(&base).ok();
+            return;
+        }
+
+        assert_eq!(
+            dir_size(&assets).unwrap(),
+            100,
+            "the junction target must not contribute to the freed size"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
 // ==================== Config Commands ====================
 
 #[tauri::command]
@@ -766,63 +868,90 @@ pub fn cmd_get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
-pub fn cmd_save_config(
+pub async fn cmd_save_config(
     app: AppHandle,
     state: State<'_, AppState>,
     new_config: AppConfig,
 ) -> Result<(), String> {
     events::emit_log(&app, "info", "config", "Saving configuration...");
     let total_ram_mb = crate::config::detect_total_ram_mb();
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    let previous = config.clone();
-    // The renderer is not a trust boundary for numeric limits: clamp here so
-    // a bad IPC payload can never persist a 0 MB / multi-TB heap.
-    let mut new_config = new_config;
-    new_config.default_memory_mb = new_config
-        .default_memory_mb
-        .clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
-    new_config.max_memory_mb = new_config
-        .max_memory_mb
-        .clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
-    let gc = new_config.default_gc_preset.trim().to_lowercase();
-    new_config.default_gc_preset = match gc.as_str() {
-        "standard" | "g1gc" | "zgc" => gc,
-        _ => "g1gc".to_string(),
-    };
-    if !crate::config::AFTER_LAUNCH_ACTIONS.contains(&new_config.after_launch_action.as_str()) {
-        new_config.after_launch_action = "do_nothing".to_string();
-    }
-    new_config
-        .validate_memory_and_gc()
+    // Keep the std::sync::MutexGuard in an inner scope: it is not `Send`, so
+    // it must be dropped before the async room teardown below.
+    let rooms_disabled = {
+        let mut config = state.config.lock().map_err(|e| e.to_string())?;
+        let previous = config.clone();
+        // Turning the experimental Rooms feature off must end an active room
+        // gracefully (hostname restored, bridge stopped, state cleared)
+        // instead of leaving a hidden listener or a stale room behind.
+        let rooms_disabled = previous.rooms_enabled && !new_config.rooms_enabled;
+        // The renderer is not a trust boundary for numeric limits: clamp here
+        // so a bad IPC payload can never persist a 0 MB / multi-TB heap.
+        let mut new_config = new_config;
+        new_config.default_memory_mb = new_config
+            .default_memory_mb
+            .clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+        new_config.max_memory_mb = new_config
+            .max_memory_mb
+            .clamp(crate::config::MIN_MEMORY_MB, crate::config::MAX_MEMORY_MB);
+        let gc = new_config.default_gc_preset.trim().to_lowercase();
+        new_config.default_gc_preset = match gc.as_str() {
+            "standard" | "g1gc" | "zgc" => gc,
+            _ => "g1gc".to_string(),
+        };
+        if !crate::config::AFTER_LAUNCH_ACTIONS.contains(&new_config.after_launch_action.as_str()) {
+            new_config.after_launch_action = "do_nothing".to_string();
+        }
+        new_config
+            .validate_memory_and_gc()
+            .map_err(|e| e.to_string())?;
+        crate::config::validate_memory_cap(
+            previous.max_memory_mb,
+            new_config.max_memory_mb,
+            total_ram_mb,
+        )
         .map_err(|e| e.to_string())?;
-    crate::config::validate_memory_cap(
-        previous.max_memory_mb,
-        new_config.max_memory_mb,
-        total_ram_mb,
-    )
-    .map_err(|e| e.to_string())?;
-    crate::config::validate_default_memory_cap(
-        previous.default_memory_mb,
-        new_config.default_memory_mb,
-        total_ram_mb,
-    )
-    .map_err(|e| e.to_string())?;
-    // The renderer does not know about the migration marker; saving settings
-    // must not downgrade a current config back to the legacy schema.
-    new_config.config_version = crate::config::CONFIG_VERSION;
-    *config = new_config;
-    if let Err(e) = config.save() {
-        // Keep the running session consistent with the disk: a failed write
-        // must not leave the launcher using values it did not persist.
-        *config = previous;
-        return Err(e.to_string());
+        crate::config::validate_default_memory_cap(
+            previous.default_memory_mb,
+            new_config.default_memory_mb,
+            total_ram_mb,
+        )
+        .map_err(|e| e.to_string())?;
+        // The renderer does not know about the migration marker; saving
+        // settings must not downgrade a current config back to the legacy
+        // schema.
+        new_config.config_version = crate::config::CONFIG_VERSION;
+        *config = new_config;
+        if let Err(e) = config.save() {
+            // Keep the running session consistent with the disk: a failed
+            // write must not leave the launcher using values it did not
+            // persist.
+            *config = previous;
+            return Err(e.to_string());
+        }
+        crate::download::set_global_proxy_policy(
+            config.proxy_enabled,
+            config.use_system_proxy(),
+            config.proxy_url(),
+            config.proxy_only,
+        );
+        rooms_disabled
+    };
+    if rooms_disabled {
+        if let Err(e) = crate::commands::rooms::teardown_room_session(&state).await {
+            events::emit_log(
+                &app,
+                "error",
+                "rooms",
+                &format!("Rooms disabled, but session cleanup failed: {}", e),
+            );
+            events::emit_room_error(&format!(
+                "Rooms were disabled, but the previous room could not be fully cleaned up: {}",
+                e
+            ));
+        } else {
+            events::emit_log(&app, "info", "rooms", "Rooms disabled: session ended");
+        }
     }
-    crate::download::set_global_proxy_policy(
-        config.proxy_enabled,
-        config.use_system_proxy(),
-        config.proxy_url(),
-        config.proxy_only,
-    );
     events::emit_log(&app, "info", "config", "Configuration saved");
     Ok(())
 }

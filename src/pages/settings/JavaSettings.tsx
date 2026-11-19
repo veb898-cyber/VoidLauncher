@@ -116,9 +116,159 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
   return (
     <>
       <section className="settings-section">
+        <h2 className="settings-section__title">{t('settings.group_performance')}</h2>
+
+        <div className="settings-row" data-setting-id="default_memory_mb">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.memory_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.memory_desc')}
+            </div>
+          </div>
+          <div className="settings-row__control" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
+            <input
+              className="input"
+              type="number"
+              min="2048"
+              max={uiLimitMb}
+              step="512"
+              value={config.default_memory_mb}
+              onChange={(e) => {
+                // `max` only constrains the spinner arrows: typed values must
+                // be clamped too, or a typo is persisted and handed to the JVM.
+                const parsed = parseInt(e.target.value, 10) || 2048;
+                updateConfig(
+                  'default_memory_mb',
+                  Math.min(uiLimitMb, Math.max(2048, parsed)),
+                );
+              }}
+              style={{ width: 100, textAlign: 'center' }}
+              id="min-memory-input"
+              aria-label={t('settings.memory_title')}
+            />
+            <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>{t('settings.memory_unit')}</span>
+            <Tooltip content={t('settings.memory_reset_tooltip')}>
+              <button
+                className="btn btn--secondary btn--sm"
+                onClick={async () => {
+                  const totalMb = await detectSystemRam();
+                  // Tiered: 4 / 6 / 8 GB depending on total RAM, snapped to
+                  // 512 MB step, but never above the current explicit cap.
+                  const recommended = snapToMemoryStep(
+                    getRecommendedMemoryMb(totalMb),
+                  );
+                  updateConfig(
+                    'default_memory_mb',
+                    Math.min(recommended, uiLimitMb),
+                  );
+                }}
+                id="reset-memory-btn"
+              >
+                {t('settings.memory_reset')}
+              </button>
+            </Tooltip>
+          </div>
+        </div>
+
+        <div className="settings-row" style={{ paddingTop: 0 }} data-setting-id="max_memory_mb">
+          <div className="settings-row__info">
+            <div className="settings-row__desc">
+              {t('settings.memory_limit_current', {
+                limit: formatGb(storedLimitMb),
+              })}
+              {safeMaxMb != null && (
+                <>
+                  {' '}
+                  {t('settings.memory_limit_safe', {
+                    safe: formatGb(safeMaxMb),
+                  })}
+                </>
+              )}
+            </div>
+            {memoryAboveLimit && (
+              <div className="settings-row__note settings-row__note--active">
+                {t('settings.memory_limit_exceeded', {
+                  selected: formatGb(config.default_memory_mb),
+                  effective: formatGb(uiLimitMb),
+                })}
+              </div>
+            )}
+            {limitAboveSafe && (
+              <div className="settings-row__note settings-row__note--active">
+                {t('settings.memory_limit_above_safe', {
+                  limit: formatGb(storedLimitMb),
+                  safe: formatGb(safeMaxMb!),
+                })}
+              </div>
+            )}
+            {systemRamMb == null && (
+              <div className="settings-row__note settings-row__note--locked">
+                {t('settings.memory_limit_unknown')}
+              </div>
+            )}
+            {systemRamMb != null && safeMaxMb == null && (
+              <div className="settings-row__note settings-row__note--active">
+                {t('settings.memory_limit_low_ram')}
+              </div>
+            )}
+          </div>
+          <div className="settings-row__control">
+            {canRaiseLimit && (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => updateConfig('max_memory_mb', safeMaxMb!)}
+                id="raise-memory-limit-btn"
+              >
+                {t('settings.memory_limit_raise', {
+                  safe: formatGb(safeMaxMb),
+                })}
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <div className="settings-row" data-setting-id="default_gc_preset">
+          <div className="settings-row__info">
+            <div className="settings-row__title">{t('settings.gc_title')}</div>
+            <div className="settings-row__desc">
+              {t('settings.gc_desc')}
+            </div>
+            <div className="settings-row__note settings-row__note--locked">
+              {t('settings.gc_zgc_note')}
+            </div>
+            {config.default_gc_preset === 'zgc' && zgcBlocked && (
+              <div className="settings-row__note settings-row__note--active">
+                {t('settings.gc_zgc_unavailable')}
+              </div>
+            )}
+          </div>
+          <div className="settings-row__control" style={{ width: 320 }}>
+            <CustomSelect
+              value={config.default_gc_preset}
+              ariaLabel={t('settings.gc_title')}
+              options={[
+                { value: 'standard', label: t('instance_editor.gc_standard'), description: t('instance_editor.gc_standard_short') },
+                { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: t('instance_editor.gc_g1gc_short') },
+                {
+                  value: 'zgc',
+                  label: t('instance_editor.gc_zgc'),
+                  description: zgcBlocked
+                    ? t('settings.gc_zgc_unavailable_short')
+                    : t('instance_editor.gc_zgc_req'),
+                  disabled: zgcBlocked,
+                },
+              ]}
+              onChange={(v) => updateConfig('default_gc_preset', v)}
+            />
+          </div>
+        </div>
+      </section>
+
+      <section className="settings-section">
         <h2 className="settings-section__title">{t('settings.group_java_runtime')}</h2>
 
-        <div className="settings-row">
+        <div className="settings-row" data-setting-id="java_path">
           <div className="settings-row__info">
             <div className="settings-row__title">{t('settings.java_path_title')}</div>
             <div className="settings-row__desc">
@@ -146,7 +296,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
           </div>
         </div>
 
-        <div className="settings-subsection">
+        <div className="settings-subsection" data-setting-id="java_installations">
           <div className="settings-subsection__head">
             <span className="settings-subsection__title">{t('settings.java_detected_heading')}</span>
             <Button
@@ -211,156 +361,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
         </div>
       </section>
 
-      <section className="settings-section">
-        <h2 className="settings-section__title">{t('settings.group_performance')}</h2>
-
-        <div className="settings-row">
-          <div className="settings-row__info">
-            <div className="settings-row__title">{t('settings.memory_title')}</div>
-            <div className="settings-row__desc">
-              {t('settings.memory_desc')}
-            </div>
-          </div>
-          <div className="settings-row__control" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)' }}>
-            <input
-              className="input"
-              type="number"
-              min="2048"
-              max={uiLimitMb}
-              step="512"
-              value={config.default_memory_mb}
-              onChange={(e) => {
-                // `max` only constrains the spinner arrows: typed values must
-                // be clamped too, or a typo is persisted and handed to the JVM.
-                const parsed = parseInt(e.target.value, 10) || 2048;
-                updateConfig(
-                  'default_memory_mb',
-                  Math.min(uiLimitMb, Math.max(2048, parsed)),
-                );
-              }}
-              style={{ width: 100, textAlign: 'center' }}
-              id="min-memory-input"
-              aria-label={t('settings.memory_title')}
-            />
-            <span style={{ color: 'var(--text-secondary)', fontSize: 'var(--font-size-sm)' }}>{t('settings.memory_unit')}</span>
-            <Tooltip content={t('settings.memory_reset_tooltip')}>
-              <button
-                className="btn btn--secondary btn--sm"
-                onClick={async () => {
-                  const totalMb = await detectSystemRam();
-                  // Tiered: 4 / 6 / 8 GB depending on total RAM, snapped to
-                  // 512 MB step, but never above the current explicit cap.
-                  const recommended = snapToMemoryStep(
-                    getRecommendedMemoryMb(totalMb),
-                  );
-                  updateConfig(
-                    'default_memory_mb',
-                    Math.min(recommended, uiLimitMb),
-                  );
-                }}
-                id="reset-memory-btn"
-              >
-                {t('settings.memory_reset')}
-              </button>
-            </Tooltip>
-          </div>
-        </div>
-
-        <div className="settings-row" style={{ paddingTop: 0 }}>
-          <div className="settings-row__info">
-            <div className="settings-row__desc">
-              {t('settings.memory_limit_current', {
-                limit: formatGb(storedLimitMb),
-              })}
-              {safeMaxMb != null && (
-                <>
-                  {' '}
-                  {t('settings.memory_limit_safe', {
-                    safe: formatGb(safeMaxMb),
-                  })}
-                </>
-              )}
-            </div>
-            {memoryAboveLimit && (
-              <div className="settings-row__note settings-row__note--active">
-                {t('settings.memory_limit_exceeded', {
-                  selected: formatGb(config.default_memory_mb),
-                  effective: formatGb(uiLimitMb),
-                })}
-              </div>
-            )}
-            {limitAboveSafe && (
-              <div className="settings-row__note settings-row__note--active">
-                {t('settings.memory_limit_above_safe', {
-                  limit: formatGb(storedLimitMb),
-                  safe: formatGb(safeMaxMb!),
-                })}
-              </div>
-            )}
-            {systemRamMb == null && (
-              <div className="settings-row__note settings-row__note--locked">
-                {t('settings.memory_limit_unknown')}
-              </div>
-            )}
-            {systemRamMb != null && safeMaxMb == null && (
-              <div className="settings-row__note settings-row__note--active">
-                {t('settings.memory_limit_low_ram')}
-              </div>
-            )}
-          </div>
-          <div className="settings-row__control">
-            {canRaiseLimit && (
-              <Button
-                size="sm"
-                variant="secondary"
-                onClick={() => updateConfig('max_memory_mb', safeMaxMb!)}
-                id="raise-memory-limit-btn"
-              >
-                {t('settings.memory_limit_raise', {
-                  safe: formatGb(safeMaxMb),
-                })}
-              </Button>
-            )}
-          </div>
-        </div>
-
-        <div className="settings-row">
-          <div className="settings-row__info">
-            <div className="settings-row__title">{t('settings.gc_title')}</div>
-            <div className="settings-row__desc">
-              {t('settings.gc_desc')}
-            </div>
-            <div className="settings-row__note settings-row__note--locked">
-              {t('settings.gc_zgc_note')}
-            </div>
-            {config.default_gc_preset === 'zgc' && zgcBlocked && (
-              <div className="settings-row__note settings-row__note--active">
-                {t('settings.gc_zgc_unavailable')}
-              </div>
-            )}
-          </div>
-          <div className="settings-row__control" style={{ width: 320 }}>
-            <CustomSelect
-              value={config.default_gc_preset}
-              options={[
-                { value: 'standard', label: t('instance_editor.gc_standard'), description: t('instance_editor.gc_standard_short') },
-                { value: 'g1gc', label: t('instance_editor.gc_g1gc'), description: t('instance_editor.gc_g1gc_short') },
-                {
-                  value: 'zgc',
-                  label: t('instance_editor.gc_zgc'),
-                  description: zgcBlocked
-                    ? t('settings.gc_zgc_unavailable_short')
-                    : t('instance_editor.gc_zgc_req'),
-                  disabled: zgcBlocked,
-                },
-              ]}
-              onChange={(v) => updateConfig('default_gc_preset', v)}
-            />
-          </div>
-        </div>
-      </section>
-
-      <section className="settings-section">
+      <section className="settings-section" data-setting-id="java_downloads">
         <h2 className="settings-section__title">{t('settings.java_download_heading')}</h2>
         <p className="settings-section__desc">
           {t('settings.java_download_desc')}
@@ -405,6 +406,7 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
                   <Button
                     size="sm"
                     variant={isInstalled ? 'secondary' : 'primary'}
+                    aria-label={`${t('settings.java_download_btn')} Java ${jv.major_version}`}
                     disabled={isDownloading}
                     loading={isDownloading}
                     onClick={async () => {
@@ -458,7 +460,9 @@ export function JavaSettings({ config, updateConfig }: JavaSettingsProps) {
                     {m.vendor} &bull; {m.is_64bit ? t('settings.java_64bit') : t('settings.java_32bit')}
                   </div>
                 </div>
-                <Button size="sm" variant="secondary" onClick={async () => {
+                <Button size="sm" variant="secondary"
+                  aria-label={`${t('settings.java_remove_btn')} Java ${m.major_version}`}
+                  onClick={async () => {
                   try {
                     await invoke('cmd_remove_managed_java', { majorVersion: m.major_version });
                     addToast(t('settings.java_remove_success', { version: m.major_version.toString() }), 'success');

@@ -37,9 +37,14 @@ interface ModalProps {
    * scrollbar — the content shrinks instead of the dialog scrolling.
    */
   dense?: boolean;
+  /**
+   * When false, Escape and a click on the backdrop do nothing. Used while an
+   * operation cannot be cancelled safely (e.g. cache deletion in progress).
+   */
+  dismissible?: boolean;
 }
 
-export function Modal({ open, onClose, title, children, footer, maxWidth, bare, fitContent, growWithContent, dense }: ModalProps) {
+export function Modal({ open, onClose, title, children, footer, maxWidth, bare, fitContent, growWithContent, dense, dismissible = true }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const wasOpen = useRef(false);
 
@@ -88,6 +93,10 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare, 
       // Stacked dialogs each listen on window; let only the top one react.
       if (!isTopmostDialog()) return;
       if (e.key === 'Escape') {
+        if (!dismissible) {
+          e.preventDefault();
+          return;
+        }
         e.preventDefault();
         onClose();
         return;
@@ -126,7 +135,7 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare, 
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [open, onClose]);
+  }, [open, onClose, dismissible]);
 
   if (!open) return null;
 
@@ -137,7 +146,7 @@ export function Modal({ open, onClose, title, children, footer, maxWidth, bare, 
   return createPortal(
     <div
       className={bare ? 'modal-overlay modal-overlay--bare' : 'modal-overlay'}
-      onClick={onClose}
+      onClick={dismissible ? onClose : undefined}
     >
       <div
         ref={dialogRef}

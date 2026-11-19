@@ -543,6 +543,7 @@ export function InstanceEditor({ open, instance, onClose, onSaved }: Props) {
           }}
           onCancel={() => setConfirmClose(false)}
           confirmLabel={t('instance_editor.close_discard')}
+          variant="danger"
           cancelLabel={t('instance_editor.close_stay')}
         />,
         document.body

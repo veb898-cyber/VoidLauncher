@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useT } from '../lib/i18n';
 import { LauncherLogs } from './Logs';
 import { GameLogs } from './GameLogs';
-import { SlidingTabs } from '../components/ui/SlidingTabs';
+import { SlidingTabs, slidingPanelId, slidingTabId } from '../components/ui/SlidingTabs';
 
 type TerminalView = 'launcher' | 'game';
 
@@ -36,16 +36,30 @@ export function Terminal() {
         active={view}
         onChange={setView}
         ariaLabel={t('terminal.title')}
+        controlsPanels
+        idPrefix="terminal-tabs"
         style={{ marginBottom: 'var(--space-md)', flexShrink: 0 }}
       />
 
       {/* Both panes stay mounted: switching tabs must not interrupt the live
           game-log stream, lose its scroll position or reset the launcher log
           filters. The inactive pane is only hidden. */}
-      <div style={{ flex: 1, minHeight: 0, display: view === 'game' ? 'flex' : 'none', flexDirection: 'column' }}>
+      <div
+        role="tabpanel"
+        id={slidingPanelId('terminal-tabs', 'game')}
+        aria-labelledby={slidingTabId('terminal-tabs', 'game')}
+        hidden={view !== 'game'}
+        style={{ flex: 1, minHeight: 0, display: view === 'game' ? 'flex' : 'none', flexDirection: 'column' }}
+      >
         <GameLogs />
       </div>
-      <div style={{ flex: 1, minHeight: 0, display: view === 'launcher' ? 'flex' : 'none', flexDirection: 'column' }}>
+      <div
+        role="tabpanel"
+        id={slidingPanelId('terminal-tabs', 'launcher')}
+        aria-labelledby={slidingTabId('terminal-tabs', 'launcher')}
+        hidden={view !== 'launcher'}
+        style={{ flex: 1, minHeight: 0, display: view === 'launcher' ? 'flex' : 'none', flexDirection: 'column' }}
+      >
         <LauncherLogs />
       </div>
     </div>

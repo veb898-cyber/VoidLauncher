@@ -226,21 +226,32 @@ impl TailscaleManager {
         let msi_path = cache_dir.join(sanitized_cache_name(&filename));
         if !msi_path.exists() {
             progress(0.15, "Downloading installer");
-            let bytes = crate::download::send_with_fallback(client.get(&msi_url))
-                .await
-                .map_err(LauncherError::Network)?
-                .bytes()
-                .await
-                .map_err(LauncherError::Network)?;
+            download_msi(&client, &msi_url, &msi_path).await?;
             progress(0.7, "Saving installer");
-            std::fs::write(&msi_path, &bytes)?;
         } else {
             progress(0.7, "Installer already cached");
         }
 
-        // 4. Verify SHA-256.
+        // 4. Verify SHA-256. A cached file can be truncated or left over from
+        //    an interrupted download; drop it and fetch once more instead of
+        //    failing every future install attempt on the same bad cache entry.
         progress(0.75, "Verifying installer checksum");
-        verify_sha256(&msi_path, &sha256_hex)?;
+        if verify_sha256(&msi_path, &sha256_hex).is_err() {
+            std::fs::remove_file(&msi_path).ok();
+            progress(0.7, "Re-downloading installer");
+            download_msi(&client, &msi_url, &msi_path).await?;
+            progress(0.75, "Verifying installer checksum");
+            verify_sha256(&msi_path, &sha256_hex)?;
+        }
+
+        // 4b. Authenticode + publisher check BEFORE msiexec. SHA-256 from the
+        //     same HTTPS origin is not a substitute for Windows trusting the
+        //     signer chain.
+        progress(0.78, "Verifying installer signature");
+        if let Err(e) = crate::rooms::authenticode::verify_installer_signature(&msi_path) {
+            std::fs::remove_file(&msi_path).ok();
+            return Err(e);
+        }
 
         // 5. Silent install. msiexec is synchronous and can take minutes;
         //    never block the async runtime with it.
@@ -456,6 +467,19 @@ fn sanitized_cache_name(filename: &str) -> String {
         .to_string()
 }
 
+/// Download an installer to the cache path. The caller verifies SHA-256; a
+/// truncated file is removed and fetched again on the next attempt.
+async fn download_msi(client: &reqwest::Client, url: &str, path: &Path) -> Result<()> {
+    let bytes = crate::download::send_with_fallback(client.get(url))
+        .await
+        .map_err(LauncherError::Network)?
+        .bytes()
+        .await
+        .map_err(LauncherError::Network)?;
+    std::fs::write(path, &bytes)?;
+    Ok(())
+}
+
 /// Fetch and validate the SHA-256 published next to the installer as
 /// `<msi_url>.sha256` (a plain hex digest, tolerating a trailing filename).
 async fn fetch_sha256(client: &reqwest::Client, msi_url: &str) -> Result<String> {
@@ -554,13 +578,31 @@ fn verify_sha256(path: &Path, expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn msiexec_path() -> Result<PathBuf> {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .ok_or_else(|| LauncherError::Launch("Windows system directory is not available".into()))?;
+    let path = std::path::PathBuf::from(root)
+        .join("System32")
+        .join("msiexec.exe");
+    if !path.is_file() {
+        return Err(LauncherError::Launch(format!(
+            "System msiexec.exe not found at {}",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
 /// Run msiexec for a silent install; 0 and 3010 (reboot required) are OK.
 #[cfg(target_os = "windows")]
 fn install_msi_silent(msi_path: &Path) -> Result<()> {
     let _guard = MSI_INSTALL_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut child = std::process::Command::new("msiexec")
+    let msiexec = msiexec_path()?;
+    let mut child = std::process::Command::new(&msiexec)
         .arg("/i")
         .arg(msi_path)
         .arg("/qn")
@@ -596,23 +638,36 @@ fn install_msi_silent(msi_path: &Path) -> Result<()> {
         }
     };
     let code = status.code().unwrap_or(-1);
-    if code == 0 || code == 3010 {
-        Ok(())
-    } else if code == 1603 {
-        // 1603 = fatal error during installation. When msiexec runs from a
-        // non-elevated process (typical: VoidLauncher not started as
-        // administrator) the Tailscale per-machine MSI often fails with this
-        // code, so give the user an actionable hint instead of a bare code.
-        Err(LauncherError::Launch(
-            "msiexec exited with code 1603 while installing Tailscale \
-             (installation requires administrator rights — run VoidLauncher as administrator)"
+    classify_msiexec_exit(code)
+}
+
+/// Classify a Windows Installer exit code. `0` and `3010` (reboot required)
+/// are success; `1602` is the user cancelling the elevation/installation
+/// prompt and must be reported as "nothing was installed", not as a crash.
+fn classify_msiexec_exit(code: i32) -> Result<()> {
+    match code {
+        0 | 3010 => Ok(()),
+        1602 => Err(LauncherError::Launch(
+            "Tailscale installation was cancelled before it started; nothing was installed."
                 .to_string(),
-        ))
-    } else {
-        Err(LauncherError::Launch(format!(
+        )),
+        1603 => {
+            // 1603 = fatal error during installation. When msiexec runs from a
+            // non-elevated process (typical: VoidLauncher not started as
+            // administrator) the Tailscale per-machine MSI often fails with
+            // this code, so give the user an actionable hint instead of a
+            // bare code.
+            Err(LauncherError::Launch(
+                "msiexec exited with code 1603 while installing Tailscale \
+                 (installation requires administrator rights — approve the Windows prompt \
+                 or run VoidLauncher as administrator)"
+                    .to_string(),
+            ))
+        }
+        _ => Err(LauncherError::Launch(format!(
             "msiexec exited with code {} while installing Tailscale",
             code
-        )))
+        ))),
     }
 }
 
@@ -1168,5 +1223,73 @@ mod tests {
         assert!(verify_sha256(&f, good).is_ok());
         assert!(verify_sha256(&f, &good.to_uppercase()).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn msiexec_exit_codes_report_success_cancel_and_elevation_failure() {
+        assert!(classify_msiexec_exit(0).is_ok());
+        assert!(
+            classify_msiexec_exit(3010).is_ok(),
+            "reboot required is success"
+        );
+
+        let cancelled = classify_msiexec_exit(1602).unwrap_err().to_string();
+        assert!(
+            cancelled.contains("cancelled") && cancelled.contains("nothing was installed"),
+            "1602 must be reported as a clean cancellation, got: {cancelled}"
+        );
+
+        let denied = classify_msiexec_exit(1603).unwrap_err().to_string();
+        assert!(
+            denied.contains("administrator") && denied.contains("1603"),
+            "1603 must explain the elevation requirement, got: {denied}"
+        );
+
+        let other = classify_msiexec_exit(1618).unwrap_err().to_string();
+        assert!(
+            other.contains("1618"),
+            "unexpected codes stay visible: {other}"
+        );
+    }
+
+    #[test]
+    fn msiexec_path_is_the_absolute_system_binary() {
+        #[cfg(target_os = "windows")]
+        {
+            let path = msiexec_path().expect("system msiexec");
+            assert!(path.is_absolute());
+            assert!(
+                path.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with("system32\\msiexec.exe"),
+                "got: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn stopped_or_logged_out_daemons_are_not_ready() {
+        for state in ["Stopped", "NeedsLogin", "NoState", "Starting"] {
+            let json = serde_json::json!({
+                "BackendState": state,
+                "AuthURL": "https://login.tailscale.com/a/example",
+                "Self": { "TailscaleIPs": ["100.64.0.1"] }
+            })
+            .to_string();
+            let status = TailscaleManager::parse_status(&json).unwrap();
+            let expected = state == "Starting";
+            assert_eq!(
+                TailscaleManager::is_logged_in(&status),
+                expected,
+                "BackendState {state}"
+            );
+            // The login URL is only surfaced when the node still needs approval.
+            assert_eq!(
+                TailscaleManager::auth_url(&status).is_some(),
+                !expected,
+                "AuthURL availability for {state}"
+            );
+        }
     }
 }

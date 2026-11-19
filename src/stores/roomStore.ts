@@ -35,6 +35,8 @@ export interface RoomStatus {
   bridgePort: number;
   endpoint: string | null;
   hostOnline: boolean;
+  /** Registered host instance (local name); never the invitation secret. */
+  hostInstance: string | null;
 }
 
 /** Progress payload of the `room_progress` event. */
@@ -46,19 +48,28 @@ export interface RoomProgress {
 
 interface RoomStore {
   status: RoomStatus | null;
+  /** Host-only copyable invitation (room id + secret); never part of status. */
+  invitation: string | null;
   progress: RoomProgress | null;
   busy: boolean;
   error: string | null;
   loaded: boolean;
 
   loadStatus: () => Promise<void>;
+  loadInvitation: () => Promise<void>;
+  /** Refresh the Tailscale snapshot; never installs or signs in. */
   checkLink: () => Promise<void>;
+  /** Install Tailscale after the user explicitly confirmed it. */
+  installTailscale: () => Promise<void>;
+  /** Start the interactive Tailscale sign-in after an explicit click. */
+  login: () => Promise<void>;
   createHost: (roomName: string) => Promise<void>;
   joinGuest: (roomCode: string) => Promise<void>;
   leave: () => Promise<void>;
   refresh: () => Promise<void>;
-  detectMinecraftPort: () => Promise<number | null>;
+  detectMinecraftPort: (instanceName: string) => Promise<number | null>;
   reportMinecraftPort: (port: number | null) => Promise<void>;
+  setHostInstance: (instanceName: string) => Promise<boolean>;
   openAdminConsole: () => Promise<void>;
   setProgress: (p: RoomProgress | null) => void;
   clearError: () => void;
@@ -66,6 +77,7 @@ interface RoomStore {
 
 export const useRoomStore = create<RoomStore>((set, get) => ({
   status: null,
+  invitation: null,
   progress: null,
   busy: false,
   error: null,
@@ -74,9 +86,24 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
   loadStatus: async () => {
     try {
       const status = await invoke<RoomStatus>('cmd_room_status');
-      set({ status, loaded: true, error: null });
+      set((state) => ({
+        status,
+        loaded: true,
+        error: null,
+        invitation: status.role === 'host' ? state.invitation : null,
+      }));
     } catch (e: any) {
       set({ loaded: true, error: e.toString() });
+    }
+  },
+
+  loadInvitation: async () => {
+    try {
+      const invitation = await invoke<string>('cmd_room_invitation');
+      set({ invitation });
+    } catch {
+      // Not the host (or Rooms just turned off); no invitation to copy.
+      set({ invitation: null });
     }
   },
 
@@ -90,13 +117,33 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
     }
   },
 
+  installTailscale: async () => {
+    set({ busy: true, error: null });
+    try {
+      const status = await invoke<RoomStatus>('cmd_room_install_tailscale');
+      set({ status, busy: false });
+    } catch (e: any) {
+      set({ busy: false, error: e.toString() });
+    }
+  },
+
+  login: async () => {
+    set({ busy: true, error: null });
+    try {
+      const status = await invoke<RoomStatus>('cmd_room_login');
+      set({ status, busy: false });
+    } catch (e: any) {
+      set({ busy: false, error: e.toString() });
+    }
+  },
+
   createHost: async (roomName: string) => {
     set({ busy: true, error: null });
     try {
       const status = await invoke<RoomStatus>('cmd_room_create_host', {
         roomName: roomName.trim() || null,
       });
-      set({ status, busy: false });
+      set({ status, busy: false, invitation: null });
     } catch (e: any) {
       set({ busy: false, error: e.toString() });
     }
@@ -108,7 +155,7 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
       const status = await invoke<RoomStatus>('cmd_room_join_guest', {
         roomCode: roomCode.trim(),
       });
-      set({ status, busy: false });
+      set({ status, busy: false, invitation: null });
     } catch (e: any) {
       set({ busy: false, error: e.toString() });
     }
@@ -118,7 +165,7 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
     set({ busy: true, error: null });
     try {
       const status = await invoke<RoomStatus>('cmd_room_leave');
-      set({ status, busy: false, progress: null });
+      set({ status, busy: false, progress: null, invitation: null });
     } catch (e: any) {
       set({ busy: false, error: e.toString() });
     }
@@ -133,11 +180,18 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
     }
   },
 
-  detectMinecraftPort: async () => {
+  detectMinecraftPort: async (instanceName: string) => {
     try {
-      const port = await invoke<number | null>('cmd_room_detect_minecraft_port');
-      await invoke('cmd_room_report_minecraft_port', { port: port ?? null });
-      await get().loadStatus();
+      const port = await invoke<number | null>('cmd_room_detect_minecraft_port', {
+        instanceName,
+      });
+      const current = get().status?.minecraftPort ?? null;
+      // The host view polls while the game runs to notice a closed LAN world.
+      // Only write/refresh when the detected port actually changed.
+      if ((port ?? null) !== current) {
+        await invoke('cmd_room_report_minecraft_port', { port: port ?? null });
+        await get().loadStatus();
+      }
       return port ?? null;
     } catch (e: any) {
       set({ error: e.toString() });
@@ -151,6 +205,16 @@ export const useRoomStore = create<RoomStore>((set, get) => ({
       await get().loadStatus();
     } catch (e: any) {
       set({ error: e.toString() });
+    }
+  },
+
+  setHostInstance: async (instanceName: string) => {
+    try {
+      await invoke('cmd_room_set_host_instance', { instance: instanceName });
+      return true;
+    } catch (e: any) {
+      set({ error: e.toString() });
+      return false;
     }
   },
 

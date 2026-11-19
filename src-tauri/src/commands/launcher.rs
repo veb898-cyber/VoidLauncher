@@ -1572,6 +1572,29 @@ pub async fn cmd_launch_game(
                 );
             }
         }
+        // The game is gone: a host room must stop advertising this game's LAN
+        // port immediately, even if the Rooms page is closed. Only the exact
+        // registered instance may clear it.
+        {
+            let app_state = app_clone.state::<AppState>();
+            match app_state
+                .room_state
+                .clear_minecraft_port_if_host_instance(&instance_clone)
+            {
+                Ok(true) => {
+                    let _ = app_clone.emit("room_status_changed", serde_json::json!({}));
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    events::emit_log(
+                        &app_clone,
+                        "warn",
+                        "rooms",
+                        &format!("Failed to clear the room LAN port after game exit: {}", e),
+                    );
+                }
+            }
+        }
         // Emit the completion before releasing the registry entry. Otherwise
         // a new launch can acquire the slot and emit `game_started` first,
         // and the older completion would remove the new run from the UI.

@@ -1,4 +1,4 @@
-import { ShieldCheck, ExternalLink, Download, Network } from 'lucide-react';
+import { ShieldCheck, ExternalLink, Download, LogIn, Network } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
@@ -11,18 +11,24 @@ interface RoomSetupViewProps {
   status: RoomStatus;
   progress: RoomProgress | null;
   busy: boolean;
-  onCheck: () => void;
+  onRefresh: () => void;
+  onInstall: () => void;
+  onLogin: () => void;
 }
 
 /**
- * First-run setup: install and sign in to Tailscale. The launcher never asks
- * for credentials — the sign-in link opens in the system browser and the
- * launcher polls the connection state until it turns ready.
+ * First-run setup: install and sign in to Tailscale. Nothing happens
+ * automatically: installation starts only from the explicit "Install" button
+ * (after a confirmation dialog), and sign-in only from the explicit "Sign in"
+ * button. The launcher never asks for credentials — the sign-in link opens in
+ * the system browser and the launcher polls the connection state.
  */
-export function RoomSetupView({ status, progress, busy, onCheck }: RoomSetupViewProps) {
+export function RoomSetupView({ status, progress, busy, onRefresh, onInstall, onLogin }: RoomSetupViewProps) {
   const t = useT();
   const ts = status.tailscale;
   const waitingLogin = ts.installed && !ts.logged_in;
+  const installing = progress?.stage === 'install' && progress.fraction < 1;
+  const loggingIn = progress?.stage === 'login' && progress.fraction < 1;
   const steps = [
     { title: t('rooms.setup_step1_title'), desc: t('rooms.setup_step1_desc') },
     { title: t('rooms.setup_step2_title'), desc: t('rooms.setup_step2_desc') },
@@ -172,7 +178,21 @@ export function RoomSetupView({ status, progress, busy, onCheck }: RoomSetupView
       )}
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-md)', alignItems: 'center' }}>
-        <Button onClick={onCheck} loading={busy} disabled={busy}>
+        {!ts.installed && (
+          <Button onClick={onInstall} loading={installing} disabled={busy || installing}>
+            <Download size={16} />
+            {installing ? t('rooms.setup_installing') : t('rooms.setup_install')}
+          </Button>
+        )}
+
+        {waitingLogin && (
+          <Button onClick={onLogin} loading={loggingIn} disabled={busy || loggingIn}>
+            <LogIn size={16} />
+            {loggingIn ? t('rooms.setup_logging_in') : t('rooms.setup_login_action')}
+          </Button>
+        )}
+
+        <Button variant="secondary" onClick={onRefresh} loading={busy} disabled={busy || installing}>
           <RefreshIcon spinning={busy} size={15} />
           {busy ? t('rooms.setup_checking') : t('rooms.setup_check')}
         </Button>
@@ -184,7 +204,7 @@ export function RoomSetupView({ status, progress, busy, onCheck }: RoomSetupView
           </Button>
         )}
 
-        {waitingLogin && (
+        {loggingIn && (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-sm)', color: 'var(--text-tertiary)', fontSize: 'var(--font-size-sm)' }}>
             <LoadingSpinner size={14} />
             {t('rooms.setup_waiting')}

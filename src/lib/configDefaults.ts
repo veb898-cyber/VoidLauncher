@@ -20,5 +20,8 @@ export function withConfigDefaults(config: AppConfig): AppConfig {
     elyby_skins_in_game: config.elyby_skins_in_game ?? true,
     proxy_only: config.proxy_only ?? true,
     use_system_proxy: config.use_system_proxy ?? true,
+    // Experimental Rooms stays opt-in; an older backend payload or a config
+    // written before the flag existed must keep the tab hidden.
+    rooms_enabled: config.rooms_enabled ?? false,
   };
 }

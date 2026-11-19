@@ -220,6 +220,12 @@ pub struct AppConfig {
     /// existed.
     #[serde(default = "default_elyby_skins_in_game")]
     pub elyby_skins_in_game: bool,
+    /// Show the experimental Rooms (multiplayer over Tailscale) interface.
+    /// Off by default: the feature has not been validated on two real devices
+    /// yet, so it must stay an explicit opt-in. Hiding the tab never affects
+    /// normal Minecraft launches.
+    #[serde(default)]
+    pub rooms_enabled: bool,
 }
 
 fn default_client_id() -> String {
@@ -308,6 +314,9 @@ impl Default for AppConfig {
             curseforge_api_key: "$2a$10$wuAJuNZuted3NORVmpgUC.m8sI.pv1tOPKZyBgLFGjxFp/br0lZCC"
                 .into(),
             elyby_skins_in_game: true,
+            // Experimental: opt-in only. The Rooms tab stays hidden until the
+            // user enables it in Settings -> Experimental features.
+            rooms_enabled: false,
         }
     }
 }
@@ -766,10 +775,43 @@ mod tests {
         let config: AppConfig = serde_json::from_value(legacy).expect("legacy config parses");
         assert!(config.elyby_skins_in_game);
         assert!(config.proxy_only);
+        assert!(
+            !config.rooms_enabled,
+            "Rooms must stay an explicit opt-in for legacy configs"
+        );
         assert_eq!(
             config.config_version, 0,
             "a config without the marker is a legacy config"
         );
+    }
+
+    #[test]
+    fn fresh_config_keeps_rooms_disabled_by_default() {
+        let config = AppConfig::default();
+        assert!(
+            !config.rooms_enabled,
+            "the experimental Rooms tab must not appear without an opt-in"
+        );
+    }
+
+    #[test]
+    fn rooms_opt_in_survives_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("vl-config-rooms-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            !AppConfig::default().rooms_enabled,
+            "opt-in must start disabled"
+        );
+        let config = AppConfig {
+            data_dir: dir.clone(),
+            rooms_enabled: true,
+            ..AppConfig::default()
+        };
+        config.save().unwrap();
+
+        let loaded = AppConfig::load(&dir);
+        assert!(loaded.rooms_enabled, "the Rooms toggle must persist");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

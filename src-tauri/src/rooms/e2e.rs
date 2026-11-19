@@ -158,6 +158,7 @@ async fn room_control_plane_lifecycle_over_loopback() {
         .expect("create_room");
     assert_eq!(row.role, RoomRole::Host, "role after create");
     let code = row.room_id.clone().expect("room id");
+    let secret = row.room_secret.clone().expect("invitation secret");
     assert!(valid_room_id(&code), "generated code shape: {}", code);
     println!("[e2e] host created room {}", code);
 
@@ -170,7 +171,7 @@ async fn room_control_plane_lifecycle_over_loopback() {
     println!("[e2e] bridge listening on {}:{}", HOST_IP, port);
 
     // ---------- 3. GUEST: no port advertised yet ----------
-    let pre = query_host_status_for_test(HOST_IP, port, &code)
+    let pre = query_host_status_for_test(HOST_IP, port, &code, &secret)
         .await
         .expect("query before port");
     assert_eq!(pre.room_id, code, "bridge echoes room id");
@@ -179,32 +180,55 @@ async fn room_control_plane_lifecycle_over_loopback() {
 
     // ---------- 4. HOST: advertise the LAN port ----------
     host.set_minecraft_port(Some(45678)).expect("set port");
-    let post = query_host_status_for_test(HOST_IP, port, &code)
+    let post = query_host_status_for_test(HOST_IP, port, &code, &secret)
         .await
         .expect("query after port");
     assert_eq!(post.mc_port, Some(45678), "guest sees advertised port");
     println!("[e2e] guest query post-port -> mc_port=Some(45678)");
 
-    // ---------- 5. Auth: wrong / missing code rejected ----------
+    // ---------- 5. Auth: wrong code / wrong secret / missing proof rejected ----------
     assert!(
-        query_host_status_for_test(HOST_IP, port, "ZZZZ-9999")
+        query_host_status_for_test(HOST_IP, port, "ZZZZ-9999", &secret)
             .await
             .is_err(),
         "wrong room code must be rejected"
+    );
+    assert!(
+        query_host_status_for_test(
+            HOST_IP,
+            port,
+            &code,
+            &crate::rooms::room_state::generate_room_secret()
+        )
+        .await
+        .is_err(),
+        "a guest without the invitation secret must be rejected"
     );
     let (code403, _) = raw_http(
         port,
         "GET /room/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     )
     .await;
-    assert_eq!(code403, 403, "missing code must be 403");
-    println!("[e2e] auth: wrong/missing code -> rejected");
+    assert_eq!(code403, 403, "missing invitation must be 403");
+    let (legacy403, _) = raw_http(
+        port,
+        &format!(
+            "GET /room/status?code={} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            code
+        ),
+    )
+    .await;
+    assert_eq!(
+        legacy403, 403,
+        "a bare code without challenge/auth must not be accepted"
+    );
+    println!("[e2e] auth: wrong/missing invitation -> rejected");
 
     // ---------- 6. Protocol: method / route handling ----------
     let (m405, _) = raw_http(
         port,
         &format!(
-            "POST /room/status?code={} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            "POST /room/status?room={} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
             code
         ),
     )
@@ -222,7 +246,7 @@ async fn room_control_plane_lifecycle_over_loopback() {
     host.leave().expect("leave");
     assert_eq!(host.role(), RoomRole::None, "role after leave");
     assert!(
-        query_host_status_for_test(HOST_IP, port, &code)
+        query_host_status_for_test(HOST_IP, port, &code, &secret)
             .await
             .is_err(),
         "bridge must deny after the host left"
@@ -232,9 +256,11 @@ async fn room_control_plane_lifecycle_over_loopback() {
     // ---------- 8. HOST: re-create -> new code, same live bridge ----------
     let again = host.create_room(None).expect("re-create");
     let code2 = again.room_id.clone().expect("new room id");
+    let secret2 = again.room_secret.clone().expect("new invitation secret");
     assert!(valid_room_id(&code2), "re-created code shape: {}", code2);
+    assert_ne!(secret, secret2, "a new room must get a new secret");
     host.set_minecraft_port(Some(45679)).expect("set port 2");
-    let reread = query_host_status_for_test(HOST_IP, port, &code2)
+    let reread = query_host_status_for_test(HOST_IP, port, &code2, &secret2)
         .await
         .expect("query re-created room");
     assert_eq!(
@@ -252,6 +278,11 @@ async fn room_control_plane_lifecycle_over_loopback() {
         snap.room_id.as_deref(),
         Some(code2.as_str()),
         "room id survives restart"
+    );
+    assert_eq!(
+        snap.room_secret.as_deref(),
+        Some(secret2.as_str()),
+        "invitation secret survives restart"
     );
     // The advertised LAN port belongs to the world that was open before the
     // restart; it must NOT be advertised again (stale-port policy), and the
@@ -337,9 +368,10 @@ async fn void_link_bridge_tracks_room_and_rebinds() {
     let state = Arc::new(RoomStateManager::new(&dir));
     let row = state.create_room(None).expect("create room");
     let code = row.room_id.expect("room id");
+    let secret = row.room_secret.expect("invitation secret");
 
     let port_a = bind_bridge_on_free_port(HOST_IP, &state).await;
-    let q = query_host_status_for_test(HOST_IP, port_a, &code)
+    let q = query_host_status_for_test(HOST_IP, port_a, &code, &secret)
         .await
         .expect("bridge serves");
     assert_eq!(q.room_id, code, "first bind answers");
@@ -348,7 +380,7 @@ async fn void_link_bridge_tracks_room_and_rebinds() {
     ensure_void_link_server(HOST_IP.into(), state.clone())
         .await
         .expect("idempotent same ip");
-    let q2 = query_host_status_for_test(HOST_IP, port_a, &code)
+    let q2 = query_host_status_for_test(HOST_IP, port_a, &code, &secret)
         .await
         .expect("still serves");
     assert_eq!(q2.room_id, code, "idempotent call must not kill the bridge");
@@ -357,12 +389,12 @@ async fn void_link_bridge_tracks_room_and_rebinds() {
     // NEW address (rebind with the current tailnet IP).
     let port_b = bind_bridge_on_free_port("127.0.0.2", &state).await;
     assert!(
-        query_host_status_for_test(HOST_IP, port_a, &code)
+        query_host_status_for_test(HOST_IP, port_a, &code, &secret)
             .await
             .is_err(),
         "old listener must be aborted on IP change"
     );
-    let q3 = query_host_status_for_test("127.0.0.2", port_b, &code)
+    let q3 = query_host_status_for_test("127.0.0.2", port_b, &code, &secret)
         .await
         .expect("new bridge serves");
     assert_eq!(q3.room_id, code, "rebound bridge answers");
@@ -371,7 +403,7 @@ async fn void_link_bridge_tracks_room_and_rebinds() {
     state.leave().expect("leave");
     stop_void_link_server().await;
     assert!(
-        query_host_status_for_test("127.0.0.2", port_b, &code)
+        query_host_status_for_test("127.0.0.2", port_b, &code, &secret)
             .await
             .is_err(),
         "bridge must be stopped on leave"
@@ -392,9 +424,10 @@ async fn invalid_ip_does_not_stop_a_live_bridge() {
     let state = Arc::new(RoomStateManager::new(&dir));
     let row = state.create_room(None).expect("create room");
     let code = row.room_id.expect("room id");
+    let secret = row.room_secret.expect("invitation secret");
     let port = bind_bridge_on_free_port(HOST_IP, &state).await;
 
-    let before = query_host_status_for_test(HOST_IP, port, &code)
+    let before = query_host_status_for_test(HOST_IP, port, &code, &secret)
         .await
         .expect("bridge serves before invalid start");
     assert_eq!(before.room_id, code);
@@ -402,7 +435,7 @@ async fn invalid_ip_does_not_stop_a_live_bridge() {
     let err = ensure_void_link_server("not-an-ip".into(), state.clone()).await;
     assert!(err.is_err(), "invalid tailnet IP must fail");
 
-    let after = query_host_status_for_test(HOST_IP, port, &code)
+    let after = query_host_status_for_test(HOST_IP, port, &code, &secret)
         .await
         .expect("invalid IP must not abort a healthy bridge");
     assert_eq!(after.room_id, code);

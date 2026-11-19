@@ -13,11 +13,14 @@
 //!   * Minecraft traffic never crosses a backend: the tailnet carries it
 //!     directly between the guest client and the host's game process.
 //!   * The VoidLink bridge only exchanges small control payloads (room id,
-//!     Minecraft port). It is guarded by the room code.
+//!     Minecraft port). The public room id selects the room; a separate
+//!     invitation secret authenticates the host via a fresh HMAC challenge.
 
+pub mod authenticode;
 pub mod minecraft_connector;
 pub mod peer_discovery;
 pub mod room_state;
+pub mod secret_store;
 pub mod tailscale;
 pub mod void_link;
 

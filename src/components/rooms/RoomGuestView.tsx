@@ -218,6 +218,8 @@ export function RoomGuestView({ status, instances }: RoomGuestViewProps) {
         open={confirmLeave}
         title={t('rooms.leave_confirm_title')}
         description={t('rooms.leave_confirm_guest_desc')}
+        confirmLabel={t('rooms.leave')}
+        variant="primary"
         busy={busy}
         onCancel={() => setConfirmLeave(false)}
         onConfirm={() => { leave(); }}

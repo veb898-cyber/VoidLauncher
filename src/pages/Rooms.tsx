@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { Check, CheckCircle2, Copy, LogIn, Network, Plus, Users } from 'lucide-react';
+import { Check, CheckCircle2, Copy, FlaskConical, LogIn, Network, Plus, Users } from 'lucide-react';
 import { useRoomStore, type RoomStatus } from '../stores/roomStore';
 import { useInstanceStore } from '../stores/instanceStore';
 import { useRoomEvents } from '../hooks/useRoomEvents';
@@ -8,6 +8,7 @@ import { RoomHostView } from '../components/rooms/RoomHostView';
 import { RoomGuestView } from '../components/rooms/RoomGuestView';
 import { RoomStatusBadge } from '../components/rooms/RoomStatusBadge';
 import { Button } from '../components/ui/Button';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import { Input } from '../components/ui/Input';
 import { SnakeSpinner } from '../components/ui/SnakeSpinner';
 import { addToast } from '../components/ui/Toast';
@@ -29,9 +30,17 @@ export function Rooms() {
   const busy = useRoomStore((s) => s.busy);
   const loadStatus = useRoomStore((s) => s.loadStatus);
   const checkLink = useRoomStore((s) => s.checkLink);
+  const installTailscale = useRoomStore((s) => s.installTailscale);
+  const login = useRoomStore((s) => s.login);
+  const [confirmInstall, setConfirmInstall] = useState(false);
 
   const instances = useInstanceStore((s) => s.instances);
+  const instancesLoading = useInstanceStore((s) => s.isLoading);
   const loadInstances = useInstanceStore((s) => s.loadInstances);
+  // Distinguishes "the list is still loading" from "there are genuinely no
+  // instances". The host view must not treat a saved instance as deleted
+  // while the first list request is still in flight.
+  const [instancesLoadFinished, setInstancesLoadFinished] = useState(instances.length > 0);
 
   // Command errors go through the same global toast as everywhere else in
   // the launcher (no inline banner). Background install failures arrive via
@@ -45,20 +54,41 @@ export function Rooms() {
 
   useEffect(() => {
     loadStatus();
-    if (useInstanceStore.getState().instances.length === 0) {
-      loadInstances();
+    let cancelled = false;
+    if (instances.length === 0) {
+      setInstancesLoadFinished(false);
+      loadInstances().finally(() => {
+        if (!cancelled) setInstancesLoadFinished(true);
+      });
+    } else {
+      setInstancesLoadFinished(true);
     }
-  }, [loadStatus, loadInstances]);
+    return () => {
+      cancelled = true;
+    };
+  }, [loadStatus, loadInstances, instances.length]);
 
   const tsReady = !!status && status.tailscale.installed && status.tailscale.logged_in;
+  const hasStatus = !!status;
+  const role = status?.role ?? 'none';
+  const instancesLoaded = !instancesLoading && (instances.length > 0 || instancesLoadFinished);
 
   // Poll while the Tailscale setup is incomplete: the backend install/login
   // tasks run in the background and there is no push event for "ready".
   useEffect(() => {
-    if (!status || tsReady) return;
+    if (!hasStatus || tsReady) return;
     const id = window.setInterval(() => { loadStatus(); }, 2500);
     return () => window.clearInterval(id);
-  }, [status, tsReady, loadStatus]);
+  }, [hasStatus, tsReady, loadStatus]);
+
+  // Hosts keep polling too: `cmd_room_status` re-binds the VoidLink bridge
+  // when Tailscale reconnects with a new tailnet IP. Without this a network
+  // change would leave the bridge on a stale address.
+  useEffect(() => {
+    if (!tsReady || role !== 'host') return;
+    const id = window.setInterval(() => { loadStatus(); }, 5000);
+    return () => window.clearInterval(id);
+  }, [tsReady, role, loadStatus]);
 
   return (
     <div className="page" style={{ display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
@@ -73,6 +103,27 @@ export function Rooms() {
         <RoomStatusBadge status={status} />
       </div>
 
+      <div
+        className="glass-card animate-slide-up"
+        role="note"
+        style={{
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: 'var(--space-md)',
+          padding: 'var(--space-md) var(--space-lg)',
+          marginBottom: 'var(--space-xl)',
+          borderColor: 'var(--surface-border)',
+        }}
+      >
+        <FlaskConical size={20} color="var(--primary)" aria-hidden style={{ flexShrink: 0, marginTop: 2 }} />
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 600, marginBottom: 2 }}>{t('rooms.experimental_title')}</div>
+          <p style={{ margin: 0, color: 'var(--text-secondary)', lineHeight: 1.55, fontSize: 'var(--font-size-sm)' }}>
+            {t('rooms.experimental_notice')}
+          </p>
+        </div>
+      </div>
+
       {!loaded && !status ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', color: 'var(--text-secondary)' }}>
           <SnakeSpinner size={18} /> {t('rooms.loading')}
@@ -83,11 +134,18 @@ export function Rooms() {
         </div>
       ) : !tsReady ? (
         <div className="page-stage">
-          <RoomSetupView status={status} progress={progress} busy={busy} onCheck={checkLink} />
+          <RoomSetupView
+            status={status}
+            progress={progress}
+            busy={busy}
+            onRefresh={checkLink}
+            onInstall={() => setConfirmInstall(true)}
+            onLogin={login}
+          />
         </div>
       ) : status.role === 'host' ? (
         <div className="page-stage">
-          <RoomHostView status={status} instances={instances} />
+          <RoomHostView status={status} instances={instances} instancesLoaded={instancesLoaded} />
         </div>
       ) : status.role === 'guest' ? (
         <div className="page-stage">
@@ -98,6 +156,20 @@ export function Rooms() {
           <RoomLobby />
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmInstall}
+        title={t('rooms.setup_install_confirm_title')}
+        description={t('rooms.setup_install_confirm_desc')}
+        confirmLabel={t('rooms.setup_install_confirm_ok')}
+        variant="primary"
+        busy={busy}
+        onCancel={() => setConfirmInstall(false)}
+        onConfirm={() => {
+          setConfirmInstall(false);
+          void installTailscale();
+        }}
+      />
     </div>
   );
 }
@@ -161,8 +233,8 @@ function RoomLobby() {
               label={t('rooms.room_code_label')}
               placeholder={t('rooms.room_code_placeholder')}
               value={code}
-              maxLength={9}
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
+              maxLength={160}
+              onChange={(e) => setCode(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter' && code.trim()) joinGuest(code); }}
             />
             <p style={{ margin: 'var(--space-xs) 0 var(--space-sm)', fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>

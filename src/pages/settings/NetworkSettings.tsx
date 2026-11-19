@@ -40,7 +40,7 @@ export function NetworkSettings({ config, updateConfig }: NetworkSettingsProps) 
     <section className="settings-section">
       <h2 className="settings-section__title">{t('settings.group_proxy')}</h2>
 
-      <div className="settings-row">
+      <div className="settings-row" data-setting-id="proxy_enabled">
         <div className="settings-row__info">
           <div className="settings-row__title">{t('settings.proxy_enabled_title')}</div>
           <div className="settings-row__desc">
@@ -62,6 +62,7 @@ export function NetworkSettings({ config, updateConfig }: NetworkSettingsProps) 
       <div
         className="settings-row settings-row--dependent"
         style={{ opacity: config.proxy_enabled ? 1 : 0.5 }}
+        data-setting-id="use_system_proxy"
       >
         <div className="settings-row__info">
           <div className="settings-row__title">{t('settings.proxy_system_title')}</div>
@@ -92,6 +93,7 @@ export function NetworkSettings({ config, updateConfig }: NetworkSettingsProps) 
 
       <div
         className="settings-row settings-row--stacked"
+        data-setting-id="proxy_addr"
         style={{ opacity: manualDisabled ? 0.5 : 1 }}
       >
         {config.use_system_proxy && (
@@ -121,6 +123,7 @@ export function NetworkSettings({ config, updateConfig }: NetworkSettingsProps) 
             </label>
             <input
               id="proxy-port"
+              data-setting-id="proxy_port"
               className="input proxy-port-input"
               type="number"
               min={1}
@@ -144,6 +147,7 @@ export function NetworkSettings({ config, updateConfig }: NetworkSettingsProps) 
         </div>
         <div
           className="settings-row settings-row--dependent"
+          data-setting-id="proxy_only"
           style={{ opacity: config.proxy_enabled ? 1 : 0.5 }}
         >
           <div className="settings-row__info">

@@ -1156,6 +1156,16 @@ a {
   border: 2px solid var(--surface-border);
   transition: border-color var(--transition-normal);
   cursor: pointer;
+  display: block;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+}
+
+.sidebar__item:focus-visible,
+.sidebar__avatar:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .sidebar__avatar:hover {
@@ -1858,6 +1868,11 @@ select option {
   font-size: var(--font-size-xl);
   overflow: hidden;
   flex-shrink: 0;
+  /* The editable icon is a real button; keep the old tile look. */
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font-family: inherit;
 }
 
 .instance-card__icon img {
@@ -1901,6 +1916,11 @@ select option {
 .icon-editable:active {
   transform: scale(0.96);
   transition-duration: var(--transition-fast);
+}
+
+.icon-editable:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .instance-card__body {
@@ -1967,6 +1987,27 @@ select option {
 .instance-card__info {
   flex: 1;
   min-width: 0;
+}
+
+/* The card itself remains a mouse convenience surface; this real button is
+   the keyboard/screen-reader entry point and must not inherit browser button
+   chrome. */
+.instance-card__open {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.instance-card__open:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
 .instance-card__actions {
@@ -2355,6 +2396,14 @@ select option {
   cursor: not-allowed;
 }
 
+/* Keyboard focus must stay visible on the tab row; the active tab already has
+   colour + the sliding frame, but focus is a separate state. */
+.tab:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -3px;
+  border-radius: var(--radius-sm);
+}
+
 .tab--active {
   color: var(--primary);
 }
@@ -2532,11 +2581,28 @@ select option {
 .settings-nav {
   overflow-x: auto;
   padding-bottom: 1px;
-  scrollbar-width: none;
+  padding-right: var(--space-sm);
+  /* A thin, theme-coloured bar makes horizontal scrolling discoverable when
+     the tab row no longer fits; the active tab is also scrolled into view. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--surface-border) transparent;
 }
 
 .settings-nav::-webkit-scrollbar {
-  display: none;
+  height: 4px;
+}
+
+.settings-nav::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.settings-nav::-webkit-scrollbar-thumb {
+  background: var(--surface-border);
+  border-radius: var(--radius-full);
+}
+
+.settings-nav::-webkit-scrollbar-thumb:hover {
+  background: var(--surface-border-hover);
 }
 
 .settings-nav .tabs__indicator {
@@ -2550,6 +2616,10 @@ select option {
   align-items: center;
   gap: 6px;
   white-space: nowrap;
+  /* Slightly tighter than the global tab padding so the seven Settings
+     categories fit at the default 1200px window without shrinking text. */
+  padding-left: 10px;
+  padding-right: 10px;
 }
 
 .settings-nav .tab svg {
@@ -2783,6 +2853,13 @@ html:not([data-theme='lg']) .settings-page--active {
 .toggle input:disabled + .toggle__slider {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* The real checkbox is visually hidden, so the visible slider must carry the
+   keyboard focus ring. */
+.toggle input:focus-visible + .toggle__slider {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
 }
 
 .toggle input:checked + .toggle__slider .toggle__knob {
@@ -4384,6 +4461,28 @@ input[type="range"]:active::-moz-range-thumb {
   box-shadow: var(--shadow-lg);
 }
 
+.content-version-row:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+.selection-chip__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.selection-chip__remove:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
 /* Frozen-glass look for the tall markdown panels of the modpacks page. */
 
 /* Accounts page: whole card selects the account (the 3D preview on the
@@ -4402,6 +4501,27 @@ input[type="range"]:active::-moz-range-thumb {
 .account-card:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
+}
+
+.account-card__select {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.account-card__select:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
 /* Per-account actions: compact hit targets with a soft glow on hover. The
@@ -4646,6 +4766,13 @@ input[type="range"]:active::-moz-range-thumb {
   border-radius: calc(var(--radius-md) - 4px);
 }
 
+/* Raw buttons inside a floating menu (banner swatches) have no .btn chrome,
+   so the focus ring is their only keyboard affordance. */
+.floating-menu button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
 /* Instance card context menu (right click) */
 .ctx-menu {
   position: fixed;
@@ -4846,6 +4973,61 @@ input[type="range"]:active::-moz-range-thumb {
 
 .settings-row__note--active {
   color: var(--color-warning);
+}
+
+/* Cache-clear confirmation: two plain-language fact blocks plus a retryable
+   error. Uses the same tokens as the rest of Settings. */
+.cache-clear__facts {
+  display: grid;
+  gap: var(--space-md);
+  margin: var(--space-md) 0;
+}
+
+.cache-clear__fact-label {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.cache-clear__fact-text {
+  margin-top: 2px;
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.cache-clear__note {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+.cache-clear__progress {
+  margin-top: var(--space-md);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+
+.cache-clear__success {
+  padding: var(--space-md);
+  border: 1px solid color-mix(in srgb, var(--color-success) 35%, transparent);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-success) 10%, transparent);
+  color: var(--color-success);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+
+.cache-clear__error {
+  margin-top: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid color-mix(in srgb, var(--color-danger) 35%, transparent);
+  border-radius: var(--radius-md);
+  background: var(--danger-bg);
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
 }
 
 .experimental-block {
@@ -5988,6 +6170,60 @@ html[data-theme='lg'] body.app-frozen .titlebar::after {
 
 .content-list-row--selected {
   background: var(--primary-dim);
+}
+
+.content-list-row-select,
+.content-list-card-select {
+  font-family: inherit;
+}
+
+.content-list-row-select:focus-visible,
+.content-list-card-select:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
+
+.content-list-toggle:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.instance-list__row:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+/* The instance detail lives in a narrow pane; six tabs no longer fit in it at
+   the minimum window width. Scroll only the tab row, with the same thin
+   scrollbar and auto-reveal behaviour as the Settings categories. */
+.instance-detail-tabs {
+  overflow-x: auto;
+  padding-bottom: 1px;
+  padding-right: var(--space-sm);
+  scrollbar-width: thin;
+  scrollbar-color: var(--surface-border) transparent;
+}
+
+.instance-detail-tabs::-webkit-scrollbar {
+  height: 4px;
+}
+
+.instance-detail-tabs::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.instance-detail-tabs::-webkit-scrollbar-thumb {
+  background: var(--surface-border);
+  border-radius: var(--radius-full);
+}
+
+.instance-detail-tabs::-webkit-scrollbar-thumb:hover {
+  background: var(--surface-border-hover);
+}
+
+.instance-detail-tabs .tabs__indicator {
+  bottom: 0;
 }
 
 .content-list-row--added {

@@ -6,6 +6,10 @@
 (вкладка бокового меню). Код: `src-tauri/src/rooms/`, `src-tauri/src/commands/rooms.rs`,
 `src/pages/Rooms.tsx`, `src/stores/roomStore.ts`.
 
+> Историческая заметка: протокол ниже описывает ранний MVP. Актуальная версия
+> разделяет публичный Room ID и секрет приглашения, а VoidLink использует
+> challenge-response (см. `rooms-tailscale-architecture.md`, §7).
+
 ---
 
 ## 1. Компоненты и где они встраиваются

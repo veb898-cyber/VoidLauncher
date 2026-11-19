@@ -34,6 +34,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["full"] }
 sha1 = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
 md-5 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 zip = "9"
@@ -62,6 +63,9 @@ winreg = "0.55"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Certificates",
+    "Win32_Security_WinTrust",
     "Win32_System_Threading",
     # Used only by the smoke harness' OpenGL capability probe (M7.4.1):
     # a hidden window + a 3.2 core context, so CI reports what the runner's
