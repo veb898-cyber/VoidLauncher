@@ -345,6 +345,9 @@ fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
             url,
             path,
             sha1,
+            sha256: None,
+            sha512: None,
+            checksum_source: None,
             size,
         });
     }

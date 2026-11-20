@@ -709,6 +709,41 @@ pub async fn cmd_prepare_elyby_skins(
     }
 }
 
+/// Launch-time Fabric integrity preparation.
+///
+/// This is the exact path used by `cmd_launch_game` before the game process is
+/// even considered. It verifies/re-downloads every Fabric loader library,
+/// enriches legacy profiles with repository checksums, and persists the
+/// upgraded profile so later launches need no checksum lookup. Returns an
+/// optional save warning without aborting the launch (the files were already
+/// verified in memory); verification failures are returned as errors.
+async fn prepare_fabric_libraries_for_launch(
+    config: &crate::config::AppConfig,
+    instance: &mut instances::Instance,
+) -> std::result::Result<Option<String>, String> {
+    let verified = match instance.loader_profile.as_mut() {
+        Some(profile) => {
+            modloaders::fabric::ensure_libraries(profile, &config.libraries_dir()).await
+        }
+        None => Ok(false),
+    };
+    match verified {
+        Ok(true) => {
+            // A legacy profile gained repository checksums; persist them so
+            // the lookup and verification happen once, not every launch.
+            match instances::save_instance(&config.instances_dir(), instance, None) {
+                Ok(()) => Ok(None),
+                Err(e) => Ok(Some(format!(
+                    "Fabric loader libraries were verified, but the upgraded checksum metadata could not be saved: {}",
+                    e
+                ))),
+            }
+        }
+        Ok(false) => Ok(None),
+        Err(e) => Err(format!("Failed to repair Fabric loader libraries: {}", e)),
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_launch_game(
     app: AppHandle,
@@ -1266,7 +1301,19 @@ pub async fn cmd_launch_game(
     // Self-heal loader libraries: if one was deleted or quarantined after
     // installation, download it now instead of silently dropping it from the
     // classpath (which surfaces later as NoClassDefFoundError).
-    if let Some(profile) = &instance.loader_profile {
+    if instance.loader == instances::LoaderType::Fabric {
+        // Fabric libraries have typed checksums persisted in the profile
+        // (metadata SHA-1/256/512 or an explicit same-origin repository
+        // checksum). Never fall back to "file exists" for this loader.
+        match prepare_fabric_libraries_for_launch(&config, &mut instance).await {
+            Ok(Some(warning)) => events::emit_log(&app, "warn", "launch", &warning),
+            Ok(None) => {}
+            Err(msg) => {
+                events::emit_log(&app, "error", "launch", &msg);
+                return Err(msg.into());
+            }
+        }
+    } else if let Some(profile) = &instance.loader_profile {
         for lib in &profile.libraries {
             if lib.url.is_empty() || crate::import::check_safe_remote_path(&lib.path).is_err() {
                 continue;
@@ -2484,7 +2531,99 @@ pub fn cmd_stop_game(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::tests::{
+        direct_proxy_lock, mock_dir, sha512_hex, spawn_mock, MockServer, MockSpec,
+    };
+    use crate::instances::{Instance, LoaderType};
     use crate::launch_state::{LaunchPhase, LaunchRegistry};
+    use crate::modloaders::{LoaderLibrary, LoaderProfile};
+    use std::sync::atomic::Ordering;
+
+    const LEGACY_ASM_SHA1: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
+
+    fn launch_config(data_dir: &Path) -> crate::config::AppConfig {
+        crate::config::AppConfig {
+            data_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    fn mock_base(server: &MockServer) -> String {
+        server.url.trim_end_matches("artifact.bin").to_string()
+    }
+
+    fn legacy_fabric_instance(name: &str, base: &str, loader_path: &str) -> Instance {
+        let mut instance = Instance::new(
+            name,
+            "1.20.1",
+            LoaderType::Fabric,
+            Some("0.19.5".to_string()),
+        );
+        instance.loader_profile = Some(LoaderProfile {
+            main_class: "net.fabricmc.loader.impl.launch.knot.KnotClient".to_string(),
+            libraries: vec![
+                LoaderLibrary {
+                    name: "net.fabricmc:fabric-loader:0.19.5".to_string(),
+                    url: base.to_string(),
+                    path: loader_path.to_string(),
+                    sha1: None,
+                    sha256: None,
+                    sha512: None,
+                    checksum_source: None,
+                    size: None,
+                },
+                LoaderLibrary {
+                    name: "org.ow2.asm:asm:9.6".to_string(),
+                    url: "https://maven.fabricmc.net/".to_string(),
+                    path: "org/ow2/asm/asm/9.6/asm-9.6.jar".to_string(),
+                    sha1: Some(LEGACY_ASM_SHA1.to_string()),
+                    sha256: None,
+                    sha512: None,
+                    checksum_source: None,
+                    size: Some(3),
+                },
+            ],
+            jvm_args: Vec::new(),
+            game_args: Vec::new(),
+            legacy_args: false,
+        });
+        instance
+    }
+
+    fn seed_launch_instance(
+        config: &crate::config::AppConfig,
+        instance: &Instance,
+    ) -> std::path::PathBuf {
+        instances::create_instance(&config.instances_dir(), instance, &LaunchRegistry::new())
+            .expect("create test instance");
+        let asm = config
+            .libraries_dir()
+            .join("org/ow2/asm/asm/9.6/asm-9.6.jar");
+        std::fs::create_dir_all(asm.parent().unwrap()).unwrap();
+        std::fs::write(&asm, b"abc").unwrap();
+        config
+            .instances_dir()
+            .join(&instance.name)
+            .join("instance.json")
+    }
+
+    fn seed_loader_file(config: &crate::config::AppConfig, path: &str, bytes: &[u8]) {
+        let dest = config.libraries_dir().join(path);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(dest, bytes).unwrap();
+    }
+
+    fn assert_no_part_files(path: &Path) {
+        for suffix in [".part", ".part.meta"] {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            assert!(
+                !std::path::PathBuf::from(value).exists(),
+                "temporary file for {} must not remain",
+                path.display()
+            );
+        }
+    }
 
     /// `AppState` with a launch registry and no Tauri app.
     fn test_state() -> AppState {
@@ -2505,6 +2644,155 @@ mod tests {
             room_state: std::sync::Arc::new(crate::rooms::room_state::RoomStateManager::new(&dir)),
             tailscale: crate::rooms::tailscale::TailscaleManager::new(dir),
         }
+    }
+
+    #[tokio::test]
+    async fn launch_preparation_migrates_legacy_fabric_profile_and_reuses_it() {
+        let _proxy = direct_proxy_lock().await;
+        let body = b"fabric-loader-artifact";
+        let expected = sha512_hex(body);
+        let server = spawn_mock(vec![MockSpec::ok(expected.as_bytes()), MockSpec::ok(body)]).await;
+        let data_dir = mock_dir("launch_fabric_migration");
+        let config = launch_config(&data_dir);
+        let loader_path = "net/fabricmc/fabric-loader/0.19.5/fabric-loader-0.19.5.jar";
+        let mut instance =
+            legacy_fabric_instance("Legacy Fabric", &mock_base(&server), loader_path);
+        let json_path = seed_launch_instance(&config, &instance);
+        seed_loader_file(&config, loader_path, b"old-placeholder");
+
+        // Scenario A: the real launch-time preparation path migrates, verifies
+        // and persists the profile before any game process is considered.
+        let warning = prepare_fabric_libraries_for_launch(&config, &mut instance)
+            .await
+            .expect("online preparation");
+        assert!(warning.is_none());
+        assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+
+        let first_bytes = std::fs::read(&json_path).unwrap();
+        let saved: Instance = serde_json::from_slice(&first_bytes).unwrap();
+        let saved_libs = &saved.loader_profile.as_ref().unwrap().libraries;
+        assert_eq!(saved_libs[0].sha512.as_deref(), Some(expected.as_str()));
+        assert_eq!(saved_libs[0].checksum_source.as_deref(), Some("repository"));
+        assert_eq!(saved_libs[0].sha1, None);
+        assert_eq!(saved_libs[1].sha1.as_deref(), Some(LEGACY_ASM_SHA1));
+        assert_eq!(saved_libs[1].size, Some(3));
+        assert_eq!(saved.mc_version, "1.20.1");
+        assert_eq!(saved.loader_version.as_deref(), Some("0.19.5"));
+        assert_eq!(
+            std::fs::read(config.libraries_dir().join(loader_path)).unwrap(),
+            body
+        );
+        assert_no_part_files(&config.libraries_dir().join(loader_path));
+
+        // Scenario B: reload from disk, then run preparation again. The saved
+        // checksum must be used and no metadata/checksum request may be made.
+        let mut reloaded =
+            instances::get_instance(&config.instances_dir(), "Legacy Fabric").unwrap();
+        let warning = prepare_fabric_libraries_for_launch(&config, &mut reloaded)
+            .await
+            .expect("second local preparation");
+        assert!(warning.is_none());
+        assert_eq!(
+            server.hits.load(Ordering::SeqCst),
+            2,
+            "second preparation must not touch the network"
+        );
+        assert_eq!(
+            std::fs::read(&json_path).unwrap(),
+            first_bytes,
+            "an already-valid profile must not be rewritten"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn launch_preparation_offline_failure_preserves_files_profile_and_neighbors() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![
+            MockSpec::status(404),
+            MockSpec::status(404),
+            MockSpec::status(404),
+        ])
+        .await;
+        let data_dir = mock_dir("launch_fabric_offline");
+        let config = launch_config(&data_dir);
+        let loader_path = "net/fabricmc/fabric-loader/0.19.5/fabric-loader-0.19.5.jar";
+        let mut instance =
+            legacy_fabric_instance("Legacy Fabric", &mock_base(&server), loader_path);
+        let json_path = seed_launch_instance(&config, &instance);
+        seed_loader_file(&config, loader_path, b"working-loader");
+        let before_json = std::fs::read(&json_path).unwrap();
+        let before_lib = std::fs::read(config.libraries_dir().join(loader_path)).unwrap();
+
+        let neighbor = Instance::new("Neighbor", "1.20.1", LoaderType::Vanilla, None);
+        let neighbor_json = seed_launch_instance(&config, &neighbor);
+        let before_neighbor = std::fs::read(&neighbor_json).unwrap();
+
+        let err = prepare_fabric_libraries_for_launch(&config, &mut instance)
+            .await
+            .expect_err("offline checksum lookup must fail");
+        assert!(err.contains("no repository checksum"), "got: {err}");
+        assert_eq!(
+            std::fs::read(config.libraries_dir().join(loader_path)).unwrap(),
+            before_lib
+        );
+        assert_eq!(std::fs::read(&json_path).unwrap(), before_json);
+        assert_eq!(std::fs::read(&neighbor_json).unwrap(), before_neighbor);
+        let saved: Instance = serde_json::from_slice(&before_json).unwrap();
+        let saved_lib = &saved.loader_profile.as_ref().unwrap().libraries[0];
+        assert!(saved_lib.sha1.is_none());
+        assert!(saved_lib.sha256.is_none());
+        assert!(saved_lib.sha512.is_none());
+        assert!(saved_lib.checksum_source.is_none());
+        assert_no_part_files(&config.libraries_dir().join(loader_path));
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn launch_preparation_checksum_mismatch_rolls_back() {
+        let _proxy = direct_proxy_lock().await;
+        let wrong = "0".repeat(128);
+        let hostile = b"hostile-artifact";
+        let server = spawn_mock(vec![
+            MockSpec::ok(wrong.as_bytes()),
+            MockSpec::ok(hostile),
+            MockSpec::ok(hostile),
+            MockSpec::ok(hostile),
+            MockSpec::ok(hostile),
+            MockSpec::ok(hostile),
+        ])
+        .await;
+        let data_dir = mock_dir("launch_fabric_mismatch");
+        let config = launch_config(&data_dir);
+        let loader_path = "net/fabricmc/fabric-loader/0.19.5/fabric-loader-0.19.5.jar";
+        let mut instance =
+            legacy_fabric_instance("Legacy Fabric", &mock_base(&server), loader_path);
+        let json_path = seed_launch_instance(&config, &instance);
+        seed_loader_file(&config, loader_path, b"working-loader");
+        let before_json = std::fs::read(&json_path).unwrap();
+        let before_lib = std::fs::read(config.libraries_dir().join(loader_path)).unwrap();
+
+        let err = prepare_fabric_libraries_for_launch(&config, &mut instance)
+            .await
+            .expect_err("a wrong repository checksum must abort preparation");
+        assert!(err.contains("SHA512 mismatch"), "got: {err}");
+        assert_eq!(
+            std::fs::read(config.libraries_dir().join(loader_path)).unwrap(),
+            before_lib,
+            "the working artifact must survive a failed verification"
+        );
+        assert_eq!(
+            std::fs::read(&json_path).unwrap(),
+            before_json,
+            "a failed migration must not persist the bogus checksum"
+        );
+        let saved: Instance = serde_json::from_slice(&before_json).unwrap();
+        let saved_lib = &saved.loader_profile.as_ref().unwrap().libraries[0];
+        assert!(saved_lib.sha512.is_none());
+        assert!(saved_lib.checksum_source.is_none());
+        assert_no_part_files(&config.libraries_dir().join(loader_path));
+        assert_eq!(server.hits.load(Ordering::SeqCst), 6);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]
