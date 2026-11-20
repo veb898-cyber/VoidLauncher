@@ -1,3 +1,4 @@
+pub(crate) mod artifact;
 #[allow(dead_code)]
 pub mod fabric;
 pub mod forge;

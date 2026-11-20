@@ -1,5 +1,6 @@
 use super::{LoaderLibrary, LoaderProfile, LoaderVersionPage};
 use crate::error::{LauncherError, Result};
+use crate::integrity::HashSpec;
 use crate::versions::maven_to_path;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -50,6 +51,10 @@ struct ForgeArtifact {
     path: Option<String>,
     url: Option<String>,
     sha1: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    sha512: Option<String>,
     size: Option<u64>,
 }
 
@@ -111,64 +116,25 @@ async fn download_installer(mc_version: &str, forge_version: &str) -> Result<Pat
 
     let installer_path = std::env::temp_dir().join(format!("forge-{}-installer.jar", full_version));
 
-    // Reuse a cached installer only when it is a real, readable installer
-    // archive. A truncation, an HTML error page or a partially downloaded
-    // file must trigger a fresh download instead of failing later in the
-    // processor pipeline.
-    if installer_path.exists() {
-        if installer_jar_is_valid(&installer_path) {
-            tracing::debug!(target: "launcher", "Reusing existing installer at {}", installer_path.display());
-            return Ok(installer_path);
-        }
-        tracing::warn!(
-            target: "launcher",
-            "Cached Forge installer is not a valid archive, re-downloading: {}",
-            installer_path.display()
-        );
+    // A cached installer is accepted only after its checksum has been
+    // verified. The first candidate whose repository sidecar is available
+    // wins; a 404 candidate simply falls through to the next legacy layout.
+    super::artifact::download_verified_installer(
+        &installer_urls,
+        &installer_path,
+        super::artifact::FORGE_HOSTS,
+        &format!("Forge installer {full_version}"),
+    )
+    .await?;
+
+    // The checksum proves the exact Maven bytes; the structural check is an
+    // additional guard against an installer that is authentic but unusable.
+    if !installer_jar_is_valid(&installer_path) {
         let _ = std::fs::remove_file(&installer_path);
-    }
-
-    let mut last_err = String::new();
-    let mut downloaded = false;
-
-    for installer_url in &installer_urls {
-        for attempt in 1..=3u32 {
-            match crate::download::download_file(installer_url, &installer_path, "").await {
-                Ok(()) => {
-                    if installer_jar_is_valid(&installer_path) {
-                        downloaded = true;
-                        break;
-                    }
-                    last_err = "downloaded file is not a valid installer archive".to_string();
-                    let _ = std::fs::remove_file(&installer_path);
-                    tracing::warn!(target: "launcher", "Forge installer download attempt {}/3 for {} produced an invalid archive", attempt, installer_url);
-                    if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_secs(3 * attempt as u64))
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    tracing::warn!(target: "launcher", "Forge installer download attempt {}/3 for {} failed: {}", attempt, installer_url, last_err);
-                    if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_secs(3 * attempt as u64))
-                            .await;
-                    }
-                }
-            }
-        }
-        if downloaded {
-            break;
-        }
-    }
-
-    if !downloaded {
         return Err(LauncherError::ModLoader(format!(
-            "Failed to download Forge installer after 3 attempts: {}",
-            last_err
+            "Downloaded Forge installer {full_version} is not a valid installer archive"
         )));
     }
-
     Ok(installer_path)
 }
 
@@ -306,6 +272,20 @@ pub(crate) fn read_entry_from_jar<R: Read + std::io::Seek>(
     None
 }
 
+/// Read only `install_profile.json` from a cached installer JAR.
+///
+/// Used for local fast-path checks that must not turn a healthy launch into a
+/// network request. The caller still verifies the installer before relying on
+/// it for install/repair.
+pub(crate) fn read_install_profile_from_installer(
+    installer_path: &Path,
+) -> Option<serde_json::Value> {
+    let file = std::fs::File::open(installer_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let text = read_entry_from_jar(&mut archive, "install_profile.json")?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Extract a binary entry from inside a JAR (zip) archive to a destination path.
 pub(crate) fn extract_entry_from_jar<R: Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
@@ -352,44 +332,50 @@ pub(crate) async fn download_processor_lib(
     lib_val: &serde_json::Value,
     libraries_dir: &Path,
     maven_base: &str,
+    allowed_hosts: &[&str],
 ) -> Result<()> {
     let name = lib_val.get("name").and_then(|n| n.as_str()).unwrap_or("");
     if name.is_empty() {
         return Ok(());
     }
 
-    // Build URL and path from the downloads.artifact section
-    let (url, path_str) = if let Some(downloads) = lib_val.get("downloads") {
-        if let Some(artifact) = downloads.get("artifact") {
-            let p = artifact
-                .get("path")
-                .and_then(|p| p.as_str())
-                .unwrap_or("")
-                .to_string();
-            let lib_path = if p.is_empty() { maven_to_path(name) } else { p };
-            let lib_url = artifact
-                .get("url")
-                .and_then(|u| u.as_str())
-                .filter(|u| !u.is_empty())
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| format!("{}{}", maven_base, lib_path));
-            (lib_url, lib_path)
-        } else {
-            let path = maven_to_path(name);
-            let base = lib_val
-                .get("url")
-                .and_then(|u| u.as_str())
-                .filter(|u| !u.is_empty())
-                .unwrap_or(maven_base);
-            let base = if base.ends_with('/') {
-                base.to_string()
-            } else {
-                format!("{}/", base)
-            };
-            (format!("{}{}", base, path), path.to_string())
+    let artifact = lib_val
+        .get("downloads")
+        .and_then(|downloads| downloads.get("artifact"));
+    let (url, path_str, sha1, sha256, sha512, size) = if let Some(artifact) = artifact {
+        let path_str = artifact
+            .get("path")
+            .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| maven_to_path(name));
+        let url = artifact.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        // An empty artifact URL means the file is embedded in the installer.
+        if url.is_empty() {
+            return Ok(());
         }
+        (
+            url.to_string(),
+            path_str,
+            artifact
+                .get("sha1")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            artifact
+                .get("sha256")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            artifact
+                .get("sha512")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            artifact.get("size").and_then(|v| v.as_u64()),
+        )
     } else {
-        let path = maven_to_path(name);
+        let path_str = maven_to_path(name);
         let base = lib_val
             .get("url")
             .and_then(|u| u.as_str())
@@ -400,40 +386,45 @@ pub(crate) async fn download_processor_lib(
         } else {
             format!("{}/", base)
         };
-        (format!("{}{}", base, path), path.to_string())
+        (
+            format!("{}{}", base, path_str),
+            path_str,
+            None,
+            None,
+            None,
+            None,
+        )
     };
 
-    let lib_path = libraries_dir.join(&path_str);
     if crate::import::check_safe_remote_path(&path_str).is_err() {
         return Err(LauncherError::ModLoader(format!(
             "Unsafe processor library path: {}",
             path_str
         )));
     }
-    // Trust an existing file only when it is not a JAR or passes the
-    // structural check — a zero-byte/truncated processor library would
-    // otherwise be accepted and break the pipeline run that follows.
-    let existing_ok = lib_path.exists()
-        && (lib_path.extension().and_then(|e| e.to_str()) != Some("jar")
-            || is_usable_jar(&lib_path));
-    if existing_ok {
-        return Ok(());
-    }
 
-    // If URL is empty, the file is embedded in the installer JAR. Don't download.
-    if url.is_empty() || url == maven_base {
-        return Ok(());
-    }
-
-    if let Some(parent) = lib_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-
-    crate::download::download_file(&url, &lib_path, "")
+    let source = super::artifact::has_metadata_checksum(
+        sha1.as_deref(),
+        sha256.as_deref(),
+        sha512.as_deref(),
+    )
+    .then(|| "metadata".to_string());
+    let mut lib = LoaderLibrary {
+        name: name.to_string(),
+        url,
+        path: path_str,
+        sha1,
+        sha256,
+        sha512,
+        checksum_source: source,
+        size,
+    };
+    super::artifact::ensure_library(&mut lib, libraries_dir, allowed_hosts, "processor")
         .await
+        .map(|_| ())
         .map_err(|e| {
             LauncherError::ModLoader(format!(
-                "Failed to download processor library {}: {}",
+                "Failed to verify processor library {}: {}",
                 name, e
             ))
         })
@@ -453,6 +444,201 @@ pub(crate) struct ForgeProcessorInputs<'a> {
     /// installer data files under `<data_base>/_data/<data_version>/...` so
     /// different loader versions can never reuse each other's patch files.
     pub data_version: &'a str,
+}
+
+/// A processor-generated JAR and the checksum the installer metadata declares
+/// for it. Not every generated JAR has a publisher checksum; those without one
+/// are still required to be structurally valid.
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessorOutput {
+    pub path: PathBuf,
+    pub checksum: Option<HashSpec>,
+}
+
+/// Build the variable map used by installer processors and output checks.
+// The arguments mirror the installer context one-to-one; grouping them into
+// another struct would duplicate `ForgeProcessorInputs` without simplifying
+// either caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_processor_vars(
+    install_profile: &serde_json::Value,
+    installer_path: &Path,
+    libraries_dir: &Path,
+    mc_version: &str,
+    client_jar: &Path,
+    root_dir: &Path,
+    data_base: &str,
+    data_version: &str,
+) -> HashMap<String, String> {
+    let mut vars: HashMap<String, String> = HashMap::new();
+    vars.insert("SIDE".to_string(), "client".to_string());
+    vars.insert(
+        "MINECRAFT_JAR".to_string(),
+        client_jar.to_string_lossy().to_string(),
+    );
+    vars.insert("MINECRAFT_VERSION".to_string(), mc_version.to_string());
+    vars.insert("ROOT".to_string(), root_dir.to_string_lossy().to_string());
+    vars.insert(
+        "INSTALLER".to_string(),
+        installer_path.to_string_lossy().to_string(),
+    );
+    vars.insert(
+        "LIBRARY_DIR".to_string(),
+        libraries_dir.to_string_lossy().to_string(),
+    );
+
+    if let Some(data_map) = install_profile.get("data").and_then(|d| d.as_object()) {
+        for (key, entry) in data_map {
+            let client_val = entry.get("client").and_then(|c| c.as_str()).unwrap_or("");
+            if client_val.starts_with('[') {
+                // Maven artifact reference - resolve to local filesystem path
+                vars.insert(
+                    key.clone(),
+                    resolve_artifact_ref(client_val, libraries_dir)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            } else if client_val.starts_with('/') {
+                // Path inside installer JAR - use extracted location in libraries dir
+                let jar_path = client_val.trim_start_matches('/');
+                let fname = Path::new(jar_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("data");
+                let data_path = data_file_path(libraries_dir, data_base, data_version, key, fname);
+                vars.insert(key.clone(), data_path.to_string_lossy().to_string());
+            } else {
+                // Plain string (e.g. SHA hash in quotes) - use as-is, strip surrounding quotes
+                let clean = client_val.trim_matches('\'').trim_matches('"').to_string();
+                vars.insert(key.clone(), clean);
+            }
+        }
+    }
+    vars
+}
+
+fn resolve_processor_value(raw: &str, vars: &HashMap<String, String>) -> Result<String> {
+    let mut value = raw.to_string();
+    for (key, replacement) in vars {
+        value = value.replace(&format!("{{{}}}", key), replacement);
+    }
+    if value.contains('{') || value.contains('}') {
+        return Err(LauncherError::ModLoader(format!(
+            "Processor metadata has an unresolved placeholder: {}",
+            truncate_for_error(&value, 300)
+        )));
+    }
+    let trimmed = value.trim();
+    let without_quotes = trimmed
+        .strip_prefix('\'')
+        .and_then(|v| v.strip_suffix('\''))
+        .or_else(|| trimmed.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+        .unwrap_or(trimmed);
+    Ok(without_quotes.to_string())
+}
+
+/// Resolve the processor outputs that are expected for this installer.
+///
+/// The installer's `data` map names the client-side JARs and, for some of
+/// them, a paired `*_SHA` value. Those SHA-1 values are publisher metadata,
+/// not a hash computed after generation. `MC_UNPACKED` is server-only and is
+/// deliberately excluded.
+pub(crate) fn processor_output_plan(
+    install_profile: &serde_json::Value,
+    vars: &HashMap<String, String>,
+    libraries_dir: &Path,
+) -> Result<Vec<ProcessorOutput>> {
+    let mut outputs: Vec<ProcessorOutput> = Vec::new();
+    let Some(data) = install_profile.get("data").and_then(|d| d.as_object()) else {
+        return Ok(outputs);
+    };
+
+    let mut push = |path: PathBuf, checksum: Option<HashSpec>| -> Result<()> {
+        if !path.starts_with(libraries_dir) {
+            return Err(LauncherError::ModLoader(format!(
+                "Processor output escapes the libraries directory: {}",
+                path.display()
+            )));
+        }
+        crate::import::ensure_no_reparse_points(libraries_dir, &path)?;
+        if let Some(existing) = outputs.iter_mut().find(|output| output.path == path) {
+            if existing.checksum.is_none() {
+                existing.checksum = checksum;
+            }
+            return Ok(());
+        }
+        outputs.push(ProcessorOutput { path, checksum });
+        Ok(())
+    };
+
+    for (key, entry) in data {
+        if key == "MC_UNPACKED" || entry.get("client").and_then(|v| v.as_str()).is_none() {
+            continue;
+        }
+        let Some(path) = vars.get(key) else {
+            continue;
+        };
+        if path.is_empty() {
+            let artifact_ref = entry
+                .get("client")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| value.starts_with('['));
+            if artifact_ref {
+                return Err(LauncherError::ModLoader(format!(
+                    "Processor output {key} has an unsafe or malformed artifact coordinate"
+                )));
+            }
+            continue;
+        }
+        if !path.to_ascii_lowercase().ends_with(".jar") {
+            continue;
+        }
+        let checksum = match vars.get(&format!("{key}_SHA")) {
+            Some(hash) if !hash.is_empty() => Some(HashSpec::sha1(hash)?),
+            _ => None,
+        };
+        push(PathBuf::from(path), checksum)?;
+    }
+
+    // Newer installer profiles may declare outputs directly. Use them too so
+    // a renamed output is not silently ignored.
+    if let Some(processors) = install_profile.get("processors").and_then(|p| p.as_array()) {
+        for processor in processors {
+            let Some(outputs_map) = processor.get("outputs").and_then(|o| o.as_object()) else {
+                continue;
+            };
+            for (raw_path, raw_checksum) in outputs_map {
+                let Some(raw_checksum) = raw_checksum.as_str() else {
+                    continue;
+                };
+                let path = PathBuf::from(resolve_processor_value(raw_path, vars)?);
+                let checksum = resolve_processor_value(raw_checksum, vars)?;
+                push(path, Some(HashSpec::sha1(&checksum)?))?;
+            }
+        }
+    }
+
+    Ok(outputs)
+}
+
+pub(crate) fn verify_processor_outputs(outputs: &[ProcessorOutput]) -> Result<()> {
+    for output in outputs {
+        if !is_usable_jar(&output.path) {
+            return Err(LauncherError::ModLoader(format!(
+                "Processor output is missing or not a valid JAR: {}",
+                output.path.display()
+            )));
+        }
+        if let Some(checksum) = &output.checksum {
+            if !checksum.verify_file(&output.path)? {
+                return Err(LauncherError::ModLoader(format!(
+                    "Processor output failed its installer metadata checksum: {}",
+                    output.path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run the Forge installer processors (Forge 1.13+) by spawning Java processes
@@ -486,52 +672,19 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
         .and_then(|p| p.as_array())
         .ok_or_else(|| LauncherError::ModLoader("No processors in install_profile.json".into()))?;
 
-    // Build variable map
-    let mut vars: HashMap<String, String> = HashMap::new();
-    vars.insert("SIDE".to_string(), "client".to_string());
-    vars.insert(
-        "MINECRAFT_JAR".to_string(),
-        client_jar.to_string_lossy().to_string(),
+    let vars = build_processor_vars(
+        install_profile,
+        installer_path,
+        libraries_dir,
+        mc_version,
+        client_jar,
+        root_dir,
+        data_base,
+        data_version,
     );
-    vars.insert("MINECRAFT_VERSION".to_string(), mc_version.to_string());
-    vars.insert("ROOT".to_string(), root_dir.to_string_lossy().to_string());
-    vars.insert(
-        "INSTALLER".to_string(),
-        installer_path.to_string_lossy().to_string(),
-    );
-    vars.insert(
-        "LIBRARY_DIR".to_string(),
-        libraries_dir.to_string_lossy().to_string(),
-    );
-
-    // Add data entries to vars
-    if let Some(data_map) = install_profile.get("data").and_then(|d| d.as_object()) {
-        for (key, entry) in data_map {
-            let client_val = entry.get("client").and_then(|c| c.as_str()).unwrap_or("");
-            if client_val.starts_with('[') {
-                // Maven artifact reference - resolve to local filesystem path
-                vars.insert(
-                    key.clone(),
-                    resolve_artifact_ref(client_val, libraries_dir)
-                        .to_string_lossy()
-                        .to_string(),
-                );
-            } else if client_val.starts_with('/') {
-                // Path inside installer JAR - use extracted location in libraries dir
-                let jar_path = client_val.trim_start_matches('/');
-                let fname = Path::new(jar_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("data");
-                let data_path = data_file_path(libraries_dir, data_base, data_version, key, fname);
-                vars.insert(key.clone(), data_path.to_string_lossy().to_string());
-            } else {
-                // Plain string (e.g. SHA hash in quotes) - use as-is, strip surrounding quotes
-                let clean = client_val.trim_matches('\'').trim_matches('"').to_string();
-                vars.insert(key.clone(), clean);
-            }
-        }
-    }
+    // Resolve the output list before running anything, so a malformed or
+    // escaping output coordinate fails before Java can write to it.
+    let expected_outputs = processor_output_plan(install_profile, &vars, libraries_dir)?;
 
     tracing::info!(target: "launcher", "Running {} Forge processors", processors.len());
 
@@ -702,6 +855,28 @@ pub(crate) fn run_forge_processors(inputs: ForgeProcessorInputs<'_>) -> Result<(
         tracing::info!(target: "launcher", "Processor {} completed", idx);
     }
 
+    // A successful process exit is not enough: the installer metadata names
+    // the expected client JAR checksums. Verify them before reporting the
+    // generated pipeline as usable.
+    if let Err(e) = verify_processor_outputs(&expected_outputs) {
+        for output in &expected_outputs {
+            let _ = std::fs::remove_file(&output.path);
+        }
+        return Err(e);
+    }
+    tracing::info!(
+        target: "launcher",
+        "Processor outputs verified ({} declared checksums, {} structural-only)",
+        expected_outputs
+            .iter()
+            .filter(|output| output.checksum.is_some())
+            .count(),
+        expected_outputs
+            .iter()
+            .filter(|output| output.checksum.is_none())
+            .count()
+    );
+
     Ok(())
 }
 
@@ -713,26 +888,62 @@ fn build_profile(
 ) -> Result<LoaderProfile> {
     let mut libraries = Vec::new();
     for lib in libs {
-        let (url, path, sha1, size) = if let Some(downloads) = &lib.downloads {
-            if let Some(artifact) = &downloads.artifact {
-                let lib_path = artifact
-                    .path
-                    .clone()
-                    .unwrap_or_else(|| maven_to_path(&lib.name));
-                // An explicitly empty URL means the artifact is embedded in the
-                // installer JAR (modern Forge ships its runtime jar that way)
-                // and must be extracted from it, not downloaded from maven.
-                let lib_url = match artifact.url.as_ref() {
-                    Some(u) if u.is_empty() => String::new(),
-                    Some(u) => u.clone(),
-                    None => format!("https://maven.minecraftforge.net/{}", lib_path),
-                };
-                (
-                    lib_url,
-                    lib_path,
-                    artifact.sha1.clone().filter(|s| !s.is_empty()),
-                    artifact.size,
-                )
+        let (url, path, sha1, sha256, sha512, checksum_source, size) =
+            if let Some(downloads) = &lib.downloads {
+                if let Some(artifact) = &downloads.artifact {
+                    let lib_path = artifact
+                        .path
+                        .clone()
+                        .unwrap_or_else(|| maven_to_path(&lib.name));
+                    // An explicitly empty URL means the artifact is embedded in the
+                    // installer JAR (modern Forge ships its runtime jar that way)
+                    // and must be extracted from it, not downloaded from maven.
+                    let lib_url = match artifact.url.as_ref() {
+                        Some(u) if u.is_empty() => String::new(),
+                        Some(u) => u.clone(),
+                        None => format!("https://maven.minecraftforge.net/{}", lib_path),
+                    };
+                    let sha1 = artifact.sha1.clone().filter(|s| !s.is_empty());
+                    let sha256 = artifact.sha256.clone().filter(|s| !s.is_empty());
+                    let sha512 = artifact.sha512.clone().filter(|s| !s.is_empty());
+                    let source = super::artifact::has_metadata_checksum(
+                        sha1.as_deref(),
+                        sha256.as_deref(),
+                        sha512.as_deref(),
+                    )
+                    .then(|| "metadata".to_string());
+                    (
+                        lib_url,
+                        lib_path,
+                        sha1,
+                        sha256,
+                        sha512,
+                        source,
+                        artifact.size,
+                    )
+                } else {
+                    let path = maven_to_path(&lib.name);
+                    let base = lib
+                        .url
+                        .as_ref()
+                        .filter(|u| !u.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| super::artifact::FORGE_MAVEN.to_string());
+                    let base = if base.ends_with('/') {
+                        base
+                    } else {
+                        format!("{}/", base)
+                    };
+                    (
+                        format!("{}{}", base, path),
+                        path,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
             } else {
                 let path = maven_to_path(&lib.name);
                 let base = lib
@@ -740,38 +951,31 @@ fn build_profile(
                     .as_ref()
                     .filter(|u| !u.is_empty())
                     .cloned()
-                    .unwrap_or_else(|| "https://maven.minecraftforge.net/".to_string());
+                    .unwrap_or_else(|| super::artifact::FORGE_MAVEN.to_string());
                 let base = if base.ends_with('/') {
                     base
                 } else {
                     format!("{}/", base)
                 };
-                (format!("{}{}", base, path), path, None, None)
-            }
-        } else {
-            let path = maven_to_path(&lib.name);
-            let base = lib
-                .url
-                .as_ref()
-                .filter(|u| !u.is_empty())
-                .cloned()
-                .unwrap_or_else(|| "https://maven.minecraftforge.net/".to_string());
-            let base = if base.ends_with('/') {
-                base
-            } else {
-                format!("{}/", base)
+                (
+                    format!("{}{}", base, path),
+                    path,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             };
-            (format!("{}{}", base, path), path, None, None)
-        };
 
         libraries.push(LoaderLibrary {
             name: lib.name.clone(),
             url,
             path,
             sha1,
-            sha256: None,
-            sha512: None,
-            checksum_source: None,
+            sha256,
+            sha512,
+            checksum_source,
             size,
         });
     }
@@ -1092,12 +1296,69 @@ pub async fn ensure_processor_jars(
     };
 
     // Processor outputs are written into the timestamped version dir
-    // (e.g. 1.16.5-20210115.111550), not the plain MC version one —
+    // (e.g. 1.16.5-20210115.111550), not the plain MC version one -
     // scan whatever version dirs exist under net/minecraft/client/.
     let client_version_dirs = scan_client_version_dirs(&libraries_dir);
-    // Existing outputs are trusted only when they pass the structural check:
-    // an empty/truncated JAR left behind by a failed processor must trigger
-    // a re-run instead of being accepted as installed.
+    let forge_client_path = libraries_dir
+        .join("net")
+        .join("minecraftforge")
+        .join("forge")
+        .join(&full_version)
+        .join(format!("forge-{}-client.jar", full_version));
+
+    let vd = versions_dir.join(mc_version);
+    let client_jar = if vd.join("client.jar").exists() {
+        vd.join("client.jar")
+    } else {
+        vd.join(format!("{}.jar", mc_version))
+    };
+    let root_dir = versions_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| versions_dir.clone());
+    if !client_jar.exists() {
+        return Err(LauncherError::ModLoader(format!(
+            "Client JAR not found at {:?}",
+            client_jar
+        )));
+    }
+
+    // If the installer is still cached, its metadata names the exact
+    // generated paths and, for most outputs, SHA-1 values. Prefer that over
+    // the old "any structurally valid JAR with the right suffix" scan: it
+    // rejects a stale or wrong-loader output before the pipeline is skipped.
+    let cached_installer =
+        std::env::temp_dir().join(format!("forge-{}-installer.jar", full_version));
+    let metadata_outputs = read_install_profile_from_installer(&cached_installer)
+        .map(|profile| {
+            let vars = build_processor_vars(
+                &profile,
+                &cached_installer,
+                &libraries_dir,
+                mc_version,
+                &client_jar,
+                &root_dir,
+                "net/minecraftforge/forge",
+                &full_version,
+            );
+            processor_output_plan(&profile, &vars, &libraries_dir)
+        })
+        .transpose()?;
+    if let Some(outputs) = &metadata_outputs {
+        if !outputs.is_empty() && verify_processor_outputs(outputs).is_ok() {
+            tracing::debug!(
+                target: "launcher",
+                "All Forge processor JARs match the cached installer metadata"
+            );
+            return Ok(());
+        }
+    }
+
+    // Without cached metadata, keep the structural fallback so a cleaned
+    // %TEMP% does not force a download on every launch. Existing outputs are
+    // trusted only when they pass the structural check: an empty/truncated
+    // JAR left behind by a failed processor must trigger a re-run instead of
+    // being accepted as installed.
     let slim_ok = find_client_jar_in(&client_version_dirs, mc_version, "slim")
         .map(|p| is_usable_jar(&p))
         .unwrap_or(false);
@@ -1107,16 +1368,9 @@ pub async fn ensure_processor_jars(
     let srg_ok = find_client_jar_in(&client_version_dirs, mc_version, "srg")
         .map(|p| is_usable_jar(&p))
         .unwrap_or(false);
-    let forge_client_path = libraries_dir
-        .join("net")
-        .join("minecraftforge")
-        .join("forge")
-        .join(&full_version)
-        .join(format!("forge-{}-client.jar", full_version));
-
     let client_ok = is_usable_jar(&forge_client_path);
 
-    if slim_ok && extra_ok && client_ok && srg_ok {
+    if metadata_outputs.is_none() && slim_ok && extra_ok && client_ok && srg_ok {
         tracing::debug!(target: "launcher", "All Forge processor JARs present");
         return Ok(());
     }
@@ -1163,12 +1417,13 @@ pub async fn ensure_processor_jars(
     tracing::info!(target: "launcher", "Downloading Forge processor libraries...");
     if let Some(libraries) = install_profile.get("libraries").and_then(|l| l.as_array()) {
         for lib_val in libraries {
-            if let Err(e) =
-                download_processor_lib(lib_val, &libraries_dir, "https://maven.minecraftforge.net/")
-                    .await
-            {
-                tracing::warn!(target: "launcher", "Processor library download warning: {}", e);
-            }
+            download_processor_lib(
+                lib_val,
+                &libraries_dir,
+                super::artifact::FORGE_MAVEN,
+                super::artifact::FORGE_HOSTS,
+            )
+            .await?;
         }
     }
 
@@ -1220,26 +1475,9 @@ pub async fn ensure_processor_jars(
 
     drop(archive); // Release the JAR bytes
 
-    // --- Step 3: Locate client JAR ---
-    let vd = versions_dir.join(mc_version);
-    let client_jar = if vd.join("client.jar").exists() {
-        vd.join("client.jar")
-    } else {
-        vd.join(format!("{}.jar", mc_version))
-    };
-    if !client_jar.exists() {
-        return Err(LauncherError::ModLoader(format!(
-            "Client JAR not found at {:?}",
-            client_jar
-        )));
-    }
-
-    let root_dir = versions_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| versions_dir.to_path_buf());
-
-    // --- Step 4: Run the processor pipeline ---
+    // --- Step 3: Run the processor pipeline ---
+    // The client JAR and root path were resolved above for the
+    // metadata-based fast path and are guaranteed present here.
     // libraries_dir is always `<data_dir>/libraries` (see config.rs),
     // so its parent is the app data dir used to locate managed runtimes.
     let data_dir = libraries_dir
@@ -1287,7 +1525,9 @@ pub async fn ensure_processor_jars(
             // whole pipeline instead of finding it "already present".
             tracing::warn!(target: "launcher", "Forge processor run failed: {}", e);
             std::fs::remove_file(&forge_client_path).ok();
-            std::fs::remove_file(&installer_path).ok();
+            // Keep the verified installer cached: the next attempt uses its
+            // metadata to reject partial outputs and re-run the pipeline
+            // instead of falling back to a structural-only check.
             return Err(LauncherError::ModLoader(format!(
                 "Forge processor pipeline failed: {}",
                 e
@@ -1305,7 +1545,7 @@ pub async fn ensure_processor_jars(
     // Keep the validated installer cached (see download_installer) so a
     // self-heal of an unrelated processor JAR does not download it again.
 
-    // --- Step 5: Verify outputs ---
+    // --- Step 4: Verify outputs ---
     // Outputs live in the timestamped version dir (1.16.5-20210115.111550);
     // re-scan (the pipeline may have created dirs since the skip check) and
     // apply the same structural check — a file that fails it is not a valid
@@ -1438,74 +1678,14 @@ pub async fn install(
 ) -> Result<LoaderProfile> {
     tracing::info!(target: "launcher", "Installing Forge for MC {} (loader {})", mc_version, loader_version);
 
-    let profile = get_profile(mc_version, loader_version).await?;
-
-    for lib in &profile.libraries {
-        // Empty URL = artifact embedded in the installer JAR; it is extracted
-        // by ensure_processor_jars, so don't try to download it.
-        if lib.url.is_empty() {
-            tracing::debug!(target: "launcher", "Skipping download of {} (embedded in installer)", lib.name);
-            continue;
-        }
-        let lib_path = libraries_dir.join(&lib.path);
-        if !lib_path.exists() {
-            match crate::download::download_file(&lib.url, &lib_path, "").await {
-                Ok(()) => {}
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("404") && lib.name.starts_with("net.minecraftforge:forge:")
-                    {
-                        // Modern Forge (MC 1.13+) publishes the runtime jar as
-                        // `forge-{maven_version}-universal.jar` in the same
-                        // directory, but newer install profiles reference a
-                        // `-client` classifier that no longer exists on maven.
-                        let version_dir = Path::new(&lib.path)
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let universal_name = if version_dir.is_empty() {
-                            None
-                        } else {
-                            Some(format!("forge-{}-universal.jar", version_dir))
-                        };
-                        let universal_url = if let Some(name) = &universal_name {
-                            lib.url
-                                .rsplit_once('/')
-                                .map(|(base, _)| format!("{}/{}", base, name))
-                                .unwrap_or_else(|| lib.url.clone())
-                        } else {
-                            lib.url.replace(".jar", "-universal.jar")
-                        };
-                        let universal_path = if let Some(name) = &universal_name {
-                            Path::new(&lib.path)
-                                .parent()
-                                .map(|p| p.join(name))
-                                .unwrap_or_else(|| PathBuf::from(&lib.path))
-                        } else {
-                            PathBuf::from(lib.path.replace(".jar", "-universal.jar"))
-                        };
-                        let universal_full = libraries_dir.join(&universal_path);
-                        if !universal_full.exists() {
-                            tracing::debug!(target: "launcher", "Trying universal fallback for {}", lib.name);
-                            if let Err(e2) =
-                                crate::download::download_file(&universal_url, &universal_full, "")
-                                    .await
-                            {
-                                tracing::warn!(target: "launcher", "Failed to download Forge library {} (both paths): {}", lib.name, e2);
-                                return Err(e);
-                            }
-                            std::fs::copy(&universal_full, &lib_path).ok();
-                        }
-                    } else {
-                        tracing::warn!(target: "launcher", "Failed to download Forge library {}: {}", lib.name, err_str);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
+    let mut profile = get_profile(mc_version, loader_version).await?;
+    super::artifact::ensure_libraries(
+        &mut profile,
+        libraries_dir,
+        super::artifact::FORGE_HOSTS,
+        "Forge",
+    )
+    .await?;
 
     // Modern Forge (1.13+) embeds its runtime JAR(s) in the installer with an
     // empty `url` in version.json. Extract them BEFORE ensure_processor_jars,
@@ -1529,6 +1709,225 @@ pub async fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn write_test_jar(path: &Path, seed: u8) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
+        zip.write_all(b"Manifest-Version: 1.0\n").unwrap();
+        zip.start_file("payload.bin", options).unwrap();
+        zip.write_all(&vec![seed; 4096]).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "voidlauncher_forge_processor_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn processor_output_plan_uses_installer_metadata_and_rejects_corruption() {
+        let dir = test_dir("plan");
+        let libs = dir.join("libraries");
+        std::fs::create_dir_all(&libs).unwrap();
+
+        let slim = resolve_artifact_ref("[net.minecraft:client:1.20.1-TEST:slim]", &libs);
+        let extra = resolve_artifact_ref("[net.minecraft:client:1.20.1-TEST:extra]", &libs);
+        let srg = resolve_artifact_ref("[net.minecraft:client:1.20.1-TEST:srg]", &libs);
+        let patched =
+            resolve_artifact_ref("[net.minecraftforge:forge:1.20.1-47.4.29:client]", &libs);
+        let unpacked = resolve_artifact_ref("[net.minecraft:client:1.20.1-TEST:unpacked]", &libs);
+        write_test_jar(&slim, 1);
+        write_test_jar(&extra, 2);
+        write_test_jar(&srg, 3);
+        write_test_jar(&patched, 4);
+
+        let slim_sha = crate::download::hash_file_sha1(&slim).unwrap();
+        let extra_sha = crate::download::hash_file_sha1(&extra).unwrap();
+        let patched_sha = crate::download::hash_file_sha1(&patched).unwrap();
+        let profile = serde_json::json!({
+            "data": {
+                "MC_SLIM": { "client": "[net.minecraft:client:1.20.1-TEST:slim]" },
+                "MC_SLIM_SHA": { "client": format!("'{}'", slim_sha) },
+                "MC_EXTRA": { "client": "[net.minecraft:client:1.20.1-TEST:extra]" },
+                "MC_EXTRA_SHA": { "client": format!("'{}'", extra_sha) },
+                "MC_SRG": { "client": "[net.minecraft:client:1.20.1-TEST:srg]" },
+                "MC_UNPACKED": { "client": "[net.minecraft:client:1.20.1-TEST:unpacked]" },
+                "PATCHED": { "client": "[net.minecraftforge:forge:1.20.1-47.4.29:client]" },
+                "PATCHED_SHA": { "client": format!("'{}'", patched_sha) }
+            }
+        });
+        let installer = dir.join("installer.jar");
+        let client = dir.join("client.jar");
+        let root = dir.join("root");
+        let vars = build_processor_vars(
+            &profile,
+            &installer,
+            &libs,
+            "1.20.1",
+            &client,
+            &root,
+            "net/minecraftforge/forge",
+            "1.20.1-47.4.29",
+        );
+        let plan = processor_output_plan(&profile, &vars, &libs).unwrap();
+        assert_eq!(plan.len(), 4, "only client-side JARs are expected");
+        assert!(!plan.iter().any(|output| output.path == unpacked));
+        assert!(plan
+            .iter()
+            .find(|output| output.path == slim)
+            .unwrap()
+            .checksum
+            .is_some());
+        assert!(plan
+            .iter()
+            .find(|output| output.path == srg)
+            .unwrap()
+            .checksum
+            .is_none());
+        verify_processor_outputs(&plan).unwrap();
+
+        // A structurally valid but wrong JAR must fail the metadata hash.
+        write_test_jar(&patched, 9);
+        assert!(verify_processor_outputs(&plan).is_err());
+
+        // A missing declared output is not accepted just because the others
+        // exist.
+        std::fs::remove_file(&srg).unwrap();
+        assert!(verify_processor_outputs(&plan).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn processor_output_plan_rejects_bad_hashes_and_unsafe_paths() {
+        let dir = test_dir("bad");
+        let libs = dir.join("libraries");
+        std::fs::create_dir_all(&libs).unwrap();
+        let installer = dir.join("installer.jar");
+        let client = dir.join("client.jar");
+        let root = dir.join("root");
+
+        let malformed = serde_json::json!({
+            "data": {
+                "MC_SLIM": { "client": "[net.minecraft:client:1.20.1-TEST:slim]" },
+                "MC_SLIM_SHA": { "client": "'not-a-hash'" }
+            }
+        });
+        let vars = build_processor_vars(
+            &malformed,
+            &installer,
+            &libs,
+            "1.20.1",
+            &client,
+            &root,
+            "net/minecraftforge/forge",
+            "1.20.1-47.4.29",
+        );
+        assert!(processor_output_plan(&malformed, &vars, &libs).is_err());
+
+        let traversal = serde_json::json!({
+            "data": {
+                "MC_SLIM": { "client": "[net.minecraft:client:../../escape:slim]" }
+            }
+        });
+        let vars = build_processor_vars(
+            &traversal,
+            &installer,
+            &libs,
+            "1.20.1",
+            &client,
+            &root,
+            "net/minecraftforge/forge",
+            "1.20.1-47.4.29",
+        );
+        assert!(processor_output_plan(&traversal, &vars, &libs).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn processor_output_paths_are_version_scoped() {
+        let dir = test_dir("versions");
+        let libs = dir.join("libraries");
+        std::fs::create_dir_all(&libs).unwrap();
+        let installer = dir.join("installer.jar");
+        let client = dir.join("client.jar");
+        let root = dir.join("root");
+
+        let plan_for = |loader_version: &str, mappings_version: &str| {
+            let profile = serde_json::json!({
+                "data": {
+                    "MC_SLIM": {
+                        "client": format!("[net.minecraft:client:{mappings_version}:slim]")
+                    },
+                    "PATCHED": {
+                        "client": format!(
+                            "[net.minecraftforge:forge:{loader_version}:client]"
+                        )
+                    }
+                }
+            });
+            let vars = build_processor_vars(
+                &profile,
+                &installer,
+                &libs,
+                "1.20.1",
+                &client,
+                &root,
+                "net/minecraftforge/forge",
+                loader_version,
+            );
+            processor_output_plan(&profile, &vars, &libs).unwrap()
+        };
+
+        let first = plan_for("1.20.1-47.4.29", "1.20.1-20230612.114412");
+        let second = plan_for("1.20.1-47.4.30", "1.20.1-20230701.000000");
+        assert_ne!(
+            first.iter().map(|o| &o.path).collect::<Vec<_>>(),
+            second.iter().map(|o| &o.path).collect::<Vec<_>>(),
+            "a changed loader/mapping version must not reuse the old output path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn processor_outputs_map_is_resolved_and_verified() {
+        let dir = test_dir("outputs_map");
+        let libs = dir.join("libraries");
+        let out = libs.join("example/output/1.0/output-1.0.jar");
+        write_test_jar(&out, 7);
+        let sha = crate::download::hash_file_sha1(&out).unwrap();
+        let profile = serde_json::json!({
+            "data": {},
+            "processors": [{
+                "outputs": {
+                    "{OUT}": "{OUT_SHA}"
+                }
+            }]
+        });
+        let mut vars = HashMap::new();
+        vars.insert("OUT".to_string(), out.to_string_lossy().to_string());
+        vars.insert("OUT_SHA".to_string(), sha);
+        let plan = processor_output_plan(&profile, &vars, &libs).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].path, out);
+        assert!(plan[0].checksum.is_some());
+        verify_processor_outputs(&plan).unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn provider_artifact_hashes_and_sizes_reach_the_loader_profile() {
@@ -1539,6 +1938,8 @@ mod tests {
                     "path": "example/library/1.0/library-1.0.jar",
                     "url": "https://maven.example.invalid/library-1.0.jar",
                     "sha1": "0123456789abcdef0123456789abcdef01234567",
+                    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "sha512": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                     "size": 4242
                 }
             }
@@ -1550,6 +1951,10 @@ mod tests {
             library.sha1.as_deref(),
             Some("0123456789abcdef0123456789abcdef01234567")
         );
+        assert!(library.sha256.is_some());
+        assert!(library.sha512.is_some());
+        assert_eq!(library.checksum_source.as_deref(), Some("metadata"));
+        assert_eq!(library.checksum().unwrap().unwrap().algorithm(), "sha512");
         assert_eq!(library.size, Some(4242));
     }
 
