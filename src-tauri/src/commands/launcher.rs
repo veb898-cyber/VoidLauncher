@@ -744,6 +744,50 @@ async fn prepare_fabric_libraries_for_launch(
     }
 }
 
+/// Launch-time Forge/NeoForge integrity preparation.
+///
+/// Uses the same typed metadata/repository checksum pipeline as install,
+/// Verify and Repair. A profile enriched with checksums is persisted before
+/// the game is launched; verification failure aborts the launch.
+async fn prepare_maven_loader_libraries_for_launch(
+    config: &crate::config::AppConfig,
+    instance: &mut instances::Instance,
+) -> std::result::Result<Option<String>, String> {
+    let (profile, hosts, label): (&mut modloaders::LoaderProfile, &[&str], &str) =
+        match instance.loader {
+            instances::LoaderType::Forge => (
+                instance
+                    .loader_profile
+                    .as_mut()
+                    .ok_or_else(|| "Forge loader profile is missing".to_string())?,
+                modloaders::artifact::FORGE_HOSTS,
+                "Forge",
+            ),
+            instances::LoaderType::NeoForge => (
+                instance
+                    .loader_profile
+                    .as_mut()
+                    .ok_or_else(|| "NeoForge loader profile is missing".to_string())?,
+                modloaders::artifact::NEOFORGE_HOSTS,
+                "NeoForge",
+            ),
+            _ => return Err("Not a Maven-backed loader".to_string()),
+        };
+
+    match modloaders::artifact::ensure_libraries(profile, &config.libraries_dir(), hosts, label).await
+    {
+        Ok(true) => match instances::save_instance(&config.instances_dir(), instance, None) {
+            Ok(()) => Ok(None),
+            Err(e) => Ok(Some(format!(
+                "{} loader libraries were verified, but the upgraded checksum metadata could not be saved: {}",
+                label, e
+            ))),
+        },
+        Ok(false) => Ok(None),
+        Err(e) => Err(format!("Failed to repair {} loader libraries: {}", label, e)),
+    }
+}
+
 #[tauri::command]
 pub async fn cmd_launch_game(
     app: AppHandle,
@@ -1313,29 +1357,17 @@ pub async fn cmd_launch_game(
                 return Err(msg.into());
             }
         }
-    } else if let Some(profile) = &instance.loader_profile {
-        for lib in &profile.libraries {
-            if lib.url.is_empty() || crate::import::check_safe_remote_path(&lib.path).is_err() {
-                continue;
-            }
-            let lib_path = config.libraries_dir().join(&lib.path);
-            let is_jar = lib.path.to_ascii_lowercase().ends_with(".jar");
-            let needs_download =
-                !lib_path.is_file() || (is_jar && !modloaders::forge::is_usable_jar(&lib_path));
-            if !needs_download {
-                continue;
-            }
-            events::emit_log(
-                &app,
-                "info",
-                "launch",
-                &format!("Repairing loader library {}...", lib.name),
-            );
-            if let Err(e) =
-                download::download_file(&lib.url, &lib_path, lib.sha1.as_deref().unwrap_or(""))
-                    .await
-            {
-                let msg = format!("Failed to repair loader library {}: {}", lib.name, e);
+    } else if matches!(
+        instance.loader,
+        instances::LoaderType::Forge | instances::LoaderType::NeoForge
+    ) {
+        // Forge/NeoForge libraries are verified through their trusted
+        // installer metadata (or an official Maven sidecar for legacy
+        // profiles), never through the Fabric-specific path.
+        match prepare_maven_loader_libraries_for_launch(&config, &mut instance).await {
+            Ok(Some(warning)) => events::emit_log(&app, "warn", "launch", &warning),
+            Ok(None) => {}
+            Err(msg) => {
                 events::emit_log(&app, "error", "launch", &msg);
                 return Err(msg.into());
             }
@@ -2590,6 +2622,37 @@ mod tests {
         instance
     }
 
+    fn legacy_maven_loader_instance(
+        name: &str,
+        loader: LoaderType,
+        base: &str,
+        loader_path: &str,
+    ) -> Instance {
+        let version = match loader {
+            LoaderType::Forge => "47.4.28",
+            LoaderType::NeoForge => "47.1.105",
+            _ => "1.0",
+        };
+        let mut instance = Instance::new(name, "1.20.1", loader, Some(version.to_string()));
+        instance.loader_profile = Some(LoaderProfile {
+            main_class: "test.Main".to_string(),
+            libraries: vec![LoaderLibrary {
+                name: "example:loader:1.0".to_string(),
+                url: format!("{base}{loader_path}"),
+                path: loader_path.to_string(),
+                sha1: None,
+                sha256: None,
+                sha512: None,
+                checksum_source: None,
+                size: None,
+            }],
+            jvm_args: Vec::new(),
+            game_args: Vec::new(),
+            legacy_args: false,
+        });
+        instance
+    }
+
     fn seed_launch_instance(
         config: &crate::config::AppConfig,
         instance: &Instance,
@@ -2793,6 +2856,116 @@ mod tests {
         assert_no_part_files(&config.libraries_dir().join(loader_path));
         assert_eq!(server.hits.load(Ordering::SeqCst), 6);
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn launch_preparation_migrates_forge_and_neoforge_profiles() {
+        let _proxy = direct_proxy_lock().await;
+        for (loader, loader_path, name) in [
+            (
+                LoaderType::Forge,
+                "net/minecraftforge/securejarhandler/2.1.10/securejarhandler-2.1.10.jar",
+                "Legacy Forge",
+            ),
+            (
+                LoaderType::NeoForge,
+                "net/neoforged/fancymodloader/loader/47.2.2/loader-47.2.2.jar",
+                "Legacy NeoForge",
+            ),
+        ] {
+            let body = b"loader-artifact";
+            let expected = sha512_hex(body);
+            let server =
+                spawn_mock(vec![MockSpec::ok(expected.as_bytes()), MockSpec::ok(body)]).await;
+            let data_dir = mock_dir(&format!("launch_{loader:?}_migration"));
+            let config = launch_config(&data_dir);
+            let mut instance = legacy_maven_loader_instance(
+                name,
+                loader.clone(),
+                &mock_base(&server),
+                loader_path,
+            );
+            let json_path = seed_launch_instance(&config, &instance);
+            seed_loader_file(&config, loader_path, b"old-placeholder");
+
+            let warning = prepare_maven_loader_libraries_for_launch(&config, &mut instance)
+                .await
+                .expect("online Maven loader preparation");
+            assert!(warning.is_none());
+            assert_eq!(server.hits.load(Ordering::SeqCst), 2);
+
+            let first_bytes = std::fs::read(&json_path).unwrap();
+            let saved: Instance = serde_json::from_slice(&first_bytes).unwrap();
+            let saved_lib = &saved.loader_profile.as_ref().unwrap().libraries[0];
+            assert_eq!(saved_lib.sha512.as_deref(), Some(expected.as_str()));
+            assert_eq!(saved_lib.checksum_source.as_deref(), Some("repository"));
+
+            let mut reloaded = instances::get_instance(&config.instances_dir(), name).unwrap();
+            let warning = prepare_maven_loader_libraries_for_launch(&config, &mut reloaded)
+                .await
+                .expect("second local Maven loader preparation");
+            assert!(warning.is_none());
+            assert_eq!(
+                server.hits.load(Ordering::SeqCst),
+                2,
+                "{loader:?}: second preparation must not touch the network"
+            );
+            assert_eq!(std::fs::read(&json_path).unwrap(), first_bytes);
+            assert_no_part_files(&config.libraries_dir().join(loader_path));
+            let _ = std::fs::remove_dir_all(&data_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_preparation_forge_offline_failure_preserves_files_and_profile() {
+        let _proxy = direct_proxy_lock().await;
+        for (loader, loader_path, name) in [
+            (
+                LoaderType::Forge,
+                "net/minecraftforge/securejarhandler/2.1.10/securejarhandler-2.1.10.jar",
+                "Offline Forge",
+            ),
+            (
+                LoaderType::NeoForge,
+                "net/neoforged/fancymodloader/loader/47.2.2/loader-47.2.2.jar",
+                "Offline NeoForge",
+            ),
+        ] {
+            let server = spawn_mock(vec![
+                MockSpec::status(404),
+                MockSpec::status(404),
+                MockSpec::status(404),
+            ])
+            .await;
+            let data_dir = mock_dir(&format!("launch_{loader:?}_offline"));
+            let config = launch_config(&data_dir);
+            let mut instance = legacy_maven_loader_instance(
+                name,
+                loader.clone(),
+                &mock_base(&server),
+                loader_path,
+            );
+            let json_path = seed_launch_instance(&config, &instance);
+            seed_loader_file(&config, loader_path, b"working-loader");
+            let before_json = std::fs::read(&json_path).unwrap();
+            let before_lib = std::fs::read(config.libraries_dir().join(loader_path)).unwrap();
+
+            let err = prepare_maven_loader_libraries_for_launch(&config, &mut instance)
+                .await
+                .expect_err("offline Maven loader preparation must fail");
+            assert!(err.contains("No repository checksum"), "got: {err}");
+            assert_eq!(
+                std::fs::read(config.libraries_dir().join(loader_path)).unwrap(),
+                before_lib
+            );
+            assert_eq!(std::fs::read(&json_path).unwrap(), before_json);
+            let saved: Instance = serde_json::from_slice(&before_json).unwrap();
+            let saved_lib = &saved.loader_profile.as_ref().unwrap().libraries[0];
+            assert!(saved_lib.sha512.is_none());
+            assert!(saved_lib.checksum_source.is_none());
+            assert_no_part_files(&config.libraries_dir().join(loader_path));
+            let _ = std::fs::remove_dir_all(&data_dir);
+        }
     }
 
     #[test]

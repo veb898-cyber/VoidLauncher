@@ -74,6 +74,10 @@ struct NeoForgeArtifact {
     path: Option<String>,
     url: Option<String>,
     sha1: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    sha512: Option<String>,
     size: Option<u64>,
 }
 
@@ -168,64 +172,33 @@ async fn download_installer(
     super::validate_loader_request(mc_version, neo_version)?;
     let (group_path, maven_version) = neoforge_maven(mc_version, neo_version);
     let artifact = group_path.rsplit('/').next().unwrap_or("neoforge");
-    let installer_url = format!(
-        "https://maven.neoforged.net/releases/{}/{}/{}-{}-installer.jar",
+    let rest = format!(
+        "{}/{}/{}-{}-installer.jar",
         group_path, maven_version, artifact, maven_version
     );
+    let installer_urls = vec![
+        format!("{}{}", super::artifact::NEOFORGE_MAVEN, rest),
+        format!("{}{}", super::artifact::NEOFORGE_MIRROR_MAVEN, rest),
+    ];
 
-    tracing::info!(target: "launcher", "Fetching NeoForge installer JAR: {}", installer_url);
+    tracing::info!(target: "launcher", "Fetching NeoForge installer JAR: {}", installer_urls[0]);
 
-    // Use download_file with retries for reliable download
     let installer_path = installer_cache_path(mc_version, neo_version);
 
-    // Reuse a cached installer only when it is a real archive. The file is
-    // kept after a successful install so repairing a processor JAR does not
-    // re-download it, which also makes this validation matter in practice.
-    if installer_path.exists() {
-        if super::forge::installer_jar_is_valid(&installer_path) {
-            tracing::debug!(target: "launcher", "Reusing existing NeoForge installer at {}", installer_path.display());
-        } else {
-            tracing::warn!(
-                target: "launcher",
-                "Cached NeoForge installer is not a valid archive, re-downloading: {}",
-                installer_path.display()
-            );
-            let _ = std::fs::remove_file(&installer_path);
-        }
-    }
+    // Both the official origin and the sanctioned mirror have checksum
+    // sidecars. The cached installer is accepted only after verification.
+    super::artifact::download_verified_installer(
+        &installer_urls,
+        &installer_path,
+        super::artifact::NEOFORGE_HOSTS,
+        &format!("NeoForge installer {maven_version}"),
+    )
+    .await?;
 
-    let mut last_err = String::new();
-    if !installer_path.exists() {
-        for attempt in 1..=3u32 {
-            match crate::download::download_file(&installer_url, &installer_path, "").await {
-                Ok(()) => {
-                    if super::forge::installer_jar_is_valid(&installer_path) {
-                        break;
-                    }
-                    last_err = "downloaded file is not a valid installer archive".to_string();
-                    let _ = std::fs::remove_file(&installer_path);
-                    tracing::warn!(target: "launcher", "NeoForge installer download attempt {}/3 produced an invalid archive", attempt);
-                    if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_secs(3 * attempt as u64))
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    tracing::warn!(target: "launcher", "NeoForge installer download attempt {}/3 failed: {}", attempt, last_err);
-                    if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_secs(3 * attempt as u64))
-                            .await;
-                    }
-                }
-            }
-        }
-    }
-
-    if !installer_path.exists() {
+    if !super::forge::installer_jar_is_valid(&installer_path) {
+        let _ = std::fs::remove_file(&installer_path);
         return Err(LauncherError::ModLoader(format!(
-            "Failed to download NeoForge installer after 3 attempts: {}",
-            last_err
+            "Downloaded NeoForge installer {maven_version} is not a valid installer archive"
         )));
     }
 
@@ -297,57 +270,85 @@ async fn download_installer(
 fn build_profile(profile: NeoForgeInstallProfile) -> Result<LoaderProfile> {
     let mut libraries = Vec::new();
     for lib in &profile.libraries {
-        let (url, path, sha1, size) = if let Some(downloads) = &lib.downloads {
-            if let Some(artifact) = &downloads.artifact {
-                let lib_path = artifact
-                    .path
-                    .clone()
-                    .unwrap_or_else(|| maven_to_path(&lib.name));
-                let lib_url = artifact
-                    .url
-                    .clone()
-                    .unwrap_or_else(|| format!("https://maven.neoforged.net/{}", lib_path));
-                (
-                    lib_url,
-                    lib_path,
-                    artifact.sha1.clone().filter(|s| !s.is_empty()),
-                    artifact.size,
-                )
+        let (url, path, sha1, sha256, sha512, checksum_source, size) =
+            if let Some(downloads) = &lib.downloads {
+                if let Some(artifact) = &downloads.artifact {
+                    let lib_path = artifact
+                        .path
+                        .clone()
+                        .unwrap_or_else(|| maven_to_path(&lib.name));
+                    let lib_url = artifact.url.clone().unwrap_or_else(|| {
+                        format!("{}{}", super::artifact::NEOFORGE_MAVEN, lib_path)
+                    });
+                    let sha1 = artifact.sha1.clone().filter(|s| !s.is_empty());
+                    let sha256 = artifact.sha256.clone().filter(|s| !s.is_empty());
+                    let sha512 = artifact.sha512.clone().filter(|s| !s.is_empty());
+                    let source = super::artifact::has_metadata_checksum(
+                        sha1.as_deref(),
+                        sha256.as_deref(),
+                        sha512.as_deref(),
+                    )
+                    .then(|| "metadata".to_string());
+                    (
+                        lib_url,
+                        lib_path,
+                        sha1,
+                        sha256,
+                        sha512,
+                        source,
+                        artifact.size,
+                    )
+                } else {
+                    let path = maven_to_path(&lib.name);
+                    let base = lib
+                        .url
+                        .clone()
+                        .unwrap_or_else(|| super::artifact::NEOFORGE_MAVEN.into());
+                    let base = if base.ends_with('/') {
+                        base
+                    } else {
+                        format!("{}/", base)
+                    };
+                    (
+                        format!("{}{}", base, path),
+                        path,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
             } else {
                 let path = maven_to_path(&lib.name);
                 let base = lib
                     .url
                     .clone()
-                    .unwrap_or_else(|| "https://maven.neoforged.net/".into());
+                    .unwrap_or_else(|| super::artifact::NEOFORGE_MAVEN.into());
                 let base = if base.ends_with('/') {
                     base
                 } else {
                     format!("{}/", base)
                 };
-                (format!("{}{}", base, path), path, None, None)
-            }
-        } else {
-            let path = maven_to_path(&lib.name);
-            let base = lib
-                .url
-                .clone()
-                .unwrap_or_else(|| "https://maven.neoforged.net/".into());
-            let base = if base.ends_with('/') {
-                base
-            } else {
-                format!("{}/", base)
+                (
+                    format!("{}{}", base, path),
+                    path,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             };
-            (format!("{}{}", base, path), path, None, None)
-        };
 
         libraries.push(LoaderLibrary {
             name: lib.name.clone(),
             url,
             path,
             sha1,
-            sha256: None,
-            sha512: None,
-            checksum_source: None,
+            sha256,
+            sha512,
+            checksum_source,
             size,
         });
     }
@@ -537,18 +538,57 @@ pub async fn ensure_processor_jars(
     // call, so a tampered instance.json must not reach the filesystem.
     super::validate_loader_request(mc_version, loader_version)?;
 
-    // Fast path: read the output coordinate from the cached installer. This
-    // is what makes a healthy 26.x install skip the pipeline even though its
-    // JAR is not at the legacy `neoforge-<ver>-client.jar` location.
-    let cached_profile =
-        read_install_profile_from_installer(&installer_cache_path(mc_version, loader_version));
+    // Fast path: read the output coordinates and metadata checksums from the
+    // cached installer. This is what makes a healthy 26.x install skip the
+    // pipeline even though its JAR is not at the legacy
+    // `neoforge-<ver>-client.jar` location.
+    let installer_path = installer_cache_path(mc_version, loader_version);
+    let cached_profile = read_install_profile_from_installer(&installer_path);
     let candidates = expected_client_jar_paths(
         libraries_dir,
         mc_version,
         loader_version,
         cached_profile.as_ref(),
     );
-    if find_client_jar(&candidates).is_some() {
+    let metadata_outputs = cached_profile
+        .as_ref()
+        .map(|profile| {
+            let (group_path, maven_version) = neoforge_maven(mc_version, loader_version);
+            let vd = versions_dir.join(mc_version);
+            let client_jar = if vd.join("client.jar").exists() {
+                vd.join("client.jar")
+            } else {
+                vd.join(format!("{}.jar", mc_version))
+            };
+            let root_dir = versions_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| versions_dir.to_path_buf());
+            let vars = super::forge::build_processor_vars(
+                profile,
+                &installer_path,
+                libraries_dir,
+                mc_version,
+                &client_jar,
+                &root_dir,
+                &group_path,
+                &maven_version,
+            );
+            super::forge::processor_output_plan(profile, &vars, libraries_dir)
+        })
+        .transpose()?;
+    if let Some(outputs) = &metadata_outputs {
+        if !outputs.is_empty() && super::forge::verify_processor_outputs(outputs).is_ok() {
+            tracing::debug!(
+                target: "launcher",
+                "NeoForge processor JARs match the cached installer metadata"
+            );
+            return Ok(());
+        }
+    }
+    // Without cached metadata, keep the structural fallback so a cleaned
+    // %TEMP% does not force a reinstall on every launch.
+    if metadata_outputs.is_none() && find_client_jar(&candidates).is_some() {
         return Ok(());
     }
 
@@ -586,7 +626,14 @@ pub async fn install(
 
     // Download installer (kept on disk for the processor pipeline below)
     let (raw_profile, installer_path) = download_installer(mc_version, loader_version).await?;
-    let profile = build_profile(raw_profile)?;
+    let mut profile = build_profile(raw_profile)?;
+    super::artifact::ensure_libraries(
+        &mut profile,
+        libraries_dir,
+        super::artifact::NEOFORGE_HOSTS,
+        "NeoForge",
+    )
+    .await?;
 
     // The installer also carries install_profile.json with the full
     // processor library list (70 libs for 21.1.248, vs 47 in version.json).
@@ -628,26 +675,9 @@ pub async fn install(
         .map(|a| !a.is_empty())
         .unwrap_or(false);
 
-    // --- Step 1: download version.json launch libraries ---
-    let total = profile.libraries.len();
-    for (i, lib) in profile.libraries.iter().enumerate() {
-        let lib_path = libraries_dir.join(&lib.path);
-        if !lib_path.exists() {
-            if let Some(app_handle) = app {
-                let _ = app_handle.emit(
-                    "loader-install-progress",
-                    serde_json::json!({
-                        "stage": "downloading",
-                        "message": format!("Downloading {} ({}/{})", lib.name, i + 1, total),
-                    }),
-                );
-            }
-            if let Err(e) = crate::download::download_file(&lib.url, &lib_path, "").await {
-                tracing::warn!(target: "launcher", "Failed to download NeoForge library {}: {}", lib.name, e);
-                return Err(e);
-            }
-        }
-    }
+    // --- Step 1: version.json launch libraries ---
+    // Verified above by `artifact::ensure_libraries`; every artifact either
+    // matched its metadata checksum or was rejected.
 
     // --- Step 2: download the installer's processor libraries ---
     // install_profile.json libraries include everything the processors need
@@ -664,15 +694,13 @@ pub async fn install(
                         "message": format!("Downloading processor libraries ({}/{})", i + 1, pl_total),
                     }));
                 }
-                if let Err(e) = super::forge::download_processor_lib(
+                super::forge::download_processor_lib(
                     lib_val,
                     libraries_dir,
-                    "https://maven.neoforged.net/",
+                    super::artifact::NEOFORGE_MAVEN,
+                    super::artifact::NEOFORGE_HOSTS,
                 )
-                .await
-                {
-                    tracing::warn!(target: "launcher", "NeoForge processor library download warning: {}", e);
-                }
+                .await?;
             }
         }
     }
@@ -836,7 +864,9 @@ pub async fn install(
                     for path in &client_paths {
                         std::fs::remove_file(path).ok();
                     }
-                    std::fs::remove_file(&installer_path).ok();
+                    // Keep the verified installer cached: the next attempt
+                    // uses its metadata to reject partial outputs and re-run
+                    // the pipeline instead of a structural-only fallback.
                     return Err(LauncherError::ModLoader(format!(
                         "NeoForge processor pipeline failed: {}",
                         e
@@ -932,6 +962,38 @@ mod tests {
 
     /// NeoForge 1.20.1 (the `net.neoforged:forge` fork) must use the MC-prefixed
     /// gradle-style version under the forge group.
+    #[test]
+    fn build_profile_carries_typed_checksum_provenance() {
+        let profile = NeoForgeInstallProfile {
+            id: "test".to_string(),
+            main_class: "test.Main".to_string(),
+            libraries: vec![NeoForgeLibrary {
+                name: "net.neoforged:example:1.0".to_string(),
+                url: None,
+                downloads: Some(NeoForgeDownloads {
+                    artifact: Some(NeoForgeArtifact {
+                        path: Some("net/neoforged/example/1.0/example-1.0.jar".to_string()),
+                        url: Some(
+                            "https://maven.neoforged.net/releases/net/neoforged/example/1.0/example-1.0.jar"
+                                .to_string(),
+                        ),
+                        sha1: Some("a".repeat(40)),
+                        sha256: Some("b".repeat(64)),
+                        sha512: Some("c".repeat(128)),
+                        size: Some(7),
+                    }),
+                }),
+            }],
+            arguments: None,
+            minecraft_arguments: None,
+        };
+        let built = build_profile(profile).unwrap();
+        let lib = &built.libraries[0];
+        assert_eq!(lib.checksum_source.as_deref(), Some("metadata"));
+        assert_eq!(lib.checksum().unwrap().unwrap().algorithm(), "sha512");
+        assert_eq!(lib.size, Some(7));
+    }
+
     #[test]
     fn neoforge_maven_uses_forge_fork_for_1_20_1() {
         let (group, version) = neoforge_maven("1.20.1", "47.1.106");
