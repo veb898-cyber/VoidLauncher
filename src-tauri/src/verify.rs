@@ -900,6 +900,52 @@ fn check_library_file(
     }
 }
 
+/// Typed variant used by Fabric, whose libraries may carry SHA-256/SHA-512 or
+/// an explicit same-origin repository checksum instead of only SHA-1.
+fn check_library_file_typed(
+    cat: &mut CategoryBuilder,
+    path: &Path,
+    expected: Option<&crate::integrity::HashSpec>,
+    expected_size: u64,
+    display: &str,
+    mode: VerifyMode,
+) {
+    cat.checked += 1;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        cat.add_issue(display, "missing", true);
+        return;
+    };
+    if metadata.len() == 0 {
+        cat.add_issue(display, "corrupt", true);
+        return;
+    }
+    if expected_size > 0 && metadata.len() != expected_size {
+        cat.add_issue(display, "size_mismatch", true);
+        return;
+    }
+    if mode == VerifyMode::Quick {
+        // A size match is useful evidence, but it is not proof of contents.
+        cat.unverified += 1;
+        return;
+    }
+    let Some(expected) = expected else {
+        // No provider checksum: `exists()` is not proof of a usable JAR.
+        // At least reject a truncated/non-archive file so Repair can act;
+        // otherwise report it honestly as unverified (not verified).
+        match content_archive_readable(path) {
+            ArchiveStreamCheck::Valid => cat.unverified += 1,
+            ArchiveStreamCheck::Corrupt => cat.add_issue(display, "corrupt", true),
+            ArchiveStreamCheck::Unverified => cat.unverified += 1,
+        }
+        return;
+    };
+    match expected.verify_file(path) {
+        Ok(true) => cat.verified += 1,
+        Ok(false) => cat.add_issue(display, "corrupt", true),
+        Err(_) => cat.unverified += 1,
+    }
+}
+
 /// Which parts of an instance a verification run inspects: everything,
 /// launcher-managed files only, or one user-content folder. Repair is always
 /// launcher-only regardless of scope.
@@ -1178,15 +1224,35 @@ pub fn verify_instance_scoped_mode(
                 continue;
             }
             let p = libraries_dir.join(&llib.path);
-            let sha1 = llib.sha1.as_deref().unwrap_or("");
-            check_library_file(
-                &mut libraries,
-                &p,
-                sha1,
-                llib.size.unwrap_or(0),
-                &format!("libraries/{}", llib.path),
-                mode,
-            );
+            let display = format!("libraries/{}", llib.path);
+            if instance.loader == LoaderType::Fabric {
+                let expected = match llib.checksum() {
+                    Ok(expected) => expected,
+                    Err(_) => {
+                        libraries.checked += 1;
+                        libraries.add_issue(display, "corrupt", true);
+                        continue;
+                    }
+                };
+                check_library_file_typed(
+                    &mut libraries,
+                    &p,
+                    expected.as_ref(),
+                    llib.size.unwrap_or(0),
+                    &display,
+                    mode,
+                );
+            } else {
+                let sha1 = llib.sha1.as_deref().unwrap_or("");
+                check_library_file(
+                    &mut libraries,
+                    &p,
+                    sha1,
+                    llib.size.unwrap_or(0),
+                    &display,
+                    mode,
+                );
+            }
         }
     }
     let libraries = libraries.build();
@@ -1724,6 +1790,7 @@ pub async fn repair_instance(
             .push(format!("Unsafe version id in metadata: {}", vi.id));
         Vec::new()
     };
+    let mut fabric_libraries: Vec<crate::modloaders::LoaderLibrary> = Vec::new();
     if let Some(profile) = &instance.loader_profile {
         for llib in &profile.libraries {
             if check_safe_remote_path(&llib.path).is_err() {
@@ -1734,6 +1801,13 @@ pub async fn repair_instance(
                 continue;
             }
             let p = libraries_dir.join(&llib.path);
+            if instance.loader == LoaderType::Fabric {
+                // Typed verification also repairs old profiles whose persisted
+                // checksum is missing: `ensure_library` resolves the official
+                // same-origin Maven checksum first.
+                fabric_libraries.push(llib.clone());
+                continue;
+            }
             let sha1 = llib.sha1.clone().unwrap_or_default();
             let ok = if !p.exists() {
                 false
@@ -1802,6 +1876,30 @@ pub async fn repair_instance(
                 summary.failed += 1;
                 summary.errors.push(format!("{}: {}", name, e));
                 tracing::warn!(target: "launcher", "Repair download failed for {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    // Fabric libraries carry typed checksums (metadata or repository). Repair
+    // them through the same helper the installer and launch self-heal use, so
+    // a missing checksum or a corrupt existing JAR can never degrade into an
+    // unverified download.
+    for (i, lib) in fabric_libraries.iter().enumerate() {
+        ensure_instance_idle(config, instance)?;
+        emit(
+            "files",
+            45.0 + (i as f64 / fabric_libraries.len().max(1) as f64) * 2.0,
+            &format!("Repairing Fabric library {}...", lib.name),
+        );
+        match crate::modloaders::fabric::ensure_library(lib, &libraries_dir).await {
+            Ok(true) => summary.repaired += 1,
+            Ok(false) => {}
+            Err(e) => {
+                summary.failed += 1;
+                summary
+                    .errors
+                    .push(format!("Fabric library {}: {}", lib.name, e));
+                tracing::warn!(target: "launcher", "Fabric repair failed for {}: {}", lib.name, e);
             }
         }
     }
@@ -3006,6 +3104,82 @@ mod tests {
             libs.issues
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_forge_and_neoforge_profiles_keep_the_legacy_sha1_verify_path() {
+        for loader in [LoaderType::Forge, LoaderType::NeoForge] {
+            let tag = format!("legacy_{loader:?}");
+            let dir = temp_dir(&tag);
+            let config = test_config(&dir);
+            let mut instance =
+                Instance::new("Legacy", "1.20.1", loader, Some("47.2.0".to_string()));
+            let path = "com/example/legacy/1.0/legacy-1.0.jar";
+            instance.loader_profile = Some(crate::modloaders::LoaderProfile {
+                main_class: "test.Main".to_string(),
+                libraries: vec![crate::modloaders::LoaderLibrary {
+                    name: "com.example:legacy:1.0".to_string(),
+                    url: "https://maven.example.invalid/".to_string(),
+                    path: path.to_string(),
+                    sha1: Some(ABC_SHA1.to_string()),
+                    sha256: None,
+                    sha512: None,
+                    checksum_source: None,
+                    size: Some(3),
+                }],
+                jvm_args: Vec::new(),
+                game_args: Vec::new(),
+                legacy_args: false,
+            });
+            write_version_json(
+                &config,
+                "1.20.1",
+                ABC_SHA1,
+                3,
+                "https://example.com/client.jar",
+            );
+            write_file_with_sha1(&config.versions_dir().join("1.20.1/client.jar"), b"abc");
+            write_file_with_sha1(&config.libraries_dir().join(path), b"abc");
+
+            let report = verify_instance_scoped_mode(
+                &config,
+                &instance,
+                VerifyScope::Launcher,
+                VerifyMode::Deep,
+            );
+            let libs = cat(&report, "libraries");
+            assert_eq!(
+                libs.issue_count, 0,
+                "{tag}: a valid legacy library must verify through SHA-1"
+            );
+            assert!(libs.verified >= 1, "{tag}: SHA-1 must be used");
+
+            // A Forge/NeoForge profile must ignore the Fabric-only stronger
+            // checksum fields. The SHA-1 still matches, while the deliberately
+            // wrong SHA-256/SHA-512 would fail if the Fabric typed branch ran.
+            {
+                let lib = &mut instance.loader_profile.as_mut().unwrap().libraries[0];
+                lib.sha256 = Some("b".repeat(64));
+                lib.sha512 = Some("c".repeat(128));
+                lib.checksum_source = Some("metadata".to_string());
+            }
+            let report = verify_instance_scoped_mode(
+                &config,
+                &instance,
+                VerifyScope::Launcher,
+                VerifyMode::Deep,
+            );
+            let libs = cat(&report, "libraries");
+            assert_eq!(
+                libs.issue_count, 0,
+                "{tag}: Forge/NeoForge must keep using SHA-1, not Fabric's typed checksum"
+            );
+            assert!(
+                libs.verified >= 1,
+                "{tag}: SHA-1 must still verify the file"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

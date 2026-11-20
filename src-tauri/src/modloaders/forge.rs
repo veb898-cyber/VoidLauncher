@@ -769,6 +769,9 @@ fn build_profile(
             url,
             path,
             sha1,
+            sha256: None,
+            sha512: None,
+            checksum_source: None,
             size,
         });
     }
