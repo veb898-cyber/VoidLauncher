@@ -210,6 +210,28 @@ fn parse_pack_version(value: &str) -> Option<ParsedPackVersion> {
     if value.is_empty() {
         return None;
     }
+    // CurseForge file display names often append the game version:
+    // `13.6.0 for 26.1.2`. The API query already filtered files by the lock's
+    // MC version, so this suffix is redundant. Strip only a plain numeric
+    // suffix after ` for `; verbose names such as `Minecraft 1.20.1` or
+    // `build 17` remain unorderable.
+    if let Some((head, suffix)) = value.rsplit_once(" for ") {
+        let suffix = suffix.trim();
+        let suffix_parts: Vec<&str> = suffix.split('.').collect();
+        let numeric_suffix = (2..=4).contains(&suffix_parts.len())
+            && suffix_parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+        if numeric_suffix {
+            if let Some(parsed) = parse_pack_version_exact(head.trim()) {
+                return Some(parsed);
+            }
+        }
+    }
+    parse_pack_version_exact(value)
+}
+
+fn parse_pack_version_exact(value: &str) -> Option<ParsedPackVersion> {
     // A leading `v` is a spelling of the same number, not a different format.
     let value = value
         .strip_prefix('v')
@@ -1695,8 +1717,14 @@ fn plan_modrinth_update(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .unwrap_or_else(|| r.project_id.clone());
+        let staged = staging.join(&new_path);
+        // A manifest checksum is publisher-declared (verified archive). The
+        // SHA-1 fallback only identifies the staged bytes for deep verification;
+        // it is never written to the Packlock or used as proof of a remote file.
+        let sidecar_hash = packlock::mrpack_entry_hash(new_entry)
+            .or_else(|| crate::download::hash_file_sha1(&staged).ok());
         plan.installs.push(PlannedInstall {
-            staged: staging.join(&new_path),
+            staged,
             dest,
             preserve_disabled,
             expect_absent: false,
@@ -1709,7 +1737,7 @@ fn plan_modrinth_update(
                 version_id: Some(packlock::mrpack_entry_version(new_entry)),
                 version_number: None,
                 file_id: None,
-                hash: packlock::mrpack_entry_sha1(new_entry),
+                hash: sidecar_hash,
             }),
             is_mod: true,
         });
@@ -1961,6 +1989,37 @@ pub async fn cmd_repair_modpack(
 
 // ==================== CurseForge ====================
 
+/// Batch-fetch metadata for every file an update/repair is about to touch.
+/// One request per 50 ids keeps large pack updates from making a metadata call
+/// per changed file, while still returning the exact `CfFile` used for the
+/// hash/identity checks in `download_mod_file`.
+async fn cf_file_metadata_batch(
+    file_ids: &[u64],
+    api_key: &str,
+) -> Result<HashMap<u64, CfFile>, String> {
+    let mut unique = file_ids.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let mut files = HashMap::new();
+    for chunk in unique.chunks(50) {
+        match curseforge::get_files_by_ids(chunk, api_key).await {
+            Ok(batch) => {
+                for file in batch {
+                    files.insert(file.id, file);
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "CurseForge file metadata request failed for {} file(s): {}",
+                    chunk.len(),
+                    error
+                ))
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// CF pack update: staged downloads via the CF file API, then the shared
 /// park-aside apply.
 async fn update_curseforge(
@@ -2095,6 +2154,19 @@ async fn update_curseforge(
             return Err(format!("Content classification failed: {e}"));
         }
     };
+    // One batch metadata call (chunked) for every changed file; the exact
+    // CfFile is then checked by download_mod_file before any bytes move.
+    let file_ids: Vec<u64> = targets
+        .iter()
+        .filter_map(|r| r.file_id.parse::<u64>().ok())
+        .collect();
+    let files_by_id = match cf_file_metadata_batch(&file_ids, &ctx.api_key).await {
+        Ok(files) => files,
+        Err(e) => {
+            cleanup_files(&staging, &temp_zip);
+            return Err(format!("CurseForge file metadata failed: {e}"));
+        }
+    };
     for (i, r) in targets.iter().enumerate() {
         let class = classes
             .get(&r.project_id)
@@ -2107,16 +2179,13 @@ async fn update_curseforge(
             total,
             &format!("Downloading {} {}/{}...", class.label(), i + 1, total),
         );
-        if i > 0 {
-            // Undocumented CF rate limit — pace the metadata calls.
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        }
         let stage_result: Result<(), String> = async {
             let pid = parse_id(&r.project_id, "project")?;
             let fid = parse_id(&r.file_id, "file")?;
-            let cf_file = curseforge::get_mod_file(pid, fid, &ctx.api_key)
-                .await
-                .map_err(|e| format!("CurseForge info for {} failed: {}", r.project_id, e))?;
+            let cf_file = files_by_id
+                .get(&fid)
+                .cloned()
+                .ok_or_else(|| format!("CurseForge metadata was not returned for {fid}"))?;
             check_safe_file_name(&cf_file.file_name).map_err(|e| e.to_string())?;
             let dest = cf_staged_path(&stage_mods, class, &cf_file.file_name);
             if let Some(parent) = dest.parent() {
@@ -2769,21 +2838,8 @@ async fn update_modrinth(
             )
         }
     };
-    let file = latest
-        .files
-        .iter()
-        .find(|f| f.primary)
-        .or_else(|| latest.files.first())
-        .ok_or_else(|| "Modrinth version has no files".to_string())?;
-    if !file.url.starts_with("https://") {
-        return Err("Download URL must be HTTPS.".to_string());
-    }
-    if !crate::is_allowed_download_host(&file.url) {
-        return Err(format!(
-            "Download host is not in the allowlist: {}",
-            file.url
-        ));
-    }
+    let archive = crate::content_install::resolve_modrinth_archive(&latest.files)
+        .map_err(|e| format!("New pack archive metadata rejected: {e}"))?;
 
     emit(
         app,
@@ -2804,10 +2860,7 @@ async fn update_modrinth(
         instance_temp_token(&ctx.instance.name),
         latest.id
     ));
-    let sha1 = file.hashes.get("sha1").map(|s| s.as_str()).unwrap_or("");
-    if let Err(e) =
-        crate::download::download_file_sized(&file.url, &temp_zip, sha1, file.size).await
-    {
+    if let Err(e) = crate::content_install::download_modrinth_archive(&archive, &temp_zip).await {
         let _ = std::fs::remove_file(&temp_zip);
         return Err(format!("Pack download failed: {}", e));
     }
@@ -2952,7 +3005,7 @@ async fn update_modrinth(
         pack_project_id: lock.pack_project_id.clone(),
         pack_name: lock.pack_name.clone(),
         file_id: latest.id.clone(),
-        file_name: file.filename.clone(),
+        file_name: archive.file_name.clone(),
         file_display_name: latest.version_number.clone(),
         channel: packlock::PackChannel::from_modrinth(&latest.version_type)
             .map(|channel| channel.as_str().to_string())
@@ -3048,11 +3101,22 @@ async fn repair_modrinth(
             extract_budget
                 .claim_path(&path)
                 .map_err(|e| e.to_string())?;
-            crate::import::install_mrpack_file(&path, entry, &staging, &no_embedded, false)
-                .await
-                .map_err(|e| format!("{}: {}", key, e))?;
+            crate::import::install_mrpack_file_verified(
+                &path,
+                entry,
+                &staging,
+                &no_embedded,
+                false,
+            )
+            .await
+            .map_err(|e| format!("{}: {}", key, e))?;
+            let staged = staging.join(&path);
+            // See the update path: a locally computed SHA-1 is only a content
+            // identity for the sidecar, never remote-publisher proof.
+            let sidecar_hash = packlock::mrpack_entry_hash(entry)
+                .or_else(|| crate::download::hash_file_sha1(&staged).ok());
             plan.installs.push(PlannedInstall {
-                staged: staging.join(&path),
+                staged,
                 dest,
                 preserve_disabled: false,
                 expect_absent: true,
@@ -3071,7 +3135,7 @@ async fn repair_modrinth(
                     version_id: Some(packlock::mrpack_entry_version(entry)),
                     version_number: None,
                     file_id: None,
-                    hash: packlock::mrpack_entry_sha1(entry),
+                    hash: sidecar_hash,
                 }),
                 is_mod: true,
             });
@@ -3097,17 +3161,9 @@ async fn repair_modrinth(
             let version = modrinth::get_version_by_id(&lock.file_id)
                 .await
                 .map_err(|e| format!("Pack version info failed: {}", e))?;
-            let file = version
-                .files
-                .iter()
-                .find(|f| f.primary)
-                .or_else(|| version.files.first())
-                .ok_or_else(|| "Pack version has no files".to_string())?;
-            if !file.url.starts_with("https://") || !crate::is_allowed_download_host(&file.url) {
-                return Err("Pack file URL is not allowed".to_string());
-            }
-            let sha1 = file.hashes.get("sha1").map(|s| s.as_str()).unwrap_or("");
-            crate::download::download_file_sized(&file.url, &temp_zip, sha1, file.size)
+            let archive = crate::content_install::resolve_modrinth_archive(&version.files)
+                .map_err(|e| format!("Pack archive metadata rejected: {e}"))?;
+            crate::content_install::download_modrinth_archive(&archive, &temp_zip)
                 .await
                 .map_err(|e| format!("Pack archive download failed: {}", e))?;
             let installs = stage_mrpack_repair_overrides(
@@ -6432,6 +6488,42 @@ mod update_integrity_tests {
             ),
             PackCandidate::UpToDate
         ));
+    }
+
+    #[test]
+    fn curseforge_mc_version_suffix_does_not_disable_safe_updates() {
+        assert_eq!(
+            candidate_is_newer("14.1.2 for 26.2", "14.1.1 for 26.2"),
+            VersionOrder::Newer
+        );
+        assert_eq!(
+            candidate_is_newer("13.6.0 for 26.1.2", "13.6.0 for 26.1.2"),
+            VersionOrder::NotNewer
+        );
+        assert_eq!(
+            candidate_is_newer("1.9.0 for 1.20.1", "Minecraft 1.20.1"),
+            VersionOrder::Unknown,
+            "only a numeric MC suffix may be stripped"
+        );
+        assert_eq!(
+            candidate_is_newer("1.0.0 for snapshots", "1.0.0"),
+            VersionOrder::Unknown
+        );
+
+        let installed = cf_file_version(1, 1, "2026-01-01T00:00:00Z", "13.5.0 for 26.1.2");
+        match curseforge_update_decision(
+            &installed,
+            &[cf_file_version(
+                2,
+                1,
+                "2026-02-01T00:00:00Z",
+                "13.6.0 for 26.1.2",
+            )],
+            "release",
+        ) {
+            PackCandidate::Newer(file) => assert_eq!(file.id, 2),
+            _ => panic!("a newer MC-suffixed release must be offered"),
+        }
     }
 
     #[test]
