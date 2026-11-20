@@ -2449,7 +2449,7 @@ fn install_local_content_into(
     }
 
     let hash = download::hash_file_sha1(&target_path).ok();
-    let snapshots = snapshot_sidecars(&content_dir, &[target_name.as_str()]);
+    let snapshots = content::snapshot_sidecars(&content_dir, &[target_name.as_str()]);
     if let Err(error) = content::write_sidecar(
         &content_dir,
         &target_name,
@@ -2468,7 +2468,7 @@ fn install_local_content_into(
         // remove it and put back whatever content occupied the target before.
         remove_local_path(&target_path);
         restore_local_stash(&stashed);
-        let metadata_restore = restore_sidecars(&content_dir, &snapshots);
+        let metadata_restore = content::restore_sidecars(&content_dir, &snapshots);
         let metadata_note = metadata_restore
             .err()
             .map(|restore| format!("; metadata restore failed: {restore}"))
@@ -2552,95 +2552,6 @@ fn parse_positive_content_id(value: Option<&str>, label: &str) -> Result<u64, St
         .ok_or_else(|| format!("Invalid {label}"))
 }
 
-/// One sidecar file captured before an install publishes new metadata.
-struct SidecarSnapshotEntry {
-    path: PathBuf,
-    contents: Option<Vec<u8>>,
-}
-
-/// Every metadata file `read_sidecar_meta` can consult for `filename`:
-/// the current `.index/` layout plus both historical next-to-file variants.
-fn sidecar_snapshot_paths(content_dir: &std::path::Path, filename: &str) -> Vec<PathBuf> {
-    let Some(filename) = std::path::Path::new(filename)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
-    else {
-        return Vec::new();
-    };
-    vec![
-        crate::instances::sidecar_meta_path(content_dir, filename),
-        crate::instances::legacy_sidecar_path(content_dir, filename),
-        content_dir.join(format!("{filename}.voidlauncher.json")),
-    ]
-}
-
-fn snapshot_sidecars(
-    content_dir: &std::path::Path,
-    filenames: &[&str],
-) -> Vec<SidecarSnapshotEntry> {
-    let mut paths: Vec<PathBuf> = Vec::new();
-    for filename in filenames {
-        for path in sidecar_snapshot_paths(content_dir, filename) {
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-    }
-    paths
-        .into_iter()
-        .map(|path| {
-            // Never follow a junction/symlink while capturing rollback data.
-            let contents = if crate::import::ensure_no_reparse_points(content_dir, &path).is_ok()
-                && path.is_file()
-            {
-                std::fs::read(&path).ok()
-            } else {
-                None
-            };
-            SidecarSnapshotEntry { path, contents }
-        })
-        .collect()
-}
-
-/// Best-effort restoration of the exact sidecar bytes captured before an
-/// install. Failure here is reported by the install's error path; the content
-/// file itself is restored by `restore_stashed_files`.
-fn restore_sidecars(
-    content_dir: &std::path::Path,
-    snapshots: &[SidecarSnapshotEntry],
-) -> Result<(), String> {
-    let mut errors: Vec<String> = Vec::new();
-    for snapshot in snapshots {
-        if crate::import::ensure_no_reparse_points(content_dir, &snapshot.path).is_err() {
-            errors.push(format!("{}: unsafe metadata path", snapshot.path.display()));
-            continue;
-        }
-        match &snapshot.contents {
-            Some(contents) => {
-                if let Some(parent) = snapshot.path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if let Err(error) = std::fs::write(&snapshot.path, contents) {
-                    errors.push(format!("{}: {error}", snapshot.path.display()));
-                }
-            }
-            None => {
-                if snapshot.path.is_file() {
-                    if let Err(error) = std::fs::remove_file(&snapshot.path) {
-                        errors.push(format!("{}: {error}", snapshot.path.display()));
-                    }
-                }
-            }
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
 /// Publish the verified file's sidecar as part of the same install result.
 ///
 /// The file has already been downloaded and verified, but a verified file with
@@ -2664,12 +2575,12 @@ where
     if let Some(old) = old_filename {
         names.push(old);
     }
-    let snapshots = snapshot_sidecars(content_dir, &names);
+    let snapshots = content::snapshot_sidecars(content_dir, &names);
 
     if let Err(error) = write_sidecar() {
         let _ = std::fs::remove_file(dest);
         crate::instances::restore_stashed_files(stashed);
-        let metadata_restore = restore_sidecars(content_dir, &snapshots);
+        let metadata_restore = content::restore_sidecars(content_dir, &snapshots);
         let metadata_note = metadata_restore
             .err()
             .map(|restore| format!("; metadata restore failed: {restore}"))

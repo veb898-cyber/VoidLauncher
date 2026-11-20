@@ -420,7 +420,35 @@ fn verify_md5(path: &Path, expected: &str) -> bool {
     hash == expected.to_lowercase()
 }
 
+/// An existing ATLauncher file may only be skipped when its publisher MD5
+/// matches. A same-named stale/corrupt file is not "already installed", and a
+/// missing checksum cannot make an existing file trusted.
+fn atl_existing_file_is_current(dest: &Path, m: &AtMod) -> bool {
+    if m.optional || !dest.is_file() {
+        return false;
+    }
+    m.md5
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|md5| verify_md5(dest, md5))
+}
+
 async fn download_atl_mod(m: &AtMod, dest: &Path, client: &reqwest::Client) -> Result<()> {
+    // ATLauncher publishes an MD5, not a SHA-1/SHA-256. This is a separate
+    // legacy publisher-hash category; a missing checksum must not silently
+    // turn into an unverified download.
+    let md5 = m
+        .md5
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            LauncherError::Instance(format!(
+                "ATLauncher file {} has no publisher MD5; refusing to download it",
+                m.name
+            ))
+        })?;
     let url = match m.download.as_str() {
         "server" => m
             .url
@@ -438,12 +466,8 @@ async fn download_atl_mod(m: &AtMod, dest: &Path, client: &reqwest::Client) -> R
         )));
     }
 
-    if dest.exists() {
-        if let Some(md5) = &m.md5 {
-            if !md5.is_empty() && verify_md5(dest, md5) {
-                return Ok(());
-            }
-        }
+    if dest.exists() && verify_md5(dest, md5) {
+        return Ok(());
     }
 
     let resp = crate::download::send_with_fallback(
@@ -458,19 +482,62 @@ async fn download_atl_mod(m: &AtMod, dest: &Path, client: &reqwest::Client) -> R
         )));
     }
     let bytes = resp.bytes().await?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+    let Some(parent) = dest.parent() else {
+        return Err(LauncherError::Download(format!(
+            "Destination {} has no parent directory",
+            dest.display()
+        )));
+    };
+    std::fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".voidlauncher-atl-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&staging, &bytes)?;
+    publish_atl_staged_file(dest, &staging, md5, &m.name)
+}
+
+/// Verify and publish an ATLauncher download without ever overwriting the
+/// previous file before the publisher MD5 has passed. A mismatch or a failed
+/// publish removes the staging file and leaves/restores the old content.
+fn publish_atl_staged_file(dest: &Path, staging: &Path, md5: &str, name: &str) -> Result<()> {
+    if !verify_md5(staging, md5) {
+        let _ = std::fs::remove_file(staging);
+        return Err(LauncherError::Download(format!(
+            "MD5 mismatch for {}",
+            name
+        )));
     }
-    std::fs::write(dest, &bytes)?;
-    if let Some(md5) = &m.md5 {
-        if !md5.is_empty() && !verify_md5(dest, md5) {
-            let _ = std::fs::remove_file(dest);
+    let Some(parent) = dest.parent() else {
+        let _ = std::fs::remove_file(staging);
+        return Err(LauncherError::Download(format!(
+            "Destination {} has no parent directory",
+            dest.display()
+        )));
+    };
+    let filename = dest
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .ok_or_else(|| LauncherError::Download("Invalid ATLauncher destination".to_string()))?;
+    let stashed = match instances::stash_old_content_files(parent, filename) {
+        Ok(stashed) => stashed,
+        Err(error) => {
+            let _ = std::fs::remove_file(staging);
             return Err(LauncherError::Download(format!(
-                "MD5 mismatch for {}",
-                m.name
+                "Cannot park the previous ATLauncher file: {error}"
             )));
         }
+    };
+    if let Err(error) = std::fs::rename(staging, dest) {
+        instances::restore_stashed_files(&stashed);
+        let _ = std::fs::remove_file(staging);
+        return Err(LauncherError::Download(format!(
+            "Cannot publish ATLauncher file {}: {error}",
+            name
+        )));
     }
+    instances::discard_stashed_files(&stashed);
     Ok(())
 }
 
@@ -710,7 +777,7 @@ pub async fn install_atlauncher_pack(
             } else {
                 dest_dir.join(&file_name)
             };
-            if !is_extract && dest.exists() && !m.optional {
+            if !is_extract && atl_existing_file_is_current(&dest, &m) {
                 let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if let Some(ref a) = app_owned {
                     let _ = a.emit(
@@ -881,6 +948,135 @@ mod tests {
             crate::import::AtlModKind::ResourcePackExtract
         );
         assert!(crate::import::atl_extract_spec("mods", Some("mods"), None).is_none());
+    }
+
+    #[tokio::test]
+    async fn atl_download_without_md5_is_rejected_before_network() {
+        let file = AtMod {
+            name: "No Hash".into(),
+            version: None,
+            url: Some("https://example.invalid/mod.jar".into()),
+            file: None,
+            md5: None,
+            filesize: None,
+            type_: "mods".into(),
+            download: "direct".into(),
+            client: true,
+            optional: false,
+            recommended: false,
+            hidden: false,
+            library: false,
+            extract_to: None,
+            extract_folder: None,
+        };
+        let dest = std::env::temp_dir().join(format!(
+            "vl_atl_no_hash_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let error = download_atl_mod(&file, &dest, &reqwest::Client::new())
+            .await
+            .expect_err("missing publisher MD5 must fail");
+        assert!(error.to_string().contains("MD5"), "got: {error}");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn atl_md5_mismatch_keeps_old_file_and_removes_staging() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_atl_mismatch_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("mod.jar");
+        std::fs::write(&dest, b"old-content").unwrap();
+        let staging = dir.join(".voidlauncher-atl-staging");
+        std::fs::write(&staging, b"new-content").unwrap();
+
+        let error = publish_atl_staged_file(&dest, &staging, &"0".repeat(32), "Test Mod")
+            .expect_err("a wrong MD5 must fail");
+        assert!(error.to_string().contains("MD5 mismatch"), "got: {error}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old-content");
+        assert!(!staging.exists(), "staging must not survive the mismatch");
+        assert!(
+            !dir.join(format!("mod.jar{}", crate::instances::STASH_SUFFIX))
+                .exists(),
+            "the old file must never be parked on a mismatch"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atl_md5_match_replaces_old_file_and_discards_park() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_atl_replace_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("mod.jar");
+        std::fs::write(&dest, b"old-content").unwrap();
+        let staging = dir.join(".voidlauncher-atl-staging");
+        std::fs::write(&staging, b"new-content").unwrap();
+        use md5::Digest;
+        let md5 = format!("{:x}", md5::Md5::digest(b"new-content"));
+
+        publish_atl_staged_file(&dest, &staging, &md5, "Test Mod").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-content");
+        assert!(!staging.exists());
+        assert!(
+            !dir.join(format!("mod.jar{}", crate::instances::STASH_SUFFIX))
+                .exists(),
+            "a successful publish must discard the parked old file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_atl_file_is_only_skipped_when_its_md5_matches() {
+        let dir = std::env::temp_dir().join(format!(
+            "vl_atl_existing_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("mod.jar");
+        std::fs::write(&dest, b"").unwrap();
+        let empty_md5 = "d41d8cd98f00b204e9800998ecf8427e";
+        let mut file = AtMod {
+            name: "Existing".into(),
+            version: None,
+            url: Some("https://example.invalid/mod.jar".into()),
+            file: None,
+            md5: Some(empty_md5.into()),
+            filesize: None,
+            type_: "mods".into(),
+            download: "direct".into(),
+            client: true,
+            optional: false,
+            recommended: false,
+            hidden: false,
+            library: false,
+            extract_to: None,
+            extract_folder: None,
+        };
+
+        assert!(atl_existing_file_is_current(&dest, &file));
+        file.md5 = Some("0".repeat(32));
+        assert!(!atl_existing_file_is_current(&dest, &file));
+        file.md5 = None;
+        assert!(!atl_existing_file_is_current(&dest, &file));
+        file.md5 = Some(empty_md5.into());
+        file.optional = true;
+        assert!(!atl_existing_file_is_current(&dest, &file));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

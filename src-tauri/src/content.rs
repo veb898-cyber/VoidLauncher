@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ==================== Installed-content model (item 13) ====================
 
@@ -235,6 +235,95 @@ pub fn write_sidecar(
         let _ = std::fs::remove_file(full_legacy);
     }
     Ok(())
+}
+
+/// Exact bytes of every sidecar file `read_sidecar_meta` can consult for one
+/// content filename, captured before a metadata write so a failed install can
+/// put the previous metadata back.
+pub(crate) struct SidecarSnapshotEntry {
+    pub path: PathBuf,
+    pub contents: Option<Vec<u8>>,
+}
+
+fn sidecar_snapshot_paths(content_dir: &Path, filename: &str) -> Vec<PathBuf> {
+    let Some(filename) = Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+    else {
+        return Vec::new();
+    };
+    vec![
+        crate::instances::sidecar_meta_path(content_dir, filename),
+        crate::instances::legacy_sidecar_path(content_dir, filename),
+        content_dir.join(format!("{filename}.voidlauncher.json")),
+    ]
+}
+
+pub(crate) fn snapshot_sidecars(
+    content_dir: &Path,
+    filenames: &[&str],
+) -> Vec<SidecarSnapshotEntry> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for filename in filenames {
+        for path in sidecar_snapshot_paths(content_dir, filename) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            // Never follow a junction/symlink while capturing rollback data.
+            let contents = if crate::import::ensure_no_reparse_points(content_dir, &path).is_ok()
+                && path.is_file()
+            {
+                std::fs::read(&path).ok()
+            } else {
+                None
+            };
+            SidecarSnapshotEntry { path, contents }
+        })
+        .collect()
+}
+
+/// Put the captured sidecar bytes back after a failed metadata write. A path
+/// that did not exist before the attempt is removed, so a partially written
+/// sidecar cannot be mistaken for the previous one.
+pub(crate) fn restore_sidecars(
+    content_dir: &Path,
+    snapshots: &[SidecarSnapshotEntry],
+) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    for snapshot in snapshots {
+        if crate::import::ensure_no_reparse_points(content_dir, &snapshot.path).is_err() {
+            errors.push(format!("{}: unsafe metadata path", snapshot.path.display()));
+            continue;
+        }
+        match &snapshot.contents {
+            Some(contents) => {
+                if let Some(parent) = snapshot.path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(error) = std::fs::write(&snapshot.path, contents) {
+                    errors.push(format!("{}: {error}", snapshot.path.display()));
+                }
+            }
+            None => {
+                if snapshot.path.is_file() {
+                    if let Err(error) = std::fs::remove_file(&snapshot.path) {
+                        errors.push(format!("{}: {error}", snapshot.path.display()));
+                    }
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// List every installed content file in `content_dir`, sidecar-less manual

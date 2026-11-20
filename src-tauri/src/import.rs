@@ -1,8 +1,10 @@
 use crate::config::AppConfig;
 use crate::content;
+use crate::curseforge::CfFile;
 use crate::download;
 use crate::error::{LauncherError, Result};
 use crate::instances::{self, Instance, LoaderType};
+use crate::integrity::HashSpec;
 use crate::modloaders;
 use crate::modrinth;
 use crate::modrinth::ModrinthFile;
@@ -776,6 +778,14 @@ fn pick_modrinth_file<'a>(
             return Some(f);
         }
     }
+    if let Some(h) = hashes["sha256"].as_str() {
+        if let Some(f) = files
+            .iter()
+            .find(|f| f.hashes.get("sha256").map(|v| v == h).unwrap_or(false))
+        {
+            return Some(f);
+        }
+    }
     if let Some(h) = hashes["sha512"].as_str() {
         if let Some(f) = files
             .iter()
@@ -788,6 +798,324 @@ fn pick_modrinth_file<'a>(
         .iter()
         .find(|f| f.filename == filename)
         .or_else(|| files.iter().find(|f| f.primary))
+}
+
+/// Parse the checksums declared by a `modrinth.index.json` file entry.
+///
+/// Empty values mean "not provided"; a non-empty malformed value is an error.
+/// Unknown algorithms (including MD5) are ignored and never treated as SHA-1.
+fn mrpack_declared_hash(file_entry: &serde_json::Value) -> Result<Option<HashSpec>> {
+    let Some(hashes) = file_entry.get("hashes") else {
+        return Ok(None);
+    };
+    if hashes.is_null() {
+        return Ok(None);
+    }
+    let Some(hashes) = hashes.as_object() else {
+        return Err(LauncherError::Instance(
+            "mrpack hashes metadata is not an object".to_string(),
+        ));
+    };
+    let mut map: HashMap<String, String> = HashMap::new();
+    for key in ["sha512", "sha-512", "sha256", "sha-256", "sha1", "sha-1"] {
+        let Some(value) = hashes.get(key) else {
+            continue;
+        };
+        match value {
+            serde_json::Value::String(value) => {
+                map.insert(key.to_string(), value.clone());
+            }
+            serde_json::Value::Null => {}
+            _ => {
+                return Err(LauncherError::Instance(format!(
+                    "mrpack hash '{key}' is not a string"
+                )))
+            }
+        }
+    }
+    HashSpec::from_metadata(&map)
+        .map_err(|e| LauncherError::Instance(format!("Invalid mrpack hash metadata: {e}")))
+}
+
+/// Allowlisted download URLs declared by an mrpack entry.
+fn mrpack_allowed_downloads(file_entry: &serde_json::Value) -> Vec<String> {
+    file_entry["downloads"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| {
+                    let allowed = crate::download::validate_download_url(s).is_ok();
+                    if !allowed {
+                        tracing::warn!(
+                            target: "launcher",
+                            "Ignoring an unsafe download URL in mrpack metadata"
+                        );
+                    }
+                    allowed
+                })
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Exact filename match for a provider fallback. A manifest URL may only
+/// disambiguate several API files with the same name; it is never used as the
+/// download source.
+fn exact_modrinth_file<'a>(
+    files: &'a [ModrinthFile],
+    filename: &str,
+    manifest_urls: &[String],
+) -> Result<Option<&'a ModrinthFile>> {
+    let matches: Vec<&ModrinthFile> = files
+        .iter()
+        .filter(|file| file.filename == filename)
+        .collect();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if matches.len() == 1 {
+        return Ok(matches.first().copied());
+    }
+    let by_url: Vec<&ModrinthFile> = matches
+        .iter()
+        .copied()
+        .filter(|file| manifest_urls.iter().any(|url| url == &file.url))
+        .collect();
+    if by_url.len() == 1 {
+        Ok(by_url.first().copied())
+    } else {
+        Err(LauncherError::Instance(format!(
+            "mrpack file '{filename}' is ambiguous in provider metadata"
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct MrpackDownloadPlan {
+    urls: Vec<String>,
+    hash: HashSpec,
+    size: Option<u64>,
+}
+
+fn provider_hash_matches(file: &ModrinthFile, declared: &HashSpec) -> bool {
+    let keys: &[&str] = match declared.algorithm() {
+        "sha1" => &["sha1", "sha-1"],
+        "sha256" => &["sha256", "sha-256"],
+        "sha512" => &["sha512", "sha-512"],
+        _ => return false,
+    };
+    keys.iter().any(|key| {
+        file.hashes
+            .get(*key)
+            .is_some_and(|value| value.eq_ignore_ascii_case(declared.hex()))
+    })
+}
+
+/// Resolve the independent provider hash for a remote mrpack file whose
+/// manifest has no checksum. Only an exact filename match is accepted.
+async fn resolve_mrpack_provider_file(
+    file_entry: &serde_json::Value,
+    path_str: &str,
+) -> Result<(ModrinthFile, HashSpec, Option<u64>)> {
+    let filename = path_str.rsplit('/').next().unwrap_or(path_str);
+    let requested_project = file_entry["project_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let manifest_urls = mrpack_allowed_downloads(file_entry);
+
+    let mut version_ids: Vec<String> = Vec::new();
+    if let Some(version_id) = file_entry["version_id"].as_str() {
+        if !version_id.is_empty() {
+            version_ids.push(version_id.to_string());
+        }
+    }
+    if let Some(versions) = file_entry["versions"].as_array() {
+        for version in versions.iter().filter_map(|value| value.as_str()) {
+            if !version.is_empty() {
+                version_ids.push(version.to_string());
+            }
+        }
+    }
+    version_ids.sort_unstable();
+    version_ids.dedup();
+
+    let mut versions: Vec<modrinth::ModrinthVersionResponse> = Vec::new();
+    if !version_ids.is_empty() {
+        for version_id in &version_ids {
+            if let Ok(version) = modrinth::get_version_by_id(version_id).await {
+                versions.push(version);
+            }
+        }
+    }
+    if versions.is_empty() {
+        if let Some(project_id) = requested_project {
+            if let Ok(project_versions) = modrinth::get_project_versions(project_id).await {
+                versions = project_versions;
+            }
+        }
+    }
+    if versions.is_empty() {
+        return Err(LauncherError::Instance(format!(
+            "No independent provider metadata for mrpack file '{path_str}'; refusing to download it without a checksum"
+        )));
+    }
+
+    let mut matches: Vec<(ModrinthFile, HashSpec, Option<u64>)> = Vec::new();
+    for version in versions {
+        if requested_project.is_some_and(|project| version.project_id != project) {
+            continue;
+        }
+        let Some(file) = exact_modrinth_file(&version.files, filename, &manifest_urls)? else {
+            continue;
+        };
+        if !file.url.starts_with("https://")
+            || !crate::download::validate_download_url(&file.url).is_ok()
+        {
+            return Err(LauncherError::Instance(format!(
+                "Provider returned an unsafe URL for mrpack file '{path_str}'"
+            )));
+        }
+        let hash = HashSpec::from_metadata(&file.hashes)
+            .map_err(|e| LauncherError::Instance(format!("Invalid provider checksum: {e}")))?
+            .ok_or_else(|| {
+                LauncherError::Instance(format!(
+                    "Provider has no checksum for mrpack file '{path_str}'; refusing to download it"
+                ))
+            })?;
+        let candidate = (file.clone(), hash, (file.size > 0).then_some(file.size));
+        if !matches
+            .iter()
+            .any(|(existing, existing_hash, existing_size)| {
+                existing.url == candidate.0.url
+                    && existing_hash.hex() == candidate.1.hex()
+                    && existing_size == &candidate.2
+            })
+        {
+            matches.push(candidate);
+        }
+    }
+
+    match matches.len() {
+        0 => Err(LauncherError::Instance(format!(
+            "Provider metadata has no exact file match for mrpack file '{path_str}'; refusing to download it without a checksum"
+        ))),
+        1 => Ok(matches.remove(0)),
+        _ => Err(LauncherError::Instance(format!(
+            "Provider metadata is ambiguous for mrpack file '{path_str}'; refusing to download it without a checksum"
+        ))),
+    }
+}
+
+async fn resolve_mrpack_download(
+    file_entry: &serde_json::Value,
+    path_str: &str,
+    declared_hash: Option<&HashSpec>,
+    require_provider: bool,
+) -> Result<MrpackDownloadPlan> {
+    let manifest_size = file_entry["fileSize"].as_u64().filter(|size| *size > 0);
+    let manifest_urls = mrpack_allowed_downloads(file_entry);
+    let has_provider_identity = file_entry["version_id"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty())
+        || file_entry["project_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        || file_entry["versions"].as_array().is_some_and(|versions| {
+            versions
+                .iter()
+                .any(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+        });
+    if require_provider && !has_provider_identity {
+        // Legacy lock entries without provider ids have no independent source
+        // to refresh. They may still use their archived checksum, but a remote
+        // file without even that checksum is never downloaded.
+        let Some(hash) = declared_hash else {
+            return Err(LauncherError::Instance(format!(
+                "Packlock entry for '{path_str}' has no provider identity or checksum; refusing to download it"
+            )));
+        };
+        if manifest_urls.is_empty() {
+            return Err(LauncherError::Instance(format!(
+                "Packlock entry for '{path_str}' has no download URL"
+            )));
+        }
+        return Ok(MrpackDownloadPlan {
+            urls: manifest_urls,
+            hash: hash.clone(),
+            size: manifest_size,
+        });
+    }
+    if require_provider {
+        // Packlock repair/restore must not trust the saved URL or checksum as
+        // the only source. Resolve the current provider metadata and keep the
+        // saved hash only as a cross-check.
+        let (file, hash, provider_size) =
+            resolve_mrpack_provider_file(file_entry, path_str).await?;
+        if let Some(declared) = declared_hash {
+            if !provider_hash_matches(&file, declared) {
+                return Err(LauncherError::Instance(format!(
+                    "Packlock checksum for '{path_str}' does not match provider metadata"
+                )));
+            }
+        }
+        if let (Some(manifest), Some(provider)) = (manifest_size, provider_size) {
+            if manifest != provider {
+                return Err(LauncherError::Instance(format!(
+                    "mrpack file size for '{path_str}' does not match provider metadata"
+                )));
+            }
+        }
+        let mut urls = vec![file.url];
+        for url in manifest_urls {
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        return Ok(MrpackDownloadPlan {
+            urls,
+            hash,
+            size: provider_size.or(manifest_size),
+        });
+    }
+    if let Some(hash) = declared_hash {
+        let urls = if manifest_urls.is_empty() {
+            resolve_mrpack_urls(file_entry, path_str).await
+        } else {
+            manifest_urls
+        };
+        if urls.is_empty() {
+            return Err(LauncherError::Instance(format!(
+                "No download URL for {path_str}"
+            )));
+        }
+        return Ok(MrpackDownloadPlan {
+            urls,
+            hash: hash.clone(),
+            size: manifest_size,
+        });
+    }
+
+    let (file, hash, provider_size) = resolve_mrpack_provider_file(file_entry, path_str).await?;
+    if let (Some(manifest), Some(provider)) = (manifest_size, provider_size) {
+        if manifest != provider {
+            return Err(LauncherError::Instance(format!(
+                "mrpack file size for '{path_str}' does not match provider metadata"
+            )));
+        }
+    }
+    let mut urls = vec![file.url.clone()];
+    for url in mrpack_allowed_downloads(file_entry) {
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    Ok(MrpackDownloadPlan {
+        urls,
+        hash,
+        size: provider_size.or(manifest_size),
+    })
 }
 
 async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> Vec<String> {
@@ -839,6 +1167,7 @@ async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> 
 
     for (hash, algo) in [
         hashes["sha512"].as_str().map(|h| (h, "sha512")),
+        hashes["sha256"].as_str().map(|h| (h, "sha256")),
         hashes["sha1"].as_str().map(|h| (h, "sha1")),
     ]
     .into_iter()
@@ -870,29 +1199,61 @@ async fn resolve_mrpack_urls(file_entry: &serde_json::Value, path_str: &str) -> 
     urls
 }
 
-fn write_mrpack_sidecar(dest_path: &Path, file_entry: &serde_json::Value) -> std::io::Result<()> {
+fn write_mrpack_sidecar(
+    dest_path: &Path,
+    file_entry: &serde_json::Value,
+    hash: Option<&HashSpec>,
+) -> std::io::Result<()> {
+    let Some(parent) = dest_path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mrpack destination has no parent",
+        ));
+    };
     let filename = dest_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let sidecar = serde_json::json!({
-        "provider": "modrinth",
-        "project_id": file_entry["project_id"].as_str(),
-        "version_id": file_entry["version_id"].as_str().or_else(|| {
-            file_entry["versions"].as_array().and_then(|v| v.first()).and_then(|x| x.as_str())
-        }),
-        "version_number": null,
-        "filename": filename,
-        "downloaded_from_mrpack": true,
-    });
-    if let Some(parent) = dest_path.parent() {
-        // Use the central sidecar naming rule: `.disabled` is stripped before
-        // the extension, so a disabled MRPACK file is still discoverable by
-        // `read_sidecar_meta`/update checks.
-        let sidecar_path = crate::instances::sidecar_meta_path(parent, filename);
-        ensure_no_reparse_points(parent, &sidecar_path)?;
-        if let Some(index_dir) = sidecar_path.parent() {
-            std::fs::create_dir_all(index_dir)?;
-        }
-        ensure_no_reparse_points(parent, &sidecar_path)?;
-        std::fs::write(sidecar_path, sidecar.to_string())?;
+    let content_type = parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(content::content_type_for_dir)
+        .unwrap_or("unknown");
+    content::write_sidecar(
+        parent,
+        filename,
+        &content::SidecarWrite {
+            provider: "modrinth",
+            content_type,
+            project_id: file_entry["project_id"].as_str(),
+            project_name: None,
+            version_id: file_entry["version_id"].as_str().or_else(|| {
+                file_entry["versions"]
+                    .as_array()
+                    .and_then(|v| v.first())
+                    .and_then(|x| x.as_str())
+            }),
+            version_number: None,
+            file_id: None,
+            hash: hash.map(HashSpec::hex),
+        },
+    )
+}
+
+/// Write metadata for a freshly imported mrpack file. A failure rolls the new
+/// file back; an unrecorded file would leave update/repair with stale metadata.
+fn finish_mrpack_file(
+    dest_path: &Path,
+    file_entry: &serde_json::Value,
+    hash: Option<&HashSpec>,
+    with_sidecar: bool,
+) -> Result<()> {
+    if !with_sidecar {
+        return Ok(());
+    }
+    if let Err(error) = write_mrpack_sidecar(dest_path, file_entry, hash) {
+        let _ = std::fs::remove_file(dest_path);
+        return Err(LauncherError::Instance(format!(
+            "Could not write mrpack metadata for {}: {error}",
+            dest_path.display()
+        )));
     }
     Ok(())
 }
@@ -920,12 +1281,38 @@ fn mrpack_dest(mc_dir: &Path, path_str: &str) -> Result<PathBuf> {
     Ok(dest_path)
 }
 
+/// Install one mrpack index file using the trust policy of the caller.
+///
+/// A fresh import/update may trust the manifest hash because the manifest is
+/// inside the pack archive. Packlock repair uses the `_verified` variant, which
+/// re-resolves provider metadata and never trusts the saved URL/hash alone.
 pub(crate) async fn install_mrpack_file(
     path_str: &str,
     file_entry: &serde_json::Value,
     mc_dir: &Path,
     embedded: &Arc<HashMap<String, Vec<u8>>>,
     with_sidecar: bool,
+) -> Result<()> {
+    install_mrpack_file_inner(path_str, file_entry, mc_dir, embedded, with_sidecar, false).await
+}
+
+pub(crate) async fn install_mrpack_file_verified(
+    path_str: &str,
+    file_entry: &serde_json::Value,
+    mc_dir: &Path,
+    embedded: &Arc<HashMap<String, Vec<u8>>>,
+    with_sidecar: bool,
+) -> Result<()> {
+    install_mrpack_file_inner(path_str, file_entry, mc_dir, embedded, with_sidecar, true).await
+}
+
+async fn install_mrpack_file_inner(
+    path_str: &str,
+    file_entry: &serde_json::Value,
+    mc_dir: &Path,
+    embedded: &Arc<HashMap<String, Vec<u8>>>,
+    with_sidecar: bool,
+    require_provider: bool,
 ) -> Result<()> {
     let dest_path = mrpack_dest(mc_dir, path_str)?;
     ensure_no_reparse_points(mc_dir, &dest_path)?;
@@ -934,63 +1321,80 @@ pub(crate) async fn install_mrpack_file(
     }
     ensure_no_reparse_points(mc_dir, &dest_path)?;
 
-    let expected_sha1 = file_entry["hashes"]["sha1"].as_str().unwrap_or("");
+    let declared_hash = mrpack_declared_hash(file_entry)?;
     let norm_path = normalize_zip_path(path_str);
 
     if let Some(data) = embedded.get(&norm_path) {
+        // Local override bytes: no network trust decision is involved. If the
+        // manifest declares a checksum, still verify the archived bytes before
+        // publishing them; otherwise a local override is installed as-is.
         std::fs::write(&dest_path, data)?;
-        if !expected_sha1.is_empty() {
-            let mut hasher = sha1::Sha1::new();
-            use sha1::Digest;
-            hasher.update(data);
-            let hash = format!("{:x}", hasher.finalize());
-            if hash != expected_sha1 {
+        if let Some(hash) = declared_hash.as_ref() {
+            let verified = match hash.verify_file(&dest_path) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&dest_path);
+                    return Err(error);
+                }
+            };
+            if !verified {
+                let _ = std::fs::remove_file(&dest_path);
                 return Err(LauncherError::Instance(format!(
                     "Embedded file hash mismatch for {}",
                     path_str
                 )));
             }
         }
-        if with_sidecar {
-            write_mrpack_sidecar(&dest_path, file_entry)?;
-        }
+        finish_mrpack_file(&dest_path, file_entry, declared_hash.as_ref(), with_sidecar)?;
         return Ok(());
     }
 
-    if dest_path.exists() && !expected_sha1.is_empty() {
-        let path_buf = dest_path.clone();
-        if crate::download::verify_sha1(&path_buf, expected_sha1).unwrap_or(false) {
-            if with_sidecar {
-                write_mrpack_sidecar(&dest_path, file_entry)?;
+    if dest_path.exists() {
+        if let Some(hash) = declared_hash.as_ref() {
+            if hash.verify_file(&dest_path).unwrap_or(false) {
+                finish_mrpack_file(&dest_path, file_entry, Some(hash), with_sidecar)?;
+                return Ok(());
             }
-            return Ok(());
         }
     }
 
-    let urls = resolve_mrpack_urls(file_entry, path_str).await;
-    if urls.is_empty() {
-        return Err(LauncherError::Instance(format!(
-            "No download URL for {}",
-            path_str
-        )));
+    let plan = resolve_mrpack_download(
+        file_entry,
+        path_str,
+        declared_hash.as_ref(),
+        require_provider,
+    )
+    .await?;
+
+    // A previous interrupted attempt may already have published the exact
+    // provider-verified bytes.
+    if dest_path.exists() && plan.hash.verify_file(&dest_path).unwrap_or(false) {
+        finish_mrpack_file(&dest_path, file_entry, Some(&plan.hash), with_sidecar)?;
+        return Ok(());
     }
 
-    let dest_buf = dest_path.clone();
-    for url in urls {
-        if crate::download::download_file(&url, &dest_buf, expected_sha1)
-            .await
-            .is_ok()
-        {
-            if with_sidecar {
-                write_mrpack_sidecar(&dest_path, file_entry)?;
+    let mut last_error: Option<String> = None;
+    for url in plan.urls {
+        let result = if let Some(size) = plan.size {
+            crate::download::download_file_sized_verified(&url, &dest_path, &plan.hash, size).await
+        } else {
+            crate::download::download_file_verified(&url, &dest_path, &plan.hash).await
+        };
+        match result {
+            Ok(()) => {
+                finish_mrpack_file(&dest_path, file_entry, Some(&plan.hash), with_sidecar)?;
+                return Ok(());
             }
-            return Ok(());
+            Err(error) => last_error = Some(error.to_string()),
         }
     }
 
     Err(LauncherError::Instance(format!(
-        "Failed to download {}",
-        path_str
+        "Failed to download {}{}",
+        path_str,
+        last_error
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
     )))
 }
 
@@ -2517,6 +2921,13 @@ fn extract_mrpack_layers(
     Ok((extracted_any, embedded, override_keys))
 }
 
+/// Import the files inside an `.mrpack`.
+///
+/// The caller decides whether the archive itself was publisher-verified:
+/// catalog installs write a PackLock afterwards, while a local import
+/// deliberately does not. Manifest hashes from a local archive are
+/// user-declared checksums and must never be promoted to publisher proof by a
+/// later update or repair.
 pub(crate) async fn import_mrpack(
     instances_dir: &Path,
     path: &str,
@@ -2793,6 +3204,50 @@ pub(crate) fn plan_curseforge_manifest_files(
     (targets, failed)
 }
 
+/// Publish a downloaded CurseForge file and its sidecar as one transaction.
+///
+/// The old content file is parked first (never deleted), so a failure while
+/// moving the new file into place or while writing metadata restores the old
+/// content and the exact previous sidecar bytes. A verified file that cannot
+/// be described by metadata must not remain on disk under stale metadata.
+fn publish_curseforge_file<F>(
+    content_dir: &Path,
+    filename: &str,
+    staging: &Path,
+    dest_path: &Path,
+    write_sidecar: F,
+) -> std::result::Result<(), String>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    let stashed = match instances::stash_old_content_files(content_dir, filename) {
+        Ok(stashed) => stashed,
+        Err(error) => {
+            let _ = std::fs::remove_file(staging);
+            return Err(error);
+        }
+    };
+    if let Err(error) = std::fs::rename(staging, dest_path) {
+        instances::restore_stashed_files(&stashed);
+        let _ = std::fs::remove_file(staging);
+        return Err(format!("Cannot publish downloaded file: {error}"));
+    }
+
+    let snapshots = content::snapshot_sidecars(content_dir, &[filename]);
+    if let Err(error) = write_sidecar() {
+        let _ = std::fs::remove_file(dest_path);
+        instances::restore_stashed_files(&stashed);
+        let metadata_note = content::restore_sidecars(content_dir, &snapshots)
+            .err()
+            .map(|restore| format!("; metadata restore failed: {restore}"))
+            .unwrap_or_default();
+        return Err(format!("Metadata write failed: {error}{metadata_note}"));
+    }
+
+    instances::discard_stashed_files(&stashed);
+    Ok(())
+}
+
 /// Download one CurseForge mod file into the correct content folder of an
 /// instance and write its sidecar. The error carries the file name and a
 /// human-readable reason so the import report (and the retry UI) can name the
@@ -2804,6 +3259,7 @@ pub(crate) async fn install_curseforge_file(
     fid: u64,
     api_key: &str,
     claims: Option<&Mutex<ExtractBudget>>,
+    preloaded: Option<CfFile>,
 ) -> std::result::Result<String, (String, String)> {
     let content_dir = mc_dir.join(class.folder());
     if let Err(e) = std::fs::create_dir_all(&content_dir) {
@@ -2813,9 +3269,12 @@ pub(crate) async fn install_curseforge_file(
         ));
     }
     let fallback = format!("{}:{}", pid, fid);
-    let cf_file = crate::curseforge::get_mod_file(pid, fid, api_key)
-        .await
-        .map_err(|e| (fallback.clone(), format!("CurseForge API error: {}", e)))?;
+    let cf_file = match preloaded {
+        Some(file) => file,
+        None => crate::curseforge::get_mod_file(pid, fid, api_key)
+            .await
+            .map_err(|e| (fallback.clone(), format!("CurseForge API error: {}", e)))?,
+    };
     let display = if cf_file.display_name.trim().is_empty() {
         fallback.clone()
     } else {
@@ -2842,12 +3301,21 @@ pub(crate) async fn install_curseforge_file(
             return Err((display, e.to_string()));
         }
     }
-    let dest_path = content_dir.join(&cf_file.file_name);
+    let filename = cf_file.file_name.clone();
+    let dest_path = content_dir.join(&filename);
     ensure_no_reparse_points(mc_dir, &dest_path)
         .map_err(|e| (display.clone(), format!("Unsafe destination: {}", e)))?;
+
+    // Download beside the destination first. The old file stays in place until
+    // the verified bytes are ready; only then are file and sidecar swapped
+    // together. The staging name is deterministic per destination so a paused
+    // retry resumes the same `.part`, and it starts with a dot so content
+    // listings ignore an abandoned attempt after a crash.
+    let staging = content_dir.join(format!(".voidlauncher-cf-{filename}"));
     if let Err(e) =
-        crate::curseforge::download_mod_file(pid, fid, &cf_file, api_key, &dest_path).await
+        crate::curseforge::download_mod_file(pid, fid, &cf_file, api_key, &staging).await
     {
+        let _ = std::fs::remove_file(&staging);
         return Err((display, format!("Download failed: {}", e)));
     }
 
@@ -2856,24 +3324,29 @@ pub(crate) async fn install_curseforge_file(
     let pid_str = pid.to_string();
     let fid_str = fid.to_string();
     let hash = cf_file.sha1_hash().map(|s| s.to_string());
-    let _ = content::write_sidecar(
-        &content_dir,
-        &cf_file.file_name,
-        &content::SidecarWrite {
-            provider: "curseforge",
-            content_type: class.content_type(),
-            project_id: Some(&pid_str),
-            project_name: Some(&display),
-            version_id: None,
-            // CurseForge has no separate version field; the display name
-            // (e.g. "jei-1.20.1-forge-15.21.0.138") is the closest thing to
-            // a real version and beats the "${file.jarVersion}" placeholder
-            // many JARs ship with.
-            version_number: Some(&display),
-            file_id: Some(&fid_str),
-            hash: hash.as_deref(),
-        },
-    );
+    let publish = publish_curseforge_file(&content_dir, &filename, &staging, &dest_path, || {
+        content::write_sidecar(
+            &content_dir,
+            &filename,
+            &content::SidecarWrite {
+                provider: "curseforge",
+                content_type: class.content_type(),
+                project_id: Some(&pid_str),
+                project_name: Some(&display),
+                version_id: None,
+                // CurseForge has no separate version field; the display name
+                // (e.g. "jei-1.20.1-forge-15.21.0.138") is the closest thing to
+                // a real version and beats the "${file.jarVersion}" placeholder
+                // many JARs ship with.
+                version_number: Some(&display),
+                file_id: Some(&fid_str),
+                hash: hash.as_deref(),
+            },
+        )
+    });
+    if let Err(e) = publish {
+        return Err((display, e));
+    }
 
     Ok(display)
 }
@@ -2946,7 +3419,7 @@ pub(crate) async fn retry_curseforge_import_files(
             });
             continue;
         };
-        match install_curseforge_file(&mc_dir, class, *pid, *fid, api_key, None).await {
+        match install_curseforge_file(&mc_dir, class, *pid, *fid, api_key, None, None).await {
             Ok(_) => report.installed += 1,
             Err((name, reason)) => report.failed.push(FailedImportFile {
                 file_name: name,
@@ -3106,6 +3579,24 @@ pub(crate) async fn import_curseforge_pack(
             .count();
         let total_tasks = targets.len();
 
+        // Batch the publisher metadata for the whole pack. This is the same
+        // API data download_mod_file validates; falling back to per-file
+        // lookup only when the batch endpoint is unavailable keeps retries
+        // possible without turning a large pack into one request per file.
+        let mut file_ids: Vec<u64> = targets.iter().map(|target| target.file_id).collect();
+        file_ids.sort_unstable();
+        file_ids.dedup();
+        let mut preloaded_files: HashMap<u64, crate::curseforge::CfFile> = HashMap::new();
+        for chunk in file_ids.chunks(50) {
+            if let Ok(files) = crate::curseforge::get_files_by_ids(chunk, curseforge_api_key).await
+            {
+                for file in files {
+                    preloaded_files.insert(file.id, file);
+                }
+            }
+        }
+        let preloaded_files = Arc::new(preloaded_files);
+
         let semaphore = Arc::new(Semaphore::new(4));
         let completed = Arc::new(AtomicUsize::new(classification_failed.len()));
         let in_progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3132,6 +3623,7 @@ pub(crate) async fn import_curseforge_pack(
             let succeeded = succeeded.clone();
             let failed_ids = failed_ids.clone();
             let claims = claims.clone();
+            let preloaded_files = preloaded_files.clone();
             let pid = target.project_id;
             let fid = target.file_id;
             let class = target.class;
@@ -3161,6 +3653,7 @@ pub(crate) async fn import_curseforge_pack(
                     fid,
                     &api_key,
                     Some(claims.as_ref()),
+                    preloaded_files.get(&fid).cloned(),
                 )
                 .await;
 
@@ -4418,7 +4911,7 @@ mod tests {
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::write(&dest, b"jar").unwrap();
         let entry = serde_json::json!({"project_id": "abc"});
-        write_mrpack_sidecar(&dest, &entry).unwrap();
+        write_mrpack_sidecar(&dest, &entry, None).unwrap();
         let expected = base
             .join("mods")
             .join(".index")
@@ -4562,6 +5055,210 @@ mod tests {
         );
     }
 
+    #[test]
+    fn packlock_provider_hash_cross_check_uses_the_same_algorithm() {
+        let sha1 = "a".repeat(40);
+        let sha512 = "b".repeat(128);
+        let mut hashes = HashMap::new();
+        hashes.insert("sha1".to_string(), sha1.clone());
+        hashes.insert("sha512".to_string(), sha512.clone());
+        let file = ModrinthFile {
+            hashes,
+            url: "https://cdn.modrinth.com/data/file.jar".to_string(),
+            filename: "file.jar".to_string(),
+            primary: true,
+            size: 1,
+        };
+        assert!(provider_hash_matches(
+            &file,
+            &HashSpec::sha1(&sha1).unwrap()
+        ));
+        assert!(!provider_hash_matches(
+            &file,
+            &HashSpec::sha1(&"c".repeat(40)).unwrap()
+        ));
+        let weaker_only = ModrinthFile {
+            hashes: HashMap::from([("sha512".to_string(), sha512)]),
+            ..file
+        };
+        assert!(!provider_hash_matches(
+            &weaker_only,
+            &HashSpec::sha1(&sha1).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_mrpack_remote_file_without_hash_or_provider_identity_is_rejected() {
+        let entry = serde_json::json!({
+            "path": "mods/unknown.jar",
+            "hashes": {},
+            "downloads": ["https://cdn.modrinth.com/data/unknown.jar"]
+        });
+        let error = resolve_mrpack_download(&entry, "mods/unknown.jar", None, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No independent provider metadata"),
+            "got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn packlock_legacy_entry_without_provider_ids_uses_its_archived_hash() {
+        let sha1 = "a".repeat(40);
+        let entry = serde_json::json!({
+            "path": "mods/legacy.jar",
+            "hashes": {"sha1": sha1.clone()},
+            "downloads": ["https://cdn.modrinth.com/data/legacy.jar"],
+            "fileSize": 10
+        });
+        let declared = HashSpec::sha1(&sha1).unwrap();
+        let plan = resolve_mrpack_download(&entry, "mods/legacy.jar", Some(&declared), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.urls,
+            vec!["https://cdn.modrinth.com/data/legacy.jar".to_string()]
+        );
+        assert_eq!(plan.hash.hex(), sha1);
+        assert_eq!(plan.size, Some(10));
+
+        let no_hash = serde_json::json!({
+            "path": "mods/legacy.jar",
+            "hashes": {},
+            "downloads": ["https://cdn.modrinth.com/data/legacy.jar"]
+        });
+        assert!(
+            resolve_mrpack_download(&no_hash, "mods/legacy.jar", None, true)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mrpack_declared_hash_uses_priority_and_rejects_malformed_values() {
+        let sha1 = "a".repeat(40);
+        let sha256 = "b".repeat(64);
+        let sha512 = "c".repeat(128);
+
+        let entry = serde_json::json!({"hashes": {"sha1": sha1.clone(), "sha512": sha512.clone()}});
+        let hash = mrpack_declared_hash(&entry).unwrap().unwrap();
+        assert_eq!(hash.algorithm(), "sha512");
+        assert_eq!(hash.hex(), sha512);
+
+        let entry = serde_json::json!({"hashes": {"sha1": sha1.clone(), "sha256": sha256.clone()}});
+        let hash = mrpack_declared_hash(&entry).unwrap().unwrap();
+        assert_eq!(hash.algorithm(), "sha256");
+
+        let empty = serde_json::json!({"hashes": {}});
+        assert_eq!(mrpack_declared_hash(&empty).unwrap(), None);
+        let malformed = serde_json::json!({"hashes": {"sha512": "not-a-hash"}});
+        assert!(mrpack_declared_hash(&malformed).is_err());
+        let mixed = serde_json::json!({"hashes": {"sha1": sha1.clone(), "sha512": "not-a-hash"}});
+        assert!(
+            mrpack_declared_hash(&mixed).is_err(),
+            "a malformed stronger hash must not fall back to SHA-1"
+        );
+        let wrong_type = serde_json::json!({"hashes": {"sha1": 42}});
+        assert!(mrpack_declared_hash(&wrong_type).is_err());
+        let unknown = serde_json::json!({"hashes": {"md5": "d41d8cd98f00b204e9800998ecf8427e"}});
+        assert_eq!(mrpack_declared_hash(&unknown).unwrap(), None);
+    }
+
+    #[test]
+    fn mrpack_provider_file_match_is_exact_and_url_only_disambiguates() {
+        let file = |name: &str, url: &str| ModrinthFile {
+            hashes: HashMap::new(),
+            url: url.to_string(),
+            filename: name.to_string(),
+            primary: true,
+            size: 10,
+        };
+        let files = vec![
+            file("same.jar", "https://cdn.modrinth.com/data/one.jar"),
+            file("same.jar", "https://cdn.modrinth.com/data/two.jar"),
+            file("other.jar", "https://cdn.modrinth.com/data/other.jar"),
+        ];
+        assert_eq!(
+            exact_modrinth_file(&files, "other.jar", &[])
+                .unwrap()
+                .map(|f| f.url.as_str()),
+            Some("https://cdn.modrinth.com/data/other.jar")
+        );
+        assert!(exact_modrinth_file(&files, "same.jar", &[]).is_err());
+        assert_eq!(
+            exact_modrinth_file(
+                &files,
+                "same.jar",
+                &["https://cdn.modrinth.com/data/two.jar".to_string()]
+            )
+            .unwrap()
+            .map(|f| f.url.as_str()),
+            Some("https://cdn.modrinth.com/data/two.jar")
+        );
+    }
+
+    #[tokio::test]
+    async fn mrpack_embedded_override_without_hash_is_local_content() {
+        let base = std::env::temp_dir().join(format!(
+            "vl_mrpack_embedded_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut embedded = HashMap::new();
+        embedded.insert("mods/local.jar".to_string(), b"local-override".to_vec());
+        let entry = serde_json::json!({
+            "path": "mods/local.jar",
+            "hashes": {},
+            "downloads": []
+        });
+
+        install_mrpack_file("mods/local.jar", &entry, &base, &Arc::new(embedded), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(base.join("mods/local.jar")).unwrap(),
+            b"local-override"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn mrpack_embedded_override_hash_mismatch_does_not_publish() {
+        let base = std::env::temp_dir().join(format!(
+            "vl_mrpack_embedded_bad_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut embedded = HashMap::new();
+        embedded.insert("mods/local.jar".to_string(), b"tampered".to_vec());
+        let entry = serde_json::json!({
+            "path": "mods/local.jar",
+            "hashes": {
+                "sha512": "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043"
+            },
+            "downloads": []
+        });
+
+        assert!(
+            install_mrpack_file("mods/local.jar", &entry, &base, &Arc::new(embedded), false,)
+                .await
+                .is_err()
+        );
+        assert!(!base.join("mods/local.jar").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[tokio::test]
     async fn mrpack_install_rejects_a_spoofed_download_before_any_request() {
         let base = std::env::temp_dir().join(format!(
@@ -4583,7 +5280,8 @@ mod tests {
             .await
             .expect_err("the spoofed URL must be rejected");
         assert!(
-            err.to_string().contains("No download URL"),
+            err.to_string().contains("without a checksum")
+                || err.to_string().contains("independent provider metadata"),
             "unexpected error: {err}"
         );
         assert!(!base.join("mods/bad.jar").exists());
@@ -4797,6 +5495,123 @@ mod tests {
     fn import_completion_rejects_pack_with_no_installed_files() {
         assert_eq!(import_completion(10, 0), ImportCompletion::Failed);
         assert_eq!(import_completion(1, 0), ImportCompletion::Failed);
+    }
+
+    #[test]
+    fn curseforge_publish_restores_previous_file_and_metadata_on_sidecar_failure() {
+        let base = std::env::temp_dir().join(format!(
+            "vl_cf_publish_rollback_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let content_dir = base.join("mods");
+        std::fs::create_dir_all(&content_dir).unwrap();
+        let dest = content_dir.join("example.jar");
+        std::fs::write(&dest, b"old-content").unwrap();
+        content::write_sidecar(
+            &content_dir,
+            "example.jar",
+            &content::SidecarWrite {
+                provider: "curseforge",
+                content_type: "mod",
+                project_id: Some("7"),
+                project_name: Some("Old"),
+                version_id: None,
+                version_number: Some("1"),
+                file_id: Some("42"),
+                hash: Some(&"a".repeat(40)),
+            },
+        )
+        .unwrap();
+        let old_sidecar = std::fs::read(crate::instances::sidecar_meta_path(
+            &content_dir,
+            "example.jar",
+        ))
+        .unwrap();
+        let staging = content_dir.join(".voidlauncher-cf-test-staging");
+        std::fs::write(&staging, b"new-content").unwrap();
+
+        let error = publish_curseforge_file(&content_dir, "example.jar", &staging, &dest, || {
+            // Simulate a write that truncates the current sidecar and then
+            // fails (disk full / AV lock): rollback must restore the exact
+            // previous bytes, not leave partial metadata.
+            std::fs::write(
+                crate::instances::sidecar_meta_path(&content_dir, "example.jar"),
+                b"{broken",
+            )?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "injected metadata failure",
+            ))
+        })
+        .unwrap_err();
+
+        assert!(error.contains("injected metadata failure"), "got: {error}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old-content");
+        assert_eq!(
+            std::fs::read(crate::instances::sidecar_meta_path(
+                &content_dir,
+                "example.jar"
+            ))
+            .unwrap(),
+            old_sidecar
+        );
+        assert!(!staging.exists(), "staging must not survive the failure");
+        assert!(
+            !content_dir
+                .join(format!("example.jar{}", crate::instances::STASH_SUFFIX))
+                .exists(),
+            "the parked file must be restored, not left behind"
+        );
+        let installed = content::InstalledContent::read(&content_dir, "example.jar", "mod");
+        assert_eq!(installed.file_id.as_deref(), Some("42"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn curseforge_publish_replaces_previous_content_only_after_metadata_succeeds() {
+        let base = std::env::temp_dir().join(format!(
+            "vl_cf_publish_ok_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let content_dir = base.join("mods");
+        std::fs::create_dir_all(&content_dir).unwrap();
+        let dest = content_dir.join("example.jar");
+        std::fs::write(&dest, b"old-content").unwrap();
+        let staging = content_dir.join(".voidlauncher-cf-test-staging");
+        std::fs::write(&staging, b"new-content").unwrap();
+
+        publish_curseforge_file(&content_dir, "example.jar", &staging, &dest, || {
+            content::write_sidecar(
+                &content_dir,
+                "example.jar",
+                &content::SidecarWrite {
+                    provider: "curseforge",
+                    content_type: "mod",
+                    project_id: Some("7"),
+                    project_name: Some("New"),
+                    version_id: None,
+                    version_number: Some("2"),
+                    file_id: Some("43"),
+                    hash: Some(&"b".repeat(40)),
+                },
+            )
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-content");
+        let installed = content::InstalledContent::read(&content_dir, "example.jar", "mod");
+        assert_eq!(installed.file_id.as_deref(), Some("43"));
+        assert!(
+            !content_dir
+                .join(format!("example.jar{}", crate::instances::STASH_SUFFIX))
+                .exists(),
+            "a successful install must discard the parked old file"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

@@ -245,9 +245,12 @@ pub async fn cmd_install_curseforge_modpack(
         .collect::<String>();
     let temp_path =
         std::env::temp_dir().join(format!("voidlauncher-cf-{}-{}.zip", safe_instance, file_id));
-    curseforge::download_mod_file(mod_id, file_id, &file, &api_key, &temp_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(e) =
+        curseforge::download_mod_file(mod_id, file_id, &file, &api_key, &temp_path).await
+    {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e.to_string());
+    }
 
     // Pack metadata for the update lock — read while the temp zip exists.
     let (manifest, overrides, override_hashes) = match crate::packlock::pack_zip_info(&temp_path) {
@@ -487,21 +490,14 @@ pub async fn cmd_install_modrinth_modpack(
     let version = modrinth::get_version_by_id(&version_id)
         .await
         .map_err(|e| e.to_string())?;
-    let file = version
-        .files
-        .iter()
-        .find(|f| f.primary)
-        .or_else(|| version.files.first())
-        .ok_or("Modrinth version has no files")?;
-    if !file.url.starts_with("https://") {
-        return Err("Download URL must be HTTPS.".to_string());
-    }
-    if !crate::is_allowed_download_host(&file.url) {
+    if version.id != version_id {
         return Err(format!(
-            "Download host is not in the allowlist: {}",
-            file.url
+            "Modrinth returned metadata for version {} instead of the requested {version_id}",
+            version.id
         ));
     }
+    let archive = crate::content_install::resolve_modrinth_archive(&version.files)
+        .map_err(|e| format!("Pack archive metadata rejected: {e}"))?;
     let safe_instance = instance_name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -510,10 +506,10 @@ pub async fn cmd_install_modrinth_modpack(
         "voidlauncher-mr-{}-{}.mrpack",
         safe_instance, version_id
     ));
-    let expected_sha1 = file.hashes.get("sha1").map(|s| s.as_str()).unwrap_or("");
-    crate::download::download_file_sized(&file.url, &temp_path, expected_sha1, file.size)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = crate::content_install::download_modrinth_archive(&archive, &temp_path).await {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e.to_string());
+    }
 
     // Pack metadata for the update lock — read while the temp zip exists.
     let (manifest, overrides, override_hashes) = match crate::packlock::mrpack_zip_info(&temp_path)
@@ -554,7 +550,7 @@ pub async fn cmd_install_modrinth_modpack(
         pack_project_id: version.project_id.clone(),
         pack_name,
         file_id: version.id.clone(),
-        file_name: file.filename.clone(),
+        file_name: archive.file_name.clone(),
         file_display_name: version.version_number.clone(),
         channel: crate::packlock::PackChannel::from_modrinth(&version.version_type)
             .map(|channel| channel.as_str().to_string())
