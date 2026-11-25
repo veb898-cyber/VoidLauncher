@@ -597,6 +597,49 @@ pub(crate) fn cf_cdn_urls(file_id: u64, file_name: &str) -> Vec<String> {
     urls
 }
 
+/// Validate the API metadata before a CurseForge file is downloaded.
+///
+/// The caller already fetched `CfFile` by `(mod_id, file_id)`, but a stale or
+/// mismatched cache/fixture must not be able to swap the project, file or hash.
+/// Only `algo == 1` is SHA-1; MD5 and unknown algorithms are ignored.
+fn validate_cf_download_metadata(cf_file: &CfFile, mod_id: u64, file_id: u64) -> Result<HashSpec> {
+    if mod_id == 0 || file_id == 0 {
+        return Err(crate::error::LauncherError::Download(
+            "Invalid CurseForge project or file id".to_string(),
+        ));
+    }
+    if cf_file.id != file_id {
+        return Err(crate::error::LauncherError::Download(format!(
+            "CurseForge metadata is for file {}, not the requested {file_id}",
+            cf_file.id
+        )));
+    }
+    if cf_file.mod_id != mod_id {
+        return Err(crate::error::LauncherError::Download(format!(
+            "CurseForge file {} does not belong to project {mod_id}",
+            cf_file.id
+        )));
+    }
+    if cf_file.is_available == Some(false) {
+        return Err(crate::error::LauncherError::Download(format!(
+            "CurseForge file {} is not available",
+            cf_file.id
+        )));
+    }
+    if cf_file.file_name.trim().is_empty() {
+        return Err(crate::error::LauncherError::Download(format!(
+            "CurseForge file {file_id} has no file name"
+        )));
+    }
+    let sha1 = cf_file.sha1_hash().ok_or_else(|| {
+        crate::error::LauncherError::Download(format!(
+            "CurseForge file {} ({}) has no SHA-1 checksum; refusing to download it",
+            cf_file.id, cf_file.file_name
+        ))
+    })?;
+    HashSpec::sha1(sha1)
+}
+
 /// Download a CurseForge mod file, trying the signed API URL then CDN fallbacks.
 pub async fn download_mod_file(
     mod_id: u64,
@@ -605,6 +648,8 @@ pub async fn download_mod_file(
     api_key: &str,
     dest_path: &std::path::Path,
 ) -> Result<()> {
+    // Validate and resolve the publisher checksum before any network request.
+    let expected = validate_cf_download_metadata(cf_file, mod_id, file_id)?;
     let mut urls = download_url_candidates(mod_id, file_id, &cf_file.file_name, api_key).await;
     if let Some(u) = cf_file.download_url.as_ref().filter(|u| !u.is_empty()) {
         if !urls.iter().any(|x| x == u) {
@@ -626,18 +671,21 @@ pub async fn download_mod_file(
     }
 
     let dest_buf = dest_path.to_path_buf();
-    let expected_sha1 = cf_file.sha1_hash().unwrap_or("");
     let mut last_err = String::new();
 
     for url in urls {
-        match crate::download::download_file_sized(
-            &url,
-            &dest_buf,
-            expected_sha1,
-            cf_file.file_length,
-        )
-        .await
-        {
+        let result = if cf_file.file_length > 0 {
+            crate::download::download_file_sized_verified(
+                &url,
+                &dest_buf,
+                &expected,
+                cf_file.file_length,
+            )
+            .await
+        } else {
+            crate::download::download_file_verified(&url, &dest_buf, &expected).await
+        };
+        match result {
             Ok(()) => return Ok(()),
             // Pause stops the whole install — never fall to the next mirror.
             Err(e @ crate::error::LauncherError::Paused) => return Err(e),
@@ -788,6 +836,59 @@ mod tests {
             hashes: vec![],
             is_available: available,
         }
+    }
+
+    fn cf_download_file() -> CfFile {
+        let mut file = cf_file(42, "mod", "2026-01-01T00:00:00Z", Some(true));
+        file.mod_id = 7;
+        file.hashes = vec![CfHash {
+            value: "a".repeat(40),
+            algo: 1,
+        }];
+        file
+    }
+
+    #[test]
+    fn cf_download_metadata_accepts_matching_algo1_hash() {
+        let file = cf_download_file();
+        let expected = validate_cf_download_metadata(&file, 7, 42).unwrap();
+        assert_eq!(expected.algorithm(), "sha1");
+        assert_eq!(expected.hex(), "a".repeat(40));
+    }
+
+    #[test]
+    fn cf_download_metadata_rejects_identity_and_availability_errors() {
+        let file = cf_download_file();
+        assert!(validate_cf_download_metadata(&file, 8, 42).is_err());
+        assert!(validate_cf_download_metadata(&file, 7, 43).is_err());
+
+        let unavailable = CfFile {
+            is_available: Some(false),
+            ..cf_download_file()
+        };
+        assert!(validate_cf_download_metadata(&unavailable, 7, 42).is_err());
+
+        let mut unnamed = cf_download_file();
+        unnamed.file_name.clear();
+        assert!(validate_cf_download_metadata(&unnamed, 7, 42).is_err());
+    }
+
+    #[test]
+    fn cf_download_metadata_rejects_missing_or_unknown_sha1() {
+        let mut missing = cf_download_file();
+        missing.hashes.clear();
+        assert!(validate_cf_download_metadata(&missing, 7, 42).is_err());
+
+        let mut unknown = cf_download_file();
+        unknown.hashes = vec![CfHash {
+            value: "b".repeat(40),
+            algo: 2,
+        }];
+        assert!(validate_cf_download_metadata(&unknown, 7, 42).is_err());
+
+        let mut corrupt = cf_download_file();
+        corrupt.hashes[0].value = "not-a-sha1".to_string();
+        assert!(validate_cf_download_metadata(&corrupt, 7, 42).is_err());
     }
 
     #[test]

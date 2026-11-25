@@ -170,6 +170,84 @@ pub(crate) fn resolve_modrinth(
     })
 }
 
+/// Resolve the pack archive selected by a Modrinth version.
+///
+/// Pack installs select a version, not an individual file. The backend picks
+/// the only file or the single primary file and its strongest publisher hash;
+/// the frontend never supplies the archive URL or checksum.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedModrinthArchive {
+    pub url: String,
+    pub file_name: String,
+    pub hash: HashSpec,
+    pub size: Option<u64>,
+}
+
+pub(crate) fn resolve_modrinth_archive(files: &[ModrinthFile]) -> Result<ResolvedModrinthArchive> {
+    // A modpack install selects a *version*, not a file. The file must be
+    // unambiguous: the only file, or the single primary file. Falling back to
+    // "the first file" would silently install an arbitrary extra artifact when
+    // the version carries more than one file.
+    let file = match files {
+        [] => {
+            return Err(content_error(
+                "Modrinth version has no downloadable archive",
+            ))
+        }
+        [only] => only,
+        _ => {
+            let mut primaries = files.iter().filter(|file| file.primary);
+            match (primaries.next(), primaries.next()) {
+                (Some(primary), None) => primary,
+                (None, _) => {
+                    return Err(content_error(
+                        "Modrinth version contains multiple files and no primary archive; refusing to choose one",
+                    ))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(content_error(
+                        "Modrinth version contains multiple primary files; the archive is ambiguous",
+                    ))
+                }
+            }
+        }
+    };
+    if !file.url.starts_with("https://") || !crate::is_allowed_download_host(&file.url) {
+        return Err(content_error(
+            "Modrinth archive URL is outside the trusted HTTPS allowlist",
+        ));
+    }
+    let hash = HashSpec::from_metadata(&file.hashes)
+        .map_err(|e| {
+            content_error(format!(
+                "Modrinth archive checksum metadata is invalid: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            content_error(format!(
+                "Modrinth archive '{}' has no usable checksum; refusing to download it",
+                file.filename
+            ))
+        })?;
+    Ok(ResolvedModrinthArchive {
+        url: file.url.clone(),
+        file_name: file.filename.clone(),
+        hash,
+        size: (file.size > 0).then_some(file.size),
+    })
+}
+
+pub(crate) async fn download_modrinth_archive(
+    archive: &ResolvedModrinthArchive,
+    dest: &std::path::Path,
+) -> Result<()> {
+    if let Some(size) = archive.size {
+        crate::download::download_file_sized_verified(&archive.url, dest, &archive.hash, size).await
+    } else {
+        crate::download::download_file_verified(&archive.url, dest, &archive.hash).await
+    }
+}
+
 /// Resolve the exact CurseForge file selected by the user.
 ///
 /// The caller must pass metadata fetched for the requested file id. The
@@ -507,6 +585,102 @@ mod tests {
         assert!(
             resolve_modrinth(&mr_version(vec![file]), "project-1", "only.jar", "", "").is_err()
         );
+    }
+
+    #[test]
+    fn modrinth_archive_uses_primary_file_and_strongest_hash() {
+        let extra = mr_file(
+            "extra.jar",
+            "https://cdn.modrinth.com/data/extra.jar",
+            false,
+            &[("sha1", SHA1_B)],
+        );
+        let primary = mr_file(
+            "pack.mrpack",
+            "https://cdn.modrinth.com/data/pack.mrpack",
+            true,
+            &[("sha1", SHA1_A), ("sha512", SHA512_A)],
+        );
+        let resolved = resolve_modrinth_archive(&[extra, primary]).unwrap();
+
+        assert_eq!(resolved.file_name, "pack.mrpack");
+        assert_eq!(resolved.url, "https://cdn.modrinth.com/data/pack.mrpack");
+        assert_eq!(resolved.hash.algorithm(), "sha512");
+        assert_eq!(resolved.hash.hex(), SHA512_A);
+        assert_eq!(resolved.size, Some(123));
+    }
+
+    #[test]
+    fn modrinth_archive_uses_the_only_file_even_without_the_primary_flag() {
+        let only = mr_file(
+            "pack.mrpack",
+            "https://cdn.modrinth.com/data/pack.mrpack",
+            false,
+            &[("sha1", SHA1_A)],
+        );
+        let resolved = resolve_modrinth_archive(&[only]).unwrap();
+        assert_eq!(resolved.file_name, "pack.mrpack");
+    }
+
+    #[test]
+    fn modrinth_archive_rejects_multiple_files_without_a_single_primary() {
+        let first = mr_file(
+            "first.mrpack",
+            "https://cdn.modrinth.com/data/first.mrpack",
+            false,
+            &[("sha1", SHA1_A)],
+        );
+        let second = mr_file(
+            "second.mrpack",
+            "https://cdn.modrinth.com/data/second.mrpack",
+            false,
+            &[("sha1", SHA1_B)],
+        );
+        let error = resolve_modrinth_archive(&[first, second]).unwrap_err();
+        assert!(error.to_string().contains("no primary"), "got: {error}");
+
+        let primary_a = mr_file(
+            "a.mrpack",
+            "https://cdn.modrinth.com/data/a.mrpack",
+            true,
+            &[("sha1", SHA1_A)],
+        );
+        let primary_b = mr_file(
+            "b.mrpack",
+            "https://cdn.modrinth.com/data/b.mrpack",
+            true,
+            &[("sha1", SHA1_B)],
+        );
+        let error = resolve_modrinth_archive(&[primary_a, primary_b]).unwrap_err();
+        assert!(error.to_string().contains("ambiguous"), "got: {error}");
+    }
+
+    #[test]
+    fn modrinth_archive_rejects_missing_invalid_or_unsafe_metadata() {
+        let no_hash = mr_file(
+            "pack.mrpack",
+            "https://cdn.modrinth.com/data/pack.mrpack",
+            true,
+            &[],
+        );
+        assert!(resolve_modrinth_archive(&[no_hash]).is_err());
+
+        let bad_hash = mr_file(
+            "pack.mrpack",
+            "https://cdn.modrinth.com/data/pack.mrpack",
+            true,
+            &[("sha512", "not-a-hash")],
+        );
+        assert!(resolve_modrinth_archive(&[bad_hash]).is_err());
+
+        let unsafe_url = mr_file(
+            "pack.mrpack",
+            "https://attacker.example/pack.mrpack",
+            true,
+            &[("sha1", SHA1_A)],
+        );
+        assert!(resolve_modrinth_archive(&[unsafe_url]).is_err());
+        assert!(resolve_modrinth_archive(&[]).is_err());
     }
 
     #[test]

@@ -301,9 +301,25 @@ pub fn mrpack_entry_path(entry: &serde_json::Value) -> String {
     entry["path"].as_str().unwrap_or_default().to_string()
 }
 
-/// sha1 of an mrpack entry, when declared.
-pub fn mrpack_entry_sha1(entry: &serde_json::Value) -> Option<String> {
-    entry["hashes"]["sha1"].as_str().map(str::to_string)
+/// Strongest *manifest-declared* checksum of an mrpack entry, when declared.
+///
+/// For a pack archive that was verified against the provider's hash this is a
+/// publisher-declared checksum inside that archive. It is not a locally
+/// computed file hash and never proves a file that was merely present on disk.
+/// The sidecar records this value so deep verification uses the same algorithm
+/// the installer enforced (SHA-512/SHA-256/SHA-1). Invalid non-empty metadata
+/// is rejected earlier by `install_mrpack_file`; this helper only reads already
+/// validated manifests and returns `None` if nothing usable is present.
+pub fn mrpack_entry_hash(entry: &serde_json::Value) -> Option<String> {
+    let hashes = entry.get("hashes")?.as_object()?;
+    let map: std::collections::HashMap<String, String> = hashes
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+        .collect();
+    crate::integrity::HashSpec::from_metadata(&map)
+        .ok()
+        .flatten()
+        .map(|hash| hash.hex().to_string())
 }
 
 /// Map an `modrinth.index.json` manifest to `identity → entry`, keeping only
@@ -605,6 +621,26 @@ mod tests {
             "project_id": pid,
             "version_id": vid,
         })
+    }
+
+    #[test]
+    fn mrpack_entry_hash_prefers_sha512_and_ignores_invalid_metadata() {
+        let sha1 = "a".repeat(40);
+        let sha256 = "b".repeat(64);
+        let sha512 = "c".repeat(128);
+        let entry = serde_json::json!({
+            "hashes": {
+                "sha1": sha1,
+                "sha256": sha256,
+                "sha512": sha512.clone(),
+            }
+        });
+        assert_eq!(mrpack_entry_hash(&entry).as_deref(), Some(sha512.as_str()));
+
+        let empty = serde_json::json!({"hashes": {}});
+        assert_eq!(mrpack_entry_hash(&empty), None);
+        let bad = serde_json::json!({"hashes": {"sha512": "not-a-hash"}});
+        assert_eq!(mrpack_entry_hash(&bad), None);
     }
 
     #[test]
