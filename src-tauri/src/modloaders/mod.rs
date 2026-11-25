@@ -5,7 +5,9 @@ pub mod neoforge;
 pub(crate) mod prism_meta;
 
 use crate::error::Result;
+use crate::integrity::HashSpec;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Information about a mod loader version
@@ -49,8 +51,38 @@ pub struct LoaderLibrary {
     pub name: String,
     pub url: String,
     pub path: String,
+    #[serde(default)]
     pub sha1: Option<String>,
+    /// Stronger checksums are optional so profiles written by older builds
+    /// remain readable. Fabric metadata currently publishes SHA-1 only; the
+    /// repository fallback may supply SHA-256/SHA-512.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha512: Option<String>,
+    /// "metadata" or "repository" when known. This is informational; the
+    /// checksum itself is still validated by `HashSpec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_source: Option<String>,
     pub size: Option<u64>,
+}
+
+impl LoaderLibrary {
+    /// Strongest available checksum for this library, if one is recorded.
+    /// Empty values mean "absent"; a malformed non-empty value is an error.
+    pub fn checksum(&self) -> Result<Option<HashSpec>> {
+        let mut hashes = HashMap::new();
+        for (key, value) in [
+            ("sha1", self.sha1.as_deref()),
+            ("sha256", self.sha256.as_deref()),
+            ("sha512", self.sha512.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                hashes.insert(key.to_string(), value.to_string());
+            }
+        }
+        HashSpec::from_metadata(&hashes)
+    }
 }
 
 /// Validate version strings that loader code later uses in URLs, temp file
@@ -195,6 +227,152 @@ mod tests {
                 loader
             );
         }
+    }
+
+    const LEGACY_SHA1: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
+
+    fn legacy_profile_fixture(loader: &str) -> serde_json::Value {
+        let (main_class, name, url, path, size) = match loader {
+            "Fabric" => (
+                "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                "org.ow2.asm:asm:9.6",
+                "https://maven.fabricmc.net/",
+                "org/ow2/asm/asm/9.6/asm-9.6.jar",
+                122_535,
+            ),
+            "Forge" => (
+                "cpw.mods.bootstraplauncher.BootstrapLauncher",
+                "net.minecraftforge:forge:1.20.1-47.2.0:universal",
+                "https://maven.minecraftforge.net/",
+                "net/minecraftforge/forge/1.20.1-47.2.0/forge-1.20.1-47.2.0-universal.jar",
+                8_112_112,
+            ),
+            "NeoForge" => (
+                "cpw.mods.bootstraplauncher.BootstrapLauncher",
+                "net.neoforged:neoforge:20.4.237:universal",
+                "https://maven.neoforged.net/releases/",
+                "net/neoforged/neoforge/20.4.237/neoforge-20.4.237-universal.jar",
+                9_223_372,
+            ),
+            other => panic!("unknown loader fixture {other}"),
+        };
+        serde_json::json!({
+            "main_class": main_class,
+            "libraries": [{
+                "name": name,
+                "url": url,
+                "path": path,
+                "sha1": LEGACY_SHA1,
+                "size": size
+            }],
+            "jvm_args": [],
+            "game_args": [],
+            "legacy_args": false
+        })
+    }
+
+    #[test]
+    fn legacy_fabric_forge_and_neoforge_profiles_round_trip_without_new_fields() {
+        for loader in ["Fabric", "Forge", "NeoForge"] {
+            let profile: LoaderProfile =
+                serde_json::from_value(legacy_profile_fixture(loader)).unwrap();
+            let lib = &profile.libraries[0];
+            assert_eq!(lib.sha1.as_deref(), Some(LEGACY_SHA1), "{loader}");
+            assert_eq!(lib.sha256, None, "{loader}");
+            assert_eq!(lib.sha512, None, "{loader}");
+            assert_eq!(lib.checksum_source, None, "{loader}");
+            assert!(lib.size.is_some(), "{loader}");
+            assert_eq!(
+                lib.checksum().unwrap().unwrap().algorithm(),
+                "sha1",
+                "{loader} must keep using its persisted SHA-1"
+            );
+
+            let saved = serde_json::to_value(&profile).unwrap();
+            let saved_lib = &saved["libraries"][0];
+            assert_eq!(saved_lib["sha1"], LEGACY_SHA1, "{loader}");
+            assert!(saved_lib["size"].as_u64().is_some(), "{loader}");
+            assert!(saved_lib.get("sha256").is_none(), "{loader}");
+            assert!(saved_lib.get("sha512").is_none(), "{loader}");
+            assert!(saved_lib.get("checksum_source").is_none(), "{loader}");
+
+            let round_tripped: LoaderProfile = serde_json::from_value(saved).unwrap();
+            assert_eq!(
+                round_tripped.libraries[0].sha1.as_deref(),
+                Some(LEGACY_SHA1),
+                "{loader}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_null_sha1_stays_null_and_does_not_gain_a_checksum() {
+        let mut fixture = legacy_profile_fixture("Forge");
+        fixture["libraries"][0]["sha1"] = serde_json::Value::Null;
+        let profile: LoaderProfile = serde_json::from_value(fixture).unwrap();
+        assert!(profile.libraries[0].checksum().unwrap().is_none());
+        let saved = serde_json::to_value(&profile).unwrap();
+        assert!(saved["libraries"][0]["sha1"].is_null());
+        assert!(saved["libraries"][0].get("sha256").is_none());
+        assert!(saved["libraries"][0].get("sha512").is_none());
+        assert!(saved["libraries"][0].get("checksum_source").is_none());
+    }
+
+    #[test]
+    fn malformed_new_checksum_does_not_fall_back_to_legacy_sha1() {
+        let mut fixture = legacy_profile_fixture("NeoForge");
+        fixture["libraries"][0]["sha512"] = serde_json::json!("not-a-hash");
+        let profile: LoaderProfile = serde_json::from_value(fixture).unwrap();
+        assert!(
+            profile.libraries[0].checksum().is_err(),
+            "a malformed non-empty SHA-512 must be an error, not a SHA-1 fallback"
+        );
+    }
+
+    #[test]
+    fn loader_library_checksum_uses_the_strongest_persisted_value() {
+        let base = LoaderLibrary {
+            name: "example:artifact:1.0".to_string(),
+            url: "https://maven.fabricmc.net/".to_string(),
+            path: "example/artifact/1.0/artifact-1.0.jar".to_string(),
+            sha1: Some("a".repeat(40)),
+            sha256: Some("b".repeat(64)),
+            sha512: Some("c".repeat(128)),
+            checksum_source: Some("metadata".to_string()),
+            size: Some(1),
+        };
+        assert_eq!(base.checksum().unwrap().unwrap().algorithm(), "sha512");
+
+        let sha256_only = LoaderLibrary {
+            sha1: None,
+            sha512: None,
+            ..base.clone()
+        };
+        assert_eq!(
+            sha256_only.checksum().unwrap().unwrap().algorithm(),
+            "sha256"
+        );
+
+        let sha1_only = LoaderLibrary {
+            sha256: None,
+            sha512: None,
+            ..base.clone()
+        };
+        assert_eq!(sha1_only.checksum().unwrap().unwrap().algorithm(), "sha1");
+
+        let none = LoaderLibrary {
+            sha1: None,
+            sha256: None,
+            sha512: None,
+            ..base.clone()
+        };
+        assert!(none.checksum().unwrap().is_none());
+
+        let malformed = LoaderLibrary {
+            sha512: Some("not-a-hash".to_string()),
+            ..base
+        };
+        assert!(malformed.checksum().is_err());
     }
 
     #[test]

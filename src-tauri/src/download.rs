@@ -2860,7 +2860,7 @@ pub(crate) fn http_client_for_exact_host(host: &str) -> Result<reqwest::Client> 
     Ok(client)
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
@@ -4785,7 +4785,7 @@ mod tests {
     // failed download never touches it.
 
     #[derive(Clone)]
-    struct MockSpec {
+    pub(crate) struct MockSpec {
         status: u16,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
@@ -4795,7 +4795,7 @@ mod tests {
     }
 
     impl MockSpec {
-        fn ok(body: &[u8]) -> Self {
+        pub(crate) fn ok(body: &[u8]) -> Self {
             Self {
                 status: 200,
                 headers: vec![("Content-Type".into(), "application/octet-stream".into())],
@@ -4806,7 +4806,7 @@ mod tests {
             }
         }
 
-        fn status(status: u16) -> Self {
+        pub(crate) fn status(status: u16) -> Self {
             Self {
                 status,
                 headers: Vec::new(),
@@ -4872,7 +4872,7 @@ mod tests {
             }
         }
 
-        fn redirect(location: &str) -> Self {
+        pub(crate) fn redirect(location: &str) -> Self {
             Self {
                 status: 302,
                 headers: vec![("Location".into(), location.into())],
@@ -4895,13 +4895,13 @@ mod tests {
         }
     }
 
-    struct MockServer {
-        url: String,
-        hits: Arc<AtomicUsize>,
+    pub(crate) struct MockServer {
+        pub(crate) url: String,
+        pub(crate) hits: Arc<AtomicUsize>,
         started: Arc<tokio::sync::Notify>,
     }
 
-    async fn spawn_mock(specs: Vec<MockSpec>) -> MockServer {
+    pub(crate) async fn spawn_mock(specs: Vec<MockSpec>) -> MockServer {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4985,7 +4985,7 @@ mod tests {
         }
     }
 
-    fn mock_dir(tag: &str) -> std::path::PathBuf {
+    pub(crate) fn mock_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "vl_download_lifecycle_{}_{}_{}",
             tag,
@@ -4999,7 +4999,7 @@ mod tests {
         dir
     }
 
-    fn sha1_hex(bytes: &[u8]) -> String {
+    pub(crate) fn sha1_hex(bytes: &[u8]) -> String {
         use sha1::{Digest, Sha1};
         let mut hasher = Sha1::new();
         hasher.update(bytes);
@@ -5010,7 +5010,7 @@ mod tests {
             .collect()
     }
 
-    fn sha256_hex(bytes: &[u8]) -> String {
+    pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(bytes);
@@ -5021,7 +5021,7 @@ mod tests {
             .collect()
     }
 
-    fn sha512_hex(bytes: &[u8]) -> String {
+    pub(crate) fn sha512_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha512};
         let mut hasher = Sha512::new();
         hasher.update(bytes);
@@ -5032,13 +5032,13 @@ mod tests {
             .collect()
     }
 
-    async fn direct_proxy_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    pub(crate) async fn direct_proxy_lock() -> tokio::sync::MutexGuard<'static, ()> {
         let guard = PROXY_TEST_LOCK.lock().await;
         apply_test_proxy(false, false, None, true);
         guard
     }
 
-    fn assert_clean(part: &Path, meta: &Path) {
+    pub(crate) fn assert_clean(part: &Path, meta: &Path) {
         assert!(
             !part.exists(),
             ".part must be removed after a terminal error"

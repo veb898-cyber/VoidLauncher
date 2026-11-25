@@ -1394,6 +1394,9 @@ mod tests {
             url: "https://libraries.minecraft.net/".to_string(),
             path: path.to_string(),
             sha1: None,
+            sha256: None,
+            sha512: None,
+            checksum_source: None,
             size: None,
         }
     }
