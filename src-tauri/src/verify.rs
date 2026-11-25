@@ -23,6 +23,45 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
+#[cfg(test)]
+pub(crate) struct VerifyScanHook {
+    pub instance_name: String,
+    pub started: std::sync::mpsc::Sender<()>,
+    pub release: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static VERIFY_SCAN_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<VerifyScanHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_verify_scan_hook(hook: Option<VerifyScanHook>) {
+    let slot = VERIFY_SCAN_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn run_verify_scan_hook(instance_name: &str) {
+    let hook = {
+        let mut slot = VERIFY_SCAN_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|hook| hook.instance_name == instance_name)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        let _ = hook.started.send(());
+        hook.release.wait();
+    }
+}
+
 /// Maximum number of individual issues listed per category in the report
 /// (the full count is still tracked in `issue_count`).
 const MAX_ISSUES_LISTED: usize = 100;
@@ -31,12 +70,14 @@ const MAX_ISSUES_LISTED: usize = 100;
 pub struct VerifyIssue {
     /// Path relative to the launcher data or instance directory.
     pub path: String,
-    /// "missing" | "corrupt" | "invalid" | "outdated_loader"
+    /// Stable kind identifier. Frontend labels live in
+    /// `src/components/instances/verifyIssueLabels.ts`.
     pub kind: String,
     /// True when repair can fix this issue by re-downloading.
     pub repairable: bool,
-    /// Extra context for the kind: "outdated_loader" carries the loader
-    /// version range the mod asked for (e.g. ">=0.19.5"). Absent otherwise.
+    /// Extra diagnostic context for the kind. For example, "outdated_loader"
+    /// carries the loader version range the mod asked for (e.g. ">=0.19.5"),
+    /// while generation issues carry the underlying error or path detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -113,13 +154,23 @@ impl CategoryBuilder {
     }
 
     fn add_issue(&mut self, path: impl Into<String>, kind: &str, repairable: bool) {
+        self.add_issue_with_detail(path, kind, repairable, None);
+    }
+
+    fn add_issue_with_detail(
+        &mut self,
+        path: impl Into<String>,
+        kind: &str,
+        repairable: bool,
+        detail: Option<String>,
+    ) {
         self.issue_count += 1;
         if self.issues.len() < MAX_ISSUES_LISTED {
             self.issues.push(VerifyIssue {
                 path: path.into(),
                 kind: kind.to_string(),
                 repairable,
-                detail: None,
+                detail,
             });
         }
     }
@@ -400,27 +451,10 @@ fn asset_object_state(path: &Path, hash: &str, size: u64) -> AssetObjectState {
     }
 }
 
-/// Structural validation shared by launch and import preparation. A file that
+/// Structural validation shared by every asset-index consumer. A file that
 /// merely parses as JSON is not necessarily a usable asset index.
 pub(crate) fn validate_asset_index(index: &versions::AssetIndexData) -> Result<()> {
-    if index.objects.is_empty() {
-        return Err(LauncherError::Version(
-            "Asset index contains no objects".to_string(),
-        ));
-    }
-    for (name, object) in &index.objects {
-        if name.is_empty() || name.contains('\0') {
-            return Err(LauncherError::Version(
-                "Asset index contains an invalid asset name".to_string(),
-            ));
-        }
-        if !download::is_valid_asset_hash(&object.hash) {
-            return Err(LauncherError::Version(format!(
-                "Asset index contains an invalid hash for '{name}'"
-            )));
-        }
-    }
-    Ok(())
+    index.validate_structure()
 }
 
 /// Result of the cheap launch-time check. `paths` holds every object that must
@@ -1039,6 +1073,8 @@ pub fn verify_instance_scoped_mode(
     scope: VerifyScope,
     mode: VerifyMode,
 ) -> VerifyReport {
+    #[cfg(test)]
+    run_verify_scan_hook(&instance.name);
     if let Some(dirs) = scope.content_only_dirs() {
         return content_only_report(config, instance, dirs, mode);
     }
@@ -1225,7 +1261,7 @@ pub fn verify_instance_scoped_mode(
             }
             let p = libraries_dir.join(&llib.path);
             let display = format!("libraries/{}", llib.path);
-            if instance.loader == LoaderType::Fabric {
+            if instance.loader != LoaderType::Vanilla {
                 let expected = match llib.checksum() {
                     Ok(expected) => expected,
                     Err(_) => {
@@ -1279,11 +1315,14 @@ pub fn verify_instance_scoped_mode(
                     true,
                 );
             } else {
-                let index_ok = if vi.asset_index.sha1.is_empty() {
-                    assets.unverified += 1;
-                    true
-                } else {
-                    match download::verify_sha1(&index_path, &vi.asset_index.sha1) {
+                let index_ok = match crate::integrity::HashSpec::from_sha1(&vi.asset_index.sha1) {
+                    Ok(None) => {
+                        // Historical metadata without a publisher checksum:
+                        // reported honestly as unverified, never as verified.
+                        assets.unverified += 1;
+                        true
+                    }
+                    Ok(Some(hash)) => match hash.verify_file(&index_path) {
                         Ok(true) => {
                             assets.verified += 1;
                             true
@@ -1297,14 +1336,33 @@ pub fn verify_instance_scoped_mode(
                             );
                             false
                         }
-                        Err(_) => {
+                        Err(error) => {
                             assets.unverified += 1;
-                            true
+                            assets.add_issue_with_detail(
+                                format!("assets/indexes/{}.json", vi.assets),
+                                "unreadable",
+                                false,
+                                Some(error.to_string()),
+                            );
+                            false
                         }
+                    },
+                    Err(error) => {
+                        // A non-empty malformed checksum is not the same as a
+                        // missing one: it must never degrade into structural-
+                        // only acceptance.
+                        assets.checked = 1;
+                        assets.add_issue_with_detail(
+                            format!("assets/indexes/{}.json", vi.assets),
+                            "invalid",
+                            false,
+                            Some(format!("malformed publisher asset-index checksum: {error}")),
+                        );
+                        false
                     }
                 };
                 if index_ok {
-                    match versions::load_asset_index(&index_path) {
+                    match versions::load_validated_asset_index(&index_path) {
                         Ok(index) => {
                             let objects_dir = assets_dir.join("objects");
                             for obj in index.objects.values() {
@@ -1389,12 +1447,14 @@ pub fn verify_instance_scoped_mode(
         // the failure that actually blocks launching.
         if instance.loader == LoaderType::NeoForge {
             if let Some(loader_version) = instance.loader_version.as_deref() {
-                let cached = modloaders::neoforge::read_install_profile_from_installer(
-                    &modloaders::neoforge::installer_cache_path(
-                        &instance.mc_version,
-                        loader_version,
-                    ),
-                );
+                let cached = modloaders::neoforge::installer_cache(
+                    &instance.mc_version,
+                    loader_version,
+                    &libraries_dir,
+                )
+                .and_then(|cache| {
+                    modloaders::neoforge::read_install_profile_from_installer(&cache.installer)
+                });
                 let expected = modloaders::neoforge::expected_client_jar_paths(
                     &libraries_dir,
                     &instance.mc_version,
@@ -1415,10 +1475,125 @@ pub fn verify_instance_scoped_mode(
                 }
             }
         }
+
+        // Processor state is part of loader health. This is deliberately a
+        // read-only, non-blocking inspection: if another operation currently
+        // owns the cache lock, Verify reports Busy instead of guessing.
+        if let Some(loader_version) = instance.loader_version.as_deref() {
+            let inspection = match instance.loader {
+                LoaderType::Forge => modloaders::forge::inspect_generation(
+                    &instance.mc_version,
+                    loader_version,
+                    &libraries_dir,
+                    &versions_dir,
+                ),
+                LoaderType::NeoForge => modloaders::neoforge::inspect_generation(
+                    &instance.mc_version,
+                    loader_version,
+                    &libraries_dir,
+                    &versions_dir,
+                ),
+                LoaderType::Fabric | LoaderType::Vanilla => {
+                    modloaders::processor_cache::GenerationInspection::new(
+                        modloaders::processor_cache::GenerationState::Healthy,
+                    )
+                }
+            };
+            for issue in &inspection.issues {
+                loader.add_issue_with_detail(
+                    issue.path.clone(),
+                    &issue.kind,
+                    issue.repairable,
+                    issue.detail.clone(),
+                );
+            }
+            match inspection.state {
+                modloaders::processor_cache::GenerationState::Healthy => {}
+                modloaders::processor_cache::GenerationState::Busy => {
+                    if !loader
+                        .issues
+                        .iter()
+                        .any(|issue| issue.kind == "verification_incomplete")
+                    {
+                        loader.add_issue_with_detail(
+                            format!("{}/generation", loader_type_str(&instance.loader)),
+                            "verification_incomplete",
+                            false,
+                            Some(
+                                "another install, repair or launch is publishing this loader version; retry Verify"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
+                modloaders::processor_cache::GenerationState::RecoveryRequired => {
+                    if !loader
+                        .issues
+                        .iter()
+                        .any(|issue| issue.kind == "recovery_required")
+                    {
+                        loader.add_issue_with_detail(
+                            format!("{}/generation", loader_type_str(&instance.loader)),
+                            "recovery_required",
+                            false,
+                            Some(
+                                "the processor transaction requires manual recovery; launch is blocked"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
+                modloaders::processor_cache::GenerationState::NeedsMigration => {
+                    if !loader
+                        .issues
+                        .iter()
+                        .any(|issue| issue.kind == "missing_installer_metadata")
+                    {
+                        loader.add_issue_with_detail(
+                            format!("{}/generation", loader_type_str(&instance.loader)),
+                            "migration_required",
+                            true,
+                            Some(
+                                "verified installer provenance is missing; online preparation is required"
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                }
+                modloaders::processor_cache::GenerationState::NeedsRepair => {
+                    if !loader.issues.iter().any(|issue| {
+                        issue.kind.contains("generation")
+                            || issue.kind.contains("generated")
+                            || issue.kind.contains("embedded")
+                    }) {
+                        loader.add_issue_with_detail(
+                            format!("{}/generation", loader_type_str(&instance.loader)),
+                            "generation_needs_repair",
+                            true,
+                            Some("processor generation requires regeneration".to_string()),
+                        );
+                    }
+                }
+                modloaders::processor_cache::GenerationState::Incomplete => {
+                    if !loader
+                        .issues
+                        .iter()
+                        .any(|issue| issue.kind == "verification_incomplete")
+                    {
+                        loader.add_issue_with_detail(
+                            format!("{}/generation", loader_type_str(&instance.loader)),
+                            "verification_incomplete",
+                            false,
+                            Some("processor generation could not be fully verified".to_string()),
+                        );
+                    }
+                }
+            }
+        }
     }
     let loader = loader.build();
 
-    // ── java ────────────────────────────────────────────────────
+    // ---- java ----
     let mut java = CategoryBuilder::new("java");
     if let Some(vi) = &version_info {
         let required = vi.required_java_major();
@@ -1441,7 +1616,7 @@ pub fn verify_instance_scoped_mode(
                     break;
                 }
                 Some(_) => {
-                    // Valid binary but wrong major — launch would use it and
+                    // Valid binary but wrong major - launch would use it and
                     // fail; report so the user can fix the instance setting.
                     explicit_invalid = true;
                 }
@@ -1520,9 +1695,11 @@ fn neoforge_client_jar_missing(instance: &Instance, libraries_dir: &Path) -> boo
     let Some(loader_version) = instance.loader_version.as_deref() else {
         return false;
     };
-    let cached = modloaders::neoforge::read_install_profile_from_installer(
-        &modloaders::neoforge::installer_cache_path(&instance.mc_version, loader_version),
-    );
+    let cached =
+        modloaders::neoforge::installer_cache(&instance.mc_version, loader_version, libraries_dir)
+            .and_then(|cache| {
+                modloaders::neoforge::read_install_profile_from_installer(&cache.installer)
+            });
     let expected = modloaders::neoforge::expected_client_jar_paths(
         libraries_dir,
         &instance.mc_version,
@@ -1681,6 +1858,73 @@ fn ensure_instance_idle(config: &AppConfig, instance: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// Load an existing index only when its publisher checksum matches and its
+/// structure is usable. `None` means Repair must fetch the publisher bytes.
+fn load_trusted_asset_index(path: &Path, expected_sha1: &str) -> Option<versions::AssetIndexData> {
+    if !path.exists() {
+        return None;
+    }
+    let trusted = match crate::integrity::HashSpec::from_sha1(expected_sha1) {
+        Ok(None) => true,
+        Ok(Some(hash)) => hash.verify_file(path).ok() == Some(true),
+        Err(_) => false,
+    };
+    if !trusted {
+        return None;
+    }
+    versions::load_validated_asset_index(path).ok()
+}
+
+/// Restore the publisher Asset Index when the local file is missing, its
+/// publisher checksum does not match, or its structure is unusable.
+///
+/// This is the complete Asset Index portion of Repair, extracted so it can be
+/// exercised with a controlled HTTP origin. It never falls back to structural
+/// trust for a checksum-mismatched or structurally invalid document.
+async fn restore_asset_index_for_repair<E>(
+    config: &AppConfig,
+    instance: &Instance,
+    vi: &VersionInfo,
+    assets_dir: &Path,
+    index_path: &Path,
+    summary: &mut RepairSummary,
+    emit: &E,
+) -> Result<Option<versions::AssetIndexData>>
+where
+    E: Fn(&str, f64, &str) + Sync,
+{
+    ensure_instance_idle(config, instance)?;
+    versions::prepare_asset_index_path(assets_dir, index_path)
+        .map_err(|e| LauncherError::Download(format!("Refusing unsafe asset index path: {e}")))?;
+    let mut asset_index = load_trusted_asset_index(index_path, &vi.asset_index.sha1);
+    if asset_index.is_none() {
+        emit("assets", 50.0, "Fetching asset index...");
+        if !crate::is_allowed_download_host(&vi.asset_index.url) {
+            return Err(LauncherError::Download(
+                "Access denied: asset index host not allowed".to_string(),
+            ));
+        }
+        let index_bytes = versions::fetch_asset_index_bytes(
+            &vi.asset_index.url,
+            &vi.asset_index.sha1,
+            vi.asset_index.size,
+        )
+        .await?;
+        ensure_instance_idle(config, instance)?;
+        let parsed_index = versions::parse_asset_index_bytes(&index_bytes)?;
+        validate_asset_index(&parsed_index)?;
+        let index = versions::store_asset_index_bytes(
+            index_path,
+            &index_bytes,
+            &vi.asset_index.sha1,
+            vi.asset_index.size,
+        )?;
+        summary.repaired += 1;
+        asset_index = Some(index);
+    }
+    Ok(asset_index)
+}
+
 /// Re-download broken launcher-managed files and restore missing metadata.
 ///
 /// Emits `repair_progress` events: `{ stage, percent, message }`.
@@ -1790,7 +2034,7 @@ pub async fn repair_instance(
             .push(format!("Unsafe version id in metadata: {}", vi.id));
         Vec::new()
     };
-    let mut fabric_libraries: Vec<crate::modloaders::LoaderLibrary> = Vec::new();
+    let mut typed_libraries: Vec<crate::modloaders::LoaderLibrary> = Vec::new();
     if let Some(profile) = &instance.loader_profile {
         for llib in &profile.libraries {
             if check_safe_remote_path(&llib.path).is_err() {
@@ -1801,11 +2045,11 @@ pub async fn repair_instance(
                 continue;
             }
             let p = libraries_dir.join(&llib.path);
-            if instance.loader == LoaderType::Fabric {
+            if instance.loader != LoaderType::Vanilla {
                 // Typed verification also repairs old profiles whose persisted
                 // checksum is missing: `ensure_library` resolves the official
                 // same-origin Maven checksum first.
-                fabric_libraries.push(llib.clone());
+                typed_libraries.push(llib.clone());
                 continue;
             }
             let sha1 = llib.sha1.clone().unwrap_or_default();
@@ -1880,70 +2124,21 @@ pub async fn repair_instance(
         }
     }
 
-    // Fabric libraries carry typed checksums (metadata or repository). Repair
-    // them through the same helper the installer and launch self-heal use, so
-    // a missing checksum or a corrupt existing JAR can never degrade into an
-    // unverified download.
-    for (i, lib) in fabric_libraries.iter().enumerate() {
-        ensure_instance_idle(config, instance)?;
-        emit(
-            "files",
-            45.0 + (i as f64 / fabric_libraries.len().max(1) as f64) * 2.0,
-            &format!("Repairing Fabric library {}...", lib.name),
-        );
-        match crate::modloaders::fabric::ensure_library(lib, &libraries_dir).await {
-            Ok(true) => summary.repaired += 1,
-            Ok(false) => {}
-            Err(e) => {
-                summary.failed += 1;
-                summary
-                    .errors
-                    .push(format!("Fabric library {}: {}", lib.name, e));
-                tracing::warn!(target: "launcher", "Fabric repair failed for {}: {}", lib.name, e);
-            }
-        }
-    }
-
-    // ── 3. assets ───────────────────────────────────────────────
+    // ---- 3. assets ----
     emit("assets", 48.0, "Checking assets...");
-    ensure_instance_idle(config, instance)?;
     let index_path = assets_dir
         .join("indexes")
         .join(format!("{}.json", vi.assets));
-    let index_trusted = index_path.exists()
-        && (vi.asset_index.sha1.is_empty()
-            || download::verify_sha1(&index_path, &vi.asset_index.sha1).ok() == Some(true));
-    let mut asset_index = if index_trusted {
-        versions::load_asset_index(&index_path).ok()
-    } else {
-        None
-    };
-    if asset_index.is_none() {
-        emit("assets", 50.0, "Fetching asset index...");
-        if !crate::is_allowed_download_host(&vi.asset_index.url) {
-            return Err(LauncherError::Download(
-                "Access denied: asset index host not allowed".to_string(),
-            ));
-        }
-        let index = versions::fetch_asset_index(&vi.asset_index.url).await?;
-        ensure_instance_idle(config, instance)?;
-        let indexes_dir = assets_dir.join("indexes");
-        if let Err(e) = crate::import::ensure_no_reparse_points(&assets_dir, &indexes_dir) {
-            return Err(LauncherError::Download(format!(
-                "Refusing unsafe asset index path: {e}"
-            )));
-        }
-        std::fs::create_dir_all(&indexes_dir)?;
-        crate::import::ensure_no_reparse_points(&assets_dir, &index_path).map_err(|e| {
-            LauncherError::Download(format!("Refusing unsafe asset index path: {e}"))
-        })?;
-        instances::write_file_atomic(
-            &index_path,
-            serde_json::to_string_pretty(&index)?.as_bytes(),
-        )?;
-        summary.repaired += 1;
-        asset_index = Some(index);
-    }
+    let asset_index = restore_asset_index_for_repair(
+        config,
+        instance,
+        &vi,
+        &assets_dir,
+        &index_path,
+        &mut summary,
+        &emit,
+    )
+    .await?;
     if let Some(index) = &asset_index {
         let objects_dir = assets_dir.join("objects");
         if let Err(e) = crate::import::ensure_no_reparse_points(&assets_dir, &objects_dir) {
@@ -2032,50 +2227,7 @@ pub async fn repair_instance(
         ensure_instance_idle(config, instance)?;
         let _ = download::ensure_virtual_assets(&vi.assets, index, &assets_dir);
     }
-
-    // ── 4. loader profile + processor output ────────────────────
-    if !matches!(instance.loader, LoaderType::Vanilla)
-        && (instance.loader_profile.is_none()
-            || neoforge_client_jar_missing(instance, &libraries_dir))
-    {
-        ensure_instance_idle(config, instance)?;
-        emit("loader", 88.0, "Installing mod loader...");
-        match &instance.loader_version {
-            Some(lv) => {
-                let loader_str = loader_type_str(&instance.loader);
-                match modloaders::install_loader(
-                    loader_str,
-                    &instance.mc_version,
-                    lv,
-                    &libraries_dir,
-                    &versions_dir,
-                    Some(app),
-                )
-                .await
-                {
-                    Ok(profile) => {
-                        let mut inst = instance.clone();
-                        inst.loader_profile = Some(profile);
-                        instances::save_instance(&instances_dir, &inst, None)?;
-                        summary.repaired += 1;
-                    }
-                    Err(e) => {
-                        summary.failed += 1;
-                        summary.errors.push(format!("Loader install: {}", e));
-                        tracing::warn!(target: "launcher", "Loader repair failed: {}", e);
-                    }
-                }
-            }
-            None => {
-                summary.failed += 1;
-                summary
-                    .errors
-                    .push("No loader version recorded for this instance".to_string());
-            }
-        }
-    }
-
-    // ── 5. java ─────────────────────────────────────────────────
+    // ---- 4. Java runtime ----
     let required = vi.required_java_major();
     let java_ok = {
         let mut ok = false;
@@ -2096,7 +2248,7 @@ pub async fn repair_instance(
     };
     if !java_ok {
         ensure_instance_idle(config, instance)?;
-        emit("java", 92.0, &format!("Downloading Java {}...", required));
+        emit("java", 88.0, &format!("Downloading Java {}...", required));
         match crate::java_download::download_java_runtime(required, &config.data_dir, app).await {
             Ok(_) => summary.repaired += 1,
             Err(e) => {
@@ -2107,7 +2259,195 @@ pub async fn repair_instance(
         }
     }
 
-    // ── 6. content is report-only ───────────────────────────────
+    // ---- loader generation ----
+    if !matches!(instance.loader, LoaderType::Vanilla) {
+        match instance.loader_version.as_deref() {
+            None => {
+                summary.failed += 1;
+                summary
+                    .errors
+                    .push("No loader version recorded for this instance".to_string());
+            }
+            Some(loader_version) => {
+                ensure_instance_idle(config, instance)?;
+                let needs_install = instance.loader_profile.is_none()
+                    || neoforge_client_jar_missing(instance, &libraries_dir);
+                if needs_install {
+                    emit("loader", 92.0, "Installing mod loader...");
+                    match modloaders::install_loader(
+                        loader_type_str(&instance.loader),
+                        &instance.mc_version,
+                        loader_version,
+                        &libraries_dir,
+                        &versions_dir,
+                        Some(app),
+                    )
+                    .await
+                    {
+                        Ok(profile) => {
+                            let mut inst = instance.clone();
+                            inst.loader_profile = Some(profile);
+                            instances::save_instance(&instances_dir, &inst, None)?;
+                            summary.repaired += 1;
+                        }
+                        Err(e) => {
+                            summary.failed += 1;
+                            summary.errors.push(format!("Loader install: {}", e));
+                            tracing::warn!(target: "launcher", "Loader repair failed: {}", e);
+                        }
+                    }
+                } else {
+                    // The profile already exists, but that is not proof that
+                    // the generated outputs or embedded libraries are usable.
+                    // Inspect first, then reuse the transactional ensure path
+                    // for every fixable state.
+                    emit("loader", 94.0, "Verifying loader generation...");
+                    let inspection = match instance.loader {
+                        LoaderType::Forge => modloaders::forge::inspect_generation(
+                            &instance.mc_version,
+                            loader_version,
+                            &libraries_dir,
+                            &versions_dir,
+                        ),
+                        LoaderType::NeoForge => modloaders::neoforge::inspect_generation(
+                            &instance.mc_version,
+                            loader_version,
+                            &libraries_dir,
+                            &versions_dir,
+                        ),
+                        LoaderType::Fabric | LoaderType::Vanilla => {
+                            modloaders::processor_cache::GenerationInspection::new(
+                                modloaders::processor_cache::GenerationState::Healthy,
+                            )
+                        }
+                    };
+                    if inspection.state
+                        == modloaders::processor_cache::GenerationState::RecoveryRequired
+                    {
+                        summary.failed += 1;
+                        let detail = inspection
+                            .issues
+                            .iter()
+                            .find_map(|issue| issue.detail.clone())
+                            .unwrap_or_else(|| {
+                                "the processor transaction requires manual recovery".to_string()
+                            });
+                        summary.errors.push(format!("Loader generation: {detail}"));
+                    } else if inspection.state
+                        != modloaders::processor_cache::GenerationState::Healthy
+                    {
+                        let result = match instance.loader {
+                            LoaderType::Forge => {
+                                modloaders::forge::ensure_processor_jars(
+                                    &instance.mc_version,
+                                    loader_version,
+                                    &libraries_dir,
+                                    &versions_dir,
+                                    Some(app),
+                                )
+                                .await
+                            }
+                            LoaderType::NeoForge => {
+                                modloaders::neoforge::ensure_processor_jars(
+                                    &instance.mc_version,
+                                    loader_version,
+                                    &libraries_dir,
+                                    &versions_dir,
+                                    Some(app),
+                                )
+                                .await
+                            }
+                            LoaderType::Fabric | LoaderType::Vanilla => Ok(()),
+                        };
+                        match result {
+                            Ok(()) => {
+                                if inspection.state
+                                    != modloaders::processor_cache::GenerationState::Busy
+                                {
+                                    summary.repaired += 1;
+                                }
+                            }
+                            Err(e) => {
+                                summary.failed += 1;
+                                summary.errors.push(format!("Loader generation: {}", e));
+                                tracing::warn!(
+                                    target: "launcher",
+                                    "Loader generation repair failed: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Loader libraries carry typed checksums (metadata or repository). Repair
+    // them through the same helper the installer and launch self-heal use, so
+    // a missing checksum or a corrupt existing JAR can never degrade into an
+    // unverified download. Forge/NeoForge use the Maven resolver; Fabric keeps
+    // its own resolver.
+    let loader_label = match instance.loader {
+        LoaderType::Fabric => "Fabric",
+        LoaderType::Forge => "Forge",
+        LoaderType::NeoForge => "NeoForge",
+        LoaderType::Vanilla => "Vanilla",
+    };
+    for (i, lib) in typed_libraries.iter().enumerate() {
+        ensure_instance_idle(config, instance)?;
+        emit(
+            "files",
+            95.0 + (i as f64 / typed_libraries.len().max(1) as f64) * 3.0,
+            &format!("Repairing {} library {}...", loader_label, lib.name),
+        );
+        let result = match instance.loader {
+            LoaderType::Fabric => {
+                crate::modloaders::fabric::ensure_library(lib, &libraries_dir).await
+            }
+            LoaderType::Forge => {
+                let mut lib = lib.clone();
+                crate::modloaders::artifact::ensure_library(
+                    &mut lib,
+                    &libraries_dir,
+                    crate::modloaders::artifact::FORGE_HOSTS,
+                    "Forge",
+                )
+                .await
+                .map(|outcome| outcome.downloaded)
+            }
+            LoaderType::NeoForge => {
+                let mut lib = lib.clone();
+                crate::modloaders::artifact::ensure_library(
+                    &mut lib,
+                    &libraries_dir,
+                    crate::modloaders::artifact::NEOFORGE_HOSTS,
+                    "NeoForge",
+                )
+                .await
+                .map(|outcome| outcome.downloaded)
+            }
+            LoaderType::Vanilla => Ok(false),
+        };
+        match result {
+            Ok(true) => summary.repaired += 1,
+            Ok(false) => {}
+            Err(e) => {
+                summary.failed += 1;
+                summary
+                    .errors
+                    .push(format!("{} library {}: {}", loader_label, lib.name, e));
+                tracing::warn!(
+                    target: "launcher",
+                    "{} repair failed for {}: {}",
+                    loader_label,
+                    lib.name,
+                    e
+                );
+            }
+        }
+    }
+    // ---- 6. content is report-only ----
     summary.content_skipped = scan_content(
         &instances_dir,
         instance,
@@ -2199,6 +2539,25 @@ mod tests {
             serde_json::to_string_pretty(&json).unwrap(),
         )
         .unwrap();
+    }
+
+    fn set_asset_index_metadata(
+        config: &AppConfig,
+        mc_version: &str,
+        sha1: &str,
+        size: u64,
+        url: &str,
+    ) {
+        let path = config
+            .versions_dir()
+            .join(mc_version)
+            .join(format!("{mc_version}.json"));
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        json["assetIndex"]["sha1"] = serde_json::json!(sha1);
+        json["assetIndex"]["size"] = serde_json::json!(size);
+        json["assetIndex"]["url"] = serde_json::json!(url);
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
     }
 
     fn write_file_with_sha1(path: &Path, bytes: &[u8]) {
@@ -2593,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn present_neoforge_client_jar_keeps_the_loader_category_healthy() {
+    fn present_neoforge_client_jar_is_not_mistaken_for_generation_proof() {
         let dir = temp_dir("neoforge_client_present");
         let config = test_config(&dir);
         let instance = neoforge_instance("1.21.4", "21.4.157");
@@ -2607,7 +2966,22 @@ mod tests {
 
         let loader = cat(&report, "loader");
         assert_eq!(loader.checked, 1);
-        assert_eq!(loader.issue_count, 0, "{:?}", loader.issues);
+        assert!(
+            !loader
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "missing" && issue.path.ends_with(".jar")),
+            "a present client JAR must not be reported missing: {:?}",
+            loader.issues
+        );
+        assert!(
+            loader
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "missing_generation_metadata"),
+            "missing generation provenance must not be reported healthy: {:?}",
+            loader.issues
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2648,12 +3022,28 @@ mod tests {
             )),
         );
 
+        assert!(
+            !neoforge_client_jar_missing(&instance, &config.libraries_dir()),
+            "the 26.x client JAR layout must be recognized without a cached installer"
+        );
+
         let report = verify_instance(&config, &instance);
 
         let loader = cat(&report, "loader");
-        assert_eq!(
-            loader.issue_count, 0,
+        assert!(
+            !loader
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "missing" && issue.path.ends_with(".jar")),
             "26.x layout must not be reported missing: {:?}",
+            loader.issues
+        );
+        assert!(
+            loader
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "missing_generation_metadata"),
+            "generation health must remain unknown without cache provenance: {:?}",
             loader.issues
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2723,9 +3113,27 @@ mod tests {
         let client = config.versions_dir().join("1.20.1").join("client.jar");
         write_file_with_sha1(&client, b"abc");
 
+        let object_bytes = b"x";
+        let hash = crate::download::tests::sha1_hex(object_bytes);
         let indexes = config.assets_dir().join("indexes");
         std::fs::create_dir_all(&indexes).unwrap();
-        std::fs::write(indexes.join("5.json"), r#"{"objects":{}}"#).unwrap();
+        std::fs::write(
+            indexes.join("5.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "objects": {
+                    "minecraft/test.bin": { "hash": hash, "size": 1 }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let object = config
+            .assets_dir()
+            .join("objects")
+            .join(&hash[..2])
+            .join(&hash);
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::write(&object, object_bytes).unwrap();
 
         let report = verify_instance(&config, &instance);
 
@@ -3107,7 +3515,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_forge_and_neoforge_profiles_keep_the_legacy_sha1_verify_path() {
+    fn forge_and_neoforge_verify_use_typed_checksums() {
         for loader in [LoaderType::Forge, LoaderType::NeoForge] {
             let tag = format!("legacy_{loader:?}");
             let dir = temp_dir(&tag);
@@ -3154,13 +3562,16 @@ mod tests {
             );
             assert!(libs.verified >= 1, "{tag}: SHA-1 must be used");
 
-            // A Forge/NeoForge profile must ignore the Fabric-only stronger
-            // checksum fields. The SHA-1 still matches, while the deliberately
-            // wrong SHA-256/SHA-512 would fail if the Fabric typed branch ran.
+            // Forge/NeoForge now use the typed path. A deliberately wrong
+            // SHA-1 must be ignored when a correct SHA-512 is present.
+            let library_path = config.libraries_dir().join(path);
+            let sha256 = crate::download::hash_file_sha256(&library_path).unwrap();
+            let sha512 = crate::download::hash_file_sha512(&library_path).unwrap();
             {
                 let lib = &mut instance.loader_profile.as_mut().unwrap().libraries[0];
-                lib.sha256 = Some("b".repeat(64));
-                lib.sha512 = Some("c".repeat(128));
+                lib.sha1 = Some("0".repeat(40));
+                lib.sha256 = Some(sha256);
+                lib.sha512 = Some(sha512);
                 lib.checksum_source = Some("metadata".to_string());
             }
             let report = verify_instance_scoped_mode(
@@ -3172,11 +3583,26 @@ mod tests {
             let libs = cat(&report, "libraries");
             assert_eq!(
                 libs.issue_count, 0,
-                "{tag}: Forge/NeoForge must keep using SHA-1, not Fabric's typed checksum"
+                "{tag}: the strongest typed checksum must be used"
             );
             assert!(
                 libs.verified >= 1,
-                "{tag}: SHA-1 must still verify the file"
+                "{tag}: a correct SHA-512 must verify the file"
+            );
+
+            instance.loader_profile.as_mut().unwrap().libraries[0].sha512 = Some("0".repeat(128));
+            let report = verify_instance_scoped_mode(
+                &config,
+                &instance,
+                VerifyScope::Launcher,
+                VerifyMode::Deep,
+            );
+            let libs = cat(&report, "libraries");
+            assert!(
+                libs.issues
+                    .iter()
+                    .any(|issue| issue.kind == "corrupt" && issue.path.contains(path)),
+                "{tag}: a wrong strongest checksum must be reported corrupt"
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -3390,6 +3816,289 @@ mod tests {
             map_to_resources: false,
         };
         assert!(validate_asset_index(&bad_hash).is_err());
+    }
+
+    #[test]
+    fn checksum_matching_but_structurally_invalid_index_is_not_healthy() {
+        let dir = temp_dir("asset_index_empty_matching");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
+        let empty = br#"{"objects":{}}"#;
+        let sha1 = crate::download::tests::sha1_hex(empty);
+        set_asset_index_metadata(
+            &config,
+            "1.20.1",
+            &sha1,
+            empty.len() as u64,
+            "https://example.com/index.json",
+        );
+        let index_path = config.assets_dir().join("indexes").join("5.json");
+        std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        std::fs::write(&index_path, empty).unwrap();
+
+        let report = verify_instance_scoped_mode(
+            &config,
+            &instance,
+            VerifyScope::Launcher,
+            VerifyMode::Deep,
+        );
+        let assets = cat(&report, "assets");
+        assert!(
+            assets
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "corrupt" && issue.path.contains("indexes/5.json")),
+            "structurally invalid trusted index must not be healthy: {:?}",
+            assets.issues
+        );
+        assert!(!report.healthy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_version_info_for_index(url: &str, sha1: &str, size: u64) -> versions::VersionInfo {
+        versions::VersionInfo {
+            id: "1.20.1".to_string(),
+            version_type: "release".to_string(),
+            main_class: "net.minecraft.client.main.Main".to_string(),
+            minecraft_arguments: None,
+            arguments: None,
+            libraries: Vec::new(),
+            downloads: versions::Downloads {
+                client: versions::DownloadInfo {
+                    sha1: ABC_SHA1.to_string(),
+                    size: 3,
+                    url: "https://example.com/client.jar".to_string(),
+                },
+                server: None,
+            },
+            asset_index: versions::AssetIndex {
+                id: "5".to_string(),
+                sha1: sha1.to_string(),
+                size,
+                total_size: 0,
+                url: url.to_string(),
+            },
+            assets: "5".to_string(),
+            java_version: None,
+            compliance_level: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_asset_index_fetches_validates_and_publishes_publisher_bytes() {
+        use crate::download::tests::{direct_proxy_lock, sha1_hex, spawn_mock, MockSpec};
+
+        let _proxy = direct_proxy_lock().await;
+        let object_bytes = b"x";
+        let hash = sha1_hex(object_bytes);
+        let valid_index = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "minecraft/test.bin": { "hash": hash, "size": object_bytes.len() }
+            }
+        }))
+        .unwrap();
+        let valid_sha1 = sha1_hex(&valid_index);
+        let server = spawn_mock(vec![MockSpec::ok(&valid_index)]).await;
+
+        let dir = temp_dir("repair_asset_full");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        let assets_dir = config.assets_dir();
+        let indexes = assets_dir.join("indexes");
+        std::fs::create_dir_all(&indexes).unwrap();
+        let index_path = indexes.join("5.json");
+        std::fs::write(&index_path, br#"{"objects":{}}"#).unwrap();
+        let object_path = assets_dir.join("objects").join(&hash[..2]).join(&hash);
+        std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        std::fs::write(&object_path, object_bytes).unwrap();
+
+        let vi = test_version_info_for_index(&server.url, &valid_sha1, valid_index.len() as u64);
+        let mut summary = RepairSummary::default();
+        let repaired = restore_asset_index_for_repair(
+            &config,
+            &instance,
+            &vi,
+            &assets_dir,
+            &index_path,
+            &mut summary,
+            &|_, _, _| {},
+        )
+        .await
+        .expect("valid publisher bytes must repair the index");
+        let repaired = repaired.expect("repair must return the parsed publisher index");
+        assert_eq!(repaired.objects.len(), 1);
+        assert!(repaired.objects.contains_key("minecraft/test.bin"));
+        assert_eq!(summary.repaired, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(std::fs::read(&index_path).unwrap(), valid_index);
+        assert_eq!(
+            crate::download::hash_file_sha1(&index_path).unwrap(),
+            valid_sha1
+        );
+        assert_eq!(server.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn repair_asset_index_fails_closed_when_publisher_bytes_are_invalid() {
+        use crate::download::tests::{direct_proxy_lock, sha1_hex, spawn_mock, MockSpec};
+
+        let _proxy = direct_proxy_lock().await;
+        let invalid = br#"{"objects":{}}"#;
+        let invalid_sha1 = sha1_hex(invalid);
+        let server = spawn_mock(vec![MockSpec::ok(invalid)]).await;
+
+        let dir = temp_dir("repair_asset_invalid_publisher");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        let assets_dir = config.assets_dir();
+        let indexes = assets_dir.join("indexes");
+        std::fs::create_dir_all(&indexes).unwrap();
+        let index_path = indexes.join("5.json");
+        std::fs::write(&index_path, invalid).unwrap();
+
+        let vi = test_version_info_for_index(&server.url, &invalid_sha1, invalid.len() as u64);
+        let mut summary = RepairSummary::default();
+        let error = restore_asset_index_for_repair(
+            &config,
+            &instance,
+            &vi,
+            &assets_dir,
+            &index_path,
+            &mut summary,
+            &|_, _, _| {},
+        )
+        .await
+        .expect_err("publisher bytes that remain structurally invalid must fail closed");
+        assert!(error.to_string().contains("no objects"), "got: {error}");
+        assert_eq!(
+            server.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a checksum-matching but structurally invalid local index must be refetched"
+        );
+        assert_eq!(summary.repaired, 0);
+        assert_eq!(std::fs::read(&index_path).unwrap(), invalid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_index_loader_rejects_invalid_structure_and_malformed_checksum() {
+        let dir = temp_dir("trusted_index_helper");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        let empty = br#"{"objects":{}}"#;
+        std::fs::write(&path, empty).unwrap();
+        assert!(
+            load_trusted_asset_index(&path, &crate::download::tests::sha1_hex(empty)).is_none()
+        );
+        assert!(load_trusted_asset_index(&path, "not-a-sha1").is_none());
+
+        let object_bytes = b"x";
+        let hash = crate::download::tests::sha1_hex(object_bytes);
+        let valid = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "minecraft/test.bin": { "hash": hash, "size": object_bytes.len() }
+            }
+        }))
+        .unwrap();
+        std::fs::write(&path, &valid).unwrap();
+        let loaded = load_trusted_asset_index(&path, &crate::download::tests::sha1_hex(&valid))
+            .expect("valid trusted index");
+        assert_eq!(loaded.objects.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_asset_index_sha1_is_an_error_not_unverified() {
+        let dir = temp_dir("asset_index_malformed_sha1");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
+        set_asset_index_metadata(
+            &config,
+            "1.20.1",
+            "not-a-sha1",
+            0,
+            "https://example.com/index.json",
+        );
+        let index_path = config.assets_dir().join("indexes").join("5.json");
+        std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        std::fs::write(&index_path, br#"{"objects":{}}"#).unwrap();
+
+        let report = verify_instance_scoped_mode(
+            &config,
+            &instance,
+            VerifyScope::Launcher,
+            VerifyMode::Deep,
+        );
+        let assets = cat(&report, "assets");
+        assert!(
+            assets
+                .issues
+                .iter()
+                .any(|issue| { issue.kind == "invalid" && issue.path.contains("indexes/5.json") }),
+            "malformed checksum must be an explicit integrity issue: {:?}",
+            assets.issues
+        );
+        assert!(!report.healthy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_asset_index_sha1_keeps_the_explicit_unverified_policy() {
+        let dir = temp_dir("asset_index_empty_sha1");
+        let config = test_config(&dir);
+        let instance = test_instance("1.20.1");
+        write_version_json(
+            &config,
+            "1.20.1",
+            ABC_SHA1,
+            3,
+            "https://example.com/client.jar",
+        );
+        let body = serde_json::json!({
+            "objects": {
+                "minecraft/test.bin": {
+                    "hash": "aa".repeat(20),
+                    "size": 1
+                }
+            }
+        });
+        let body = serde_json::to_vec(&body).unwrap();
+        let index_path = config.assets_dir().join("indexes").join("5.json");
+        std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        std::fs::write(&index_path, body).unwrap();
+
+        let report = verify_instance_scoped_mode(
+            &config,
+            &instance,
+            VerifyScope::Launcher,
+            VerifyMode::Deep,
+        );
+        let assets = cat(&report, "assets");
+        assert_eq!(assets.unverified, 1);
+        assert!(
+            !assets
+                .issues
+                .iter()
+                .any(|issue| issue.path.contains("indexes/5.json")),
+            "an explicitly absent checksum is unverified, not corrupt: {:?}",
+            assets.issues
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

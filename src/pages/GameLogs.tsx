@@ -12,7 +12,7 @@ import { Button } from '../components/ui/Button';
 import { CopyButton } from '../components/ui/CopyButton';
 import { Tooltip } from '../components/ui/Tooltip';
 import { ConfirmDialog } from '../components/ui/ConfirmDialog';
-import { VerifyRepairModal } from '../components/instances/VerifyRepairModal';
+import { GameLogsVerifyRepair } from './GameLogsVerifyRepair';
 import { CRASH_KEYS, CRASH_ACTION_KEYS, VERDICT_KEYS, type CrashAnalysis, type CrashAction } from '../lib/diagnostics';
 import { filterLogLines, getLineColor, getLineLevel } from '../lib/gameLogs';
 import {
@@ -693,10 +693,10 @@ export function GameLogs() {
         busy={actionBusy !== null}
       />
 
-      <VerifyRepairModal
-        open={repairOpen && !!shownSession}
+      <GameLogsVerifyRepair
+        session={shownSession}
+        open={repairOpen}
         onClose={() => setRepairOpen(false)}
-        instanceName={shownSession?.instance_name ?? ''}
       />
     </div>
   );

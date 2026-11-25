@@ -2001,6 +2001,125 @@ async fn prepare_loader(
 /// Fetch the version manifest for the instance's Minecraft version and
 /// download the missing version files + assets, writing the version JSON the
 /// launch path expects (same layout `cmd_install_version` produces).
+/// Restore/validate the shared Asset Index for an import. The import
+/// preparation must not publish an instance as ready with an unusable shared
+/// index, and it must preserve a previous working file on failure.
+async fn prepare_asset_index_for_import(
+    app: Option<&AppHandle>,
+    config: &AppConfig,
+    instance: &Instance,
+    version_info: &versions::VersionInfo,
+    report: &mut PrepareReport,
+) -> Option<versions::AssetIndexData> {
+    let index_path = config
+        .assets_dir()
+        .join("indexes")
+        .join(format!("{}.json", version_info.assets));
+    if let Err(e) = versions::prepare_asset_index_path(&config.assets_dir(), &index_path) {
+        tracing::warn!(target: "launcher", "Failed to prepare asset index dir for '{}': {}", instance.name, e);
+        report.warn(format!(
+            "The asset index directory could not be prepared: {}",
+            e
+        ));
+        return None;
+    }
+    let local_index_matches_publisher = version_info.asset_index.sha1.is_empty()
+        || crate::download::verify_sha1(&index_path, &version_info.asset_index.sha1).ok()
+            == Some(true);
+    let mut asset_index = if index_path.exists() && local_index_matches_publisher {
+        match versions::load_validated_asset_index(&index_path) {
+            Ok(index) => Some(index),
+            Err(e) => {
+                tracing::warn!(
+                    target: "launcher",
+                    "Local asset index for '{}' is unusable: {}",
+                    instance.name, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if asset_index.is_none() {
+        emit_progress(app, "assets", 0, 1, "Downloading asset index...");
+        if !crate::is_allowed_download_host(&version_info.asset_index.url) {
+            tracing::warn!(
+                target: "launcher",
+                "Asset index URL for {} is not in the download allowlist; skipping",
+                instance.mc_version
+            );
+            report.warn(format!(
+                "The asset download source for Minecraft {} is not allowed.",
+                instance.mc_version
+            ));
+            return None;
+        }
+        let bytes = match versions::fetch_asset_index_bytes(
+            &version_info.asset_index.url,
+            &version_info.asset_index.sha1,
+            version_info.asset_index.size,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(
+                    target: "launcher",
+                    "Failed to fetch asset index for {}: {} (the launch will retry)",
+                    instance.mc_version, e
+                );
+                report.warn(format!(
+                    "The asset index for Minecraft {} could not be downloaded: {}",
+                    instance.mc_version, e
+                ));
+                return None;
+            }
+        };
+        let parsed = match versions::parse_asset_index_bytes(&bytes) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(
+                    target: "launcher",
+                    "Downloaded asset index for '{}' is invalid: {}",
+                    instance.name, e
+                );
+                report.warn(format!(
+                    "The asset index for Minecraft {} is invalid: {}",
+                    instance.mc_version, e
+                ));
+                return None;
+            }
+        };
+        if let Err(e) = verify::validate_asset_index(&parsed) {
+            tracing::warn!(
+                target: "launcher",
+                "Downloaded asset index for '{}' is invalid: {}",
+                instance.name, e
+            );
+            report.warn(format!(
+                "The asset index for Minecraft {} is invalid: {}",
+                instance.mc_version, e
+            ));
+            return None;
+        }
+        match versions::store_asset_index_bytes(
+            &index_path,
+            &bytes,
+            &version_info.asset_index.sha1,
+            version_info.asset_index.size,
+        ) {
+            Ok(fetched) => asset_index = Some(fetched),
+            Err(e) => {
+                tracing::warn!(target: "launcher", "Failed to store asset index for '{}': {}", instance.name, e);
+                report.warn(format!("The asset index could not be saved: {}", e));
+                return None;
+            }
+        }
+    }
+    asset_index
+}
+
 async fn prepare_version_and_assets(
     app: Option<&AppHandle>,
     config: &AppConfig,
@@ -2179,95 +2298,11 @@ async fn prepare_version_and_assets(
     // Asset index + assets. A present index is validated, not trusted: a
     // truncated JSON or an index whose objects are missing must be restored
     // before the instance is published as ready.
-    let index_path = config
-        .assets_dir()
-        .join("indexes")
-        .join(format!("{}.json", version_info.assets));
-    let mut asset_index = if index_path.exists() {
-        match versions::load_asset_index(&index_path)
-            .and_then(|index| verify::validate_asset_index(&index).map(|_| index))
-        {
-            Ok(index) => Some(index),
-            Err(e) => {
-                tracing::warn!(
-                    target: "launcher",
-                    "Local asset index for '{}' is unusable: {}",
-                    instance.name, e
-                );
-                None
-            }
-        }
-    } else {
-        None
+    let Some(asset_index) =
+        prepare_asset_index_for_import(app, config, instance, &version_info, report).await
+    else {
+        return;
     };
-    if asset_index.is_none() {
-        emit_progress(app, "assets", 0, 1, "Downloading asset index...");
-        if !crate::is_allowed_download_host(&version_info.asset_index.url) {
-            tracing::warn!(
-                target: "launcher",
-                "Asset index URL for {} is not in the download allowlist; skipping",
-                instance.mc_version
-            );
-            report.warn(format!(
-                "The asset download source for Minecraft {} is not allowed.",
-                instance.mc_version
-            ));
-            return;
-        }
-        let fetched = match versions::fetch_asset_index(&version_info.asset_index.url).await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(
-                    target: "launcher",
-                    "Failed to fetch asset index for {}: {} (the launch will retry)",
-                    instance.mc_version, e
-                );
-                report.warn(format!(
-                    "The asset index for Minecraft {} could not be downloaded: {}",
-                    instance.mc_version, e
-                ));
-                return;
-            }
-        };
-        if let Err(e) = verify::validate_asset_index(&fetched) {
-            tracing::warn!(
-                target: "launcher",
-                "Downloaded asset index for '{}' is invalid: {}",
-                instance.name, e
-            );
-            report.warn(format!(
-                "The asset index for Minecraft {} is invalid: {}",
-                instance.mc_version, e
-            ));
-            return;
-        }
-        if let Some(parent) = index_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(target: "launcher", "Failed to create asset index dir for '{}': {}", instance.name, e);
-                report.warn(format!(
-                    "The asset index directory could not be created: {}",
-                    e
-                ));
-                return;
-            }
-        }
-        match serde_json::to_string_pretty(&fetched) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&index_path, json) {
-                    tracing::warn!(target: "launcher", "Failed to write asset index for '{}': {}", instance.name, e);
-                    report.warn(format!("The asset index could not be saved: {}", e));
-                    return;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "launcher", "Failed to serialize asset index for '{}': {}", instance.name, e);
-                report.warn(format!("The asset index could not be serialized: {}", e));
-                return;
-            }
-        }
-        asset_index = Some(fetched);
-    }
-    let asset_index = asset_index.expect("asset index was loaded or downloaded");
 
     // Validate every object; download only what is missing/damaged. Import
     // preparation should leave the instance genuinely launchable, not merely
@@ -6536,5 +6571,119 @@ mod tests {
             "the slot is released"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn import_asset_index_version(url: &str, sha1: &str, size: u64) -> versions::VersionInfo {
+        versions::VersionInfo {
+            id: "1.20.1".to_string(),
+            version_type: "release".to_string(),
+            main_class: "net.minecraft.client.main.Main".to_string(),
+            minecraft_arguments: None,
+            arguments: None,
+            libraries: Vec::new(),
+            downloads: versions::Downloads {
+                client: versions::DownloadInfo {
+                    sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".to_string(),
+                    size: 1,
+                    url: "https://example.com/client.jar".to_string(),
+                },
+                server: None,
+            },
+            asset_index: versions::AssetIndex {
+                id: "5".to_string(),
+                sha1: sha1.to_string(),
+                size,
+                total_size: 0,
+                url: url.to_string(),
+            },
+            assets: "5".to_string(),
+            java_version: None,
+            compliance_level: 0,
+        }
+    }
+
+    fn import_index_bytes() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "minecraft/test.bin": {
+                    "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 1
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn import_asset_index_publishes_raw_bytes_and_preserves_old_on_failure() {
+        use crate::download::tests::{direct_proxy_lock, mock_dir, sha1_hex, spawn_mock, MockSpec};
+
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("import_asset_index");
+        let config = AppConfig {
+            data_dir: dir.clone(),
+            ..Default::default()
+        };
+        let instance = Instance::new("Import Test", "1.20.1", LoaderType::Vanilla, None);
+        let body = import_index_bytes();
+        let sha1 = sha1_hex(&body);
+        let server = spawn_mock(vec![MockSpec::ok(&body)]).await;
+        let vi = import_asset_index_version(&server.url, &sha1, body.len() as u64);
+        let mut report = PrepareReport::default();
+
+        let result = prepare_asset_index_for_import(None, &config, &instance, &vi, &mut report)
+            .await
+            .expect("valid publisher bytes must be imported");
+        assert_eq!(result.objects.len(), 1);
+        let path = config.assets_dir().join("indexes/5.json");
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert_eq!(server.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        std::fs::write(&path, b"previous-working-index").unwrap();
+        let invalid = br#"{"objects":{}}"#;
+        let invalid_sha1 = sha1_hex(invalid);
+        let failing = spawn_mock(vec![MockSpec::ok(invalid)]).await;
+        let bad_vi = import_asset_index_version(&failing.url, &invalid_sha1, invalid.len() as u64);
+        let failed =
+            prepare_asset_index_for_import(None, &config, &instance, &bad_vi, &mut report).await;
+        assert!(failed.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous-working-index");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn import_asset_index_rejects_a_reparse_point_destination() {
+        use crate::download::tests::{direct_proxy_lock, mock_dir, sha1_hex, spawn_mock, MockSpec};
+
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("import_asset_junction");
+        let config = AppConfig {
+            data_dir: dir.clone(),
+            ..Default::default()
+        };
+        let assets = config.assets_dir();
+        std::fs::create_dir_all(&assets).unwrap();
+        let outside = mock_dir("import_asset_junction_outside");
+        let indexes = assets.join("indexes");
+        if !create_junction(&indexes, &outside) {
+            eprintln!("skipping junction test: mklink /J failed");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+        let instance = Instance::new("Import Junction", "1.20.1", LoaderType::Vanilla, None);
+        let body = import_index_bytes();
+        let sha1 = sha1_hex(&body);
+        let server = spawn_mock(vec![MockSpec::ok(&body)]).await;
+        let vi = import_asset_index_version(&server.url, &sha1, body.len() as u64);
+        let mut report = PrepareReport::default();
+        let result =
+            prepare_asset_index_for_import(None, &config, &instance, &vi, &mut report).await;
+        assert!(result.is_none());
+        assert!(!outside.join("5.json").exists());
+        let _ = std::fs::remove_dir(&indexes);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

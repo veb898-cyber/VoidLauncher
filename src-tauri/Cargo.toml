@@ -77,6 +77,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+# `mock_app`/`MockRuntime` for command-level reservation tests. This feature
+# is test-only and is not enabled in production builds.
+tauri = { version = "2", features = ["test"] }
+
 [profile.release]
 strip = true
 lto = true

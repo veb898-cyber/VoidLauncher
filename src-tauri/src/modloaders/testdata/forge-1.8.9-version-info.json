@@ -1,0 +1,26 @@
+[
+  {
+    "name": "net.minecraftforge:forge:1.8.9-11.15.1.2318-1.8.9",
+    "url": "https://maven.minecraftforge.net/"
+  },
+  {
+    "name": "net.minecraft:launchwrapper:1.12",
+    "serverreq": true
+  },
+  {
+    "name": "org.ow2.asm:asm-all:5.0.3",
+    "serverreq": true
+  },
+  {
+    "name": "lzma:lzma:0.0.1"
+  },
+  {
+    "name": "net.sf.jopt-simple:jopt-simple:4.6"
+  },
+  {
+    "name": "java3d:vecmath:1.5.2"
+  },
+  {
+    "name": "net.sf.trove4j:trove4j:3.0.3"
+  }
+]

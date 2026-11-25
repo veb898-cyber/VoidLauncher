@@ -709,39 +709,66 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
         .ok_or_else(|| LauncherError::Instance("File path has no file name".into()))?;
     let tmp_path = parent.join(format!(".{}.tmp", file_name));
     let bak_path = parent.join(format!(".{}.bak", file_name));
+    write_file_atomic_paths(path, contents, &tmp_path, &bak_path)
+}
 
-    std::fs::write(&tmp_path, contents)?;
+/// Variant for shared targets that different instances may repair at the same
+/// time (currently the global Asset Index). Unlike [`write_file_atomic`], the
+/// temporary and backup names are unique, so two writers cannot collide on the
+/// same sibling path. Callers that need serialized publication must still hold
+/// their own target lock.
+pub(crate) fn write_file_atomic_unique(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| LauncherError::Instance("File path has no parent directory".into()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| LauncherError::Instance("File path has no file name".into()))?;
+    let token = uuid::Uuid::new_v4().simple();
+    let tmp_path = parent.join(format!(".{}.{}.tmp", file_name, token));
+    let bak_path = parent.join(format!(".{}.{}.bak", file_name, token));
+    write_file_atomic_paths(path, contents, &tmp_path, &bak_path)
+}
+
+fn write_file_atomic_paths(
+    path: &Path,
+    contents: &[u8],
+    tmp_path: &Path,
+    bak_path: &Path,
+) -> Result<()> {
+    std::fs::write(tmp_path, contents)?;
     // Flush the temp file before the rename so a crash cannot leave a
     // renamed-but-empty file on a delayed-write filesystem.
-    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp_path) {
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(tmp_path) {
         let _ = f.sync_all();
     }
 
-    match std::fs::rename(&tmp_path, path) {
+    match std::fs::rename(tmp_path, path) {
         Ok(()) => Ok(()),
         Err(first_err) => {
             if !path.exists() {
-                let _ = std::fs::remove_file(&tmp_path);
+                let _ = std::fs::remove_file(tmp_path);
                 return Err(first_err.into());
             }
             // Keep the original in place while the replacement is prepared:
             // a concurrent reader must never observe the file missing. A copy
             // (not a rename) also leaves the live file usable if the second
             // rename still fails.
-            let _ = std::fs::remove_file(&bak_path);
-            if let Err(e) = std::fs::copy(path, &bak_path) {
-                let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::remove_file(bak_path);
+            if let Err(e) = std::fs::copy(path, bak_path) {
+                let _ = std::fs::remove_file(tmp_path);
                 return Err(e.into());
             }
-            match std::fs::rename(&tmp_path, path) {
+            match std::fs::rename(tmp_path, path) {
                 Ok(()) => {
-                    let _ = std::fs::remove_file(&bak_path);
+                    let _ = std::fs::remove_file(bak_path);
                     Ok(())
                 }
                 Err(e) => {
                     // The original was never moved, so it is still intact.
-                    let _ = std::fs::remove_file(&tmp_path);
-                    let _ = std::fs::remove_file(&bak_path);
+                    let _ = std::fs::remove_file(tmp_path);
+                    let _ = std::fs::remove_file(bak_path);
                     Err(e.into())
                 }
             }
@@ -8193,6 +8220,27 @@ version = 'hIibTfxn'
             "the source instance must not be renamed"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_instance_rejects_case_insensitive_duplicate_identity() {
+        let dir = temp_dir("create_duplicate_identity");
+        let instances_dir = dir.join("instances");
+        let launches = crate::launch_state::LaunchRegistry::new();
+
+        let alpha = Instance::new("Alpha", "1.20.1", LoaderType::Vanilla, None);
+        create_instance(&instances_dir, &alpha, &launches).unwrap();
+
+        let duplicate = Instance::new("alpha", "1.21.1", LoaderType::Vanilla, None);
+        let error = create_instance(&instances_dir, &duplicate, &launches).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "got: {error}");
+
+        let listed = list_instances(&instances_dir).unwrap();
+        assert_eq!(listed.len(), 1, "one directory must mean one identity");
+        assert_eq!(listed[0].name, "Alpha");
+        let resolved = get_instance(&instances_dir, &listed[0].name).unwrap();
+        assert_eq!(resolved.name, listed[0].name);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { CheckCircle2, AlertTriangle, Wrench } from 'lucide-react';
@@ -8,12 +8,19 @@ import { Button } from '../ui/Button';
 import { ProgressBar } from '../ui/ProgressBar';
 import { SlidingTabs } from '../ui/SlidingTabs';
 import { useT, type MessageKey } from '../../lib/i18n';
+import { RepairResultView } from './RepairResultView';
+import {
+  initialRepairResultState,
+  repairResultReducer,
+  type RepairSummary,
+} from './repairResult';
+import { issueKindLabelKey } from './verifyIssueLabels';
 
 interface VerifyIssue {
   path: string;
   kind: string;
   repairable: boolean;
-  /** Extra context for the kind ("outdated_loader" carries the loader range). */
+  /** Extra diagnostic context; content and length are kind-specific. */
   detail?: string | null;
 }
 
@@ -35,13 +42,6 @@ interface VerifyReport {
   mode: 'quick' | 'deep';
 }
 
-interface RepairSummary {
-  repaired: number;
-  failed: number;
-  content_skipped: number;
-  errors: string[];
-}
-
 interface RepairProgress {
   stage: string;
   percent: number;
@@ -56,17 +56,6 @@ const CAT_LABELS: Record<string, MessageKey> = {
   loader: 'verify.cat_loader',
   java: 'verify.cat_java',
   content: 'verify.cat_content',
-};
-
-const KIND_LABELS: Record<string, MessageKey> = {
-  missing: 'verify.kind_missing',
-  corrupt: 'verify.kind_corrupt',
-  invalid: 'verify.kind_invalid',
-  unsafe: 'verify.kind_unsafe',
-  outdated_loader: 'verify.kind_outdated_loader',
-  size_mismatch: 'verify.kind_size_mismatch',
-  hash_mismatch: 'verify.kind_hash_mismatch',
-  incomplete: 'verify.kind_incomplete',
 };
 
 /** Which part of an instance to scan: everything, launcher files only, or one
@@ -89,54 +78,90 @@ interface VerifyRepairModalProps {
 
 export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairModalProps) {
   const t = useT();
-  const [report, setReport] = useState<VerifyReport | null>(null);
+  interface ReportSlot {
+    key: string;
+    report: VerifyReport;
+  }
+  const [reportState, setReportState] = useState<ReportSlot | null>(null);
   const [checking, setChecking] = useState(false);
   const [repairing, setRepairing] = useState(false);
   const [scope, setScope] = useState<VerifyScope>('all');
   const [mode, setMode] = useState<VerifyMode>('deep');
   const [progress, setProgress] = useState<RepairProgress | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [summary, setSummary] = useState<RepairSummary | null>(null);
+  // Verify and Repair errors are separate: a later Verify must not hide a
+  // Repair failure, and the Repair result survives the automatic re-verify.
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+  const [repairResult, dispatchRepairResult] = useReducer(
+    repairResultReducer,
+    initialRepairResultState,
+  );
   const unlistenRef = useRef<(() => void) | null>(null);
-  // Per-scope/mode results stay valid for the lifetime of the open dialog:
-  // switching a tab shows the stored result instead of re-scanning. The cache
-  // is dropped by «Проверить снова», by a repair, and on unmount (closing the
-  // dialog) — owner: «результаты одни и те же, пока не закрою это окно или
-  // пока не проведу проверку заново».
-  const cacheRef = useRef<Partial<Record<string, VerifyReport>>>({});
-  // Latest scan request wins: a slow reply for a previous scope must not
-  // overwrite the report of the scope the user is looking at now.
+  // `instanceName` is the stable instance/directory identity in this app.
+  // Caching is intentionally limited to the open dialog: switching tabs keeps
+  // its result, but closing the dialog or changing the instance invalidates
+  // every entry. The key also contains the instance so two sessions can never
+  // share a report.
+  const activeKey = `${instanceName}:${scope}:${mode}`;
+  const cacheRef = useRef<Record<string, VerifyReport>>({});
+  // Latest scan request wins: a slow reply from a previous instance/scope must
+  // never overwrite the current report or its cache entry.
   const requestSeq = useRef(0);
+  // These refs track the latest lifecycle values for async callbacks. They are
+  // assigned during render so a promise resolution between render and effect
+  // cannot observe a stale instance/open flag.
+  const openRef = useRef(open);
+  openRef.current = open;
+  const instanceRef = useRef(instanceName);
+  instanceRef.current = instanceName;
+  const report = reportState?.key === activeKey ? reportState.report : null;
 
   const runVerify = useCallback(async (force = false) => {
-    const cacheKey = `${scope}:${mode}`;
+    dispatchRepairResult({ type: 'verify_started' });
+    const requestedInstance = instanceName;
+    const requestedKey = `${requestedInstance}:${scope}:${mode}`;
     if (!force) {
-      const cached = cacheRef.current[cacheKey];
+      const cached = cacheRef.current[requestedKey];
       if (cached) {
         requestSeq.current += 1;
-        setReport(cached);
-        setError(null);
-        setSummary(null);
+        setReportState({ key: requestedKey, report: cached });
+        setVerifyError(null);
         setChecking(false);
         return;
       }
+    } else {
+      // A forced scan is a new snapshot, not a confirmation of the previous
+      // one. Drop the old successful entry before the request; if the scan
+      // fails, returning to this scope must not resurrect a stale Healthy
+      // report from cache.
+      delete cacheRef.current[requestedKey];
     }
     const seq = ++requestSeq.current;
     setChecking(true);
-    setError(null);
-    setSummary(null);
+    setVerifyError(null);
     try {
       const result = await invoke<VerifyReport>('cmd_verify_instance', {
-        instanceName,
+        instanceName: requestedInstance,
         scope,
         mode,
       });
-      cacheRef.current[cacheKey] = result;
-      if (seq === requestSeq.current) setReport(result);
+      if (
+        seq !== requestSeq.current
+        || !openRef.current
+        || instanceRef.current !== requestedInstance
+      ) {
+        return;
+      }
+      cacheRef.current[requestedKey] = result;
+      setReportState({ key: requestedKey, report: result });
     } catch (e) {
-      if (seq === requestSeq.current) {
-        setError(String(e));
-        setReport(null);
+      if (
+        seq === requestSeq.current
+        && openRef.current
+        && instanceRef.current === requestedInstance
+      ) {
+        delete cacheRef.current[requestedKey];
+        setVerifyError(String(e));
+        setReportState(null);
       }
     } finally {
       if (seq === requestSeq.current) setChecking(false);
@@ -144,12 +169,29 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
   }, [instanceName, scope, mode]);
 
   useEffect(() => {
+    // A different instance must never inherit the previous instance's report
+    // or cache, even if this component stays mounted (GameLogs does exactly
+    // that). The increment invalidates any request already in flight.
+    requestSeq.current += 1;
+    cacheRef.current = {};
+    setReportState(null);
+    setVerifyError(null);
+    dispatchRepairResult({ type: 'reset' });
+    setProgress(null);
+    setChecking(false);
+  }, [instanceName]);
+
+  useEffect(() => {
     if (open) {
       runVerify();
     } else {
-      setReport(null);
-      setError(null);
-      setSummary(null);
+      // Closing the dialog drops the per-open cache. The next open is a new
+      // snapshot, not a replay of a report from before files changed.
+      requestSeq.current += 1;
+      cacheRef.current = {};
+      setReportState(null);
+      setVerifyError(null);
+      dispatchRepairResult({ type: 'reset' });
       setProgress(null);
       setRepairing(false);
       setChecking(false);
@@ -177,20 +219,29 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
   }, [repairing]);
 
   const runRepair = useCallback(async () => {
+    const requestedInstance = instanceName;
     setRepairing(true);
-    setError(null);
-    setSummary(null);
+    // The old report belongs to the pre-repair state. Do not leave it next to
+    // a failed Repair error or a partial result.
+    requestSeq.current += 1;
+    cacheRef.current = {};
+    setReportState(null);
+    setVerifyError(null);
+    setChecking(false);
+    dispatchRepairResult({ type: 'repair_started' });
     setProgress(null);
     try {
       const result = await invoke<RepairSummary>('cmd_repair_instance', {
-        instanceName,
+        instanceName: requestedInstance,
       });
-      setSummary(result);
+      if (!openRef.current || instanceRef.current !== requestedInstance) return;
+      dispatchRepairResult({ type: 'repair_finished', summary: result });
       // The instance changed on disk — every cached scope is stale now.
       cacheRef.current = {};
       await runVerify(true);
     } catch (e) {
-      setError(String(e));
+      if (!openRef.current || instanceRef.current !== requestedInstance) return;
+      dispatchRepairResult({ type: 'repair_failed', error: String(e) });
     } finally {
       setRepairing(false);
       setProgress(null);
@@ -276,17 +327,17 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
         </div>
       )}
 
-      {error && !busy && (
+      {verifyError && !busy && (
         <div style={{ color: 'var(--danger, #e5534b)', fontSize: 'var(--font-size-sm)', marginBottom: 'var(--space-md)' }}>
-          {t('verify.error', { error })}
+          {t('verify.error', { error: verifyError })}
         </div>
       )}
 
-      {summary && !busy && (
-        <div style={{ fontSize: 'var(--font-size-sm)', marginBottom: 'var(--space-md)', color: summary.failed > 0 ? 'var(--danger, #e5534b)' : 'var(--success, #3fb950)' }}>
-          {t('verify.repaired', { repaired: summary.repaired, failed: summary.failed })}
-        </div>
-      )}
+      <RepairResultView
+        summary={repairResult.summary}
+        error={repairResult.error}
+      />
+
 
       {repairing && progress && (
         <div style={{ marginBottom: 'var(--space-md)' }}>
@@ -377,28 +428,42 @@ export function VerifyRepairModal({ open, onClose, instanceName }: VerifyRepairM
             .filter((cat) => cat.issue_count > 0)
             .map((cat) => (
               <div key={`${cat.id}-issues`} style={{ paddingLeft: 'var(--space-xl)', display: 'flex', flexDirection: 'column', gap: 2 }}>
-                {cat.issues.slice(0, 20).map((issue, i) => (
-                  <div
-                    key={i}
-                    style={{
-                      fontSize: 'var(--font-size-xs)',
-                      color: 'var(--text-tertiary)',
-                      display: 'flex',
-                      gap: 'var(--space-sm)',
-                      alignItems: 'baseline',
-                    }}
-                  >
-                    <code style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{issue.path}</code>
-                    {issue.detail && (
-                      <span style={{ color: 'var(--text-tertiary)', flexShrink: 0 }}>
-                        {t('verify.issue_requires', { range: issue.detail })}
-                      </span>
-                    )}
-                    <span style={{ color: issue.kind === 'missing' ? 'var(--danger, #e5534b)' : 'var(--warning, #d29922)', flexShrink: 0 }}>
-                      {KIND_LABELS[issue.kind] ? t(KIND_LABELS[issue.kind]) : issue.kind}
-                    </span>
-                  </div>
-                ))}
+                {cat.issues.slice(0, 20).map((issue, i) => {
+                  const labelKey = issueKindLabelKey(issue.kind);
+                  return (
+                    <div
+                      key={i}
+                      style={{
+                        fontSize: 'var(--font-size-xs)',
+                        color: 'var(--text-tertiary)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 2,
+                        minWidth: 0,
+                      }}
+                    >
+                      <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'baseline', minWidth: 0 }}>
+                        <code style={{ flex: 1, minWidth: 0, overflowWrap: 'anywhere', wordBreak: 'break-word' }}>{issue.path}</code>
+                        <span style={{ color: issue.kind === 'missing' ? 'var(--danger, #e5534b)' : 'var(--warning, #d29922)', flexShrink: 0 }}>
+                          {labelKey ? t(labelKey) : t('verify.kind_unknown', { kind: issue.kind })}
+                        </span>
+                      </div>
+                      {issue.detail && (
+                        <div
+                          data-testid="verify-issue-detail"
+                          style={{
+                            color: 'var(--text-tertiary)',
+                            whiteSpace: 'pre-wrap',
+                            overflowWrap: 'anywhere',
+                            wordBreak: 'break-word',
+                          }}
+                        >
+                          {issue.detail}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
                 {cat.issues.length > 20 && (
                   <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-tertiary)' }}>
                     … +{cat.issues.length - 20}

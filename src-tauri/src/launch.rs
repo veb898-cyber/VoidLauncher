@@ -1077,7 +1077,9 @@ pub fn spawn_launch(
         LauncherError::Launch(msg)
     })?;
 
-    tracing::info!(target: "launcher", "Java process spawned with PID: {}", child.id());
+    // Логирование PID намеренно оставлено вызывающему: между успешным
+    // `spawn` и передачей child под owning guard не должно быть ни одного
+    // потенциально panic-опасного действия.
     Ok(child)
 }
 
@@ -1089,6 +1091,12 @@ pub fn spawn_launch(
 /// downloaded and re-probed) by the prepare phase; when present it is used
 /// verbatim, so prepare and spawn always run the same JVM and its probed
 /// architecture drives the native selection. `None` resolves the JVM here.
+///
+/// У возвращённого child ещё не подключены readers для stdout/stderr.
+/// Вызывающий обязан сначала взять процесс под ownership (команда запуска
+/// создаёт guard, удерживающий reservation), и только затем вызвать
+/// [`attach_output_readers_for_launch`]. Так все потенциально panic-опасные
+/// действия после `spawn` остаются вне окна, где процесс ещё без владельца.
 #[allow(clippy::too_many_arguments)]
 pub fn launch_minecraft(
     config: &AppConfig,
@@ -1170,8 +1178,33 @@ pub fn launch_minecraft(
     }
     tracing::info!(target: "launcher", "Spawning Java process...");
 
-    let mut child = spawn_launch(&profile, &java_path, &game_dir)?;
+    // Никаких fallible/panic-опасных действий после успешного `spawn`:
+    // вызывающий сразу создаёт owning guard и лишь затем подключает readers.
+    spawn_launch(&profile, &java_path, &game_dir)
+}
 
+#[cfg(test)]
+static TEST_PANIC_DURING_OUTPUT_ATTACH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn set_test_panic_during_output_attach(value: bool) {
+    TEST_PANIC_DURING_OUTPUT_ATTACH.store(value, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Подключает readers stdout/stderr после того, как вызывающий создал
+/// owning guard для child. `launch_minecraft` намеренно не делает этого сам:
+/// guard должен появиться сразу после `spawn`, до любых fallible действий.
+pub(crate) fn attach_output_readers_for_launch(
+    config: &AppConfig,
+    instance: &Instance,
+    session_log_path: Option<&str>,
+    child: &mut std::process::Child,
+) {
+    #[cfg(test)]
+    if TEST_PANIC_DURING_OUTPUT_ATTACH.load(std::sync::atomic::Ordering::SeqCst) {
+        panic!("injected panic during output attachment");
+    }
     // Prism-style unified logging: drain BOTH pipes concurrently and append
     // every line to the current session log as it arrives (interleaved with
     // the launcher's own messages). Raw bytes are also teed to forensic
@@ -1194,8 +1227,6 @@ pub fn launch_minecraft(
             session_log_path.map(|s| s.to_string()),
         );
     }
-
-    Ok(child)
 }
 
 /// Find all available Java installations (system + managed)
