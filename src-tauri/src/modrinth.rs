@@ -8,6 +8,22 @@ const USER_AGENT: &str = concat!(
     " (github.com/voidlauncher)"
 );
 
+/// Modrinth ids/slugs are safe path components. Rejecting anything else keeps
+/// a frontend-supplied id from changing the API path or adding a query string.
+fn validate_id(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(crate::error::LauncherError::Download(format!(
+            "Invalid Modrinth {label}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModrinthSearchResult {
     pub slug: String,
@@ -162,6 +178,7 @@ pub async fn search_mods(
 }
 
 pub async fn get_project(id: &str) -> Result<ModrinthProject> {
+    validate_id(id, "project id")?;
     let url = format!("{}/project/{}", BASE_URL, id);
     api_get(&url).await
 }
@@ -184,6 +201,7 @@ pub async fn get_versions(
     mc_version: Option<&str>,
     loader: Option<&str>,
 ) -> Result<Vec<ModrinthVersion>> {
+    validate_id(project_id, "project id")?;
     let mut params = Vec::new();
     if let Some(v) = mc_version {
         params.push(format!(
@@ -209,6 +227,7 @@ pub async fn get_versions(
 }
 
 pub async fn get_version_by_id(version_id: &str) -> Result<ModrinthVersionResponse> {
+    validate_id(version_id, "version id")?;
     let url = format!("{}/version/{}", BASE_URL, version_id);
     api_get(&url).await
 }
@@ -221,6 +240,7 @@ pub async fn get_version_by_hash(hash: &str, algorithm: &str) -> Result<Modrinth
 
 /// Get all versions for a Modrinth project.
 pub async fn get_project_versions(project_id: &str) -> Result<Vec<ModrinthVersionResponse>> {
+    validate_id(project_id, "project id")?;
     let url = format!("{}/project/{}/version", BASE_URL, project_id);
     api_get(&url).await
 }
@@ -311,4 +331,20 @@ pub async fn popular_mods(
     );
 
     api_get(&url).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_id_accepts_modrinth_ids_and_rejects_path_syntax() {
+        assert!(validate_id("project-1_abc", "project id").is_ok());
+        for bad in ["", "..", "../project", "project?x=1", "project/child"] {
+            assert!(
+                validate_id(bad, "project id").is_err(),
+                "id must be rejected: {bad:?}"
+            );
+        }
+    }
 }

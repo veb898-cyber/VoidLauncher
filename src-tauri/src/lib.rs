@@ -6,6 +6,7 @@ mod bug_report;
 mod commands;
 pub mod config;
 mod content;
+mod content_install;
 mod crash_signals;
 mod curseforge;
 mod default_skin;
@@ -397,7 +398,6 @@ pub fn run() {
             commands::mods::cmd_search_curseforge,
             commands::mods::cmd_get_modrinth_versions,
             commands::mods::cmd_get_curseforge_files,
-            commands::mods::cmd_install_mod,
             commands::mods::cmd_install_local_content,
             commands::mods::cmd_get_modrinth_project,
             commands::mods::cmd_get_modrinth_version_by_id,

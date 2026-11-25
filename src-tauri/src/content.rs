@@ -181,13 +181,23 @@ pub struct SidecarWrite<'a> {
 }
 
 /// Write the unified sidecar into the `.index/` folder (Prism layout) and
-/// drop any stale legacy-layout file. Callers treat failures as non-fatal:
-/// the content file itself is already installed.
+/// drop any stale legacy-layout files. Callers that install content must treat
+/// a failure as an install failure and roll the file back; diagnostic/test
+/// callers may ignore the error.
 pub fn write_sidecar(
     content_dir: &Path,
     filename: &str,
     w: &SidecarWrite<'_>,
 ) -> std::io::Result<()> {
+    // Sidecar names must stay a single path component. Callers pass content
+    // filenames, but this function is also a public boundary within the crate.
+    if filename.is_empty() || filename == "." || filename == ".." || filename.contains(['/', '\\'])
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid sidecar filename",
+        ));
+    }
     let mut sidecar = serde_json::json!({
         "provider": w.provider,
         "content_type": w.content_type,
@@ -216,6 +226,14 @@ pub fn write_sidecar(
     crate::import::ensure_no_reparse_points(content_dir, &path)?;
     std::fs::write(&path, sidecar.to_string())?;
     let _ = std::fs::remove_file(crate::instances::legacy_sidecar_path(content_dir, filename));
+    // Historical full-filename layout (`foo.jar.voidlauncher.json`). The
+    // reader still probes it, so a successful write must retire it as well;
+    // otherwise a stale sidecar could describe this file if the new one is
+    // ever removed.
+    let full_legacy = content_dir.join(format!("{filename}.voidlauncher.json"));
+    if crate::import::ensure_no_reparse_points(content_dir, &full_legacy).is_ok() {
+        let _ = std::fs::remove_file(full_legacy);
+    }
     Ok(())
 }
 
@@ -1086,6 +1104,10 @@ mod tests {
         let mods = dir.join("mods");
         std::fs::create_dir_all(&mods).unwrap();
 
+        // Seed both historical layouts; the successful write must retire them.
+        std::fs::write(mods.join("sodium.voidlauncher.json"), "{}").unwrap();
+        std::fs::write(mods.join("sodium.jar.voidlauncher.json"), "{}").unwrap();
+
         write_sidecar(&mods, "sodium.jar", &full_write()).unwrap();
         let got = InstalledContent::read(&mods, "sodium.jar", "mod");
 
@@ -1102,7 +1124,18 @@ mod tests {
         assert!(got.installed_at.is_some());
         // Legacy layout must have been cleaned up.
         assert!(!mods.join("sodium.voidlauncher.json").exists());
+        assert!(!mods.join("sodium.jar.voidlauncher.json").exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_sidecar_rejects_path_components() {
+        let dir = temp_dir("sidecar_path");
+        let error = write_sidecar(&dir, "../escape.jar", &full_write())
+            .expect_err("sidecar names must stay inside the content directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!dir.join("..").join("escape.jar.voidlauncher.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
