@@ -21,6 +21,7 @@ mod import;
 mod install_progress;
 mod instance_readiness;
 pub mod instances;
+mod integrity;
 mod java;
 mod java_download;
 pub mod jvm;
