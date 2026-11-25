@@ -25,7 +25,7 @@
 //! the entry it created, never an entry of a newer run of the same instance.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::running_state::ProcessIdentity;
 
@@ -98,8 +98,14 @@ struct Inner {
 
 /// One mutex for every per-instance phase: `Starting`, `Running`, `Preparing`
 /// and the config-mutation lock are decided together, never by separate locks.
+///
+/// The registry shares its inner state through `Arc` so an owned reservation
+/// can be moved into a blocking worker. That worker must keep the instance
+/// reserved until it has actually stopped touching instance files, even if the
+/// outer async command future has already been dropped.
+#[derive(Clone)]
 pub struct LaunchRegistry {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl Default for LaunchRegistry {
@@ -111,7 +117,7 @@ impl Default for LaunchRegistry {
 impl LaunchRegistry {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(Inner::default()),
+            inner: Arc::new(Mutex::new(Inner::default())),
         }
     }
 
@@ -189,6 +195,18 @@ impl LaunchRegistry {
         let token = self.begin_edit(instance)?;
         Ok(EditGuard {
             registry: self,
+            instance: instance.to_string(),
+            token: Some(token),
+        })
+    }
+
+    /// Owned variant for a blocking worker that must outlive the async command
+    /// future which started it. The worker keeps the instance reserved until
+    /// it finishes, even if the outer future is dropped.
+    pub(crate) fn edit_guard_owned(&self, instance: &str) -> Result<OwnedEditGuard, LaunchBusy> {
+        let token = self.begin_edit(instance)?;
+        Ok(OwnedEditGuard {
+            registry: self.clone(),
             instance: instance.to_string(),
             token: Some(token),
         })
@@ -339,6 +357,25 @@ pub struct EditGuard<'a> {
 }
 
 impl Drop for EditGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.registry.release(&self.instance, token);
+        }
+    }
+}
+
+/// `'static`-friendly edit reservation for a blocking worker.
+///
+/// It owns a clone of the registry, so it can be moved into
+/// `spawn_blocking` and remains effective after the command future that
+/// created it has been dropped.
+pub(crate) struct OwnedEditGuard {
+    registry: LaunchRegistry,
+    instance: String,
+    token: Option<LaunchToken>,
+}
+
+impl Drop for OwnedEditGuard {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
             self.registry.release(&self.instance, token);
@@ -549,6 +586,48 @@ mod tests {
 
         let prepare = registry.begin_prepare("Pack").expect("prepare wins");
         assert!(registry.release("Pack", prepare));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_edit_guard_survives_cancellation_of_the_awaiting_future() {
+        use tokio::sync::oneshot;
+
+        let registry = LaunchRegistry::new();
+        let guard = registry.edit_guard_owned("Pack").expect("free instance");
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                started_tx.send(()).ok();
+                release_rx.blocking_recv().ok();
+                done_tx.send(()).ok();
+            })
+            .await
+            .unwrap();
+        });
+
+        started_rx.await.expect("blocking worker started");
+        assert!(registry.is_busy("Pack"));
+        assert_eq!(registry.begin_edit("Pack"), Err(LaunchBusy::Editing));
+
+        // This is the cancellation the command future experiences while the
+        // blocking worker is still alive. The guard belongs to the worker.
+        worker.abort();
+        assert!(registry.is_busy("Pack"), "worker still owns the instance");
+
+        release_tx.send(()).unwrap();
+        done_rx.await.expect("worker completed");
+        for _ in 0..100 {
+            if !registry.is_busy("Pack") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!registry.is_busy("Pack"));
+        let token = registry.begin_edit("Pack").expect("released");
+        assert!(registry.release("Pack", token));
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod fabric;
 pub mod forge;
 pub mod neoforge;
 pub(crate) mod prism_meta;
+pub(crate) mod processor_cache;
 
 use crate::error::Result;
 use crate::integrity::HashSpec;
@@ -142,7 +143,9 @@ pub async fn install_loader(
     }
     match loader {
         "Fabric" => fabric::install(mc_version, loader_version, libraries_dir).await,
-        "Forge" => forge::install(mc_version, loader_version, libraries_dir, versions_dir).await,
+        "Forge" => {
+            forge::install(mc_version, loader_version, libraries_dir, versions_dir, app).await
+        }
         "NeoForge" => {
             neoforge::install(mc_version, loader_version, libraries_dir, versions_dir, app).await
         }

@@ -1943,13 +1943,14 @@ async fn download_to_part_observed_with_hash(
 }
 
 /// Some Mojang artifacts (e.g. `launchwrapper`) are referenced by old
-/// Forge profiles on `maven.minecraftforge.net` but only exist on
-/// Mojang's own mirror. Attempt the same path on the other host when
-/// the primary one fails (404).
+/// Forge profiles on `maven.minecraftforge.net` and can also be served by
+/// Mojang's own mirror. Attempt the same path on the other host when the
+/// primary one fails (404).
 ///
-/// NeoForge's `maven.neoforged.net` is IP-blocked for RU users (connect
-/// timeout), and `maven.creeperhost.net` is DPI-throttled, so we try the
-/// BMCLAPI mirror first (path without `/releases/`), then creeperhost.
+/// For NeoForge URLs the shared downloader tries the same path through the
+/// BMCLAPI body mirror and then the allowlisted CreeperHost fallback. These
+/// are transport alternatives only; every candidate is still verified against
+/// the publisher/repository checksum before publication.
 fn mirror_alternates(url: &str) -> Vec<String> {
     const FORGE_MAVEN: &str = "https://maven.minecraftforge.net/";
     const MOJANG_LIBRARIES: &str = "https://libraries.minecraft.net/";
@@ -4839,7 +4840,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn truncated(body: &[u8], declared: usize) -> Self {
+        pub(crate) fn truncated(body: &[u8], declared: usize) -> Self {
             Self {
                 status: 200,
                 headers: vec![("Content-Type".into(), "application/octet-stream".into())],
@@ -4850,7 +4851,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn chunked(body: &[u8]) -> Self {
+        pub(crate) fn chunked(body: &[u8]) -> Self {
             Self {
                 status: 200,
                 headers: vec![("Content-Type".into(), "application/octet-stream".into())],

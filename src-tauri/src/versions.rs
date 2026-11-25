@@ -1,7 +1,9 @@
 use crate::error::{LauncherError, Result};
 use crate::import::check_safe_remote_path;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version manifest from Mojang
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -156,6 +158,45 @@ pub struct AssetObject {
     pub is_virtual: bool,
 }
 
+impl AssetIndexData {
+    /// Structural checks shared by every consumer of an asset index.
+    ///
+    /// This deliberately validates the publisher's parsed document, not the
+    /// raw bytes. The raw SHA-1/size checks remain a separate, earlier step.
+    /// Unknown JSON fields are tolerated: real Mojang indexes have grown new
+    /// fields over time, and rejecting them would break historical versions.
+    pub(crate) fn validate_structure(&self) -> Result<()> {
+        if self.objects.is_empty() {
+            return Err(LauncherError::Version(
+                "Asset index contains no objects".to_string(),
+            ));
+        }
+        for (name, object) in &self.objects {
+            if name.is_empty() || name.contains('\0') {
+                return Err(LauncherError::Version(
+                    "Asset index contains an invalid asset name".to_string(),
+                ));
+            }
+            if crate::download::is_unsafe_archive_path(name) {
+                return Err(LauncherError::Version(format!(
+                    "Asset index contains an unsafe asset name: {name}"
+                )));
+            }
+            if !crate::download::is_valid_asset_hash(&object.hash) {
+                return Err(LauncherError::Version(format!(
+                    "Asset index contains an invalid hash for '{name}'"
+                )));
+            }
+            if object.size == 0 {
+                return Err(LauncherError::Version(format!(
+                    "Asset index contains an invalid size for '{name}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Fetch version manifest from Mojang (with retries honoring Retry-After,
 /// since Mojang periodically throttles this endpoint with HTTP 429).
 pub async fn fetch_version_manifest() -> Result<VersionManifest> {
@@ -207,11 +248,260 @@ pub async fn fetch_version_info(url: &str) -> Result<VersionInfo> {
     Ok(info)
 }
 
-/// Fetch asset index
-pub async fn fetch_asset_index(url: &str) -> Result<AssetIndexData> {
+/// Upper bound for a publisher asset-index document. Real indexes are well
+/// below 1 MiB; this prevents a mislabelled response from being buffered
+/// without limit before the checksum is checked.
+const MAX_ASSET_INDEX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Prepare the shared `assets/indexes` destination for publication without
+/// following a junction/symlink out of the assets directory. All Asset Index
+/// publication paths use this helper so Install, Launch, Import and Repair
+/// enforce the same path boundary.
+pub(crate) fn prepare_asset_index_path(assets_dir: &Path, index_path: &Path) -> Result<()> {
+    let indexes_dir = assets_dir.join("indexes");
+    crate::import::ensure_no_reparse_points(assets_dir, &indexes_dir)?;
+    std::fs::create_dir_all(&indexes_dir)?;
+    crate::import::ensure_no_reparse_points(assets_dir, &indexes_dir)?;
+    crate::import::ensure_no_reparse_points(assets_dir, index_path)?;
+    Ok(())
+}
+
+/// Validate the exact publisher bytes of an asset index before they are
+/// published. The SHA-1 is the value from the official version metadata; an
+/// empty value is the historical "metadata did not provide a checksum" case.
+pub(crate) fn validate_asset_index_bytes(
+    bytes: &[u8],
+    expected_sha1: &str,
+    expected_size: u64,
+) -> Result<()> {
+    if expected_size > 0 && bytes.len() as u64 != expected_size {
+        return Err(LauncherError::Version(format!(
+            "Asset index size mismatch: expected {expected_size} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    if let Some(hash) = crate::integrity::HashSpec::from_sha1(expected_sha1)? {
+        if !hash.verify_bytes(bytes) {
+            return Err(LauncherError::Version(
+                "Asset index SHA-1 does not match the publisher metadata".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse publisher bytes without rewriting them. Launcher defaults
+/// (`virtual: false`, `map_to_resources: false`) exist only in this in-memory
+/// representation; the original bytes remain the file on disk.
+pub(crate) fn parse_asset_index_bytes(bytes: &[u8]) -> Result<AssetIndexData> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to parse asset index: {}", e);
+        LauncherError::Version(format!("Failed to parse asset index: {e}"))
+    })
+}
+
+#[cfg(test)]
+type AssetIndexTestHook = std::sync::Arc<dyn Fn(&AssetIndexPublishState) + Send + Sync>;
+
+#[cfg(test)]
+struct AssetIndexTestHooks {
+    before_lock: AssetIndexTestHook,
+    after_lock: AssetIndexTestHook,
+}
+
+struct AssetIndexPublishState {
+    /// Process-wide expected publisher checksum for this target. It prevents
+    /// two callers from silently publishing different publisher documents for
+    /// the same index id.
+    expected_sha1: Mutex<Option<String>>,
+    /// Deterministic test instrumentation; absent in production builds.
+    #[cfg(test)]
+    test_hooks: Mutex<Option<AssetIndexTestHooks>>,
+}
+
+static ASSET_INDEX_PUBLISH_STATES: OnceLock<Mutex<HashMap<String, Arc<AssetIndexPublishState>>>> =
+    OnceLock::new();
+
+fn asset_index_publish_key(path: &Path) -> String {
+    let key = path.to_string_lossy().to_string();
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
+fn asset_index_publish_state(path: &Path) -> Arc<AssetIndexPublishState> {
+    let mut states = ASSET_INDEX_PUBLISH_STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    states
+        .entry(asset_index_publish_key(path))
+        .or_insert_with(|| {
+            Arc::new(AssetIndexPublishState {
+                expected_sha1: Mutex::new(None),
+                #[cfg(test)]
+                test_hooks: Mutex::new(None),
+            })
+        })
+        .clone()
+}
+
+#[cfg(test)]
+impl AssetIndexPublishState {
+    fn test_hook_before_lock(&self) {
+        let hook = {
+            let hooks = self
+                .test_hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            hooks.as_ref().map(|hooks| hooks.before_lock.clone())
+        };
+        if let Some(hook) = hook {
+            hook(self);
+        }
+    }
+
+    fn test_hook_after_lock(&self) {
+        let hook = {
+            let hooks = self
+                .test_hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            hooks.as_ref().map(|hooks| hooks.after_lock.clone())
+        };
+        if let Some(hook) = hook {
+            hook(self);
+        }
+    }
+
+    fn clear_test_hooks(&self) {
+        *self
+            .test_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn install_asset_index_test_hooks<Before, After>(
+    path: &Path,
+    before_lock: Before,
+    after_lock: After,
+) -> Arc<AssetIndexPublishState>
+where
+    Before: Fn(&AssetIndexPublishState) + Send + Sync + 'static,
+    After: Fn(&AssetIndexPublishState) + Send + Sync + 'static,
+{
+    let state = asset_index_publish_state(path);
+    *state
+        .test_hooks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(AssetIndexTestHooks {
+        before_lock: Arc::new(before_lock),
+        after_lock: Arc::new(after_lock),
+    });
+    state
+}
+
+/// Publish exactly the verified publisher bytes with an atomic replace.
+/// Validation and pre-replacement write failures leave the old working index
+/// in place. A post-replacement re-read/verification failure is reported
+/// without restoring the previous file.
+///
+/// Publication is serialized per target path. A unique temporary filename is
+/// used so two different instances repairing the same global index cannot
+/// collide on `.name.tmp`. If a second caller presents a different non-empty
+/// publisher checksum for the same index id, it is rejected instead of being
+/// silently accepted as a last-writer-wins publication.
+pub(crate) fn store_asset_index_bytes(
+    path: &Path,
+    bytes: &[u8],
+    expected_sha1: &str,
+    expected_size: u64,
+) -> Result<AssetIndexData> {
+    validate_asset_index_bytes(bytes, expected_sha1, expected_size)?;
+    let index = parse_asset_index_bytes(bytes)?;
+    index.validate_structure()?;
+
+    let state = asset_index_publish_state(path);
+    #[cfg(test)]
+    state.test_hook_before_lock();
+    let mut published = state
+        .expected_sha1
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[cfg(test)]
+    state.test_hook_after_lock();
+    let expected = expected_sha1.trim().to_ascii_lowercase();
+    if let Some(existing) = published.as_deref() {
+        if expected.is_empty() {
+            return Err(LauncherError::Version(format!(
+                "Refusing to replace verified asset index {} with bytes that have no publisher checksum",
+                path.display()
+            )));
+        }
+        if existing != expected {
+            return Err(LauncherError::Version(format!(
+                "Conflicting publisher checksum for asset index {}: already published {}, requested {}",
+                path.display(),
+                existing,
+                expected
+            )));
+        }
+    }
+
+    crate::instances::write_file_atomic_unique(path, bytes)?;
+    // Re-read the published file: the write pipeline is shared with other
+    // launcher files, and this catches an external replacement before we
+    // return success to the caller.
+    let stored = std::fs::read(path)?;
+    validate_asset_index_bytes(&stored, expected_sha1, expected_size)?;
+    if stored != bytes {
+        return Err(LauncherError::Version(format!(
+            "Asset index publication was replaced before verification: {}",
+            path.display()
+        )));
+    }
+    if !expected.is_empty() {
+        *published = Some(expected);
+    }
+    Ok(index)
+}
+
+/// Fetch the raw publisher asset-index document and verify its exact bytes
+/// before returning them. Callers must store these bytes unchanged (for
+/// example via [`store_asset_index_bytes`]); they must not re-serialize the
+/// parsed [`AssetIndexData`].
+pub(crate) async fn fetch_asset_index_bytes(
+    url: &str,
+    expected_sha1: &str,
+    expected_size: u64,
+) -> Result<Vec<u8>> {
+    fetch_asset_index_bytes_with_limit(url, expected_sha1, expected_size, MAX_ASSET_INDEX_BYTES)
+        .await
+}
+
+/// Streaming implementation with an explicit testable limit. The production
+/// caller always passes `MAX_ASSET_INDEX_BYTES`; tests use a small limit to
+/// prove that a chunked response cannot bypass the cap.
+async fn fetch_asset_index_bytes_with_limit(
+    url: &str,
+    expected_sha1: &str,
+    expected_size: u64,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    // Fail on a malformed publisher checksum before making a network request.
+    let expected = crate::integrity::HashSpec::from_sha1(expected_sha1)?;
+    if expected_size > max_bytes as u64 {
+        return Err(LauncherError::Version(format!(
+            "Asset index is unreasonably large: metadata declares {expected_size} bytes"
+        )));
+    }
     tracing::info!(target: "launcher", "Fetching asset index from {}", url);
     let client = crate::download::global_http_client()?;
-    let index = crate::download::get_with_retry(
+    let mut response = crate::download::get_with_retry(
         client.get(url).timeout(std::time::Duration::from_secs(20)),
         "Mojang",
         4,
@@ -221,14 +511,41 @@ pub async fn fetch_asset_index(url: &str) -> Result<AssetIndexData> {
     .map_err(|e| {
         tracing::error!(target: "launcher", "Failed to fetch asset index: {}", e);
         e
-    })?
-    .json::<AssetIndexData>()
-    .await
-    .map_err(|e| {
-        tracing::error!(target: "launcher", "Failed to parse asset index: {}", e);
-        e
     })?;
-    Ok(index)
+
+    if let Some(length) = response.content_length() {
+        if length > max_bytes as u64 {
+            return Err(LauncherError::Version(format!(
+                "Asset index is unreasonably large: {length} bytes"
+            )));
+        }
+    }
+
+    // Stream instead of `response.bytes()`: a chunked response has no
+    // trustworthy Content-Length and must never be buffered past the cap.
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        tracing::error!(target: "launcher", "Failed to read asset index body: {}", e);
+        LauncherError::Network(e)
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(LauncherError::Version(format!(
+                "Asset index is unreasonably large: more than {max_bytes} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    validate_asset_index_bytes(&bytes, expected_sha1, expected_size)?;
+    if let Some(hash) = expected {
+        tracing::info!(
+            target: "launcher",
+            "Asset index verified ({} bytes, {})",
+            bytes.len(),
+            hash.algorithm()
+        );
+    }
+    Ok(bytes)
 }
 
 /// Architecture that native archives and Mojang `arch` rules are selected for.
@@ -972,7 +1289,10 @@ pub fn collect_downloads(
     )
 }
 
-/// Load a saved asset index (e.g. `indexes/legacy.json`) from disk
+/// Load a saved asset index (e.g. `indexes/legacy.json`) from disk.
+///
+/// This is the raw loader; use [`load_validated_asset_index`] for every
+/// production consumer that is allowed to trust the document.
 pub fn load_asset_index(path: &Path) -> Result<AssetIndexData> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| LauncherError::Version(format!("Failed to read asset index: {}", e)))?;
@@ -980,6 +1300,15 @@ pub fn load_asset_index(path: &Path) -> Result<AssetIndexData> {
     let index: AssetIndexData = serde_json::from_str(&contents)
         .map_err(|e| LauncherError::Version(format!("Failed to parse asset index: {}", e)))?;
 
+    Ok(index)
+}
+
+/// Load an asset index and apply the same structural checks used for newly
+/// downloaded publisher bytes. The raw SHA-1/size check remains the caller's
+/// responsibility because it depends on the version metadata.
+pub fn load_validated_asset_index(path: &Path) -> Result<AssetIndexData> {
+    let index = load_asset_index(path)?;
+    index.validate_structure()?;
     Ok(index)
 }
 
@@ -1991,6 +2320,561 @@ mod tests {
         assert!(index.map_to_resources);
         assert!(index.objects["sound/a.ogg"].is_virtual);
         assert!(!index.objects["texts/b.txt"].is_virtual);
+    }
+
+    // Real publisher indexes used to prove that storage and verification use
+    // the original bytes, not a re-serialized AssetIndexData.
+    const INDEX_112: &[u8] = include_bytes!("versions/testdata/asset-index-1.12.json");
+    const INDEX_1201: &[u8] = include_bytes!("versions/testdata/asset-index-1.20.1.json");
+    const INDEX_PRE16: &[u8] = include_bytes!("versions/testdata/asset-index-pre-1.6.json");
+    const INDEX_1214: &[u8] = include_bytes!("versions/testdata/asset-index-1.21.4.json");
+    const INDEX_112_SHA1: &str = "a21e1ded1a24ea1548dd8db0cf30b6acb02655a9";
+    const INDEX_1201_SHA1: &str = "7397e41cb1f5b1b9e14bfbd27ba44fc98b75727b";
+    const INDEX_PRE16_SHA1: &str = "3d8e55480977e32acd9844e545177e69a52f594b";
+    const INDEX_1214_SHA1: &str = "480d8ec8280fe619ae1df49dbe1da6f3a1849c7b";
+    use crate::download::tests::{direct_proxy_lock, sha1_hex, spawn_mock, MockSpec};
+    use std::sync::atomic::Ordering;
+
+    fn asset_test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "vl_asset_index_{}_{}",
+            label,
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    #[test]
+    fn publisher_asset_index_is_stored_byte_identical() {
+        let dir = asset_test_dir("raw");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1.12.json");
+        let index =
+            store_asset_index_bytes(&path, INDEX_112, INDEX_112_SHA1, INDEX_112.len() as u64)
+                .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), INDEX_112);
+        assert_eq!(
+            crate::download::hash_file_sha1(&path).unwrap(),
+            INDEX_112_SHA1
+        );
+        assert!(!index.objects.is_empty());
+        // Parsing again must not rewrite the publisher file.
+        let before = std::fs::read(&path).unwrap();
+        let _ = parse_asset_index_bytes(&before).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), INDEX_112);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn modern_publisher_asset_index_is_stored_byte_identical() {
+        let dir = asset_test_dir("raw_modern");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        store_asset_index_bytes(&path, INDEX_1201, INDEX_1201_SHA1, INDEX_1201.len() as u64)
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), INDEX_1201);
+        assert_eq!(
+            crate::download::hash_file_sha1(&path).unwrap(),
+            INDEX_1201_SHA1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_normalized_index_is_detected_and_replaced_with_publisher_bytes() {
+        let dir = asset_test_dir("migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1.12.json");
+        let parsed = parse_asset_index_bytes(INDEX_112).unwrap();
+        let normalized = serde_json::to_vec_pretty(&parsed).unwrap();
+        std::fs::write(&path, &normalized).unwrap();
+        assert!(
+            !crate::download::verify_sha1(&path, INDEX_112_SHA1).unwrap(),
+            "the old launcher-normalized representation must not match the publisher SHA-1"
+        );
+        store_asset_index_bytes(&path, INDEX_112, INDEX_112_SHA1, INDEX_112.len() as u64).unwrap();
+        assert!(crate::download::verify_sha1(&path, INDEX_112_SHA1).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), INDEX_112);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_size_asset_index_corruption_is_detected_by_checksum() {
+        let mut corrupt = INDEX_112.to_vec();
+        corrupt[1000] ^= 0xff;
+        assert_eq!(corrupt.len(), INDEX_112.len());
+        assert!(!crate::integrity::HashSpec::sha1(INDEX_112_SHA1)
+            .unwrap()
+            .verify_bytes(&corrupt));
+        let error = validate_asset_index_bytes(&corrupt, INDEX_112_SHA1, INDEX_112.len() as u64)
+            .expect_err("same-size corruption must fail the publisher checksum");
+        assert!(error.to_string().contains("SHA-1"), "got: {error}");
+    }
+
+    #[test]
+    fn wrong_publisher_checksum_does_not_replace_the_working_index() {
+        let dir = asset_test_dir("wrong_hash");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1.12.json");
+        std::fs::write(&path, b"previous-working-index").unwrap();
+        let error = store_asset_index_bytes(
+            &path,
+            INDEX_112,
+            "0000000000000000000000000000000000000000",
+            INDEX_112.len() as u64,
+        )
+        .expect_err("a wrong checksum must fail before publication");
+        assert!(error.to_string().contains("SHA-1"), "got: {error}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"previous-working-index",
+            "the old index must stay in place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_asset_index_is_restored_with_publisher_bytes() {
+        let dir = asset_test_dir("missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        assert!(!path.exists());
+        store_asset_index_bytes(&path, INDEX_1201, INDEX_1201_SHA1, INDEX_1201.len() as u64)
+            .unwrap();
+        assert!(path.is_file());
+        assert_eq!(std::fs::read(&path).unwrap(), INDEX_1201);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launcher_defaults_exist_only_after_deserialization() {
+        let parsed = parse_asset_index_bytes(INDEX_112).unwrap();
+        assert!(!parsed.map_to_resources);
+        assert!(parsed.objects.values().all(|object| !object.is_virtual));
+        // The exact publisher bytes do not contain the normalized flags.
+        assert!(!INDEX_112
+            .windows(12)
+            .any(|window| window == b"\"virtual\":"));
+    }
+
+    #[tokio::test]
+    async fn fetch_asset_index_returns_verified_publisher_bytes() {
+        let _proxy = crate::download::tests::direct_proxy_lock().await;
+        let server = crate::download::tests::spawn_mock(vec![MockSpec::ok(INDEX_112)]).await;
+        let bytes = fetch_asset_index_bytes(&server.url, INDEX_112_SHA1, INDEX_112.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(bytes, INDEX_112);
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_asset_index_rejects_wrong_checksum_before_storage() {
+        let _proxy = crate::download::tests::direct_proxy_lock().await;
+        let server = crate::download::tests::spawn_mock(vec![MockSpec::ok(INDEX_112)]).await;
+        let error = fetch_asset_index_bytes(
+            &server.url,
+            "0000000000000000000000000000000000000000",
+            INDEX_112.len() as u64,
+        )
+        .await
+        .expect_err("a mismatching publisher checksum must fail");
+        assert!(error.to_string().contains("SHA-1"), "got: {error}");
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_asset_index_checksum_fails_without_network() {
+        let _proxy = crate::download::tests::direct_proxy_lock().await;
+        let server = crate::download::tests::spawn_mock(vec![MockSpec::ok(INDEX_112)]).await;
+        let error = fetch_asset_index_bytes(&server.url, "not-a-hash", 0)
+            .await
+            .expect_err("malformed checksum must fail before the request");
+        assert!(error.to_string().to_lowercase().contains("sha1"));
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0);
+    }
+
+    fn tiny_index(name: &str, hash: &str) -> Vec<u8> {
+        let mut objects = serde_json::Map::new();
+        objects.insert(
+            name.to_string(),
+            serde_json::json!({ "hash": hash, "size": 1 }),
+        );
+        serde_json::to_vec(&serde_json::json!({ "objects": objects })).unwrap()
+    }
+
+    #[test]
+    fn asset_index_structure_rejects_unusable_documents() {
+        let hash = "aa".repeat(20);
+        let cases: &[(&[u8], &str)] = &[
+            (br#"{"objects":{}}"#, "empty objects"),
+            (br#"{"objects":[]}"#, "objects has the wrong type"),
+            (br#"{"virtual":true}"#, "missing objects"),
+            (br#"{"objects":{"a":{"hash":"zz","size":1}}}"#, "bad hash"),
+            (
+                br#"{"objects":{"a":{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":0}}}"#,
+                "zero size",
+            ),
+            (
+                br#"{"objects":{"a":{"hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+                "missing size",
+            ),
+            (b"not-json", "malformed json"),
+        ];
+        for (bytes, label) in cases {
+            let result =
+                parse_asset_index_bytes(bytes).and_then(|index| index.validate_structure());
+            assert!(result.is_err(), "{label} must be rejected");
+        }
+
+        let valid = tiny_index("minecraft/test.bin", &hash);
+        let index = parse_asset_index_bytes(&valid).unwrap();
+        index.validate_structure().unwrap();
+
+        // Unknown future fields are tolerated; required fields are not.
+        let extra = serde_json::json!({
+            "objects": { "minecraft/test.bin": { "hash": hash, "size": 1, "future": true } },
+            "map_to_resources": false,
+            "future_index_field": "ignored"
+        });
+        let extra = serde_json::to_vec(&extra).unwrap();
+        parse_asset_index_bytes(&extra)
+            .unwrap()
+            .validate_structure()
+            .unwrap();
+    }
+
+    #[test]
+    fn real_legacy_and_modern_indexes_pass_structural_validation() {
+        for (bytes, sha1, label) in [
+            (INDEX_PRE16, INDEX_PRE16_SHA1, "pre-1.6"),
+            (INDEX_112, INDEX_112_SHA1, "1.12.2"),
+            (INDEX_1201, INDEX_1201_SHA1, "1.20.1"),
+            (INDEX_1214, INDEX_1214_SHA1, "1.21.4"),
+        ] {
+            assert_eq!(sha1_hex(bytes), sha1, "{label} fixture publisher SHA-1");
+            parse_asset_index_bytes(bytes)
+                .unwrap_or_else(|error| panic!("{label}: {error}"))
+                .validate_structure()
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+    }
+
+    #[test]
+    fn structurally_invalid_trusted_index_is_not_loaded_by_the_validated_helper() {
+        let dir = asset_test_dir("validated");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        std::fs::write(&path, br#"{"objects":{}}"#).unwrap();
+        assert!(
+            load_asset_index(&path).is_ok(),
+            "raw loader remains available"
+        );
+        assert!(load_validated_asset_index(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_rejects_invalid_structure_without_replacing_the_old_index() {
+        let dir = asset_test_dir("invalid_store");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        std::fs::write(&path, b"previous-working-index").unwrap();
+        let empty = br#"{"objects":{}}"#;
+        let error = store_asset_index_bytes(&path, empty, &sha1_hex(empty), empty.len() as u64)
+            .expect_err("an empty index must be rejected before publication");
+        assert!(error.to_string().contains("no objects"), "got: {error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous-working-index");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_unique_publication_cleans_temporary_files() {
+        let dir = asset_test_dir("failed_unique");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let body = tiny_index("minecraft/test.bin", &"aa".repeat(20));
+        let error = store_asset_index_bytes(&path, &body, &sha1_hex(&body), body.len() as u64)
+            .expect_err("a directory at the final path must fail publication");
+        assert!(!error.to_string().is_empty());
+        assert!(path.is_dir(), "the pre-existing path must not be removed");
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| { !entry.file_name().to_string_lossy().ends_with(".tmp") }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_same_index_publication_is_serialized() {
+        let dir = asset_test_dir("concurrent_same");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1.12.json");
+        let (first_inside_tx, first_inside_rx) = std::sync::mpsc::channel();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let (second_inside_tx, second_inside_rx) = std::sync::mpsc::channel();
+        let before_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let after_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let state = install_asset_index_test_hooks(
+            &path,
+            {
+                let before_calls = before_calls.clone();
+                let observed_tx = std::sync::Mutex::new(observed_tx);
+                move |state: &AssetIndexPublishState| {
+                    // The first writer must proceed; the second writer checks
+                    // that the same per-target mutex is still held before it
+                    // calls the production lock.
+                    if before_calls.fetch_add(1, Ordering::SeqCst) != 1 {
+                        return;
+                    }
+                    let observation = match state.expected_sha1.try_lock() {
+                        Ok(guard) => {
+                            drop(guard);
+                            "unlocked"
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => "locked",
+                        Err(std::sync::TryLockError::Poisoned(_)) => "poisoned",
+                    };
+                    observed_tx.lock().unwrap().send(observation).unwrap();
+                }
+            },
+            {
+                let after_calls = after_calls.clone();
+                let first_inside_tx = std::sync::Mutex::new(first_inside_tx);
+                let second_inside_tx = std::sync::Mutex::new(second_inside_tx);
+                let release_first_rx = std::sync::Mutex::new(release_first_rx);
+                move |_state: &AssetIndexPublishState| {
+                    let call = after_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if call == 1 {
+                        // Hold the production guard while the second writer
+                        // attempts publication. Releasing this channel is the
+                        // only way the first critical section can finish.
+                        first_inside_tx.lock().unwrap().send(()).unwrap();
+                        release_first_rx.lock().unwrap().recv().unwrap();
+                    } else {
+                        second_inside_tx.lock().unwrap().send(()).unwrap();
+                    }
+                }
+            },
+        );
+
+        let first_path = path.clone();
+        let first = std::thread::spawn(move || {
+            store_asset_index_bytes(
+                &first_path,
+                INDEX_112,
+                INDEX_112_SHA1,
+                INDEX_112.len() as u64,
+            )
+            .map(|_| ())
+        });
+        first_inside_rx
+            .recv()
+            .expect("the first writer must enter the protected publication section");
+
+        let second_path = path.clone();
+        let second = std::thread::spawn(move || {
+            store_asset_index_bytes(
+                &second_path,
+                INDEX_112,
+                INDEX_112_SHA1,
+                INDEX_112.len() as u64,
+            )
+            .map(|_| ())
+        });
+        let observation = observed_rx
+            .recv()
+            .expect("the second writer must reach the publication lock");
+        let entered_before_release = second_inside_rx.try_recv().is_ok();
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        state.clear_test_hooks();
+
+        // If the per-target lock is removed from the production path, the
+        // second writer's try_lock succeeds here and the test fails.
+        assert_eq!(observation, "locked", "the target lock was not held");
+        assert!(
+            !entered_before_release,
+            "the second publisher entered before the first left the protected section"
+        );
+        second_inside_rx
+            .recv()
+            .expect("the second writer must enter after the first releases the lock");
+        assert_eq!(std::fs::read(&path).unwrap(), INDEX_112);
+        assert_eq!(
+            crate::download::hash_file_sha1(&path).unwrap(),
+            INDEX_112_SHA1
+        );
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| { !entry.file_name().to_string_lossy().ends_with(".tmp") }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_publication_releases_the_target_lock() {
+        let dir = asset_test_dir("failed_releases_lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let body = tiny_index("minecraft/test.bin", &"aa".repeat(20));
+        store_asset_index_bytes(&path, &body, &sha1_hex(&body), body.len() as u64)
+            .expect_err("a directory at the final path must fail publication");
+        std::fs::remove_dir(&path).unwrap();
+
+        store_asset_index_bytes(&path, &body, &sha1_hex(&body), body.len() as u64)
+            .expect("the failed writer must release the target lock");
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panicking_publication_does_not_leave_the_target_lock_poisoned() {
+        let dir = asset_test_dir("panic_releases_lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        let body = tiny_index("minecraft/test.bin", &"aa".repeat(20));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = install_asset_index_test_hooks(&path, |_| {}, {
+            let calls = calls.clone();
+            move |_state: &AssetIndexPublishState| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("injected publication panic");
+                }
+            }
+        });
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store_asset_index_bytes(&path, &body, &sha1_hex(&body), body.len() as u64)
+        }));
+        assert!(result.is_err(), "the injected panic must unwind the writer");
+        state.clear_test_hooks();
+
+        store_asset_index_bytes(&path, &body, &sha1_hex(&body), body.len() as u64)
+            .expect("a poisoned target lock must still be recoverable");
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| { !entry.file_name().to_string_lossy().ends_with(".tmp") }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conflicting_expected_checksums_are_not_last_writer_wins() {
+        let dir = asset_test_dir("conflicting_hashes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        let first = tiny_index("minecraft/a.bin", &"aa".repeat(20));
+        let second = tiny_index("minecraft/b.bin", &"bb".repeat(20));
+        store_asset_index_bytes(&path, &first, &sha1_hex(&first), first.len() as u64).unwrap();
+        let error =
+            store_asset_index_bytes(&path, &second, &sha1_hex(&second), second.len() as u64)
+                .expect_err("a different publisher checksum for the same id must fail");
+        assert!(error.to_string().contains("Conflicting publisher checksum"));
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| { !entry.file_name().to_string_lossy().ends_with(".tmp") }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_index_is_not_replaced_by_an_empty_publisher_checksum() {
+        let dir = asset_test_dir("verified_empty_checksum");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        let body = tiny_index("minecraft/test.bin", &"aa".repeat(20));
+        store_asset_index_bytes(&path, &body, &sha1_hex(&body), body.len() as u64).unwrap();
+        let error = store_asset_index_bytes(&path, &body, "", body.len() as u64)
+            .expect_err("a verified target must not accept an empty expected checksum");
+        assert!(
+            error.to_string().contains("no publisher checksum"),
+            "got: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_conflicting_checksums_have_exactly_one_winner() {
+        let dir = asset_test_dir("concurrent_conflict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.json");
+        let first = tiny_index("minecraft/a.bin", &"aa".repeat(20));
+        let second = tiny_index("minecraft/b.bin", &"bb".repeat(20));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for body in [first.clone(), second.clone()] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store_asset_index_bytes(&path, &body, &sha1_hex(&body), body.len() as u64)
+                    .map(|_| ())
+            }));
+        }
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let stored = std::fs::read(&path).unwrap();
+        assert!(stored == first || stored == second);
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| { !entry.file_name().to_string_lossy().ends_with(".tmp") }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn asset_index_size_cap_is_32_mib() {
+        assert_eq!(MAX_ASSET_INDEX_BYTES, 32 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn asset_index_streaming_accepts_the_boundary_and_rejects_chunked_overflow() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::chunked(b"1234")]).await;
+        let body = fetch_asset_index_bytes_with_limit(&server.url, "", 4, 4)
+            .await
+            .unwrap();
+        assert_eq!(body, b"1234");
+
+        let server = spawn_mock(vec![MockSpec::chunked(b"12345")]).await;
+        let error = fetch_asset_index_bytes_with_limit(&server.url, "", 0, 4)
+            .await
+            .expect_err("chunked body above the cap must fail");
+        assert!(
+            error.to_string().contains("unreasonably large"),
+            "got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_index_streaming_rejects_declared_and_actual_overflow() {
+        let _proxy = direct_proxy_lock().await;
+        let server = spawn_mock(vec![MockSpec::truncated(b"x", 10)]).await;
+        let error = fetch_asset_index_bytes_with_limit(&server.url, "", 0, 4)
+            .await
+            .expect_err("declared oversized body must fail before reading");
+        assert!(
+            error.to_string().contains("unreasonably large"),
+            "got: {error}"
+        );
+
+        let server = spawn_mock(vec![MockSpec::truncated(b"12", 4)]).await;
+        let error = fetch_asset_index_bytes_with_limit(&server.url, "", 4, 4)
+            .await
+            .expect_err("truncated stream must not be accepted");
+        assert!(!error.to_string().is_empty());
     }
 
     #[test]

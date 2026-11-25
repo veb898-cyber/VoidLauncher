@@ -614,16 +614,31 @@ async fn install_version(config: &AppConfig, mc: &str) -> Result<versions::Versi
         .join("indexes")
         .join(format!("{}.json", vi.assets));
     if !idx_path.exists() {
-        let asset_index = versions::fetch_asset_index(&vi.asset_index.url)
-            .await
+        versions::prepare_asset_index_path(&config.assets_dir(), &idx_path)
+            .map_err(|e| e.to_string())?;
+        let bytes = versions::fetch_asset_index_bytes(
+            &vi.asset_index.url,
+            &vi.asset_index.sha1,
+            vi.asset_index.size,
+        )
+        .await
+        .map_err(|e| format!("asset index {}: {}", mc, e))?;
+        let parsed = versions::parse_asset_index_bytes(&bytes)
             .map_err(|e| format!("asset index {}: {}", mc, e))?;
-        std::fs::create_dir_all(idx_path.parent().unwrap()).map_err(|e| e.to_string())?;
-        let json = serde_json::to_string_pretty(&asset_index).map_err(|e| e.to_string())?;
-        std::fs::write(&idx_path, json).map_err(|e| e.to_string())?;
+        crate::verify::validate_asset_index(&parsed)
+            .map_err(|e| format!("asset index {}: {}", mc, e))?;
+        let asset_index = versions::store_asset_index_bytes(
+            &idx_path,
+            &bytes,
+            &vi.asset_index.sha1,
+            vi.asset_index.size,
+        )
+        .map_err(|e| format!("asset index {}: {}", mc, e))?;
         download::download_assets(&asset_index, &config.assets_dir(), |_, _, _, _, _| {})
             .await
             .map_err(|e| format!("assets {}: {}", mc, e))?;
-        let asset_index = versions::load_asset_index(&idx_path).map_err(|e| e.to_string())?;
+        let asset_index =
+            versions::load_validated_asset_index(&idx_path).map_err(|e| e.to_string())?;
         download::ensure_virtual_assets(&vi.assets, &asset_index, &config.assets_dir())
             .map_err(|e| format!("virtual assets {}: {}", mc, e))?;
     }
@@ -1334,6 +1349,9 @@ async fn run_combo(config: &AppConfig, data_dir: &Path, mc: &str, loader: &str) 
         Ok(c) => c,
         Err(e) => return Err(format!("launch spawn error: {}", e)),
     };
+    // Smoke-путь не создаёт launch reservation, поэтому подключает readers
+    // сразу после получения child.
+    launch::attach_output_readers_for_launch(config, &instance, None, &mut child);
     let pid = child.id();
     report_line(&format!("spawned pid {}", pid));
     let run = ComboRun {

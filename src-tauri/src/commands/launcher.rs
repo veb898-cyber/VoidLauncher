@@ -42,6 +42,40 @@ fn load_local_version_info(versions_dir: &Path, mc_version: &str) -> Option<vers
     (info.id == mc_version).then_some(info)
 }
 
+/// Download, validate and publish the Asset Index for the Install command.
+/// Kept separate from the command so the real publication path can be tested
+/// without downloading the whole game.
+async fn install_asset_index_for_version(
+    config: &crate::config::AppConfig,
+    version_info: &versions::VersionInfo,
+) -> Result<versions::AssetIndexData, String> {
+    if !is_allowed_download_host(&version_info.asset_index.url) {
+        return Err("Access denied: asset index host not allowed".to_string());
+    }
+    let indexes_dir = config.assets_dir().join("indexes");
+    let index_path = indexes_dir.join(format!("{}.json", version_info.assets));
+    versions::prepare_asset_index_path(&config.assets_dir(), &index_path)
+        .map_err(|e| e.to_string())?;
+
+    let index_bytes = versions::fetch_asset_index_bytes(
+        &version_info.asset_index.url,
+        &version_info.asset_index.sha1,
+        version_info.asset_index.size,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let parsed_index =
+        versions::parse_asset_index_bytes(&index_bytes).map_err(|e| e.to_string())?;
+    verify::validate_asset_index(&parsed_index).map_err(|e| e.to_string())?;
+    versions::store_asset_index_bytes(
+        &index_path,
+        &index_bytes,
+        &version_info.asset_index.sha1,
+        version_info.asset_index.size,
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn cmd_install_version(
     app: AppHandle,
@@ -154,18 +188,7 @@ pub async fn cmd_install_version(
         tracker.set_stage("assets", "Downloading asset index...");
 
         // Download and save asset index
-        if !is_allowed_download_host(&version_info.asset_index.url) {
-            return Err("Access denied: asset index host not allowed".to_string());
-        }
-        let asset_index = versions::fetch_asset_index(&version_info.asset_index.url)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let indexes_dir = config.assets_dir().join("indexes");
-        std::fs::create_dir_all(&indexes_dir).map_err(|e| e.to_string())?;
-        let index_path = indexes_dir.join(format!("{}.json", version_info.assets));
-        let index_json = serde_json::to_string_pretty(&asset_index).map_err(|e| e.to_string())?;
-        std::fs::write(index_path, index_json).map_err(|e| e.to_string())?;
+        let asset_index = install_asset_index_for_version(&config, &version_info).await?;
 
         events::emit_log(
             &app,
@@ -241,10 +264,10 @@ pub async fn cmd_install_version(
 /// Load the local asset index, or restore it from Mojang when it is missing or
 /// structurally invalid. Launch must never treat "the file exists" as proof
 /// that its contents are usable.
-async fn ensure_asset_index_for_launch(
-    app: &AppHandle,
+async fn ensure_asset_index_for_launch_core(
     config: &crate::config::AppConfig,
     version_info: &versions::VersionInfo,
+    log: &(dyn Fn(&str, &str) + Sync),
 ) -> Result<versions::AssetIndexData, String> {
     if crate::import::check_safe_file_name(&version_info.assets).is_err() {
         return Err(format!(
@@ -256,24 +279,36 @@ async fn ensure_asset_index_for_launch(
         .assets_dir()
         .join("indexes")
         .join(format!("{}.json", version_info.assets));
+    versions::prepare_asset_index_path(&config.assets_dir(), &index_path)
+        .map_err(|e| e.to_string())?;
     let mut local_problem = None;
     if index_path.exists() {
-        match versions::load_asset_index(&index_path)
-            .and_then(|index| verify::validate_asset_index(&index).map(|_| index))
-        {
-            Ok(index) => return Ok(index),
-            Err(e) => {
-                local_problem = Some(e.to_string());
-                events::emit_log(
-                    app,
-                    "warn",
-                    "launch",
-                    &format!(
-                        "Local asset index {} is unusable ({}); restoring it from Mojang.",
-                        version_info.assets, e
-                    ),
-                );
+        let local_matches_publisher = version_info.asset_index.sha1.is_empty()
+            || crate::download::verify_sha1(&index_path, &version_info.asset_index.sha1).ok()
+                == Some(true);
+        if local_matches_publisher {
+            match versions::load_validated_asset_index(&index_path) {
+                Ok(index) => return Ok(index),
+                Err(e) => {
+                    local_problem = Some(e.to_string());
+                    log(
+                        "warn",
+                        &format!(
+                            "Local asset index {} is unusable ({}); restoring it from Mojang.",
+                            version_info.assets, e
+                        ),
+                    );
+                }
             }
+        } else {
+            local_problem = Some("publisher SHA-1 mismatch".to_string());
+            log(
+                "warn",
+                &format!(
+                    "Local asset index {} does not match the publisher metadata; restoring it from Mojang.",
+                    version_info.assets
+                ),
+            );
         }
     }
     if !crate::is_allowed_download_host(&version_info.asset_index.url) {
@@ -282,46 +317,48 @@ async fn ensure_asset_index_for_launch(
             version_info.asset_index.url
         ));
     }
-    let index = versions::fetch_asset_index(&version_info.asset_index.url)
-        .await
-        .map_err(|e| {
-            let reason = local_problem
-                .as_deref()
-                .map(|problem| format!(" the local index is invalid ({problem});"))
-                .unwrap_or_default();
-            format!(
-                "Minecraft assets are incomplete:{reason} the asset index could not be \
-                 downloaded. Connect to the internet or run Repair. ({e})"
-            )
-        })?;
-    verify::validate_asset_index(&index).map_err(|e| {
+    let stored = async {
+        let bytes = versions::fetch_asset_index_bytes(
+            &version_info.asset_index.url,
+            &version_info.asset_index.sha1,
+            version_info.asset_index.size,
+        )
+        .await?;
+        let parsed = versions::parse_asset_index_bytes(&bytes)?;
+        verify::validate_asset_index(&parsed)?;
+        let index = versions::store_asset_index_bytes(
+            &index_path,
+            &bytes,
+            &version_info.asset_index.sha1,
+            version_info.asset_index.size,
+        )?;
+        Ok::<_, crate::error::LauncherError>(index)
+    }
+    .await
+    .map_err(|e| {
+        let reason = local_problem
+            .as_deref()
+            .map(|problem| format!(" the local index is invalid ({problem});"))
+            .unwrap_or_default();
         format!(
-            "The downloaded asset index for Minecraft {} is invalid: {e}",
-            version_info.assets
+            "Minecraft assets are incomplete:{reason} the asset index could not be \
+             downloaded or saved. Connect to the internet or run Repair. ({e})"
         )
     })?;
-    if let Some(parent) = index_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(&index).map_err(|e| e.to_string())?;
-    let temp = index_path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        version_info.assets,
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::write(&temp, json).map_err(|e| e.to_string())?;
-    if let Err(e) = std::fs::rename(&temp, &index_path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(format!("The restored asset index could not be saved: {e}"));
-    }
-    events::emit_log(
-        app,
+    log(
         "info",
-        "launch",
         &format!("Restored asset index {} from Mojang.", version_info.assets),
     );
-    Ok(index)
+    Ok(stored)
+}
+
+async fn ensure_asset_index_for_launch(
+    app: &AppHandle,
+    config: &crate::config::AppConfig,
+    version_info: &versions::VersionInfo,
+) -> Result<versions::AssetIndexData, String> {
+    let log = |level: &str, message: &str| events::emit_log(app, level, "launch", message);
+    ensure_asset_index_for_launch_core(config, version_info, &log).await
 }
 
 /// Verify every asset object before launch, then download only the objects
@@ -509,16 +546,20 @@ async fn ensure_java_for_launch(
 /// reservation is released automatically; once the process exists
 /// [`LaunchReservation::mark_running`] publishes it as `Running` and the exit
 /// handler owns the entry from then on.
-struct LaunchReservation<'a> {
-    state: &'a AppState,
+pub(crate) struct LaunchReservation {
+    state: std::sync::Arc<LaunchReservationState>,
+}
+
+struct LaunchReservationState {
+    launches: crate::launch_state::LaunchRegistry,
     instance_name: String,
     token: crate::launch_state::LaunchToken,
     /// Still holds a `Starting` entry; becomes false after `mark_running`.
-    holds_start: bool,
+    holds_start: std::sync::atomic::AtomicBool,
 }
 
-impl<'a> LaunchReservation<'a> {
-    fn acquire(state: &'a AppState, instance_name: &str) -> Result<Self, String> {
+impl LaunchReservation {
+    fn acquire(state: &AppState, instance_name: &str) -> Result<Self, String> {
         let token = state
             .launches
             .begin_launch(instance_name)
@@ -541,10 +582,12 @@ impl<'a> LaunchReservation<'a> {
                 ),
             })?;
         Ok(Self {
-            state,
-            instance_name: instance_name.to_string(),
-            token,
-            holds_start: true,
+            state: std::sync::Arc::new(LaunchReservationState {
+                launches: state.launches.clone(),
+                instance_name: instance_name.to_string(),
+                token,
+                holds_start: std::sync::atomic::AtomicBool::new(true),
+            }),
         })
     }
 
@@ -554,29 +597,306 @@ impl<'a> LaunchReservation<'a> {
     /// (the exit handler removes it), so the slot is never freed while the game
     /// is up.
     fn mark_running(&mut self, identity: Option<crate::running_state::ProcessIdentity>) {
-        if !self.holds_start {
+        if !self
+            .state
+            .holds_start
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
         self.state
             .launches
-            .mark_running(&self.instance_name, self.token, identity);
-        self.holds_start = false;
+            .mark_running(&self.state.instance_name, self.state.token, identity);
+        self.state
+            .holds_start
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Token identifying this reservation, handed to the exit handler so it
     /// can release exactly this run's entry.
     fn token(&self) -> crate::launch_state::LaunchToken {
-        self.token
+        self.state.token
+    }
+
+    /// Keep the `Starting` slot alive in a blocking launch worker. The lease
+    /// shares the reservation state, so the slot is released only after both
+    /// the command and its blocking worker are gone. The outer command still
+    /// owns the final `mark_running` transition.
+    fn worker_lease(&self) -> LaunchLease {
+        LaunchLease {
+            _state: std::sync::Arc::clone(&self.state),
+        }
     }
 }
 
-impl Drop for LaunchReservation<'_> {
+impl Drop for LaunchReservationState {
     fn drop(&mut self) {
-        if !self.holds_start {
+        if self.holds_start.load(std::sync::atomic::Ordering::SeqCst) {
+            self.launches.release(&self.instance_name, self.token);
+        }
+    }
+}
+
+/// Shared-lifetime `Starting` lease for a blocking launch worker.
+struct LaunchLease {
+    _state: std::sync::Arc<LaunchReservationState>,
+}
+
+impl LaunchLease {
+    fn instance_name(&self) -> &str {
+        &self._state.instance_name
+    }
+}
+
+#[cfg(test)]
+static TEST_REAPER_SPAWN_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_REAPER_SPAWN_PANIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_REAPER_PANIC_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_REAPER_ENTERED: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_REAPER_FINISHED: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_test_reaper_spawn_failure(value: bool) {
+    TEST_REAPER_SPAWN_FAILURE.store(value, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn set_test_reaper_spawn_panic(value: bool) {
+    TEST_REAPER_SPAWN_PANIC.store(value, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn set_test_reaper_panic_once(value: bool) {
+    TEST_REAPER_PANIC_ONCE.store(value, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn set_test_reaper_entered(sender: Option<std::sync::mpsc::Sender<()>>) {
+    *TEST_REAPER_ENTERED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = sender;
+}
+
+#[cfg(test)]
+fn set_test_reaper_finished(sender: Option<std::sync::mpsc::Sender<()>>) {
+    *TEST_REAPER_FINISHED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = sender;
+}
+
+/// Владение child-процессом, первую попытку остановки которого выполнить не
+/// удалось.
+///
+/// Job хранит handle процесса и lease. Он лежит в `Arc<Mutex<Option<...>>>`,
+/// поэтому panic reaper-а не может уничтожить ownership, пока cleanup не
+/// подтверждён.
+struct LaunchChildCleanup {
+    child: std::process::Child,
+    lease: LaunchLease,
+}
+
+impl LaunchChildCleanup {
+    fn reap_once(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            if let Some(sender) = TEST_REAPER_ENTERED
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            if TEST_REAPER_PANIC_ONCE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                panic!("injected launch reaper panic");
+            }
+        }
+        let instance = self.lease.instance_name().to_string();
+        match stop_unpersisted_child(&mut self.child, None) {
+            StopOutcome::Stopped => true,
+            StopOutcome::StillRunning(reason) => {
+                tracing::warn!(
+                    target: "launcher",
+                    "Launch cleanup for '{}' is still pending: {}",
+                    instance,
+                    reason
+                );
+                false
+            }
+        }
+    }
+}
+
+fn launch_reaper_step(slot: &std::sync::Arc<std::sync::Mutex<Option<LaunchChildCleanup>>>) -> bool {
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match guard.as_mut() {
+        Some(job) => job.reap_once(),
+        None => true,
+    }
+}
+
+fn launch_reaper_loop(slot: std::sync::Arc<std::sync::Mutex<Option<LaunchChildCleanup>>>) {
+    loop {
+        let done = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            launch_reaper_step(&slot)
+        })) {
+            Ok(done) => done,
+            Err(_) => {
+                tracing::error!(
+                    target: "launcher",
+                    "Launch reaper panicked during child cleanup; retaining ownership and retrying"
+                );
+                false
+            }
+        };
+        if done {
+            *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            #[cfg(test)]
+            if let Some(sender) = TEST_REAPER_FINISHED
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = sender.send(());
+            }
             return;
         }
-        self.state.launches.release(&self.instance_name, self.token);
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
+}
+
+/// Передаёт всё ещё живой незарегистрированный child в reaper, владеющий им.
+/// Если поток reaper-а создать не удалось, вызывающий сохраняет ownership и
+/// выполняет тот же цикл синхронно: reservation остаётся занятой до
+/// подтверждённого reap.
+fn start_launch_reaper(child: std::process::Child, lease: LaunchLease) {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(LaunchChildCleanup {
+        child,
+        lease,
+    })));
+    #[cfg(test)]
+    let force_spawn_failure = TEST_REAPER_SPAWN_FAILURE.load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    let force_spawn_panic = TEST_REAPER_SPAWN_PANIC.load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let force_spawn_failure = false;
+    #[cfg(not(test))]
+    let force_spawn_panic = false;
+
+    // Обычно `Builder::spawn` сообщает об ошибке через `io::Result`, но panic
+    // при создании потока не должен разворачивать этот кадр: локальный slot
+    // является последним владельцем child и его lease. Перехватываем panic и
+    // переходим к синхронному reaper-у так же, как при `Err`.
+    let thread_slot = std::sync::Arc::clone(&slot);
+    let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if force_spawn_panic {
+            panic!("injected launch reaper spawn panic");
+        }
+        if force_spawn_failure {
+            return Err(std::io::Error::other(
+                "injected launch reaper spawn failure",
+            ));
+        }
+        std::thread::Builder::new()
+            .name("voidlauncher-launch-reaper".to_string())
+            .spawn(move || launch_reaper_loop(thread_slot))
+    }));
+    match spawned {
+        Ok(Ok(_handle)) => {}
+        Ok(Err(error)) => {
+            tracing::error!(
+                target: "launcher",
+                "Could not create launch reaper thread ({}); keeping the instance busy and reaping synchronously",
+                error
+            );
+            launch_reaper_loop(slot);
+        }
+        Err(_) => {
+            tracing::error!(
+                target: "launcher",
+                "Launch reaper thread creation panicked; keeping the instance busy and reaping synchronously"
+            );
+            launch_reaper_loop(slot);
+        }
+    }
+}
+
+/// Владеет только что запущенным процессом игры, пока async-команда не
+/// запишет его pid/сессию и не опубликует `Running`. Если future команды будет
+/// dropped раньше, guard останавливает и reap-ит child, а не оставляет игру
+/// без учёта.
+struct LaunchChildGuard {
+    child: Option<std::process::Child>,
+    /// Удерживает launch reservation до остановки и reap дочернего процесса.
+    /// Lease уничтожается только после cleanup, поэтому отменённая команда не
+    /// освобождает `Starting`, пока процесс ещё жив.
+    _lease: Option<LaunchLease>,
+}
+
+impl LaunchChildGuard {
+    fn new(child: std::process::Child, lease: LaunchLease) -> Self {
+        Self {
+            child: Some(child),
+            _lease: Some(lease),
+        }
+    }
+
+    fn as_mut(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("launch child guard disarmed")
+    }
+
+    fn take(&mut self) -> std::process::Child {
+        self.child.take().expect("launch child guard disarmed")
+    }
+}
+
+impl Drop for LaunchChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // Use the same verified tree-stop path as a failed pid write;
+            // helper processes must not survive an unregistered launch.
+            match stop_unpersisted_child(&mut child, None) {
+                StopOutcome::Stopped => {}
+                StopOutcome::StillRunning(reason) => {
+                    // Gate должен оставаться занятым до фактического reap.
+                    // Передаём child handle и lease в reaper thread, чтобы
+                    // следующая операция не получила instance, пока
+                    // незарегистрированный child ещё жив.
+                    tracing::error!(
+                        target: "launcher",
+                        "Cancelled launch could not stop its child ({}); keeping the instance reservation until it exits",
+                        reason
+                    );
+                    if let Some(lease) = self._lease.take() {
+                        start_launch_reaper(child, lease);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Создаёт owning guard сразу после spawn и выполняет output attachment уже
+/// под guard-ом. Любая panic/ошибка после spawn не оставляет child без
+/// владельца.
+fn finish_launch_child(
+    child: std::process::Child,
+    lease: LaunchLease,
+    config: &crate::config::AppConfig,
+    instance: &crate::instances::Instance,
+    session_log: Option<&str>,
+) -> LaunchChildGuard {
+    let mut guard = LaunchChildGuard::new(child, lease);
+    launch::attach_output_readers_for_launch(config, instance, session_log, guard.as_mut());
+    guard
 }
 
 /// Backend launch gate: reserve the single-flight slot, then verify the
@@ -584,10 +904,10 @@ impl Drop for LaunchReservation<'_> {
 /// check race-free — an import either holds the slot (this fails) or the slot
 /// is ours until the marker is read, so it cannot publish/remove the directory
 /// in between. Used by `cmd_launch_game`; tested directly without an AppHandle.
-fn acquire_launch_gate<'a>(
-    state: &'a AppState,
+pub(crate) fn acquire_launch_gate(
+    state: &AppState,
     instance_name: &str,
-) -> Result<LaunchReservation<'a>, String> {
+) -> Result<LaunchReservation, String> {
     let reservation = LaunchReservation::acquire(state, instance_name)?;
     let instances_dir = state
         .config
@@ -1314,6 +1634,7 @@ pub async fn cmd_launch_game(
                     loader_ver,
                     &config.libraries_dir(),
                     &config.versions_dir(),
+                    Some(&app),
                 )
                 .await
                 {
@@ -1330,6 +1651,7 @@ pub async fn cmd_launch_game(
                     loader_ver,
                     &config.libraries_dir(),
                     &config.versions_dir(),
+                    Some(&app),
                 )
                 .await
                 {
@@ -1396,7 +1718,8 @@ pub async fn cmd_launch_game(
     // Launch preparation (Java probing, classpath assembly, argument
     // composition) is blocking I/O and subprocess work; run it on the
     // blocking pool so it cannot stall the async runtime / UI.
-    let mut child = {
+    let launch_lease = reservation.worker_lease();
+    let mut child_guard = {
         let launch_config = config.clone();
         let launch_instance = instance.clone();
         let launch_version_info = version_info.clone();
@@ -1409,7 +1732,7 @@ pub async fn cmd_launch_game(
         let launch_session_log = session_log.clone();
         let launch_java = prepared_java.clone();
         let result = tokio::task::spawn_blocking(move || {
-            launch::launch_minecraft(
+            let child = launch::launch_minecraft(
                 &launch_config,
                 &launch_instance,
                 &launch_version_info,
@@ -1425,7 +1748,18 @@ pub async fn cmd_launch_game(
                 Some(&launch_java),
                 total_ram_mb,
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+            // Lease перемещается в child guard вместе с child handle сразу
+            // после возврата spawn-а. Все последующие действия, включая
+            // attach output readers, выполняются уже под guard-ом.
+            let child_guard = finish_launch_child(
+                child,
+                launch_lease,
+                &launch_config,
+                &launch_instance,
+                launch_session_log.as_deref(),
+            );
+            Ok::<LaunchChildGuard, String>(child_guard)
         })
         .await
         .map_err(|e| format!("Launch task failed: {}", e))?;
@@ -1435,11 +1769,12 @@ pub async fn cmd_launch_game(
         })?
     };
 
-    let pid = child.id();
+    let pid = child_guard.as_mut().id();
+    tracing::info!(target: "launcher", "Java process spawned with PID: {}", pid);
     // Read the exact identity of the process we just spawned (through its own
     // handle, so it cannot describe any other process). It is persisted below
     // and published through the registry, and every later Stop re-verifies it.
-    let process_identity = crate::running_state::identity_of_child(&child);
+    let process_identity = crate::running_state::identity_of_child(child_guard.as_mut());
     let _ = instances::update_last_played(&config.instances_dir(), &instance_name);
     // Persist the pid BEFORE anything else can fail: if the launcher is
     // closed or updated while the game runs, the next start recovers the
@@ -1454,7 +1789,7 @@ pub async fn cmd_launch_game(
         // again after a crash or an update. Do not report a registered launch:
         // stop the process we just started (re-verifying its identity), or at
         // least say loudly that it may still be running.
-        let outcome = stop_unpersisted_child(&mut child, process_identity.as_ref());
+        let outcome = stop_unpersisted_child(child_guard.as_mut(), process_identity.as_ref());
         let msg = unpersisted_launch_error(&instance_name, pid, &cause, &outcome);
         events::emit_log(&app, "error", "launch", &msg);
         if let Some(p) = session_log.as_deref() {
@@ -1464,7 +1799,7 @@ pub async fn cmd_launch_game(
         return Err(msg.into());
     }
     let child_handle: Arc<std::sync::Mutex<Option<std::process::Child>>> =
-        Arc::new(std::sync::Mutex::new(Some(child)));
+        Arc::new(std::sync::Mutex::new(Some(child_guard.take())));
 
     // Start the playtime session BEFORE releasing the reservation and before
     // the "close on launch" window close: the app-exit handler flushes active
@@ -1779,7 +2114,7 @@ fn ensure_loader_mc_match(
 /// the instance-name reservation are held for the whole command, so a rename,
 /// delete or launch cannot invalidate the instance between reading its config
 /// and saving the installed profile.
-struct LoaderInstallContext<'a> {
+pub(crate) struct LoaderInstallContext<'a> {
     _mutation: crate::commands::instances::InstanceMutationGuard<'a>,
     _name: instances::InstanceNameReservation,
     instances_dir: std::path::PathBuf,
@@ -1789,7 +2124,7 @@ struct LoaderInstallContext<'a> {
 }
 
 impl<'a> LoaderInstallContext<'a> {
-    fn acquire(state: &'a AppState, instance_name: &str) -> Result<Self, String> {
+    pub(crate) fn acquire(state: &'a AppState, instance_name: &str) -> Result<Self, String> {
         // No config lock may be held here: the mutation guard reads data_dir
         // through the same mutex.
         let mutation =
@@ -1825,6 +2160,32 @@ impl<'a> LoaderInstallContext<'a> {
     }
 }
 
+/// Shared preflight for the three loader-install commands. Validation and the
+/// instance mutation/name reservations happen before any network or instance
+/// metadata write.
+pub(crate) fn acquire_loader_install_context<'a>(
+    state: &'a AppState,
+    instance_name: &str,
+) -> Result<LoaderInstallContext<'a>, String> {
+    validate_instance_name(instance_name)?;
+    LoaderInstallContext::acquire(state, instance_name)
+}
+
+/// Command preflight for changing a loader version. The version-trim/empty
+/// check and the instance reservation both happen before any loader download.
+pub(crate) fn acquire_update_loader_context<'a>(
+    state: &'a AppState,
+    instance_name: &str,
+    loader_version: &str,
+    lang: &str,
+) -> Result<LoaderInstallContext<'a>, String> {
+    validate_instance_name(instance_name)?;
+    if loader_version.trim().is_empty() {
+        return Err(i18n::tr(lang, "instance_no_loader_version", &[]));
+    }
+    LoaderInstallContext::acquire(state, instance_name)
+}
+
 #[tauri::command]
 pub async fn cmd_install_fabric(
     state: State<'_, AppState>,
@@ -1833,9 +2194,8 @@ pub async fn cmd_install_fabric(
     instance_name: String,
     lang: Option<String>,
 ) -> Result<(), String> {
-    validate_instance_name(&instance_name)?;
     let lang = lang.as_deref().unwrap_or("en");
-    let ctx = LoaderInstallContext::acquire(state.inner(), &instance_name)?;
+    let ctx = acquire_loader_install_context(state.inner(), &instance_name)?;
     ensure_loader_mc_match(lang, "Fabric", &ctx.instance, &mc_version)?;
     let profile = modloaders::fabric::install(&mc_version, &loader_version, &ctx.libraries_dir)
         .await
@@ -1857,21 +2217,22 @@ pub async fn cmd_install_fabric(
 
 #[tauri::command]
 pub async fn cmd_install_forge(
+    app: AppHandle,
     state: State<'_, AppState>,
     mc_version: String,
     loader_version: String,
     instance_name: String,
     lang: Option<String>,
 ) -> Result<(), String> {
-    validate_instance_name(&instance_name)?;
     let lang = lang.as_deref().unwrap_or("en");
-    let ctx = LoaderInstallContext::acquire(state.inner(), &instance_name)?;
+    let ctx = acquire_loader_install_context(state.inner(), &instance_name)?;
     ensure_loader_mc_match(lang, "Forge", &ctx.instance, &mc_version)?;
     let profile = modloaders::forge::install(
         &mc_version,
         &loader_version,
         &ctx.libraries_dir,
         &ctx.versions_dir,
+        Some(&app),
     )
     .await
     .map_err(|e| {
@@ -1892,22 +2253,22 @@ pub async fn cmd_install_forge(
 
 #[tauri::command]
 pub async fn cmd_install_neoforge(
+    app: AppHandle,
     state: State<'_, AppState>,
     mc_version: String,
     loader_version: String,
     instance_name: String,
     lang: Option<String>,
 ) -> Result<(), String> {
-    validate_instance_name(&instance_name)?;
     let lang = lang.as_deref().unwrap_or("en");
-    let ctx = LoaderInstallContext::acquire(state.inner(), &instance_name)?;
+    let ctx = acquire_loader_install_context(state.inner(), &instance_name)?;
     ensure_loader_mc_match(lang, "NeoForge", &ctx.instance, &mc_version)?;
     let profile = modloaders::neoforge::install(
         &mc_version,
         &loader_version,
         &ctx.libraries_dir,
         &ctx.versions_dir,
-        None,
+        Some(&app),
     )
     .await
     .map_err(|e| {
@@ -2034,14 +2395,9 @@ pub async fn cmd_update_instance_loader(
     loader_version: String,
     lang: Option<String>,
 ) -> Result<(), String> {
-    validate_instance_name(&instance_name)?;
     let lang = lang.as_deref().unwrap_or("en");
     let loader_version = loader_version.trim().to_string();
-    if loader_version.is_empty() {
-        return Err(i18n::tr(lang, "instance_no_loader_version", &[]));
-    }
-
-    let ctx = LoaderInstallContext::acquire(state.inner(), &instance_name)?;
+    let ctx = acquire_update_loader_context(state.inner(), &instance_name, &loader_version, lang)?;
     let loader_type = match ctx.instance.loader {
         instances::LoaderType::Fabric => "Fabric",
         instances::LoaderType::Forge => "Forge",
@@ -2385,6 +2741,33 @@ enum StopOutcome {
     StillRunning(String),
 }
 
+/// Wait for a child after a successful kill. A `wait` error does not prove
+/// that the process is gone; the caller must keep the handle and retry.
+fn wait_for_reaped_child(child: &mut std::process::Child) -> StopOutcome {
+    match wait_child(child) {
+        Ok(_) => StopOutcome::Stopped,
+        Err(error) => StopOutcome::StillRunning(format!(
+            "the process was signalled but wait/reap failed: {error}"
+        )),
+    }
+}
+
+#[cfg(test)]
+static TEST_WAIT_FAILURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn set_test_wait_failure(value: bool) {
+    TEST_WAIT_FAILURE.store(value, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn wait_child(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(test)]
+    if TEST_WAIT_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected child wait failure"));
+    }
+    child.wait()
+}
+
 /// Stop a freshly spawned game whose running state could not be saved.
 ///
 /// The verified `kill_process_tree` path is tried first (exactly what Stop
@@ -2398,10 +2781,7 @@ fn stop_unpersisted_child(
     let mut reason = String::new();
     if let Some(identity) = identity {
         match crate::running_state::kill_process_tree(identity) {
-            Ok(()) => {
-                let _ = child.wait();
-                return StopOutcome::Stopped;
-            }
+            Ok(()) => return wait_for_reaped_child(child),
             Err(err) => reason = err,
         }
     }
@@ -2410,18 +2790,14 @@ fn stop_unpersisted_child(
     // retry the verified tree kill (taskkill /T still covers helper processes).
     if let Some(live) = crate::running_state::identity_of_child(child) {
         match crate::running_state::kill_process_tree(&live) {
-            Ok(()) => {
-                let _ = child.wait();
-                return StopOutcome::Stopped;
-            }
+            Ok(()) => return wait_for_reaped_child(child),
             Err(err) => reason = err,
         }
     }
     // Last resort: the owned handle is exact and cannot hit another process,
     // although it may leave helper processes behind.
     if child.kill().is_ok() {
-        let _ = child.wait();
-        return StopOutcome::Stopped;
+        return wait_for_reaped_child(child);
     }
     // The process may have exited on its own between the attempts.
     if matches!(child.try_wait(), Ok(Some(_))) {
@@ -2566,6 +2942,43 @@ mod tests {
     use crate::download::tests::{
         direct_proxy_lock, mock_dir, sha512_hex, spawn_mock, MockServer, MockSpec,
     };
+
+    /// Сериализует тесты, использующие process/reaper test hooks.
+    static F01_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Держит `F01_TEST_LOCK` и сбрасывает все process/reaper hooks при
+    /// выходе, в том числе при панике, чтобы сбой одного теста не влиял на
+    /// следующие.
+    struct F01TestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl F01TestGuard {
+        fn acquire() -> Self {
+            let lock = F01_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            reset_f01_hooks();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for F01TestGuard {
+        fn drop(&mut self) {
+            reset_f01_hooks();
+        }
+    }
+
+    fn reset_f01_hooks() {
+        set_test_wait_failure(false);
+        set_test_reaper_spawn_failure(false);
+        set_test_reaper_spawn_panic(false);
+        set_test_reaper_panic_once(false);
+        set_test_reaper_entered(None);
+        set_test_reaper_finished(None);
+        crate::launch::set_test_panic_during_output_attach(false);
+    }
+
     use crate::instances::{Instance, LoaderType};
     use crate::launch_state::{LaunchPhase, LaunchRegistry};
     use crate::modloaders::{LoaderLibrary, LoaderProfile};
@@ -2582,6 +2995,40 @@ mod tests {
 
     fn mock_base(server: &MockServer) -> String {
         server.url.trim_end_matches("artifact.bin").to_string()
+    }
+
+    fn asset_index_version(
+        index_url: &str,
+        index_sha1: &str,
+        index_size: u64,
+        assets: &str,
+    ) -> versions::VersionInfo {
+        versions::VersionInfo {
+            id: "1.20.1".to_string(),
+            version_type: "release".to_string(),
+            main_class: "net.minecraft.client.main.Main".to_string(),
+            minecraft_arguments: None,
+            arguments: None,
+            libraries: Vec::new(),
+            downloads: versions::Downloads {
+                client: versions::DownloadInfo {
+                    sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".to_string(),
+                    size: 1,
+                    url: "https://example.com/client.jar".to_string(),
+                },
+                server: None,
+            },
+            asset_index: versions::AssetIndex {
+                id: assets.to_string(),
+                sha1: index_sha1.to_string(),
+                size: index_size,
+                total_size: 0,
+                url: index_url.to_string(),
+            },
+            assets: assets.to_string(),
+            java_version: None,
+            compliance_level: 0,
+        }
     }
 
     fn legacy_fabric_instance(name: &str, base: &str, loader_path: &str) -> Instance {
@@ -3036,6 +3483,22 @@ mod tests {
     }
 
     #[test]
+    fn launch_worker_lease_keeps_starting_after_the_command_future_is_gone() {
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let worker_lease = reservation.worker_lease();
+        drop(reservation);
+        assert_eq!(
+            state.launches.phase("Pack"),
+            Some(LaunchPhase::Starting),
+            "the blocking worker still owns the Starting slot"
+        );
+        assert!(LaunchReservation::acquire(&state, "Pack").is_err());
+        drop(worker_lease);
+        assert_eq!(state.launches.phase("Pack"), None);
+    }
+
+    #[test]
     fn a_failed_preparation_releases_the_reservation() {
         let state = test_state();
         {
@@ -3232,6 +3695,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn an_unpersisted_child_is_stopped_by_its_real_identity() {
+        let _f01 = F01TestGuard::acquire();
         let mut child = spawn_test_process();
         let pid = child.id();
         let forged = crate::running_state::ProcessIdentity {
@@ -3260,6 +3724,340 @@ mod tests {
             !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
             "the stopped process must not be reported as running, got: {probe:?}"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn launch_child_guard_kills_an_unregistered_child_on_drop() {
+        let _f01 = F01TestGuard::acquire();
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let lease = reservation.worker_lease();
+        drop(reservation);
+        let child = spawn_test_process();
+        let pid = child.id();
+        let guard = LaunchChildGuard::new(child, lease);
+        assert_eq!(
+            state.launches.phase("Pack"),
+            Some(LaunchPhase::Starting),
+            "the child guard must own the reservation while the process exists"
+        );
+        assert!(
+            LaunchReservation::acquire(&state, "Pack").is_err(),
+            "a second launch must be blocked by the guarded child"
+        );
+        drop(guard);
+        let probe = crate::running_state::read_identity(pid);
+        assert!(
+            !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
+            "a dropped launch guard must not leave an untracked child, got: {probe:?}"
+        );
+        assert_eq!(
+            state.launches.phase("Pack"),
+            None,
+            "the reservation must be released only after the child is gone"
+        );
+        let _reservation = LaunchReservation::acquire(&state, "Pack")
+            .expect("the instance must be launchable after cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(windows)]
+    async fn cancelled_launch_worker_keeps_reservation_until_child_is_reaped() {
+        use tokio::sync::oneshot;
+
+        let _f01 = F01TestGuard::acquire();
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let lease = reservation.worker_lease();
+        let (child_started_tx, child_started_rx) = oneshot::channel();
+        let (pid_tx, pid_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+
+        let worker = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let child = spawn_test_process();
+                let _ = pid_tx.send(child.id());
+                let _ = child_started_tx.send(());
+                // Имитируем launch worker, который всё ещё владеет child,
+                // пока внешняя command future уже отменена.
+                let _ = release_rx.blocking_recv();
+                LaunchChildGuard::new(child, lease)
+            })
+            .await
+            .expect("launch worker task")
+        });
+
+        child_started_rx.await.expect("child actually started");
+        let pid = pid_rx.await.expect("child pid");
+        assert_eq!(
+            state.launches.phase("Pack"),
+            Some(LaunchPhase::Starting),
+            "the launch lease must hold Starting while the worker is alive"
+        );
+
+        // The outer command future is gone while the blocking worker still
+        // owns the child and its lease.
+        drop(reservation);
+        worker.abort();
+        assert_eq!(
+            state.launches.phase("Pack"),
+            Some(LaunchPhase::Starting),
+            "cancelling the command must not release the worker-owned lease"
+        );
+        assert!(
+            LaunchReservation::acquire(&state, "Pack").is_err(),
+            "a second launch must be blocked while the child is unregistered"
+        );
+
+        release_tx.send(()).expect("release launch worker");
+        for _ in 0..500 {
+            if state.launches.phase("Pack").is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.launches.phase("Pack"),
+            None,
+            "the reservation must be released only after the child is reaped"
+        );
+        let probe = crate::running_state::read_identity(pid);
+        assert!(
+            !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
+            "the cancelled launch must not leave an untracked child, got: {probe:?}"
+        );
+        let _reservation = LaunchReservation::acquire(&state, "Pack")
+            .expect("the instance must be launchable after cancellation cleanup");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn successful_launch_guard_transfers_to_running_lifecycle() {
+        let _f01 = F01TestGuard::acquire();
+        let state = test_state();
+        let mut reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let lease = reservation.worker_lease();
+        let token = reservation.token();
+        let child = spawn_test_process();
+        let config = state.config.lock().unwrap().clone();
+        let instance = crate::instances::Instance::new(
+            "Pack",
+            "1.20.1",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        let mut guard = finish_launch_child(child, lease, &config, &instance, None);
+        let mut child = guard.take();
+
+        // This is the normal successful transition: mark_running happens
+        // before the guard is dropped, and the PID/child is then owned by
+        // the existing Running lifecycle.
+        reservation.mark_running(None);
+        drop(guard);
+        assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Running));
+        drop(reservation);
+        assert_eq!(
+            state.launches.phase("Pack"),
+            Some(LaunchPhase::Running),
+            "dropping the guard must not stop a registered game"
+        );
+        assert!(state.launches.release("Pack", token));
+        assert_eq!(state.launches.phase("Pack"), None);
+        assert_eq!(
+            stop_unpersisted_child(&mut child, None),
+            StopOutcome::Stopped
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn finish_launch_child_reaps_when_output_attach_panics() {
+        let _f01 = F01TestGuard::acquire();
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let lease = reservation.worker_lease();
+        drop(reservation);
+        let child = spawn_test_process();
+        let pid = child.id();
+        let config = state.config.lock().unwrap().clone();
+        let instance = crate::instances::Instance::new(
+            "Pack",
+            "1.20.1",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        crate::launch::set_test_panic_during_output_attach(true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finish_launch_child(child, lease, &config, &instance, None)
+        }));
+        crate::launch::set_test_panic_during_output_attach(false);
+
+        assert!(result.is_err(), "the injected attach panic must unwind");
+        assert_eq!(
+            state.launches.phase("Pack"),
+            None,
+            "the guard must release the reservation only after child cleanup"
+        );
+        let probe = crate::running_state::read_identity(pid);
+        assert!(
+            !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
+            "output-attach panic must not leave an unmanaged child, got: {probe:?}"
+        );
+        let _reservation = LaunchReservation::acquire(&state, "Pack")
+            .expect("the instance must be launchable after panic cleanup");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn wait_failure_keeps_child_and_reservation_until_retry_succeeds() {
+        let _f01 = F01TestGuard::acquire();
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let lease = reservation.worker_lease();
+        drop(reservation);
+        let child = spawn_test_process();
+        let pid = child.id();
+        let mut cleanup = LaunchChildCleanup { child, lease };
+
+        set_test_wait_failure(true);
+        assert!(
+            !cleanup.reap_once(),
+            "injected wait failure must leave cleanup pending"
+        );
+        assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Starting));
+        assert!(
+            LaunchReservation::acquire(&state, "Pack").is_err(),
+            "a wait failure must not release the instance"
+        );
+
+        set_test_wait_failure(false);
+        assert!(
+            cleanup.reap_once(),
+            "retry must confirm that the child is reaped"
+        );
+        drop(cleanup);
+        assert_eq!(
+            state.launches.phase("Pack"),
+            None,
+            "the reservation must be released after the confirmed reap"
+        );
+        let probe = crate::running_state::read_identity(pid);
+        assert!(
+            !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
+            "wait failure must not lose the child handle, got: {probe:?}"
+        );
+        let _reservation = LaunchReservation::acquire(&state, "Pack")
+            .expect("the instance must be launchable after retry");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn reaper_spawn_failure_keeps_ownership_until_synchronous_reap() {
+        let _f01 = F01TestGuard::acquire();
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let lease = reservation.worker_lease();
+        drop(reservation);
+        let child = spawn_test_process();
+        let pid = child.id();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        set_test_reaper_entered(Some(entered_tx));
+        set_test_reaper_spawn_failure(true);
+        set_test_wait_failure(true);
+
+        let worker = std::thread::spawn(move || start_launch_reaper(child, lease));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("synchronous fallback reaper must start");
+        assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Starting));
+        assert!(LaunchReservation::acquire(&state, "Pack").is_err());
+
+        set_test_wait_failure(false);
+        worker.join().expect("fallback reaper thread");
+        set_test_reaper_spawn_failure(false);
+        set_test_reaper_entered(None);
+
+        assert_eq!(state.launches.phase("Pack"), None);
+        let probe = crate::running_state::read_identity(pid);
+        assert!(
+            !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
+            "fallback reaper must not lose the child handle, got: {probe:?}"
+        );
+        let _reservation = LaunchReservation::acquire(&state, "Pack")
+            .expect("the instance must be launchable after fallback reap");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn reaper_spawn_panic_keeps_ownership_until_synchronous_reap() {
+        let _f01 = F01TestGuard::acquire();
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let lease = reservation.worker_lease();
+        drop(reservation);
+        let child = spawn_test_process();
+        let pid = child.id();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        set_test_reaper_entered(Some(entered_tx));
+        set_test_reaper_spawn_panic(true);
+        set_test_wait_failure(true);
+
+        let worker = std::thread::spawn(move || start_launch_reaper(child, lease));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("synchronous fallback reaper must start after spawn panic");
+        assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Starting));
+        assert!(LaunchReservation::acquire(&state, "Pack").is_err());
+
+        set_test_wait_failure(false);
+        worker.join().expect("fallback reaper thread");
+        assert_eq!(state.launches.phase("Pack"), None);
+        let probe = crate::running_state::read_identity(pid);
+        assert!(
+            !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
+            "spawn panic must not lose the child handle, got: {probe:?}"
+        );
+        let _reservation = LaunchReservation::acquire(&state, "Pack")
+            .expect("the instance must be launchable after fallback reap");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn reaper_panic_keeps_reservation_until_retry_reaps() {
+        let _f01 = F01TestGuard::acquire();
+        let state = test_state();
+        let reservation = LaunchReservation::acquire(&state, "Pack").expect("reserve");
+        let lease = reservation.worker_lease();
+        drop(reservation);
+        let child = spawn_test_process();
+        let pid = child.id();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        set_test_reaper_entered(Some(entered_tx));
+        set_test_reaper_finished(Some(finished_tx));
+        set_test_reaper_panic_once(true);
+        set_test_wait_failure(true);
+
+        start_launch_reaper(child, lease);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reaper must start");
+        assert_eq!(state.launches.phase("Pack"), Some(LaunchPhase::Starting));
+        assert!(LaunchReservation::acquire(&state, "Pack").is_err());
+
+        set_test_wait_failure(false);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reaper must finish after the retry succeeds");
+        assert_eq!(state.launches.phase("Pack"), None);
+        let probe = crate::running_state::read_identity(pid);
+        assert!(
+            !matches!(probe, crate::running_state::IdentityProbe::Found(_)),
+            "reaper panic must not lose the child handle, got: {probe:?}"
+        );
+        let _reservation = LaunchReservation::acquire(&state, "Pack")
+            .expect("the instance must be launchable after reaper retry");
     }
 
     #[test]
@@ -3524,6 +4322,117 @@ mod tests {
             !instances_dir.join("Pack").exists(),
             "a failed save must not recreate the directory"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn valid_asset_index_bytes() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "minecraft/test.bin": {
+                    "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size": 1
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn install_asset_index_publishes_publisher_bytes_and_preserves_old_on_failure() {
+        use crate::download::tests::sha1_hex;
+
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("install_asset_index");
+        let config = launch_config(&dir);
+        let body = valid_asset_index_bytes();
+        let sha1 = sha1_hex(&body);
+        let server = spawn_mock(vec![MockSpec::ok(&body)]).await;
+        let vi = asset_index_version(&server.url, &sha1, body.len() as u64, "5");
+
+        install_asset_index_for_version(&config, &vi)
+            .await
+            .expect("valid publisher bytes must install");
+        let path = config.assets_dir().join("indexes/5.json");
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+
+        // A failure must leave the previous working file untouched.
+        std::fs::write(&path, b"previous-working-index").unwrap();
+        let invalid = br#"{"objects":{}}"#;
+        let invalid_sha1 = sha1_hex(invalid);
+        let failing = spawn_mock(vec![MockSpec::ok(invalid)]).await;
+        let bad_vi = asset_index_version(&failing.url, &invalid_sha1, invalid.len() as u64, "5");
+        assert!(install_asset_index_for_version(&config, &bad_vi)
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous-working-index");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn launch_asset_index_uses_local_and_repairs_checksum_valid_invalid_structure() {
+        use crate::download::tests::sha1_hex;
+
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("launch_asset_index");
+        let config = launch_config(&dir);
+        let body = valid_asset_index_bytes();
+        let sha1 = sha1_hex(&body);
+        let path = config.assets_dir().join("indexes/5.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &body).unwrap();
+        let no_network = spawn_mock(vec![MockSpec::status(500)]).await;
+        let vi = asset_index_version(&no_network.url, &sha1, body.len() as u64, "5");
+        ensure_asset_index_for_launch_core(&config, &vi, &|_, _| {})
+            .await
+            .expect("valid local index");
+        assert_eq!(no_network.hits.load(Ordering::SeqCst), 0);
+
+        let invalid = br#"{"objects":{}}"#;
+        std::fs::write(&path, invalid).unwrap();
+        let server = spawn_mock(vec![MockSpec::ok(&body)]).await;
+        let repairing = asset_index_version(&server.url, &sha1, body.len() as u64, "5");
+        ensure_asset_index_for_launch_core(&config, &repairing, &|_, _| {})
+            .await
+            .expect("a structurally invalid local index must be replaced from publisher bytes");
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+
+        // A checksum-valid but structurally invalid local file must not be
+        // treated as usable. If the publisher itself is invalid, fail closed
+        // and keep the old file in place.
+        std::fs::write(&path, invalid).unwrap();
+        let invalid_sha1 = sha1_hex(invalid);
+        let invalid_server = spawn_mock(vec![MockSpec::ok(invalid)]).await;
+        let still_invalid = asset_index_version(
+            &invalid_server.url,
+            &invalid_sha1,
+            invalid.len() as u64,
+            "5",
+        );
+        let error = ensure_asset_index_for_launch_core(&config, &still_invalid, &|_, _| {})
+            .await
+            .expect_err("checksum-valid but structurally invalid publisher must fail closed");
+        assert!(
+            error.contains("no objects") || error.contains("invalid"),
+            "got: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), invalid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn launch_asset_index_malformed_checksum_fails_before_network() {
+        let _proxy = direct_proxy_lock().await;
+        let dir = mock_dir("launch_asset_bad_sha");
+        let config = launch_config(&dir);
+        let server = spawn_mock(vec![MockSpec::status(500)]).await;
+        let vi = asset_index_version(&server.url, "not-a-hash", 0, "5");
+        let error = ensure_asset_index_for_launch_core(&config, &vi, &|_, _| {})
+            .await
+            .expect_err("malformed publisher checksum must fail closed");
+        assert!(error.to_lowercase().contains("sha1"), "got: {error}");
+        assert_eq!(server.hits.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -89,8 +89,18 @@ pub struct PackWatcherHandle {
 /// split at `:`/`/` is not safe: `https://github.com:443@evil.example/x`
 /// would look like `github.com` to a naive parser while reqwest connects to
 /// `evil.example`. Userinfo is therefore rejected outright.
-pub(crate) fn is_allowed_download_host(url: &str) -> bool {
-    download::validate_download_url(url).is_ok()
+pub(crate) fn is_allowed_download_host(raw: &str) -> bool {
+    // Test-only loopback origin for controlled mock HTTP tests. Release
+    // builds still use the strict HTTPS allowlist. Parsing (not string
+    // prefix matching) keeps userinfo URLs such as
+    // `http://127.0.0.1:1@evil.example/` from passing this branch.
+    #[cfg(test)]
+    if let Ok(url) = reqwest::Url::parse(raw) {
+        if url.scheme() == "http" && url.host_str() == Some("127.0.0.1") {
+            return true;
+        }
+    }
+    download::validate_download_url(raw).is_ok()
 }
 
 // ==================== App Builder ====================

@@ -198,6 +198,17 @@ impl HashSpec {
         let actual = hash_file(path, self.algorithm)?;
         Ok(actual.eq_ignore_ascii_case(&self.hex))
     }
+
+    /// Verify an in-memory payload. Used for small metadata documents whose
+    /// checksum sidecar is fetched before parsing; never for large artifacts.
+    pub fn verify_bytes(&self, bytes: &[u8]) -> bool {
+        let actual = match self.algorithm {
+            HashAlgorithm::Sha1 => hex::encode(Sha1::digest(bytes)),
+            HashAlgorithm::Sha256 => hex::encode(Sha256::digest(bytes)),
+            HashAlgorithm::Sha512 => hex::encode(Sha512::digest(bytes)),
+        };
+        actual.eq_ignore_ascii_case(&self.hex)
+    }
 }
 
 /// Hash a file with a validated algorithm. Used by [`HashSpec`] and by the
