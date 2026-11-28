@@ -1329,13 +1329,30 @@ pub(crate) fn best_effort_target_arch(
     instance: &Instance,
     version_info: &VersionInfo,
 ) -> crate::versions::TargetArch {
+    best_effort_target_arch_with_discovery(config, instance, version_info, || {
+        find_all_java_installations(&config.data_dir)
+    })
+}
+
+fn best_effort_target_arch_with_discovery(
+    config: &AppConfig,
+    instance: &Instance,
+    version_info: &VersionInfo,
+    discover: impl FnOnce() -> Vec<JavaInstallation>,
+) -> crate::versions::TargetArch {
+    // Automatic and managed Java selection cannot contribute a trustworthy
+    // architecture to Verify. Avoid probing every system JVM just to return
+    // Unknown; only inspect candidates when the user explicitly selected one.
+    if instance.java_path.is_none() && config.java_path.is_none() {
+        return crate::versions::TargetArch::Unknown;
+    }
     let req = JavaRequirement {
         major: version_info.required_java_major(),
         arch: None,
         require_64bit: true,
         allow_newer: false,
     };
-    let installations = find_all_java_installations(&config.data_dir);
+    let installations = discover();
     match resolve_java(
         &req,
         instance.java_path.as_deref(),
@@ -1569,6 +1586,24 @@ mod tests {
             "assets": "1"
         }))
         .expect("synthetic version JSON")
+    }
+
+    #[test]
+    fn verify_arch_does_not_probe_system_java_for_automatic_selection() {
+        let config = crate::config::AppConfig::default();
+        let instance = crate::instances::Instance::new(
+            "Automatic Java",
+            "1.20.1",
+            crate::instances::LoaderType::Vanilla,
+            None,
+        );
+        let version = synthetic_version("1.20.1");
+
+        let target = best_effort_target_arch_with_discovery(&config, &instance, &version, || {
+            panic!("automatic Java selection must not probe global installations")
+        });
+
+        assert_eq!(target, crate::versions::TargetArch::Unknown);
     }
 
     #[test]

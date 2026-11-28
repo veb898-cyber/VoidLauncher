@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   CompatibilityRequestTracker,
+  DeferredCompatibilityRefresh,
   countCompatibilityFindings,
   filterCompatibilityFindings,
   type LocalCompatibilityFinding,
@@ -27,7 +28,7 @@ describe('local compatibility report helpers', () => {
     expect(filterCompatibilityFindings(findings, 'all')).toBe(findings);
   });
 
-  it('coalesces duplicate requests and lets invalidation supersede an older response', () => {
+  it('serializes a fresh scan after invalidating an in-flight scan', () => {
     const requests = new CompatibilityRequestTracker();
     const first = requests.begin();
 
@@ -35,14 +36,23 @@ describe('local compatibility report helpers', () => {
     expect(requests.begin()).toBeNull();
 
     requests.invalidate();
+    expect(requests.begin()).toBeNull();
+    expect(requests.isCurrent(first!)).toBe(false);
+
+    expect(requests.finish(first!)).toBe(true);
     const current = requests.begin();
     expect(current).not.toBeNull();
-    expect(requests.isCurrent(first!)).toBe(false);
     expect(requests.isCurrent(current!)).toBe(true);
+    expect(requests.finish(current!)).toBe(false);
+  });
 
-    requests.finish(first!);
-    expect(requests.begin()).toBeNull();
-    requests.finish(current!);
-    expect(requests.begin()).not.toBeNull();
+  it('coalesces watcher changes until ContentManager can reload', () => {
+    const refresh = new DeferredCompatibilityRefresh();
+
+    refresh.defer();
+    refresh.defer();
+    expect(refresh.consume(true)).toBe(false);
+    expect(refresh.consume(false)).toBe(true);
+    expect(refresh.consume(false)).toBe(false);
   });
 });

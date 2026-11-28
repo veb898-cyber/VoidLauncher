@@ -28,10 +28,11 @@ export type CompatibilityFilter = 'all' | LocalCompatibilityStatus;
 export class CompatibilityRequestTracker {
   private generation = 0;
   private pendingGeneration: number | null = null;
+  private rerunRequested = false;
 
   invalidate(): void {
     this.generation += 1;
-    this.pendingGeneration = null;
+    if (this.pendingGeneration !== null) this.rerunRequested = true;
   }
 
   begin(): number | null {
@@ -45,8 +46,32 @@ export class CompatibilityRequestTracker {
     return generation === this.generation;
   }
 
-  finish(generation: number): void {
-    if (this.pendingGeneration === generation) this.pendingGeneration = null;
+  finish(generation: number): boolean {
+    if (this.pendingGeneration !== generation) return false;
+    this.pendingGeneration = null;
+    const rerunRequested = this.rerunRequested;
+    this.rerunRequested = false;
+    return rerunRequested;
+  }
+}
+
+/** Coalesce watcher events that arrive while ContentManager intentionally defers reloads. */
+export class DeferredCompatibilityRefresh {
+  private pending = false;
+
+  defer(): void {
+    this.pending = true;
+  }
+
+  consume(isBlocked: boolean): boolean {
+    if (isBlocked) return false;
+    const pending = this.pending;
+    this.pending = false;
+    return pending;
+  }
+
+  clear(): void {
+    this.pending = false;
   }
 }
 

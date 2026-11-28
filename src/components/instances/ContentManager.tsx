@@ -29,6 +29,7 @@ import { RemoteIcon } from '../../lib/remoteImage';
 import type { CompatState } from '../../lib/contentProviders';
 import {
   CompatibilityRequestTracker,
+  DeferredCompatibilityRefresh,
   countCompatibilityFindings,
   filterCompatibilityFindings,
   type CompatibilityFilter,
@@ -425,6 +426,7 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const [localCompatibilityCheckedAt, setLocalCompatibilityCheckedAt] = useState<number | null>(null);
   const [localCompatibilityError, setLocalCompatibilityError] = useState<string | null>(null);
   const [localCompatibilityLoading, setLocalCompatibilityLoading] = useState(false);
+  const deferredCompatibilityRefresh = useRef(new DeferredCompatibilityRefresh());
   const [localCompatibilityExpanded, setLocalCompatibilityExpanded] = useState(false);
   const [localCompatibilityFilter, setLocalCompatibilityFilter] = useState<CompatibilityFilter>('all');
   const localCompatibilityRequests = useRef(new CompatibilityRequestTracker());
@@ -627,12 +629,14 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     } catch (error) {
       if (localCompatibilityRequests.current.isCurrent(gen)) setLocalCompatibilityError(String(error));
     } finally {
-      localCompatibilityRequests.current.finish(gen);
+      const rerunRequested = localCompatibilityRequests.current.finish(gen);
       if (localCompatibilityRequests.current.isCurrent(gen)) setLocalCompatibilityLoading(false);
+      if (rerunRequested) void refreshLocalCompatibility();
     }
   }, [contentType, instanceName]);
 
   const loadItems = useCallback(async () => {
+    deferredCompatibilityRefresh.current.clear();
     if (contentType === 'mod') {
       invalidateLocalCompatibility();
       void refreshLocalCompatibility();
@@ -731,12 +735,6 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       }
     } catch (e: any) {
       if (gen === loadGen.current) {
-        if (contentType === 'mod') {
-          setLocalCompatibility(null);
-          setLocalCompatibilityCheckedAt(null);
-          setLocalCompatibilityError(String(e));
-          setLocalCompatibilityLoading(false);
-        }
         addToast(t('manager.load_error', { label, error: e.toString() }), 'error');
         setLoading(false);
         setIconsResolving(false);
@@ -773,8 +771,10 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   // NOT tear down and recreate the backend watcher on every click.
   const skipReloadRef = useRef(false);
   useEffect(() => {
-    skipReloadRef.current = !!(showBrowser || checkingUpdates || updates || contextMenu);
-  }, [showBrowser, checkingUpdates, updates, contextMenu]);
+    const shouldSkip = !!(showBrowser || checkingUpdates || updates || contextMenu);
+    skipReloadRef.current = shouldSkip;
+    if (deferredCompatibilityRefresh.current.consume(shouldSkip || isFrozen)) loadItems();
+  }, [showBrowser, checkingUpdates, updates, contextMenu, isFrozen, loadItems]);
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
@@ -795,11 +795,14 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
           // Only react if the change is in the subfolder we currently display
           if (e.payload.instance !== instanceName) return;
           if (e.payload.subfolder !== subfolder) return;
-          if (skipReloadRef.current) return;
           // While the launcher is frozen (unfocused during a game), defer the reload
           // — a single loadItems will be triggered by the [isFrozen] effect below
           // when focus returns. This avoids running fetches in the background.
           if (isFrozen) return;
+          if (skipReloadRef.current) {
+            deferredCompatibilityRefresh.current.defer();
+            return;
+          }
           loadItems();
         });
         if (cancelled) {
