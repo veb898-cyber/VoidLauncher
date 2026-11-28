@@ -3457,6 +3457,23 @@ pub(crate) fn get_mod_metadata(
     config: &AppConfig,
     instance_name: &str,
 ) -> crate::error::Result<Vec<ModMetadata>> {
+    get_mod_metadata_impl(config, instance_name, true)
+}
+
+/// Read cached or parsed metadata without recovering files from an interrupted
+/// update. Diagnostic scans must never rename or otherwise repair installed files.
+pub(crate) fn get_mod_metadata_read_only(
+    config: &AppConfig,
+    instance_name: &str,
+) -> crate::error::Result<Vec<ModMetadata>> {
+    get_mod_metadata_impl(config, instance_name, false)
+}
+
+fn get_mod_metadata_impl(
+    config: &AppConfig,
+    instance_name: &str,
+    recover_stashed_files: bool,
+) -> crate::error::Result<Vec<ModMetadata>> {
     let instance = instances::get_instance(&config.instances_dir(), instance_name)?;
     let mods_dir = instance.minecraft_dir(&config.instances_dir()).join("mods");
     if !mods_dir.exists() {
@@ -3475,7 +3492,9 @@ pub(crate) fn get_mod_metadata(
     // Roll back any file parked by an interrupted update before scanning —
     // otherwise the mod stays invisible (a parked name is not a .jar and is
     // skipped by this listing) until some other screen happens to recover it.
-    instances::recover_stashed_content_files(&mods_dir);
+    if recover_stashed_files {
+        instances::recover_stashed_content_files(&mods_dir);
+    }
     let pw_index = std::sync::Arc::new(instances::load_packwiz_index(&mods_dir));
 
     // Collect candidate files (cheap stat calls) before spawning workers.
