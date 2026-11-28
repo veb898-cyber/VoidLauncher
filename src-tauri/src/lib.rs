@@ -4,6 +4,7 @@ mod auth;
 pub mod authlib_injector;
 mod bug_report;
 mod commands;
+pub mod compatibility;
 pub mod config;
 mod content;
 mod content_install;

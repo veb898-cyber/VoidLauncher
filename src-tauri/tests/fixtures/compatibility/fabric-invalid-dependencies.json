@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "id": "invalid_dependency_fixture",
+  "version": "1.0.0",
+  "depends": {"library": ["[2.0,3.0)", 42]}
+}

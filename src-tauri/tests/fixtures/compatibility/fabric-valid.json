@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "compatibility_fixture",
+  "version": "1.0.0",
+  "provides": ["compatibility_fixture_legacy"],
+  "depends": {
+    "minecraft": ["1.20.1", "~1.20.1"],
+    "fabricloader": ">=0.15.0"
+  },
+  "recommends": {"recommended_lib": "*"},
+  "suggests": {"suggested_lib": "*"},
+  "conflicts": {"soft_conflict": "*"},
+  "breaks": {"hard_conflict": "[1.0,2.0)"}
+}
