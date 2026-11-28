@@ -836,6 +836,47 @@ pub struct ModMetadata {
     /// warnings in the compatibility check.
     #[serde(default)]
     pub slug_verified: bool,
+    /// Runtime mod entries and their declared relationships, parsed from the JAR.
+    /// Internal mod IDs here are independent of provider project IDs.
+    #[serde(default)]
+    pub mod_entries: Vec<ModEntryMetadata>,
+    /// False when the descriptor is malformed, incomplete, or uses unknown
+    /// relationship syntax. Consumers must report uncertainty in that case.
+    #[serde(default)]
+    pub metadata_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModEntryMetadata {
+    pub mod_id: String,
+    pub version: Option<String>,
+    pub source: String,
+    /// Fabric aliases resolved by the loader as IDs provided by this entry.
+    #[serde(default)]
+    pub provides: Vec<String>,
+    pub dependencies: Vec<ModDependencyMetadata>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModDependencyMetadata {
+    pub mod_id: String,
+    pub requirement: Option<String>,
+    /// Alternate Fabric ranges use OR semantics.
+    #[serde(default)]
+    pub alternatives: Vec<String>,
+    /// CLIENT / SERVER / BOTH for Forge-family dependencies.
+    #[serde(default)]
+    pub side: Option<String>,
+    #[serde(default = "default_true")]
+    pub complete: bool,
+    /// required / optional / recommended / suggested / incompatible /
+    /// discouraged / breaks / conflicts / unknown
+    pub kind: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// All sidecar fields `get_mod_metadata` needs, read from the sidecar file
@@ -2964,6 +3005,8 @@ pub async fn cmd_list_instance_mods(
                     slug,
                     project_id,
                     slug_verified,
+                    mod_entries: meta.mod_entries.clone(),
+                    metadata_complete: meta.metadata_complete,
                 });
             }
         }
@@ -3200,7 +3243,7 @@ static META_CACHE_FILE: OnceLock<PathBuf> = OnceLock::new();
 /// Bump when jar parsing changes in a way that alters stored values:
 /// persisted entries are keyed only by path+mtime+size and would otherwise
 /// survive a parser change with stale results.
-const META_CACHE_VERSION: u32 = 8;
+const META_CACHE_VERSION: u32 = 9;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MetaCacheFile {
@@ -3700,6 +3743,8 @@ fn build_mod_metadata(
         slug,
         project_id,
         slug_verified,
+        mod_entries: meta.mod_entries.clone(),
+        metadata_complete: meta.metadata_complete,
     }
 }
 
@@ -3841,6 +3886,8 @@ pub(crate) struct ModMetaResult {
     /// True when at least one supported mod descriptor was found. A JAR with
     /// no descriptor is a local/unknown drop, not an arbitrary-loader mod.
     pub(crate) has_descriptor: bool,
+    pub(crate) mod_entries: Vec<ModEntryMetadata>,
+    pub(crate) metadata_complete: bool,
 }
 
 impl ModMetaResult {
@@ -3947,6 +3994,8 @@ struct ModDescriptor {
     /// True when `name` came from a human-readable display name rather than a
     /// fallback to the mod id. Used to pick the combined display name.
     name_from_display: bool,
+    entries: Vec<ModEntryMetadata>,
+    complete: bool,
 }
 
 fn fallback_meta_from_filename(path: &std::path::Path) -> ModMetaResult {
@@ -3981,6 +4030,8 @@ fn fallback_meta_from_filename(path: &std::path::Path) -> ModMetaResult {
         // visible under every mod loader (the historical behaviour), but no
         // loader is claimed for it.
         has_descriptor: false,
+        mod_entries: Vec::new(),
+        metadata_complete: false,
     }
 }
 
@@ -3999,18 +4050,15 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
         Ok(a) => a,
         Err(_) => return fallback_meta_from_filename(path),
     };
-    if let Some(meta) = parse_mod_meta_archive(&mut archive) {
-        if !meta.loaders.is_empty() {
-            return meta;
-        }
-        // A recognized but unsupported descriptor (for example Quilt) in the
-        // outer archive must not hide a supported descriptor in a nested jar.
-        if let Some(nested) = read_nested_jar_meta(&mut archive) {
-            return nested;
-        }
-        return meta;
-    }
-    if let Some(meta) = read_nested_jar_meta(&mut archive) {
+    let mut remaining_bytes = 128 * 1024 * 1024;
+    let mut remaining_jars = 64;
+    let (meta, _) = read_mod_meta_archive_with_nested(
+        &mut archive,
+        0,
+        &mut remaining_bytes,
+        &mut remaining_jars,
+    );
+    if let Some(meta) = meta {
         return meta;
     }
 
@@ -4018,45 +4066,172 @@ fn read_mod_meta_from_jar(path: &std::path::Path) -> ModMetaResult {
     fallback_meta_from_filename(path)
 }
 
-/// Read metadata from a JarJar / Fabric nested jar. Sinytra Connector, for
-/// example, has no metadata in the outer archive: the real mod descriptor
-/// lives in `META-INF/jarjar/*.jar`.
+const MAX_NESTED_JAR_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NESTED_DEPTH: usize = 8;
+
+fn read_mod_meta_archive_with_nested<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    depth: usize,
+    remaining_bytes: &mut u64,
+    remaining_jars: &mut usize,
+) -> (Option<ModMetaResult>, bool) {
+    let outer = parse_mod_meta_archive(archive);
+    let (nested, nested_complete) =
+        read_nested_jar_meta(archive, depth, remaining_bytes, remaining_jars);
+    let mut combined = outer;
+    if let Some(inner) = nested {
+        match combined.as_mut() {
+            Some(meta) if meta.loaders.is_empty() && !inner.loaders.is_empty() => {
+                let mut preferred = inner;
+                preferred.metadata_complete &= meta.metadata_complete && nested_complete;
+                preferred
+                    .mod_entries
+                    .extend(std::mem::take(&mut meta.mod_entries));
+                combined = Some(preferred);
+            }
+            Some(meta) => {
+                meta.metadata_complete &= inner.metadata_complete && nested_complete;
+                meta.mod_entries.extend(inner.mod_entries);
+            }
+            None => {
+                let mut inner = inner;
+                inner.metadata_complete &= nested_complete;
+                combined = Some(inner);
+            }
+        }
+    } else if let Some(meta) = combined.as_mut() {
+        meta.metadata_complete &= nested_complete;
+    }
+    (combined, nested_complete)
+}
+
+/// Read only nested archives explicitly declared by Fabric metadata or the
+/// Forge-family JarJar manifest. Arbitrary libraries under META-INF are not
+/// active mods merely because their paths resemble a nested-JAR directory.
 fn read_nested_jar_meta<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
-) -> Option<ModMetaResult> {
-    const MAX_NESTED_JAR_BYTES: u64 = 64 * 1024 * 1024;
-    let candidates: Vec<String> = (0..archive.len())
-        .filter_map(|i| {
-            archive
-                .by_index(i)
-                .ok()
-                .and_then(|file| file.name().ok().map(|name| name.into_owned()))
-        })
-        .filter(|name| {
-            (name.starts_with("META-INF/jarjar/") || name.starts_with("META-INF/jars/"))
-                && name.ends_with(".jar")
-        })
-        .collect();
-    for name in candidates {
+    depth: usize,
+    remaining_bytes: &mut u64,
+    remaining_jars: &mut usize,
+) -> (Option<ModMetaResult>, bool) {
+    let (candidates, mut complete) = declared_nested_jar_paths(archive);
+    if candidates.is_empty() {
+        return (None, complete);
+    }
+    if depth >= MAX_NESTED_DEPTH {
+        return (None, false);
+    }
+    if candidates.len() > *remaining_jars {
+        complete = false;
+    }
+    let mut combined: Option<ModMetaResult> = None;
+    for name in candidates.into_iter().take(*remaining_jars) {
+        *remaining_jars -= 1;
         let Ok(mut file) = archive.by_name(&name) else {
+            complete = false;
             continue;
         };
         let size = file.size();
-        if size == 0 || size > MAX_NESTED_JAR_BYTES {
+        if size == 0 || size > MAX_NESTED_JAR_BYTES || size > *remaining_bytes {
+            complete = false;
             continue;
         }
+        *remaining_bytes -= size;
         let mut bytes = Vec::with_capacity(size as usize);
         if file.read_to_end(&mut bytes).is_err() {
+            complete = false;
             continue;
         }
+        drop(file);
         let Ok(mut nested) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+            complete = false;
             continue;
         };
-        if let Some(meta) = parse_mod_meta_archive(&mut nested) {
-            return Some(meta);
+        let (meta, nested_complete) = read_mod_meta_archive_with_nested(
+            &mut nested,
+            depth + 1,
+            remaining_bytes,
+            remaining_jars,
+        );
+        complete &= nested_complete;
+        if let Some(mut meta) = meta {
+            for entry in &mut meta.mod_entries {
+                entry.source = format!("{}!{}", name, entry.source);
+            }
+            if let Some(existing) = combined.as_mut() {
+                existing.metadata_complete &= meta.metadata_complete;
+                existing.mod_entries.append(&mut meta.mod_entries);
+            } else {
+                combined = Some(meta);
+            }
         }
     }
-    None
+    (combined, complete)
+}
+
+fn declared_nested_jar_paths<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> (Vec<String>, bool) {
+    let mut paths = Vec::new();
+    let mut complete = true;
+    if archive.by_name("fabric.mod.json").is_ok() {
+        match read_zip_text_limited(archive, "fabric.mod.json", MAX_MOD_METADATA_BYTES)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        {
+            Some(json) => {
+                if let Some(value) = json.get("jars") {
+                    if let Some(entries) = value.as_array() {
+                        for entry in entries {
+                            let path = entry.get("file").and_then(serde_json::Value::as_str);
+                            if let Some(path) = path.filter(|path| safe_nested_jar_path(path)) {
+                                paths.push(path.to_string());
+                            } else {
+                                complete = false;
+                            }
+                        }
+                    } else {
+                        complete = false;
+                    }
+                }
+            }
+            None => complete = false,
+        }
+    }
+    const JARJAR_MANIFEST: &str = "META-INF/jarjar/metadata.json";
+    if archive.by_name(JARJAR_MANIFEST).is_ok() {
+        match read_zip_text_limited(archive, JARJAR_MANIFEST, MAX_MOD_METADATA_BYTES)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        {
+            Some(json) => match json.get("jars").and_then(serde_json::Value::as_array) {
+                Some(entries) => {
+                    for entry in entries {
+                        let path = entry.get("path").and_then(serde_json::Value::as_str);
+                        if let Some(path) = path.filter(|path| safe_nested_jar_path(path)) {
+                            paths.push(path.to_string());
+                        } else {
+                            complete = false;
+                        }
+                    }
+                }
+                None => complete = false,
+            },
+            None => complete = false,
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    (paths, complete)
+}
+
+fn safe_nested_jar_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains(':')
+        && path.to_ascii_lowercase().ends_with(".jar")
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 const MAX_MOD_METADATA_BYTES: u64 = 2 * 1024 * 1024;
@@ -4162,7 +4337,41 @@ fn parse_mod_meta_archive<R: std::io::Read + std::io::Seek>(
         }
     }
 
-    combine_descriptors(descriptors, has_unknown_descriptor(archive))
+    let incomplete = has_malformed_supported_descriptor(archive);
+    combine_descriptors(descriptors, has_unknown_descriptor(archive), incomplete)
+}
+
+fn has_malformed_supported_descriptor<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> bool {
+    [
+        "fabric.mod.json",
+        "META-INF/neoforge.mods.toml",
+        "META-INF/mods.toml",
+    ]
+    .iter()
+    .any(|name| {
+        archive.by_name(name).is_ok()
+            && match *name {
+                "fabric.mod.json" => parse_descriptor_probe(archive, name, true),
+                _ => parse_descriptor_probe(archive, name, false),
+            }
+    })
+}
+
+fn parse_descriptor_probe<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+    json: bool,
+) -> bool {
+    let Some(raw) = read_zip_text_limited(archive, name, MAX_MOD_METADATA_BYTES) else {
+        return true;
+    };
+    if json {
+        serde_json::from_str::<serde_json::Value>(&raw).is_err()
+    } else {
+        raw.parse::<toml::Table>().is_err()
+    }
 }
 
 /// Append a descriptor unless the same loader was already found. The first
@@ -4184,10 +4393,10 @@ fn parse_fabric_descriptor<R: std::io::Read + std::io::Seek>(
     let contents = read_zip_text_limited(archive, "fabric.mod.json", MAX_MOD_METADATA_BYTES)?;
     let json = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
 
-    let id = json["id"]
+    let raw_id = json["id"]
         .as_str()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Unknown");
+        .filter(|value| is_well_formed_mod_id(value));
+    let id = raw_id.unwrap_or("Unknown");
     let display =
         usable_mod_name(json["name"].as_str().unwrap_or(""), Some(id)).map(str::to_string);
     let name = display.clone().unwrap_or_else(|| id.to_string());
@@ -4206,6 +4415,26 @@ fn parse_fabric_descriptor<R: std::io::Read + std::io::Seek>(
         .and_then(|value| value.as_str())
         .and_then(sanitize_homepage);
 
+    let (dependencies, dependencies_complete) = parse_fabric_dependencies(&json);
+    let (provides, provides_complete) = parse_fabric_provides(&json);
+    let entry_version = compatibility_version(json.get("version").and_then(|value| value.as_str()));
+    let entry_complete = json.get("schemaVersion").and_then(|value| value.as_u64()) == Some(1)
+        && raw_id.is_some()
+        && entry_version.is_some()
+        && dependencies_complete
+        && provides_complete;
+    let entries = raw_id
+        .map(|mod_id| ModEntryMetadata {
+            mod_id: mod_id.to_string(),
+            version: entry_version,
+            source: "fabric.mod.json".to_string(),
+            provides,
+            dependencies,
+            complete: entry_complete,
+        })
+        .into_iter()
+        .collect();
+
     Some(ModDescriptor {
         loader: "Fabric",
         name: instances::strip_minecraft_color_codes(&name),
@@ -4215,7 +4444,99 @@ fn parse_fabric_descriptor<R: std::io::Read + std::io::Seek>(
         authors,
         homepage,
         name_from_display: display.is_some(),
+        entries,
+        complete: entry_complete,
     })
+}
+
+fn parse_fabric_dependencies(json: &serde_json::Value) -> (Vec<ModDependencyMetadata>, bool) {
+    let mut dependencies = Vec::new();
+    let mut complete = true;
+    for (field, kind) in [
+        ("depends", "required"),
+        ("recommends", "recommended"),
+        ("suggests", "suggested"),
+        ("conflicts", "conflicts"),
+        ("breaks", "breaks"),
+    ] {
+        let Some(value) = json.get(field) else {
+            continue;
+        };
+        let Some(entries) = value.as_object() else {
+            complete = false;
+            continue;
+        };
+        for (mod_id, requirement) in entries {
+            if !is_well_formed_mod_id(mod_id) {
+                complete = false;
+                continue;
+            }
+            let (requirement, alternatives, dependency_complete) = match requirement {
+                serde_json::Value::String(value) => (Some(value.clone()), Vec::new(), true),
+                serde_json::Value::Array(values) => {
+                    let alternatives: Vec<String> = values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect();
+                    let valid = !alternatives.is_empty() && alternatives.len() == values.len();
+                    (None, alternatives, valid)
+                }
+                _ => (None, Vec::new(), false),
+            };
+            complete &= dependency_complete;
+            dependencies.push(ModDependencyMetadata {
+                mod_id: mod_id.clone(),
+                requirement,
+                alternatives,
+                side: None,
+                complete: dependency_complete,
+                kind: kind.to_string(),
+            });
+        }
+    }
+    (dependencies, complete)
+}
+
+fn parse_fabric_provides(json: &serde_json::Value) -> (Vec<String>, bool) {
+    let Some(value) = json.get("provides") else {
+        return (Vec::new(), true);
+    };
+    let Some(values) = value.as_array() else {
+        return (Vec::new(), false);
+    };
+    let mut provides = Vec::new();
+    let mut complete = true;
+    for value in values {
+        if let Some(id) = value.as_str().filter(|id| is_well_formed_mod_id(id)) {
+            if !provides.iter().any(|existing| existing == id) {
+                provides.push(id.to_string());
+            }
+        } else {
+            complete = false;
+        }
+    }
+    (provides, complete)
+}
+
+fn is_well_formed_mod_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (2..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn is_valid_forge_mod_id(value: &str) -> bool {
+    (2..=64).contains(&value.len())
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn parse_toml_descriptor<R: std::io::Read + std::io::Seek>(
@@ -4232,8 +4553,13 @@ fn parse_toml_descriptor<R: std::io::Read + std::io::Seek>(
     let mut logo = None;
     let mut authors: Vec<String> = Vec::new();
     let mut homepage = None;
+    let mut entries = Vec::new();
+    let mut complete = false;
 
     if let Ok(toml_val) = contents.parse::<toml::Table>() {
+        let parsed = parse_toml_mod_entries(&toml_val, path, manifest_version, loader);
+        entries = parsed.0;
+        complete = parsed.1;
         if let Some(mods_arr) = toml_val.get("mods").and_then(|value| value.as_array()) {
             let picked = mods_arr
                 .iter()
@@ -4329,7 +4655,157 @@ fn parse_toml_descriptor<R: std::io::Read + std::io::Seek>(
         authors,
         homepage,
         name_from_display: display.is_some(),
+        entries,
+        complete,
     })
+}
+
+fn parse_toml_mod_entries(
+    root: &toml::Table,
+    source: &str,
+    manifest_version: &str,
+    loader: &str,
+) -> (Vec<ModEntryMetadata>, bool) {
+    let Some(mods) = root.get("mods").and_then(toml::Value::as_array) else {
+        return (Vec::new(), false);
+    };
+    let mut complete = true;
+    let mut entries = Vec::new();
+    for item in mods {
+        let Some(table) = item.as_table() else {
+            complete = false;
+            continue;
+        };
+        let Some(mod_id) = table
+            .get("modId")
+            .and_then(toml::Value::as_str)
+            .filter(|id| is_valid_forge_mod_id(id))
+        else {
+            complete = false;
+            continue;
+        };
+        let raw_version = table.get("version").and_then(toml::Value::as_str);
+        let raw_version = if raw_version == Some("${file.jarVersion}") {
+            Some(manifest_version)
+        } else {
+            raw_version.or(Some("1"))
+        };
+        let version = compatibility_version(raw_version);
+        let (dependencies, deps_complete) = parse_toml_dependencies(root, mod_id, loader);
+        let entry_complete = version.is_some() && deps_complete;
+        complete &= entry_complete;
+        entries.push(ModEntryMetadata {
+            mod_id: mod_id.to_string(),
+            version,
+            source: source.to_string(),
+            provides: Vec::new(),
+            dependencies,
+            complete: entry_complete,
+        });
+    }
+    if entries.is_empty() {
+        complete = false;
+    }
+    (entries, complete)
+}
+
+fn compatibility_version(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("unknown")
+        || value.contains(['$', '{', '}'])
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn parse_toml_dependencies(
+    root: &toml::Table,
+    owner_mod_id: &str,
+    loader: &str,
+) -> (Vec<ModDependencyMetadata>, bool) {
+    let mut dependencies = Vec::new();
+    let mut complete = true;
+    let Some(groups) = root.get("dependencies") else {
+        return (dependencies, true);
+    };
+    let Some(groups) = groups.as_table() else {
+        return (dependencies, false);
+    };
+    let Some(group) = groups.get(owner_mod_id) else {
+        return (dependencies, true);
+    };
+    let Some(items) = group.as_array() else {
+        return (dependencies, false);
+    };
+    for item in items {
+        let Some(table) = item.as_table() else {
+            complete = false;
+            continue;
+        };
+        let Some(mod_id) = table
+            .get("modId")
+            .and_then(toml::Value::as_str)
+            .filter(|id| is_valid_forge_mod_id(id))
+        else {
+            complete = false;
+            continue;
+        };
+        let explicit_type = table.get("type").and_then(toml::Value::as_str);
+        let is_neoforge = loader == "NeoForge";
+        let (kind, kind_complete) = if is_neoforge {
+            match explicit_type.map(str::to_ascii_lowercase).as_deref() {
+                Some("required") => ("required", true),
+                Some("optional") => ("optional", true),
+                Some("incompatible") => ("incompatible", true),
+                Some("discouraged") => ("discouraged", true),
+                Some(_) => ("unknown", false),
+                None if table.get("type").is_none() => ("required", true),
+                None => ("unknown", false),
+            }
+        } else if table.get("type").is_some() {
+            ("unknown", false)
+        } else {
+            match table.get("mandatory").and_then(toml::Value::as_bool) {
+                Some(true) => ("required", true),
+                Some(false) => ("optional", true),
+                None => ("unknown", false),
+            }
+        };
+        complete &= kind_complete;
+        let range_value = table.get("versionRange").or_else(|| table.get("version"));
+        let (requirement, range_complete) = match range_value {
+            Some(value) => match value.as_str() {
+                Some("") if !is_neoforge => (None, true),
+                Some(value) => (Some(value.to_string()), true),
+                None => (None, false),
+            },
+            None => (None, true),
+        };
+        complete &= range_complete;
+        let (side, side_complete) = match table.get("side") {
+            None => (None, true),
+            Some(value) => match value.as_str().map(str::to_ascii_uppercase).as_deref() {
+                Some("CLIENT") => (Some("CLIENT".to_string()), true),
+                Some("SERVER") => (Some("SERVER".to_string()), true),
+                Some("BOTH") => (Some("BOTH".to_string()), true),
+                _ => (None, false),
+            },
+        };
+        complete &= side_complete;
+        dependencies.push(ModDependencyMetadata {
+            mod_id: mod_id.to_string(),
+            requirement,
+            alternatives: Vec::new(),
+            side,
+            complete: kind_complete && range_complete && side_complete,
+            kind: kind.to_string(),
+        });
+    }
+    (dependencies, complete)
 }
 
 fn parse_legacy_forge_descriptor<R: std::io::Read + std::io::Seek>(
@@ -4398,6 +4874,29 @@ fn parse_legacy_forge_descriptor<R: std::io::Read + std::io::Seek>(
             authors,
             homepage,
             name_from_display: display.is_some(),
+            entries: entries
+                .iter()
+                .filter_map(|entry| {
+                    let id = entry.get("modid")?.as_str()?.trim();
+                    if id.is_empty() {
+                        return None;
+                    }
+                    Some(ModEntryMetadata {
+                        mod_id: id.to_string(),
+                        version: entry
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        source: info_name.to_string(),
+                        provides: Vec::new(),
+                        dependencies: Vec::new(),
+                        // mcmod.info has no standardized dependency declaration;
+                        // absence cannot prove that no dependency exists.
+                        complete: false,
+                    })
+                })
+                .collect(),
+            complete: false,
         });
     }
     None
@@ -4423,8 +4922,9 @@ fn has_unknown_descriptor<R: std::io::Read + std::io::Seek>(
 fn combine_descriptors(
     descriptors: Vec<ModDescriptor>,
     unknown_descriptor: bool,
+    incomplete_descriptor: bool,
 ) -> Option<ModMetaResult> {
-    if descriptors.is_empty() && !unknown_descriptor {
+    if descriptors.is_empty() && !unknown_descriptor && !incomplete_descriptor {
         return None;
     }
 
@@ -4475,7 +4975,13 @@ fn combine_descriptors(
         slug,
         authors,
         homepage,
-        has_descriptor: true,
+        // A malformed recognized descriptor must remain visible as an
+        // unknown local mod; it is not a valid loader declaration.
+        has_descriptor: !descriptors.is_empty() || unknown_descriptor,
+        mod_entries: descriptors.iter().flat_map(|d| d.entries.clone()).collect(),
+        metadata_complete: !unknown_descriptor
+            && !incomplete_descriptor
+            && descriptors.iter().all(|descriptor| descriptor.complete),
     })
 }
 
@@ -5053,6 +5559,8 @@ mod meta_cache_file_tests {
             slug: Some("sodium".into()),
             project_id: Some("AANobbMI".into()),
             slug_verified: true,
+            mod_entries: Vec::new(),
+            metadata_complete: false,
         }
     }
 
@@ -5073,6 +5581,421 @@ mod meta_cache_file_tests {
             zip.write_all(contents.as_bytes()).expect("write zip entry");
         }
         zip.finish().expect("finish jar");
+    }
+
+    fn write_jar_bytes(path: &std::path::Path, files: &[(&str, &[u8])]) {
+        use std::io::Write as _;
+        let file = std::fs::File::create(path).expect("create jar");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, contents) in files {
+            zip.start_file(*name, options).expect("start zip entry");
+            zip.write_all(contents).expect("write zip entry");
+        }
+        zip.finish().expect("finish jar");
+    }
+
+    fn jar_bytes(tag: &str, id: &str) -> (PathBuf, Vec<u8>) {
+        let dir = test_dir(tag);
+        let path = dir.join("nested.jar");
+        write_jar(
+            &path,
+            &[(
+                "fabric.mod.json",
+                &format!(r#"{{"schemaVersion":1,"id":"{id}","version":"1.0.0"}}"#),
+            )],
+        );
+        let bytes = std::fs::read(&path).expect("read nested jar");
+        (dir, bytes)
+    }
+
+    #[test]
+    fn fabric_descriptor_extracts_all_entries_and_relationships() {
+        let dir = test_dir("compat-fabric-relationships");
+        let jar = dir.join("example.jar");
+        write_jar(
+            &jar,
+            &[(
+                "fabric.mod.json",
+                r#"{
+          "schemaVersion": 1,
+          "id": "example", "version": "1.2.0",
+          "depends": {"minecraft": ">=1.20", "shared": ["<2", ">=2.5"]},
+          "conflicts": {"warning_mod": "*"},
+          "breaks": {"broken": "*"},
+          "provides": ["old_example"]
+        }"#,
+            )],
+        );
+
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(meta.mod_entries.len(), 1);
+        let entry = &meta.mod_entries[0];
+        assert_eq!(entry.mod_id, "example");
+        assert_eq!(entry.version.as_deref(), Some("1.2.0"));
+        assert_eq!(entry.source, "fabric.mod.json");
+        assert!(entry.dependencies.iter().any(|d| d.mod_id == "shared"
+            && d.kind == "required"
+            && d.alternatives == vec!["<2", ">=2.5"]));
+        assert!(entry
+            .dependencies
+            .iter()
+            .any(|d| d.mod_id == "warning_mod" && d.kind == "conflicts"));
+        assert!(entry
+            .dependencies
+            .iter()
+            .any(|d| d.mod_id == "broken" && d.kind == "breaks"));
+        assert_eq!(entry.provides, vec!["old_example"]);
+        assert!(meta.metadata_complete);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn forge_and_neoforge_dependency_defaults_follow_their_own_formats() {
+        let cases = [
+            ("Forge", "META-INF/mods.toml", ""),
+            (
+                "NeoForge",
+                "META-INF/neoforge.mods.toml",
+                "[[dependencies.example]]\nmodId = \"library\"\n",
+            ),
+        ];
+        for (loader, path, dependency_text) in cases {
+            let dir = test_dir(&format!("compat-{loader}-defaults"));
+            let jar = dir.join("example.jar");
+            let toml =
+                format!("[[mods]]\nmodId = \"example\"\nversion = \"1.0\"\n{dependency_text}");
+            write_jar(&jar, &[(path, toml.as_str())]);
+            let meta = read_mod_meta_from_jar_pub(&jar);
+            assert!(
+                meta.metadata_complete,
+                "{loader} defaults should be understood"
+            );
+            let entry = meta
+                .mod_entries
+                .iter()
+                .find(|entry| entry.mod_id == "example")
+                .unwrap();
+            if loader == "NeoForge" {
+                assert!(entry
+                    .dependencies
+                    .iter()
+                    .any(|dep| { dep.mod_id == "library" && dep.kind == "required" }));
+            } else {
+                assert!(entry.dependencies.is_empty());
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn malformed_fabric_descriptor_is_incomplete_not_a_false_conflict() {
+        let dir = test_dir("compat-fabric-malformed");
+        let jar = dir.join("broken.jar");
+        write_jar(&jar, &[("fabric.mod.json", "{invalid json")]);
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert!(meta.mod_entries.is_empty());
+        assert!(!meta.metadata_complete);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fabric_invalid_mod_ids_are_not_treated_as_complete_metadata() {
+        let dir = test_dir("compat-fabric-invalid-id");
+        let jar = dir.join("invalid.jar");
+        write_jar(
+            &jar,
+            &[(
+                "fabric.mod.json",
+                r#"{"schemaVersion":1,"id":"Bad.Id","version":"1.0.0"}"#,
+            )],
+        );
+
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert!(!meta.metadata_complete);
+        assert!(meta.mod_entries.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn representative_loader_fixtures_preserve_format_specific_dependency_semantics() {
+        let cases = [
+            (
+                "Forge",
+                "META-INF/mods.toml",
+                include_str!("../../tests/fixtures/compatibility/forge-multi.toml"),
+            ),
+            (
+                "NeoForge",
+                "META-INF/neoforge.mods.toml",
+                include_str!("../../tests/fixtures/compatibility/neoforge-multi.toml"),
+            ),
+        ];
+        for (loader, descriptor, contents) in cases {
+            let dir = test_dir(&format!("compat-real-fixture-{loader}"));
+            let jar = dir.join("fixture.jar");
+            write_jar(&jar, &[(descriptor, contents)]);
+            let meta = read_mod_meta_from_jar_pub(&jar);
+            assert!(
+                meta.metadata_complete,
+                "{loader} fixture should parse completely"
+            );
+            assert_eq!(meta.mod_entries.len(), 2);
+            let first = &meta.mod_entries[0];
+            if loader == "Forge" {
+                assert_eq!(first.mod_id, "forge_fixture");
+                assert!(first.dependencies.iter().any(|dep| {
+                    dep.mod_id == "dedicated_server_api" && dep.side.as_deref() == Some("SERVER")
+                }));
+                assert!(meta.mod_entries[1].dependencies.iter().any(|dep| {
+                    dep.mod_id == "optional_lib"
+                        && dep.kind == "optional"
+                        && dep.requirement.is_none()
+                }));
+            } else {
+                assert_eq!(first.mod_id, "neo_fixture");
+                assert!(first
+                    .dependencies
+                    .iter()
+                    .any(|dep| { dep.mod_id == "minecraft" && dep.kind == "required" }));
+                assert!(meta.mod_entries[1]
+                    .dependencies
+                    .iter()
+                    .any(|dep| { dep.mod_id == "optional_lib" && dep.kind == "optional" }));
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        let dir = test_dir("compat-real-fixture-fabric");
+        let jar = dir.join("fabric-fixture.jar");
+        write_jar(
+            &jar,
+            &[(
+                "fabric.mod.json",
+                include_str!("../../tests/fixtures/compatibility/fabric-valid.json"),
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert!(meta.metadata_complete);
+        let entry = &meta.mod_entries[0];
+        assert_eq!(entry.mod_id, "compatibility_fixture");
+        assert_eq!(entry.provides, vec!["compatibility_fixture_legacy"]);
+        assert!(entry.dependencies.iter().any(|dep| {
+            dep.mod_id == "minecraft" && dep.alternatives == vec!["1.20.1", "~1.20.1"]
+        }));
+        assert!(entry
+            .dependencies
+            .iter()
+            .any(|dep| dep.mod_id == "soft_conflict" && dep.kind == "conflicts"));
+        assert!(entry
+            .dependencies
+            .iter()
+            .any(|dep| dep.mod_id == "hard_conflict" && dep.kind == "breaks"));
+        let _ = std::fs::remove_dir_all(dir);
+
+        let dir = test_dir("compat-real-fixture-fabric-invalid");
+        let jar = dir.join("fabric-invalid.jar");
+        write_jar(
+            &jar,
+            &[(
+                "fabric.mod.json",
+                include_str!("../../tests/fixtures/compatibility/fabric-invalid-dependencies.json"),
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert!(!meta.metadata_complete);
+        assert!(!meta.mod_entries[0].dependencies[0].complete);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn forge_and_neoforge_toml_keep_multiple_mod_entries_and_dependency_kinds() {
+        for (loader, path, toml) in [
+            (
+                "Forge",
+                "META-INF/mods.toml",
+                r#"
+                    modLoader = "javafml"
+                    loaderVersion = "[47,)"
+                    license = "MIT"
+                    [[mods]]
+                    modId = "first"
+                    version = "1.0.0"
+                    [[mods]]
+                    modId = "second"
+                    version = "2.0.0"
+                    [[dependencies.first]]
+                    modId = "minecraft"
+                    mandatory = true
+                    versionRange = "[1.20,1.21)"
+                    side = "BOTH"
+                    [[dependencies.second]]
+                    modId = "library"
+                    mandatory = false
+                "#,
+            ),
+            (
+                "NeoForge",
+                "META-INF/neoforge.mods.toml",
+                r#"
+                    modLoader = "javafml"
+                    loaderVersion = "[1,)"
+                    license = "MIT"
+                    [[mods]]
+                    modId = "first"
+                    version = "1.0.0"
+                    [[mods]]
+                    modId = "second"
+                    version = "2.0.0"
+                    [[dependencies.first]]
+                    modId = "minecraft"
+                    type = "required"
+                    versionRange = "[1.20,1.21)"
+                    side = "BOTH"
+                    [[dependencies.first]]
+                    modId = "blocked"
+                    type = "incompatible"
+                    [[dependencies.second]]
+                    modId = "library"
+                    type = "optional"
+                "#,
+            ),
+        ] {
+            let dir = test_dir(&format!("compat-{loader}-toml"));
+            let jar = dir.join("multi.jar");
+            write_jar(&jar, &[(path, toml)]);
+            let meta = read_mod_meta_from_jar_pub(&jar);
+            assert_eq!(meta.loaders, vec![loader]);
+            assert_eq!(meta.mod_entries.len(), 2);
+            assert!(meta
+                .mod_entries
+                .iter()
+                .any(|entry| entry.mod_id == "first" && entry.source == path));
+            let first = meta
+                .mod_entries
+                .iter()
+                .find(|entry| entry.mod_id == "first")
+                .unwrap();
+            assert!(first
+                .dependencies
+                .iter()
+                .any(|dep| dep.mod_id == "minecraft"
+                    && dep.kind == "required"
+                    && dep.requirement.as_deref() == Some("[1.20,1.21)")));
+            if loader == "NeoForge" {
+                assert!(first
+                    .dependencies
+                    .iter()
+                    .any(|dep| dep.mod_id == "blocked" && dep.kind == "incompatible"));
+            }
+            if loader == "Forge" {
+                assert_eq!(
+                    meta.mod_entries
+                        .iter()
+                        .find(|entry| entry.mod_id == "second")
+                        .unwrap()
+                        .dependencies[0]
+                        .kind,
+                    "optional"
+                );
+            }
+            assert!(meta.metadata_complete);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn fabric_parent_and_all_nested_jars_contribute_mod_entries() {
+        let parent_dir = test_dir("compat-nested-parent");
+        let parent = parent_dir.join("parent.jar");
+        let (first_dir, first) = jar_bytes("compat-nested-a", "nested_a");
+        let (second_dir, second) = jar_bytes("compat-nested-b", "nested_b");
+        write_jar_bytes(
+            &parent,
+            &[
+                (
+                    "fabric.mod.json",
+                    br#"{"schemaVersion":1,"id":"parent","version":"1.0.0","jars":[{"file":"META-INF/jars/a.jar"}]}"#,
+                ),
+                ("META-INF/jars/a.jar", first.as_slice()),
+                ("META-INF/jars/b.jar", second.as_slice()),
+            ],
+        );
+        let meta = read_mod_meta_from_jar_pub(&parent);
+        let ids: Vec<_> = meta
+            .mod_entries
+            .iter()
+            .map(|entry| entry.mod_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["parent", "nested_a"]);
+        let _ = std::fs::remove_dir_all(parent_dir);
+        let _ = std::fs::remove_dir_all(first_dir);
+        let _ = std::fs::remove_dir_all(second_dir);
+    }
+
+    #[test]
+    fn jarjar_embedded_mods_are_taken_only_from_the_declared_manifest_entries() {
+        let dir = test_dir("compat-jarjar-declared-only");
+        let outer = dir.join("outer.jar");
+        let (declared_dir, declared) = jar_bytes("compat-jarjar-declared", "declared_nested");
+        let (unlisted_dir, unlisted) = jar_bytes("compat-jarjar-unlisted", "unlisted_nested");
+        write_jar_bytes(
+            &outer,
+            &[
+                (
+                    "META-INF/jarjar/metadata.json",
+                    br#"{"jars":[{"identifier":{"group":"example","artifact":"declared"},"version":{"range":"[1.0,2.0)","artifactVersion":"1.0"},"path":"META-INF/jarjar/declared.jar","obfuscated":false}]}"#,
+                ),
+                ("META-INF/jarjar/declared.jar", declared.as_slice()),
+                ("META-INF/jarjar/unlisted.jar", unlisted.as_slice()),
+            ],
+        );
+        let meta = read_mod_meta_from_jar_pub(&outer);
+        assert_eq!(
+            meta.mod_entries
+                .iter()
+                .map(|entry| entry.mod_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["declared_nested"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(declared_dir);
+        let _ = std::fs::remove_dir_all(unlisted_dir);
+    }
+
+    #[test]
+    fn legacy_mcmod_info_keeps_all_entries_but_marks_relationship_data_unknown() {
+        let dir = test_dir("compat-legacy-mcmod");
+        let jar = dir.join("legacy.jar");
+        write_jar(
+            &jar,
+            &[(
+                "mcmod.info",
+                r#"[{"modid":"legacy_a","name":"Legacy A","version":"1.0"},{"modid":"legacy_b","name":"Legacy B","version":"2.0"}]"#,
+            )],
+        );
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert_eq!(
+            meta.mod_entries
+                .iter()
+                .map(|entry| entry.mod_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy_a", "legacy_b"]
+        );
+        assert!(!meta.metadata_complete);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn corrupted_jar_is_preserved_as_incomplete_unknown_metadata() {
+        let dir = test_dir("compat-corrupt-jar");
+        let jar = dir.join("corrupt.jar");
+        std::fs::write(&jar, b"not a zip archive").expect("write corrupt fixture");
+        let meta = read_mod_meta_from_jar_pub(&jar);
+        assert!(meta.mod_entries.is_empty());
+        assert!(!meta.metadata_complete);
+        assert!(!meta.has_descriptor);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5279,7 +6202,13 @@ version="2.0"
         let jar = dir.join("Connector.jar");
         write_jar_with_nested(
             &jar,
-            &[("pack.mcmeta", r#"{"pack":{"pack_format":15}}"#)],
+            &[
+                ("pack.mcmeta", r#"{"pack":{"pack_format":15}}"#),
+                (
+                    "META-INF/jarjar/metadata.json",
+                    r#"{"jars":[{"identifier":{"group":"example","artifact":"connector"},"version":{"range":"[1.0,2.0)","artifactVersion":"1.0.0"},"path":"META-INF/jarjar/Connector-mod.jar","obfuscated":false}]}"#,
+                ),
+            ],
             "META-INF/jarjar/Connector-mod.jar",
             &[(
                 "META-INF/mods.toml",
