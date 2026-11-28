@@ -419,6 +419,7 @@ pub fn run() {
             commands::mods::cmd_check_mod_updates,
             commands::content::cmd_resolve_dependencies,
             commands::content::cmd_check_content_compatibilities,
+            commands::content::cmd_analyze_instance_mod_compatibility,
             commands::auth::cmd_list_accounts,
             commands::auth::cmd_add_offline_account,
             commands::auth::cmd_add_elyby_account,

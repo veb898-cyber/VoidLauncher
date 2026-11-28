@@ -27,6 +27,13 @@ import {
 } from '../../stores/updateCheckStore';
 import { RemoteIcon } from '../../lib/remoteImage';
 import type { CompatState } from '../../lib/contentProviders';
+import {
+  CompatibilityRequestTracker,
+  countCompatibilityFindings,
+  filterCompatibilityFindings,
+  type CompatibilityFilter,
+  type LocalCompatibilityReport,
+} from '../../lib/localCompatibility';
 import { moveActiveContent, resourcePacksOptionsOrder } from '../../lib/contentOrder';
 import {
   modLoadersLabel,
@@ -414,6 +421,13 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
   const [removing, setRemoving] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; filename: string } | null>(null);
   const [compatibility, setCompatibility] = useState<Record<string, CompatState>>({});
+  const [localCompatibility, setLocalCompatibility] = useState<LocalCompatibilityReport | null>(null);
+  const [localCompatibilityCheckedAt, setLocalCompatibilityCheckedAt] = useState<number | null>(null);
+  const [localCompatibilityError, setLocalCompatibilityError] = useState<string | null>(null);
+  const [localCompatibilityLoading, setLocalCompatibilityLoading] = useState(false);
+  const [localCompatibilityExpanded, setLocalCompatibilityExpanded] = useState(false);
+  const [localCompatibilityFilter, setLocalCompatibilityFilter] = useState<CompatibilityFilter>('all');
+  const localCompatibilityRequests = useRef(new CompatibilityRequestTracker());
   const updateCheckKey = `${instanceName}:${SUBFOLDER[contentType]}`;
   const updateCheck = useUpdateCheckStore((s) => s.checks[updateCheckKey]) ?? EMPTY_UPDATE_CHECK;
   const startUpdateCheck = useUpdateCheckStore((s) => s.start);
@@ -586,7 +600,43 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     });
   }, [instanceName, subfolder, contentType, cacheIcon]);
 
+  const invalidateLocalCompatibility = useCallback(() => {
+    localCompatibilityRequests.current.invalidate();
+    setLocalCompatibility(null);
+    setLocalCompatibilityCheckedAt(null);
+    setLocalCompatibilityError(null);
+    setLocalCompatibilityLoading(false);
+  }, []);
+
+  const refreshLocalCompatibility = useCallback(async () => {
+    if (contentType !== 'mod') return;
+    const gen = localCompatibilityRequests.current.begin();
+    if (gen === null) return;
+    setLocalCompatibility(null);
+    setLocalCompatibilityCheckedAt(null);
+    setLocalCompatibilityError(null);
+    setLocalCompatibilityLoading(true);
+    try {
+      const report = await invoke<LocalCompatibilityReport>(
+        'cmd_analyze_instance_mod_compatibility',
+        { instanceName },
+      );
+      if (!localCompatibilityRequests.current.isCurrent(gen)) return;
+      setLocalCompatibility(report);
+      setLocalCompatibilityCheckedAt(Date.now());
+    } catch (error) {
+      if (localCompatibilityRequests.current.isCurrent(gen)) setLocalCompatibilityError(String(error));
+    } finally {
+      localCompatibilityRequests.current.finish(gen);
+      if (localCompatibilityRequests.current.isCurrent(gen)) setLocalCompatibilityLoading(false);
+    }
+  }, [contentType, instanceName]);
+
   const loadItems = useCallback(async () => {
+    if (contentType === 'mod') {
+      invalidateLocalCompatibility();
+      void refreshLocalCompatibility();
+    }
     const gen = ++loadGen.current;
     setLoading(true);
     setIconsResolving(true);
@@ -681,12 +731,18 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
       }
     } catch (e: any) {
       if (gen === loadGen.current) {
+        if (contentType === 'mod') {
+          setLocalCompatibility(null);
+          setLocalCompatibilityCheckedAt(null);
+          setLocalCompatibilityError(String(e));
+          setLocalCompatibilityLoading(false);
+        }
         addToast(t('manager.load_error', { label, error: e.toString() }), 'error');
         setLoading(false);
         setIconsResolving(false);
       }
     }
-  }, [instanceName, contentType, subfolder, fetchPackIcons, label, cacheIcon]);
+  }, [instanceName, contentType, subfolder, fetchPackIcons, label, cacheIcon, invalidateLocalCompatibility, refreshLocalCompatibility]);
 
   useEffect(() => {
     loadItems();
@@ -1329,6 +1385,12 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
     () => [mcVersion ? `MC ${mcVersion}` : '', loader && loader !== 'Vanilla' ? loader : ''].filter(Boolean).join(' / '),
     [mcVersion, loader]
   );
+  const localFindingCounts = useMemo(
+    () => countCompatibilityFindings(localCompatibility?.findings ?? []),
+    [localCompatibility],
+  );
+  const visibleLocalFindings = filterCompatibilityFindings(localCompatibility?.findings ?? [], localCompatibilityFilter);
+  const localModNames = useMemo(() => new Map(items.filter((item) => item.mod_id).map((item) => [item.mod_id!, item.name])), [items]);
 
   if (showBrowser) {
     // Normalize: lowercase + underscore→dash so fabric mod ids (e.g. "My_Cool_Mod")
@@ -1390,6 +1452,84 @@ function ContentManagerImpl({ instanceName, contentType, mcVersion, loader, onOp
             {label} <span style={{ fontWeight: 400, color: 'var(--text-tertiary)', fontSize: 'var(--font-size-sm)' }}>{t('packs.installed_count', { n: items.length.toString() })}</span>
           </h2>
         </div>
+
+        {contentType === 'mod' && (
+          <section aria-label={t('compatibility.local_title')} style={{ borderBottom: '1px solid var(--surface-border)', padding: 'var(--space-sm) var(--space-2xl)', flexShrink: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', minHeight: 32 }}>
+              <button type="button" onClick={() => setLocalCompatibilityExpanded((value) => !value)} aria-expanded={localCompatibilityExpanded}
+                style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flex: 1, padding: 0, border: 0, background: 'transparent', color: 'var(--text-primary)', textAlign: 'left', cursor: 'pointer' }}>
+                <ChevronDown size={14} style={{ transform: localCompatibilityExpanded ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform 180ms ease-out', flexShrink: 0 }} />
+                <strong style={{ fontSize: 'var(--font-size-sm)' }}>{t('compatibility.local_title')}</strong>
+                {localCompatibilityLoading ? (
+                  <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)' }}>{t('compatibility.checking')}</span>
+                ) : localCompatibilityError ? (
+                  <span style={{ color: 'var(--color-danger)', fontSize: 'var(--font-size-xs)' }}>{t('compatibility.failed')}</span>
+                ) : localCompatibility ? (
+                  <span style={{ color: localCompatibility.complete ? 'var(--color-success)' : 'var(--warning)', fontSize: 'var(--font-size-xs)' }}>
+                    {localCompatibility.complete ? t('compatibility.complete') : t('compatibility.incomplete')}
+                  </span>
+                ) : null}
+                {localCompatibility && <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)', fontVariantNumeric: 'tabular-nums' }}>{t('compatibility.summary_counts', { total: localFindingCounts.total, confirmed: localFindingCounts.confirmed, potential: localFindingCounts.potential, unknown: localFindingCounts.unknown })}</span>}
+              </button>
+              {localCompatibilityCheckedAt !== null && !localCompatibilityLoading && (
+                <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)', whiteSpace: 'nowrap' }}>
+                  {t('compatibility.checked_at', { time: new Date(localCompatibilityCheckedAt).toLocaleTimeString() })}
+                </span>
+              )}
+              <Button size="sm" variant="ghost" onClick={refreshLocalCompatibility} disabled={localCompatibilityLoading} aria-label={t('compatibility.refresh')} title={t('compatibility.refresh')}>
+                <RefreshIcon spinning={localCompatibilityLoading} minimumMs={BUILDS_REFRESH_MIN_SPIN_MS} />
+                {t('compatibility.refresh')}
+              </Button>
+            </div>
+            {localCompatibilityExpanded && (
+              <div style={{ padding: 'var(--space-sm) 0 2px var(--space-lg)' }}>
+                {localCompatibilityError && (
+                  <div role="alert" style={{ color: 'var(--color-danger)', fontSize: 'var(--font-size-xs)', marginBottom: 'var(--space-sm)' }}>
+                    {t('compatibility.error_detail', { error: localCompatibilityError })}
+                  </div>
+                )}
+                {localCompatibility && (
+                  <>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-sm)', flexWrap: 'wrap', marginBottom: 'var(--space-sm)' }}>
+                      <span style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)' }}>{t('compatibility.files_analyzed', { n: localCompatibility.filesAnalyzed })}</span>
+                      {(['all', 'confirmed', 'potential', 'unknown'] as const).map((filter) => (
+                        <button key={filter} type="button" onClick={() => setLocalCompatibilityFilter(filter)} aria-pressed={localCompatibilityFilter === filter}
+                          style={{ border: '1px solid var(--surface-border)', borderRadius: 'var(--radius-sm)', padding: '2px 7px', background: localCompatibilityFilter === filter ? 'var(--primary-dim)' : 'transparent', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 'var(--font-size-xs)' }}>
+                          {t(`compatibility.filter_${filter}` as Parameters<typeof t>[0])} ({filter === 'all' ? localFindingCounts.total : localFindingCounts[filter]})
+                        </button>
+                      ))}
+                    </div>
+                    {visibleLocalFindings.length === 0 ? (
+                      <div style={{ color: 'var(--text-tertiary)', fontSize: 'var(--font-size-xs)' }}>
+                        {localCompatibility.findings.length === 0 && localCompatibility.complete
+                          ? t('compatibility.no_findings')
+                          : t('compatibility.no_filter_findings')}
+                      </div>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-xs)', maxHeight: 280, overflowY: 'auto' }}>
+                        {visibleLocalFindings.map((finding, index) => (
+                          <details key={`${finding.code}:${finding.affectedFiles.join('|')}:${index}`} style={{ border: '1px solid var(--surface-border)', borderRadius: 'var(--radius-sm)', padding: 'var(--space-xs) var(--space-sm)' }}>
+                            <summary style={{ cursor: 'pointer', color: finding.status === 'confirmed' ? 'var(--color-danger)' : finding.status === 'potential' ? 'var(--warning)' : 'var(--text-secondary)', fontSize: 'var(--font-size-xs)' }}>
+                              <strong>{t(`compatibility.status_${finding.status}` as Parameters<typeof t>[0])}</strong> · {finding.explanation}
+                            </summary>
+                            <div style={{ padding: 'var(--space-sm) 0 0 var(--space-md)', display: 'grid', gap: 4, color: 'var(--text-secondary)', fontSize: 'var(--font-size-xs)', lineHeight: 1.45 }}>
+                              <div><strong>{t('compatibility.mods_label')}</strong> {finding.affectedModIds.length ? finding.affectedModIds.map((id) => `${localModNames.get(id) ?? id} (${id})`).join(', ') : t('compatibility.unknown_mod')}</div>
+                              {finding.dependency && <div><strong>{t('compatibility.requirement_label')}</strong> {finding.dependency.modId}: {finding.dependency.requirement || finding.dependency.alternatives.join(' OR ') || t('compatibility.any_version')}</div>}
+                              {finding.dependency?.providers.map((provider) => <div key={`${provider.filename}:${provider.version}`}><strong>{t('compatibility.provider_version')}</strong> {provider.filename} — {provider.version || t('manager.version_unknown')}</div>)}
+                              <div><strong>{t('compatibility.source_label')}</strong> {finding.source}</div>
+                              <div><strong>{t('compatibility.files_label')}</strong> {finding.affectedFiles.length ? finding.affectedFiles.join(', ') : t('compatibility.none')}</div>
+                              <div><strong>{t('compatibility.basis_label')}</strong> {finding.basis}</div>
+                            </div>
+                          </details>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </section>
+        )}
 
         {/* Table header — column labels have no meaning for the card list */}
         {!cardsView && (

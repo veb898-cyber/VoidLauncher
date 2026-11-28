@@ -30,6 +30,25 @@ pub struct CompatibilityFinding {
     pub affected_files: Vec<String>,
     /// Internal mod IDs only; provider project IDs are deliberately excluded.
     pub affected_mod_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency: Option<DependencyFindingDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyFindingDetail {
+    pub mod_id: String,
+    pub kind: String,
+    pub requirement: Option<String>,
+    pub alternatives: Vec<String>,
+    pub providers: Vec<InstalledModVersion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledModVersion {
+    pub filename: String,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -48,7 +67,7 @@ struct ActiveMod {
 }
 
 type ActiveMods = BTreeMap<String, Vec<ActiveMod>>;
-type DisabledMods = BTreeMap<String, Vec<String>>;
+type DisabledMods = BTreeMap<String, Vec<ActiveMod>>;
 
 #[derive(Clone, Copy)]
 struct DependencyAnalysisContext<'a> {
@@ -138,7 +157,11 @@ pub fn analyze_installed_mods(
                     disabled_ids
                         .entry(identity.to_string())
                         .or_default()
-                        .push(file.filename.clone());
+                        .push(ActiveMod {
+                            filename: file.filename.clone(),
+                            version: entry.version.clone(),
+                            source: entry.source.clone(),
+                        });
                 }
             }
         }
@@ -215,6 +238,7 @@ pub fn analyze_installed_mods(
             .filter(|entry| entry_applies_to_loader(entry, &instance.loader, &instance.mc_version))
         {
             for dependency in &entry.dependencies {
+                let finding_start = findings.len();
                 analyze_dependency(
                     &dependency_context,
                     file.filename.as_str(),
@@ -222,6 +246,48 @@ pub fn analyze_installed_mods(
                     dependency,
                     &mut findings,
                 );
+                let environment_provider = match dependency.mod_id.as_str() {
+                    "minecraft" => Some(ActiveMod {
+                        filename: "instance".to_string(),
+                        version: Some(instance.mc_version.clone()),
+                        source: "instance-config".to_string(),
+                    }),
+                    "fabricloader" if instance.loader == LoaderType::Fabric => {
+                        instance.loader_version.as_ref().map(|version| ActiveMod {
+                            filename: "instance".to_string(),
+                            version: Some(version.clone()),
+                            source: "instance-config".to_string(),
+                        })
+                    }
+                    "forge" if instance.loader == LoaderType::Forge => {
+                        instance.loader_version.as_ref().map(|version| ActiveMod {
+                            filename: "instance".to_string(),
+                            version: Some(version.clone()),
+                            source: "instance-config".to_string(),
+                        })
+                    }
+                    "neoforge" if instance.loader == LoaderType::NeoForge => {
+                        instance.loader_version.as_ref().map(|version| ActiveMod {
+                            filename: "instance".to_string(),
+                            version: Some(version.clone()),
+                            source: "instance-config".to_string(),
+                        })
+                    }
+                    _ => None,
+                };
+                let providers: &[ActiveMod] = if let Some(provider) = environment_provider.as_ref()
+                {
+                    std::slice::from_ref(provider)
+                } else {
+                    active
+                        .get(&dependency.mod_id)
+                        .or_else(|| disabled_ids.get(&dependency.mod_id))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                };
+                for item in &mut findings[finding_start..] {
+                    item.dependency = Some(dependency_detail(dependency, providers));
+                }
             }
         }
     }
@@ -528,7 +594,7 @@ fn analyze_dependency(
                             owner.mod_id, dependency.mod_id
                         ),
                         std::iter::once(owner_file.to_string())
-                            .chain(disabled_files.iter().cloned())
+                            .chain(disabled_files.iter().map(|file| file.filename.clone()))
                             .collect(),
                         vec![owner.mod_id.clone(), dependency.mod_id.clone()],
                     ));
@@ -755,6 +821,27 @@ fn finding(
         explanation: explanation.to_string(),
         affected_files: files.into_iter().collect(),
         affected_mod_ids: ids.into_iter().collect(),
+        dependency: None,
+    }
+}
+
+fn dependency_detail(
+    dependency: &ModDependencyMetadata,
+    providers: &[ActiveMod],
+) -> DependencyFindingDetail {
+    let providers: BTreeSet<_> = providers
+        .iter()
+        .map(|provider| (provider.filename.clone(), provider.version.clone()))
+        .collect();
+    DependencyFindingDetail {
+        mod_id: dependency.mod_id.clone(),
+        kind: dependency.kind.clone(),
+        requirement: dependency.requirement.clone(),
+        alternatives: dependency.alternatives.clone(),
+        providers: providers
+            .into_iter()
+            .map(|(filename, version)| InstalledModVersion { filename, version })
+            .collect(),
     }
 }
 
@@ -1124,6 +1211,89 @@ mod tests {
             .iter()
             .any(|f| f.code == "declared_incompatibility"
                 && f.status == CompatibilityStatus::Confirmed));
+    }
+
+    #[test]
+    fn dependency_finding_details_include_requirements_and_detected_versions() {
+        let installed = vec![
+            content("owner.jar", true),
+            content("library.jar", true),
+            content("library-copy.jar", true),
+        ];
+        let metadata_items = vec![
+            metadata(
+                "owner.jar",
+                vec![entry(
+                    "owner",
+                    "1.0",
+                    vec![dep("library", Some("[2,3)"), "required")],
+                )],
+                true,
+            ),
+            metadata("library.jar", vec![entry("library", "1.5", vec![])], true),
+            metadata(
+                "library-copy.jar",
+                vec![entry("library", "1.6", vec![])],
+                true,
+            ),
+        ];
+        let report = analyze_installed_mods(&instance(), &installed, &metadata_items);
+        let mismatch = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == "dependency_version_mismatch")
+            .unwrap();
+        let mismatch_json = serde_json::to_value(mismatch).unwrap();
+        assert_eq!(mismatch_json["dependency"]["modId"], "library");
+        assert_eq!(mismatch_json["dependency"]["kind"], "required");
+        assert_eq!(mismatch_json["dependency"]["requirement"], "[2,3)");
+        let providers = mismatch_json["dependency"]["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 2);
+        assert!(providers.iter().any(|provider| {
+            provider["filename"] == "library.jar" && provider["version"] == "1.5"
+        }));
+        assert!(providers.iter().any(|provider| {
+            provider["filename"] == "library-copy.jar" && provider["version"] == "1.6"
+        }));
+
+        let installed = vec![content("owner.jar", true)];
+        let metadata_items = vec![metadata(
+            "owner.jar",
+            vec![entry(
+                "owner",
+                "1.0",
+                vec![dep("missing", Some(">=1.0"), "required")],
+            )],
+            true,
+        )];
+        let report = analyze_installed_mods(&instance(), &installed, &metadata_items);
+        let missing = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == "missing_dependency")
+            .unwrap();
+        let missing_json = serde_json::to_value(missing).unwrap();
+        assert_eq!(missing_json["dependency"]["requirement"], ">=1.0");
+        assert_eq!(
+            missing_json["dependency"]["providers"],
+            serde_json::json!([])
+        );
+
+        let installed = vec![content("a.jar", true), content("b.jar", true)];
+        let metadata_items = vec![
+            metadata("a.jar", vec![entry("duplicate", "1.0", vec![])], true),
+            metadata("b.jar", vec![entry("duplicate", "1.0", vec![])], true),
+        ];
+        let report = analyze_installed_mods(&instance(), &installed, &metadata_items);
+        let duplicate = report
+            .findings
+            .iter()
+            .find(|finding| finding.code == "duplicate_mod_id")
+            .unwrap();
+        assert!(serde_json::to_value(duplicate)
+            .unwrap()
+            .get("dependency")
+            .is_none());
     }
 
     #[test]

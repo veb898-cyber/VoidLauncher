@@ -3,6 +3,8 @@
 //! compatibility classification replacing the old per-mod frontend polling.
 
 use crate::commands::instances::validate_instance_name;
+use crate::compatibility::{analyze_installed_mods, CompatibilityReport};
+use crate::config::AppConfig;
 use crate::content::{
     self, DepEdge, GraphInput, InstalledContent, InstalledProject, PlanFile, ProjectKey,
     ProjectNameEntry, Resolution, UnresolvedItem, VersionNode, DEP_EMBEDDED, DEP_INCOMPATIBLE,
@@ -14,6 +16,56 @@ use crate::AppState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use tauri::State;
+
+/// Analyze one instance from its current installed-file and cached metadata snapshot.
+fn analyze_instance_compatibility(
+    config: &AppConfig,
+    instance_name: &str,
+) -> Result<CompatibilityReport, String> {
+    validate_instance_name(instance_name)?;
+    let instances_dir = config.instances_dir();
+    let instance = instances::get_instance(&instances_dir, instance_name)
+        .map_err(|error| error.to_string())?;
+    let mods_dir = instance.mods_dir(&instances_dir);
+    match std::fs::metadata(&mods_dir) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!(
+                "Mods path is not a directory: {}",
+                mods_dir.display()
+            ));
+        }
+        Ok(_) => {
+            let entries = std::fs::read_dir(&mods_dir).map_err(|error| error.to_string())?;
+            for entry in entries {
+                entry.map_err(|error| error.to_string())?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let installed = content::list_installed(&mods_dir, "mod");
+    let metadata = crate::commands::mods::get_mod_metadata_read_only(config, instance_name)
+        .map_err(|error| error.to_string())?;
+    Ok(analyze_installed_mods(&instance, &installed, &metadata))
+}
+
+/// Analyze installed mods locally using cached JAR metadata. This is separate
+/// from the provider catalog check and never performs a network request.
+#[tauri::command]
+pub async fn cmd_analyze_instance_mod_compatibility(
+    state: State<'_, AppState>,
+    instance_name: String,
+) -> Result<CompatibilityReport, String> {
+    validate_instance_name(&instance_name)?;
+    let config = state
+        .config
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    tokio::task::spawn_blocking(move || analyze_instance_compatibility(&config, &instance_name))
+        .await
+        .map_err(|error| error.to_string())?
+}
 
 /// Content folders a content command may touch (mirrors the frontend maps).
 const ALLOWED_SUBFOLDERS: &[&str] = &["mods", "resourcepacks", "shaderpacks"];
@@ -841,6 +893,133 @@ async fn classify_cf_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CompatibilityTemp(std::path::PathBuf);
+
+    impl Drop for CompatibilityTemp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn compatibility_fixture() -> (CompatibilityTemp, AppConfig, String) {
+        let unique = format!(
+            "vl-compat-command-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp_path = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_path).unwrap();
+        let config = AppConfig {
+            data_dir: temp_path.clone(),
+            ..AppConfig::default()
+        };
+        let name = "Compatibility Fixture".to_string();
+        let instance = instances::Instance::new(
+            &name,
+            "1.21.1",
+            instances::LoaderType::Fabric,
+            Some("0.16.9".into()),
+        );
+        let instance_dir = config.instances_dir().join(&name);
+        std::fs::create_dir_all(instance_dir.join(".minecraft")).unwrap();
+        std::fs::write(
+            instance.config_file(&config.instances_dir()),
+            serde_json::to_vec(&instance).unwrap(),
+        )
+        .unwrap();
+        (CompatibilityTemp(temp_path), config, name)
+    }
+
+    #[test]
+    fn local_compatibility_accepts_a_real_empty_mods_directory() {
+        let (_temp, config, name) = compatibility_fixture();
+        let mods = config
+            .instances_dir()
+            .join(&name)
+            .join(".minecraft")
+            .join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+
+        let report = analyze_instance_compatibility(&config, &name).unwrap();
+
+        assert!(report.complete);
+        assert_eq!(report.files_analyzed, 0);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn local_compatibility_treats_an_absent_mods_directory_as_empty() {
+        let (_temp, config, name) = compatibility_fixture();
+
+        let report = analyze_instance_compatibility(&config, &name).unwrap();
+
+        assert!(report.complete);
+        assert_eq!(report.files_analyzed, 0);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn local_compatibility_does_not_restore_or_change_parked_files() {
+        let (_temp, config, name) = compatibility_fixture();
+        let mods = config
+            .instances_dir()
+            .join(&name)
+            .join(".minecraft")
+            .join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        let parked = mods.join(format!("pending.jar{}", instances::STASH_SUFFIX));
+        std::fs::write(&parked, b"parked user file").unwrap();
+
+        let report = analyze_instance_compatibility(&config, &name).unwrap();
+
+        assert!(report.complete);
+        assert_eq!(report.files_analyzed, 0);
+        assert!(parked.exists());
+        assert!(!mods.join("pending.jar").exists());
+    }
+
+    #[test]
+    fn malformed_installed_jar_returns_an_incomplete_unknown_report() {
+        let (_temp, config, name) = compatibility_fixture();
+        let mods = config
+            .instances_dir()
+            .join(&name)
+            .join(".minecraft")
+            .join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("broken.jar"), b"not a jar archive").unwrap();
+
+        let report = analyze_instance_compatibility(&config, &name).unwrap();
+
+        assert!(!report.complete);
+        assert_eq!(report.files_analyzed, 1);
+        assert!(report.findings.iter().any(|finding| {
+            finding.status == crate::compatibility::CompatibilityStatus::Unknown
+                && finding
+                    .affected_files
+                    .iter()
+                    .any(|file| file == "broken.jar")
+        }));
+    }
+
+    #[test]
+    fn non_directory_mods_path_is_an_error_not_a_clean_report() {
+        let (_temp, config, name) = compatibility_fixture();
+        let mods = config
+            .instances_dir()
+            .join(&name)
+            .join(".minecraft")
+            .join("mods");
+        std::fs::write(&mods, b"not a directory").unwrap();
+
+        let result = analyze_instance_compatibility(&config, &name);
+
+        assert!(result.is_err());
+    }
 
     #[test]
     fn graph_fetcher_projects_separate_same_id_by_provider() {
