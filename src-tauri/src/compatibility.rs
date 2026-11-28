@@ -40,6 +40,26 @@ pub struct CompatibilityReport {
     pub findings: Vec<CompatibilityFinding>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveMod {
+    filename: String,
+    version: Option<String>,
+    source: String,
+}
+
+type ActiveMods = BTreeMap<String, Vec<ActiveMod>>;
+type DisabledMods = BTreeMap<String, Vec<String>>;
+
+#[derive(Clone, Copy)]
+struct DependencyAnalysisContext<'a> {
+    mc_version: &'a str,
+    loader: &'a LoaderType,
+    loader_version: Option<&'a str>,
+    active: &'a ActiveMods,
+    disabled: &'a DisabledMods,
+    all_files_complete: bool,
+}
+
 /// Analyze a metadata snapshot produced by `get_mod_metadata`. The caller
 /// pairs it with `InstalledContent`, whose filename-derived enabled bit is
 /// authoritative. Missing metadata is represented as unknown, never clean.
@@ -57,8 +77,8 @@ pub fn analyze_installed_mods(
     let mut findings = Vec::new();
     let mut complete = true;
 
-    let mut active: BTreeMap<String, Vec<(String, Option<String>, String, bool)>> = BTreeMap::new();
-    let mut disabled_ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut active: ActiveMods = BTreeMap::new();
+    let mut disabled_ids: DisabledMods = BTreeMap::new();
     for file in installed {
         let Some(meta) = by_filename.get(file.filename.as_str()) else {
             complete = false;
@@ -107,12 +127,11 @@ pub fn analyze_installed_mods(
             if file.enabled {
                 for identity in identities {
                     let occurrences = active.entry(identity.to_string()).or_default();
-                    occurrences.push((
-                        file.filename.clone(),
-                        entry.version.clone(),
-                        entry.source.clone(),
-                        entry.complete,
-                    ));
+                    occurrences.push(ActiveMod {
+                        filename: file.filename.clone(),
+                        version: entry.version.clone(),
+                        source: entry.source.clone(),
+                    });
                 }
             } else {
                 for identity in identities {
@@ -142,7 +161,7 @@ pub fn analyze_installed_mods(
             // prove that both candidates will be loaded simultaneously.
             let has_nested_candidate = occurrences
                 .iter()
-                .any(|occurrence| occurrence.2.contains('!'));
+                .any(|occurrence| occurrence.source.contains('!'));
             findings.push(finding(
                 "duplicate_mod_id",
                 if has_nested_candidate {
@@ -157,7 +176,10 @@ pub fn analyze_installed_mods(
                     "the same internal mod ID is declared by multiple enabled JAR entries"
                 },
                 &format!("Enabled files declare internal mod ID `{mod_id}` more than once."),
-                occurrences.iter().map(|o| o.0.clone()).collect(),
+                occurrences
+                    .iter()
+                    .map(|occurrence| occurrence.filename.clone())
+                    .collect(),
                 vec![mod_id.clone()],
             ));
         }
@@ -175,6 +197,14 @@ pub fn analyze_installed_mods(
                     .all(|entry| entry.complete)
         })
     });
+    let dependency_context = DependencyAnalysisContext {
+        mc_version: &instance.mc_version,
+        loader: &instance.loader,
+        loader_version: instance.loader_version.as_deref(),
+        active: &active,
+        disabled: &disabled_ids,
+        all_files_complete,
+    };
     for file in &active_files {
         let Some(meta) = by_filename.get(file.filename.as_str()) else {
             continue;
@@ -186,15 +216,10 @@ pub fn analyze_installed_mods(
         {
             for dependency in &entry.dependencies {
                 analyze_dependency(
-                    &instance.mc_version,
-                    &instance.loader,
-                    instance.loader_version.as_deref(),
+                    &dependency_context,
                     file.filename.as_str(),
                     entry,
                     dependency,
-                    &active,
-                    &disabled_ids,
-                    all_files_complete,
                     &mut findings,
                 );
             }
@@ -311,17 +336,20 @@ fn entry_applies_to_loader(
 }
 
 fn analyze_dependency(
-    mc_version: &str,
-    loader: &LoaderType,
-    loader_version: Option<&str>,
+    context: &DependencyAnalysisContext<'_>,
     owner_file: &str,
     owner: &ModEntryMetadata,
     dependency: &ModDependencyMetadata,
-    active: &BTreeMap<String, Vec<(String, Option<String>, String, bool)>>,
-    disabled: &BTreeMap<String, Vec<String>>,
-    all_files_complete: bool,
     findings: &mut Vec<CompatibilityFinding>,
 ) {
+    let DependencyAnalysisContext {
+        mc_version,
+        loader,
+        loader_version,
+        active,
+        disabled,
+        all_files_complete,
+    } = *context;
     if dependency.side.as_deref() == Some("SERVER") {
         return;
     }
@@ -407,12 +435,11 @@ fn analyze_dependency(
     }
     let provider = if is_environment {
         environment_version.map(|v| {
-            vec![(
-                "instance".to_string(),
-                Some(v.to_string()),
-                "instance-config".to_string(),
-                true,
-            )]
+            vec![ActiveMod {
+                filename: "instance".to_string(),
+                version: Some(v.to_string()),
+                source: "instance-config".to_string(),
+            }]
         })
     } else {
         candidates.cloned()
@@ -430,15 +457,17 @@ fn analyze_dependency(
                     .requirement
                     .as_deref()
                     .is_some_and(|value| !value.is_empty());
-            for (file, version, source, _) in &files {
+            for candidate in &files {
                 let matches = if has_requirement {
-                    requirement_matches_dependency(dependency, version.as_deref())
+                    requirement_matches_dependency(dependency, candidate.version.as_deref())
                 } else {
                     Some(true)
                 };
                 match matches {
-                    Some(true) => matching_files.push(file.clone()),
-                    None => unknown_files.push((file.clone(), source.clone())),
+                    Some(true) => matching_files.push(candidate.filename.clone()),
+                    None => {
+                        unknown_files.push((candidate.filename.clone(), candidate.source.clone()))
+                    }
                     Some(false) => {}
                 }
             }
@@ -524,7 +553,7 @@ fn analyze_dependency(
                     .as_deref()
                     .is_some_and(|value| !value.is_empty());
             if has_requirement {
-                if !is_environment && providers.iter().all(|item| item.1.is_none()) {
+                if !is_environment && providers.iter().all(|item| item.version.is_none()) {
                     findings.push(finding(
                         "dependency_version_unknown",
                         CompatibilityStatus::Unknown,
@@ -535,16 +564,18 @@ fn analyze_dependency(
                         ),
                         "The dependency exists, but its installed version is unknown.",
                         std::iter::once(owner_file.to_string())
-                            .chain(providers.iter().map(|p| p.0.clone()))
+                            .chain(providers.iter().map(|candidate| candidate.filename.clone()))
                             .collect(),
                         vec![owner.mod_id.clone(), dependency.mod_id.clone()],
                     ));
                 } else {
                     let matched = providers.iter().any(|item| {
-                        requirement_matches_dependency(dependency, item.1.as_deref()) == Some(true)
+                        requirement_matches_dependency(dependency, item.version.as_deref())
+                            == Some(true)
                     });
                     let unknown = providers.iter().any(|item| {
-                        requirement_matches_dependency(dependency, item.1.as_deref()).is_none()
+                        requirement_matches_dependency(dependency, item.version.as_deref())
+                            .is_none()
                     });
                     if !matched && unknown {
                         findings.push(finding(
@@ -553,7 +584,7 @@ fn analyze_dependency(
                             &owner_source(owner),
                             "the range or installed version is not supported by the conservative evaluator",
                             "The range was preserved from metadata but could not be evaluated safely.",
-                            std::iter::once(owner_file.to_string()).chain(providers.iter().map(|p| p.0.clone())).collect(),
+                            std::iter::once(owner_file.to_string()).chain(providers.iter().map(|candidate| candidate.filename.clone())).collect(),
                             vec![owner.mod_id.clone(), dependency.mod_id.clone()],
                         ));
                     } else if !matched {
@@ -569,7 +600,7 @@ fn analyze_dependency(
                             &owner_source(owner),
                             "no enabled provider satisfies the declared version range",
                             &format!("`{}` requires `{}` to match the recorded range, but none of the enabled copies satisfy it.", owner.mod_id, dependency.mod_id),
-                            std::iter::once(owner_file.to_string()).chain(providers.iter().map(|p| p.0.clone())).collect(),
+                            std::iter::once(owner_file.to_string()).chain(providers.iter().map(|candidate| candidate.filename.clone())).collect(),
                             vec![owner.mod_id.clone(), dependency.mod_id.clone()],
                         ));
                     }
@@ -607,13 +638,14 @@ fn analyze_dependency(
                 return;
             }
             let matching = providers.iter().any(|provider| {
-                requirement_matches_dependency(dependency, provider.1.as_deref()) == Some(true)
+                requirement_matches_dependency(dependency, provider.version.as_deref())
+                    == Some(true)
             });
             if matching {
                 return;
             }
             let has_unknown_provider = providers.iter().any(|provider| {
-                requirement_matches_dependency(dependency, provider.1.as_deref()).is_none()
+                requirement_matches_dependency(dependency, provider.version.as_deref()).is_none()
             });
             let status = if has_unknown_provider {
                 CompatibilityStatus::Unknown
@@ -640,7 +672,7 @@ fn analyze_dependency(
                 "optional dependency version does not satisfy the declaration",
                 "The optional mod is present, but its version does not satisfy the declared range.",
                 std::iter::once(owner_file.to_string())
-                    .chain(providers.iter().map(|p| p.0.clone()))
+                    .chain(providers.iter().map(|candidate| candidate.filename.clone()))
                     .collect(),
                 vec![owner.mod_id.clone(), dependency.mod_id.clone()],
             ));
